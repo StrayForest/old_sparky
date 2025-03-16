@@ -486,17 +486,19 @@ async def fill_missing_captains(teams_count, update, context):
 async def assign_team_numbers_and_notify(update, context, teams_count):
     """Когда количество капитанов равно количеству команд, присваиваем номера команд и отправляем уведомления."""
     conn = await get_db_connection()
+    print("присваиваем цифры капитанам")
     try:
         query = f"SELECT user_id FROM players WHERE status = 'captain';"
         captains = await conn.fetch(query)
 
         # Присваиваем капитанам номера команд от 1 до teams_count
         for i, captain in enumerate(captains, 1):
+            print("присваиваем цифры капитанам в цикле")
             user_id = captain['user_id']
             await update_player_status(user_id, 'captain', i)  # Присваиваем номер команды
             await context.bot.send_message(user_id, f"Ты стал капитаном команды {i}!")
 
-        await update.callback_query.edit_message_text(f"Капитаны успешно назначены для {teams_count} команд.")
+        await update.callback_query.edit_message_text(f"Капитаны успешно назначены для команд.")
 
     finally:
         await conn.close()
@@ -504,6 +506,7 @@ async def assign_team_numbers_and_notify(update, context, teams_count):
 async def update_player_status(user_id, status, team_number=None):
     """Обновляет статус игрока в базе данных и присваивает номер команды, если требуется."""
     conn = await get_db_connection()
+    print("обновляем статус")
     try:
         if status == 'captain' and team_number is not None:
             query = f"""
