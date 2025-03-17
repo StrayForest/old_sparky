@@ -370,7 +370,7 @@ async def search_captains(teams_count, update, context):
     await send_captain_offers(captains, update, context)
 
     # Ждем 60 секунд на ответ
-    await asyncio.sleep(60)
+    await asyncio.sleep(10)
 
     # Проверяем и находим недостающих капитанов
     await fill_missing_captains(teams_count, update, context)
@@ -517,6 +517,7 @@ async def update_player_status(user_id, status, team_number=None):
         else:
             query = f"UPDATE players SET status = '{status}' WHERE user_id = {user_id};"
         await conn.execute(query)
+        print('статус обновлен')
     finally:
         await conn.close()
 
@@ -608,9 +609,10 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return RANK  # Устанавливаем состояние обратно на выбор ранга
     
     elif data.startswith("teams_"):
-        teams_count = int(data.split("_")[1])  # Извлекаем количество команд из данных
+        teams_count = int(data.split("_")[1])
         logger.info(f"Команды выбраны: {teams_count}") 
-        await search_captains(teams_count, update, context)  # Передаем в новую функцию для обработки
+        await search_captains(teams_count, update, context)
+        return  # Добавляем return, чтобы не выполнялся код дальше
 
     elif data.startswith("accept_"):
         logger.info(f"Обрабатываем команду 'Принять' для данных: {data}")
