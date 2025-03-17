@@ -14,7 +14,6 @@ with open('config.json', 'r') as f:
     config = json.load(f)
 DB_CONFIG = config['postgresql']
 
-RANK, SUBRANK, PLAYTIME, POOL, CONFIRM, PHONE = range(6)
 PLAYTIME_OPTIONS = ["0-100", "101-300", "301-500", "501-700", "701-1000", "1000+"]
 roman_numerals = ['I', 'II', 'III', 'IV', 'V', 'VI']
 
@@ -57,7 +56,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = None
     try:
-        # Получаем асинхронное подключение к базе данных
         conn = await get_db_connection()
 
         # Проверка, существует ли уже пользователь с таким user_id
@@ -72,21 +70,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 VALUES ($1, $2)
             """, user_id, username)
             logger.info(f"Пользователь {user_id} был добавлен в базу данных.")
-        else:
-            logger.info(f"Пользователь {user_id} уже существует в базе данных.")
     
     except Exception as e:
         logger.error(f"Ошибка при работе с базой данных: {e}")
     
     finally:
-        # Закрываем подключение
         if conn:
             await close_db_connection(conn)
 
-    # Сообщение приветствия
     welcome_text = (
         "Привет! 👋\n\n"
-        "Ты попал в систему регистрации на турнир от OldSparky! 🏆\n\n"
+        "Это регистрация на турнир от OldSparky! 🏆\n\n"
         "Чтобы зарегистрироваться, нажми команду /reg.\n"
     )
     await update.message.reply_text(welcome_text, parse_mode='HTML')
@@ -95,18 +89,18 @@ async def reg(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
 
     try:
-        # Получаем подключение к базе данных (здесь просто пример)
         conn = await get_db_connection()
         
-        # Проверяем, есть ли пользователь в базе с установленным рангом
-        existing_user = await conn.fetchrow("SELECT * FROM players WHERE user_id = $1", user_id)
+        existing_user = await conn.fetchrow("SELECT rank FROM players WHERE user_id = $1", user_id)
         
-        # Закрываем соединение с базой данных
         await conn.close()
 
-        # Если не зарегистрирован, начинаем процесс регистрации
-        context.user_data.clear()  # Очищаем данные пользователя в контексте
-        keyboard = rank_keyboard()  # Ваш метод для создания клавиатуры
+        if existing_user and existing_user["rank"]:
+            await update.message.reply_text("Ты уже зарегистрирован на текущий турнир!")
+            return
+
+        context.user_data.clear()
+        keyboard = rank_keyboard()
         await update.message.reply_text("Выбери свой ранг", reply_markup=keyboard)
     
     except Exception as e:
@@ -114,12 +108,10 @@ async def reg(update: Update, context: CallbackContext):
         await update.message.reply_text("Произошла ошибка при регистрации. Попробуй снова позже.")
 
 def rank_keyboard():
-    """Создаем клавиатуру с выбором ранга"""
     keyboard = [[InlineKeyboardButton(rank, callback_data=rank)] for rank in RANKS]
     return InlineKeyboardMarkup(keyboard)
 
 async def rank_choice(update: Update, context: CallbackContext):
-    """Обрабатываем выбор ранга"""
     query = update.callback_query
     await query.answer()
     
@@ -130,7 +122,6 @@ async def rank_choice(update: Update, context: CallbackContext):
     await query.message.edit_text("Выбери подранг", reply_markup=InlineKeyboardMarkup(keyboard))
 
 def subrank_keyboard(selected_rank):
-    """Создаем клавиатуру с подрангами"""
     keyboard = [
         [InlineKeyboardButton(f"{selected_rank} {roman}", callback_data=str(index + 1))]
         for index, roman in enumerate(roman_numerals)
@@ -140,7 +131,6 @@ def subrank_keyboard(selected_rank):
     return keyboard
 
 async def subrank_choice(update: Update, context: CallbackContext):
-    """Обрабатываем выбор подранга"""
     query = update.callback_query
     await query.answer()
     
@@ -148,7 +138,6 @@ async def subrank_choice(update: Update, context: CallbackContext):
         selected_subrank = int(query.data)
         context.user_data['subrank'] = selected_subrank
         
-        # Переходим к выбору времени игры
         await query.message.edit_text("Выбери количество часов в игре", reply_markup=playtime_keyboard())
     
     except ValueError:
@@ -156,22 +145,19 @@ async def subrank_choice(update: Update, context: CallbackContext):
         await query.message.edit_text("Произошла ошибка. Попробуй еще раз.")
 
 def playtime_keyboard():
-    """Создаем клавиатуру с выбором времени игры"""
     keyboard = [[InlineKeyboardButton(option, callback_data=option)] for option in PLAYTIME_OPTIONS]
     return InlineKeyboardMarkup(keyboard)
 
 async def playtime_choice(update: Update, context: CallbackContext):
-    """Обрабатываем выбор времени игры"""
     query = update.callback_query
     await query.answer()
     
     context.user_data['playtime'] = query.data
     context.user_data['pool'] = []
-    keyboard = pool_keyboard([])  # Пустой пул на старте
+    keyboard = pool_keyboard([])
     await query.message.edit_text("Выбери пул героев и нажми кнопку 'Далее'", reply_markup=keyboard)
 
 def pool_keyboard(selected_pool):
-    """Создаем клавиатуру с выбором героев из пула"""
     keyboard = [
         [
             InlineKeyboardButton("✅ Выбрать все", callback_data="select_all"),
@@ -197,43 +183,34 @@ async def pool_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pool = context.user_data.get('pool', [])
         if not pool:
             await query.message.edit_text("Выбери хотя бы одного героя!", reply_markup=pool_keyboard(pool))
-            return  # Ожидаем выбор хотя бы одного героя
-        return await confirm_registration(update, context)  # Если выбраны герои, переходим к подтверждению
+            return
+        return await confirm_registration(update, context)
 
-    # Получаем текущий пул героев из user_data, если его нет - создаем пустой список
     pool = context.user_data.get('pool', [])
 
-    # Если герой уже в пуле, убираем его, если нет - добавляем
     if selected_hero in pool:
         pool.remove(selected_hero)
     else:
         pool.append(selected_hero)
 
-    # Сохраняем измененный пул обратно в user_data
     context.user_data['pool'] = pool
     
-    # Обновляем клавиатуру и сообщение с новым выбором
     keyboard = pool_keyboard(pool)
-    await query.message.edit_text("Выбери пул:", reply_markup=keyboard)
+    await query.message.edit_text("Выбери пул героев и нажми кнопку 'Далее'", reply_markup=keyboard)
 
-async def confirm_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data
-
-    # Формируем полный ранг
+def generate_confirmation_text(data):
     rank = data.get('rank', 'Не выбрано')
     subrank_index = data.get('subrank', None)
 
     if subrank_index is not None:
-        subrank = roman_numerals[subrank_index - 1]  # Учитываем, что subrank начинается с 1
+        subrank = roman_numerals[subrank_index - 1]
         full_rank = f"{rank} {subrank}"
     else:
         full_rank = rank
 
-    # Формируем текст для подтверждения
     playtime = data.get('playtime', 'Не выбрано')
     pool = data.get('pool', [])
-    
-    # Проверяем, выбраны ли все герои
+
     if pool == POOL_LIST:
         pool_text = 'Все'
     else:
@@ -244,8 +221,15 @@ async def confirm_registration(update: Update, context: ContextTypes.DEFAULT_TYP
         f"🛡️ <b>Ранг:</b> {full_rank}\n"
         f"⏳ <b>Часы в игре:</b> {playtime}\n"
         f"🦸‍♂️ <b>Герои:</b> {pool_text}\n\n"
-        f"<i>Если все верно, нажми 'Подтвердить'.</i>"
     )
+    
+    return confirmation_text
+
+async def confirm_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data
+
+    confirmation_text = generate_confirmation_text(data)
+    confirmation_text += "<i>Если все верно, нажми 'Подтвердить'.</i>"
 
     keyboard = InlineKeyboardMarkup([ 
         [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm")],
@@ -256,15 +240,18 @@ async def confirm_registration(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.message.edit_text(confirmation_text, reply_markup=keyboard, parse_mode='HTML')
 
-    return CONFIRM
-
 async def confirm_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    data = context.user_data
+    confirmation_text = generate_confirmation_text(data)
+
     if query.data == "cancel":
         logger.info(f"Пользователь {update.effective_user.id} отменил регистрацию.")
-        await query.message.edit_text("Регистрация отменена.")
+        confirmation_text += "<i>Регистрация отменена.</i>"
+
+        await query.message.edit_text(confirmation_text, reply_markup=InlineKeyboardMarkup([]), parse_mode='HTML')
 
     elif query.data == "confirm":
         username = update.effective_user.username
@@ -272,22 +259,21 @@ async def confirm_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not username:
             logger.warning(f"Пользователь {update.effective_user.id} не указал никнейм в Telegram.")
             await query.message.reply_text("У тебя нет ника в Telegram.\nУкажи свой номер телефона для связи:")
-            return PHONE
 
         try:
-            # Сохраняем данные регистрации
             await save_registration_data(update, context)
             logger.info(f"Пользователь {update.effective_user.id} успешно зарегистрирован.")
-            await query.message.reply_text("Регистрация прошла успешно! 🎉", parse_mode='HTML')
+            confirmation_text += "<i>Регистрация прошла успешно! 🎉</i>"
+
+            await query.message.edit_text(confirmation_text, reply_markup=InlineKeyboardMarkup([]), parse_mode='HTML')
         except Exception as e:
             logger.error(f"Ошибка при сохранении данных регистрации пользователя {update.effective_user.id}: {e}")
             await query.message.reply_text("Произошла ошибка при регистрации. Попробуй снова.")
-        
+      
 async def phone_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text
     user_id = update.effective_user.id
 
-    # Сохраняем номер телефона в context.user_data
     context.user_data['phone'] = phone
     
     try:
@@ -309,22 +295,18 @@ async def save_registration_data(update: Update, context: ContextTypes.DEFAULT_T
                 f"playtime: {data.get('playtime')}, pool: {pool_str}, phone: {phone}")
 
     try:
-        # Получаем соединение с базой данных асинхронно
         conn = await get_db_connection()
 
-        # Проверяем, существует ли пользователь в базе данных
         user_check_query = "SELECT user_id FROM players WHERE user_id = $1"
         user_exists = await conn.fetch(user_check_query, user_id)
 
         if not user_exists:
-            # Если пользователя нет в базе, добавляем его
             logger.info(f"User {user_id} not found in the database. Adding new record.")
             await conn.execute("""
                 INSERT INTO players (user_id, rank, subrank, playtime, pool, phone)
                 VALUES ($1, $2, $3, $4, $5, $6)
             """, user_id, data.get('rank'), data.get('subrank'), data.get('playtime'), pool_str, phone)
         else:
-            # Если пользователь существует, обновляем его данные
             logger.info(f"User {user_id} found in the database. Updating record.")
             await conn.execute("""
                 UPDATE players
@@ -332,22 +314,17 @@ async def save_registration_data(update: Update, context: ContextTypes.DEFAULT_T
                 WHERE user_id = $6
             """, data.get('rank'), data.get('subrank'), data.get('playtime'), pool_str, phone, user_id)
 
-        # Закрываем соединение
         await conn.close()
 
     except Exception as e:
         logger.error(f"Database error while saving data for user_id {user_id}: {e}")
-        raise  # Генерируем ошибку, чтобы было понятно, что пошло не так
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Произошла ошибка: {context.error}")
+        raise
 
 ######################################################################################################################
 
 async def tournament_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает у пользователя количество команд и ищет капитанов, назначая их."""
     keyboard = [
-        [InlineKeyboardButton("2", callback_data="teams_2")],
+        [InlineKeyboardButton("1", callback_data="teams_1")],
         [InlineKeyboardButton("4", callback_data="teams_4")],
         [InlineKeyboardButton("8", callback_data="teams_8")],
         [InlineKeyboardButton("16", callback_data="teams_16")]
@@ -356,40 +333,49 @@ async def tournament_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Выберите количество команд для турнира", reply_markup=reply_markup)
 
 async def search_captains(teams_count, update, context):
-    """Ищет капитанов и отправляет им предложение стать капитанами."""
     logger.info(f"Ищем капитанов для {teams_count} команд.")
     
-    # Получаем необходимых капитанов
     captains = await get_candidates_for_captain(teams_count)
 
     if not captains:
         await update.callback_query.edit_message_text("Нет доступных игроков.")
         return
 
-    # Отправляем предложение стать капитанами
     await send_captain_offers(captains, update, context)
 
-    # Ждем 60 секунд на ответ
-    await asyncio.sleep(10)
+    await asyncio.sleep(3)
 
-    # Проверяем и находим недостающих капитанов
     await fill_missing_captains(teams_count, update, context)
 
-    # Когда количество капитанов равно количеству команд, распределяем номера команд
     await assign_team_numbers_and_notify(update, context, teams_count)
 
 async def get_candidates_for_captain(teams_count):
     conn = await get_db_connection()
     try:
+        # Запрос на выборку кандидатов
         query = """
             SELECT user_id, rank, COALESCE(subrank, 0) AS subrank 
             FROM players 
-            WHERE status IS NULL OR status = '' 
-            ORDER BY ARRAY_POSITION($1::text[], rank), subrank DESC 
+            WHERE (status IS NULL OR status = '') 
+              AND (rank IS NOT NULL AND rank <> '')  -- Проверяем, что у игрока есть ранг
+            ORDER BY ARRAY_POSITION($1::text[], rank) ASC, subrank DESC  -- Сортировка по порядку массива и по subrank
             LIMIT $2;
         """
-        # Передаем в запрос параметры: массив RANKS и количество команд
-        return await conn.fetch(query, RANKS, teams_count)
+        # Получаем кандидатов
+        candidates = await conn.fetch(query, RANKS, teams_count)
+        
+        if candidates:
+            # Запрос на обновление статуса для выбранных кандидатов
+            user_ids = [candidate['user_id'] for candidate in candidates]
+            update_query = """
+                UPDATE players
+                SET status = 'waiting_for_captain'
+                WHERE user_id = ANY($1::bigint[]);
+            """
+            # Передаем user_ids как bigint[]
+            await conn.execute(update_query, user_ids)
+        
+        return candidates
     except Exception as e:
         logger.error(f"Ошибка при получении кандидатов: {e}")
         return []
@@ -397,106 +383,74 @@ async def get_candidates_for_captain(teams_count):
         await conn.close()
 
 async def send_captain_offers(captains, update, context):
-    """Отправляем предложения стать капитанами выбранным игрокам."""
     for captain in captains:
         user_id = captain['user_id']
+
+        # Логируем информацию о том, кому отправляется сообщение
+        logger.info(f"Отправка предложения капитанства игроку {user_id} {captain}")
         
-        keyboard = InlineKeyboardMarkup([
+        keyboard = InlineKeyboardMarkup([  # Создание кнопок для принятия или отказа
             [InlineKeyboardButton("Принять", callback_data=f"accept_{user_id}")],
             [InlineKeyboardButton("Отказаться", callback_data=f"decline_{user_id}")]
         ])
         
         try:
+            # Отправка сообщения с предложением стать капитаном
             message = await context.bot.send_message(
                 chat_id=user_id,
-                text="Ты выбран капитаном. Нажми кнопку!",
+                text="Ты выбран капитаном.",
                 reply_markup=keyboard
             )
-            print(f"✅ Сообщение отправлено пользователю {user_id}: {message.message_id}")
+            # Логируем успешную отправку
+            logger.info(f"✅ Сообщение отправлено пользователю {user_id}: {message.message_id}")
         except Exception as e:
-            print(f"❌ Ошибка при отправке сообщения пользователю {user_id}: {e}")
+            # Логируем ошибку при отправке
+            logger.error(f"❌ Ошибка при отправке сообщения пользователю {user_id}: {e}")
 
 async def fill_missing_captains(teams_count, update, context):
-    """Если капитанов меньше, чем команд, ищем следующих кандидатов."""
     conn = await get_db_connection()
     try:
-        # Логируем количество капитанов в базе данных
         captain_count = await conn.fetchval("SELECT COUNT(*) FROM players WHERE status = 'captain';")
         logger.info(f"Текущие капитаны: {captain_count}")
 
-        # Пока капитанов недостаточно, ищем следующих
         while captain_count < teams_count:
-            logger.info(f"Капитанов меньше чем команд, ищем следующего кандидата. Требуется: {teams_count}, найдено: {captain_count}")
-            
-            # Ищем следующего игрока с пустым статусом
-            query = """
-                SELECT user_id 
-                FROM players 
-                WHERE status IS NULL OR status = '' 
-                ORDER BY ARRAY_POSITION($1::text[], rank), subrank DESC 
-                LIMIT 1;
-            """
-            # Передаем параметры для запроса
-            next_captain = await conn.fetchrow(query, RANKS)
+            needed_captains = teams_count - captain_count
+            logger.info(f"Нужно ещё {needed_captains} капитанов.")
 
-            if not next_captain:
-                # Логируем, если нет доступных игроков
-                logger.warning(f"Не удалось найти свободного игрока для капитана. Требуемое количество капитанов: {teams_count}")
+            # Используем get_candidates_for_captain для получения кандидатов
+            captains = await get_candidates_for_captain(needed_captains)
+
+            if not captains:
+                logger.warning("Не удалось найти свободных игроков для капитанов.")
                 await context.bot.send_message(
                     update.message.chat.id,
-                    f"Не досточно игроков для назначения {teams_count} капитанов.",
+                    f"Недостаточно игроков для назначения {teams_count} капитанов."
                 )
-                break  # Если нет доступных игроков, выходим
+                break
 
-            user_id = next_captain['user_id']
-            logger.info(f"Назначаем пользователя {user_id} капитаном.")
+            await send_captain_offers(captains, update, context)
 
-            keyboard = [
-                [InlineKeyboardButton("Принять", callback_data=f"accept_{user_id}")],
-                [InlineKeyboardButton("Отказаться", callback_data=f"decline_{user_id}")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            logger.info("Ожидание 60 секунд для ответов.")
+            await asyncio.sleep(3)
 
-            # Логируем отправку сообщения пользователю
-            logger.info(f"Отправка сообщения пользователю {user_id} с предложением стать капитаном.")
-            await context.bot.send_message(
-                user_id,
-                f"Ты выбран капитаном.",
-                reply_markup=reply_markup
-            )
-
-            await update_player_status(user_id, 'weight_captain_confirm')
-
-            # Ждем 60 секунд
-            logger.info(f"Ожидаем 60 секунд, чтобы дать пользователю ответ.")
-            await asyncio.sleep(60)
-
-            # Перепроверяем количество капитанов
             captain_count = await conn.fetchval("SELECT COUNT(*) FROM players WHERE status = 'captain';")
-            logger.info(f"После ожидания количество капитанов: {captain_count}")
+            logger.info(f"После ожидания капитанов: {captain_count}")
 
     except Exception as e:
-        # Логируем исключения
         logger.error(f"Произошла ошибка: {e}")
     finally:
-        # Закрываем соединение с базой данных
         logger.info("Закрытие соединения с базой данных.")
         await conn.close()
 
 async def assign_team_numbers_and_notify(update, context, teams_count):
-    """Когда количество капитанов равно количеству команд, присваиваем номера команд и отправляем уведомления."""
     conn = await get_db_connection()
-    print("присваиваем цифры капитанам")
     try:
         query = f"SELECT user_id FROM players WHERE status = 'captain';"
         captains = await conn.fetch(query)
 
-        # Присваиваем капитанам номера команд от 1 до teams_count
         for i, captain in enumerate(captains, 1):
-            print("присваиваем цифры капитанам в цикле")
             user_id = captain['user_id']
-            await update_player_status(user_id, 'captain', i)  # Присваиваем номер команды
-            await context.bot.send_message(user_id, f"Ты стал капитаном команды {i}!")
+            await update_player_status(user_id, 'captain', i)
 
         await update.callback_query.edit_message_text(f"Капитаны успешно назначены для команд.")
 
@@ -504,9 +458,7 @@ async def assign_team_numbers_and_notify(update, context, teams_count):
         await conn.close()
 
 async def update_player_status(user_id, status, team_number=None):
-    """Обновляет статус игрока в базе данных и присваивает номер команды, если требуется."""
     conn = await get_db_connection()
-    print("обновляем статус")
     try:
         if status == 'captain' and team_number is not None:
             query = f"""
@@ -517,50 +469,40 @@ async def update_player_status(user_id, status, team_number=None):
         else:
             query = f"UPDATE players SET status = '{status}' WHERE user_id = {user_id};"
         await conn.execute(query)
-        print('статус обновлен')
     finally:
         await conn.close()
 
 async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
-        # Логируем разбор данных
         logger.info(f"Получен запрос на принятие капитанства от {query.from_user.id}. Данные: {query.data}")
 
         _, user_id = query.data.split('_')
         user_id = int(user_id)
 
-        # Логируем изменение статуса игрока
         logger.info(f"Обновляем статус пользователя {user_id} на 'captain'.")
         await update_player_status(user_id, 'captain')
 
-        # Логируем успешную отправку сообщения
         logger.info(f"Отправка сообщения пользователю {user_id} о том, что он стал капитаном.")
         await query.edit_message_text("Вы стали капитаном!")
     except Exception as e:
-        # Логируем ошибку
         logger.error(f"Ошибка при принятии капитанства: {e}")
         await query.edit_message_text("Произошла ошибка. Попробуй позже.")
 
 async def decline(update: Update, _):
-    """Обрабатывает отказ от капитанства."""
     query = update.callback_query
     try:
-        # Логируем разбор данных
         logger.info(f"Получен запрос на отказ от капитанства от {query.from_user.id}. Данные: {query.data}")
 
         _, user_id = query.data.split('_')
         user_id = int(user_id)
 
-        # Логируем обновление статуса
         logger.info(f"Обновляем статус пользователя {user_id} на 'cancel'.")
         await update_player_status(user_id, 'cancel')
 
-        # Логируем успешную отправку сообщения
         logger.info(f"Отправка сообщения пользователю {user_id} о том, что он отказался от капитанства.")
         await query.edit_message_text(text="Вы отказались от предложения капитана.")
     except Exception as e:
-        # Логируем ошибку
         logger.error(f"Ошибка при отказе от капитанства для user_id {user_id}: {e}")
         await query.edit_message_text(text="Произошла ошибка. Попробуйте позже.")
 
@@ -606,13 +548,13 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "back_to_rank":
         context.user_data['rank'] = None
         await query.message.edit_text("Выбери ранг:", reply_markup=rank_keyboard())
-        return RANK  # Устанавливаем состояние обратно на выбор ранга
+        return
     
     elif data.startswith("teams_"):
         teams_count = int(data.split("_")[1])
         logger.info(f"Команды выбраны: {teams_count}") 
         await search_captains(teams_count, update, context)
-        return  # Добавляем return, чтобы не выполнялся код дальше
+        return
 
     elif data.startswith("accept_"):
         logger.info(f"Обрабатываем команду 'Принять' для данных: {data}")
