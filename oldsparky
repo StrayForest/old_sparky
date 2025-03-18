@@ -19,8 +19,10 @@ roman_numerals = ['I', 'II', 'III', 'IV', 'V', 'VI']
 
 RANKS = [
     "Этернус", "Владыка", "Фантом", "Оракул", "Архонт", "Эмиссар",
-    "Ритуалист", "Чародей", "Алхимик", "Искатель", "Послушник"
+    "Ритуалист", "Чародей", "Алхимик", "Искатель", "Послушник",
+    "Варвар", "Титан"  # Добавляем недостающие ранги
 ]
+
 
 POOL_LIST = [
     "Abrams", "Bebop", "Dynamo", "Grey Talon", "Haze", "Infernus",
@@ -31,6 +33,7 @@ POOL_LIST = [
 
 async def get_db_connection():
     try:
+        # Подключаемся к базе данных
         conn = await asyncpg.connect(
             user=DB_CONFIG['user'],
             password=DB_CONFIG['password'],
@@ -38,15 +41,31 @@ async def get_db_connection():
             host=DB_CONFIG['host'],
             port=DB_CONFIG['port']
         )
+        logger.info("Успешно подключено к базе данных")
         return conn
+    except asyncpg.exceptions.CannotConnectNowError:
+        logger.error("Не удалось подключиться к базе данных: база данных недоступна")
+        raise
+    except asyncpg.exceptions.InvalidPasswordError:
+        logger.error("Неверный пароль для базы данных")
+        raise
+    except asyncpg.exceptions.InvalidURIError:
+        logger.error("Неверный URI для подключения к базе данных")
+        raise
     except Exception as e:
         logger.error(f"Ошибка подключения к базе данных: {e}")
         raise
 async def close_db_connection(conn):
     try:
-        await conn.close()
+        # Проверка на открытость соединения перед его закрытием
+        if conn.is_closed():
+            logger.info("Соединение с БД уже закрыто.")
+        else:
+            await conn.close()  # Закрытие соединения
+            logger.info("Соединение с БД успешно закрыто.")
     except Exception as e:
         logger.error(f"Ошибка при закрытии соединения с БД: {e}")
+
 
 ######################################################################################################################
 
@@ -324,7 +343,7 @@ async def save_registration_data(update: Update, context: ContextTypes.DEFAULT_T
 
 async def tournament_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("1", callback_data="teams_1")],
+        [InlineKeyboardButton("2", callback_data="teams_2")],
         [InlineKeyboardButton("4", callback_data="teams_4")],
         [InlineKeyboardButton("8", callback_data="teams_8")],
         [InlineKeyboardButton("16", callback_data="teams_16")]
@@ -343,7 +362,7 @@ async def search_captains(teams_count, update, context):
 
     await send_captain_offers(captains, update, context)
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(60)
 
     await fill_missing_captains(teams_count, update, context)
 
@@ -431,7 +450,7 @@ async def fill_missing_captains(teams_count, update, context):
             await send_captain_offers(captains, update, context)
 
             logger.info("Ожидание 60 секунд для ответов.")
-            await asyncio.sleep(3)
+            await asyncio.sleep(60)
 
             captain_count = await conn.fetchval("SELECT COUNT(*) FROM players WHERE status = 'captain';")
             logger.info(f"После ожидания капитанов: {captain_count}")
@@ -458,19 +477,20 @@ async def assign_team_numbers_and_notify(update, context, teams_count):
         await conn.close()
 
 async def update_player_status(user_id, status, team_number=None):
-    conn = await get_db_connection()
+    conn = await get_db_connection()  # Получаем соединение с базой данных
     try:
         if status == 'captain' and team_number is not None:
-            query = f"""
+            query = """
                 UPDATE players 
-                SET status = 'captain', team = {team_number} 
-                WHERE user_id = {user_id};
+                SET status = $1, team = $2 
+                WHERE user_id = $3;
             """
+            await conn.execute(query, status, team_number, user_id)  # Параметризованный запрос
         else:
-            query = f"UPDATE players SET status = '{status}' WHERE user_id = {user_id};"
-        await conn.execute(query)
+            query = "UPDATE players SET status = $1 WHERE user_id = $2;"
+            await conn.execute(query, status, user_id)  # Параметризованный запрос
     finally:
-        await conn.close()
+        await conn.close()  # Закрытие соединения после выполнения запроса
 
 async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -505,6 +525,108 @@ async def decline(update: Update, _):
     except Exception as e:
         logger.error(f"Ошибка при отказе от капитанства для user_id {user_id}: {e}")
         await query.edit_message_text(text="Произошла ошибка. Попробуйте позже.")
+
+######################################################################################################################
+
+async def get_best_players():
+    conn = await get_db_connection()
+
+    # Запрос для извлечения топ 10 игроков по рангу и с учетом других условий
+    query = """
+        SELECT user_id, rank, playtime, pool, COALESCE(subrank, 0) AS subrank 
+        FROM players 
+        WHERE (status IS NULL OR status = '') 
+          AND (rank IS NOT NULL AND rank <> '')  -- Проверяем, что у игрока есть ранг
+        ORDER BY ARRAY_POSITION($1::text[], rank) ASC, subrank DESC  -- Сортировка по порядку массива и по subrank
+        LIMIT 5;
+    """
+    # Выполнение запроса с передачей массива рангов
+    players = await conn.fetch(query, RANKS)
+    logger.info(f'Игроки: {players}')
+
+    await conn.close()  # Закрытие соединения
+    return players
+
+# Получение следующего капитана по очереди
+async def get_team_id_for_current_turn():
+    conn = await get_db_connection()
+    # Мы ищем команду, у которой статус 'captain' в столбце 'status'
+    query = "SELECT team FROM players WHERE status = 'captain' ORDER BY team ASC LIMIT 1"
+    result = await conn.fetch(query)
+    await conn.close()
+    
+    if result:
+        return result[0]['team']  # Возвращаем команду капитана (team)
+    return None  # Возвращаем None, если капитан не найден
+
+# Обновление статуса игрока после выбора
+async def update_player_status(user_id, team_id):
+    conn = await get_db_connection()
+    query = """
+        UPDATE players 
+        SET status = 'player', team = $1 
+        WHERE user_id = $2;
+    """
+    await conn.execute(query, team_id, user_id)
+    await conn.close()  # Закрытие соединения
+
+# Переход к следующему капитану (по очереди)
+async def advance_to_next_captain():
+    conn = await get_db_connection()
+    # Мы ищем следующего капитана по очереди из таблицы 'players' с нужным статусом
+    query = "SELECT team FROM players WHERE status = 'captain' ORDER BY team ASC LIMIT 1"
+    result = await conn.fetch(query)
+    
+    if result:
+        next_captain = result[0]['team']
+        update_query = "UPDATE captains SET current_turn = TRUE WHERE team_id = $1"
+        await conn.execute(update_query, next_captain)
+
+    await conn.close()  # Закрытие соединения
+
+# Отправка кнопок с игроками капитану
+async def send_player_buttons(update, players):
+    # Создание списка игроков для отправки сообщения
+    player_info_text = ""
+    buttons = []
+
+    for index, player in enumerate(players, start=1):
+        user_id = player['user_id']
+        rank = player['rank']
+        subrank = player['subrank']
+        playtime = player.get('playtime', 'Не указано')
+        pool = player.get('pool', 'Не указано')
+
+        # Форматируем данные для отображения в сообщении
+        full_rank = f"{rank} {subrank}"
+        pool_text = pool
+        # Если пул не указан, оставляем как "Не указано"
+        if pool_text == 'Не указано':
+            pool_text = 'Не выбран'
+
+        # Создание красивого форматированного текста
+        player_info_text += f"—🛡️ <b>Ранг:</b> {full_rank}\n"
+        player_info_text += f"<b>{index}</b> ⏳ <b>Часы в игре:</b> {playtime}\n"
+        player_info_text += f"—🦸‍♂️ <b>Герои:</b> {pool_text}\n\n"
+
+        # Создаем кнопку с цифрой (номер игрока)
+        button = InlineKeyboardButton(str(index), callback_data=f"pick_{user_id}_{index}")
+        buttons.append(button)
+
+    # Оборачиваем кнопки в список
+    keyboard = InlineKeyboardMarkup([buttons])  # Все кнопки в одном ряду
+
+    # Отправка текста с информацией о всех игроках
+    await update.message.reply_text(
+        f"Выберите игрока для вашей команды:\n\n{player_info_text}",
+        reply_markup=keyboard,
+        parse_mode='HTML'  # Используем HTML для форматирования текста
+    )
+
+# Обработчик команды /start_test
+async def start_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    players = await get_best_players()
+    await send_player_buttons(update, players)
 
 ######################################################################################################################
 
@@ -567,6 +689,18 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await decline(update, context)
         logger.info(f"Кнопка 'Отказаться' обработана, обновляем сообщение.")
         return
+    
+    elif data.startswith("pick_"):
+        user_id = int(data.split("_")[1])
+        team_id = await get_team_id_for_current_turn()
+        await update_player_status(user_id, team_id)
+
+        # Обновляем список игроков
+        players = await get_best_players()
+        await send_player_buttons(update, players)
+
+        # Переход к следующему капитану
+        await advance_to_next_captain()
 
     # Если что-то пошло не так
     logger.warning(f"Неизвестная callback_data: {data}")
@@ -578,6 +712,7 @@ def register_handlers(application: Application):
     # Регистрация обработчиков команд и кнопок
     application.add_handler(CommandHandler("start", start))  # Обработчик команды /start
     application.add_handler(CommandHandler("reg", reg))
+    application.add_handler(CommandHandler("start_test", start_test))
     application.add_handler(CommandHandler("tournament_start", tournament_start))  # Обработчик команды /tournament_start
     
     # Обработчик для всех кнопок (включая регистрации, выборы и т.д.)
