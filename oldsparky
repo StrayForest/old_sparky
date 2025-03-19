@@ -1,5 +1,7 @@
 import asyncio
 import json
+from multiprocessing import context
+from typing import Counter
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application, CallbackContext, CommandHandler, CallbackQueryHandler, ConversationHandler, ContextTypes, MessageHandler, filters
@@ -362,7 +364,7 @@ async def search_captains(teams_count, update, context):
 
     await send_captain_offers(captains, update, context)
 
-    await asyncio.sleep(60)
+    await asyncio.sleep(10)
 
     await fill_missing_captains(teams_count, update, context)
 
@@ -469,14 +471,14 @@ async def assign_team_numbers_and_notify(update, context, teams_count):
 
         for i, captain in enumerate(captains, 1):
             user_id = captain['user_id']
-            await update_player_status(user_id, 'captain', i)
+            await update_captain_status(user_id, 'captain', i)
 
         await update.callback_query.edit_message_text(f"Капитаны успешно назначены для команд.")
 
     finally:
         await conn.close()
 
-async def update_player_status(user_id, status, team_number=None):
+async def update_captain_status(user_id, status, team_number=None):
     conn = await get_db_connection()  # Получаем соединение с базой данных
     try:
         if status == 'captain' and team_number is not None:
@@ -485,12 +487,13 @@ async def update_player_status(user_id, status, team_number=None):
                 SET status = $1, team = $2 
                 WHERE user_id = $3;
             """
-            await conn.execute(query, status, team_number, user_id)  # Параметризованный запрос
+            await conn.execute(query, status, str(team_number), user_id) 
         else:
             query = "UPDATE players SET status = $1 WHERE user_id = $2;"
-            await conn.execute(query, status, user_id)  # Параметризованный запрос
+            await conn.execute(query, status, user_id)
     finally:
         await conn.close()  # Закрытие соединения после выполнения запроса
+
 
 async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -501,7 +504,7 @@ async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = int(user_id)
 
         logger.info(f"Обновляем статус пользователя {user_id} на 'captain'.")
-        await update_player_status(user_id, 'captain')
+        await update_captain_status(user_id, 'captain')
 
         logger.info(f"Отправка сообщения пользователю {user_id} о том, что он стал капитаном.")
         await query.edit_message_text("Вы стали капитаном!")
@@ -518,7 +521,7 @@ async def decline(update: Update, _):
         user_id = int(user_id)
 
         logger.info(f"Обновляем статус пользователя {user_id} на 'cancel'.")
-        await update_player_status(user_id, 'cancel')
+        await update_captain_status(user_id, 'cancel')
 
         logger.info(f"Отправка сообщения пользователю {user_id} о том, что он отказался от капитанства.")
         await query.edit_message_text(text="Вы отказались от предложения капитана.")
@@ -531,7 +534,7 @@ async def decline(update: Update, _):
 async def get_best_players():
     conn = await get_db_connection()
 
-    # Запрос для извлечения топ 10 игроков по рангу и с учетом других условий
+    # Запрос для извлечения топ 5 игроков по рангу и с учетом других условий
     query = """
         SELECT user_id, rank, playtime, pool, COALESCE(subrank, 0) AS subrank 
         FROM players 
@@ -547,20 +550,43 @@ async def get_best_players():
     await conn.close()  # Закрытие соединения
     return players
 
-# Получение следующего капитана по очереди
 async def get_team_id_for_current_turn():
     conn = await get_db_connection()
-    # Мы ищем команду, у которой статус 'captain' в столбце 'status'
-    query = "SELECT team FROM players WHERE status = 'captain' ORDER BY team ASC LIMIT 1"
+    
+    # Получаем все значения из столбца 'team' в таблице 'players'
+    query = "SELECT team FROM players"
     result = await conn.fetch(query)
+    logger.info(f'Номера команд: {result}')
     await conn.close()
     
-    if result:
-        return result[0]['team']  # Возвращаем команду капитана (team)
-    return None  # Возвращаем None, если капитан не найден
+    # Если нет результатов в БД, возвращаем None
+    if not result:
+        return None
+    
+    # Извлекаем все значения team
+    teams = [row['team'] for row in result]
+    
+    # Подсчитываем количество повторений каждого значения
+    team_counts = Counter(teams)
+    
+    # Проверяем, есть ли такие числа, которые встречаются 6 раз
+    if any(count == 6 for count in team_counts.values()):
+        # Если есть, игнорируем такие числа
+        team_counts = {team: count for team, count in team_counts.items() if count != 6}
+    
+    # Если после фильтрации остались числа, находим минимальное значение по частоте
+    if team_counts:
+        min_count = min(team_counts.values())
+        min_teams = [team for team, count in team_counts.items() if count == min_count]
+        
+        # Возвращаем минимальное значение из списка минимальных, отсортировав по возрастанию
+        return min(min_teams)
+    
+    # Если после фильтрации нет доступных чисел
+    return None
 
 # Обновление статуса игрока после выбора
-async def update_player_status(user_id, team_id):
+async def update_player_status(user_id, team_id, context):
     conn = await get_db_connection()
     query = """
         UPDATE players 
@@ -570,23 +596,30 @@ async def update_player_status(user_id, team_id):
     await conn.execute(query, team_id, user_id)
     await conn.close()  # Закрытие соединения
 
-# Переход к следующему капитану (по очереди)
-async def advance_to_next_captain():
-    conn = await get_db_connection()
-    # Мы ищем следующего капитана по очереди из таблицы 'players' с нужным статусом
-    query = "SELECT team FROM players WHERE status = 'captain' ORDER BY team ASC LIMIT 1"
-    result = await conn.fetch(query)
+async def send_player_buttons(update: Update, players, context: CallbackContext):
+    # Получаем команду капитана, используя нашу функцию
+    team_id = await get_team_id_for_current_turn()
+    logger.info(f"Номер команды: {team_id}")
+
+    if not team_id:
+        await update.message.reply_text("Нет капитана для текущей команды.")
+        return
     
-    if result:
-        next_captain = result[0]['team']
-        update_query = "UPDATE captains SET current_turn = TRUE WHERE team_id = $1"
-        await conn.execute(update_query, next_captain)
+    # Теперь извлекаем капитана из базы данных по найденной команде
+    conn = await get_db_connection()
+    query = "SELECT user_id FROM players WHERE status = 'captain' AND team = $1 LIMIT 1"
+    result = await conn.fetch(query, team_id)
+    await conn.close()
+    logger.info(f"Найденный капитан: {result}")
 
-    await conn.close()  # Закрытие соединения
+    if not result:
+        await update.message.reply_text("Не удалось найти капитана для этой команды.")
+        return
 
-# Отправка кнопок с игроками капитану
-async def send_player_buttons(update, players):
-    # Создание списка игроков для отправки сообщения
+    # Получаем user_id капитана
+    captain_user_id = result[0]['user_id']
+
+    # Теперь отправляем сообщение капитану с кнопками
     player_info_text = ""
     buttons = []
 
@@ -616,8 +649,9 @@ async def send_player_buttons(update, players):
     # Оборачиваем кнопки в список
     keyboard = InlineKeyboardMarkup([buttons])  # Все кнопки в одном ряду
 
-    # Отправка текста с информацией о всех игроках
-    await update.message.reply_text(
+    # Отправка сообщения капитану с кнопками
+    await context.bot.send_message(
+        captain_user_id,  # Отправляем сообщение именно капитану
         f"Выберите игрока для вашей команды:\n\n{player_info_text}",
         reply_markup=keyboard,
         parse_mode='HTML'  # Используем HTML для форматирования текста
@@ -626,7 +660,7 @@ async def send_player_buttons(update, players):
 # Обработчик команды /start_test
 async def start_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     players = await get_best_players()
-    await send_player_buttons(update, players)
+    await send_player_buttons(update, players, context)
 
 ######################################################################################################################
 
@@ -697,10 +731,7 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Обновляем список игроков
         players = await get_best_players()
-        await send_player_buttons(update, players)
-
-        # Переход к следующему капитану
-        await advance_to_next_captain()
+        await send_player_buttons(update, players, context)
 
     # Если что-то пошло не так
     logger.warning(f"Неизвестная callback_data: {data}")
