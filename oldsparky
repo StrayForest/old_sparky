@@ -494,7 +494,6 @@ async def update_captain_status(user_id, status, team_number=None):
     finally:
         await conn.close()  # Закрытие соединения после выполнения запроса
 
-
 async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
@@ -585,8 +584,7 @@ async def get_team_id_for_current_turn():
     # Если после фильтрации нет доступных чисел
     return None
 
-# Обновление статуса игрока после выбора
-async def update_player_status(user_id, team_id, context):
+async def update_player_status(user_id, team_id):
     conn = await get_db_connection()
     query = """
         UPDATE players 
@@ -643,7 +641,7 @@ async def send_player_buttons(update: Update, players, context: CallbackContext)
         player_info_text += f"—🦸‍♂️ <b>Герои:</b> {pool_text}\n\n"
 
         # Создаем кнопку с цифрой (номер игрока)
-        button = InlineKeyboardButton(str(index), callback_data=f"pick_{user_id}_{index}")
+        button = InlineKeyboardButton(str(index), callback_data=f"pick_{user_id}_{captain_user_id}")
         buttons.append(button)
 
     # Оборачиваем кнопки в список
@@ -657,7 +655,6 @@ async def send_player_buttons(update: Update, players, context: CallbackContext)
         parse_mode='HTML'  # Используем HTML для форматирования текста
     )
 
-# Обработчик команды /start_test
 async def start_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     players = await get_best_players()
     await send_player_buttons(update, players, context)
@@ -725,13 +722,22 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     elif data.startswith("pick_"):
-        user_id = int(data.split("_")[1])
+        _, user_id, captain_user_id = data.split("_")
+        user_id = int(user_id)
+        captain_user_id = int(captain_user_id)
+
         team_id = await get_team_id_for_current_turn()
         await update_player_status(user_id, team_id)
+
+        try:
+            await context.bot.delete_message(chat_id=captain_user_id, message_id=update.callback_query.message.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение капитана: {e}")
 
         # Обновляем список игроков
         players = await get_best_players()
         await send_player_buttons(update, players, context)
+        return
 
     # Если что-то пошло не так
     logger.warning(f"Неизвестная callback_data: {data}")
