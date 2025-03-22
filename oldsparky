@@ -25,6 +25,7 @@ RANKS = [
     "Варвар", "Титан"  # Добавляем недостающие ранги
 ]
 
+is_picking = False
 
 POOL_LIST = [
     "Abrams", "Bebop", "Dynamo", "Grey Talon", "Haze", "Infernus",
@@ -582,7 +583,7 @@ async def get_team_id_for_current_turn():
         return min(min_teams)
     
     # Если после фильтрации нет доступных чисел
-    return None
+    return "complete"
 
 async def update_player_status(user_id, team_id):
     conn = await get_db_connection()
@@ -662,6 +663,7 @@ async def start_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ######################################################################################################################
 
 async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global is_picking
     query = update.callback_query
     await query.answer()
     data = query.data  # Получаем данные кнопки
@@ -722,24 +724,32 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     elif data.startswith("pick_"):
-        _, user_id, captain_user_id = data.split("_")
-        user_id = int(user_id)
-        captain_user_id = int(captain_user_id)
+        if is_picking:  
+            return
 
-        team_id = await get_team_id_for_current_turn()
-        await update_player_status(user_id, team_id)
+        is_picking = True
 
         try:
-            await context.bot.delete_message(chat_id=captain_user_id, message_id=update.callback_query.message.message_id)
-        except Exception as e:
-            logger.warning(f"Не удалось удалить сообщение капитана: {e}")
+            _, user_id, captain_user_id = data.split("_")
+            user_id = int(user_id)
+            captain_user_id = int(captain_user_id)
 
-        # Обновляем список игроков
-        players = await get_best_players()
-        await send_player_buttons(update, players, context)
+            team_id = await get_team_id_for_current_turn()
+            await update_player_status(user_id, team_id)
+
+            try:
+                await context.bot.delete_message(chat_id=captain_user_id, message_id=query.message.message_id)
+            except Exception as e:
+                logger.warning(f"Не удалось удалить сообщение с пиком: {e}")
+
+            players = await get_best_players()
+            await send_player_buttons(update, players, context)
+
+        finally:
+            is_picking = False
+
         return
 
-    # Если что-то пошло не так
     logger.warning(f"Неизвестная callback_data: {data}")
     await query.message.reply_text("Произошла ошибка, попробуй еще раз.")
 
