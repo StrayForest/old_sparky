@@ -71,7 +71,6 @@ async def close_db_connection(conn):
     except Exception as e:
         logger.error(f"Ошибка при закрытии соединения с БД: {e}")
 
-
 ######################################################################################################################
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -346,7 +345,7 @@ async def save_registration_data(update: Update, context: ContextTypes.DEFAULT_T
 
 ######################################################################################################################
 
-async def tournament_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def find_captain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("2", callback_data="teams_2")],
         [InlineKeyboardButton("4", callback_data="teams_4")],
@@ -533,6 +532,10 @@ async def decline(update: Update, _):
 
 ######################################################################################################################
 
+async def start_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    players = await get_best_players()
+    await send_player_buttons(update, players, context)
+
 async def get_best_players():
     conn = await get_db_connection()
 
@@ -661,9 +664,163 @@ async def send_player_buttons(update: Update, players, context: CallbackContext)
         parse_mode='HTML'  # Используем HTML для форматирования текста
     )
 
-async def start_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    players = await get_best_players()
-    await send_player_buttons(update, players, context)
+######################################################################################################################
+
+async def my_team(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+
+    conn = await get_db_connection()
+
+    query = """
+        SELECT user_id, username, rank, subrank, playtime, pool, status, team
+        FROM players 
+        WHERE user_id = $1
+    """
+    result = await conn.fetch(query, user_id)
+
+    if not result:
+        await update.message.reply_text("Ты не состоишь в команде.")
+        await conn.close()
+        return
+
+    team = result[0]['team']
+
+    # Запрашиваем команду и её номер
+    team_number_query = """
+        SELECT DISTINCT team FROM players WHERE team = $1
+    """
+    team_number_result = await conn.fetch(team_number_query, team)
+    
+    # Номер команды
+    team_number = team_number_result[0]['team'] if team_number_result else "Неизвестно"
+
+    # Запрашиваем капитана и игроков в одном запросе
+    query = """
+        SELECT user_id, username, rank, subrank, playtime, pool, status
+        FROM players
+        WHERE team = $1
+    """
+    players_result = await conn.fetch(query, team)
+    await conn.close()
+
+    # Разделяем капитана и игроков
+    captain_info = "Капитан не найден."
+    players_info = ""
+
+    for player in players_result:
+        # Добавляем @, если username нет
+        player_username = f"@{player['username']}" if player['username'] else f"@{player['user_id']}"
+
+        player_info = (
+            f"💬 <b>Ник в ТГ:</b> {player_username}\n"
+            f"🛡️ <b>Ранг:</b> {player['rank']} {get_roman_numeral(player['subrank'])}\n"
+            f"⏳ <b>Часы в игре:</b> {player['playtime']}\n"
+            f"🦸‍♂️ <b>Герои:</b> {player['pool']}\n"
+        )
+
+        # Разделяем капитана и остальных игроков
+        if player['status'] == 'captain':
+            captain_info = (
+                f"Капитан:\n"
+                f"{player_info}"
+            )
+        else:
+            players_info += f"\n{player_info}"
+
+    # Если капитан не найден, то мы выводим это отдельно
+    if captain_info == "Капитан не найден.":
+        captain_info = "Капитан не найден."
+
+    # Отправляем сообщение с номером команды, капитаном и игроками
+    await update.message.reply_text(
+        f"<b>Твоя команда</b> №{team_number}\n\n{captain_info}{players_info}",
+        parse_mode="HTML"
+    )
+
+def get_roman_numeral(subrank_index):
+    if 1 <= subrank_index <= len(roman_numerals):
+        return roman_numerals[subrank_index - 1]
+    return None
+
+######################################################################################################################
+
+async def enemy_team(update: Update, context: CallbackContext):
+    # Получаем подключение к базе данных
+    conn = await get_db_connection()
+
+    # Запрашиваем все уникальные команды в БД (находим все команды по столбцу team)
+    query = "SELECT DISTINCT team FROM players WHERE team IS NOT NULL ORDER BY team ASC"
+    teams_result = await conn.fetch(query)
+    await conn.close()
+
+    if not teams_result:
+        await update.message.reply_text("Нет доступных команд.")
+        return
+
+    # Генерируем кнопки для всех команд
+    keyboard = [
+        [InlineKeyboardButton(f"Команда {team['team']}", callback_data=f"enemy_{team['team']}")]
+        for team in teams_result if team['team'] is not None  # Исключаем None
+    ]
+
+    # Отправляем сообщение с кнопками
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Выберите команду:", reply_markup=reply_markup)
+
+async def show_enemy_team(update: Update, context: CallbackContext, team_id: int):
+    # Получаем подключение к базе данных
+    conn = await get_db_connection()
+
+    # Преобразуем team_id в строку
+    team_number = str(team_id)
+
+    # Запрашиваем игроков из выбранной команды
+    query = """
+        SELECT user_id, username, rank, subrank, playtime, pool, status 
+        FROM players 
+        WHERE team = $1
+    """
+    players_result = await conn.fetch(query, team_number)  # Передаем строку
+    await conn.close()
+
+    if not players_result:
+        await update.callback_query.answer("Команда пуста.")
+        return
+
+    # Формируем информацию о капитане и игроках
+    captain_info = "Капитан не найден."
+    players_info = ""
+
+    for player in players_result:
+        # Добавляем @, если username нет
+        player_username = f"@{player['username']}" if player['username'] else f"@{player['user_id']}"
+
+        player_info = (
+            f"💬 <b>Ник в ТГ:</b> {player_username}\n"
+            f"🛡️ <b>Ранг:</b> {player['rank']} {get_roman_numeral(player['subrank'])}\n"
+            f"⏳ <b>Часы в игре:</b> {player['playtime']}\n"
+            f"🦸‍♂️ <b>Герои:</b> {player['pool']}\n"
+        )
+
+        # Разделяем капитана и остальных игроков
+        if player['status'] == 'captain':
+            captain_info = (
+                f"Капитан:\n"
+                f"{player_info}"
+            )
+        else:
+            players_info += f"\n{player_info}"
+
+    # Если капитан не найден, то мы выводим это отдельно
+    if captain_info == "Капитан не найден.":
+        captain_info = "Капитан не найден."
+
+    # Ответ на нажатие кнопки с информацией о команде
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text(
+        text=f"<b>Команда соперников</b> №{team_number}\n\n{captain_info}{players_info}",
+        parse_mode="HTML"
+    )
 
 ######################################################################################################################
 
@@ -754,6 +911,10 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_picking = False
 
         return
+    
+    elif data.startswith("enemy_"):  # Если данные начинаются с 'enemy_'
+        team_id = int(data.split("_")[1])  # Извлекаем team_id
+        return await show_enemy_team(update, context, team_id)
 
     logger.warning(f"Неизвестная callback_data: {data}")
     await query.message.reply_text("Произошла ошибка, попробуй еще раз.")
@@ -764,9 +925,11 @@ def register_handlers(application: Application):
     # Регистрация обработчиков команд и кнопок
     application.add_handler(CommandHandler("start", start))  # Обработчик команды /start
     application.add_handler(CommandHandler("reg", reg))
-    application.add_handler(CommandHandler("start_test", start_test))
-    application.add_handler(CommandHandler("tournament_start", tournament_start))  # Обработчик команды /tournament_start
-    
+    application.add_handler(CommandHandler("start_pick", start_pick))
+    application.add_handler(CommandHandler("find_captain", find_captain))
+    application.add_handler(CommandHandler("my_team", my_team))
+    application.add_handler(CommandHandler("enemy_team", enemy_team))
+
     # Обработчик для всех кнопок (включая регистрации, выборы и т.д.)
     application.add_handler(CallbackQueryHandler(buttons_handler, block=False))  # Обработчик всех callback-запросов от кнопок
     
