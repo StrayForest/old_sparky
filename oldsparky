@@ -27,6 +27,8 @@ RANKS = [
 
 is_picking = False
 
+admin_id = 831275635
+
 POOL_LIST = [
     "Abrams", "Bebop", "Dynamo", "Grey Talon", "Haze", "Infernus",
     "Ivy", "Kelvin", "Lady Geist", "Lash", "McGinnis", "Mo & Krill",
@@ -554,7 +556,7 @@ async def get_team_id_for_current_turn():
     conn = await get_db_connection()
     
     # Получаем все значения из столбца 'team' в таблице 'players'
-    query = "SELECT team FROM players"
+    query = "SELECT team FROM players WHERE team IS NOT NULL"
     result = await conn.fetch(query)
     logger.info(f'Номера команд: {result}')
     await conn.close()
@@ -570,9 +572,9 @@ async def get_team_id_for_current_turn():
     team_counts = Counter(teams)
     
     # Проверяем, есть ли такие числа, которые встречаются 6 раз
-    if any(count == 6 for count in team_counts.values()):
+    if any(count == 3 for count in team_counts.values()):
         # Если есть, игнорируем такие числа
-        team_counts = {team: count for team, count in team_counts.items() if count != 6}
+        team_counts = {team: count for team, count in team_counts.items() if count != 3}
     
     # Если после фильтрации остались числа, находим минимальное значение по частоте
     if team_counts:
@@ -601,10 +603,13 @@ async def send_player_buttons(update: Update, players, context: CallbackContext)
     logger.info(f"Номер команды: {team_id}")
 
     if not team_id:
-        await update.message.reply_text("Нет капитана для текущей команды.")
+        await context.bot.send_message(admin_id, "Капитаны не назначены.")
         return
     
-    # Теперь извлекаем капитана из базы данных по найденной команде
+    elif team_id == 'complete':
+        await context.bot.send_message(admin_id, "Команды укомплектованы.")
+        return
+    
     conn = await get_db_connection()
     query = "SELECT user_id FROM players WHERE status = 'captain' AND team = $1 LIMIT 1"
     result = await conn.fetch(query, team_id)
