@@ -824,6 +824,20 @@ async def show_enemy_team(update: Update, context: CallbackContext, team_id: int
 
 ######################################################################################################################
 
+async def admin(update: Update, context: CallbackContext):
+    admin_commands = (
+        "⚙️ <b>Доступные команды администратора:</b>\n\n"
+        "/reg_start - старт регистрации\n"
+        "/reg_stop - закрытие регистрации\n"
+        "/find_captain - отбор капитанов\n"
+        "/start_pick - набор игроков в команды"
+    )
+    
+    # Отправляем сообщение с командами администратора
+    await update.message.reply_text(admin_commands, parse_mode="HTML")
+
+######################################################################################################################
+
 async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global is_picking
     query = update.callback_query
@@ -929,6 +943,7 @@ def register_handlers(application: Application):
     application.add_handler(CommandHandler("find_captain", find_captain))
     application.add_handler(CommandHandler("my_team", my_team))
     application.add_handler(CommandHandler("enemy_team", enemy_team))
+    application.add_handler(CommandHandler("admin", admin))
 
     # Обработчик для всех кнопок (включая регистрации, выборы и т.д.)
     application.add_handler(CallbackQueryHandler(buttons_handler, block=False))  # Обработчик всех callback-запросов от кнопок
