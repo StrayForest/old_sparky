@@ -345,6 +345,77 @@ async def save_registration_data(update: Update, context: ContextTypes.DEFAULT_T
 
 ######################################################################################################################
 
+async def ready_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = await get_db_connection()
+
+    try:
+        users = await get_registered_users(conn)
+
+        if not users:
+            logger.info("Нет пользователей с непустым значением в поле 'rank'.")
+            await update.message.reply_text("Нет регистраций.")
+            return
+
+        await send_ready_check_message(users, context)
+    finally:
+        await conn.close()
+
+async def get_registered_users(conn):
+    """Получить всех пользователей с непустым значением в поле rank и статусом, не равным 'cancel' или 'ready'."""
+    query = """
+        SELECT user_id 
+        FROM players 
+        WHERE rank IS NOT NULL AND rank != '' AND status NOT IN ('cancel', 'ready')
+    """
+    users = await conn.fetch(query)
+    return users
+
+async def send_ready_check_message(users, context):
+    """Отправить уникальные сообщения с кнопками всем пользователям с задержкой."""
+    for user in users:
+        # Проверяем, что у пользователя есть user_id
+        if 'user_id' not in user:
+            logger.error(f"❌ Не удалось найти user_id у пользователя {user}")
+            continue
+
+        keyboard = [
+            [InlineKeyboardButton("Да", callback_data=f"ready_yes_{user['user_id']}")],
+            [InlineKeyboardButton("Нет", callback_data=f"ready_no_{user['user_id']}")]
+        ]
+
+        try:
+            message = await context.bot.send_message(
+                chat_id=user['user_id'],
+                text="Подтверди участие в турнире.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            logger.info(f"✅ Сообщение отправлено пользователю {user['user_id']}: {message.message_id}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при отправке сообщения пользователю {user['user_id']}: {e}")
+
+        await asyncio.sleep(0,5)
+
+async def ready_check_yes(user_id: int):
+    """Устанавливает статус 'ready' для пользователя"""
+    conn = await get_db_connection()
+    query = "UPDATE players SET status = 'ready' WHERE user_id = $1"
+    await conn.execute(query, user_id)
+    await conn.close()
+
+async def ready_check_no(user_id: int):
+    """Устанавливает статус 'cancel' для пользователя"""
+    conn = await get_db_connection()
+    query = "UPDATE players SET status = 'cancel' WHERE user_id = $1"
+    await conn.execute(query, user_id)
+    await conn.close()
+
+######################################################################################################################
+
+async def ready_stop():
+    pass
+
+######################################################################################################################
+
 async def find_captain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("2", callback_data="teams_2")],
@@ -375,27 +446,23 @@ async def search_captains(teams_count, update, context):
 async def get_candidates_for_captain(teams_count):
     conn = await get_db_connection()
     try:
-        # Запрос на выборку кандидатов
         query = """
             SELECT user_id, rank, COALESCE(subrank, 0) AS subrank 
             FROM players 
-            WHERE (status IS NULL OR status = '') 
-              AND (rank IS NOT NULL AND rank <> '')  -- Проверяем, что у игрока есть ранг
+            WHERE (status = 'ready') 
+              AND (rank IS NOT NULL AND rank <> '')
             ORDER BY ARRAY_POSITION($1::text[], rank) ASC, subrank DESC  -- Сортировка по порядку массива и по subrank
             LIMIT $2;
         """
-        # Получаем кандидатов
         candidates = await conn.fetch(query, RANKS, teams_count)
         
         if candidates:
-            # Запрос на обновление статуса для выбранных кандидатов
             user_ids = [candidate['user_id'] for candidate in candidates]
             update_query = """
                 UPDATE players
                 SET status = 'waiting_for_captain'
                 WHERE user_id = ANY($1::bigint[]);
             """
-            # Передаем user_ids как bigint[]
             await conn.execute(update_query, user_ids)
         
         return candidates
@@ -409,25 +476,21 @@ async def send_captain_offers(captains, update, context):
     for captain in captains:
         user_id = captain['user_id']
 
-        # Логируем информацию о том, кому отправляется сообщение
         logger.info(f"Отправка предложения капитанства игроку {user_id} {captain}")
         
-        keyboard = InlineKeyboardMarkup([  # Создание кнопок для принятия или отказа
+        keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("Принять", callback_data=f"accept_{user_id}")],
             [InlineKeyboardButton("Отказаться", callback_data=f"decline_{user_id}")]
         ])
         
         try:
-            # Отправка сообщения с предложением стать капитаном
             message = await context.bot.send_message(
                 chat_id=user_id,
                 text="Ты выбран капитаном.",
                 reply_markup=keyboard
             )
-            # Логируем успешную отправку
             logger.info(f"✅ Сообщение отправлено пользователю {user_id}: {message.message_id}")
         except Exception as e:
-            # Логируем ошибку при отправке
             logger.error(f"❌ Ошибка при отправке сообщения пользователю {user_id}: {e}")
 
 async def fill_missing_captains(teams_count, update, context):
@@ -481,7 +544,7 @@ async def assign_team_numbers_and_notify(update, context, teams_count):
         await conn.close()
 
 async def update_captain_status(user_id, status, team_number=None):
-    conn = await get_db_connection()  # Получаем соединение с базой данных
+    conn = await get_db_connection()
     try:
         if status == 'captain' and team_number is not None:
             query = """
@@ -494,7 +557,7 @@ async def update_captain_status(user_id, status, team_number=None):
             query = "UPDATE players SET status = $1 WHERE user_id = $2;"
             await conn.execute(query, status, user_id)
     finally:
-        await conn.close()  # Закрытие соединения после выполнения запроса
+        await conn.close()
 
 async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -543,7 +606,7 @@ async def get_best_players():
     query = """
         SELECT user_id, rank, playtime, pool, COALESCE(subrank, 0) AS subrank 
         FROM players 
-        WHERE (status IS NULL OR status = '') 
+        WHERE (status = 'ready') 
           AND (rank IS NOT NULL AND rank <> '')  -- Проверяем, что у игрока есть ранг
         ORDER BY ARRAY_POSITION($1::text[], rank) ASC, subrank DESC  -- Сортировка по порядку массива и по subrank
         LIMIT 5;
@@ -558,36 +621,27 @@ async def get_best_players():
 async def get_team_id_for_current_turn():
     conn = await get_db_connection()
     
-    # Получаем все значения из столбца 'team' в таблице 'players'
     query = "SELECT team FROM players WHERE team IS NOT NULL"
     result = await conn.fetch(query)
     logger.info(f'Номера команд: {result}')
     await conn.close()
     
-    # Если нет результатов в БД, возвращаем None
     if not result:
         return None
     
-    # Извлекаем все значения team
     teams = [row['team'] for row in result]
     
-    # Подсчитываем количество повторений каждого значения
     team_counts = Counter(teams)
     
-    # Проверяем, есть ли такие числа, которые встречаются 6 раз
-    if any(count == 3 for count in team_counts.values()):
-        # Если есть, игнорируем такие числа
+    if any(count == 6 for count in team_counts.values()):
         team_counts = {team: count for team, count in team_counts.items() if count != 3}
     
-    # Если после фильтрации остались числа, находим минимальное значение по частоте
     if team_counts:
         min_count = min(team_counts.values())
         min_teams = [team for team, count in team_counts.items() if count == min_count]
         
-        # Возвращаем минимальное значение из списка минимальных, отсортировав по возрастанию
         return min(min_teams)
     
-    # Если после фильтрации нет доступных чисел
     return "complete"
 
 async def update_player_status(user_id, team_id):
@@ -598,10 +652,9 @@ async def update_player_status(user_id, team_id):
         WHERE user_id = $2;
     """
     await conn.execute(query, team_id, user_id)
-    await conn.close()  # Закрытие соединения
+    await conn.close()
 
 async def send_player_buttons(update: Update, players, context: CallbackContext):
-    # Получаем команду капитана, используя нашу функцию
     team_id = await get_team_id_for_current_turn()
     logger.info(f"Номер команды: {team_id}")
 
@@ -623,10 +676,8 @@ async def send_player_buttons(update: Update, players, context: CallbackContext)
         await update.message.reply_text("Не удалось найти капитана для этой команды.")
         return
 
-    # Получаем user_id капитана
     captain_user_id = result[0]['user_id']
 
-    # Теперь отправляем сообщение капитану с кнопками
     player_info_text = ""
     buttons = []
 
@@ -637,31 +688,29 @@ async def send_player_buttons(update: Update, players, context: CallbackContext)
         playtime = player.get('playtime', 'Не указано')
         pool = player.get('pool', 'Не указано')
 
-        # Форматируем данные для отображения в сообщении
         full_rank = f"{rank} {subrank}"
         pool_text = pool
-        # Если пул не указан, оставляем как "Не указано"
+
         if pool_text == 'Не указано':
             pool_text = 'Не выбран'
 
-        # Создание красивого форматированного текста
+
         player_info_text += f"—🛡️ <b>Ранг:</b> {full_rank}\n"
         player_info_text += f"<b>{index}</b> ⏳ <b>Часы в игре:</b> {playtime}\n"
         player_info_text += f"—🦸‍♂️ <b>Герои:</b> {pool_text}\n\n"
 
-        # Создаем кнопку с цифрой (номер игрока)
         button = InlineKeyboardButton(str(index), callback_data=f"pick_{user_id}_{captain_user_id}")
         buttons.append(button)
 
-    # Оборачиваем кнопки в список
-    keyboard = InlineKeyboardMarkup([buttons])  # Все кнопки в одном ряду
 
-    # Отправка сообщения капитану с кнопками
+    keyboard = InlineKeyboardMarkup([buttons])
+
+
     await context.bot.send_message(
-        captain_user_id,  # Отправляем сообщение именно капитану
+        captain_user_id,
         f"Выберите игрока для вашей команды:\n\n{player_info_text}",
         reply_markup=keyboard,
-        parse_mode='HTML'  # Используем HTML для форматирования текста
+        parse_mode='HTML'
     )
 
 ######################################################################################################################
@@ -671,11 +720,12 @@ async def my_team(update: Update, context: CallbackContext):
 
     conn = await get_db_connection()
 
-    query = """
-        SELECT user_id, username, rank, subrank, playtime, pool, status, team
-        FROM players 
-        WHERE user_id = $1
+    query_captain = """
+        SELECT user_id, username, rank, subrank, playtime, pool
+        FROM players
+        WHERE team = $1 AND status = 'captain'
     """
+
     result = await conn.fetch(query, user_id)
 
     if not result:
@@ -685,30 +735,25 @@ async def my_team(update: Update, context: CallbackContext):
 
     team = result[0]['team']
 
-    # Запрашиваем команду и её номер
     team_number_query = """
         SELECT DISTINCT team FROM players WHERE team = $1
     """
     team_number_result = await conn.fetch(team_number_query, team)
     
-    # Номер команды
     team_number = team_number_result[0]['team'] if team_number_result else "Неизвестно"
 
-    # Запрашиваем капитана и игроков в одном запросе
     query = """
-        SELECT user_id, username, rank, subrank, playtime, pool, status
+        SELECT user_id, username, rank, subrank, playtime, pool
         FROM players
         WHERE team = $1
     """
     players_result = await conn.fetch(query, team)
     await conn.close()
 
-    # Разделяем капитана и игроков
     captain_info = "Капитан не найден."
     players_info = ""
 
     for player in players_result:
-        # Добавляем @, если username нет
         player_username = f"@{player['username']}" if player['username'] else f"@{player['user_id']}"
 
         player_info = (
@@ -718,7 +763,6 @@ async def my_team(update: Update, context: CallbackContext):
             f"🦸‍♂️ <b>Герои:</b> {player['pool']}\n"
         )
 
-        # Разделяем капитана и остальных игроков
         if player['status'] == 'captain':
             captain_info = (
                 f"Капитан:\n"
@@ -727,11 +771,9 @@ async def my_team(update: Update, context: CallbackContext):
         else:
             players_info += f"\n{player_info}"
 
-    # Если капитан не найден, то мы выводим это отдельно
     if captain_info == "Капитан не найден.":
         captain_info = "Капитан не найден."
 
-    # Отправляем сообщение с номером команды, капитаном и игроками
     await update.message.reply_text(
         f"<b>Твоя команда</b> №{team_number}\n\n{captain_info}{players_info}",
         parse_mode="HTML"
@@ -745,10 +787,8 @@ def get_roman_numeral(subrank_index):
 ######################################################################################################################
 
 async def enemy_team(update: Update, context: CallbackContext):
-    # Получаем подключение к базе данных
     conn = await get_db_connection()
 
-    # Запрашиваем все уникальные команды в БД (находим все команды по столбцу team)
     query = "SELECT DISTINCT team FROM players WHERE team IS NOT NULL ORDER BY team ASC"
     teams_result = await conn.fetch(query)
     await conn.close()
@@ -757,42 +797,35 @@ async def enemy_team(update: Update, context: CallbackContext):
         await update.message.reply_text("Нет доступных команд.")
         return
 
-    # Генерируем кнопки для всех команд
     keyboard = [
         [InlineKeyboardButton(f"Команда {team['team']}", callback_data=f"enemy_{team['team']}")]
-        for team in teams_result if team['team'] is not None  # Исключаем None
+        for team in teams_result if team['team'] is not None
     ]
 
-    # Отправляем сообщение с кнопками
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Выберите команду:", reply_markup=reply_markup)
 
 async def show_enemy_team(update: Update, context: CallbackContext, team_id: int):
-    # Получаем подключение к базе данных
     conn = await get_db_connection()
 
-    # Преобразуем team_id в строку
     team_number = str(team_id)
 
-    # Запрашиваем игроков из выбранной команды
     query = """
         SELECT user_id, username, rank, subrank, playtime, pool, status 
         FROM players 
         WHERE team = $1
     """
-    players_result = await conn.fetch(query, team_number)  # Передаем строку
+    players_result = await conn.fetch(query, team_number)
     await conn.close()
 
     if not players_result:
         await update.callback_query.answer("Команда пуста.")
         return
 
-    # Формируем информацию о капитане и игроках
     captain_info = "Капитан не найден."
     players_info = ""
 
     for player in players_result:
-        # Добавляем @, если username нет
         player_username = f"@{player['username']}" if player['username'] else f"@{player['user_id']}"
 
         player_info = (
@@ -802,7 +835,6 @@ async def show_enemy_team(update: Update, context: CallbackContext, team_id: int
             f"🦸‍♂️ <b>Герои:</b> {player['pool']}\n"
         )
 
-        # Разделяем капитана и остальных игроков
         if player['status'] == 'captain':
             captain_info = (
                 f"Капитан:\n"
@@ -811,11 +843,9 @@ async def show_enemy_team(update: Update, context: CallbackContext, team_id: int
         else:
             players_info += f"\n{player_info}"
 
-    # Если капитан не найден, то мы выводим это отдельно
     if captain_info == "Капитан не найден.":
         captain_info = "Капитан не найден."
 
-    # Ответ на нажатие кнопки с информацией о команде
     await update.callback_query.answer()
     await update.callback_query.edit_message_text(
         text=f"<b>Команда соперников</b> №{team_number}\n\n{captain_info}{players_info}",
@@ -827,9 +857,10 @@ async def show_enemy_team(update: Update, context: CallbackContext, team_id: int
 async def admin(update: Update, context: CallbackContext):
     admin_commands = (
         "⚙️ <b>Доступные команды администратора:</b>\n\n"
-        "/reg_start - старт регистрации\n"
-        "/reg_stop - закрытие регистрации\n"
-        "/find_captain - отбор капитанов\n"
+        "/reg_start - старт регистрации\n\n"
+        "/reg_stop - закрытие регистрации\n\n"
+        "/ready_check - проверка всех на готовность\n\n"
+        "/find_captain - отбор капитанов\n\n"
         "/start_pick - набор игроков в команды"
     )
     
@@ -842,37 +873,31 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global is_picking
     query = update.callback_query
     await query.answer()
-    data = query.data  # Получаем данные кнопки
+    data = query.data
     logger.info(f"Получены данные: {query.data}")
 
-    # Обработка кнопок выбора ранга
     if data in RANKS:
         return await rank_choice(update, context)
     
-    # Обработка подрангов (числа от 1 до 6)
-    elif data.isdigit():  # Подранги (числа от 1 до 6)
+    elif data.isdigit():
         return await subrank_choice(update, context)
     
-    # Обработка выбора времени игры
     elif data in PLAYTIME_OPTIONS:
         return await playtime_choice(update, context)
     
-    # Обработка выбора героя из пула или нажатия "next"
     elif data in POOL_LIST or data == "next":
         return await pool_choice(update, context)
     
-    # Обработка подтверждения или отмены регистрации
     elif data in ["confirm", "cancel"]:
         return await confirm_choice(update, context)
     
-    # Обработка кнопок "Выбрать все" и "Очистить"
     elif data == "select_all":
-        context.user_data['pool'] = POOL_LIST[:]  # Выбираем всех героев
+        context.user_data['pool'] = POOL_LIST[:]
         await query.message.edit_text("Выбери пул:", reply_markup=pool_keyboard(POOL_LIST))
         return
     
     elif data == "clear_all":
-        context.user_data['pool'] = []  # Очищаем пул
+        context.user_data['pool'] = []
         await query.message.edit_text("Выбери пул:", reply_markup=pool_keyboard([]))
         return
     
@@ -926,29 +951,44 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
     
-    elif data.startswith("enemy_"):  # Если данные начинаются с 'enemy_'
-        team_id = int(data.split("_")[1])  # Извлекаем team_id
+    elif data.startswith("enemy_"):
+        team_id = int(data.split("_")[1])
         return await show_enemy_team(update, context, team_id)
+    
+    elif data.startswith("ready_"):
+        parts = data.split("_")
+        action = parts[1]  # Это будет 'yes' или 'no'
+        user_id = int(parts[2])  # Преобразуем user_id в целое число
+
+        logger.info(f"Извлечен user_id: {user_id}")
+
+        if action == "yes":
+            await ready_check_yes(user_id)
+            await query.edit_message_text("Ты записан в турнир!")
+            return
+        
+        elif action == "no":
+            await ready_check_no(user_id)
+            await query.edit_message_text("Ты отказался от участия.")
+            return
 
     logger.warning(f"Неизвестная callback_data: {data}")
     await query.message.reply_text("Произошла ошибка, попробуй еще раз.")
 
 def register_handlers(application: Application):
-    """Регистрируем все обработчики."""
     application.handlers.clear()
-    # Регистрация обработчиков команд и кнопок
-    application.add_handler(CommandHandler("start", start))  # Обработчик команды /start
+
+    application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reg", reg))
     application.add_handler(CommandHandler("start_pick", start_pick))
     application.add_handler(CommandHandler("find_captain", find_captain))
     application.add_handler(CommandHandler("my_team", my_team))
     application.add_handler(CommandHandler("enemy_team", enemy_team))
     application.add_handler(CommandHandler("admin", admin))
+    application.add_handler(CommandHandler("ready_check", ready_check))
 
-    # Обработчик для всех кнопок (включая регистрации, выборы и т.д.)
-    application.add_handler(CallbackQueryHandler(buttons_handler, block=False))  # Обработчик всех callback-запросов от кнопок
+    application.add_handler(CallbackQueryHandler(buttons_handler, block=False))
     
-    # Обработчик для ввода телефона (если нужно)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, phone_choice))
 
 def main():
