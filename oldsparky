@@ -365,7 +365,7 @@ async def get_registered_users(conn):
     query = """
         SELECT user_id 
         FROM players 
-        WHERE rank IS NOT NULL AND rank != '' AND status NOT IN ('cancel', 'ready')
+        WHERE rank IS NOT NULL
     """
     users = await conn.fetch(query)
     return users
@@ -396,23 +396,38 @@ async def send_ready_check_message(users, context):
         await asyncio.sleep(0,5)
 
 async def ready_check_yes(user_id: int):
-    """Устанавливает статус 'ready' для пользователя"""
+    """Проверяет статус перед установкой 'ready'"""
     conn = await get_db_connection()
+
+    query = "SELECT status FROM players WHERE user_id = $1"
+    row = await conn.fetchrow(query, user_id)
+
+    if row and row["status"] == "cancel":
+        await conn.close()
+        return "Время на подтверждение вышло."
+
     query = "UPDATE players SET status = 'ready' WHERE user_id = $1"
     await conn.execute(query, user_id)
     await conn.close()
-
+    
+    return "Ты записан на турнир!"
+    
 async def ready_check_no(user_id: int):
     """Устанавливает статус 'cancel' для пользователя"""
     conn = await get_db_connection()
     query = "UPDATE players SET status = 'cancel' WHERE user_id = $1"
     await conn.execute(query, user_id)
     await conn.close()
+    return "Ты отказался от участия."
 
 ######################################################################################################################
 
 async def ready_stop():
-    pass
+    """Меняет статус на 'cancel' для всех пользователей, у которых статус пустой"""
+    conn = await get_db_connection()
+    query = "UPDATE players SET status = 'cancel' WHERE status IS NULL OR status = ''"
+    await conn.execute(query)
+    await conn.close()
 
 ######################################################################################################################
 
@@ -957,19 +972,19 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("ready_"):
         parts = data.split("_")
-        action = parts[1]  # Это будет 'yes' или 'no'
-        user_id = int(parts[2])  # Преобразуем user_id в целое число
+        action = parts[1]  # 'yes' или 'no'
+        user_id = int(parts[2])  # user_id как число
 
         logger.info(f"Извлечен user_id: {user_id}")
 
         if action == "yes":
-            await ready_check_yes(user_id)
-            await query.edit_message_text("Ты записан в турнир!")
+            message = await ready_check_yes(user_id)
+            await query.edit_message_text(message)
             return
-        
+
         elif action == "no":
-            await ready_check_no(user_id)
-            await query.edit_message_text("Ты отказался от участия.")
+            message = await ready_check_no(user_id)
+            await query.edit_message_text(message)
             return
 
     logger.warning(f"Неизвестная callback_data: {data}")
@@ -986,6 +1001,7 @@ def register_handlers(application: Application):
     application.add_handler(CommandHandler("enemy_team", enemy_team))
     application.add_handler(CommandHandler("admin", admin))
     application.add_handler(CommandHandler("ready_check", ready_check))
+    application.add_handler(CommandHandler("ready_stop", ready_stop))
 
     application.add_handler(CallbackQueryHandler(buttons_handler, block=False))
     
