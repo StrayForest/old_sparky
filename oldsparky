@@ -12,6 +12,7 @@ is_picking = False
 admin_id = 831275635
 team_pick_count = False
 registration_start = False
+UP_DOWN = "DOWN"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -640,6 +641,9 @@ async def decline(update: Update, _):
 async def start_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != admin_id:
         return
+    
+    global UP_DOWN
+    UP_DOWN = "DOWN"
 
     players = await get_best_players()
     await send_player_buttons(update, players, context)
@@ -665,6 +669,8 @@ async def get_best_players():
     return players
 
 async def get_team_id_for_current_turn():
+    global UP_DOWN
+    
     conn = await get_db_connection()
     
     query = "SELECT team FROM players WHERE team IS NOT NULL"
@@ -682,11 +688,18 @@ async def get_team_id_for_current_turn():
     if any(count == 6 for count in team_counts.values()):
         team_counts = {team: count for team, count in team_counts.items() if count != 6}
     
-    if team_counts:
-        min_count = min(team_counts.values())
-        min_teams = [team for team, count in team_counts.items() if count == min_count]
-        
-        return min(min_teams)
+    if len(set(team_counts.values())) == 1:
+        UP_DOWN = "DOWN" if UP_DOWN == "UP" else "UP"
+
+    if UP_DOWN == "UP":
+            min_count = min(team_counts.values())
+            min_teams = [team for team, count in team_counts.items() if count == min_count]
+            return min(min_teams)
+    else:
+        if team_counts:
+            min_count = min(team_counts.values())
+            min_teams = [team for team, count in team_counts.items() if count == min_count]
+            return max(min_teams)
     
     return "complete"
 
@@ -745,7 +758,7 @@ async def send_player_buttons(update: Update, players, context: CallbackContext)
         player_info_text += f"<b>{index}</b> ⏳ <b>Часы в игре:</b> {playtime}\n"
         player_info_text += f"—🦸‍♂️ <b>Герои:</b> {pool_text}\n\n"
 
-        button = InlineKeyboardButton(str(index), callback_data=f"pick_{user_id}_{captain_user_id}")
+        button = InlineKeyboardButton(str(index), callback_data=f"pick_{user_id}_{captain_user_id}_{team_id}")
         buttons.append(button)
 
 
@@ -1051,11 +1064,10 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_picking = True
 
         try:
-            _, user_id, captain_user_id = data.split("_")
+            _, user_id, captain_user_id, team_id = data.split("_")
             user_id = int(user_id)
             captain_user_id = int(captain_user_id)
 
-            team_id = await get_team_id_for_current_turn()
             await update_player_status(user_id, team_id)
 
             try:
