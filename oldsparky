@@ -899,37 +899,50 @@ async def show_enemy_team(update: Update, context: CallbackContext, team_id: int
 
 ######################################################################################################################
 
-async def swap_player(user_id):
+async def swap_player(update: Update, context: CallbackContext):
     conn = await get_db_connection()
-    try:
-        check_query = """
-            SELECT team FROM players WHERE user_id = $1 AND status = 'captain';
-        """
-        result = await conn.fetchrow(check_query, user_id)
-        
-        if not result:
-            return "Данная команда доступна только капитану."
-        
-        team_id = result['team']
-        
-        team_query = """
-            SELECT user_id, username, phone FROM players WHERE team = $1;
-        """
-        team_members = await conn.fetch(team_query, team_id)
-        
-        contacts = []
-        for member in team_members:
-            if member['phone']:
-                contacts.append(member['phone'])
-            else:
-                contacts.append(f"@{member['username']}")
-        
-        return "\n".join(contacts)
-    except Exception as e:
-        logger.error(f"Ошибка при замене игрока: {e}")
-        return "Произошла ошибка при обработке запроса."
-    finally:
+
+    user_id = update.message.from_user.id
+
+    user_query = "SELECT team FROM players WHERE user_id = $1"
+    user_team_result = await conn.fetchval(user_query, user_id)
+
+    if not user_team_result:
+        await update.message.reply_text("Вы не состоите в команде.")
         await conn.close()
+        return
+
+    team_number = str(user_team_result)
+
+    captain_query = "SELECT status FROM players WHERE user_id = $1 AND team = $2"
+    user_status = await conn.fetchval(captain_query, user_id, team_number)
+
+    if user_status != 'captain':
+        await update.message.reply_text("Только капитан может вызвать эту команду.")
+        await conn.close()
+        return
+
+    query = """
+        SELECT user_id, username, phone 
+        FROM players 
+        WHERE team = $1
+    """
+    players_result = await conn.fetch(query, team_number)
+    await conn.close()
+
+    if not players_result:
+        await update.message.reply_text("В вашей команде нет игроков.")
+        return
+
+    keyboard = []
+    for player in players_result:
+        player_nickname = player['username'] if player['username'] else player['phone']
+        keyboard.append(
+            [InlineKeyboardButton(f"{player_nickname}", callback_data=f"swap_{player['user_id']}")]
+        )
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Кого заменить?", reply_markup=reply_markup)
 
 ######################################################################################################################
 
@@ -1079,6 +1092,9 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(message)
             return
 
+    elif data.startswith("swap_"):
+        pass
+
     logger.warning(f"Неизвестная callback_data: {data}")
     await query.message.reply_text("Произошла ошибка, попробуй еще раз.")
 
@@ -1098,6 +1114,7 @@ def register_handlers(application: Application):
 
     application.add_handler(CommandHandler("my_team", my_team))
     application.add_handler(CommandHandler("enemy_team", enemy_team))
+    application.add_handler(CommandHandler("swap_player", swap_player))
 
     application.add_handler(CommandHandler("admin", admin))
     application.add_handler(CommandHandler("player_summary", player_summary))
