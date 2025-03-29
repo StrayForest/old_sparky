@@ -762,29 +762,30 @@ async def send_player_buttons(update: Update, players, context: CallbackContext)
 ######################################################################################################################
 
 async def my_team(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-
     conn = await get_db_connection()
 
-    query = """
-        SELECT team FROM players WHERE user_id = $1
-    """
-    result = await conn.fetch(query, user_id)
-
-    if not result:
-        await update.message.reply_text("Ты не состоишь в команде.")
+    user_id = update.message.from_user.id
+    user_query = "SELECT team FROM players WHERE user_id = $1"
+    user_team_result = await conn.fetchval(user_query, user_id)
+    
+    if not user_team_result:
+        await update.message.reply_text("Вы не состоите в команде.")
         await conn.close()
         return
 
-    team = result[0]['team']
+    team_number = str(user_team_result)
 
     query = """
-        SELECT user_id, username, phone, rank, subrank, playtime, pool, status
-        FROM players
+        SELECT user_id, username, phone, rank, subrank, playtime, pool, status 
+        FROM players 
         WHERE team = $1
     """
-    players_result = await conn.fetch(query, team)
+    players_result = await conn.fetch(query, team_number)
     await conn.close()
+
+    if not players_result:
+        await update.message.reply_text("В вашей команде нет игроков.")
+        return
 
     captain_info = "Капитан не найден."
     players_info = ""
@@ -798,7 +799,7 @@ async def my_team(update: Update, context: CallbackContext):
             player_nickname = "Не указано."
 
         player_info = (
-            f"💬 <b>Ник в ТГ:</b> {player_nickname}\n"
+            f"💬 <b>ТГ:</b> {player_nickname}\n"
             f"🛡️ <b>Ранг:</b> {player['rank']} {get_roman_numeral(player['subrank'])}\n"
             f"⏳ <b>Часы в игре:</b> {player['playtime']}\n"
             f"🦸‍♂️ <b>Герои:</b> {player['pool']}\n"
@@ -810,7 +811,7 @@ async def my_team(update: Update, context: CallbackContext):
             players_info += f"\n{player_info}"
 
     await update.message.reply_text(
-        f"<b>Твоя команда</b> №{team}\n\n{captain_info}{players_info}",
+        text=f"<b>Ваша команда</b> № {team_number}\n\n{captain_info}{players_info}",
         parse_mode="HTML"
     )
 
@@ -824,16 +825,26 @@ def get_roman_numeral(subrank_index):
 async def enemy_team(update: Update, context: CallbackContext):
     conn = await get_db_connection()
 
-    query = "SELECT DISTINCT team FROM players WHERE team IS NOT NULL ORDER BY team ASC"
-    teams_result = await conn.fetch(query)
+    user_id = update.message.from_user.id
+    user_query = "SELECT team FROM players WHERE user_id = $1"
+    user_team_result = await conn.fetchval(user_query, user_id)
+    
+    if not user_team_result:
+        await update.message.reply_text("Вы не состоите в команде.")
+        await conn.close()
+        return
+
+    query = "SELECT DISTINCT team FROM players WHERE team IS NOT NULL AND team != $1 ORDER BY team ASC"
+    teams_result = await conn.fetch(query, user_team_result)
     await conn.close()
 
     if not teams_result:
         await update.message.reply_text("Нет доступных команд.")
         return
 
+    # Создаем клавиатуру
     keyboard = [
-        [InlineKeyboardButton(f"Команда {team['team']}", callback_data=f"enemy_{team['team']}")]
+        [InlineKeyboardButton(f"Команда № {team['team']}", callback_data=f"enemy_{team['team']}")]
         for team in teams_result if team['team'] is not None
     ]
 
@@ -869,13 +880,12 @@ async def show_enemy_team(update: Update, context: CallbackContext, team_id: int
             player_nickname = "Не указано."
 
         player_info = (
-            f"💬 <b>Ник в ТГ:</b> {player_nickname}\n"
+            f"💬 <b>ТГ:</b> {player_nickname}\n"
             f"🛡️ <b>Ранг:</b> {player['rank']} {get_roman_numeral(player['subrank'])}\n"
             f"⏳ <b>Часы в игре:</b> {player['playtime']}\n"
             f"🦸‍♂️ <b>Герои:</b> {player['pool']}\n"
         )
 
-        # Проверяем, является ли игрок капитаном
         if player['status'] == 'captain':
             captain_info = f"Капитан:\n{player_info}"
         else:
@@ -883,7 +893,7 @@ async def show_enemy_team(update: Update, context: CallbackContext, team_id: int
 
     await update.callback_query.answer()
     await update.callback_query.edit_message_text(
-        text=f"<b>Команда соперников</b> №{team_number}\n\n{captain_info}{players_info}",
+        text=f"<b>Команда соперников</b> № {team_number}\n\n{captain_info}{players_info}",
         parse_mode="HTML"
     )
 
