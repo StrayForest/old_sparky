@@ -718,7 +718,10 @@ async def update_player_status(user_id, team_id):
 
 async def send_player_buttons(update: Update, players, context: CallbackContext):
     team_id = await get_team_id_for_current_turn()
-    logger.info(f"Номер команды: {team_id}")  
+    logger.info(f"Номер команды: {team_id}")
+
+    if team_id == 'complete':
+        return
     
     conn = await get_db_connection()
     query = "SELECT user_id FROM players WHERE status = 'captain' AND team = $1 LIMIT 1"
@@ -910,10 +913,10 @@ async def show_enemy_team(update: Update, context: CallbackContext, team_id: int
 async def swap_player(update: Update, context: CallbackContext):
     conn = await get_db_connection()
 
-    user_id = update.message.from_user.id
+    captain_user_id = update.message.from_user.id
 
     user_query = "SELECT team FROM players WHERE user_id = $1"
-    user_team_result = await conn.fetchval(user_query, user_id)
+    user_team_result = await conn.fetchval(user_query, captain_user_id)
 
     if not user_team_result:
         await update.message.reply_text("Вы не состоите в команде.")
@@ -923,7 +926,7 @@ async def swap_player(update: Update, context: CallbackContext):
     team_number = str(user_team_result)
 
     captain_query = "SELECT status FROM players WHERE user_id = $1 AND team = $2"
-    user_status = await conn.fetchval(captain_query, user_id, team_number)
+    user_status = await conn.fetchval(captain_query, captain_user_id, team_number)
 
     if user_status != 'captain':
         await update.message.reply_text("Только капитан может вызвать эту команду.")
@@ -946,7 +949,7 @@ async def swap_player(update: Update, context: CallbackContext):
     for player in players_result:
         player_nickname = player['username'] if player['username'] else player['phone']
         keyboard.append(
-            [InlineKeyboardButton(f"{player_nickname}", callback_data=f"swap_{player['user_id']}")]
+            [InlineKeyboardButton(f"{player_nickname}", callback_data=f"swap_{captain_user_id}_{player['user_id']}_{team_number}")]
         )
 
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -969,6 +972,49 @@ async def del_player_from_team(user_id):
         logger.error(f"Ошибка при удалении игрока из команды: {e}")
     finally:
         await conn.close()
+
+async def swap_player_buttons(update: Update, players, captain_user_id, context: CallbackContext):
+    team_id = await get_team_id_for_current_turn()
+    logger.info(f"Номер команды: {team_id}")
+
+    if team_id == 'complete':
+        await context.bot.send_message(captain_user_id, "Замена прошла успешно.")
+        return
+
+    player_info_text = ""
+    buttons = []
+
+    for index, player in enumerate(players, start=1):
+        user_id = player['user_id']
+        rank = player['rank']
+        subrank = player['subrank']
+        playtime = player.get('playtime', 'Не указано')
+        pool = player.get('pool', 'Не указано')
+
+        full_rank = f"{rank} {subrank}"
+        pool_text = pool
+
+        if pool_text == 'Не указано':
+            pool_text = 'Не выбран'
+
+
+        player_info_text += f"—🛡️ <b>Ранг:</b> {full_rank}\n"
+        player_info_text += f"<b>{index}</b> ⏳ <b>Часы в игре:</b> {playtime}\n"
+        player_info_text += f"—🦸‍♂️ <b>Герои:</b> {pool_text}\n\n"
+
+        button = InlineKeyboardButton(str(index), callback_data=f"swap_{user_id}_{captain_user_id}_{team_id}")
+        buttons.append(button)
+
+
+    keyboard = InlineKeyboardMarkup([buttons])
+
+
+    await context.bot.send_message(
+        captain_user_id,
+        f"Выберите игрока для вашей команды:\n\n{player_info_text}",
+        reply_markup=keyboard,
+        parse_mode='HTML'
+    )
 
 ######################################################################################################################
 
@@ -1096,7 +1142,27 @@ async def player_summary(update: Update, context: CallbackContext):
     await update.message.reply_text(message)
 
 async def captain(update: Update, context: CallbackContext):
-    pass
+    conn = await get_db_connection()
+
+    user_id = update.message.from_user.id
+
+    captain_query = "SELECT status FROM players WHERE user_id = $1"
+    user_status = await conn.fetchval(captain_query, user_id)
+
+    if user_status != 'captain':
+        await update.message.reply_text("Только капитан может вызвать эту команду.")
+        await conn.close()
+        return
+    
+    captain_commands = (
+        "⚙️ <b>Доступные команды капитана:</b>\n\n"
+
+        "/swap_player - заменить игрока\n"
+        "/swap_captain - сменить капитана\n\n"
+    )
+
+    await update.message.reply_text(captain_commands, parse_mode="HTML")
+
 ######################################################################################################################
 
 async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1202,11 +1268,11 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     elif data.startswith("swap_"):
-        _, user_id = data.split("_")
+        _, captain_user_id, user_id = data.split("_")
         await del_player_from_team(user_id)
 
         players = await get_best_players()
-        await send_player_buttons(update, players, context)
+        await swap_player_buttons(update, players, captain_user_id, context)
 
         return
     
@@ -1230,12 +1296,13 @@ def register_handlers(application: Application):
 
     application.add_handler(CommandHandler("ready_check", ready_check))
     application.add_handler(CommandHandler("ready_stop", ready_stop))
-    application.add_handler(CommandHandler("start_pick", start_pick))
     application.add_handler(CommandHandler("find_captain", find_captain))
+    application.add_handler(CommandHandler("start_pick", start_pick))
 
     application.add_handler(CommandHandler("my_team", my_team))
     application.add_handler(CommandHandler("enemy_team", enemy_team))
 
+    application.add_handler(CommandHandler("captain", captain))
     application.add_handler(CommandHandler("swap_player", swap_player))
     application.add_handler(CommandHandler("swap_captain", swap_captain))
 
