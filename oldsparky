@@ -957,6 +957,71 @@ async def swap_player(update: Update, context: CallbackContext):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Кого заменить?", reply_markup=reply_markup)
 
+async def del_player_from_team(user_id):
+    conn = await get_db_connection()
+    try:
+        update_query = """
+        UPDATE players 
+        SET team = NULL, status = 'cancel'
+        WHERE user_id = $1;
+        """
+        await conn.execute(update_query, user_id)
+        logger.info(f"Игрок {user_id} удален из команды.")
+    except Exception as e:
+        logger.error(f"Ошибка при удалении игрока из команды: {e}")
+    finally:
+        await conn.close()
+
+async def pick_new_player(update: Update, players, context: CallbackContext):
+    team_id = await get_team_id_for_current_turn()
+    logger.info(f"Номер команды: {team_id}")
+    
+    conn = await get_db_connection()
+    query = "SELECT user_id FROM players WHERE status = 'captain' AND team = $1 LIMIT 1"
+    result = await conn.fetch(query, team_id)
+    await conn.close()
+    logger.info(f"Найденный капитан: {result}")
+
+    if not result:
+        await update.message.reply_text("Не удалось найти капитана для этой команды.")
+        return
+
+    captain_user_id = result[0]['user_id']
+
+    player_info_text = ""
+    buttons = []
+
+    for index, player in enumerate(players, start=1):
+        user_id = player['user_id']
+        rank = player['rank']
+        subrank = player['subrank']
+        playtime = player.get('playtime', 'Не указано')
+        pool = player.get('pool', 'Не указано')
+
+        full_rank = f"{rank} {subrank}"
+        pool_text = pool
+
+        if pool_text == 'Не указано':
+            pool_text = 'Не выбран'
+
+
+        player_info_text += f"—🛡️ <b>Ранг:</b> {full_rank}\n"
+        player_info_text += f"<b>{index}</b> ⏳ <b>Часы в игре:</b> {playtime}\n"
+        player_info_text += f"—🦸‍♂️ <b>Герои:</b> {pool_text}\n\n"
+
+        button = InlineKeyboardButton(str(index), callback_data=f"pick_{user_id}_{captain_user_id}_{team_id}")
+        buttons.append(button)
+
+
+    keyboard = InlineKeyboardMarkup([buttons])
+
+
+    await context.bot.send_message(
+        captain_user_id,
+        f"Выберите игрока для вашей команды:\n\n{player_info_text}",
+        reply_markup=keyboard,
+        parse_mode='HTML'
+    )
 ######################################################################################################################
 
 async def admin(update: Update, context: CallbackContext):
@@ -1105,8 +1170,14 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     elif data.startswith("swap_"):
-        pass
+        _, user_id = data.split("_")
+        await del_player_from_team(user_id)
 
+        players = await get_best_players()
+        await pick_new_player(update, players, context)
+
+        return
+    
     logger.warning(f"Неизвестная callback_data: {data}")
     await query.message.reply_text("Произошла ошибка, попробуй еще раз.")
 
