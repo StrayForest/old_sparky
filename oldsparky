@@ -479,7 +479,7 @@ async def search_captains(teams_count, update, context):
 
     await send_captain_offers(captains, update, context)
 
-    await asyncio.sleep(90)
+    await asyncio.sleep(10)
 
     await fill_missing_captains(teams_count, update, context)
 
@@ -572,7 +572,7 @@ async def fill_missing_captains(teams_count, update, context):
         logger.info("Закрытие соединения с базой данных.")
         await conn.close()
 
-async def assign_team_numbers_and_notify(update, context):
+async def assign_team_numbers_and_notify(update, context, teams_count):
     conn = await get_db_connection()
     try:
         query = """
