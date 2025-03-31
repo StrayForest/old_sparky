@@ -572,17 +572,26 @@ async def fill_missing_captains(teams_count, update, context):
         logger.info("Закрытие соединения с базой данных.")
         await conn.close()
 
-async def assign_team_numbers_and_notify(update, context, teams_count):
+async def assign_team_numbers_and_notify(update, context):
     conn = await get_db_connection()
     try:
-        query = f"SELECT user_id FROM players WHERE status = 'captain';"
-        captains = await conn.fetch(query)
+        query = """
+            SELECT user_id, rank, COALESCE(subrank, 0) AS subrank, playtime
+            FROM players 
+            WHERE status = 'captain' 
+              AND (rank IS NOT NULL AND rank <> '')
+            ORDER BY ARRAY_POSITION($1::text[], rank) ASC, 
+                     subrank DESC, 
+                     ARRAY_POSITION($2::text[], playtime) DESC;
+        """
+        captains = await conn.fetch(query, RANKS, list(reversed(PLAYTIME_OPTIONS)))
 
-        for i, captain in enumerate(captains, 1):
+        for i, captain in enumerate(captains, 1):  
             user_id = captain['user_id']
             await update_captain_status(user_id, 'captain', i)
-
-        await update.message.reply_text(f"Капитаны успешно назначены для команд.")
+        
+        message_target = update.message if update.message else update.callback_query.message
+        await message_target.reply_text("Капитаны успешно назначены для команд.")
 
     finally:
         await conn.close()
