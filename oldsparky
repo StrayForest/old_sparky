@@ -9,6 +9,7 @@ import logging
 import asyncpg
 
 is_picking = False
+swaping = False
 admin_id = 831275635
 team_pick_count = False
 registration_start = False
@@ -985,10 +986,11 @@ async def del_player_from_team(user_id):
         await conn.close()
 
 async def pick_new_player(update: Update, players, team_id, context: CallbackContext):
-    message_target = update.message or update.callback_query.message  # Проверяем, откуда пришел запрос
+    query = update.callback_query  # Используем callback_query, если это кнопка
+    message_target = query.message if query else update.message  # Проверяем, откуда пришел запрос
 
     if not players:
-        await message_target.reply_text("Нет доступных игроков для выбора.")
+        await message_target.edit_text("Нет доступных игроков для выбора.")
         return
 
     player_info_text = ""
@@ -1013,7 +1015,8 @@ async def pick_new_player(update: Update, players, team_id, context: CallbackCon
 
     keyboard = InlineKeyboardMarkup([buttons])
 
-    await message_target.reply_text(
+    # Редактируем существующее сообщение, а не отправляем новое
+    await message_target.edit_text(
         f"Выберите игрока для вашей команды:\n\n{player_info_text}",
         reply_markup=keyboard,
         parse_mode='HTML'
@@ -1066,6 +1069,7 @@ async def player_summary(update: Update, context: CallbackContext):
 
 async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global is_picking
+    global swaping
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -1167,20 +1171,39 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     elif data.startswith("choiceswap_"):
-        _, user_id, team_id = data.split("_")
+        if swaping:  
+            return
+        
+        swaping = True
 
-        await del_player_from_team(user_id)
+        try:
+            _, user_id, team_id = data.split("_")
 
-        players = await get_best_players()
-        await pick_new_player(update, players, team_id, context)
+            await del_player_from_team(user_id)
 
+            players = await get_best_players()
+            await pick_new_player(update, players, team_id, context)
+
+        finally:
+            swaping = False
         return
 
     elif data.startswith("swap_"):
-        _, user_id, team_id = data.split("_")
+        if swaping:  
+            return
+        
+        try:
+            swaping = True
 
-        await update_player_status(user_id, team_id)
+            _, user_id, team_id = data.split("_")
 
+            await update_player_status(user_id, team_id)
+
+            # Заменяем сообщение после успешного обновления
+            await query.message.edit_text("Игрок успешно добавлен в команду.")
+
+        finally:
+            swaping = False
         return
 
     logger.warning(f"Неизвестная callback_data: {data}")
