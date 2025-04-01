@@ -40,14 +40,15 @@ POOL_LIST = [
 
 async def get_db_connection():
     try:
+        # Подключаемся к pgbouncer, используя тот же пользователь, пароль, базу данных и т.д.
         conn = await asyncpg.connect(
             user=DB_CONFIG['user'],
             password=DB_CONFIG['password'],
             database=DB_CONFIG['database'],
-            host=DB_CONFIG['host'],
-            port=DB_CONFIG['port']
+            host=DB_CONFIG['host'],  # Указываем IP адрес pgbouncer или домен
+            port=6432                # Порт, на котором работает pgbouncer
         )
-        logger.info("Успешно подключено к базе данных")
+        logger.info("Успешно подключено к базе данных через pgbouncer")
         return conn
     except asyncpg.exceptions.CannotConnectNowError:
         logger.error("Не удалось подключиться к базе данных: база данных недоступна")
@@ -59,8 +60,9 @@ async def get_db_connection():
         logger.error("Неверный URI для подключения к базе данных")
         raise
     except Exception as e:
-        logger.error(f"Ошибка подключения к базе данных: {e}")
+        logger.error(f"Ошибка подключения к базе данных через pgbouncer: {e}")
         raise
+
 async def close_db_connection(conn):
     try:
         if conn.is_closed():
