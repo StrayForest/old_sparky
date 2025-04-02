@@ -40,17 +40,18 @@ POOL_LIST = [
 
 async def get_db_connection():
     try:
-        conn = await asyncpg.connect(
+        pool = await asyncpg.create_pool(
             user=DB_CONFIG['user'],
             password=DB_CONFIG['password'],
             database=DB_CONFIG['database'],
             host=DB_CONFIG['host'],
-            port=6432
+            port=6432,
+            statement_cache_size=0
         )
         logger.info("Успешно подключено к базе данных через PgBouncer.")
-        return conn
+        return pool
     except asyncpg.exceptions.CannotConnectNowError:
-        logger.error("Не удалось подключиться к базе данных: база данных недоступна.")
+        logger.error("Не удалось подключиться к базе данных, она недоступна.")
         raise
     except asyncpg.exceptions.InvalidPasswordError:
         logger.error("Неверный пароль для базы данных.")
@@ -62,43 +63,28 @@ async def get_db_connection():
         logger.error(f"Ошибка подключения к базе данных через PgBouncer: {e}")
         raise
 
-async def close_db_connection(conn):
-    try:
-        if conn.is_closed():
-            logger.info("Соединение с БД уже закрыто.")
-        else:
-            await conn.close()
-            logger.info("Соединение с БД успешно закрыто.")
-    except Exception as e:
-        logger.error(f"Ошибка при закрытии соединения с БД: {e}")
-
 ######################################################################################################################
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username
 
-    conn = None
     try:
-        conn = await get_db_connection()
-
-        existing_user = await conn.fetchrow("""
-            SELECT 1 FROM players WHERE user_id = $1
-        """, user_id)
-
-        if not existing_user:
+        async with await get_db_connection() as conn:
             await conn.execute("""
                 INSERT INTO players (user_id, username) 
                 VALUES ($1, $2)
+                ON CONFLICT (user_id) DO NOTHING
             """, user_id, username)
-            logger.info(f"Пользователь {user_id} был добавлен в базу данных.")
-    
+
+            logger.info(f"Пользователь {user_id} был добавлен в базу данных или уже существует.")
+
+    except asyncpg.exceptions.CannotConnectNowError:
+        logger.error("Не удалось подключиться к базе данных, она недоступна.")
+        await update.message.reply_text("Ошибка подключения к базе данных. Попробуйте позже.")
     except Exception as e:
         logger.error(f"Ошибка при работе с базой данных: {e}")
-    
-    finally:
-        if conn:
-            await close_db_connection(conn)
+        await update.message.reply_text("Произошла ошибка при регистрации. Попробуйте позже.")
 
     welcome_text = (
         "Привет! 👋\n\n"
@@ -135,11 +121,8 @@ async def reg(update: Update, context: CallbackContext):
         return
 
     try:
-        conn = await get_db_connection()
-
-        existing_user = await conn.fetchrow("SELECT rank FROM players WHERE user_id = $1", user_id)
-        
-        await conn.close()
+        async with await get_db_connection() as conn:
+            existing_user = await conn.fetchrow("SELECT rank FROM players WHERE user_id = $1", user_id)
 
         if existing_user and existing_user["rank"]:
             await update.message.reply_text("Ты уже зарегистрирован на текущий турнир!")
@@ -148,7 +131,7 @@ async def reg(update: Update, context: CallbackContext):
         context.user_data.clear()
         keyboard = rank_keyboard()
         await update.message.reply_text("Выбери свой ранг", reply_markup=keyboard)
-    
+
     except Exception as e:
         logger.error(f"Ошибка при работе с базой данных: {e}")
         await update.message.reply_text("Произошла ошибка при регистрации. Попробуй снова позже.")
@@ -336,33 +319,30 @@ async def save_registration_data(update: Update, context: ContextTypes.DEFAULT_T
     pool_str = ','.join(data.get('pool', [])) if data.get('pool') else None
     phone = data.get('phone', None)
 
-    logger.info(f"Saving data for user_id: {user_id}, rank: {data.get('rank')}, subrank: {data.get('subrank')}, "
-                f"playtime: {data.get('playtime')}, pool: {pool_str}, phone: {phone}")
+    logger.info(f"Сохраняем данные для user_id: {user_id}, ранг: {data.get('rank')}, подранг: {data.get('subrank')}, "
+                f"игровое время: {data.get('playtime')}, пул: {pool_str}, телефон: {phone}")
 
     try:
-        conn = await get_db_connection()
+        async with await get_db_connection() as conn:
+            user_check_query = "SELECT user_id FROM players WHERE user_id = $1"
+            user_exists = await conn.fetch(user_check_query, user_id)
 
-        user_check_query = "SELECT user_id FROM players WHERE user_id = $1"
-        user_exists = await conn.fetch(user_check_query, user_id)
-
-        if not user_exists:
-            logger.info(f"User {user_id} not found in the database. Adding new record.")
-            await conn.execute("""
-                INSERT INTO players (user_id, rank, subrank, playtime, pool, phone)
-                VALUES ($1, $2, $3, $4, $5, $6)
-            """, user_id, data.get('rank'), data.get('subrank'), data.get('playtime'), pool_str, phone)
-        else:
-            logger.info(f"User {user_id} found in the database. Updating record.")
-            await conn.execute("""
-                UPDATE players
-                SET rank = $1, subrank = $2, playtime = $3, pool = $4, phone = $5
-                WHERE user_id = $6
-            """, data.get('rank'), data.get('subrank'), data.get('playtime'), pool_str, phone, user_id)
-
-        await conn.close()
+            if not user_exists:
+                logger.info(f"Пользователь {user_id} не найден в базе данных. Добавляем новый запись.")
+                await conn.execute("""
+                    INSERT INTO players (user_id, rank, subrank, playtime, pool, phone)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                """, user_id, data.get('rank'), data.get('subrank'), data.get('playtime'), pool_str, phone)
+            else:
+                logger.info(f"Пользователь {user_id} найден в базе данных. Обновляем запись.")
+                await conn.execute("""
+                    UPDATE players
+                    SET rank = $1, subrank = $2, playtime = $3, pool = $4, phone = $5
+                    WHERE user_id = $6
+                """, data.get('rank'), data.get('subrank'), data.get('playtime'), pool_str, phone, user_id)
 
     except Exception as e:
-        logger.error(f"Database error while saving data for user_id {user_id}: {e}")
+        logger.error(f"Ошибка при сохранении данных для user_id {user_id}: {e}")
         raise
 
 ######################################################################################################################
