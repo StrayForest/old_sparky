@@ -3,11 +3,13 @@ import json
 from typing import Counter
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application, CallbackContext, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 )
 import logging
 import asyncpg
 
+
+current_timer_job = None
 is_picking = False
 swaping = False
 admin_id = 831275635
@@ -95,7 +97,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ######################################################################################################################
 
-async def reg_start(update: Update, context: CallbackContext):
+async def reg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != admin_id:
         return
 
@@ -103,7 +105,7 @@ async def reg_start(update: Update, context: CallbackContext):
     registration_start = True
     await update.message.reply_text("Регистрация открыта.")
 
-async def reg_stop(update: Update, context: CallbackContext):
+async def reg_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != admin_id:
         return
     
@@ -113,7 +115,7 @@ async def reg_stop(update: Update, context: CallbackContext):
 
 ######################################################################################################################
 
-async def reg(update: Update, context: CallbackContext):
+async def reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if not registration_start:
@@ -140,7 +142,7 @@ def rank_keyboard():
     keyboard = [[InlineKeyboardButton(rank, callback_data=rank)] for rank in RANKS]
     return InlineKeyboardMarkup(keyboard)
 
-async def rank_choice(update: Update, context: CallbackContext):
+async def rank_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
@@ -159,7 +161,7 @@ def subrank_keyboard(selected_rank):
     
     return keyboard
 
-async def subrank_choice(update: Update, context: CallbackContext):
+async def subrank_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
@@ -177,7 +179,7 @@ def playtime_keyboard():
     keyboard = [[InlineKeyboardButton(option, callback_data=option)] for option in PLAYTIME_OPTIONS]
     return InlineKeyboardMarkup(keyboard)
 
-async def playtime_choice(update: Update, context: CallbackContext):
+async def playtime_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
@@ -351,19 +353,20 @@ async def ready_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != admin_id:
         return
 
-    conn = await get_db_connection()
-
     try:
-        users = await get_registered_users(conn)
+        async with await get_db_connection() as conn:
+            users = await get_registered_users(conn)
 
-        if not users:
-            logger.info("Нет пользователей с непустым значением в поле 'rank'.")
-            await update.message.reply_text("Нет регистраций.")
-            return
+            if not users:
+                logger.info("Нет пользователей с непустым значением в поле 'rank'.")
+                await update.message.reply_text("Нет регистраций.")
+                return
 
-        await send_ready_check_message(users, context)
-    finally:
-        await conn.close()
+            await send_ready_check_message(users, context)
+
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении команды ready_check: {e}")
+        await update.message.reply_text("Произошла ошибка при выполнении команды. Попробуйте позже.")
 
 async def get_registered_users(conn):
     query = """
@@ -375,63 +378,80 @@ async def get_registered_users(conn):
     return users
 
 async def send_ready_check_message(users, context):
+    tasks = []
     for user in users:
         if 'user_id' not in user:
             logger.error(f"❌ Не удалось найти user_id у пользователя {user}")
             continue
 
-        keyboard = [
-            [InlineKeyboardButton("Да", callback_data=f"ready_yes_{user['user_id']}")],
-            [InlineKeyboardButton("Нет", callback_data=f"ready_no_{user['user_id']}")]
-        ]
+        keyboard = [[
+            InlineKeyboardButton("Да", callback_data=f"ready_yes_{user['user_id']}"),
+            InlineKeyboardButton("Нет", callback_data=f"ready_no_{user['user_id']}")
+        ]]
 
-        try:
-            message = await context.bot.send_message(
-                chat_id=user['user_id'],
-                text="Подтверди участие в турнире.",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            logger.info(f"✅ Сообщение отправлено пользователю {user['user_id']}: {message.message_id}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка при отправке сообщения пользователю {user['user_id']}: {e}")
+        tasks.append(asyncio.create_task(send_message(user['user_id'], keyboard, context)))
 
-        await asyncio.sleep(0,5)
+    await asyncio.gather(*tasks)
+
+async def send_message(user_id, keyboard, context):
+    try:
+        message = await context.bot.send_message(
+            chat_id=user_id,
+            text="Подтверди участие в турнире.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        logger.info(f"✅ Сообщение отправлено пользователю {user_id}: {message.message_id}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при отправке сообщения пользователю {user_id}: {e}")
+    
+    await asyncio.sleep(0.1)  # Небольшая задержка, чтобы избежать ограничений Telegram API
 
 async def ready_check_yes(user_id: int):
-    conn = await get_db_connection()
+    try:
+        async with await get_db_connection() as conn:
+            query = "SELECT status FROM players WHERE user_id = $1"
+            row = await conn.fetchrow(query, user_id)
 
-    query = "SELECT status FROM players WHERE user_id = $1"
-    row = await conn.fetchrow(query, user_id)
+            if row and row["status"] == "cancel":
+                return "Время на подтверждение вышло."
 
-    if row and row["status"] == "cancel":
-        await conn.close()
-        return "Время на подтверждение вышло."
+            query = "UPDATE players SET status = 'ready' WHERE user_id = $1"
+            await conn.execute(query, user_id)
 
-    query = "UPDATE players SET status = 'ready' WHERE user_id = $1"
-    await conn.execute(query, user_id)
-    await conn.close()
+        return "Ты записан на турнир!"
     
-    return "Ты записан на турнир!"
-    
+    except Exception as e:
+        logger.error(f"Ошибка при подтверждении участия пользователя {user_id}: {e}")
+        return "Произошла ошибка. Попробуй снова позже."
+
 async def ready_check_no(user_id: int):
-    conn = await get_db_connection()
-    query = "UPDATE players SET status = 'cancel' WHERE user_id = $1"
-    await conn.execute(query, user_id)
-    await conn.close()
-    return "Ты отказался от участия."
+    try:
+        async with await get_db_connection() as conn:
+            query = "UPDATE players SET status = 'cancel' WHERE user_id = $1"
+            await conn.execute(query, user_id)
+
+        return "Ты отказался от участия."
+
+    except Exception as e:
+        logger.error(f"Ошибка при отказе пользователя {user_id} от участия: {e}")
+        return "Произошла ошибка. Попробуй снова позже."
 
 ######################################################################################################################
 
-async def ready_stop(update: Update, context: CallbackContext):
+async def ready_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != admin_id:
         return
 
-    conn = await get_db_connection()
-    query = "UPDATE players SET status = 'cancel' WHERE status IS NULL OR status = ''"
-    await conn.execute(query)
-    await conn.close()
+    try:
+        async with await get_db_connection() as conn:
+            query = "UPDATE players SET status = 'cancel' WHERE status IS NULL OR status = ''"
+            await conn.execute(query)
 
-    await update.message.reply_text("Проверка на готовность завершена.")
+        await update.message.reply_text("Проверка на готовность завершена.")
+
+    except Exception as e:
+        logger.error(f"Ошибка при завершении проверки на готовность: {e}")
+        await update.message.reply_text("Произошла ошибка при завершении проверки. Попробуйте позже.")
 
 ######################################################################################################################
 
@@ -460,42 +480,41 @@ async def search_captains(teams_count, update, context):
 
     await send_captain_offers(captains, update, context)
 
-    await asyncio.sleep(10)
+    await asyncio.sleep(90)
 
     await fill_missing_captains(teams_count, update, context)
 
     await assign_team_numbers_and_notify(update, context, teams_count)
 
 async def get_candidates_for_captain(teams_count):
-    conn = await get_db_connection()
     try:
-        query = """
-            SELECT user_id, rank, COALESCE(subrank, 0) AS subrank, playtime
-            FROM players 
-            WHERE (status = 'ready') 
-              AND (rank IS NOT NULL AND rank <> '')
-            ORDER BY ARRAY_POSITION($1::text[], rank) ASC, 
-                     subrank DESC, 
-                     ARRAY_POSITION($2::text[], playtime) DESC
-            LIMIT $3;
-        """
-        candidates = await conn.fetch(query, RANKS, list(reversed(PLAYTIME_OPTIONS)), teams_count)
-        
-        if candidates:
-            user_ids = [candidate['user_id'] for candidate in candidates]
-            update_query = """
-                UPDATE players
-                SET status = 'waiting_for_captain'
-                WHERE user_id = ANY($1::bigint[]);
+        async with await get_db_connection() as conn:
+            query = """
+                SELECT user_id, rank, COALESCE(subrank, 0) AS subrank, playtime
+                FROM players 
+                WHERE (status = 'ready') 
+                  AND (rank IS NOT NULL AND rank <> '')
+                ORDER BY ARRAY_POSITION($1::text[], rank) ASC, 
+                         subrank DESC, 
+                         ARRAY_POSITION($2::text[], playtime) DESC
+                LIMIT $3;
             """
-            await conn.execute(update_query, user_ids)
-        
-        return candidates
+            candidates = await conn.fetch(query, RANKS, list(reversed(PLAYTIME_OPTIONS)), teams_count)
+            
+            if candidates:
+                user_ids = [candidate['user_id'] for candidate in candidates]
+                update_query = """
+                    UPDATE players
+                    SET status = 'waiting_for_captain'
+                    WHERE user_id = ANY($1::bigint[]);
+                """
+                await conn.execute(update_query, user_ids)
+
+            return candidates
+
     except Exception as e:
         logger.error(f"Ошибка при получении кандидатов: {e}")
         return []
-    finally:
-        await conn.close()
 
 async def send_captain_offers(captains, update, context):
     for captain in captains:
@@ -511,7 +530,7 @@ async def send_captain_offers(captains, update, context):
         try:
             message = await context.bot.send_message(
                 chat_id=user_id,
-                text="*Ты выбран капитаном.*\n\n_В случае отказа ты не сможешь принять участие в турнире._",  # Теперь курсив
+                text="*Ты выбран капитаном.*\n\n_В случае отказа ты не сможешь принять участие в турнире._",
                 reply_markup=keyboard,
                 parse_mode="Markdown"
             )
@@ -520,78 +539,77 @@ async def send_captain_offers(captains, update, context):
             logger.error(f"❌ Ошибка при отправке сообщения пользователю {user_id}: {e}")
 
 async def fill_missing_captains(teams_count, update, context):
-    conn = await get_db_connection()
     try:
-        captain_count = await conn.fetchval("SELECT COUNT(*) FROM players WHERE status = 'captain';")
-        logger.info(f"Текущие капитаны: {captain_count}")
-
-        while captain_count < teams_count:
-            needed_captains = teams_count - captain_count
-            logger.info(f"Нужно ещё {needed_captains} капитанов.")
-
-            captains = await get_candidates_for_captain(needed_captains)
-
-            if not captains:
-                logger.warning("Не удалось найти свободных игроков для капитанов.")
-                await context.bot.send_message(
-                    update.message.chat.id,
-                    f"Недостаточно игроков для назначения {teams_count} капитанов."
-                )
-                break
-
-            await send_captain_offers(captains, update, context)
-
-            logger.info("Ожидание 90 секунд для ответов.")
-            await asyncio.sleep(90)
-
+        async with await get_db_connection() as conn:
             captain_count = await conn.fetchval("SELECT COUNT(*) FROM players WHERE status = 'captain';")
-            logger.info(f"После ожидания капитанов: {captain_count}")
+            logger.info(f"Текущие капитаны: {captain_count}")
+
+            while captain_count < teams_count:
+                needed_captains = teams_count - captain_count
+                logger.info(f"Нужно ещё {needed_captains} капитанов.")
+
+                captains = await get_candidates_for_captain(needed_captains)
+
+                if not captains:
+                    logger.warning("Не удалось найти свободных игроков для капитанов.")
+                    await context.bot.send_message(
+                        update.message.chat.id,
+                        f"Недостаточно игроков для назначения {teams_count} капитанов."
+                    )
+                    break
+
+                await send_captain_offers(captains, update, context)
+
+                logger.info("Ожидание 90 секунд для ответов.")
+                await asyncio.sleep(90)
+
+                captain_count = await conn.fetchval("SELECT COUNT(*) FROM players WHERE status = 'captain';")
+                logger.info(f"После ожидания капитанов: {captain_count}")
 
     except Exception as e:
         logger.error(f"Произошла ошибка: {e}")
-    finally:
-        logger.info("Закрытие соединения с базой данных.")
-        await conn.close()
 
 async def assign_team_numbers_and_notify(update, context, teams_count):
-    conn = await get_db_connection()
     try:
-        query = """
-            SELECT user_id, rank, COALESCE(subrank, 0) AS subrank, playtime
-            FROM players 
-            WHERE status = 'captain' 
-              AND (rank IS NOT NULL AND rank <> '')
-            ORDER BY ARRAY_POSITION($1::text[], rank) ASC, 
-                     subrank DESC, 
-                     ARRAY_POSITION($2::text[], playtime) DESC;
-        """
-        captains = await conn.fetch(query, RANKS, list(reversed(PLAYTIME_OPTIONS)))
+        async with await get_db_connection() as conn:
+            query = """
+                SELECT user_id, rank, COALESCE(subrank, 0) AS subrank, playtime
+                FROM players 
+                WHERE status = 'captain' 
+                  AND (rank IS NOT NULL AND rank <> '')
+                ORDER BY ARRAY_POSITION($1::text[], rank) ASC, 
+                         subrank DESC, 
+                         ARRAY_POSITION($2::text[], playtime) DESC;
+            """
+            captains = await conn.fetch(query, RANKS, list(reversed(PLAYTIME_OPTIONS)))
 
-        for i, captain in enumerate(captains, 1):  
-            user_id = captain['user_id']
-            await update_captain_status(user_id, 'captain', i)
-        
-        message_target = update.message if update.message else update.callback_query.message
-        await message_target.reply_text("Капитаны успешно назначены для команд.")
+            for i, captain in enumerate(captains, 1):  
+                user_id = captain['user_id']
+                await update_captain_status(user_id, 'captain', i)
 
-    finally:
-        await conn.close()
+            message_target = update.message if update.message else update.callback_query.message
+            await message_target.reply_text("Капитаны успешно назначены для команд.")
+
+    except Exception as e:
+        logger.error(f"Ошибка при назначении капитанов и отправке уведомления: {e}")
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
 
 async def update_captain_status(user_id, status, team_number=None):
-    conn = await get_db_connection()
     try:
-        if status == 'captain' and team_number is not None:
-            query = """
-                UPDATE players 
-                SET status = $1, team = $2 
-                WHERE user_id = $3;
-            """
-            await conn.execute(query, status, str(team_number), user_id) 
-        else:
-            query = "UPDATE players SET status = $1 WHERE user_id = $2;"
-            await conn.execute(query, status, user_id)
-    finally:
-        await conn.close()
+        async with await get_db_connection() as conn:
+            if status == 'captain' and team_number is not None:
+                query = """
+                    UPDATE players 
+                    SET status = $1, team = $2 
+                    WHERE user_id = $3;
+                """
+                await conn.execute(query, status, str(team_number), user_id)
+            else:
+                query = "UPDATE players SET status = $1 WHERE user_id = $2;"
+                await conn.execute(query, status, user_id)
+
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении статуса капитана для пользователя {user_id}: {e}")
 
 async def accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -640,80 +658,95 @@ async def start_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_player_buttons(update, players, context)
 
 async def get_best_players():
-    conn = await get_db_connection()
+    try:
+        async with await get_db_connection() as conn:
+            query = """
+                SELECT user_id, rank, playtime, pool, COALESCE(subrank, 0) AS subrank 
+                FROM players 
+                WHERE (status = 'ready') 
+                  AND (rank IS NOT NULL AND rank <> '')
+                ORDER BY ARRAY_POSITION($1::text[], rank) ASC,
+                        subrank DESC,
+                        ARRAY_POSITION($2::text[], playtime) DESC
+                LIMIT 5;
+            """
+            players = await conn.fetch(query, RANKS, list(reversed(PLAYTIME_OPTIONS)))
+            
+            logger.info(f'Игроки: {players}')
+            
+            return players
 
-    query = """
-        SELECT user_id, rank, playtime, pool, COALESCE(subrank, 0) AS subrank 
-        FROM players 
-        WHERE (status = 'ready') 
-          AND (rank IS NOT NULL AND rank <> '')
-        ORDER BY ARRAY_POSITION($1::text[], rank) ASC,
-                    subrank DESC,
-                    ARRAY_POSITION($2::text[], playtime) DESC
-        LIMIT 5;
-    """
-    players = await conn.fetch(query, RANKS, list(reversed(PLAYTIME_OPTIONS)))
-
-    logger.info(f'Игроки: {players}')
-
-    await conn.close()
-    return players
+    except Exception as e:
+        logger.error(f"Ошибка при получении лучших игроков: {e}")
+        return []
 
 async def get_team_id_for_current_turn():
     global UP_DOWN
     
-    conn = await get_db_connection()
-    
-    query = "SELECT team FROM players WHERE team IS NOT NULL"
-    result = await conn.fetch(query)
-    logger.info(f'Номера команд: {result}')
-    await conn.close()
-    
-    if not result:
-        return None
-    
-    teams = [row['team'] for row in result]
-    
-    team_counts = Counter(teams)
-    
-    if any(count == 6 for count in team_counts.values()):
-        team_counts = {team: count for team, count in team_counts.items() if count != 6}
-    
-    if len(set(team_counts.values())) == 1:
-        UP_DOWN = "DOWN" if UP_DOWN == "UP" else "UP"
-
-    if UP_DOWN == "UP":
+    try:
+        async with await get_db_connection() as conn:
+            query = "SELECT team FROM players WHERE team IS NOT NULL"
+            result = await conn.fetch(query)
+            logger.info(f'Номера команд: {result}')
+        
+        if not result:
+            return None
+        
+        teams = [row['team'] for row in result]
+        
+        team_counts = Counter(teams)
+        
+        if any(count == 6 for count in team_counts.values()):
+            team_counts = {team: count for team, count in team_counts.items() if count != 6}
+        
+        if len(set(team_counts.values())) == 1:
+            UP_DOWN = "DOWN" if UP_DOWN == "UP" else "UP"
+        
+        if UP_DOWN == "UP":
             min_count = min(team_counts.values())
             min_teams = [team for team, count in team_counts.items() if count == min_count]
             return min(min_teams)
-    else:
-        if team_counts:
-            min_count = min(team_counts.values())
-            min_teams = [team for team, count in team_counts.items() if count == min_count]
-            return max(min_teams)
-    
-    return "complete"
+        else:
+            if team_counts:
+                min_count = min(team_counts.values())
+                min_teams = [team for team, count in team_counts.items() if count == min_count]
+                return max(min_teams)
+        
+        return "complete"
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении команды для текущего тура: {e}")
+        return
 
-async def update_player_status(user_id, team_id):
-    conn = await get_db_connection()
-    
+async def update_player_status(user_id, team_id, context: ContextTypes.DEFAULT_TYPE):
     user_id = int(user_id)
     team_id = str(team_id)
 
     try:
-        query = """
-            UPDATE players 
-            SET status = 'player', team = $1 
-            WHERE user_id = $2;
-        """
-        await conn.execute(query, team_id, user_id)
-        logger.info(f"Игрок {user_id} теперь в команде {team_id}.")
+        async with await get_db_connection() as conn:
+            query = """
+                UPDATE players 
+                SET status = 'player', team = $1 
+                WHERE user_id = $2;
+            """
+            await conn.execute(query, team_id, user_id)
+            logger.info(f"Игрок {user_id} теперь в команде {team_id}.")
+
+        try:
+            await context.bot.send_message(
+                user_id,
+                f"Ты взят в команду № {team_id}."
+            )
+        except Exception as send_error:
+            if "Chat not found" in str(send_error):
+                logger.warning(f"Чат с пользователем {user_id} не найден. Сообщение не отправлено.")
+            else:
+                logger.error(f"Ошибка при отправке сообщения игроку {user_id}: {send_error}", exc_info=True)
+
     except Exception as e:
         logger.error(f"Ошибка при обновлении статуса игрока {user_id}: {e}", exc_info=True)
-    finally:
-        await conn.close()
 
-async def send_player_buttons(update: Update, players, context: CallbackContext):
+async def send_player_buttons(update: Update, players, context: ContextTypes.DEFAULT_TYPE):
     team_id = await get_team_id_for_current_turn()
     logger.info(f"Номер команды: {team_id}")
 
@@ -725,108 +758,146 @@ async def send_player_buttons(update: Update, players, context: CallbackContext)
         await context.bot.send_message(admin_id, "Команды укомплектованы.")
         return
     
-    conn = await get_db_connection()
-    query = "SELECT user_id FROM players WHERE status = 'captain' AND team = $1 LIMIT 1"
-    result = await conn.fetch(query, team_id)
-    await conn.close()
-    logger.info(f"Найденный капитан: {result}")
+    try:
+        async with await get_db_connection() as conn:
+            query = "SELECT user_id FROM players WHERE status = 'captain' AND team = $1 LIMIT 1"
+            result = await conn.fetch(query, team_id)
+            logger.info(f"Найденный капитан: {result}")
 
-    if not result:
-        await update.message.reply_text("Не удалось найти капитана для этой команды.")
-        return
+            if not result:
+                await update.message.reply_text("Не удалось найти капитана для этой команды.")
+                return
 
-    captain_user_id = result[0]['user_id']
+            captain_user_id = result[0]['user_id']
 
-    player_info_text = ""
-    buttons = []
+        player_info_text = ""
+        buttons = []
 
-    for index, player in enumerate(players, start=1):
-        user_id = player['user_id']
-        rank = player['rank']
-        subrank = player['subrank']
-        playtime = player.get('playtime', 'Не указано')
-        pool = player.get('pool', 'Не указано')
+        for index, player in enumerate(players, start=1):
+            user_id = player['user_id']
+            rank = player['rank']
+            subrank = player['subrank']
+            playtime = player.get('playtime', 'Не указано')
+            pool = player.get('pool', 'Не указано')
 
-        full_rank = f"{rank} {subrank}"
-        pool_text = pool
+            full_rank = f"{rank} {get_roman_numeral(subrank)}"
+            pool_text = pool if pool != 'Не указано' else 'Не выбран'
 
-        if pool_text == 'Не указано':
-            pool_text = 'Не выбран'
+            if pool != 'Не указано':
+                pool_text = ', '.join([hero.strip() for hero in pool.split(',')])
+            else:
+                pool_text = 'Не выбран'
 
+            player_info_text += f"—🛡️ <b>Ранг:</b> {full_rank}\n"
+            player_info_text += f"<b>{index}</b> ⏳ <b>Часы в игре:</b> {playtime}\n"
+            player_info_text += f"—🦸‍♂️ <b>Герои:</b> {pool_text}\n\n"
 
-        player_info_text += f"—🛡️ <b>Ранг:</b> {full_rank}\n"
-        player_info_text += f"<b>{index}</b> ⏳ <b>Часы в игре:</b> {playtime}\n"
-        player_info_text += f"—🦸‍♂️ <b>Герои:</b> {pool_text}\n\n"
+            button = InlineKeyboardButton(str(index), callback_data=f"pick_{user_id}_{captain_user_id}_{team_id}")
+            buttons.append(button)
 
-        button = InlineKeyboardButton(str(index), callback_data=f"pick_{user_id}_{captain_user_id}_{team_id}")
-        buttons.append(button)
+        keyboard = InlineKeyboardMarkup([buttons])
 
-
-    keyboard = InlineKeyboardMarkup([buttons])
-
-
-    await context.bot.send_message(
-        captain_user_id,
-        f"Выберите игрока для вашей команды:\n\n{player_info_text}",
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
+        await context.bot.send_message(
+            captain_user_id,
+            f"Выберите игрока для вашей команды:\n\n{player_info_text}",
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при отправке кнопок для капитана: {e}")
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
 
 ######################################################################################################################
 
-async def my_team(update: Update, context: CallbackContext):
-    conn = await get_db_connection()
+async def tournament_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("✅ Да", callback_data="confirm_refresh"),
+         InlineKeyboardButton("❌ Нет", callback_data="cancel_refresh")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
+    await update.message.reply_text("Очистить все данные?", reply_markup=reply_markup)
+
+async def clear_tournament_data():
+    try:
+        async with await get_db_connection() as conn:
+            query = """
+            UPDATE players 
+            SET username = NULL, phone = NULL, rank = NULL, subrank = NULL, 
+                pool = NULL, playtime = NULL, status = NULL, team = NULL;
+            """
+            await conn.execute(query)
+
+        return "✅ Турнирные данные успешно сброшены!"
+
+    except Exception as e:
+        logger.error(f"Ошибка при сбросе данных турнира: {e}")
+        return "⚠️ Произошла ошибка. Попробуйте позже."
+
+######################################################################################################################
+
+async def my_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    user_query = "SELECT team FROM players WHERE user_id = $1"
-    user_team_result = await conn.fetchval(user_query, user_id)
-    
-    if not user_team_result:
-        await update.message.reply_text("Вы не состоите в команде.")
-        await conn.close()
-        return
 
-    team_number = str(user_team_result)
+    try:
+        async with await get_db_connection() as conn:
+            user_team_result = await conn.fetchval("SELECT team FROM players WHERE user_id = $1", user_id)
 
-    query = """
-        SELECT user_id, username, phone, rank, subrank, playtime, pool, status 
-        FROM players 
-        WHERE team = $1
-    """
-    players_result = await conn.fetch(query, team_number)
-    await conn.close()
+            if not user_team_result:
+                await update.message.reply_text("Вы не состоите в команде.")
+                return
 
-    if not players_result:
-        await update.message.reply_text("В вашей команде нет игроков.")
-        return
+            team_number = str(user_team_result)
 
-    captain_info = "Капитан не найден."
-    players_info = ""
+            players_result = await conn.fetch("""
+                SELECT user_id, username, phone, rank, subrank, playtime, pool, status 
+                FROM players 
+                WHERE team = $1
+            """, team_number)
 
-    for player in players_result:
-        if player['username']:
-            player_nickname = f"@{player['username']}"
-        elif player['phone']:
-            player_nickname = f"{player['phone']}"
-        else:
-            player_nickname = "Не указано."
+            if not players_result:
+                await update.message.reply_text("В вашей команде нет игроков.")
+                return
 
-        player_info = (
-            f"💬 <b>ТГ:</b> {player_nickname}\n"
-            f"🛡️ <b>Ранг:</b> {player['rank']} {get_roman_numeral(player['subrank'])}\n"
-            f"⏳ <b>Часы в игре:</b> {player['playtime']}\n"
-            f"🦸‍♂️ <b>Герои:</b> {player['pool']}\n"
-        )
+            captain_info = "Капитан не найден."
+            players_info = ""
 
-        if player['status'] == 'captain':
-            captain_info = f"Капитан:\n{player_info}"
-        else:
-            players_info += f"\n{player_info}"
+            for player in players_result:
+                if player['username']:
+                    player_nickname = f"@{player['username']}"
+                elif player['phone']:
+                    player_nickname = f"{player['phone']}"
+                else:
+                    player_nickname = "Не указано."
 
-    await update.message.reply_text(
-        text=f"<b>Ваша команда</b> № {team_number}\n\n{captain_info}{players_info}",
-        parse_mode="HTML"
-    )
+                if player['pool'] and player['pool'] != 'Не указано':
+                    pool_text = ', '.join([hero.strip() for hero in player['pool'].split(',')])
+                else:
+                    pool_text = 'Не выбран'
+
+                player_info = (
+                    f"💬 <b>ТГ:</b> {player_nickname}\n"
+                    f"🛡️ <b>Ранг:</b> {player['rank']} {get_roman_numeral(player['subrank'])}\n"
+                    f"⏳ <b>Часы в игре:</b> {player['playtime']}\n"
+                    f"🦸‍♂️ <b>Герои:</b> {pool_text}\n"
+                )
+
+                if player['status'] == 'captain':
+                    captain_info = f"Капитан:\n{player_info}"
+                else:
+                    players_info += f"\n{player_info}"
+
+            await update.message.reply_text(
+                text=f"<b>Ваша команда</b> № {team_number}\n\n{captain_info}{players_info}",
+                parse_mode="HTML"
+            )
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении информации о команде: {e}")
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
+
+######################################################################################################################
 
 def get_roman_numeral(subrank_index):
     if 1 <= subrank_index <= len(roman_numerals):
@@ -835,147 +906,150 @@ def get_roman_numeral(subrank_index):
 
 ######################################################################################################################
 
-async def enemy_team(update: Update, context: CallbackContext):
-    conn = await get_db_connection()
-
+async def enemy_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    user_query = "SELECT team FROM players WHERE user_id = $1"
-    user_team_result = await conn.fetchval(user_query, user_id)
+
+    try:
+        async with await get_db_connection() as conn:
+            user_team_result = await conn.fetchval("SELECT team FROM players WHERE user_id = $1", user_id)
+            
+            if not user_team_result:
+                await update.message.reply_text("Вы не состоите в команде.")
+                return
+
+            teams_result = await conn.fetch("SELECT DISTINCT team FROM players WHERE team IS NOT NULL AND team != $1 ORDER BY team ASC", user_team_result)
+
+            if not teams_result:
+                await update.message.reply_text("Нет доступных команд.")
+                return
+
+            keyboard = [
+                [InlineKeyboardButton(f"Команда № {team['team']}", callback_data=f"enemy_{team['team']}")]
+                for team in teams_result if team['team'] is not None
+            ]
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text("Выберите команду:", reply_markup=reply_markup)
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении информации о командах: {e}")
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
+
+async def show_enemy_team(update: Update, context: ContextTypes.DEFAULT_TYPE, team_id: int):
+    try:
+        team_number = str(team_id)
+
+        async with await get_db_connection() as conn:
+            query = """
+                SELECT user_id, username, phone, rank, subrank, playtime, pool, status 
+                FROM players 
+                WHERE team = $1
+            """
+            players_result = await conn.fetch(query, team_number)
+
+            if not players_result:
+                await update.callback_query.answer("Команда пуста.")
+                return
+
+            captain_info = "Капитан не найден."
+            players_info = ""
+
+            for player in players_result:
+                player_nickname = f"@{player['username']}" if player['username'] else (f"{player['phone']}" if player['phone'] else "Не указано.")
+
+                if player['pool'] and player['pool'] != 'Не указано':
+                    pool_text = ', '.join([hero.strip() for hero in player['pool'].split(',')])
+                else:
+                    pool_text = 'Не выбран'
+
+                player_info = (
+                    f"💬 <b>ТГ:</b> {player_nickname}\n"
+                    f"🛡️ <b>Ранг:</b> {player['rank']} {get_roman_numeral(player['subrank'])}\n"
+                    f"⏳ <b>Часы в игре:</b> {player['playtime']}\n"
+                    f"🦸‍♂️ <b>Герои:</b> {pool_text}\n"
+                )
+
+                if player['status'] == 'captain':
+                    captain_info = f"Капитан:\n{player_info}"
+                else:
+                    players_info += f"\n{player_info}"
+
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                text=f"<b>Команда соперников</b> № {team_number}\n\n{captain_info}{players_info}",
+                parse_mode="HTML"
+            )
     
-    if not user_team_result:
-        await update.message.reply_text("Вы не состоите в команде.")
-        await conn.close()
-        return
-
-    query = "SELECT DISTINCT team FROM players WHERE team IS NOT NULL AND team != $1 ORDER BY team ASC"
-    teams_result = await conn.fetch(query, user_team_result)
-    await conn.close()
-
-    if not teams_result:
-        await update.message.reply_text("Нет доступных команд.")
-        return
-
-    # Создаем клавиатуру
-    keyboard = [
-        [InlineKeyboardButton(f"Команда № {team['team']}", callback_data=f"enemy_{team['team']}")]
-        for team in teams_result if team['team'] is not None
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите команду:", reply_markup=reply_markup)
-
-async def show_enemy_team(update: Update, context: CallbackContext, team_id: int):
-    conn = await get_db_connection()
-
-    team_number = str(team_id)
-
-    query = """
-        SELECT user_id, username, phone, rank, subrank, playtime, pool, status 
-        FROM players 
-        WHERE team = $1
-    """
-    players_result = await conn.fetch(query, team_number)
-    await conn.close()
-
-    if not players_result:
-        await update.callback_query.answer("Команда пуста.")
-        return
-
-    captain_info = "Капитан не найден."
-    players_info = ""
-
-    for player in players_result:
-        if player['username']:
-            player_nickname = f"@{player['username']}"
-        elif player['phone']:
-            player_nickname = f"{player['phone']}"
-        else:
-            player_nickname = "Не указано."
-
-        player_info = (
-            f"💬 <b>ТГ:</b> {player_nickname}\n"
-            f"🛡️ <b>Ранг:</b> {player['rank']} {get_roman_numeral(player['subrank'])}\n"
-            f"⏳ <b>Часы в игре:</b> {player['playtime']}\n"
-            f"🦸‍♂️ <b>Герои:</b> {player['pool']}\n"
-        )
-
-        if player['status'] == 'captain':
-            captain_info = f"Капитан:\n{player_info}"
-        else:
-            players_info += f"\n{player_info}"
-
-    await update.callback_query.answer()
-    await update.callback_query.edit_message_text(
-        text=f"<b>Команда соперников</b> № {team_number}\n\n{captain_info}{players_info}",
-        parse_mode="HTML"
-    )
+    except Exception as e:
+        logger.error(f"Ошибка при отображении команды соперников: {e}")
+        await update.callback_query.answer("Произошла ошибка. Попробуйте позже.")
 
 ######################################################################################################################
 
-async def swap_player(update: Update, context: CallbackContext):
-    conn = await get_db_connection()
+async def swap_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.message.from_user.id
 
-    user_id = update.message.from_user.id
+        async with await get_db_connection() as conn:
+            user_query = "SELECT team FROM players WHERE user_id = $1"
+            user_team_result = await conn.fetchval(user_query, user_id)
 
-    user_query = "SELECT team FROM players WHERE user_id = $1"
-    user_team_result = await conn.fetchval(user_query, user_id)
+            if not user_team_result:
+                await update.message.reply_text("Вы не состоите в команде.")
+                return
 
-    if not user_team_result:
-        await update.message.reply_text("Вы не состоите в команде.")
-        await conn.close()
-        return
+            team_number = str(user_team_result)
 
-    team_number = str(user_team_result)
+            captain_query = "SELECT status FROM players WHERE user_id = $1 AND team = $2"
+            user_status = await conn.fetchval(captain_query, user_id, team_number)
 
-    captain_query = "SELECT status FROM players WHERE user_id = $1 AND team = $2"
-    user_status = await conn.fetchval(captain_query, user_id, team_number)
+            if not user_status or user_status != 'captain':
+                await update.message.reply_text("Только капитан может вызвать эту команду.")
+                return
 
-    if user_status != 'captain':
-        await update.message.reply_text("Только капитан может вызвать эту команду.")
-        await conn.close()
-        return
+            query = """
+                SELECT user_id, username, phone 
+                FROM players 
+                WHERE team = $1 AND status != 'captain'
+            """
+            players_result = await conn.fetch(query, team_number)
 
-    query = """
-        SELECT user_id, username, phone 
-        FROM players 
-        WHERE team = $1 AND status != 'captain'
-    """
-    players_result = await conn.fetch(query, team_number)
-    await conn.close()
+            if not players_result:
+                await update.message.reply_text("В вашей команде нет игроков.")
+                return
 
-    if not players_result:
-        await update.message.reply_text("В вашей команде нет игроков.")
-        return
+            keyboard = []
+            for player in players_result:
+                player_nickname = player['username'] if player['username'] else player['phone']
+                keyboard.append(
+                    [InlineKeyboardButton(f"{player_nickname}", callback_data=f"choiceswap_{player['user_id']}_{team_number}")]
+                )
 
-    keyboard = []
-    for player in players_result:
-        player_nickname = player['username'] if player['username'] else player['phone']
-        keyboard.append(
-            [InlineKeyboardButton(f"{player_nickname}", callback_data=f"choiceswap_{player['user_id']}_{team_number}")]
-        )
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text("Кого заменить?", reply_markup=reply_markup)
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Кого заменить?", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Ошибка при вызове функции swap_player: {e}")
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
 
 async def del_player_from_team(user_id):
     try:
         user_id = int(user_id)
-        conn = await get_db_connection()
 
-        update_query = """
-        UPDATE players 
-        SET team = NULL, status = 'close'
-        WHERE user_id = $1;
-        """
-        await conn.execute(update_query, user_id)
-        logger.info(f"Игрок {user_id} удален из команды.")
+        async with await get_db_connection() as conn:
+            update_query = """
+                UPDATE players 
+                SET team = NULL, status = 'close'
+                WHERE user_id = $1;
+            """
+            await conn.execute(update_query, user_id)
+            logger.info(f"Игрок {user_id} удален из команды.")
+    
     except Exception as e:
         logger.error(f"Ошибка при удалении игрока {user_id}: {e}", exc_info=True)
         raise
-    finally:
-        await conn.close()
 
-async def pick_new_player(update: Update, players, team_id, context: CallbackContext):
+async def pick_new_player(update: Update, players, team_id, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     message_target = query.message if query else update.message
 
@@ -993,8 +1067,13 @@ async def pick_new_player(update: Update, players, team_id, context: CallbackCon
         playtime = player.get('playtime', 'Не указано')
         pool = player.get('pool', 'Не указано')
 
-        full_rank = f"{rank} {subrank}"
-        pool_text = "Не выбран" if pool == "Не указано" else pool
+        full_rank = f"{rank} {get_roman_numeral(subrank)}"
+
+        # Форматируем pool
+        if pool != 'Не указано':
+            pool_text = ', '.join([hero.strip() for hero in pool.split(',')])
+        else:
+            pool_text = 'Не выбран'
 
         player_info_text += f"—🛡️ <b>Ранг:</b> {full_rank}\n"
         player_info_text += f"<b>{index}</b> ⏳ <b>Часы в игре:</b> {playtime}\n"
@@ -1013,89 +1092,87 @@ async def pick_new_player(update: Update, players, team_id, context: CallbackCon
 
 ######################################################################################################################
 
-async def swap_captain(update: Update, context: CallbackContext):
-    conn = await get_db_connection()
-
-    user_id = update.message.from_user.id
-
-    user_query = "SELECT team FROM players WHERE user_id = $1"
-    user_team_result = await conn.fetchval(user_query, user_id)
-
-    if not user_team_result:
-        await update.message.reply_text("Вы не состоите в команде.")
-        await conn.close()
-        return
-
-    team_number = str(user_team_result)
-
-    captain_query = "SELECT status FROM players WHERE user_id = $1 AND team = $2"
-    user_status = await conn.fetchval(captain_query, user_id, team_number)
-
-    if user_status != 'captain':
-        await update.message.reply_text("Только капитан может вызвать эту команду.")
-        await conn.close()
-        return
-
-    query = """
-        SELECT user_id, username, phone 
-        FROM players 
-        WHERE team = $1
-    """
-    players_result = await conn.fetch(query, team_number)
-    await conn.close()
-
-    if not players_result:
-        await update.message.reply_text("В вашей команде нет игроков.")
-        return
-
-    keyboard = []
-    for player in players_result:
-        player_nickname = player['username'] if player['username'] else player['phone']
-        keyboard.append(
-            [InlineKeyboardButton(f"{player_nickname}", callback_data=f"swapcaptain_{player['user_id']}_{team_number}")]
-        )
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Кого назначить капитаном?", reply_markup=reply_markup)
-
-async def get_new_captain(user_id, team_id):
-    conn = await get_db_connection()
-
+async def swap_captain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        user_id = int(user_id)
-        team_id = str(team_id)
-        current_captain_query = """
-            SELECT user_id FROM players 
-            WHERE team = $1 AND status = 'captain'
-        """
-        current_captain = await conn.fetchval(current_captain_query, team_id)
+        async with await get_db_connection() as conn:
+            user_id = update.message.from_user.id
 
-        if current_captain:
-            update_captain_query = """
-                UPDATE players 
-                SET status = 'player' 
-                WHERE user_id = $1
+            user_query = "SELECT team FROM players WHERE user_id = $1"
+            user_team_result = await conn.fetchval(user_query, user_id)
+
+            if not user_team_result:
+                await update.message.reply_text("Вы не состоите в команде.")
+                return
+
+            team_number = str(user_team_result)
+
+            captain_query = "SELECT status FROM players WHERE user_id = $1 AND team = $2"
+            user_status = await conn.fetchval(captain_query, user_id, team_number)
+
+            if not user_status or user_status != 'captain':
+                await update.message.reply_text("Только капитан может вызвать эту команду.")
+                return
+            
+            query = """
+                SELECT user_id, username, phone 
+                FROM players 
+                WHERE team = $1
             """
-            await conn.execute(update_captain_query, current_captain)
+            players_result = await conn.fetch(query, team_number)
 
-        update_new_captain_query = """
-            UPDATE players 
-            SET status = 'captain' 
-            WHERE user_id = $1
-        """
-        await conn.execute(update_new_captain_query, user_id)
+            if not players_result:
+                await update.message.reply_text("В вашей команде нет игроков.")
+                return
 
-        logger.info(f"Новый капитан команды {team_id}: {user_id}")
+            keyboard = []
+            for player in players_result:
+                player_nickname = player['username'] if player['username'] else player['phone']
+                keyboard.append(
+                    [InlineKeyboardButton(f"{player_nickname}", callback_data=f"swapcaptain_{player['user_id']}_{team_number}")]
+                )
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text("Кого назначить капитаном?", reply_markup=reply_markup)
 
     except Exception as e:
-        logger.error(f"Ошибка при назначении нового капитана: {e}", exc_info=True)
+        logger.error(f"Ошибка при попытке смены капитана: {e}", exc_info=True)
+        await update.message.reply_text("Произошла ошибка при попытке смены капитана. Попробуйте снова позже.")
+
+async def get_new_captain(user_id, team_id):
+    try:
+        async with await get_db_connection() as conn:
+            user_id = int(user_id)
+            team_id = str(team_id)
+
+            current_captain_query = """
+                SELECT user_id FROM players 
+                WHERE team = $1 AND status = 'captain'
+            """
+            current_captain = await conn.fetchval(current_captain_query, team_id)
+            if current_captain:
+                update_captain_query = """
+                    UPDATE players 
+                    SET status = 'player' 
+                    WHERE user_id = $1
+                """
+                await conn.execute(update_captain_query, current_captain)
+
+            update_new_captain_query = """
+                UPDATE players 
+                SET status = 'captain' 
+                WHERE user_id = $1
+            """
+            await conn.execute(update_new_captain_query, user_id)
+
+            logger.info(f"Новый капитан команды {team_id}: {user_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при назначении нового капитана для команды {team_id} и пользователя {user_id}: {e}", exc_info=True)
         raise
-    finally:
-        await conn.close()
 
 ######################################################################################################################
 
-async def admin(update: Update, context: CallbackContext):
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != admin_id:
         return
 
@@ -1111,30 +1188,59 @@ async def admin(update: Update, context: CallbackContext):
         "/player_summary - кол-во регистраций и подтверждений\n\n"
 
         "/find_captain - отбор капитанов\n\n"
-        "/start_pick - набор игроков в команды"
+        "/start_pick - набор игроков в команды\n\n"
+
+        "/tournament_refresh - очистка всех данных\n\n"
     )
     
     await update.message.reply_text(admin_commands, parse_mode="HTML")
 
-async def player_summary(update: Update, context: CallbackContext):
+async def captain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.message.from_user.id
+
+        async with await get_db_connection() as conn:
+            captain_query = "SELECT status FROM players WHERE user_id = $1"
+            user_status = await conn.fetchval(captain_query, user_id)
+
+            if not user_status or user_status != 'captain':
+                await update.message.reply_text("Только капитан может вызвать эту команду.")
+                return
+
+            captain_commands = (
+                "⚙️ <b>Доступные команды капитана:</b>\n\n"
+
+                "/swap_player - Заменить игрока\n\n"
+                "/swap_captain - Назначить нового капитана\n"
+            )
+    
+            await update.message.reply_text(captain_commands, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"Ошибка при вызове команды captain: {e}")
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
+
+async def player_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != admin_id:
         return
 
-    conn = await get_db_connection()
+    try:
+        async with await get_db_connection() as conn:
+            query_registered = "SELECT COUNT(*) FROM players WHERE rank IS NOT NULL AND rank != ''"
+            registered_count = await conn.fetchval(query_registered)
 
-    query_registered = "SELECT COUNT(*) FROM players WHERE rank IS NOT NULL AND rank != ''"
-    registered_count = await conn.fetchval(query_registered)
+            query_ready = "SELECT COUNT(*) FROM players WHERE status IN ('ready', 'player', 'captain')"
+            ready_count = await conn.fetchval(query_ready)
 
-    query_ready = "SELECT COUNT(*) FROM players WHERE status = 'ready'"
-    ready_count = await conn.fetchval(query_ready)
+        message = (
+            f"Зарегистрированных игроков: {registered_count}\n"
+            f"Готовых к участию: {ready_count}"
+        )
+        await update.message.reply_text(message)
 
-    await conn.close()
-
-    message = (
-        f"Зарегистрированных игроков: {registered_count}\n"
-        f"Готовых к участию: {ready_count}"
-    )
-    await update.message.reply_text(message)
+    except Exception as e:
+        logger.error(f"Ошибка при получении статистики игроков: {e}", exc_info=True)
+        await update.message.reply_text("Произошла ошибка при получении статистики игроков.")
 
 ######################################################################################################################
 
@@ -1205,7 +1311,7 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id = int(user_id)
             captain_user_id = int(captain_user_id)
 
-            await update_player_status(user_id, team_id)
+            await update_player_status(user_id, team_id, context)
 
             try:
                 await context.bot.delete_message(chat_id=captain_user_id, message_id=query.message.message_id)
@@ -1268,7 +1374,7 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             _, user_id, team_id = data.split("_")
 
-            await update_player_status(user_id, team_id)
+            await update_player_status(user_id, team_id, context)
 
             await query.message.edit_text("Игрок успешно добавлен в команду.")
 
@@ -1293,6 +1399,15 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             swaping = False
         return
 
+    elif query.data == "confirm_refresh":
+        message = await clear_tournament_data()
+        await query.edit_message_text(message)
+        return
+
+    elif query.data == "cancel_refresh":
+        await query.edit_message_text("🚫 Отмена. Данные не были удалены.")
+        return
+
     logger.warning(f"Неизвестная callback_data: {data}")
     await query.message.reply_text("Произошла ошибка, попробуй еще раз.")
 
@@ -1307,8 +1422,9 @@ def register_handlers(application: Application):
 
     application.add_handler(CommandHandler("ready_check", ready_check))
     application.add_handler(CommandHandler("ready_stop", ready_stop))
-    application.add_handler(CommandHandler("start_pick", start_pick))
     application.add_handler(CommandHandler("find_captain", find_captain))
+    application.add_handler(CommandHandler("start_pick", start_pick))
+    application.add_handler(CommandHandler("tournament_refresh", tournament_refresh))
 
     application.add_handler(CommandHandler("my_team", my_team))
     application.add_handler(CommandHandler("enemy_team", enemy_team))
@@ -1316,6 +1432,7 @@ def register_handlers(application: Application):
     application.add_handler(CommandHandler("swap_captain", swap_captain))
 
     application.add_handler(CommandHandler("admin", admin))
+    application.add_handler(CommandHandler("captain", captain))
     application.add_handler(CommandHandler("player_summary", player_summary))
 
     application.add_handler(CallbackQueryHandler(buttons_handler, block=False))
