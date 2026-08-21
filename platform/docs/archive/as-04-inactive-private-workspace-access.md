@@ -12,9 +12,12 @@
 - Hardening production deployment run: `32457381384`
 - SSE revocation implementation commit: `81d3b27730cb5ec2d99b0eacb89de9a5a203e597`
 - SSE compatibility follow-up commit: `51e638c3606fba362259b3b49a2ac183eae16ce6`
-- Final CI verification run: `32460086766`
-- Final production deployment run: `32460277054`
-- Current verified AS-04 release: `gha-32460277054-1-51e638c3606f-20260821T074941Z`
+- Final AS-04 CI verification run: `32460086766`
+- Final AS-04 production deployment run: `32460277054`
+- Participant-lifecycle hardening commit: `cba27c7be7c7ca068499bd30395a1b70940f1a25`
+- Participant-lifecycle CI verification run: `32463218557`
+- Participant-lifecycle production deployment run: `32463433650`
+- Current verified release containing the AS-04 lifecycle hardening: `gha-32463433650-1-cba27c7be7c7-20260821T083045Z`
 
 ## Original finding
 
@@ -35,9 +38,25 @@ A follow-up review also found a long-lived variant: a participant who opened pri
 - If request-local stream context is unavailable, an existing invite-only tournament fails closed; public tournament stream behavior remains available after a visibility lookup.
 - Public-tournament behavior is otherwise unchanged.
 
+## Participant lifecycle follow-up
+
+A post-fix review found that the legacy organizer remove endpoint physically deleted `TournamentParticipant` while an already-issued `TournamentInviteAccess` row could remain. That destroyed the inactive-participant tombstone used to prevent self-rejoin and could allow a removed participant to join the same invite-only tournament again using retained invite access.
+
+Commit `cba27c7be7c7ca068499bd30395a1b70940f1a25` closes that lifecycle gap:
+
+- organizer participant removal now retains the participant row and changes it to `disqualified` instead of physically deleting it;
+- the existing compatibility `DELETE /tournaments/{slug}/participants/{participant_id}` still returns `204`, but the destructive handler is intercepted before deletion and the retained row records moderation actor/time;
+- transition to an inactive status still removes the participant from active ready/captain workflow and releases only that tournament's active player commitment;
+- a `disqualified` user cannot redeem an invite for the same tournament, and the rejection happens before invite access or `use_count` can be mutated;
+- the retained row therefore also continues to block self-join through the existing duplicate-participant check;
+- the normal participant roster continues to hide inactive records, while organizer-only `GET /tournaments/{slug}/participants/manage` exposes the full roster so the organizer can deliberately restore the participant through the existing moderation transition;
+- exclusion is scoped to one tournament. The regression test proves the same player can still accept an invite and join a different tournament.
+
+This follow-up does not close or weaken AS-03. Invite-use and participant-capacity serialization under concurrent requests remains a separate P1 correctness/security item.
+
 ## Verification
 
-The final hardening passed:
+The AS-04 authorization hardening passed:
 
 - unit coverage proving route matching is derived from the matched route rather than a suffix allowlist, including a hypothetical future tournament child route;
 - fail-closed status coverage proving `withdrawn`, `disqualified` and an unknown example status are denied while `registered`, `confirmed` and `checked_in` remain active;
@@ -51,10 +70,12 @@ The final hardening passed:
 
 The first SSE follow-up run exposed a compatibility regression in the low-level test helper that streams a synthetic nonexistent tournament ID directly, outside the HTTP authorization path. That regression blocked deployment, was corrected without weakening authorization for any existing private tournament, and the replacement commit `51e638c3606fba362259b3b49a2ac183eae16ce6` passed the full CI contour.
 
-GitHub Actions security/build run `32460086766` verified commit `51e638c3606fba362259b3b49a2ac183eae16ce6`. Production deployment run `32460277054` installed that exact CI-verified commit as release `gha-32460277054-1-51e638c3606f-20260821T074941Z`. Alembic remained at head `20260813_0038`; `deadlock-api`, `deadlock-worker`, `deadlock-web` and Nginx were active; origin and public deploy smoke passed.
+The participant-lifecycle follow-up added an end-to-end integration regression covering organizer removal, retained `disqualified` state, hidden active roster vs organizer management roster, same-tournament invite rejection without extra invite use, same-tournament rejoin rejection, private-workspace denial, successful participation in an unrelated tournament and explicit organizer restoration. Security/build run `32463218557` passed the complete backend suite (`643` tests, `1` skipped), Ruff, Bandit, `pip-audit`, secret scanning, frontend audit/typecheck/lint/build and Playwright smoke.
+
+Production deployment run `32463433650` installed exact commit `cba27c7be7c7ca068499bd30395a1b70940f1a25` as release `gha-32463433650-1-cba27c7be7c7-20260821T083045Z`. Alembic remained at head `20260813_0038`; `deadlock-api`, `deadlock-worker`, `deadlock-web` and Nginx were active; database, origin, public, CSP and SSE deployment smoke passed.
 
 No Cloudflare or Turnstile control was weakened, and no production challenge/security bypass was introduced for testing.
 
 ## Remaining scope
 
-AS-06 separately owns SSE connection-pressure limits, bounded long-lived connection counts and general disconnect/timeout resource cleanup. AS-04 owns authorization for private tournament reads and now enforces it both at request admission and throughout the lifetime of an active private bracket SSE stream.
+AS-03 separately owns concurrency-safe serialization of invite use and participant-capacity check/write operations. AS-06 separately owns SSE connection-pressure limits, bounded long-lived connection counts and general disconnect/timeout resource cleanup. AS-04 owns private-workspace authorization and the retained participant lifecycle required to prevent an organizer exclusion from being bypassed by self-rejoin.
