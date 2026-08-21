@@ -231,10 +231,7 @@ class PlatformTournamentPolicyApiTests(unittest.IsolatedAsyncioTestCase):
             registration_close,
         )
         slug = created["slug"]
-        self.assertEqual(
-            created["cover_url"],
-            "/assets/tournament-covers/tournament-cover-template-1-v1.webp",
-        )
+        self.assertIsNone(created["cover_url"])
 
         automation_result = await self._advance_tournament_automation(slug, registration_start)
         self.assertGreaterEqual(automation_result["registration_opened"], 1)
@@ -297,7 +294,6 @@ class PlatformTournamentPolicyApiTests(unittest.IsolatedAsyncioTestCase):
                     processor=object(),
                     storage=object(),
                 )
-
             with (
                 patch.object(tournament_routes, "api_media_service", side_effect=service_factory),
                 patch.object(
