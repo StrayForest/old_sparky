@@ -90,6 +90,23 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('platform_validate_wheelhouse.py" verify', script)
         self.assertIn('platform_validate_release_artifact.py"', script)
 
+    def test_build_derives_pip_wheel_from_tracked_lock(self) -> None:
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertIn('PINNED_PIP_VERSION="$(\n', script)
+        self.assertIn(
+            '/usr/bin/python3 -I - "$STAGING_DIR/requirements-platform.lock.txt"',
+            script,
+        )
+        self.assertIn(
+            "Tracked Python lock must contain exactly one pinned pip version", script
+        )
+        self.assertIn(
+            'PIP_WHEELS=("$WHEELHOUSE_DIR"/pip-"$PINNED_PIP_VERSION"-*.whl)',
+            script,
+        )
+        self.assertNotIn("pip-26.1.2-", script)
+
     def test_checksum_record_is_portable_and_installer_validator_is_authoritative(
         self,
     ) -> None:
