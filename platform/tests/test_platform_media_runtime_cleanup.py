@@ -3,10 +3,24 @@ from __future__ import annotations
 import unittest
 
 from apps.platform_api.app.api.schemas import MediaDescriptorResponse, MediaVariantResponse
+from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.media import compatibility_media_url
 
 
 class MediaRuntimeCleanupTests(unittest.TestCase):
+    def test_legacy_upload_route_is_not_registered(self) -> None:
+        route_paths = {
+            route.path
+            for route in create_app().routes
+            if isinstance(getattr(route, "path", None), str)
+        }
+        legacy_paths = sorted(
+            path
+            for path in route_paths
+            if path == "/api/v1/uploads" or path.startswith("/api/v1/uploads/")
+        )
+        self.assertEqual(legacy_paths, [])
+
     def test_legacy_url_is_never_returned_without_ready_media(self) -> None:
         self.assertIsNone(
             compatibility_media_url(
