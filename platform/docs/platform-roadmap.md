@@ -19,11 +19,13 @@ AS-05 public/private data-boundary work is resolved and archived with audit, pub
 
 AS-06 SSE connection pressure is resolved and archived with layered application/Nginx limits, lease-release/crash-expiry regression coverage and production-deployment evidence in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md).
 
+AS-07 R2/CDN runtime media cleanup is resolved and archived with migration inventory/reconciliation evidence, regression coverage, CI verification and production deployment in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Physical removal of runtime-inert legacy URL columns and migration-only helpers remains a separate post-grace cleanup.
+
 ## P2 — hardening and cleanup
 
-- **Next code-owned target — AS-07:** remove legacy R2 read contour and retained originals after approved inventory/backup verification.
-- AS-08: negative cache/background refresh for unknown patch IDs.
+- **Next code-owned target — AS-08:** replace synchronous external refresh work for unknown public patch IDs with bounded negative caching/coalesced background refresh and validate redirect/response bounds.
 - AS-09–AS-13: distributed auth counter, safe worker errors, config/CI drift and remaining audit hardening.
+- After the media grace period, remove the runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers once no migration/reconciliation path depends on them.
 - Continue reducing legacy/duplicate runtime and documentation paths after each replacement is proven.
 
 ## Operational / owner-controlled
