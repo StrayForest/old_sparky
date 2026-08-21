@@ -12,6 +12,7 @@
 - PostgreSQL is authoritative for durable state; Redis owns bounded ephemeral state, locks, cache and Celery transport; R2 is not a database.
 - Tournament invite-use and active participant-capacity decisions are serialized in PostgreSQL: invite claim/revoke locks the tournament row and then the invite row, while participant-count mutations serialize on the tournament row and inactive restoration rechecks capacity before reactivation.
 - Public bracket SSE uses layered admission protection: Redis-backed application leases bound global, source and authenticated-user concurrency, while Nginx retains an independent coarse source/global connection ceiling.
+- Public media rendering is one-way `R2 -> CDN -> browser`; the API does not proxy media object bytes or fall back to local-disk reads.
 
 ## Request and data flow
 
@@ -53,7 +54,9 @@ The platform connects directly to PostgreSQL. Add a database pooler only from me
 
 ## Media boundary
 
-Uploads stream into bounded private staging. The worker decodes, validates, normalizes and re-encodes WebP variants, writes immutable R2 keys, commits metadata and removes staging. Public R2 contains no new originals. API serialization builds CDN descriptors from DB rows and makes no render-path S3 read.
+Uploads stream into bounded private staging. The worker decodes, validates, normalizes and re-encodes WebP variants, writes immutable R2 keys, commits metadata and removes staging. Public R2 contains no new originals. API serialization builds CDN descriptors from committed media rows and makes no render-path S3 read.
+
+FastAPI exposes no `/api/v1/uploads/*` media-serving route and has no uploads `StaticFiles` mount. Normal runtime storage has no object-read API, R2 `get_object()`/`Body.read()` proxy path or R2-to-local-disk read fallback. Historical `avatar_url`, `banner_url` and `cover_url` fields may remain during the grace period, but runtime resolution ignores them; only ready `MediaDescriptor` URLs can reach public serialization. Legacy upload-URL parsing and object mutation helpers are migration/grace-period tooling only and must not become browser delivery paths.
 
 ## Trust boundaries
 
