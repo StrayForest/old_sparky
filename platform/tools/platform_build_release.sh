@@ -345,7 +345,27 @@ mkdir -m 0700 "$WHEELHOUSE_DIR"
   --requirement "$STAGING_DIR/requirements-platform.lock.txt"
 VERIFY_VENV="$STAGING_DIR/.wheelhouse-verify-venv"
 /usr/bin/python3 -I -m venv "$VERIFY_VENV"
-PIP_WHEELS=("$WHEELHOUSE_DIR"/pip-26.1.2-*.whl)
+PINNED_PIP_VERSION="$(
+  /usr/bin/python3 -I - "$STAGING_DIR/requirements-platform.lock.txt" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+lock = Path(sys.argv[1])
+versions = [
+    line.removeprefix("pip==").strip()
+    for line in lock.read_text(encoding="utf-8").splitlines()
+    if line.startswith("pip==")
+]
+if len(versions) != 1:
+    raise SystemExit("Tracked Python lock must contain exactly one pinned pip version.")
+version = versions[0]
+if re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+!-]*", version) is None:
+    raise SystemExit("Tracked pip version is unsafe.")
+print(version)
+PY
+)"
+PIP_WHEELS=("$WHEELHOUSE_DIR"/pip-"$PINNED_PIP_VERSION"-*.whl)
 if (( ${#PIP_WHEELS[@]} != 1 )) || [[ ! -f "${PIP_WHEELS[0]}" ]]; then
   echo "Release wheelhouse must contain exactly one pinned pip wheel." >&2
   exit 1
