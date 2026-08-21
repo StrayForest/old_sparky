@@ -1,0 +1,46 @@
+from __future__ import annotations
+
+import unittest
+
+from apps.platform_api.app.api.schemas import MediaDescriptorResponse, MediaVariantResponse
+from apps.platform_api.app.services.media import compatibility_media_url
+
+
+class MediaRuntimeCleanupTests(unittest.TestCase):
+    def test_legacy_url_is_never_returned_without_ready_media(self) -> None:
+        self.assertIsNone(
+            compatibility_media_url(
+                None,
+                preferred_variant="avatar-256",
+                legacy_url="/api/v1/uploads/avatars/legacy.webp",
+            )
+        )
+
+    def test_ready_media_returns_cdn_variant(self) -> None:
+        descriptor = MediaDescriptorResponse(
+            asset_id="asset-1",
+            purpose="profile_avatar",
+            status="ready",
+            error_code=None,
+            variants=[
+                MediaVariantResponse(
+                    name="avatar-256",
+                    width=256,
+                    height=256,
+                    byte_size=123,
+                    url="https://cdn.old-sparky.com/media/avatar.webp",
+                )
+            ],
+        )
+        self.assertEqual(
+            compatibility_media_url(
+                descriptor,
+                preferred_variant="avatar-256",
+                legacy_url="/api/v1/uploads/avatars/legacy.webp",
+            ),
+            "https://cdn.old-sparky.com/media/avatar.webp",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
