@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""Migrate legacy production upload references from R2 into immutable media variants."""
+"""Cut over legacy upload references into immutable R2 media variants.
+
+The command is intentionally migration-only. Persistent media ends in R2 and public
+reads go through the CDN. The local upload directory may be consulted only as a
+historical migration source; it is never a runtime fallback.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import Counter
+from contextlib import contextmanager
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path, PurePosixPath
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Iterator
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
@@ -33,19 +41,33 @@ LEGACY_PREFIXES = (
 )
 
 
+@dataclass(frozen=True)
+class LegacySourceSelection:
+    """One bounded source selected for a DB-referenced legacy upload."""
+
+    location: str
+    analysis_settings: Any
+    source_path: Path
+    source_bytes: int
+    source_sha256: str
+    r2_gets: int
+    local_reads: int
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Migrate DB-referenced legacy /api/v1/uploads objects directly from R2 "
-            "into immutable public media variants. No bucket listing or local "
-            "persistent fallback is used."
+            "Reconcile DB-referenced legacy /api/v1/uploads objects from R2/local "
+            "history into immutable public media variants. R2 is preferred when an "
+            "identical local duplicate exists. No bucket listing or runtime local "
+            "fallback is used."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Perform the bounded R2-to-immutable-media cutover.",
+        help="Perform the bounded legacy-to-immutable-media cutover.",
     )
     parser.add_argument("--env-file", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
@@ -243,6 +265,142 @@ def stage_legacy_r2_original(
     return destination
 
 
+def _resolve_local_original_if_present(
+    candidate: migration.LegacyMediaCandidate,
+    *,
+    upload_root: Path,
+) -> Path | None:
+    try:
+        return migration.resolve_local_original(candidate, upload_root=upload_root)
+    except migration.MigrationError as exc:
+        if exc.code == "source_missing":
+            return None
+        raise
+
+
+@contextmanager
+def materialize_legacy_source(
+    *,
+    client: object,
+    bucket_name: str,
+    candidate: migration.LegacyMediaCandidate,
+    settings,
+) -> Iterator[LegacySourceSelection]:
+    """Resolve one legacy reference without ever treating local disk as runtime storage.
+
+    R2 is the preferred migration source. If both R2 and local historical copies exist,
+    their bounded SHA-256/size must match exactly. A mismatch is a manual conflict.
+    """
+    max_bytes = int(settings.platform_media_max_input_bytes)
+    local_path = _resolve_local_original_if_present(
+        candidate,
+        upload_root=settings.platform_upload_dir,
+    )
+    local_bytes = 0
+    local_sha256: str | None = None
+    local_reads = 0
+    if local_path is not None:
+        local_bytes, local_sha256 = migration.hash_bounded_file(
+            local_path,
+            max_bytes=max_bytes,
+        )
+        local_reads = 1
+
+    with tempfile.TemporaryDirectory(prefix="old-sparky-r2-cutover-") as directory:
+        temporary_root = Path(directory)
+        r2_path: Path | None = None
+        r2_bytes = 0
+        r2_sha256: str | None = None
+        r2_gets = 0
+        try:
+            r2_path = stage_legacy_r2_original(
+                client=client,
+                bucket_name=bucket_name,
+                candidate=candidate,
+                destination_root=temporary_root,
+                max_bytes=max_bytes,
+            )
+            r2_gets = 1
+            r2_bytes, r2_sha256 = migration.hash_bounded_file(
+                r2_path,
+                max_bytes=max_bytes,
+            )
+        except migration.MigrationError as exc:
+            if exc.code != "legacy_r2_source_missing":
+                raise
+
+        if r2_path is not None and local_path is not None:
+            if r2_bytes != local_bytes or r2_sha256 != local_sha256:
+                raise migration.MigrationError(
+                    "legacy_source_conflict",
+                    "Legacy R2 and local originals differ; manual reconciliation is required.",
+                )
+            location = "both"
+            selected_path = r2_path
+            source_bytes = r2_bytes
+            source_sha256 = str(r2_sha256)
+            analysis_settings = settings.model_copy(
+                update={"platform_upload_dir": temporary_root}
+            )
+        elif r2_path is not None:
+            location = "r2"
+            selected_path = r2_path
+            source_bytes = r2_bytes
+            source_sha256 = str(r2_sha256)
+            analysis_settings = settings.model_copy(
+                update={"platform_upload_dir": temporary_root}
+            )
+        elif local_path is not None:
+            location = "local"
+            selected_path = local_path
+            source_bytes = local_bytes
+            source_sha256 = str(local_sha256)
+            analysis_settings = settings
+        else:
+            raise migration.MigrationError(
+                "legacy_source_missing",
+                "DB-referenced legacy media is absent from both R2 and local history.",
+            )
+
+        yield LegacySourceSelection(
+            location=location,
+            analysis_settings=analysis_settings,
+            source_path=selected_path,
+            source_bytes=source_bytes,
+            source_sha256=source_sha256,
+            r2_gets=r2_gets,
+            local_reads=local_reads,
+        )
+
+
+def analyze_selected_source(
+    candidate: migration.LegacyMediaCandidate,
+    *,
+    selection: LegacySourceSelection,
+    settings,
+) -> migration.CandidateAnalysis:
+    analysis = migration.analyze_candidate(
+        candidate,
+        settings=selection.analysis_settings,
+        processor=migration.production_image_processor(settings),
+    )
+    if not analysis.ok:
+        raise migration.MigrationError(
+            analysis.error_code or "invalid_source",
+            "Legacy source failed media analysis.",
+        )
+    if (
+        analysis.source_path != selection.source_path
+        or analysis.source_bytes != selection.source_bytes
+        or analysis.source_sha256 != selection.source_sha256
+    ):
+        raise migration.MigrationError(
+            "legacy_source_changed",
+            "Legacy source changed while it was being analyzed.",
+        )
+    return analysis
+
+
 def summarize_inventory(
     candidates: list[migration.LegacyMediaCandidate],
 ) -> dict[str, int]:
@@ -268,9 +426,6 @@ def _record_verification(
     record: dict[str, Any],
     verification: dict[str, Any],
 ) -> None:
-    record["source_kind"] = "legacy_r2"
-    record["source_location"] = "r2"
-    record["legacy_r2_original_retained"] = True
     record["verified_at"] = migration.utc_iso()
     record["verification"] = {
         "ok": True,
@@ -290,6 +445,7 @@ async def verify_cutover_checkpoint_record(
     verify_cdn: bool,
     cdn_timeout: float,
 ) -> dict[str, Any]:
+    previous_source_kind = record.get("source_kind")
     record["source_kind"] = "local_upload"
     try:
         verification = await migration.verify_checkpoint_record(
@@ -300,9 +456,10 @@ async def verify_cutover_checkpoint_record(
             cdn_timeout=cdn_timeout,
         )
     finally:
-        record["source_kind"] = "legacy_r2"
-        record["source_location"] = "r2"
-        record["legacy_r2_original_retained"] = True
+        if previous_source_kind is None:
+            record.pop("source_kind", None)
+        else:
+            record["source_kind"] = previous_source_kind
     _record_verification(record, verification)
     return verification
 
@@ -318,6 +475,64 @@ def cutover_checkpoint_records(checkpoint: dict[str, Any]) -> list[dict[str, Any
     ]
     records.sort(key=lambda record: str(record.get("cursor") or ""))
     return records
+
+
+def _source_report(selection: LegacySourceSelection) -> dict[str, Any]:
+    return {
+        "location": selection.location,
+        "source_bytes": selection.source_bytes,
+        "source_sha256": selection.source_sha256,
+    }
+
+
+def _base_operations() -> dict[str, int]:
+    return {
+        "r2_gets": 0,
+        "local_reads": 0,
+        "r2_head_objects": 0,
+        "cdn_gets": 0,
+        "list_objects": 0,
+        "legacy_r2_deletes": 0,
+        "local_deletes": 0,
+    }
+
+
+async def inspect_sources(
+    actionable: list[migration.LegacyMediaCandidate],
+    *,
+    settings,
+    legacy_client: object,
+) -> tuple[list[dict[str, Any]], Counter[str], dict[str, int]]:
+    results: list[dict[str, Any]] = []
+    locations: Counter[str] = Counter()
+    operations = _base_operations()
+    for candidate in actionable:
+        try:
+            with materialize_legacy_source(
+                client=legacy_client,
+                bucket_name=str(settings.platform_r2_bucket_name),
+                candidate=candidate,
+                settings=settings,
+            ) as selection:
+                analyze_selected_source(candidate, selection=selection, settings=settings)
+                operations["r2_gets"] += selection.r2_gets
+                operations["local_reads"] += selection.local_reads
+                locations[selection.location] += 1
+                results.append(
+                    {
+                        "cursor": candidate.cursor,
+                        "ok": True,
+                        **_source_report(selection),
+                    }
+                )
+        except Exception as exc:
+            code = (
+                exc.code
+                if isinstance(exc, migration.MigrationError)
+                else "source_inspection_failed"
+            )
+            results.append({"cursor": candidate.cursor, "ok": False, "code": code})
+    return results, locations, operations
 
 
 async def run_cutover(
@@ -350,46 +565,71 @@ async def run_cutover(
                 "code": "manual_conflicts_present",
                 "inventory_before": inventory_before,
                 "manual_conflicts": conflicts,
-                "operations": {"r2_gets": 0, "list_objects": 0},
+                "operations": _base_operations(),
             },
             2,
-        )
-
-    if not args.apply:
-        ready = not actionable
-        return (
-            {
-                "ok": ready,
-                "mode": "check",
-                "mutated": False,
-                "code": "ready" if ready else "legacy_r2_cutover_required",
-                "inventory_before": inventory_before,
-                "operations": {"r2_gets": 0, "list_objects": 0},
-            },
-            0 if ready else 2,
         )
 
     if len(actionable) > args.max_records:
         return (
             {
                 "ok": False,
-                "mode": "apply",
+                "mode": "apply" if args.apply else "check",
                 "mutated": False,
                 "code": "legacy_inventory_bound_exceeded",
                 "inventory_before": inventory_before,
                 "max_records": args.max_records,
-                "operations": {"r2_gets": 0, "list_objects": 0},
+                "operations": _base_operations(),
+            },
+            2,
+        )
+
+    if not actionable:
+        return (
+            {
+                "ok": True,
+                "mode": "apply" if args.apply else "check",
+                "mutated": False,
+                "code": "ready",
+                "inventory_before": inventory_before,
+                "source_locations": {},
+                "operations": _base_operations(),
+            },
+            0,
+        )
+
+    resolved_client = legacy_client or build_legacy_r2_client(settings)
+
+    if not args.apply:
+        inspected, locations, operations = await inspect_sources(
+            actionable,
+            settings=settings,
+            legacy_client=resolved_client,
+        )
+        failed = sum(not result["ok"] for result in inspected)
+        return (
+            {
+                "ok": False,
+                "mode": "check",
+                "mutated": False,
+                "code": (
+                    "legacy_source_conflicts_present"
+                    if failed
+                    else "legacy_media_cutover_required"
+                ),
+                "inventory_before": inventory_before,
+                "source_locations": dict(sorted(locations.items())),
+                "source_results": inspected,
+                "operations": operations,
             },
             2,
         )
 
     resolved_storage = storage or R2Storage.from_settings(settings)
-    resolved_client = legacy_client or build_legacy_r2_client(settings)
     checkpoint_store = migration.CheckpointStore(args.checkpoint)
     results: list[dict[str, Any]] = []
-    r2_gets = 0
-    head_objects = 0
-    cdn_gets = 0
+    source_locations: Counter[str] = Counter()
+    operations = _base_operations()
 
     with checkpoint_store:
         checkpoint = checkpoint_store.load()
@@ -404,7 +644,7 @@ async def run_cutover(
                     "code": "checkpoint_bound_exceeded",
                     "inventory_before": inventory_before,
                     "max_records": args.max_records,
-                    "operations": {"r2_gets": 0, "list_objects": 0},
+                    "operations": operations,
                 },
                 2,
             )
@@ -418,12 +658,9 @@ async def run_cutover(
                     cdn_timeout=args.cdn_timeout,
                 )
                 checkpoint_store.save(checkpoint)
-                head_objects += int(verification["head_objects"])
-                cdn_gets += int(verification["cdn_gets"])
+                operations["r2_head_objects"] += int(verification["head_objects"])
+                operations["cdn_gets"] += int(verification["cdn_gets"])
             except Exception as exc:
-                record["source_kind"] = "legacy_r2"
-                record["source_location"] = "r2"
-                record["legacy_r2_original_retained"] = True
                 record.pop("verified_at", None)
                 record["verification"] = {"ok": False}
                 record["verify_error_code"] = (
@@ -446,31 +683,20 @@ async def run_cutover(
         if not any(not result["ok"] for result in results):
             for candidate in actionable:
                 try:
-                    with tempfile.TemporaryDirectory(
-                        prefix="old-sparky-r2-cutover-"
-                    ) as directory:
-                        temporary_root = Path(directory)
-                        stage_legacy_r2_original(
-                            client=resolved_client,
-                            bucket_name=str(settings.platform_r2_bucket_name),
-                            candidate=candidate,
-                            destination_root=temporary_root,
-                            max_bytes=int(settings.platform_media_max_input_bytes),
-                        )
-                        r2_gets += 1
-                        transient_settings = settings.model_copy(
-                            update={"platform_upload_dir": temporary_root}
-                        )
-                        analysis = migration.analyze_candidate(
+                    with materialize_legacy_source(
+                        client=resolved_client,
+                        bucket_name=str(settings.platform_r2_bucket_name),
+                        candidate=candidate,
+                        settings=settings,
+                    ) as selection:
+                        operations["r2_gets"] += selection.r2_gets
+                        operations["local_reads"] += selection.local_reads
+                        source_locations[selection.location] += 1
+                        analysis = analyze_selected_source(
                             candidate,
-                            settings=transient_settings,
-                            processor=migration.production_image_processor(settings),
+                            selection=selection,
+                            settings=settings,
                         )
-                        if not analysis.ok:
-                            raise migration.MigrationError(
-                                analysis.error_code or "invalid_source",
-                                "Legacy R2 original failed media analysis.",
-                            )
                         applied = await migration.apply_candidate(
                             analysis,
                             checkpoint=checkpoint,
@@ -479,11 +705,18 @@ async def run_cutover(
                         if not applied["ok"]:
                             raise migration.MigrationError(
                                 str(applied.get("code") or "apply_failed"),
-                                "Legacy R2 original failed immutable media processing.",
+                                "Legacy source failed immutable media processing.",
                             )
                         record = checkpoint["records"][candidate.identity]
-                        record["source_location"] = "r2"
-                        record["legacy_r2_original_retained"] = True
+                        record["source_location"] = selection.location
+                        record["legacy_r2_original_retained"] = selection.location in {
+                            "r2",
+                            "both",
+                        }
+                        record["legacy_local_original_retained"] = selection.location in {
+                            "local",
+                            "both",
+                        }
                         verification = await verify_cutover_checkpoint_record(
                             record,
                             settings=settings,
@@ -492,14 +725,15 @@ async def run_cutover(
                             cdn_timeout=args.cdn_timeout,
                         )
                         checkpoint_store.save(checkpoint)
-                        head_objects += int(verification["head_objects"])
-                        cdn_gets += int(verification["cdn_gets"])
+                        operations["r2_head_objects"] += int(verification["head_objects"])
+                        operations["cdn_gets"] += int(verification["cdn_gets"])
                         results.append(
                             {
                                 "cursor": candidate.cursor,
                                 "asset_id": applied["asset_id"],
                                 "ok": True,
                                 "variants": verification["variants"],
+                                **_source_report(selection),
                             }
                         )
                 except Exception as exc:
@@ -510,9 +744,6 @@ async def run_cutover(
                     )
                     record = checkpoint.get("records", {}).get(candidate.identity)
                     if isinstance(record, dict):
-                        record["source_kind"] = "legacy_r2"
-                        record["source_location"] = "r2"
-                        record["legacy_r2_original_retained"] = True
                         record.pop("verified_at", None)
                         record["verification"] = {"ok": False}
                         record["verify_error_code"] = code
@@ -542,13 +773,8 @@ async def run_cutover(
         "failed": failed,
         "inventory_before": inventory_before,
         "inventory_after": inventory_after,
-        "operations": {
-            "r2_gets": r2_gets,
-            "r2_head_objects": head_objects,
-            "cdn_gets": cdn_gets,
-            "list_objects": 0,
-            "legacy_r2_deletes": 0,
-        },
+        "source_locations": dict(sorted(source_locations.items())),
+        "operations": operations,
         "results": results,
         "checkpoint": str(checkpoint_store.path),
     }
@@ -582,7 +808,7 @@ async def async_main(
     if settings.platform_environment.strip().lower() != "production":
         raise migration.MigrationError(
             "production_required",
-            "Legacy R2 cutover is restricted to the production environment.",
+            "Legacy media cutover is restricted to the production environment.",
         )
     migration.validate_database_boundary(settings)
     migration.validate_r2_mutation_boundary(settings)
@@ -599,12 +825,17 @@ def print_report(report: dict[str, Any], *, as_json: bool) -> None:
         print(json.dumps(report, sort_keys=True))
         return
     print(
-        "Legacy R2 media cutover: "
+        "Legacy media cutover: "
         f"mode={report.get('mode')}; "
         f"ok={str(bool(report.get('ok'))).lower()}; "
         f"mutated={str(bool(report.get('mutated'))).lower()}."
     )
-    print(json.dumps(report.get("inventory_after") or report.get("inventory_before"), sort_keys=True))
+    print(
+        json.dumps(
+            report.get("inventory_after") or report.get("inventory_before"),
+            sort_keys=True,
+        )
+    )
 
 
 async def run_with_cleanup(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -621,14 +852,14 @@ def main(argv: list[str] | None = None) -> int:
         print_report(report, as_json=args.as_json)
         return exit_code
     except migration.MigrationError as exc:
-        print(f"Legacy R2 media cutover blocked [{exc.code}]: {exc}", file=sys.stderr)
+        print(f"Legacy media cutover blocked [{exc.code}]: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("Legacy R2 media cutover interrupted.", file=sys.stderr)
+        print("Legacy media cutover interrupted.", file=sys.stderr)
         return 130
     except Exception as exc:
         print(
-            f"Legacy R2 media cutover failed safely: {type(exc).__name__}; "
+            f"Legacy media cutover failed safely: {type(exc).__name__}; "
             "no credentials were printed.",
             file=sys.stderr,
         )
