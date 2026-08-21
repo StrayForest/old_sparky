@@ -129,9 +129,9 @@ class PlatformProfilesApiTests(unittest.IsolatedAsyncioTestCase):
         payload = response.json()
         self.assertEqual(payload["handle"], handle)
         self.assertEqual(payload["deadlock_profile"]["rank"], "Oracle")
-        self.assertIsNone(payload["contact_email"])
-        self.assertIsNone(payload["steam_id"])
-        self.assertFalse(payload["steam_linked"])
+        self.assertNotIn("contact_email", payload)
+        self.assertNotIn("steam_id", payload)
+        self.assertNotIn("steam_linked", payload)
         self.assertEqual(payload["discord_account"], "private-discord")
         self.assertEqual(payload["region"], "Private region")
 
