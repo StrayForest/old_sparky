@@ -1,0 +1,24 @@
+name: Migration asset test
+
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/migration-asset-test.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify public production asset matches audited snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            https://old-sparky.com/assets/heroes/Abrams.png \
+            --output Abrams.png
+          test "$(stat -c '%s' Abrams.png)" = "115388"
+          test "$(git hash-object Abrams.png)" = "a751b0eaf01f9f834bbf56abacfd9f20361aad8c"
