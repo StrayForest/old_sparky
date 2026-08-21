@@ -12,7 +12,6 @@ This document contains only findings that still require action or direct operato
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
 | AS-02 | High / P1 | High | Cloudflare Access/MFA for privileged routes is not directly verified | Open; operator/dashboard evidence required |
-| AS-06 | Medium / P1 | High | Public SSE has no bounded per-source/global connection cap | Open |
 | AS-07 | Medium / P2 | High | Legacy upload/R2 read paths retain originals and buffer entire objects | Open; destructive removal requires approval |
 | AS-08 | Medium / P2 | High | Unknown public patch IDs can trigger synchronous external refresh work | Open |
 | AS-09 | Medium / P2 | Medium | Login protection has no account-wide counter across source IPs | Open |
@@ -38,14 +37,6 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 | Role grants and destructive pre-production cleanup | No | No | No | No | No | Yes |
 
 ## P1 findings
-
-### AS-06 — Unbounded public SSE connections
-
-- Risk: many long-lived public SSE connections can exhaust file descriptors, API/Redis connections or worker capacity.
-- Evidence owner: public tournament SSE route, bracket event service and Nginx SSE location.
-- Required result: bounded per-source/user and global connection pressure, clean disconnect/timeout release, sensible reconnect behavior and observable rejection.
-- Verification: concurrency/resource-limit tests plus Nginx/API smoke coverage.
-- Status: **Open; next implementation target**.
 
 ### AS-02 — Privileged route edge protection not proven
 
@@ -84,11 +75,10 @@ Verify the actual Cloudflare HSTS owner/value and rollback implications. Nginx m
 
 ## Remediation order
 
-1. AS-06 SSE connection pressure.
-2. AS-02 Cloudflare Access/MFA verification.
-3. AS-07 through AS-13 as bounded P2 packages; separate destructive, network-policy and product/privacy decisions where required.
-4. AS-14 remains operator verification work.
+1. AS-02 Cloudflare Access/MFA verification remains the only open P1 security finding that is directly owner-gated outside the repository.
+2. AS-07 through AS-13 proceed as bounded P2 packages; separate destructive, network-policy and product/privacy decisions where required.
+3. AS-14 remains operator verification work.
 
-Resolved AS-03 evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md).
+Resolved AS-03 evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md). Resolved AS-06 evidence is retained in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md).
 
 Any newly confirmed Critical issue or direct authentication bypass blocks production installation. Do not widen CSP, disable Turnstile, add privileged-route bypasses or weaken application RBAC to simplify testing.

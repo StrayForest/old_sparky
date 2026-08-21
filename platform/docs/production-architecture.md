@@ -11,6 +11,7 @@
 - Nginx is the only public origin listener. Application/data services bind loopback.
 - PostgreSQL is authoritative for durable state; Redis owns bounded ephemeral state, locks, cache and Celery transport; R2 is not a database.
 - Tournament invite-use and active participant-capacity decisions are serialized in PostgreSQL: invite claim/revoke locks the tournament row and then the invite row, while participant-count mutations serialize on the tournament row and inactive restoration rechecks capacity before reactivation.
+- Public bracket SSE uses layered admission protection: Redis-backed application leases bound global, source and authenticated-user concurrency, while Nginx retains an independent coarse source/global connection ceiling.
 
 ## Request and data flow
 
@@ -60,6 +61,7 @@ Uploads stream into bounded private staging. The worker decodes, validates, norm
 - Cookie mutations require application CSRF controls even behind Cloudflare.
 - Anonymous public response DTOs are explicit schema allowlists: account/contact email and Steam authentication identity do not cross the public-profile boundary, while participant moderation note, moderator identity and moderation timestamps are restricted to the organizer-management DTO.
 - Invite-only tournament workspace reads (`workspace`, roster, matches, bracket and bracket SSE admission) require active participant membership or explicit organizer/admin authority; retained `withdrawn`/`disqualified` participant rows are historical and grant no workspace access.
+- SSE admission state is ephemeral Redis state. Admission fails closed when that state cannot be consulted; normal termination releases the lease immediately, and bounded lease expiry recovers capacity after abnormal process/client termination.
 - R2, DB, mail, session and Turnstile secrets are backend-only and are not present in the web runtime environment.
 - The public media bucket and private backup bucket/tokens are separate.
 
@@ -71,4 +73,6 @@ Daily maintenance restore-verifies DB backups before pruning known artifacts. Of
 
 ## Capacity boundary
 
-The current VPS has two CPU cores and about 3.7 GiB RAM. Image concurrency starts at one. Additional workers, exporters, transforms, poolers or nodes require retained CPU/RSS/queue/DB evidence against the operations targets.
+The current VPS has two CPU cores and about 3.7 GiB RAM. Image concurrency starts at one. Public bracket SSE application admission is capped at 128 streams globally, 6 per source address and 4 per authenticated user; Nginx retains coarser hard ceilings of 160 globally and 8 per source address. Individual streams are bounded to 600 seconds, send keepalive opportunities every 15 seconds and advertise reconnect delay with 5–12 second jitter. These values are capacity safeguards, not product entitlements; change them only from retained load/resource evidence.
+
+Additional workers, exporters, transforms, poolers or nodes require retained CPU/RSS/queue/DB evidence against the operations targets.

@@ -18,16 +18,15 @@ Read this file for the current production baseline and next engineering priority
 - Organizer participant removal is a retained `disqualified` record rather than a physical participant-row deletion. A disqualified participant cannot redeem another invite or self-rejoin that same tournament, and a retry does not consume another invite use. The organizer-only management roster retains inactive rows for explicit restoration; the exclusion remains scoped to that tournament and does not block participation in unrelated tournaments.
 - Tournament invite claims/revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Last invite use and last participant slot cannot be consumed twice, and restoring a retained inactive participant rechecks capacity before making the row active again.
 - Anonymous public profile contracts omit account/contact email and Steam authentication identity. Public tournament participant/workspace contracts omit moderation note, moderator identity and moderation timestamps; organizer management uses a separate response DTO that retains those fields.
+- Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. Rejections are observable and stream lifetime/reconnect behavior is bounded.
 - Alembic head: `20260813_0038`.
 - Production contains the verified operator account and no test tournaments.
 
 ## Current engineering priority
 
-Resolve the remaining application-security/correctness P1 work in this order:
+No repository-owned P1 implementation remains after AS-06 closure.
 
-1. **AS-06 SSE connection pressure** — add bounded per-source/global long-lived connection controls and regression coverage.
-
-AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/platform-ops*` and `/api/v1/admin*` and does not replace application RBAC.
+AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/platform-ops*` and `/api/v1/admin*` and does not replace application RBAC. The next code-owned hardening target is AS-07 legacy upload/R2 cleanup, but destructive removal remains gated on approved inventory and backup verification.
 
 ## Production invariants
 
@@ -36,6 +35,7 @@ AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/pl
 - Organizer exclusion must retain the tournament participant row as `disqualified`; self-rejoin and same-tournament invite redemption remain blocked until the organizer deliberately restores an active status. This is tournament-scoped and must not become a platform-wide ban.
 - Invite use and active-participant capacity are transaction-scoped PostgreSQL invariants: invite claim/revoke locks the stable tournament and invite rows in tournament-to-invite order; active-roster mutations serialize on the tournament row and capacity is rechecked before an inactive retained participant becomes active.
 - Public API contracts are explicit allowlists. Account/contact email and Steam authentication identity do not belong to anonymous public-profile DTOs, and participant moderation metadata belongs only to organizer-management DTOs. A future public email feature requires a separate explicit opt-in contract rather than reusing account contact data.
+- Public bracket SSE must retain layered application/Nginx connection caps, fail closed when Redis-backed admission state is unavailable, release leases on normal termination and retain bounded expiry recovery after abnormal termination. Stream lifetime and reconnect timing must remain bounded.
 - Terminal tournament states freeze organizer match administration.
 - Preserve the live HTTPS/domain/secure-cookie contour unless a reviewed release changes it.
 - Rollback switches application releases; it does not automatically downgrade Alembic.

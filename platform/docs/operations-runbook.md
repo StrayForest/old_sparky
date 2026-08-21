@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-08-20
+- Last reviewed: 2026-08-21
 
 ## Runtime checks
 
@@ -115,6 +115,23 @@ dry-run by default; apply bounded batches only after a fresh verified backup,
 then verify by DB row and targeted HeadObject/CDN requests. Deletion requires a
 grace period and explicit approval.
 
+## SSE connection pressure
+
+Public bracket SSE has layered application and Nginx admission limits; the stable capacity values belong in [`production-architecture.md`](production-architecture.md). Application rejections are emitted as HTTP 429 with a bounded retry hint, limiter-backend failure is fail-closed as HTTP 503, and Nginx connection-limit rejection is also HTTP 429.
+
+Use the application journal and structured Nginx access log to distinguish ordinary reconnects from sustained pressure:
+
+```bash
+journalctl -u deadlock-api --since -1h --no-pager \
+  | grep -E 'Rejected SSE connection|Failed to release SSE connection lease|limiter backend is unavailable'
+
+grep '/bracket/events' /var/log/nginx/platform-access.log \
+  | grep '"status":429' \
+  | tail -n 50
+```
+
+The application logs a privacy-preserving source fingerprint rather than the raw source address for admission rejections. A failed immediate lease release is not by itself a leak: bounded expiry reclaims the slot, but repeated release failures indicate Redis/runtime trouble and require investigation. Do not raise SSE ceilings to suppress 429s without correlating them with legitimate concurrency and VPS/API/Redis resource evidence.
+
 ## Performance
 
 Targets under normal non-saturated load:
@@ -142,5 +159,6 @@ instead of hiding it with more local workers.
 - newest backup older than 24 hours or not restore-verified;
 - sustained Celery queue growth or retry exhaustion;
 - repeated 5xx/security delivery errors;
+- sustained SSE 429/503 outside expected abusive traffic, especially with API/Redis resource pressure;
 - p95 breach correlated with CPU, DB wait or lock evidence;
 - Origin CA expiry inside the monitor threshold.

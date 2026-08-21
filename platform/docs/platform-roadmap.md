@@ -8,12 +8,7 @@ For the production baseline and immediate engineering target, read [`CURRENT.md`
 
 ## P1 — security and correctness
 
-1. **AS-06 SSE connection pressure**
-   - add per-source/user and global long-lived connection limits;
-   - release limits correctly on disconnect/timeouts;
-   - cover API/Nginx behavior and resource-pressure regressions.
-
-2. **AS-02 privileged route access / MFA — operator-owned**
+1. **AS-02 privileged route access / MFA — operator-owned**
    - protect `/platform-ops*` and `/api/v1/admin*` with the approved Cloudflare/operator control;
    - retain application RBAC and audit events;
    - close only after direct dashboard/live evidence.
@@ -22,9 +17,11 @@ AS-03 tournament concurrency is resolved and archived with implementation, concu
 
 AS-05 public/private data-boundary work is resolved and archived with audit, public-contract tests and production-deployment evidence in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md).
 
+AS-06 SSE connection pressure is resolved and archived with layered application/Nginx limits, lease-release/crash-expiry regression coverage and production-deployment evidence in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md).
+
 ## P2 — hardening and cleanup
 
-- AS-07: remove legacy R2 read contour and retained originals after approval.
+- **Next code-owned target — AS-07:** remove legacy R2 read contour and retained originals after approved inventory/backup verification.
 - AS-08: negative cache/background refresh for unknown patch IDs.
 - AS-09–AS-13: distributed auth counter, safe worker errors, config/CI drift and remaining audit hardening.
 - Continue reducing legacy/duplicate runtime and documentation paths after each replacement is proven.
