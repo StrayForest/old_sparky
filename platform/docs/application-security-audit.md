@@ -12,8 +12,7 @@ This document contains only findings that still require action or direct operato
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
 | AS-02 | High / P1 | High | Cloudflare Access/MFA for privileged routes is not directly verified | Open; operator/dashboard evidence required |
-| AS-03 | Medium / P1 | High | Invite-use and participant-capacity checks are not serialised | Open |
-| AS-04 | Medium / P1 | High | Inactive participants can satisfy private-workspace access checks | Open; next implementation target |
+| AS-03 | Medium / P1 | High | Invite-use and participant-capacity checks are not serialised | Open; next implementation target |
 | AS-05 | Medium / P1 | High | Contact and moderation fields cross the documented public-data boundary | Open |
 | AS-06 | Medium / P1 | High | Public SSE has no bounded per-source/global connection cap | Open |
 | AS-07 | Medium / P2 | High | Legacy upload/R2 read paths retain originals and buffer entire objects | Open; destructive removal requires approval |
@@ -33,24 +32,14 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 |---|---|---|---|---|---|---|
 | Public home, patches, public profiles and public tournament summary | Read | Read | Read | Read | Read | Read |
 | Invite-only tournament summary | No, unless explicitly public metadata | With valid invite/access | Read | Read | Read | Read |
-| Roster, bracket, matches and SSE | Public tournaments: read; invite-only: no | No unless joined | Read | Own tournament: read/manage | Read/manage | Read/manage |
+| Roster, bracket, matches and SSE | Public tournaments: read; invite-only: no | No unless actively joined | Read | Own tournament: read/manage | Read/manage | Read/manage |
 | Own account/profile/media/session | No | Own records only | Own records only | Own records only | Own records only | Own records only |
 | Join/leave, ready and captain workflow | No | Subject to workflow eligibility | Own participant actions | Participant actions plus own-tournament management | App rules plus admin operations | App rules plus admin operations |
 | Tournament configuration, invites, moderation, bracket/results | No | No | No | Own tournament only | Administrative scope | Administrative scope |
 | Admin console/API | No | No | No | No by organizer role alone | Yes | Yes |
 | Role grants and destructive pre-production cleanup | No | No | No | No | No | Yes |
 
-The inactive-participant exception to the intended matrix is AS-04.
-
 ## P1 findings
-
-### AS-04 — Inactive participant records retain workspace visibility
-
-- Risk: a user who once joined an invite-only tournament can retain access after withdrawal, rejection, disqualification or another inactive transition.
-- Evidence owner: tournament workspace authorization helpers in `apps/platform_api/app/api/routes/tournaments.py`.
-- Required result: every private-workspace gate uses active/joined participation, while organizer/admin authorization stays explicit and independent.
-- Verification: role-matrix tests for every inactive status across roster, bracket, match and SSE reads.
-- Status: **Open; next implementation target**.
 
 ### AS-03 — Invite and capacity decisions race
 
@@ -58,7 +47,7 @@ The inactive-participant exception to the intended matrix is AS-04.
 - Evidence owner: invite claim, organizer participant-add and self-join check-and-write paths in `apps/platform_api/app/api/routes/tournaments.py`.
 - Required result: lock a stable tournament/invite row before check-and-write; add database-enforced invariants where practical.
 - Verification: deterministic concurrent integration tests for last invite use and last participant slot.
-- Status: **Open**.
+- Status: **Open; next implementation target**.
 
 ### AS-05 — Public data exceeds the privacy contract
 
@@ -109,16 +98,15 @@ The current workflow has been restored and is green, but the older finding must 
 ## Operational finding
 
 ### AS-14 — HSTS ownership/state requires direct verification
-Verify the actual Cloudflare HSTS owner/value and rollback implications. Nginx must not independently add or alter HSTS without that evidence. **Open; operator verification required.**
+Verify the actual Cloudflare HSTS owner/value and rollback implications. Nginx must not independently add or alter HSTS without that evidence. **Open; operator verification required**.
 
 ## Remediation order
 
-1. AS-04 inactive-participant authorization.
-2. AS-03 invite/capacity serialization.
-3. AS-05 public/private data boundary.
-4. AS-06 SSE connection pressure.
-5. AS-02 Cloudflare Access/MFA verification.
-6. AS-07 through AS-13 as bounded P2 packages; separate destructive, network-policy and product/privacy decisions where required.
-7. AS-14 remains operator verification work.
+1. AS-03 invite/capacity serialization.
+2. AS-05 public/private data boundary.
+3. AS-06 SSE connection pressure.
+4. AS-02 Cloudflare Access/MFA verification.
+5. AS-07 through AS-13 as bounded P2 packages; separate destructive, network-policy and product/privacy decisions where required.
+6. AS-14 remains operator verification work.
 
 Any newly confirmed Critical issue or direct authentication bypass blocks production installation. Do not widen CSP, disable Turnstile, add privileged-route bypasses or weaken application RBAC to simplify testing.
