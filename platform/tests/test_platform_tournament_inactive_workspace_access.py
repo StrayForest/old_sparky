@@ -5,7 +5,6 @@ import unittest
 from unittest.mock import AsyncMock
 
 from fastapi import HTTPException
-from fastapi.routing import APIRoute
 from starlette.requests import Request
 
 from apps.platform_api.app.api.router import api_router
@@ -131,25 +130,29 @@ class PlatformTournamentInactiveWorkspaceAccessTests(unittest.IsolatedAsyncioTes
         db_session.execute.assert_not_awaited()
 
     def test_tournament_router_wires_guard_as_a_top_level_dependency(self) -> None:
-        guarded_paths = {
-            "/tournaments/{slug}/workspace",
-            "/tournaments/{slug}/participants",
-            "/tournaments/{slug}/matches",
-            "/tournaments/{slug}/bracket",
-            "/tournaments/{slug}/bracket/events",
+        guarded_endpoint_names = {
+            "get_tournament_workspace",
+            "list_tournament_participants",
+            "list_tournament_matches",
+            "get_tournament_bracket",
+            "get_tournament_bracket_events",
         }
         discovered: set[str] = set()
         for route in api_router.routes:
-            if not isinstance(route, APIRoute) or route.path not in guarded_paths:
+            route_name = getattr(route, "name", None)
+            if route_name not in guarded_endpoint_names:
                 continue
-            discovered.add(route.path)
-            dependency_calls = {dependency.call for dependency in route.dependant.dependencies}
+            discovered.add(route_name)
+            dependency_calls = {
+                dependency.call
+                for dependency in getattr(route, "dependant").dependencies
+            }
             self.assertIn(
                 ensure_inactive_participant_has_no_private_workspace_access,
                 dependency_calls,
-                route.path,
+                route_name,
             )
-        self.assertEqual(discovered, guarded_paths)
+        self.assertEqual(discovered, guarded_endpoint_names)
 
 
 if __name__ == "__main__":
