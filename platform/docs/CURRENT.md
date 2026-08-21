@@ -19,6 +19,7 @@ Read this file for the current production baseline and next engineering priority
 - Tournament invite claims/revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Last invite use and last participant slot cannot be consumed twice, and restoring a retained inactive participant rechecks capacity before making the row active again.
 - Anonymous public profile contracts omit account/contact email and Steam authentication identity. Public tournament participant/workspace contracts omit moderation note, moderator identity and moderation timestamps; organizer management uses a separate response DTO that retains those fields.
 - Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. Rejections are observable and stream lifetime/reconnect behavior is bounded.
+- Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Alembic head: `20260813_0038`.
 - Production contains the verified operator account and no test tournaments.
 
@@ -26,7 +27,7 @@ Read this file for the current production baseline and next engineering priority
 
 No repository-owned P1 implementation remains after AS-06 closure.
 
-AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/platform-ops*` and `/api/v1/admin*` and does not replace application RBAC. The next code-owned hardening target is AS-07 legacy upload/R2 cleanup, but destructive removal remains gated on approved inventory and backup verification.
+AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/platform-ops*` and `/api/v1/admin*` and does not replace application RBAC. AS-07 runtime media cleanup is closed and archived; the next code-owned hardening target is AS-08 unknown-patch refresh behavior.
 
 ## Production invariants
 
@@ -36,6 +37,7 @@ AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/pl
 - Invite use and active-participant capacity are transaction-scoped PostgreSQL invariants: invite claim/revoke locks the stable tournament and invite rows in tournament-to-invite order; active-roster mutations serialize on the tournament row and capacity is rechecked before an inactive retained participant becomes active.
 - Public API contracts are explicit allowlists. Account/contact email and Steam authentication identity do not belong to anonymous public-profile DTOs, and participant moderation metadata belongs only to organizer-management DTOs. A future public email feature requires a separate explicit opt-in contract rather than reusing account contact data.
 - Public bracket SSE must retain layered application/Nginx connection caps, fail closed when Redis-backed admission state is unavailable, release leases on normal termination and retain bounded expiry recovery after abnormal termination. Stream lifetime and reconnect timing must remain bounded.
+- Public media rendering must remain `R2 -> CDN -> browser`; normal API runtime must not proxy R2 objects, serve legacy upload paths or fall back to local-disk reads. Legacy URL columns and migration helpers may remain only while runtime-inert and migration/grace-period scoped.
 - Terminal tournament states freeze organizer match administration.
 - Preserve the live HTTPS/domain/secure-cookie contour unless a reviewed release changes it.
 - Rollback switches application releases; it does not automatically downgrade Alembic.
@@ -45,6 +47,7 @@ AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/pl
 
 - Cloudflare dashboard evidence for HSTS, DNSSEC, CAA, WAF/rates, edge TLS and R2 settings.
 - Real-user CSP follow-up and classification of new enforcement reports.
+- Post-grace physical removal of runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers when no longer required.
 - Non-security feature expansion that does not remove a launch or production blocker.
 
 For priorities and backlog, use [`platform-roadmap.md`](platform-roadmap.md). For evidence and details, follow the task router in [`README.md`](README.md).
