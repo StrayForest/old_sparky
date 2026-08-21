@@ -14,7 +14,7 @@ Read this file for the current production baseline and next engineering priority
 - Web, API and worker run under separate locked Unix identities with per-service runtime environments; the web process receives no backend database, session, R2, mail, Turnstile-secret or OpenAI credentials.
 - API and worker share only the dedicated `oldsparky-media` staging group; worker state and web cache remain service-owned.
 - Current deployed product includes secure Steam OpenID login/linking, mobile auth/profile/tournament polish, enforced nonce CSP, tournament lifecycle, deterministic Deadlock assignment, locked rosters, bracket progression, immutable releases and tested rollback.
-- Invite-only tournament workspace reads now reject retained `withdrawn`/`disqualified` participant records; access requires active participation or explicit organizer/admin authority.
+- Invite-only tournament workspace reads reject retained or otherwise inactive participant records; private bracket SSE also revalidates active participant membership while the connection remains open, so withdrawal/disqualification revokes an existing stream before further private events are emitted.
 - Alembic head: `20260813_0038`.
 - Production contains the verified operator account and no test tournaments.
 
@@ -31,7 +31,7 @@ AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/pl
 ## Production invariants
 
 - Profile-level Deadlock dream slots are the source of truth.
-- Invite-only workspace reads require active participant membership or explicit organizer/admin authority; historical inactive participant rows are not authorization grants.
+- Invite-only workspace reads require active participant membership or explicit organizer/admin authority; historical inactive participant rows are not authorization grants, including for an already-open private bracket SSE stream.
 - Terminal tournament states freeze organizer match administration.
 - Preserve the live HTTPS/domain/secure-cookie contour unless a reviewed release changes it.
 - Rollback switches application releases; it does not automatically downgrade Alembic.
