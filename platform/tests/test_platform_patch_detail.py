@@ -131,6 +131,43 @@ Bonus health reduced
         self.assertEqual(heroes[1]["abilities"][0]["changes"], ["Damage reduced"])
         self.assertEqual(heroes[1]["changes"], ["Base health reduced"])
 
+    def test_objective_aliases_route_sections_without_stripping_subjects(self) -> None:
+        raw = {
+            "id": "1836506165584438",
+            "title": "Minor Update - 07-09-2026",
+            "content": """Unstable Rift warning time reduced from 25s to 20s
+Rift Troopers now have Spirit Resist (30/35/40/45%)
+Rift Troopers now have Melee Resistance (25%)
+Rift Troopers spawn interval increased from every 0.3s to 0.5s (spawns slightly more staggered)
+Unstable Rift comeback resist aura radius increased from 20m to 35m
+Rift Troopers max comeback count increased from 12 to 14
+Urn sprint speed increased from +2m/s to +3m/s
+""",
+        }
+
+        result = structure_patch_detail(raw, self.catalog)
+        objectives = {
+            section["objective_key"]: section
+            for section in result["sections"]
+            if section["kind"] == "objective"
+        }
+
+        self.assertEqual(
+            objectives["unstable_rift"]["changes"],
+            [
+                "Unstable Rift warning time reduced from 25s to 20s",
+                "Rift Troopers now have Spirit Resist (30/35/40/45%)",
+                "Rift Troopers now have Melee Resistance (25%)",
+                "Rift Troopers spawn interval increased from every 0.3s to 0.5s (spawns slightly more staggered)",
+                "Unstable Rift comeback resist aura radius increased from 20m to 35m",
+                "Rift Troopers max comeback count increased from 12 to 14",
+            ],
+        )
+        self.assertEqual(
+            objectives["urn"]["changes"],
+            ["Urn sprint speed increased from +2m/s to +3m/s"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
