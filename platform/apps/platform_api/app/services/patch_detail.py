@@ -8,6 +8,7 @@ from apps.platform_api.app.services.patch_translation import apply_cached_patch_
 
 
 _ENTITY_DELIMITERS = " \t:-–—"
+_OBJECTIVE_SUBJECT_ALIASES = frozenset({"rift trooper", "rift troopers"})
 _FLATTENED_ENTITY_BULLET_RE = re.compile(
     r"\s+-\s+(?=[A-Z][A-Za-z0-9 '&()./–—-]{0,80}:)"
 )
@@ -248,10 +249,11 @@ def structure_patch_detail(raw: dict[str, Any], catalog: dict[str, Any]) -> dict
             objective_match = base._objective_prefix_match(line)
             if objective_match is not None:
                 objective_key, matched_objective_alias = objective_match
-                objective_change = base._strip_objective_prefix(
-                    line,
-                    matched_objective_alias,
-                )
+                if matched_objective_alias.casefold() not in _OBJECTIVE_SUBJECT_ALIASES:
+                    objective_change = base._strip_objective_prefix(
+                        line,
+                        matched_objective_alias,
+                    )
         if objective_key is not None:
             definition = base.OBJECTIVE_DEFINITIONS[objective_key]
             objective = objective_catalog.get(objective_key)
