@@ -8,25 +8,22 @@ For the production baseline and immediate engineering target, read [`CURRENT.md`
 
 ## P1 — security and correctness
 
-1. **AS-03 tournament concurrency**
-   - serialize invite-use and participant-capacity-sensitive writes;
-   - preserve capacity/invite invariants under concurrent requests;
-   - add deterministic concurrency tests.
-
-2. **AS-05 public/private data boundary**
+1. **AS-05 public/private data boundary**
    - separate public DTOs from private/admin/internal data;
    - prevent account email and moderation/internal fields from leaking through public endpoints;
    - align privacy copy and migration behavior where required.
 
-3. **AS-06 SSE connection pressure**
+2. **AS-06 SSE connection pressure**
    - add per-source/user and global long-lived connection limits;
    - release limits correctly on disconnect/timeouts;
    - cover API/Nginx behavior and resource-pressure regressions.
 
-4. **AS-02 privileged route access / MFA — operator-owned**
+3. **AS-02 privileged route access / MFA — operator-owned**
    - protect `/platform-ops*` and `/api/v1/admin*` with the approved Cloudflare/operator control;
    - retain application RBAC and audit events;
    - close only after direct dashboard/live evidence.
+
+AS-03 tournament concurrency is resolved and archived with implementation, concurrency-test and production-deployment evidence in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md).
 
 ## P2 — hardening and cleanup
 

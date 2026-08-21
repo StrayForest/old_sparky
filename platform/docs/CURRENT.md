@@ -16,6 +16,7 @@ Read this file for the current production baseline and next engineering priority
 - Current deployed product includes secure Steam OpenID login/linking, mobile auth/profile/tournament polish, enforced nonce CSP, tournament lifecycle, deterministic Deadlock assignment, locked rosters, bracket progression, immutable releases and tested rollback.
 - Invite-only tournament workspace reads reject retained or otherwise inactive participant records; private bracket SSE also revalidates active participant membership while the connection remains open, so withdrawal/disqualification revokes an existing stream before further private events are emitted.
 - Organizer participant removal is a retained `disqualified` record rather than a physical participant-row deletion. A disqualified participant cannot redeem another invite or self-rejoin that same tournament, and a retry does not consume another invite use. The organizer-only management roster retains inactive rows for explicit restoration; the exclusion remains scoped to that tournament and does not block participation in unrelated tournaments.
+- Tournament invite claims/revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Last invite use and last participant slot cannot be consumed twice, and restoring a retained inactive participant rechecks capacity before making the row active again.
 - Alembic head: `20260813_0038`.
 - Production contains the verified operator account and no test tournaments.
 
@@ -23,9 +24,8 @@ Read this file for the current production baseline and next engineering priority
 
 Resolve the remaining application-security/correctness P1 work in this order:
 
-1. **AS-03 invite/capacity serialization** — make invite use and participant-capacity check-and-write operations atomic under concurrency.
-2. **AS-05 public/private data boundary** — prevent account contact and moderation/internal fields from crossing public API contracts.
-3. **AS-06 SSE connection pressure** — add bounded per-source/global long-lived connection controls and regression coverage.
+1. **AS-05 public/private data boundary** — prevent account contact and moderation/internal fields from crossing public API contracts.
+2. **AS-06 SSE connection pressure** — add bounded per-source/global long-lived connection controls and regression coverage.
 
 AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/platform-ops*` and `/api/v1/admin*` and does not replace application RBAC.
 
@@ -34,6 +34,7 @@ AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/pl
 - Profile-level Deadlock dream slots are the source of truth.
 - Invite-only workspace reads require active participant membership or explicit organizer/admin authority; historical inactive participant rows are not authorization grants, including for an already-open private bracket SSE stream.
 - Organizer exclusion must retain the tournament participant row as `disqualified`; self-rejoin and same-tournament invite redemption remain blocked until the organizer deliberately restores an active status. This is tournament-scoped and must not become a platform-wide ban.
+- Invite use and active-participant capacity are transaction-scoped PostgreSQL invariants: invite claim/revoke locks the stable tournament and invite rows in tournament-to-invite order; active-roster mutations serialize on the tournament row and capacity is rechecked before an inactive retained participant becomes active.
 - Terminal tournament states freeze organizer match administration.
 - Preserve the live HTTPS/domain/secure-cookie contour unless a reviewed release changes it.
 - Rollback switches application releases; it does not automatically downgrade Alembic.

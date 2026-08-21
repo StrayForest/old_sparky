@@ -12,7 +12,6 @@ This document contains only findings that still require action or direct operato
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
 | AS-02 | High / P1 | High | Cloudflare Access/MFA for privileged routes is not directly verified | Open; operator/dashboard evidence required |
-| AS-03 | Medium / P1 | High | Invite-use and participant-capacity checks are not serialised | Open; next implementation target |
 | AS-05 | Medium / P1 | High | Contact and moderation fields cross the documented public-data boundary | Open |
 | AS-06 | Medium / P1 | High | Public SSE has no bounded per-source/global connection cap | Open |
 | AS-07 | Medium / P2 | High | Legacy upload/R2 read paths retain originals and buffer entire objects | Open; destructive removal requires approval |
@@ -41,21 +40,13 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 
 ## P1 findings
 
-### AS-03 — Invite and capacity decisions race
-
-- Risk: concurrent requests can consume the last invite use or participant slot more than once.
-- Evidence owner: invite claim, organizer participant-add and self-join check-and-write paths in `apps/platform_api/app/api/routes/tournaments.py`.
-- Required result: lock a stable tournament/invite row before check-and-write; add database-enforced invariants where practical.
-- Verification: deterministic concurrent integration tests for last invite use and last participant slot.
-- Status: **Open; next implementation target**.
-
 ### AS-05 — Public data exceeds the privacy contract
 
 - Risk: account contact email or internal moderation context can cross public API/profile boundaries.
 - Evidence owner: registration/profile serialization and public participant DTOs.
 - Required result: explicit public DTOs with opt-in contact data and no moderation/internal fields; align existing data/privacy behavior.
 - Verification: anonymous API tests proving private/internal fields never appear.
-- Status: **Open**.
+- Status: **Open; next implementation target**.
 
 ### AS-06 — Unbounded public SSE connections
 
@@ -84,7 +75,7 @@ Unknown public patch IDs must use negative caching/coalesced background refresh 
 Add a privacy-preserving account-wide failure window/cooldown without creating a permanent lockout DoS path. **Open.**
 
 ### AS-10 — Existing-email enumeration at registration
-Decide whether duplicate-registration UX justifies disclosure; otherwise use a generic accepted flow with comparable timing/Turnstile behavior. **Open; product/security decision required.**
+Decide whether duplicate-registration UX justifies disclosure; otherwise use a generic accepted flow with comparable timing/Turnstile behavior. **Open; product/security decision required**.
 
 ### AS-11 — Worker exception text in public responses
 Expose stable public error codes/generic text and retain redacted diagnostics only in restricted logs/admin surfaces. **Open.**
@@ -102,11 +93,12 @@ Verify the actual Cloudflare HSTS owner/value and rollback implications. Nginx m
 
 ## Remediation order
 
-1. AS-03 invite/capacity serialization.
-2. AS-05 public/private data boundary.
-3. AS-06 SSE connection pressure.
-4. AS-02 Cloudflare Access/MFA verification.
-5. AS-07 through AS-13 as bounded P2 packages; separate destructive, network-policy and product/privacy decisions where required.
-6. AS-14 remains operator verification work.
+1. AS-05 public/private data boundary.
+2. AS-06 SSE connection pressure.
+3. AS-02 Cloudflare Access/MFA verification.
+4. AS-07 through AS-13 as bounded P2 packages; separate destructive, network-policy and product/privacy decisions where required.
+5. AS-14 remains operator verification work.
+
+Resolved AS-03 evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md).
 
 Any newly confirmed Critical issue or direct authentication bypass blocks production installation. Do not widen CSP, disable Turnstile, add privileged-route bypasses or weaken application RBAC to simplify testing.

@@ -10,6 +10,7 @@
 - Secrets, TLS, staging, runtimes, backups and reports live under `/opt/oldsparky/platform/shared`, outside immutable releases.
 - Nginx is the only public origin listener. Application/data services bind loopback.
 - PostgreSQL is authoritative for durable state; Redis owns bounded ephemeral state, locks, cache and Celery transport; R2 is not a database.
+- Tournament invite-use and active participant-capacity decisions are serialized in PostgreSQL: invite claim/revoke locks the tournament row and then the invite row, while participant-count mutations serialize on the tournament row and inactive restoration rechecks capacity before reactivation.
 
 ## Request and data flow
 
