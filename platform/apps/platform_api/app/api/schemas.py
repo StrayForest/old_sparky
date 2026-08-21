@@ -411,10 +411,7 @@ class PublicProfileResponse(BaseModel):
     avatar_media: MediaDescriptorResponse | None = None
     banner_media: MediaDescriptorResponse | None = None
     bio: str | None
-    contact_email: str | None
     region: str | None
-    steam_id: str | None
-    steam_linked: bool = False
     discord_account: str | None
     captain_team_name: str | None = None
     deadlock_profile: DeadlockProfileResponse | None = None
@@ -602,10 +599,13 @@ class TournamentParticipantResponse(BaseModel):
     status: str
     entry_type: str
     team_name: str | None
+    created_at: datetime
+
+
+class TournamentParticipantManagementResponse(TournamentParticipantResponse):
     moderation_note: str | None
     moderated_at: datetime | None
     moderated_by_user_id: str | None
-    created_at: datetime
 
 
 class TournamentDeadlockReadyVoteRequest(BaseModel):

@@ -9,7 +9,7 @@ from apps.platform_api.app.api.pagination import (
     PARTICIPANT_LIST_MAX_LIMIT,
     set_pagination_headers,
 )
-from apps.platform_api.app.api.schemas import TournamentParticipantResponse
+from apps.platform_api.app.api.schemas import TournamentParticipantManagementResponse
 from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.models import (
     PlayerProfile,
@@ -25,8 +25,8 @@ router = APIRouter()
 def _serialize_participant(
     participant: TournamentParticipant,
     display_name: str,
-) -> TournamentParticipantResponse:
-    return TournamentParticipantResponse(
+) -> TournamentParticipantManagementResponse:
+    return TournamentParticipantManagementResponse(
         id=participant.id,
         tournament_id=participant.tournament_id,
         user_id=participant.user_id,
@@ -43,7 +43,7 @@ def _serialize_participant(
 
 @router.get(
     "/{slug}/participants/manage",
-    response_model=list[TournamentParticipantResponse],
+    response_model=list[TournamentParticipantManagementResponse],
 )
 async def list_tournament_participants_for_management(
     slug: str,
@@ -57,7 +57,7 @@ async def list_tournament_participants_for_management(
     offset: int = Query(default=0, ge=0),
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
-) -> list[TournamentParticipantResponse]:
+) -> list[TournamentParticipantManagementResponse]:
     """Return the organizer's full roster, including inactive participant rows."""
 
     tournament = await db_session.scalar(
