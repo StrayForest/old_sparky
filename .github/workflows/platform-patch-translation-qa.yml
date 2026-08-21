@@ -76,6 +76,7 @@ jobs:
           import asyncio
           import json
           import re
+          import unicodedata
 
           from apps.platform_api.app.services import home_content
           from apps.platform_api.app.services.patch_detail import get_patch_detail, get_patch_detail_source
@@ -92,6 +93,7 @@ jobs:
               "1839041357039193",
               "1836506165584438",
           )
+          RIFT_SUBJECT_PATCH_ID = "1836506165584438"
           WATCH_TERMS = (
               "lifesteal", "cooldown", "spirit scaling", "spirit power",
               "move speed", "movement speed", "sprint speed", "dash speed",
@@ -101,6 +103,11 @@ jobs:
           SOURCE_SPEED_M_RE = re.compile(r"[+\-]?\d+(?:\.\d+)?m\b", re.IGNORECASE)
           CANONICAL_SPIRIT_SCALING = "коэффициент масштабирования от спиритической мощности"
           CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
+          def normalized_text(value):
+              return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
+
+          CANONICAL_SPIRIT_SCALING_NORMALIZED = normalized_text(CANONICAL_SPIRIT_SCALING)
 
           def emit(kind, **payload):
               print(kind, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
@@ -129,6 +136,23 @@ jobs:
                       raise SystemExit(f"segment ids/order changed for {patch_id}")
                   paired = list(zip(source_segments, ru_segments, strict=True))
 
+                  if patch_id == RIFT_SUBJECT_PATCH_ID:
+                      rift_subjects = [
+                          segment["text"]
+                          for segment in source_segments
+                          if segment["text"].startswith("Rift Troopers ")
+                      ]
+                      if len(rift_subjects) < 4:
+                          raise SystemExit(
+                              "Rift Troopers subject was stripped from objective source segments: "
+                              + json.dumps(rift_subjects, ensure_ascii=False)
+                          )
+                      if not any(
+                          segment["text"].startswith("Unstable Rift ")
+                          for segment in source_segments
+                      ):
+                          raise SystemExit("Unstable Rift subject was stripped from objective source segments")
+
                   for source_segment, ru_segment in paired:
                       if fact_fingerprint(source_segment["text"]) != fact_fingerprint(ru_segment["text"]):
                           raise SystemExit(
@@ -143,7 +167,7 @@ jobs:
                       en = source_segment["text"]
                       ru = ru_segment["text"]
                       en_lower = en.casefold()
-                      ru_lower = ru.casefold()
+                      ru_lower = normalized_text(ru)
 
                       if "bullet lifesteal" in en_lower and re.search(r"[+\-]?\d", en):
                           if "bullet lifesteal" in ru_lower:
@@ -164,7 +188,10 @@ jobs:
                           raise SystemExit(
                               f"Melee Lifesteal item reference was translated: {patch_id} {source_segment['id']}"
                           )
-                      if "spirit scaling" in en_lower and CANONICAL_SPIRIT_SCALING not in ru_lower:
+                      if (
+                          "spirit scaling" in en_lower
+                          and CANONICAL_SPIRIT_SCALING_NORMALIZED not in ru_lower
+                      ):
                           raise SystemExit(
                               f"Spirit Scaling is not Valve-canonical: {patch_id} {source_segment['id']} -> {ru}"
                           )
