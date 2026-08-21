@@ -1,0 +1,181 @@
+name: Platform media migration diagnostics
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - ".github/workflows/platform-media-migration-diagnostics.yml"
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: platform-media-migration-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  media-inventory:
+    name: Production legacy media inventory
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      TARGET_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Mark media inventory pending
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "{\"state\":\"pending\",\"context\":\"platform-media-inventory\",\"description\":\"Production legacy media inventory is running\",\"target_url\":\"${run_url}\"}"
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}"
+          test -n "${PROD_SSH_USER:-}"
+          test -n "${PROD_SSH_KEY:-}"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
+          chmod 600 ~/.ssh/old_sparky_prod
+          ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Inspect production legacy media sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            'bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          python_bin="$runtime/shared/venv/bin/python"
+          env_file="$runtime/shared/env/api.env"
+          report_file="$(mktemp)"
+          error_file="$(mktemp)"
+          cleanup() {
+            rm -f -- "$report_file" "$error_file"
+          }
+          trap cleanup EXIT
+
+          test -x "$python_bin"
+          test -f "$env_file" && test ! -L "$env_file"
+          test -x "$current/tools/platform_migrate_legacy_r2.py"
+          cd "$current"
+
+          set +e
+          PLATFORM_ENV_FILE="$env_file" \
+          PLATFORM_SHARED_DIR="$runtime/shared" \
+            "$python_bin" \
+              tools/platform_migrate_legacy_r2.py \
+              --env-file "$env_file" \
+              --max-records 1000 \
+              --json >"$report_file" 2>"$error_file"
+          inventory_exit="$?"
+          set -e
+
+          "$python_bin" - "$inventory_exit" "$report_file" "$error_file" <<'PY'
+          from __future__ import annotations
+
+          from collections import Counter
+          import json
+          from pathlib import Path
+          import sys
+
+          exit_code = int(sys.argv[1])
+          report_path = Path(sys.argv[2])
+          error_path = Path(sys.argv[3])
+          raw = report_path.read_text(encoding="utf-8", errors="replace").strip()
+          try:
+              payload = json.loads(raw)
+          except json.JSONDecodeError:
+              print(
+                  "MEDIA_INVENTORY",
+                  json.dumps(
+                      {
+                          "ok": False,
+                          "code": "diagnostic_output_not_json",
+                          "exit_code": exit_code,
+                          "stderr_bytes": error_path.stat().st_size,
+                      },
+                      separators=(",", ":"),
+                  ),
+              )
+              raise SystemExit(1)
+
+          source_results = payload.get("source_results") or []
+          failure_codes = Counter(
+              str(item.get("code") or "unknown")
+              for item in source_results
+              if isinstance(item, dict) and item.get("ok") is False
+          )
+          summary = {
+              "exit_code": exit_code,
+              "ok": bool(payload.get("ok")),
+              "code": payload.get("code"),
+              "mutated": bool(payload.get("mutated")),
+              "inventory_before": payload.get("inventory_before") or {},
+              "source_locations": payload.get("source_locations") or {},
+              "source_failures": dict(sorted(failure_codes.items())),
+              "operations": payload.get("operations") or {},
+          }
+          print("MEDIA_INVENTORY", json.dumps(summary, sort_keys=True, separators=(",", ":")))
+
+          if summary["mutated"]:
+              raise SystemExit("check-only media diagnostics reported an unexpected mutation")
+          if exit_code not in {0, 2}:
+              raise SystemExit(f"unexpected media diagnostics exit code: {exit_code}")
+          PY
+          REMOTE
+
+      - name: Mark media inventory successful
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "{\"state\":\"success\",\"context\":\"platform-media-inventory\",\"description\":\"Production legacy media inventory collected\",\"target_url\":\"${run_url}\"}"
+
+      - name: Mark media inventory failed
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "{\"state\":\"failure\",\"context\":\"platform-media-inventory\",\"description\":\"Production legacy media inventory failed\",\"target_url\":\"${run_url}\"}"
