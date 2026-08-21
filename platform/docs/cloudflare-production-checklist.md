@@ -2,7 +2,7 @@
 
 - Status: Active operator checklist
 - Owner: Cloudflare account owner
-- Last reviewed: 2026-08-08
+- Last reviewed: 2026-08-21
 
 `DONE` requires live/dashboard evidence. `VERIFY` needs dashboard confirmation;
 source code alone is not evidence. Never use a Global API Key.
@@ -12,7 +12,8 @@ source code alone is not evidence. Never use a Global API Key.
 - DONE: apex and `cdn.old-sparky.com` are proxied and serve HTTPS.
 - VERIFY: apex origin address remains correct/proxied; no accidental AAAA until
   origin IPv6 is tested.
-- TODO: enable DNSSEC and verify DS propagation.
+- DONE: DNSSEC is enabled and the operator confirmed the production DNSSEC/DS
+  contour on 2026-08-21.
 - REVIEW: scanner reports no CAA. Add records only after confirming every CA
   Cloudflare currently needs for Universal/backup certificates; an incomplete
   CAA policy can block renewal.
@@ -20,16 +21,19 @@ source code alone is not evidence. Never use a Global API Key.
 
 ## Edge TLS
 
-- VERIFY: encryption mode is **Full (strict)**.
-- VERIFY: minimum visitor TLS is 1.2 and TLS 1.3/HTTP3 are enabled.
+- DONE: encryption mode is **Full (strict)**; operator-confirmed in Cloudflare
+  on 2026-08-21.
+- DONE: minimum visitor TLS is 1.2 and TLS 1.3/HTTP3 are enabled;
+  operator-confirmed in Cloudflare on 2026-08-21.
 - OBSERVED: the supplied scan accepts TLS 1.2 ECDHE-CBC compatibility suites.
   Cloudflare documents that its default legacy-compatible edge set can be
   flagged by scanners and that custom edge suites require Advanced Certificate
   Manager. Decide whether the compatibility/paid-feature trade-off justifies
   customization; the origin now has an independent AEAD-only allowlist.
-- VERIFY: public responses currently advertise HSTS `max-age=15552000`, while
-  one supplied snapshot reports no HSTS. Confirm hostname/date/cache and the
-  dashboard owner before any change. Do not add a second origin header.
+- DONE: Cloudflare owns HSTS and the Edge Certificates dashboard showed HSTS
+  **On**, `max-age=15552000` (6 months), `includeSubDomains` Off and preload Off
+  on 2026-08-21. Nginx must not add a second HSTS header. Closure evidence is in
+  [`archive/as-14-cloudflare-hsts-ownership.md`](archive/as-14-cloudflare-hsts-ownership.md).
 - INFO: no OCSP stapling/HPKP result is not an application change request.
   HPKP is intentionally not used; Cloudflare owns edge certificate status.
 
@@ -51,8 +55,11 @@ source code alone is not evidence. Never use a Global API Key.
 - TODO: add bounded edge rates for register, login, reset, invite, support and
   upload; application controls stay authoritative.
 - VERIFY: Turnstile hostname allowlist contains only production hostnames.
-- TODO/P1: Access + MFA for `/platform-ops*`, `/api/v1/admin*` and audited
-  security paths; retain application RBAC and a tested break-glass/rollback.
+- DONE: Cloudflare Access protects `/platform-ops*` and `/api/v1/admin*` with an
+  operator-scoped Allow policy and independent MFA. A TOTP device was enrolled
+  and a fresh incognito login verified the identity -> MFA -> application path
+  on 2026-08-21; application RBAC remains authoritative. Closure evidence is in
+  [`archive/as-02-cloudflare-access-mfa.md`](archive/as-02-cloudflare-access-mfa.md).
 - VERIFY: Bot Fight Mode does not break API, health, Turnstile, CDN or crawlers.
 
 ## Origin protection
