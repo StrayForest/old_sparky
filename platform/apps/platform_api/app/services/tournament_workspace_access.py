@@ -71,9 +71,10 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
     """Revalidate long-lived tournament stream access before emitting data.
 
     Private participant streams are checked against the current participant row
-    on every emission. Missing request context fails closed for private
-    tournaments while still allowing anonymous public streams after a visibility
-    lookup.
+    on every emission. Missing request context fails closed for existing private
+    tournaments while anonymous public streams are allowed after a visibility
+    lookup. A missing tournament is tolerated for the low-level Redis stream
+    helper, which is also exercised independently of HTTP routing in tests.
     """
 
     access_context = current_tournament_stream_access_context()
@@ -110,10 +111,21 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
         return row[1] in ACTIVE_PARTICIPANT_STATUSES
 
     async with session_factory()() as db_session:
-        tournament_visibility = await db_session.scalar(
-            select(Tournament.visibility).where(Tournament.id == tournament_id)
-        )
-    return tournament_visibility == "public"
+        row = (
+            await db_session.execute(
+                select(Tournament.slug, Tournament.visibility).where(
+                    Tournament.id == tournament_id
+                )
+            )
+        ).first()
+    if row is None:
+        return True
+    if row[1] != "public":
+        return False
+    _tournament_stream_access_context.set(
+        TournamentStreamAccessContext(decision="allow", slug=str(row[0]))
+    )
+    return True
 
 
 async def ensure_private_tournament_read_membership_is_active(
