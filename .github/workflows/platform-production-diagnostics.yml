@@ -33,6 +33,7 @@ jobs:
           chmod 600 ~/.ssh/old_sparky_prod
           ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
+
       - name: Verify latest patch distribution
         shell: bash
         run: |
@@ -85,4 +86,168 @@ jobs:
 
           curl -fsS --max-time 15 "https://old-sparky.com/api/v1/content/patches/${latest_id}?diag=$(date +%s)" \
             | "$runtime/shared/venv/bin/python" -c 'import json,sys; d=json.load(sys.stdin); s=d.get("sections",[]); h=[x.get("title","") for x in s if x.get("kind")=="hero"]; print("public_api_hero_count="+str(len(h))); print("public_api_heroes="+" | ".join(h)); assert len(h) >= 13 if d.get("id")=="1840944183775204" else True'
+          REMOTE
+
+      - name: Verify ru-v8 four-patch translation regression set
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod "$PROD_SSH_USER@$PROD_SSH_HOST" 'bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+          runtime=/opt/oldsparky/platform
+          cd "$runtime/current"
+          export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
+          export PYTHONPATH="$runtime/current"
+
+          "$runtime/shared/venv/bin/python" - <<'PY'
+          import asyncio
+          import json
+          import re
+
+          from apps.platform_api.app.services import home_content
+          from apps.platform_api.app.services.patch_detail import (
+              get_patch_detail,
+              get_patch_detail_source,
+          )
+          from apps.platform_api.app.services.patch_translation import (
+              PATCH_TRANSLATION_VERSION,
+              extract_translation_segments,
+              translate_patch_to_russian,
+          )
+          from apps.platform_api.app.services.patch_translation_terms import fact_fingerprint
+
+          PATCH_IDS = (
+              "1840944183775204",
+              "1839676055886206",
+              "1839041357039193",
+              "1836506165584438",
+          )
+          WATCH_TERMS = (
+              "lifesteal",
+              "cooldown",
+              "spirit scaling",
+              "spirit power",
+              "move speed",
+              "movement speed",
+              "sprint speed",
+              "falloff range",
+              "bullet resist",
+              "spirit resist",
+              "melee resist",
+          )
+          CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
+          def emit(kind, **payload):
+              print(kind, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+          async def main():
+              catalog = await home_content.get_deadlock_asset_catalog()
+              for patch_id in PATCH_IDS:
+                  source = await get_patch_detail_source(patch_id)
+                  if source is None:
+                      raise SystemExit(f"missing source patch {patch_id}")
+
+                  result = await translate_patch_to_russian(source, catalog)
+                  emit("TRANSLATION_RUN", patch_id=patch_id, result=result)
+                  if not result.get("ok"):
+                      raise SystemExit(f"translation failed for {patch_id}: {result}")
+                  if result.get("status") == "locked":
+                      raise SystemExit(f"translation is locked for {patch_id}; fail-fast QA stops")
+
+                  translated = await get_patch_detail(patch_id)
+                  if translated is None:
+                      raise SystemExit(f"missing translated patch {patch_id}")
+
+                  source_segments = extract_translation_segments(source)
+                  translated_segments = extract_translation_segments(translated)
+                  if [s["id"] for s in source_segments] != [s["id"] for s in translated_segments]:
+                      raise SystemExit(f"segment ids/order changed for {patch_id}")
+                  if len(source_segments) != len(translated_segments):
+                      raise SystemExit(f"segment count changed for {patch_id}")
+
+                  paired = list(zip(source_segments, translated_segments, strict=True))
+                  for source_segment, ru_segment in paired:
+                      if fact_fingerprint(source_segment["text"]) != fact_fingerprint(ru_segment["text"]):
+                          raise SystemExit(
+                              f"numeric/tier fact changed for {patch_id} {source_segment['id']}"
+                          )
+
+                  if source_segments and not any(
+                      CYRILLIC_RE.search(segment["text"] or "")
+                      for segment in translated_segments
+                  ):
+                      raise SystemExit(f"patch {patch_id} has no Russian translation")
+
+                  samples = []
+                  for source_segment, ru_segment in paired:
+                      source_text = source_segment["text"]
+                      ru_text = ru_segment["text"]
+                      source_lower = source_text.casefold()
+                      ru_lower = ru_text.casefold()
+
+                      if "bullet lifesteal" in source_lower and re.search(r"[+\-]?\d", source_text):
+                          if "bullet lifesteal" in ru_lower:
+                              raise SystemExit(
+                                  f"Bullet Lifesteal stat stayed English: {patch_id} {source_segment['id']}"
+                              )
+                      if "spirit lifesteal" in source_lower and re.search(r"[+\-]?\d", source_text):
+                          if "spirit lifesteal" in ru_lower:
+                              raise SystemExit(
+                                  f"Spirit Lifesteal stat stayed English: {patch_id} {source_segment['id']}"
+                              )
+                      if "bullet, spirit and melee lifesteal" in source_lower:
+                          if "lifesteal" in ru_lower or "сопротив" in ru_lower:
+                              raise SystemExit(
+                                  f"compound Lifesteal mistranslated: {patch_id} {source_segment['id']} -> {ru_text}"
+                              )
+                      if "same change for melee lifesteal" in source_lower:
+                          if "Melee Lifesteal" not in ru_text:
+                              raise SystemExit(
+                                  f"Melee Lifesteal item reference was translated: {patch_id} {source_segment['id']}"
+                              )
+
+                      if any(term in source_lower for term in WATCH_TERMS):
+                          samples.append(
+                              {
+                                  "id": source_segment["id"],
+                                  "en": source_text,
+                                  "ru": ru_text,
+                              }
+                          )
+
+                  for sample in samples[:30]:
+                      emit("PATCH_TRANSLATION_SAMPLE", patch_id=patch_id, **sample)
+
+                  if paired:
+                      longest_source, longest_ru = max(
+                          paired,
+                          key=lambda pair: len(pair[0]["text"]),
+                      )
+                      emit(
+                          "PATCH_TRANSLATION_LONGEST",
+                          patch_id=patch_id,
+                          id=longest_source["id"],
+                          en=longest_source["text"],
+                          ru=longest_ru["text"],
+                      )
+
+                  emit(
+                      "PATCH_TRANSLATION_PATCH_OK",
+                      patch_id=patch_id,
+                      version=PATCH_TRANSLATION_VERSION,
+                      segments=len(source_segments),
+                      watched_samples=len(samples),
+                  )
+
+              print("PATCH_TRANSLATION_QA status=passed version=" + PATCH_TRANSLATION_VERSION)
+
+          asyncio.run(main())
+          PY
+
+          echo '=== Recent translation usage logs ==='
+          journalctl -u deadlock-worker -u deadlock-api --since '-20 minutes' --no-pager \
+            | grep -E 'patch_translation_(openai_usage|completed|failed)' \
+            | tail -n 120 \
+            || true
           REMOTE
