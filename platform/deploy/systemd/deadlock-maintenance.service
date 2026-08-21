@@ -1,0 +1,23 @@
+[Unit]
+Description=Old Sparky Arena backup and storage maintenance
+After=postgresql.service
+Wants=postgresql.service
+ConditionPathIsSymbolicLink=/opt/oldsparky/platform/current
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/oldsparky/platform/current
+Environment=PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python
+ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_storage_maintenance.py --apply --backup-keep 14 --release-keep 5 --test-artifact-max-age-days 7 --screenshot-max-age-days 30 --failed-build-max-age-days 1 --minimum-free-gib 5 --maximum-used-percent 85
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryMax=512M
+TimeoutStartSec=30min
+UMask=0077
+PrivateTmp=true
+ProtectSystem=full
+LockPersonality=true
+

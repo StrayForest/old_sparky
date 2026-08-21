@@ -1,0 +1,52 @@
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+profile = "efficient"
+project_doc_max_bytes = 12288
+
+[mcp_servers.openaiDeveloperDocs]
+url = "https://developers.openai.com/mcp"
+
+[agents]
+max_depth = 1
+
+[profiles.efficient]
+model_reasoning_effort = "low"
+plan_mode_reasoning_effort = "medium"
+model_reasoning_summary = "none"
+model_verbosity = "low"
+web_search = "cached"
+
+[profiles.deep]
+model_reasoning_effort = "high"
+plan_mode_reasoning_effort = "high"
+model_reasoning_summary = "none"
+model_verbosity = "medium"
+web_search = "cached"
+
+[profiles.max]
+model_reasoning_effort = "xhigh"
+plan_mode_reasoning_effort = "xhigh"
+model_reasoning_summary = "none"
+model_verbosity = "medium"
+web_search = "cached"
+
+[agents.platform_explorer]
+description = "Read-only platform API/web/domain mapper."
+config_file = "agents/platform-explorer.toml"
+nickname_candidates = ["Atlas", "Delta", "Echo"]
+
+[agents.frontend_reviewer]
+description = "Read-only platform web UI/i18n reviewer."
+config_file = "agents/frontend-reviewer.toml"
+nickname_candidates = ["Canvas", "Signal", "Vector"]
+
+[agents.platform_qa_reviewer]
+description = "Read-only MVP launch QA reviewer."
+config_file = "agents/platform-qa-reviewer.toml"
+nickname_candidates = ["Harbor", "Beacon", "Relay"]
+
+[agents.release_safety_reviewer]
+description = "Read-only release/migration safety reviewer."
+config_file = "agents/release-safety-reviewer.toml"
+nickname_candidates = ["Anchor", "Ledger", "Switch"]

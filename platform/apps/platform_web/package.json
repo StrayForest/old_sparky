@@ -1,0 +1,50 @@
+{
+  "name": "@oldsparky/platform-web",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "npm@11.16.0",
+  "engines": {
+    "node": ">=26.0.0 <27.0.0",
+    "npm": ">=11.0.0 <12.0.0"
+  },
+  "scripts": {
+    "node:runtime": "../../tools/platform_node.sh --version",
+    "dev": "../../tools/platform_node.sh ./node_modules/next/dist/bin/next dev -p 3000",
+    "build": "../../tools/platform_node.sh ./node_modules/next/dist/bin/next build",
+    "start": "../../tools/platform_node.sh ./node_modules/next/dist/bin/next start -p 3000",
+    "lint": "../../tools/platform_node.sh ./node_modules/eslint/bin/eslint.js .",
+    "test:smoke": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test",
+    "test:participant-progressive": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.participant.config.ts",
+    "test:live": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-launch.spec.ts",
+    "test:live:webkit": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-launch.spec.ts --project=live-webkit-mobile",
+    "test:live:bracket": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-bracket-realtime.spec.ts --project=live-desktop",
+    "test:live:user": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-user-journey.spec.ts --project=live-desktop",
+    "typecheck": "../../tools/platform_node.sh ./node_modules/typescript/bin/tsc --noEmit"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.21.0",
+    "next": "^16.2.9",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@next/eslint-plugin-next": "^16.2.9",
+    "@playwright/test": "^1.61.0",
+    "@tailwindcss/postcss": "^4.3.1",
+    "@types/node": "^26.0.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^10.5.0",
+    "postcss": "^8.5.25",
+    "tailwindcss": "^4.3.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1"
+  },
+  "overrides": {
+    "postcss": "$postcss",
+    "sharp": "0.35.3"
+  }
+}

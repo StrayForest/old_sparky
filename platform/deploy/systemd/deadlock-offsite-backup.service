@@ -1,0 +1,39 @@
+[Unit]
+Description=Old Sparky encrypted off-site database backup
+Documentation=file:/opt/oldsparky/platform/current/docs/backup-restore-runbook.md
+After=network-online.target deadlock-maintenance.service
+Wants=network-online.target
+ConditionPathIsSymbolicLink=/opt/oldsparky/platform/current
+ConditionPathExists=/opt/oldsparky/platform/shared/.env.backup
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/oldsparky/platform/current
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_backup_offsite.py --apply --env-file /opt/oldsparky/platform/shared/.env.backup --platform-env-file /opt/oldsparky/platform/shared/.env.platform --backup-dir /opt/oldsparky/platform/shared/backups --max-age-hours 30 --json
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryMax=256M
+TimeoutStartSec=30min
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+

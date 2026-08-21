@@ -1,0 +1,4 @@
+interface:
+  display_name: "Platform Performance Monitoring"
+  short_description: "Trace platform bottlenecks by user step"
+  default_prompt: "Use $platform-performance-monitoring to plan and verify a platform performance monitoring pass."

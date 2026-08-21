@@ -1,0 +1,23 @@
+[Unit]
+Description=Old Sparky Arena lightweight production health gate
+After=network-online.target deadlock-api.service deadlock-worker.service deadlock-web.service nginx.service
+Wants=network-online.target
+ConditionPathIsSymbolicLink=/opt/oldsparky/platform/current
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/oldsparky/platform/current
+ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_health_monitor.py
+Nice=10
+CPUQuota=20%
+MemoryMax=128M
+TimeoutStartSec=45s
+UMask=0077
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+LockPersonality=true
+

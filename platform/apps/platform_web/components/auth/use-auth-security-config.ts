@@ -1,0 +1,87 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import { platformApiRequest } from "@/lib/platform-api";
+import type { PlatformAuthSecurityConfig } from "@/lib/platform-types";
+
+export type AuthSecurityConfigState = {
+  config: PlatformAuthSecurityConfig | null;
+  status: "loading" | "ready" | "fallback" | "error";
+};
+
+const fallbackTurnstileSiteKey = process.env.NEXT_PUBLIC_PLATFORM_TURNSTILE_SITE_KEY?.trim() || null;
+
+export function useAuthSecurityConfig(enabled = true) {
+  const [attempt, setAttempt] = useState(0);
+  const [state, setState] = useState<AuthSecurityConfigState>({
+    config: fallbackSecurityConfig(),
+    status: fallbackTurnstileSiteKey ? "fallback" : "loading"
+  });
+
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+    let active = true;
+    const fallback = fallbackSecurityConfig();
+    setState({ config: fallback, status: fallback ? "fallback" : "loading" });
+
+    void platformApiRequest<PlatformAuthSecurityConfig>("/auth/security-config")
+      .then((payload) => {
+        if (active) {
+          setState({ config: validateSecurityConfig(payload), status: "ready" });
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setState({ config: fallback, status: fallback ? "fallback" : "error" });
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [attempt, enabled]);
+
+  const retry = useCallback(() => setAttempt((current) => current + 1), []);
+  return { ...state, retry };
+}
+
+function fallbackSecurityConfig(): PlatformAuthSecurityConfig | null {
+  if (!fallbackTurnstileSiteKey) {
+    return null;
+  }
+  return {
+    public_registration_enabled: true,
+    email_verification_required: false,
+    turnstile_mode: "always",
+    turnstile_site_key: fallbackTurnstileSiteKey,
+    // Steam is server-controlled and fails closed when the runtime security
+    // contract cannot be loaded; a build-time Turnstile key is not authority
+    // to enable an external identity provider.
+    steam_login_enabled: false
+  };
+}
+
+function validateSecurityConfig(payload: PlatformAuthSecurityConfig): PlatformAuthSecurityConfig {
+  if (!["off", "always", "adaptive"].includes(payload.turnstile_mode)) {
+    throw new Error("Unsupported Turnstile mode.");
+  }
+  const siteKey = payload.turnstile_site_key?.trim() || null;
+  if (payload.turnstile_mode !== "off" && !siteKey) {
+    throw new Error("Turnstile site key is missing.");
+  }
+  if (
+    typeof payload.public_registration_enabled !== "boolean"
+    || typeof payload.email_verification_required !== "boolean"
+  ) {
+    throw new Error("Authentication security state is incomplete.");
+  }
+  return {
+    public_registration_enabled: payload.public_registration_enabled,
+    email_verification_required: payload.email_verification_required,
+    turnstile_mode: payload.turnstile_mode,
+    turnstile_site_key: siteKey,
+    steam_login_enabled: payload.steam_login_enabled === true
+  };
+}

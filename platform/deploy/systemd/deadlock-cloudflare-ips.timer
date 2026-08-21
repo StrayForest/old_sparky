@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Cloudflare origin IP ranges daily
+
+[Timer]
+OnCalendar=*-*-* 02:35:00
+RandomizedDelaySec=30m
+Persistent=true
+AccuracySec=5m
+Unit=deadlock-cloudflare-ips.service
+
+[Install]
+WantedBy=timers.target

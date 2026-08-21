@@ -1,0 +1,41 @@
+[Unit]
+Description=Old Sparky Arena API
+After=network-online.target redis-server.service postgresql.service
+Wants=network-online.target redis-server.service
+
+[Service]
+Type=simple
+User=oldsparky-platform
+Group=oldsparky-platform
+WorkingDirectory=/opt/oldsparky/platform/current
+Environment=PLATFORM_SHARED_DIR=/opt/oldsparky/platform/shared
+Environment=PLATFORM_ENV_FILE=/opt/oldsparky/platform/shared/.env.platform
+Environment=PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python
+Environment=PLATFORM_API_WORKERS=2
+ExecStart=/opt/oldsparky/platform/current/tools/platform_run_api.sh
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/opt/oldsparky/platform/shared/media-staging
+TasksMax=128
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

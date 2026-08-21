@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="Hero placeholder">
+  <rect width="96" height="96" rx="10" fill="#111410"/>
+  <path d="M12 80V16h72v64H12Z" fill="#181d17" stroke="#c99245" stroke-width="3"/>
+  <path d="M28 63 42 31l9 20 7-13 11 25H28Z" fill="#4fb181" opacity=".72"/>
+  <circle cx="63" cy="30" r="8" fill="#c99245"/>
+  <path d="M21 21h54v54H21V21Z" fill="none" stroke="#fff7e2" stroke-opacity=".18" stroke-width="2"/>
+</svg>

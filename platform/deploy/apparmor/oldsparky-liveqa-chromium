@@ -1,0 +1,16 @@
+# Old Sparky production browser QA uses checksum-pinned Playwright Chromium
+# binaries from an immutable root-owned runtime cache. Ubuntu 24.04 restricts
+# unprivileged user namespaces unless an executable has an explicit profile.
+# Keep the global restriction enabled and grant userns only to these two fixed
+# Playwright revision paths. The dedicated QA uid cannot write any ancestor.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile oldsparky-liveqa-chromium /var/lib/oldsparky-liveqa/runtime-*/browsers/chromium-1228/chrome-linux64/chrome flags=(unconfined) {
+  userns,
+}
+
+profile oldsparky-liveqa-chromium-headless /var/lib/oldsparky-liveqa/runtime-*/browsers/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell flags=(unconfined) {
+  userns,
+}

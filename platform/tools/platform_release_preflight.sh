@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
+REQUIRE_PREVIOUS=0
+REQUIRE_VERIFIED_BACKUP=0
+BACKUP_MAX_AGE_HOURS="24"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --app-dir)
+      if [[ $# -lt 2 ]]; then
+        echo "--app-dir requires a path." >&2
+        exit 1
+      fi
+      APP_DIR="$2"
+      shift 2
+      ;;
+    --require-previous)
+      REQUIRE_PREVIOUS=1
+      shift
+      ;;
+    --require-verified-backup)
+      REQUIRE_VERIFIED_BACKUP=1
+      shift
+      ;;
+    --backup-max-age-hours)
+      if [[ $# -lt 2 ]]; then
+        echo "--backup-max-age-hours requires a number." >&2
+        exit 1
+      fi
+      BACKUP_MAX_AGE_HOURS="$2"
+      shift 2
+      ;;
+    --help|-h)
+      cat <<'EOF'
+Usage: platform_release_preflight.sh [--app-dir <path>] [--require-previous]
+       [--require-verified-backup] [--backup-max-age-hours <hours>]
+
+Validates the live platform release layout before or after a deploy.
+EOF
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+CURRENT_TARGET="$(readlink -f "$APP_DIR/current" 2>/dev/null || true)"
+PREVIOUS_TARGET="$(readlink -f "$APP_DIR/previous" 2>/dev/null || true)"
+SHARED_DIR="$APP_DIR/shared"
+ENV_FILE="$SHARED_DIR/.env.platform"
+PYTHON_BIN="$SHARED_DIR/venv/bin/python"
+NODE_BIN="${PLATFORM_NODE_BIN:-$SHARED_DIR/node-current/bin/node}"
+
+fail() {
+  echo "[FAIL] $1" >&2
+  exit 1
+}
+
+pass() {
+  echo "[OK] $1"
+}
+
+[[ -n "$CURRENT_TARGET" && -d "$CURRENT_TARGET" ]] || fail "Current release is missing."
+pass "Current release: $CURRENT_TARGET"
+
+if [[ "$REQUIRE_PREVIOUS" -eq 1 ]]; then
+  [[ -n "$PREVIOUS_TARGET" && -d "$PREVIOUS_TARGET" ]] || fail "Previous release is missing."
+fi
+if [[ -n "$PREVIOUS_TARGET" && -d "$PREVIOUS_TARGET" ]]; then
+  pass "Previous release: $PREVIOUS_TARGET"
+else
+  echo "[WARN] Previous release is not present."
+fi
+
+[[ -f "$ENV_FILE" ]] || fail "Shared env file is missing: $ENV_FILE"
+pass "Shared env file present"
+
+[[ -x "$PYTHON_BIN" ]] || fail "Shared Python runtime is missing: $PYTHON_BIN"
+pass "Shared Python runtime present"
+
+[[ -x "$NODE_BIN" ]] || fail "Shared Node runtime is missing: $NODE_BIN"
+NODE_MAJOR="$("$NODE_BIN" -p "process.versions.node.split('.')[0]")"
+[[ "$NODE_MAJOR" == "26" ]] || fail "Node runtime must be v26 for the current Next.js stack: $("$NODE_BIN" -v)"
+pass "Shared Node runtime present: $("$NODE_BIN" -v)"
+
+for required_path in \
+  "$CURRENT_TARGET/RELEASE.json" \
+  "$CURRENT_TARGET/apps/platform_web/.next/standalone/server.js" \
+  "$CURRENT_TARGET/tools/platform_run_api.sh" \
+  "$CURRENT_TARGET/tools/platform_run_worker.sh" \
+  "$CURRENT_TARGET/tools/platform_run_web.sh" \
+  "$CURRENT_TARGET/tools/platform_run_alembic.sh"; do
+  [[ -e "$required_path" ]] || fail "Required release file is missing: $required_path"
+done
+pass "Release artifact files present"
+
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
+
+for required_env_key in \
+  PLATFORM_DATABASE_URL \
+  PLATFORM_WEB_ORIGIN \
+  PLATFORM_SECRET_KEY \
+  PLATFORM_REDIS_URL \
+  PLATFORM_CELERY_BROKER_URL \
+  PLATFORM_CELERY_RESULT_BACKEND; do
+  if [[ -z "${!required_env_key:-}" ]]; then
+    fail "Required env key is missing: $required_env_key"
+  fi
+done
+pass "Required env keys present"
+
+DB_CHECK_OUTPUT="$(
+  cd "$CURRENT_TARGET" && \
+  PLATFORM_ENV_FILE="$ENV_FILE" \
+  PLATFORM_PYTHON_BIN="$PYTHON_BIN" \
+  PYTHONPATH="$CURRENT_TARGET" \
+  "$PYTHON_BIN" -c "import asyncio; from python_packages.platform_infra.db import warm_up_engine; asyncio.run(warm_up_engine()); print('platform-db-ok')"
+)"
+[[ "$DB_CHECK_OUTPUT" == *"platform-db-ok"* ]] || fail "Database warm-up check failed."
+pass "Database connectivity check passed"
+
+ALEMBIC_CURRENT="$(
+  cd "$CURRENT_TARGET" && \
+  PLATFORM_ENV_FILE="$ENV_FILE" \
+  PLATFORM_PYTHON_BIN="$PYTHON_BIN" \
+  tools/platform_run_alembic.sh current 2>/dev/null | tail -n 1 | awk '{print $1}'
+)"
+ALEMBIC_HEAD="$(
+  cd "$CURRENT_TARGET" && \
+  PLATFORM_ENV_FILE="$ENV_FILE" \
+  PLATFORM_PYTHON_BIN="$PYTHON_BIN" \
+  tools/platform_run_alembic.sh heads 2>/dev/null | tail -n 1 | awk '{print $1}'
+)"
+
+[[ -n "$ALEMBIC_CURRENT" ]] || fail "Could not resolve current Alembic revision."
+[[ -n "$ALEMBIC_HEAD" ]] || fail "Could not resolve Alembic head revision."
+[[ "$ALEMBIC_CURRENT" == "$ALEMBIC_HEAD" ]] || fail "Alembic current ($ALEMBIC_CURRENT) does not match head ($ALEMBIC_HEAD)."
+pass "Alembic revision at head: $ALEMBIC_HEAD"
+
+if [[ "$REQUIRE_VERIFIED_BACKUP" -eq 1 ]]; then
+  "$PYTHON_BIN" "$CURRENT_TARGET/tools/platform_backup_restore_drill.py" \
+    --output-dir "$SHARED_DIR/backups" \
+    --check-latest \
+    --max-age-hours "$BACKUP_MAX_AGE_HOURS"
+  pass "Fresh restore-verified platform backup present"
+fi
+
+echo "[OK] Platform release preflight passed"

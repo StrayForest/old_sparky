@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Cleanup After Changes"
+  short_description: "Remove dead code after each change"
+  default_prompt: "Use $code-cleanup-after-changes after a code change to remove unused code safely."

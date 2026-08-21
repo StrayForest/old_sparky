@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Old Sparky Arena maintenance daily
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+RandomizedDelaySec=30m
+Persistent=true
+AccuracySec=1m
+Unit=deadlock-maintenance.service
+
+[Install]
+WantedBy=timers.target
+

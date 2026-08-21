@@ -1,0 +1,20 @@
+[Unit]
+Description=Validate and refresh Cloudflare origin IP ranges for Nginx
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/oldsparky/platform/current
+Environment=PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python
+ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_update_cloudflare_ips.py --apply --reload
+UMask=0022
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/nginx /run
+LockPersonality=true
+
