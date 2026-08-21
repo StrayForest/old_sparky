@@ -25,8 +25,11 @@ AS-07 R2/CDN runtime media cleanup is resolved and archived with migration inven
 
 AS-08 unknown-patch refresh hardening is resolved and archived with negative-cache/coalescing regressions, redirect/response bounds, CI verification and production deployment in [`archive/as-08-patch-miss-hardening.md`](archive/as-08-patch-miss-hardening.md).
 
-- **Next code-owned target — AS-09:** add a privacy-preserving account-wide login-failure window/cooldown across source IPs without creating a permanent lockout DoS path.
-- AS-10–AS-13: registration-enumeration decision, safe worker errors, proxy/firewall drift and CI isolation revalidation.
+AS-09 distributed login guessing protection is resolved and archived with account-wide/per-IP throttling regressions, bounded cooldown behavior, CI verification and production deployment in [`archive/as-09-distributed-login-guessing.md`](archive/as-09-distributed-login-guessing.md).
+
+- **AS-10 — product/security decision:** decide whether duplicate-registration UX justifies existing-email disclosure; otherwise move to a generic accepted flow with comparable timing and Turnstile behavior.
+- **Next code-owned target — AS-11:** replace public worker exception text with stable public error codes/generic messages while retaining redacted diagnostics only in restricted logs/admin surfaces.
+- AS-12–AS-13: proxy/firewall configuration drift and CI isolation revalidation.
 - After the media grace period, remove the runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers once no migration/reconciliation path depends on them.
 - Continue reducing legacy/duplicate runtime and documentation paths after each replacement is proven.
 

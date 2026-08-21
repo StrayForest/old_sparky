@@ -12,7 +12,6 @@ This document contains only findings that still require action or direct operato
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
 | AS-02 | High / P1 | High | Cloudflare Access/MFA for privileged routes is not directly verified | Open; operator/dashboard evidence required |
-| AS-09 | Medium / P2 | Medium | Login protection has no account-wide counter across source IPs | Open |
 | AS-10 | Low / P2 | High | Registration can reveal an existing email address | Open; product/security decision required |
 | AS-11 | Low / P2 | High | Public tournament responses can expose worker exception text | Open |
 | AS-12 | Medium / P2 | High | Proxy, Cloudflare-range, UFW and startup validation can drift independently | Open |
@@ -45,9 +44,6 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 
 ## P2 findings
 
-### AS-09 — Distributed login guessing residual
-Add a privacy-preserving account-wide failure window/cooldown without creating a permanent lockout DoS path. **Open.**
-
 ### AS-10 — Existing-email enumeration at registration
 Decide whether duplicate-registration UX justifies disclosure; otherwise use a generic accepted flow with comparable timing/Turnstile behavior. **Open; product/security decision required**.
 
@@ -68,9 +64,9 @@ Verify the actual Cloudflare HSTS owner/value and rollback implications. Nginx m
 ## Remediation order
 
 1. AS-02 Cloudflare Access/MFA verification remains the only open P1 security finding that is directly owner-gated outside the repository.
-2. AS-09 through AS-13 proceed as bounded P2 packages; separate network-policy and product/privacy decisions where required.
+2. AS-10 remains a product/security decision. AS-11 is the next bounded code-owned remediation package; AS-12 and AS-13 remain separate P2 hardening work.
 3. AS-14 remains operator verification work.
 
-Resolved AS-03 evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md). Resolved AS-06 evidence is retained in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md). Resolved AS-07 evidence is retained in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Resolved AS-08 evidence is retained in [`archive/as-08-patch-miss-hardening.md`](archive/as-08-patch-miss-hardening.md).
+Resolved AS-03 evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md). Resolved AS-06 evidence is retained in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md). Resolved AS-07 evidence is retained in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Resolved AS-08 evidence is retained in [`archive/as-08-patch-miss-hardening.md`](archive/as-08-patch-miss-hardening.md). Resolved AS-09 evidence is retained in [`archive/as-09-distributed-login-guessing.md`](archive/as-09-distributed-login-guessing.md).
 
 Any newly confirmed Critical issue or direct authentication bypass blocks production installation. Do not widen CSP, disable Turnstile, add privileged-route bypasses or weaken application RBAC to simplify testing.
