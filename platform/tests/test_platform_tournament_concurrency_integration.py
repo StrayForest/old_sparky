@@ -176,9 +176,14 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
         organizer = await self._register_user("invite-organizer")
         player_a = await self._register_user("invite-a")
         player_b = await self._register_user("invite-b")
-        tournament, invite = await self._create_open_private_tournament(
+        tournament, _automatic_invite = await self._create_open_private_tournament(
             organizer,
             "ir",
+        )
+        invite = await self._create_invite(
+            organizer,
+            tournament["slug"],
+            max_uses=1,
         )
 
         async with session_factory()() as blocker:
