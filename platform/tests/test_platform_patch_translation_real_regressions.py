@@ -7,7 +7,7 @@ from apps.platform_api.app.services import patch_translation_runtime as runtime
 
 
 class PatchTranslationRealRegressionTests(unittest.TestCase):
-    """Lock in the production QA failures found in the 2026-07-28 patch."""
+    """Lock in translation failures observed in recent production patches."""
 
     @staticmethod
     def _catalog() -> dict[str, object]:
@@ -74,6 +74,7 @@ class PatchTranslationRealRegressionTests(unittest.TestCase):
             "Sprint Speed": "Скорость бега",
             "Fire Rate": "Скорострельность",
             "Spirit Power": "Спиритическая мощь",
+            "Spirit Scaling": "Коэффициент масштабирования от спиритической мощи",
             "Bullet Resist": "Сопротивляемость пулям",
             "Spirit Resist": "Сопротивляемость спиритизму",
             "Melee Resist": "Сопротивляемость в ближнем бою",

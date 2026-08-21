@@ -22,6 +22,7 @@ CANONICAL_GLOSSARY: CanonicalGlossary = {
     "Fire Rate": ("Скорострельность",),
     "Bullet Velocity": ("Скорость пуль",),
     "Spirit Power": ("Спиритическая мощь",),
+    "Spirit Scaling": ("Коэффициент масштабирования от спиритической мощи",),
     "Move Speed": ("Скорость передвижения",),
     "Sprint Speed": ("Скорость бега",),
     "Dash Speed": ("Скорость рывка",),
