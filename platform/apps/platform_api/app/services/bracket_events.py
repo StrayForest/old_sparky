@@ -5,6 +5,9 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
+from apps.platform_api.app.services.tournament_workspace_access import (
+    current_tournament_stream_access_is_valid,
+)
 from python_packages.platform_infra.redis import redis_client
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,9 @@ async def publish_bracket_event(
 
 
 async def stream_bracket_events(tournament_id: str) -> AsyncIterator[str]:
+    if not await current_tournament_stream_access_is_valid(tournament_id):
+        return
+
     client = redis_client()
     pubsub = client.pubsub()
     channel = bracket_channel(tournament_id)
@@ -45,6 +51,8 @@ async def stream_bracket_events(tournament_id: str) -> AsyncIterator[str]:
                 ignore_subscribe_messages=True,
                 timeout=15.0,
             )
+            if not await current_tournament_stream_access_is_valid(tournament_id):
+                break
             if message is None:
                 yield ": keepalive\n\n"
                 continue
