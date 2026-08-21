@@ -11,12 +11,10 @@ This document contains only findings that still require action or direct operato
 
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
-| AS-02 | High / P1 | High | Cloudflare Access/MFA for privileged routes is not directly verified | Open; operator/dashboard evidence required |
 | AS-10 | Low / P2 | High | Registration can reveal an existing email address | Open; product/security decision required |
 | AS-11 | Low / P2 | High | Public tournament responses can expose worker exception text | Open |
 | AS-12 | Medium / P2 | High | Proxy, Cloudflare-range, UFW and startup validation can drift independently | Open |
 | AS-13 | Low / P2 | Medium | CI fail-closed isolation contour requires revalidation against the current workflow | Open; revalidate before changing |
-| AS-14 | Operational / P1 | High | HSTS ownership/state requires direct Cloudflare verification | Open; operator verification required |
 
 ## Authorization matrix
 
@@ -35,12 +33,7 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 
 ## P1 findings
 
-### AS-02 — Privileged route edge protection not proven
-
-- Risk: `/platform-ops*` and `/api/v1/admin*` may lack the intended Cloudflare Access/MFA exposure boundary, although application RBAC remains authoritative.
-- Required result: direct Cloudflare configuration/live evidence for the exact privileged routes, MFA policy and break-glass behavior.
-- Constraint: repository changes alone cannot prove closure.
-- Status: **Open; operator/dashboard evidence required**.
+No open P1 security/correctness finding remains in this tracker. AS-02 privileged-route Access/MFA and AS-14 HSTS ownership/state were closed on 2026-08-21 with direct operator/dashboard/live evidence; retained evidence is archived below.
 
 ## P2 findings
 
@@ -56,17 +49,12 @@ Fail closed on production bind/proxy invariants and keep Nginx/Cloudflare/UFW tr
 ### AS-13 — CI isolation contour needs current revalidation
 The current workflow has been restored and is green, but the older finding must be rechecked against the exact supported fail-closed test runner/config before closure or modification. **Open pending revalidation.**
 
-## Operational finding
-
-### AS-14 — HSTS ownership/state requires direct verification
-Verify the actual Cloudflare HSTS owner/value and rollback implications. Nginx must not independently add or alter HSTS without that evidence. **Open; operator verification required**.
-
 ## Remediation order
 
-1. AS-02 Cloudflare Access/MFA verification remains the only open P1 security finding that is directly owner-gated outside the repository.
-2. AS-10 remains a product/security decision. AS-11 is the next bounded code-owned remediation package; AS-12 and AS-13 remain separate P2 hardening work.
-3. AS-14 remains operator verification work.
+1. No operator-owned or repository-owned P1 finding is currently open.
+2. AS-10 remains a product/security decision. AS-11 is the next bounded code-owned remediation package.
+3. AS-12 and AS-13 remain separate P2 hardening/revalidation work.
 
-Resolved AS-03 evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md). Resolved AS-06 evidence is retained in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md). Resolved AS-07 evidence is retained in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Resolved AS-08 evidence is retained in [`archive/as-08-patch-miss-hardening.md`](archive/as-08-patch-miss-hardening.md). Resolved AS-09 evidence is retained in [`archive/as-09-distributed-login-guessing.md`](archive/as-09-distributed-login-guessing.md).
+Resolved AS-02 evidence is retained in [`archive/as-02-cloudflare-access-mfa.md`](archive/as-02-cloudflare-access-mfa.md). Resolved AS-03 evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md). Resolved AS-06 evidence is retained in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md). Resolved AS-07 evidence is retained in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Resolved AS-08 evidence is retained in [`archive/as-08-patch-miss-hardening.md`](archive/as-08-patch-miss-hardening.md). Resolved AS-09 evidence is retained in [`archive/as-09-distributed-login-guessing.md`](archive/as-09-distributed-login-guessing.md). Resolved AS-14 evidence is retained in [`archive/as-14-cloudflare-hsts-ownership.md`](archive/as-14-cloudflare-hsts-ownership.md).
 
 Any newly confirmed Critical issue or direct authentication bypass blocks production installation. Do not widen CSP, disable Turnstile, add privileged-route bypasses or weaken application RBAC to simplify testing.
