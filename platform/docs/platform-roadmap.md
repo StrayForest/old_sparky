@@ -2,7 +2,7 @@
 
 - Status: Active backlog and priority map
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-21
+- Last reviewed: 2026-08-22
 
 For the production baseline and immediate engineering target, read [`CURRENT.md`](CURRENT.md). This file deliberately omits release diaries and detailed audit evidence.
 
@@ -26,9 +26,11 @@ AS-08 unknown-patch refresh hardening is resolved and archived with negative-cac
 
 AS-09 distributed login guessing protection is resolved and archived with account-wide/per-IP throttling regressions, bounded cooldown behavior, CI verification and production deployment in [`archive/as-09-distributed-login-guessing.md`](archive/as-09-distributed-login-guessing.md).
 
+AS-11 public worker-error sanitization is resolved with a persistence-boundary guard, irreversible historical-data cleanup migration and a public-response regression proving arbitrary exception text cannot leave the API. Closure evidence is retained in [`archive/as-11-worker-error-sanitization.md`](archive/as-11-worker-error-sanitization.md).
+
 - **AS-10 — product/security decision:** decide whether duplicate-registration UX justifies existing-email disclosure; otherwise move to a generic accepted flow with comparable timing and Turnstile behavior.
-- **Next code-owned target — AS-11:** replace public worker exception text with stable public error codes/generic messages while retaining redacted diagnostics only in restricted logs/admin surfaces.
-- AS-12–AS-13: proxy/firewall configuration drift and CI isolation revalidation.
+- **Next code-owned target — AS-12:** fail closed on production bind/proxy invariants and keep Nginx/Cloudflare/UFW trust ranges reconciled.
+- **AS-13:** revalidate the current CI fail-closed isolation contour before changing it.
 - After the media grace period, remove the runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers once no migration/reconciliation path depends on them.
 - Continue reducing legacy/duplicate runtime and documentation paths after each replacement is proven.
 
