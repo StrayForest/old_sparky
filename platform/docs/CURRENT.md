@@ -14,6 +14,9 @@ Read this file for the current production baseline and next engineering priority
 - Web, API and worker run under separate locked Unix identities with per-service runtime environments; the web process receives no backend database, session, R2, mail, Turnstile-secret or OpenAI credentials.
 - API and worker share only the dedicated `oldsparky-media` staging group; worker state and web cache remain service-owned.
 - Current deployed product includes secure Steam OpenID login/linking, mobile auth/profile/tournament polish, enforced nonce CSP, tournament lifecycle, deterministic Deadlock assignment, locked rosters, bracket progression, immutable releases and tested rollback.
+- Cloudflare Access now protects `/platform-ops*` and `/api/v1/admin*` with an operator-scoped Allow policy and independent MFA; a fresh incognito login verified the identity -> TOTP MFA -> application path while application `admin`/`superadmin` RBAC remains authoritative.
+- Cloudflare is the single visitor-facing HSTS owner. Dashboard verification on 2026-08-21 confirmed HSTS On with six-month `max-age=15552000`, `includeSubDomains` Off and preload Off; Nginx must continue to omit HSTS.
+- Cloudflare Full(strict), minimum visitor TLS 1.2, TLS 1.3/HTTP3 and DNSSEC were operator-confirmed on 2026-08-21.
 - Invite-only tournament workspace reads reject retained or otherwise inactive participant records; private bracket SSE also revalidates active participant membership while the connection remains open, so withdrawal/disqualification revokes an existing stream before further private events are emitted.
 - Organizer participant removal is a retained `disqualified` record rather than a physical participant-row deletion. A disqualified participant cannot redeem another invite or self-rejoin that same tournament, and a retry does not consume another invite use. The organizer-only management roster retains inactive rows for explicit restoration; the exclusion remains scoped to that tournament and does not block participation in unrelated tournaments.
 - Tournament invite claims/revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Last invite use and last participant slot cannot be consumed twice, and restoring a retained inactive participant rechecks capacity before making the row active again.
@@ -27,9 +30,9 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-No repository-owned P1 implementation remains after AS-06 closure.
+No operator-owned or repository-owned P1 implementation/verification task remains after AS-02 and AS-14 closure.
 
-AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/platform-ops*` and `/api/v1/admin*` and does not replace application RBAC. AS-07 runtime media cleanup, AS-08 unknown-patch refresh hardening and AS-09 distributed login guessing protection are closed and archived. AS-10 remains a product/security decision on registration-enumeration behavior; the next bounded code-owned remediation target is AS-11 public worker-error sanitization.
+AS-02 privileged-route Access/MFA and AS-14 HSTS ownership/state are closed with direct operator/dashboard/live evidence. AS-07 runtime media cleanup, AS-08 unknown-patch refresh hardening and AS-09 distributed login guessing protection are closed and archived. AS-10 remains a product/security decision on registration-enumeration behavior; the next bounded code-owned remediation target is AS-11 public worker-error sanitization.
 
 ## Production invariants
 
@@ -42,6 +45,8 @@ AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/pl
 - Public media rendering must remain `R2 -> CDN -> browser`; normal API runtime must not proxy R2 objects, serve legacy upload paths or fall back to local-disk reads. Legacy URL columns and migration helpers may remain only while runtime-inert and migration/grace-period scoped.
 - Unknown public patch IDs must not make the request path wait on external refresh work. Retain per-ID negative caching, cross-worker refresh coalescing and explicit no-redirect/response-size bounds for miss-triggered upstream requests.
 - Password-login protection must retain independent per-IP and account-wide buckets. Account-wide Redis state must use private HMAC fingerprints rather than plaintext identifiers; cooldowns remain bounded and must not extend on blocked requests, and a successful login clears the account failure/cooldown state.
+- Cloudflare Access is defense in depth only: privileged application RBAC remains authoritative after edge authentication/MFA succeeds.
+- Cloudflare remains the single HSTS owner; do not add `Strict-Transport-Security` at Nginx while this ownership model is active.
 - Terminal tournament states freeze organizer match administration.
 - Preserve the live HTTPS/domain/secure-cookie contour unless a reviewed release changes it.
 - Rollback switches application releases; it does not automatically downgrade Alembic.
@@ -49,7 +54,7 @@ AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/pl
 
 ## Deferred / operator-owned work
 
-- Cloudflare dashboard evidence for HSTS, DNSSEC, CAA, WAF/rates, edge TLS and R2 settings.
+- Remaining Cloudflare dashboard follow-up for CAA, WAF/rates and R2 settings where the operator checklist still marks work `VERIFY`/`TODO`.
 - Real-user CSP follow-up and classification of new enforcement reports.
 - Post-grace physical removal of runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers when no longer required.
 - Non-security feature expansion that does not remove a launch or production blocker.
