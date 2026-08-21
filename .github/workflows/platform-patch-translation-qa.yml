@@ -94,9 +94,12 @@ jobs:
           )
           WATCH_TERMS = (
               "lifesteal", "cooldown", "spirit scaling", "spirit power",
-              "move speed", "movement speed", "sprint speed", "falloff range",
-              "bullet resist", "spirit resist", "melee resist",
+              "move speed", "movement speed", "sprint speed", "dash speed",
+              "falloff range", "bullet resist", "spirit resist", "melee resist",
           )
+          SPEED_TERMS = ("move speed", "movement speed", "sprint speed", "dash speed")
+          SOURCE_SPEED_M_RE = re.compile(r"[+\-]?\d+(?:\.\d+)?m\b", re.IGNORECASE)
+          CANONICAL_SPIRIT_SCALING = "коэффициент масштабирования от спиритической мощности"
           CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
           def emit(kind, **payload):
@@ -160,6 +163,18 @@ jobs:
                       if "same change for melee lifesteal" in en_lower and "Melee Lifesteal" not in ru:
                           raise SystemExit(
                               f"Melee Lifesteal item reference was translated: {patch_id} {source_segment['id']}"
+                          )
+                      if "spirit scaling" in en_lower and CANONICAL_SPIRIT_SCALING not in ru_lower:
+                          raise SystemExit(
+                              f"Spirit Scaling is not Valve-canonical: {patch_id} {source_segment['id']} -> {ru}"
+                          )
+                      if (
+                          any(term in en_lower for term in SPEED_TERMS)
+                          and SOURCE_SPEED_M_RE.search(en)
+                          and "м/с" not in ru_lower
+                      ):
+                          raise SystemExit(
+                              f"speed value did not use м/с: {patch_id} {source_segment['id']} -> {ru}"
                           )
 
                       if any(term in en_lower for term in WATCH_TERMS):
