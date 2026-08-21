@@ -95,7 +95,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(unittest.IsolatedAsync
             participant.status = participant_status
             await db_session.commit()
 
-    async def test_inactive_members_are_denied_on_every_private_workspace_endpoint(self) -> None:
+    async def test_inactive_members_are_denied_on_all_private_tournament_child_reads(self) -> None:
         organizer = await self._register_user("organizer")
         tournament = self._assert_status(
             await organizer["client"].post(
@@ -149,14 +149,21 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(unittest.IsolatedAsync
             )
             members.append((participant_status, member))
 
-        protected_suffixes = (
+        base_protected_suffixes = (
             "workspace",
             "participants",
             "matches",
             "bracket",
             "bracket/events",
+            "invites",
+            "deadlock/ready-check",
+            "deadlock/captain-round",
+            "deadlock/auto-assignment",
         )
         for participant_status, member in members:
+            protected_suffixes = base_protected_suffixes + (
+                f"profiles/{member['user_id']}",
+            )
             for suffix in protected_suffixes:
                 with self.subTest(status=participant_status, suffix=suffix):
                     response = await member["client"].get(

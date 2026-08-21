@@ -8,35 +8,34 @@ from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.models import Tournament, TournamentParticipant
 from python_packages.platform_infra.security import get_optional_authenticated_session
 
-INACTIVE_PARTICIPANT_STATUSES = frozenset({"withdrawn", "disqualified"})
-PRIVATE_WORKSPACE_READ_SUFFIXES = frozenset(
-    {
-        "workspace",
-        "participants",
-        "matches",
-        "bracket",
-        "bracket/events",
-    }
-)
+ACTIVE_PARTICIPANT_STATUSES = frozenset({"registered", "confirmed", "checked_in"})
 
 
-def private_workspace_slug_from_request(request: Request) -> str | None:
+def private_tournament_child_slug_from_request(request: Request) -> str | None:
+    """Return the matched tournament slug for a private-read candidate route.
+
+    The router dependency runs after FastAPI has matched the route, so use route
+    metadata and parsed path params instead of maintaining a suffix allowlist.
+    The tournament summary itself (``/{slug}``) is intentionally excluded;
+    every routed GET child of ``/{slug}`` is covered automatically, including
+    future child endpoints added to the tournament router.
+    """
+
     if request.method.upper() != "GET":
         return None
 
-    parts = tuple(part for part in request.url.path.split("/") if part)
-    try:
-        tournaments_index = parts.index("tournaments")
-    except ValueError:
+    slug = str(request.path_params.get("slug") or "").strip()
+    if not slug:
         return None
 
-    slug_index = tournaments_index + 1
-    if slug_index >= len(parts):
+    route = request.scope.get("route")
+    route_path = str(getattr(route, "path", "") or "")
+    marker = "{slug}"
+    if marker not in route_path:
         return None
 
-    slug = parts[slug_index]
-    suffix = "/".join(parts[slug_index + 1 :])
-    if not slug or suffix not in PRIVATE_WORKSPACE_READ_SUFFIXES:
+    suffix = route_path.split(marker, 1)[1].strip("/")
+    if not suffix:
         return None
     return slug
 
@@ -47,20 +46,21 @@ def auth_session_has_admin_role(auth_session) -> bool:
     return "admin" in auth_session.role_slugs or "superadmin" in auth_session.role_slugs
 
 
-async def ensure_inactive_participant_has_no_private_workspace_access(
+async def ensure_private_tournament_read_membership_is_active(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> None:
-    """Revoke private tournament workspace reads once participation is inactive.
+    """Prevent retained participant rows from acting as private-read membership.
 
-    Existing route handlers historically use the existence of a participant row
-    as their private-workspace membership signal. Participant rows are retained
-    after withdrawal/disqualification for audit/history, so an inactive row must
-    be rejected before those handlers are reached.
+    Historical participant rows remain in the database for audit/history, but
+    only explicitly active statuses grant participant membership for invite-only
+    tournament child reads. Unknown future statuses fail closed until they are
+    deliberately classified as active. Organizer and platform-admin authority
+    remain independent of participant membership.
     """
 
-    slug = private_workspace_slug_from_request(request)
+    slug = private_tournament_child_slug_from_request(request)
     if slug is None or auth_session is None:
         return
     if auth_session_has_admin_role(auth_session):
@@ -90,7 +90,9 @@ async def ensure_inactive_participant_has_no_private_workspace_access(
     participant_status = row[2]
     if tournament_visibility != "invite_only" or organizer_user_id == user_id:
         return
-    if participant_status not in INACTIVE_PARTICIPANT_STATUSES:
+    if participant_status is None:
+        return
+    if participant_status in ACTIVE_PARTICIPANT_STATUSES:
         return
 
     raise HTTPException(

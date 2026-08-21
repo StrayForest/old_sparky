@@ -18,7 +18,7 @@ from apps.platform_api.app.api.routes import (
     users,
 )
 from apps.platform_api.app.services.tournament_workspace_access import (
-    ensure_inactive_participant_has_no_private_workspace_access,
+    ensure_private_tournament_read_membership_is_active,
 )
 
 api_router = APIRouter()
@@ -37,7 +37,7 @@ api_router.include_router(
     tournaments.router,
     prefix="/tournaments",
     tags=["tournaments"],
-    dependencies=[Depends(ensure_inactive_participant_has_no_private_workspace_access)],
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
 )
 api_router.include_router(stats.router, prefix="/stats", tags=["stats"])
 api_router.include_router(admin.router, prefix="/admin", tags=["admin"])
