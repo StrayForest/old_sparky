@@ -21,7 +21,7 @@ from apps.platform_api.app.services.home_content import (
     resolve_deadlock_rank_image,
 )
 from apps.platform_api.app.services.home_content_runtime import refresh_home_content
-from apps.platform_api.app.services.patch_detail import get_patch_detail
+from apps.platform_api.app.services.patch_detail_security import get_patch_detail
 from apps.platform_api.app.services.support_mail import (
     send_support_message,
     support_mail_configured,
