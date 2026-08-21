@@ -54,9 +54,13 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 "current_tournament_stream_access_is_valid",
                 access_check,
             ),
+            patch.object(bracket_events.secrets, "randbelow", return_value=0),
         ):
             stream = bracket_events.stream_bracket_events("tournament-1")
-            self.assertEqual(await anext(stream), "event: connected\ndata: {}\n\n")
+            self.assertEqual(
+                await anext(stream),
+                "retry: 5000\nevent: connected\ndata: {}\n\n",
+            )
             with self.assertRaises(StopAsyncIteration):
                 await anext(stream)
 
@@ -97,9 +101,13 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 "current_tournament_stream_access_is_valid",
                 access_check,
             ),
+            patch.object(bracket_events.secrets, "randbelow", return_value=250),
         ):
             stream = bracket_events.stream_bracket_events("tournament-3")
-            self.assertEqual(await anext(stream), "event: connected\ndata: {}\n\n")
+            self.assertEqual(
+                await anext(stream),
+                "retry: 5250\nevent: connected\ndata: {}\n\n",
+            )
             self.assertEqual(
                 await anext(stream),
                 'event: bracket\ndata: {"revision":3}\n\n',
@@ -108,6 +116,38 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(access_check.await_count, 2)
         self.assertEqual(pubsub.unsubscribed, ["platform:bracket:tournament-3"])
+        self.assertTrue(pubsub.closed)
+        self.assertTrue(client.closed)
+
+    async def test_stream_recycles_after_bounded_lifetime(self) -> None:
+        pubsub = _FakePubSub([])
+        client = _FakeRedisClient(pubsub)
+        access_check = AsyncMock(return_value=True)
+
+        with (
+            patch.object(bracket_events, "redis_client", MagicMock(return_value=client)),
+            patch.object(
+                bracket_events,
+                "current_tournament_stream_access_is_valid",
+                access_check,
+            ),
+            patch.object(bracket_events.secrets, "randbelow", return_value=0),
+            patch.object(
+                bracket_events.time,
+                "monotonic",
+                side_effect=(10.0, 10.0 + bracket_events.SSE_STREAM_MAX_LIFETIME_SECONDS),
+            ),
+        ):
+            stream = bracket_events.stream_bracket_events("tournament-4")
+            self.assertEqual(
+                await anext(stream),
+                "retry: 5000\nevent: connected\ndata: {}\n\n",
+            )
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+
+        access_check.assert_awaited_once_with("tournament-4")
+        self.assertEqual(pubsub.unsubscribed, ["platform:bracket:tournament-4"])
         self.assertTrue(pubsub.closed)
         self.assertTrue(client.closed)
 

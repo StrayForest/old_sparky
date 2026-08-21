@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -9,6 +11,12 @@ from apps.platform_api.app.services.tournament_workspace_access import (
     current_tournament_stream_access_is_valid,
 )
 from python_packages.platform_infra.redis import redis_client
+from python_packages.platform_infra.sse_connection_limit import (
+    SSE_KEEPALIVE_SECONDS,
+    SSE_RECONNECT_JITTER_MS,
+    SSE_RECONNECT_MIN_MS,
+    SSE_STREAM_MAX_LIFETIME_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +52,19 @@ async def stream_bracket_events(tournament_id: str) -> AsyncIterator[str]:
     pubsub = client.pubsub()
     channel = bracket_channel(tournament_id)
     await pubsub.subscribe(channel)
+    started_at = time.monotonic()
+    retry_ms = SSE_RECONNECT_MIN_MS + secrets.randbelow(SSE_RECONNECT_JITTER_MS + 1)
     try:
-        yield "event: connected\ndata: {}\n\n"
+        yield f"retry: {retry_ms}\nevent: connected\ndata: {{}}\n\n"
         while True:
+            remaining_seconds = (
+                SSE_STREAM_MAX_LIFETIME_SECONDS - (time.monotonic() - started_at)
+            )
+            if remaining_seconds <= 0:
+                break
             message = await pubsub.get_message(
                 ignore_subscribe_messages=True,
-                timeout=15.0,
+                timeout=min(float(SSE_KEEPALIVE_SECONDS), remaining_seconds),
             )
             if not await current_tournament_stream_access_is_valid(tournament_id):
                 break

@@ -11,6 +11,7 @@ from python_packages.platform_infra.csrf import CsrfProtectionMiddleware
 from python_packages.platform_infra.performance import RequestPerformanceMiddleware
 from python_packages.platform_infra.object_storage import get_object_storage, object_key_from_upload_url
 from python_packages.platform_infra.security import validate_auth_security_settings
+from python_packages.platform_infra.sse_connection_limit import SseConnectionLimitMiddleware
 from starlette.concurrency import run_in_threadpool
 
 
@@ -29,6 +30,7 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(RequestPerformanceMiddleware)
     app.add_middleware(CsrfProtectionMiddleware, settings_factory=get_settings)
+    app.add_middleware(SseConnectionLimitMiddleware, settings_factory=get_settings)
     if not is_production:
         # Keep CORS outermost so browser clients can inspect CSRF rejections as
         # well as successful token-issuing responses.
