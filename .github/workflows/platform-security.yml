@@ -161,7 +161,7 @@ jobs:
           npm run test:smoke --
           --project=desktop
           --project=mobile-layout
-          --grep-invert="Steam-only account is immediately usable and attaches optional email only after code confirmation|account email changes only after inline code confirmation|captain profile uses one full-width dream-slot hero picker"
+          --grep-invert="Steam-only account is immediately usable and attaches optional email only after code confirmation|account email changes only after inline code confirmation|captain profile uses one full-width dream-slot hero picker|registered player outside the published roster sees the unassigned state"
         env:
           CI: "true"
 
