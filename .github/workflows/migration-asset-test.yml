@@ -6,19 +6,30 @@ on:
     paths: [.github/workflows/migration-asset-test.yml]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Verify public production asset matches audited snapshot
+      - name: Checkout migration branch
+        uses: actions/checkout@v6
+        with:
+          ref: migration/asset-test
+
+      - name: Import one verified public asset
         shell: bash
         run: |
           set -euo pipefail
+          target='platform/apps/platform_web/public/assets/heroes/Abrams.png'
+          mkdir -p "$(dirname "$target")"
           curl --fail --silent --show-error --location \
-            https://old-sparky.com/assets/heroes/Abrams.png \
-            --output Abrams.png
-          test "$(stat -c '%s' Abrams.png)" = "115388"
-          test "$(git hash-object Abrams.png)" = "a751b0eaf01f9f834bbf56abacfd9f20361aad8c"
+            'https://old-sparky.com/assets/heroes/Abrams.png' \
+            --output "$target"
+          test "$(git hash-object "$target")" = 'a751b0eaf01f9f834bbf56abacfd9f20361aad8c'
+          git add -- "$target"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: import verified public asset'
+          git push origin HEAD:migration/asset-test
