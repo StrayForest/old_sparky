@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-16
+- Last reviewed: 2026-08-21
 
 ## Invariants
 
@@ -40,6 +40,15 @@ The platform connects directly to PostgreSQL. Add a database pooler only from me
 - Nginx owns origin TLS, proxy limits, cache headers and browser-hardening headers for HTML, API, static, SSE and error responses.
 - Cloudflare owns public DNS/edge TLS/HSTS/cache/WAF/Access. Edge controls never grant an application role.
 
+## Runtime identity and credential boundary
+
+- Next.js runs as `oldsparky-web`, FastAPI as `oldsparky-api`, and Celery as `oldsparky-worker`; each has a private primary group.
+- `/opt/oldsparky/platform/shared/.env.platform` is the root-owned canonical operator source and is not readable by runtime identities.
+- Deployment renders least-privilege service inputs under `/opt/oldsparky/platform/shared/env/`; each unit loads only its own runtime env.
+- The web runtime receives no database, session-signing, R2 secret, mail-delivery, Turnstile secret or OpenAI credential.
+- API and worker share only the `oldsparky-media` supplementary group required for media staging. Worker scratch space and web cache remain service-owned.
+- systemd process visibility is restricted with `ProtectProc=invisible`; runtime scripts fail closed if a service is started with the wrong service identity/environment contract.
+
 ## Media boundary
 
 Uploads stream into bounded private staging. The worker decodes, validates, normalizes and re-encodes WebP variants, writes immutable R2 keys, commits metadata and removes staging. Public R2 contains no new originals. API serialization builds CDN descriptors from DB rows and makes no render-path S3 read.
@@ -48,8 +57,7 @@ Uploads stream into bounded private staging. The worker decodes, validates, norm
 
 - Only managed Cloudflare ranges may supply `CF-Connecting-IP`; FastAPI accepts proxy headers only from loopback.
 - Cookie mutations require application CSRF controls even behind Cloudflare.
-- R2, DB, mail, session and Turnstile secrets are backend-only.
-- The current shared Unix identity/full env across web/API/worker violates the intended least-privilege boundary and is the next roadmap item.
+- R2, DB, mail, session and Turnstile secrets are backend-only and are not present in the web runtime environment.
 - The public media bucket and private backup bucket/tokens are separate.
 
 ## Release and recovery

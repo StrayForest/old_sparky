@@ -2,30 +2,36 @@
 
 - Status: Active backlog and priority map
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-16
+- Last reviewed: 2026-08-21
 
 For the production baseline and immediate engineering target, read [`CURRENT.md`](CURRENT.md). This file deliberately omits release diaries and detailed audit evidence.
 
 ## P1 — security and correctness
 
-1. **AS-01 runtime identities and per-service secrets**
-   - separate web/API/worker Unix identities;
-   - per-service credentials/environment;
-   - least-privilege staging/scratch/process visibility;
-   - fail-closed runtime validation;
-   - install/restart/rollback coverage.
+1. **AS-04 inactive-participant authorization**
+   - withdrawn, rejected, disqualified and otherwise inactive participant rows must not retain private-workspace access;
+   - keep organizer/admin access explicit and independent;
+   - cover all inactive states with role-matrix regression tests.
 
-2. **AS-02 privileged route access / MFA**
+2. **AS-03 tournament concurrency**
+   - serialize invite-use and participant-capacity-sensitive writes;
+   - preserve capacity/invite invariants under concurrent requests;
+   - add deterministic concurrency tests.
+
+3. **AS-05 public/private data boundary**
+   - separate public DTOs from private/admin/internal data;
+   - prevent account email and moderation/internal fields from leaking through public endpoints;
+   - align privacy copy and migration behavior where required.
+
+4. **AS-06 SSE connection pressure**
+   - add per-source/user and global long-lived connection limits;
+   - release limits correctly on disconnect/timeouts;
+   - cover API/Nginx behavior and resource-pressure regressions.
+
+5. **AS-02 privileged route access / MFA — operator-owned**
    - protect `/platform-ops*` and `/api/v1/admin*` with the approved Cloudflare/operator control;
-   - retain application RBAC and audit events.
-
-3. **AS-03/AS-04 tournament concurrency and inactive-participant authorization**
-   - serialize invite/capacity-sensitive writes;
-   - ensure withdrawn/disqualified/inactive participants cannot retain workflow access they no longer own.
-
-4. **AS-05/AS-06 public-data/privacy contract and SSE caps**
-   - make public/private data exposure explicit;
-   - bound long-lived connection pressure at API/Nginx boundaries.
+   - retain application RBAC and audit events;
+   - close only after direct dashboard/live evidence.
 
 ## P2 — hardening and cleanup
 
@@ -57,4 +63,4 @@ A production-bound package must have:
 - preflight, deploy smoke, affected live checks and clean journals;
 - no automatic migration downgrade.
 
-Detailed findings, evidence and CWE/OWASP mapping belong in [`application-security-audit.md`](application-security-audit.md). CSP policy/operations belong in [`security-runbook.md`](security-runbook.md). Release commands and rollback procedure belong in [`deployment-runbook.md`](deployment-runbook.md).
+Detailed active findings belong in [`application-security-audit.md`](application-security-audit.md). Historical findings and completed remediation evidence belong in [`archive/`](archive/). CSP policy/operations belong in [`security-runbook.md`](security-runbook.md). Release commands and rollback procedure belong in [`deployment-runbook.md`](deployment-runbook.md).
