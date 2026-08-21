@@ -12,7 +12,6 @@ This document contains only findings that still require action or direct operato
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
 | AS-02 | High / P1 | High | Cloudflare Access/MFA for privileged routes is not directly verified | Open; operator/dashboard evidence required |
-| AS-05 | Medium / P1 | High | Contact and moderation fields cross the documented public-data boundary | Open |
 | AS-06 | Medium / P1 | High | Public SSE has no bounded per-source/global connection cap | Open |
 | AS-07 | Medium / P2 | High | Legacy upload/R2 read paths retain originals and buffer entire objects | Open; destructive removal requires approval |
 | AS-08 | Medium / P2 | High | Unknown public patch IDs can trigger synchronous external refresh work | Open |
@@ -40,21 +39,13 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 
 ## P1 findings
 
-### AS-05 — Public data exceeds the privacy contract
-
-- Risk: account contact email or internal moderation context can cross public API/profile boundaries.
-- Evidence owner: registration/profile serialization and public participant DTOs.
-- Required result: explicit public DTOs with opt-in contact data and no moderation/internal fields; align existing data/privacy behavior.
-- Verification: anonymous API tests proving private/internal fields never appear.
-- Status: **Open; next implementation target**.
-
 ### AS-06 — Unbounded public SSE connections
 
 - Risk: many long-lived public SSE connections can exhaust file descriptors, API/Redis connections or worker capacity.
 - Evidence owner: public tournament SSE route, bracket event service and Nginx SSE location.
 - Required result: bounded per-source/user and global connection pressure, clean disconnect/timeout release, sensible reconnect behavior and observable rejection.
 - Verification: concurrency/resource-limit tests plus Nginx/API smoke coverage.
-- Status: **Open**.
+- Status: **Open; next implementation target**.
 
 ### AS-02 — Privileged route edge protection not proven
 
@@ -93,12 +84,11 @@ Verify the actual Cloudflare HSTS owner/value and rollback implications. Nginx m
 
 ## Remediation order
 
-1. AS-05 public/private data boundary.
-2. AS-06 SSE connection pressure.
-3. AS-02 Cloudflare Access/MFA verification.
-4. AS-07 through AS-13 as bounded P2 packages; separate destructive, network-policy and product/privacy decisions where required.
-5. AS-14 remains operator verification work.
+1. AS-06 SSE connection pressure.
+2. AS-02 Cloudflare Access/MFA verification.
+3. AS-07 through AS-13 as bounded P2 packages; separate destructive, network-policy and product/privacy decisions where required.
+4. AS-14 remains operator verification work.
 
-Resolved AS-03 evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md).
+Resolved AS-03 evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md).
 
 Any newly confirmed Critical issue or direct authentication bypass blocks production installation. Do not widen CSP, disable Turnstile, add privileged-route bypasses or weaken application RBAC to simplify testing.

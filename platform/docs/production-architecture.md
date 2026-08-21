@@ -58,6 +58,7 @@ Uploads stream into bounded private staging. The worker decodes, validates, norm
 
 - Only managed Cloudflare ranges may supply `CF-Connecting-IP`; FastAPI accepts proxy headers only from loopback.
 - Cookie mutations require application CSRF controls even behind Cloudflare.
+- Anonymous public response DTOs are explicit schema allowlists: account/contact email and Steam authentication identity do not cross the public-profile boundary, while participant moderation note, moderator identity and moderation timestamps are restricted to the organizer-management DTO.
 - Invite-only tournament workspace reads (`workspace`, roster, matches, bracket and bracket SSE admission) require active participant membership or explicit organizer/admin authority; retained `withdrawn`/`disqualified` participant rows are historical and grant no workspace access.
 - R2, DB, mail, session and Turnstile secrets are backend-only and are not present in the web runtime environment.
 - The public media bucket and private backup bucket/tokens are separate.

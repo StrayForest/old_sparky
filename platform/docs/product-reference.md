@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform API and web
-- Last reviewed: 2026-08-08
+- Last reviewed: 2026-08-21
 
 ## Public surface
 
@@ -27,6 +27,10 @@ client bundles. `/.well-known/security.txt` points to the HTTPS support form.
 - Profile, password, avatar, contacts, captain preferences and dream slots are
   owned by the authenticated account. New-password confirmation is an
   independent browser field; only the password manager may fill both.
+- Anonymous public profiles use an explicit public DTO. Account/contact email,
+  SteamID and Steam-link state stay outside that contract; user-entered public
+  fields such as Discord and region remain visible. A future public email
+  feature requires a separate explicit opt-in instead of reusing account data.
 - Organizer scope applies only to owned tournaments. Admin and superadmin
   checks remain application-side even when Cloudflare Access is enabled.
 
@@ -39,6 +43,10 @@ exceptions live in the [security audit](application-security-audit.md).
   creation requires an explicit permission or admin role.
 - Registration is solo and uses current profile data, rank/capacity rules and
   an invite/access check for private tournaments.
+- Public participant and workspace payloads use the public roster DTO and do
+  not expose moderation notes, moderator identity or moderation timestamps.
+  Organizer-only participant management uses a separate management DTO that
+  retains those fields.
 - Ready-check, captain selection, assignment, roster lock and bracket changes
   are server-owned transitions. The UI never infers permission or state.
 - Roster lock atomically creates one active
