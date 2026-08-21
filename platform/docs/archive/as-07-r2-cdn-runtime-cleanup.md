@@ -2,7 +2,8 @@
 
 - Status: Archived / resolved
 - Closed: 2026-08-21
-- Runtime implementation commit: `a2292fbf4016b1d8bfab53c2e71a7d06f5c59abe`
+- Runtime implementation merge: `d7ade5898b53cc236e78e873237762132347ff6a`
+- CDN-only URL regression commit: `a2292fbf4016b1d8bfab53c2e71a7d06f5c59abe`
 - Verified source commit: `d7ade5898b53cc236e78e873237762132347ff6a`
 - Pull request: `#3`
 - Security/build verification run: `32486516129`
@@ -29,7 +30,7 @@ Normal runtime media delivery is now strictly `R2 -> CDN -> browser`.
 
 ## Verification
 
-Regression coverage explicitly seeds historical legacy URL values and verifies that they are not returned when no ready media descriptor exists. Existing pagination, tournament-policy and bracket-flow expectations were updated to the same invariant after the first PR CI run exposed three stale tests that still expected the removed fallback behavior.
+Regression coverage explicitly seeds historical legacy URL values and verifies that they are not returned when no ready media descriptor exists. Follow-up route coverage also asserts that no registered FastAPI route exists at `/api/v1/uploads` or below it. Existing pagination, tournament-policy and bracket-flow expectations were updated to the same invariant after the first PR CI run exposed three stale tests that still expected the removed fallback behavior.
 
 PR `#3` completed successfully after those stale expectations were corrected. The subsequent `dev` push security/build run `32486516129` passed backend unit/integration tests, static/dependency security gates, frontend audit/typecheck/lint/build and Playwright smoke for merge commit `d7ade5898b53cc236e78e873237762132347ff6a`.
 
