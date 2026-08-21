@@ -16,6 +16,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Local setup, verification, commit and push workflow | [Development guide](development-guide.md) |
 | Product and workflow contracts | [Product reference](product-reference.md) |
 | Deadlock patch translation / Valve glossary contract | [Patch translation](patch-translation.md) |
+| Latest four-patch translation QA checkpoint | [Patch translation QA — 2026-08-22](patch-translation-qa-2026-08-22.md) |
 | UI system and responsive rules | [Visual theme](platform-visual-theme.md) |
 | Normal release or rollback | [Deployment runbook](deployment-runbook.md) |
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
