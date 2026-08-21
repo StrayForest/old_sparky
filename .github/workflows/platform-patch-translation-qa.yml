@@ -1,0 +1,231 @@
+name: Platform patch translation QA
+
+on:
+  workflow_run:
+    workflows: ["Platform production deploy"]
+    types: [completed]
+  push:
+    branches: [dev]
+    paths:
+      - ".github/workflows/platform-patch-translation-qa.yml"
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: platform-patch-translation-qa
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'dev')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      TARGET_SHA: ${{ github.event_name == 'push' && github.sha || github.event.workflow_run.head_sha }}
+    steps:
+      - name: Mark translation QA pending
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "{\"state\":\"pending\",\"context\":\"platform-patch-translation-qa\",\"description\":\"Four-patch Russian translation QA is running\",\"target_url\":\"${run_url}\"}"
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}"
+          test -n "${PROD_SSH_USER:-}"
+          test -n "${PROD_SSH_KEY:-}"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
+          chmod 600 ~/.ssh/old_sparky_prod
+          ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Run four-patch Russian translation QA
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod "$PROD_SSH_USER@$PROD_SSH_HOST" 'bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+          runtime=/opt/oldsparky/platform
+          cd "$runtime/current"
+          export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
+          export PYTHONPATH="$runtime/current"
+
+          "$runtime/shared/venv/bin/python" - <<'PY'
+          import asyncio
+          import json
+          import re
+
+          from apps.platform_api.app.services import home_content
+          from apps.platform_api.app.services.patch_detail import get_patch_detail, get_patch_detail_source
+          from apps.platform_api.app.services.patch_translation import (
+              PATCH_TRANSLATION_VERSION,
+              extract_translation_segments,
+              translate_patch_to_russian,
+          )
+          from apps.platform_api.app.services.patch_translation_terms import fact_fingerprint
+
+          PATCH_IDS = (
+              "1840944183775204",
+              "1839676055886206",
+              "1839041357039193",
+              "1836506165584438",
+          )
+          WATCH_TERMS = (
+              "lifesteal", "cooldown", "spirit scaling", "spirit power",
+              "move speed", "movement speed", "sprint speed", "falloff range",
+              "bullet resist", "spirit resist", "melee resist",
+          )
+          CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
+          def emit(kind, **payload):
+              print(kind, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+          async def main():
+              catalog = await home_content.get_deadlock_asset_catalog()
+              for patch_id in PATCH_IDS:
+                  source = await get_patch_detail_source(patch_id)
+                  if source is None:
+                      raise SystemExit(f"missing source patch {patch_id}")
+
+                  result = await translate_patch_to_russian(source, catalog)
+                  emit("TRANSLATION_RUN", patch_id=patch_id, result=result)
+                  if not result.get("ok"):
+                      raise SystemExit(f"translation failed for {patch_id}: {result}")
+                  if result.get("status") == "locked":
+                      raise SystemExit(f"translation is locked for {patch_id}; fail-fast QA stops")
+
+                  translated = await get_patch_detail(patch_id)
+                  if translated is None:
+                      raise SystemExit(f"missing translated patch {patch_id}")
+
+                  source_segments = extract_translation_segments(source)
+                  ru_segments = extract_translation_segments(translated)
+                  if [s["id"] for s in source_segments] != [s["id"] for s in ru_segments]:
+                      raise SystemExit(f"segment ids/order changed for {patch_id}")
+                  paired = list(zip(source_segments, ru_segments, strict=True))
+
+                  for source_segment, ru_segment in paired:
+                      if fact_fingerprint(source_segment["text"]) != fact_fingerprint(ru_segment["text"]):
+                          raise SystemExit(
+                              f"numeric/tier fact changed for {patch_id} {source_segment['id']}"
+                          )
+
+                  if source_segments and not any(CYRILLIC_RE.search(s["text"] or "") for s in ru_segments):
+                      raise SystemExit(f"patch {patch_id} has no Russian translation")
+
+                  samples = []
+                  for source_segment, ru_segment in paired:
+                      en = source_segment["text"]
+                      ru = ru_segment["text"]
+                      en_lower = en.casefold()
+                      ru_lower = ru.casefold()
+
+                      if "bullet lifesteal" in en_lower and re.search(r"[+\-]?\d", en):
+                          if "bullet lifesteal" in ru_lower:
+                              raise SystemExit(
+                                  f"Bullet Lifesteal stat stayed English: {patch_id} {source_segment['id']}"
+                              )
+                      if "spirit lifesteal" in en_lower and re.search(r"[+\-]?\d", en):
+                          if "spirit lifesteal" in ru_lower:
+                              raise SystemExit(
+                                  f"Spirit Lifesteal stat stayed English: {patch_id} {source_segment['id']}"
+                              )
+                      if "bullet, spirit and melee lifesteal" in en_lower:
+                          if "lifesteal" in ru_lower or "сопротив" in ru_lower:
+                              raise SystemExit(
+                                  f"compound Lifesteal mistranslated: {patch_id} {source_segment['id']} -> {ru}"
+                              )
+                      if "same change for melee lifesteal" in en_lower and "Melee Lifesteal" not in ru:
+                          raise SystemExit(
+                              f"Melee Lifesteal item reference was translated: {patch_id} {source_segment['id']}"
+                          )
+
+                      if any(term in en_lower for term in WATCH_TERMS):
+                          samples.append({"id": source_segment["id"], "en": en, "ru": ru})
+
+                  for sample in samples[:30]:
+                      emit("PATCH_TRANSLATION_SAMPLE", patch_id=patch_id, **sample)
+
+                  if paired:
+                      longest_en, longest_ru = max(paired, key=lambda pair: len(pair[0]["text"]))
+                      emit(
+                          "PATCH_TRANSLATION_LONGEST",
+                          patch_id=patch_id,
+                          id=longest_en["id"],
+                          en=longest_en["text"],
+                          ru=longest_ru["text"],
+                      )
+
+                  emit(
+                      "PATCH_TRANSLATION_PATCH_OK",
+                      patch_id=patch_id,
+                      version=PATCH_TRANSLATION_VERSION,
+                      segments=len(source_segments),
+                      watched_samples=len(samples),
+                  )
+
+              print("PATCH_TRANSLATION_QA status=passed version=" + PATCH_TRANSLATION_VERSION)
+
+          asyncio.run(main())
+          PY
+
+          echo '=== Recent translation usage logs ==='
+          journalctl -u deadlock-worker -u deadlock-api --since '-30 minutes' --no-pager \
+            | grep -E 'patch_translation_(openai_usage|completed|failed)' \
+            | tail -n 120 \
+            || true
+          REMOTE
+
+      - name: Mark translation QA successful
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "{\"state\":\"success\",\"context\":\"platform-patch-translation-qa\",\"description\":\"Four-patch Russian translation QA passed\",\"target_url\":\"${run_url}\"}"
+
+      - name: Mark translation QA failed
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "{\"state\":\"failure\",\"context\":\"platform-patch-translation-qa\",\"description\":\"Four-patch Russian translation QA failed\",\"target_url\":\"${run_url}\"}"
