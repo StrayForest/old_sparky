@@ -1,0 +1,129 @@
+name: Import audited source snapshot
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/public-snapshot-import.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      SOURCE_SHA: 97ae29f85ef942e9ae8d37ab56e9e06157d16050
+      SOURCE_TREE: ecc2690d58c28b3fa9ce9fbbfec83e85dfae2cea
+      SOURCE_CHECKOUT: /root/old_sparky
+
+    steps:
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}" || { echo 'PROD_SSH_HOST is missing' >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo 'PROD_SSH_USER is missing' >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo 'PROD_SSH_KEY is missing' >&2; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
+          chmod 600 ~/.ssh/old_sparky_prod
+          ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Export exact audited tree from server
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_tree="$(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "git -C '$SOURCE_CHECKOUT' rev-parse '${SOURCE_SHA}^{tree}'")"
+          test "$remote_tree" = "$SOURCE_TREE" || {
+            echo "Unexpected source tree: $remote_tree" >&2
+            exit 1
+          }
+
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "git -C '$SOURCE_CHECKOUT' archive --format=tar.gz '$SOURCE_SHA'" \
+            > "$RUNNER_TEMP/old-sparky-source.tar.gz"
+          test -s "$RUNNER_TEMP/old-sparky-source.tar.gz"
+          tar -tzf "$RUNNER_TEMP/old-sparky-source.tar.gz" >/dev/null
+
+      - name: Scan snapshot and build fresh root commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          workdir="$RUNNER_TEMP/old-sparky-public-root"
+          install -d -m 0700 "$workdir"
+          tar -xzf "$RUNNER_TEMP/old-sparky-source.tar.gz" -C "$workdir"
+          cd "$workdir"
+
+          test ! -e .git
+          test -f README.md
+          for wf in \
+            platform-live-launch.yml \
+            platform-production-content-diagnostics.yml \
+            platform-production-deploy.yml \
+            platform-production-diagnostics.yml \
+            platform-security.yml; do
+            test -f ".github/workflows/$wf"
+          done
+
+          git init --initial-branch=main
+          git config user.name 'Aleksei Lisitcin'
+          git config user.email '157023683+StrayForest@users.noreply.github.com'
+          find . -type f ! -path './.git/*' -print0 | xargs -0 git add --
+
+          python3 platform/tools/platform_secret_scan.py --root .
+
+          bad_paths="$(git ls-files | grep -E '(^|/)(\.env$|id_(rsa|dsa|ecdsa|ed25519)$|credentials\.json$|service[-_]?account.*\.json$)|\.(pem|p12|pfx|sqlite|sqlite3|dump)$' || true)"
+          if [[ -n "$bad_paths" ]]; then
+            printf 'Refusing public export: suspicious tracked paths:\n%s\n' "$bad_paths" >&2
+            exit 1
+          fi
+
+          if git grep -IEn -- '-----BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}' -- .; then
+            echo 'Refusing public export: credential-like content found.' >&2
+            exit 1
+          fi
+
+          cat > LICENSE <<'EOF_LICENSE'
+          Copyright (c) 2026 StrayForest. All rights reserved.
+
+          This source code is publicly visible for reference and review purposes only.
+
+          No permission is granted to use, copy, modify, merge, publish, distribute, sublicense, sell, deploy, host, execute as a service, create derivative works from, or otherwise exploit this source code, in whole or in part, without prior written permission from the copyright holder.
+
+          Access to or visibility of this repository does not constitute a grant of any license or other rights.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+          EOF_LICENSE
+
+          tmp_readme="$(mktemp)"
+          cat > "$tmp_readme" <<'EOF_NOTICE'
+          > [!IMPORTANT]
+          > **Source-available for review only.** No permission is granted to use, copy, modify, distribute, deploy, host, or create derivative works from this code without prior written permission. See [LICENSE](LICENSE).
+
+          EOF_NOTICE
+          cat README.md >> "$tmp_readme"
+          mv "$tmp_readme" README.md
+
+          git add -- LICENSE README.md
+          git commit -m 'Initial public source snapshot'
+
+          test "$(git rev-list --count HEAD)" -eq 1
+          test -z "$(git rev-list --parents -n 1 HEAD | cut -d' ' -f2-)"
+          test -f .github/workflows/platform-security.yml
+          test -f .github/workflows/platform-production-deploy.yml
+          test ! -e .github/workflows/public-snapshot-import.yml
+
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin HEAD:main
