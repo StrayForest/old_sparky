@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from hashlib import sha256
+import logging
 
-from sqlalchemy import MetaData, text
+from sqlalchemy import MetaData, event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, Session
 
 from python_packages.platform_infra.config import (
     PLATFORM_SCHEMA,
@@ -17,6 +19,12 @@ from python_packages.platform_infra.config import (
     validate_platform_settings,
 )
 from python_packages.platform_infra.performance import install_sqlalchemy_query_metrics
+
+logger = logging.getLogger(__name__)
+
+# Tournament.automation_last_error is part of the public TournamentResponse contract.
+# Never persist arbitrary worker/domain exception text into that field.
+PUBLIC_AUTOMATION_FAILURE_MESSAGE = "Tournament automation failed. A retry is scheduled."
 
 naming_convention = {
     "ix": "ix_%(column_0_label)s",
@@ -29,6 +37,33 @@ naming_convention = {
 
 class Base(DeclarativeBase):
     metadata = MetaData(schema=PLATFORM_SCHEMA, naming_convention=naming_convention)
+
+
+@event.listens_for(Session, "before_flush")
+def _sanitize_public_error_fields(
+    session: Session,
+    _flush_context: object,
+    _instances: object,
+) -> None:
+    """Fail closed if public ORM fields receive arbitrary internal error text."""
+
+    for instance in session.new.union(session.dirty):
+        table = getattr(instance, "__table__", None)
+        if getattr(table, "name", None) != "tournaments":
+            continue
+        raw_error = getattr(instance, "automation_last_error", None)
+        if not raw_error or raw_error == PUBLIC_AUTOMATION_FAILURE_MESSAGE:
+            continue
+
+        fingerprint = sha256(str(raw_error).encode("utf-8", errors="replace")).hexdigest()[:16]
+        logger.warning(
+            "Sanitized tournament automation error before persistence "
+            "tournament_id=%s failure_count=%s error_fingerprint=%s",
+            getattr(instance, "id", None),
+            getattr(instance, "automation_failure_count", None),
+            fingerprint,
+        )
+        setattr(instance, "automation_last_error", PUBLIC_AUTOMATION_FAILURE_MESSAGE)
 
 
 _engine: AsyncEngine | None = None
