@@ -1,0 +1,248 @@
+name: Platform production content diagnostics
+
+on:
+  workflow_run:
+    workflows: ["Platform production deploy"]
+    types: [completed]
+  push:
+    branches: [dev]
+    paths:
+      - ".github/workflows/platform-production-content-diagnostics.yml"
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  content-diagnostics:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'dev')
+    name: Production content diagnostics
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      TARGET_SHA: ${{ github.event_name == 'push' && github.sha || github.event.workflow_run.head_sha }}
+
+    steps:
+      - name: Mark content diagnostics pending
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "{\"state\":\"pending\",\"context\":\"platform-content-diagnostics\",\"description\":\"Production content diagnostics are running\",\"target_url\":\"${run_url}\"}"
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}"
+          test -n "${PROD_SSH_USER:-}"
+          test -n "${PROD_SSH_KEY:-}"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
+          chmod 600 ~/.ssh/old_sparky_prod
+          ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Probe and refresh production home content
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            'bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+          runtime=/opt/oldsparky/platform
+          cd "$runtime/current"
+          python_bin="$runtime/shared/venv/bin/python"
+
+          echo '=== YouTube endpoint probe ==='
+          "$python_bin" - <<'PY'
+          import httpx
+
+          urls = {
+              "feed": "https://www.youtube.com/feeds/videos.xml?channel_id=UCNoxEIMEAbGHLpn2IGKqlCQ",
+              "videos": "https://www.youtube.com/@deadlockOldSparky/videos",
+          }
+          headers = {
+              "Accept-Language": "en-US,en;q=0.8",
+              "Cookie": "SOCS=CAI",
+              "User-Agent": "Mozilla/5.0 (compatible; OldSparkyArena/1.0)",
+          }
+          with httpx.Client(timeout=10, follow_redirects=True, headers=headers) as client:
+              for name, url in urls.items():
+                  try:
+                      response = client.get(url)
+                      print(
+                          "YOUTUBE_PROBE",
+                          f"source={name}",
+                          f"status={response.status_code}",
+                          f"bytes={len(response.content)}",
+                          f"final_url={response.url}",
+                      )
+                  except Exception as error:
+                      print(
+                          "YOUTUBE_PROBE",
+                          f"source={name}",
+                          f"error={type(error).__name__}",
+                          f"detail={str(error)[:240]}",
+                      )
+          PY
+
+          echo '=== Forced home content refresh ==='
+          tools/platform_refresh_home_content.sh
+
+          echo '=== Local API home content and live page shape ==='
+          "$python_bin" - <<'PY'
+          import json
+          import urllib.request
+
+          import httpx
+
+          from apps.platform_api.app.services import home_content_runtime
+
+          with urllib.request.urlopen(
+              "http://127.0.0.1:8010/api/v1/content/home",
+              timeout=10,
+          ) as response:
+              payload = json.load(response)
+          videos = list(payload.get("videos") or [])
+          latest = videos[0] if videos else {}
+          print(
+              "HOME_CONTENT_API",
+              json.dumps(
+                  {
+                      "videos_available": payload.get("videos_available"),
+                      "videos_count": len(videos),
+                      "latest_video_id": latest.get("id"),
+                      "latest_video_title": latest.get("title"),
+                      "latest_video_published_at": latest.get("published_at"),
+                      "generated_at": payload.get("generated_at"),
+                  },
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              ),
+          )
+
+          headers = {
+              "Accept-Language": "en-US,en;q=0.8",
+              "Cookie": "SOCS=CAI",
+              "User-Agent": "Mozilla/5.0 (compatible; OldSparkyArena/1.0)",
+          }
+          with httpx.Client(timeout=10, follow_redirects=True, headers=headers) as client:
+              response = client.get("https://www.youtube.com/@deadlockOldSparky/videos")
+              response.raise_for_status()
+          page_text = response.text
+          renderer_videos = home_content_runtime._video_renderer_videos(page_text)
+          expected = renderer_videos[0] if renderer_videos else {}
+          markers = {
+              name: page_text.count(name)
+              for name in (
+                  '"videoRenderer"',
+                  '"gridVideoRenderer"',
+                  '"richItemRenderer"',
+                  '"lockupViewModel"',
+                  '"contentMetadataViewModel"',
+                  '"videoId"',
+              )
+          }
+          print("VIDEO_PAGE_MARKERS", json.dumps(markers, separators=(",", ":")))
+
+          latest_id = str(latest.get("id") or "")
+          snippet_index = page_text.find(f'"videoId":"{latest_id}"') if latest_id else -1
+          if snippet_index < 0 and latest_id:
+              snippet_index = page_text.find(f'\\"videoId\\":\\"{latest_id}\\"')
+          if snippet_index >= 0:
+              snippet = page_text[max(0, snippet_index - 700):snippet_index + 2100]
+              snippet = " ".join(snippet.split())
+              print("VIDEO_PAGE_SNIPPET", snippet[:2800])
+          else:
+              print("VIDEO_PAGE_SNIPPET not-found")
+
+          print(
+              "YOUTUBE_STRUCTURED",
+              json.dumps(
+                  {
+                      "videos_count": len(renderer_videos),
+                      "latest_video_id": expected.get("id"),
+                      "latest_video_title": expected.get("title"),
+                  },
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+              ),
+          )
+
+          if not renderer_videos:
+              raise SystemExit("YouTube /videos exposed no parseable videoRenderer entries")
+          if payload.get("videos_available") is not True:
+              raise SystemExit("production home content is still serving stale YouTube cache")
+          if not videos:
+              raise SystemExit("production home content has no videos")
+          if latest.get("id") != expected.get("id"):
+              raise SystemExit(
+                  "production latest video does not match YouTube /videos: "
+                  f"api={latest.get('id')} youtube={expected.get('id')}"
+              )
+          print(
+              "CONTENT_ASSERT",
+              f"latest_video_id={latest.get('id')}",
+              "status=matched",
+          )
+          PY
+
+          echo '=== Recent worker YouTube logs ==='
+          journalctl -u deadlock-worker --since '-10 minutes' --no-pager \
+            | grep -E 'youtube|home_content' \
+            | tail -n 80 \
+            || true
+          REMOTE
+
+      - name: Mark content diagnostics successful
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "{\"state\":\"success\",\"context\":\"platform-content-diagnostics\",\"description\":\"Production content diagnostics passed\",\"target_url\":\"${run_url}\"}"
+
+      - name: Mark content diagnostics failed
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "{\"state\":\"failure\",\"context\":\"platform-content-diagnostics\",\"description\":\"Production content diagnostics failed\",\"target_url\":\"${run_url}\"}"
