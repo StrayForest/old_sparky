@@ -23,8 +23,10 @@ AS-07 R2/CDN runtime media cleanup is resolved and archived with migration inven
 
 ## P2 — hardening and cleanup
 
-- **Next code-owned target — AS-08:** replace synchronous external refresh work for unknown public patch IDs with bounded negative caching/coalesced background refresh and validate redirect/response bounds.
-- AS-09–AS-13: distributed auth counter, safe worker errors, config/CI drift and remaining audit hardening.
+AS-08 unknown-patch refresh hardening is resolved and archived with negative-cache/coalescing regressions, redirect/response bounds, CI verification and production deployment in [`archive/as-08-patch-miss-hardening.md`](archive/as-08-patch-miss-hardening.md).
+
+- **Next code-owned target — AS-09:** add a privacy-preserving account-wide login-failure window/cooldown across source IPs without creating a permanent lockout DoS path.
+- AS-10–AS-13: registration-enumeration decision, safe worker errors, proxy/firewall drift and CI isolation revalidation.
 - After the media grace period, remove the runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers once no migration/reconciliation path depends on them.
 - Continue reducing legacy/duplicate runtime and documentation paths after each replacement is proven.
 
