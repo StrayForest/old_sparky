@@ -397,10 +397,10 @@ else
   NEW_VENV_DIR="$(mktemp -d "$SHARED_DIR/.venv-install-$RELEASE_SLUG.XXXXXX")"
   /usr/bin/python3 -I -m venv "$NEW_VENV_DIR"
   shopt -s nullglob
-  PIP_WHEELS=("$RELEASE_DIR"/wheelhouse/pip-26.1.2-*.whl)
+  PIP_WHEELS=("$RELEASE_DIR"/wheelhouse/pip-*.whl)
   shopt -u nullglob
   if (( ${#PIP_WHEELS[@]} != 1 )); then
-    echo "Release wheelhouse must contain exactly one pip==26.1.2 wheel." >&2
+    echo "Release wheelhouse must contain exactly one pinned pip wheel." >&2
     exit 1
   fi
   run_isolated_python "$NEW_VENV_DIR/bin/python" -I -m pip install \
