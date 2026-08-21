@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
     paths: [.github/workflows/public-snapshot-import.yml]
+  pull_request:
+    branches: [main]
+    paths: [.public-snapshot-import-trigger]
 
 permissions:
   contents: write
