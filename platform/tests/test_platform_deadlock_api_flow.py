@@ -507,7 +507,7 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             for member in roster_members
             if member["user_id"] == players[0]["user_id"]
         )
-        self.assertEqual(avatar_member["avatar_url"], avatar_url)
+        self.assertIsNone(avatar_member["avatar_url"])
         self.assertEqual(avatar_member["handle"], players[0]["display_name"])
         self.assertEqual(avatar_member["rank"], "Ascendant")
         self.assertEqual(avatar_member["subrank"], 6)
