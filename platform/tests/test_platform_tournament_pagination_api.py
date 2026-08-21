@@ -118,7 +118,7 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(payload), 1)
         self.assertIsInstance(payload[0], TournamentResponse)
         self.assertEqual(payload[0].slug, "night-cup")
-        self.assertEqual(payload[0].organizer_avatar_url, "/uploads/organizer.webp")
+        self.assertIsNone(payload[0].organizer_avatar_url)
         self.assertEqual(db_session.scalar.await_count, 1)
         self.assertEqual(db_session.execute.await_count, 1)
         self.assertEqual(response.headers["X-Total-Count"], "25")

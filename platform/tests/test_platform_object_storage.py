@@ -9,7 +9,7 @@ from python_packages.platform_infra.object_storage import ObjectStorage, object_
 
 
 class ObjectStorageTests(unittest.TestCase):
-    def test_local_storage_round_trip(self) -> None:
+    def test_local_storage_supports_migration_write_and_delete_without_runtime_get(self) -> None:
         with TemporaryDirectory() as directory:
             storage = ObjectStorage(
                 PlatformSettings(
@@ -19,14 +19,14 @@ class ObjectStorageTests(unittest.TestCase):
             )
             storage.put("avatars/example.png", b"image", "image/png")
 
-            stored = storage.get("avatars/example.png")
-            self.assertIsNotNone(stored)
-            self.assertEqual(stored.content, b"image")
+            stored_path = Path(directory) / "avatars" / "example.png"
+            self.assertEqual(stored_path.read_bytes(), b"image")
+            self.assertFalse(hasattr(storage, "get"))
 
             storage.delete("avatars/example.png")
-            self.assertIsNone(storage.get("avatars/example.png"))
+            self.assertFalse(stored_path.exists())
 
-    def test_upload_url_only_accepts_safe_object_keys(self) -> None:
+    def test_upload_url_only_accepts_safe_object_keys_for_legacy_migration(self) -> None:
         self.assertEqual(
             object_key_from_upload_url("/api/v1/uploads/tournament-covers/example.webp"),
             "tournament-covers/example.webp",

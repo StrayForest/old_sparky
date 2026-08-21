@@ -150,10 +150,17 @@ def compatibility_media_url(
     descriptor: MediaDescriptorResponse | None,
     *,
     preferred_variant: str,
-    legacy_url: str | None,
+    legacy_url: str | None = None,
 ) -> str | None:
+    """Resolve a runtime image URL exclusively from a ready CDN media descriptor.
+
+    ``legacy_url`` is accepted temporarily so older serializer call sites can be
+    removed independently without reintroducing a runtime read fallback. It is
+    intentionally ignored and can be deleted with the legacy schema cleanup.
+    """
+    del legacy_url
     if descriptor is None or descriptor.status != "ready":
-        return legacy_url
+        return None
     preferred = next(
         (
             variant.url
@@ -164,7 +171,7 @@ def compatibility_media_url(
     )
     if preferred is not None:
         return preferred
-    return descriptor.variants[-1].url if descriptor.variants else legacy_url
+    return descriptor.variants[-1].url if descriptor.variants else None
 
 
 async def load_media_descriptors(
