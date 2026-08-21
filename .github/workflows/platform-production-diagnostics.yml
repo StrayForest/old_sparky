@@ -1,0 +1,88 @@
+name: Platform production diagnostics
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - ".github/workflows/platform-production-diagnostics.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-diagnostics
+  cancel-in-progress: true
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+    steps:
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
+          chmod 600 ~/.ssh/old_sparky_prod
+          ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Verify latest patch distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod "$PROD_SSH_USER@$PROD_SSH_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          runtime=/opt/oldsparky/platform
+          cd "$runtime/current"
+          export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
+          export PYTHONPATH="$runtime/current"
+
+          "$runtime/shared/venv/bin/python" - <<'PY'
+          import asyncio
+          from apps.platform_api.app.services import home_content
+          from apps.platform_api.app.services.patch_detail import get_patch_detail
+
+          async def main():
+              home = await home_content.refresh_home_content()
+              latest = (home.get("patches") or [{}])[0]
+              patch_id = str(latest.get("id") or "")
+              detail = await get_patch_detail(patch_id)
+              sections = list((detail or {}).get("sections") or [])
+              heroes = [str(s.get("title") or "") for s in sections if s.get("kind") == "hero"]
+              items = [str(s.get("title") or "") for s in sections if s.get("kind") == "item"]
+              print("latest_patch_id=" + patch_id)
+              print("latest_patch_title=" + str(latest.get("title") or ""))
+              print("section_count=" + str(len(sections)))
+              print("hero_section_count=" + str(len(heroes)))
+              print("hero_titles=" + " | ".join(heroes))
+              print("item_section_count=" + str(len(items)))
+              if patch_id == "1840944183775204" and len(heroes) < 13:
+                  raise SystemExit("latest known patch is still not distributed across its heroes")
+
+          asyncio.run(main())
+          PY
+
+          latest_id="$($runtime/shared/venv/bin/python - <<'PY'
+          import asyncio
+          from apps.platform_api.app.services import home_content
+          async def main():
+              data = await home_content.refresh_home_content()
+              print((data.get('patches') or [{}])[0].get('id') or '')
+          asyncio.run(main())
+          PY
+          )"
+
+          curl -fsS --max-time 15 "http://127.0.0.1:8010/api/v1/content/patches/${latest_id}" \
+            | "$runtime/shared/venv/bin/python" -c 'import json,sys; d=json.load(sys.stdin); s=d.get("sections",[]); h=[x.get("title","") for x in s if x.get("kind")=="hero"]; print("internal_api_hero_count="+str(len(h))); print("internal_api_heroes="+" | ".join(h)); assert len(h) >= 13 if d.get("id")=="1840944183775204" else True'
+
+          curl -fsS --max-time 15 "https://old-sparky.com/api/v1/content/patches/${latest_id}?diag=$(date +%s)" \
+            | "$runtime/shared/venv/bin/python" -c 'import json,sys; d=json.load(sys.stdin); s=d.get("sections",[]); h=[x.get("title","") for x in s if x.get("kind")=="hero"]; print("public_api_hero_count="+str(len(h))); print("public_api_heroes="+" | ".join(h)); assert len(h) >= 13 if d.get("id")=="1840944183775204" else True'
+          REMOTE
