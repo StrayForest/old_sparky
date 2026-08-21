@@ -51,6 +51,9 @@ class PlatformSettings(BaseSettings):
     platform_auth_rate_limit_enabled: bool | None = None
     platform_auth_login_window_seconds: int = Field(default=600, ge=60, le=86_400)
     platform_auth_login_account_limit: int = Field(default=8, ge=1, le=1_000)
+    platform_auth_login_account_cooldown_seconds: int = Field(
+        default=60, ge=30, le=3_600
+    )
     platform_auth_login_ip_limit: int = Field(default=60, ge=1, le=10_000)
     platform_auth_register_window_seconds: int = Field(default=600, ge=60, le=86_400)
     platform_auth_register_ip_limit: int = Field(default=5, ge=1, le=1_000)

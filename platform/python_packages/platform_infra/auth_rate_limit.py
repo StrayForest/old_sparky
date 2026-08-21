@@ -126,8 +126,12 @@ def _login_fingerprints(
 ) -> tuple[str, str]:
     address = _remote_address(request)
     ip_fingerprint = _fingerprint(settings, f"ip:{address}")
-    account_fingerprint = _fingerprint(settings, f"ip-account:{address}:{email}")
+    account_fingerprint = _fingerprint(settings, f"login-account:{email}")
     return ip_fingerprint, account_fingerprint
+
+
+def _login_cooldown_key(account_fingerprint: str) -> str:
+    return f"platform:auth-rate:v2:login-cooldown:{account_fingerprint}"
 
 
 async def check_login_rate_limit(
@@ -162,12 +166,19 @@ async def check_login_rate_limit(
             window_seconds=resolved_settings.platform_auth_login_window_seconds,
             now_epoch=now,
         )
+        cooldown_active = bool(await cache.get(_login_cooldown_key(account_fingerprint)))
     except RedisError as exc:
         raise _backend_unavailable_error() from exc
     finally:
         await cache.aclose()
     if ip_count > resolved_settings.platform_auth_login_ip_limit:
         raise _rate_limit_error(retry_after)
+    if cooldown_active:
+        # Return the configured bound rather than the precise remaining TTL so
+        # the response does not disclose a high-resolution retry schedule.
+        raise _rate_limit_error(
+            resolved_settings.platform_auth_login_account_cooldown_seconds
+        )
     return AuthRateLimitState(
         adaptive_turnstile_required=(
             account_failures >= resolved_settings.platform_auth_adaptive_turnstile_threshold
@@ -189,14 +200,35 @@ async def record_login_failure(
     now = int(time.time()) if now_epoch is None else now_epoch
     _, account_fingerprint = _login_fingerprints(request, email, resolved_settings)
     cache = redis_client()
+    cooldown_retry_after = 0
     try:
-        failures, retry_after = await _increment_fixed_window(
+        failures, _ = await _increment_fixed_window(
             cache,
             scope="login-failure",
             fingerprint=account_fingerprint,
             window_seconds=resolved_settings.platform_auth_login_window_seconds,
             now_epoch=now,
         )
+        if failures > resolved_settings.platform_auth_login_account_limit:
+            await cache.eval(
+                DELIVERY_COOLDOWN_SCRIPT,
+                1,
+                _login_cooldown_key(account_fingerprint),
+                resolved_settings.platform_auth_login_account_cooldown_seconds,
+            )
+            cooldown_retry_after = (
+                resolved_settings.platform_auth_login_account_cooldown_seconds
+            )
+            # Reset the failure window after a cooldown starts. Once the bounded
+            # cooldown expires, another source must build a fresh account-wide
+            # failure budget instead of re-locking the account with one request.
+            failure_key, _ = _window_key(
+                "login-failure",
+                account_fingerprint,
+                resolved_settings.platform_auth_login_window_seconds,
+                now,
+            )
+            await cache.delete(failure_key)
     except RedisError as exc:
         raise _backend_unavailable_error() from exc
     finally:
@@ -205,7 +237,7 @@ async def record_login_failure(
     if delay > 0:
         await asyncio.sleep(delay)
     if failures > resolved_settings.platform_auth_login_account_limit:
-        raise _rate_limit_error(retry_after)
+        raise _rate_limit_error(cooldown_retry_after)
 
 
 async def clear_login_failures(
@@ -229,6 +261,7 @@ async def clear_login_failures(
     cache = redis_client()
     try:
         await cache.delete(key)
+        await cache.delete(_login_cooldown_key(account_fingerprint))
     except RedisError as exc:
         raise _backend_unavailable_error() from exc
     finally:
