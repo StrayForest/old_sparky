@@ -21,6 +21,7 @@ Read this file for the current production baseline and next engineering priority
 - Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. Rejections are observable and stream lifetime/reconnect behavior is bounded.
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
+- Password-login guessing protection uses independent source-IP and account-wide Redis state. Account identifiers are represented by HMAC fingerprints, shared failures drive adaptive Turnstile and a bounded cooldown, and successful login clears account failure/cooldown state.
 - Alembic head: `20260813_0038`.
 - Production contains the verified operator account and no test tournaments.
 
@@ -28,7 +29,7 @@ Read this file for the current production baseline and next engineering priority
 
 No repository-owned P1 implementation remains after AS-06 closure.
 
-AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/platform-ops*` and `/api/v1/admin*` and does not replace application RBAC. AS-07 runtime media cleanup and AS-08 unknown-patch refresh hardening are closed and archived; the next code-owned hardening target is AS-09 distributed login guessing protection.
+AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/platform-ops*` and `/api/v1/admin*` and does not replace application RBAC. AS-07 runtime media cleanup, AS-08 unknown-patch refresh hardening and AS-09 distributed login guessing protection are closed and archived. AS-10 remains a product/security decision on registration-enumeration behavior; the next bounded code-owned remediation target is AS-11 public worker-error sanitization.
 
 ## Production invariants
 
@@ -40,6 +41,7 @@ AS-02 remains an operator-owned Cloudflare Access/MFA verification task for `/pl
 - Public bracket SSE must retain layered application/Nginx connection caps, fail closed when Redis-backed admission state is unavailable, release leases on normal termination and retain bounded expiry recovery after abnormal termination. Stream lifetime and reconnect timing must remain bounded.
 - Public media rendering must remain `R2 -> CDN -> browser`; normal API runtime must not proxy R2 objects, serve legacy upload paths or fall back to local-disk reads. Legacy URL columns and migration helpers may remain only while runtime-inert and migration/grace-period scoped.
 - Unknown public patch IDs must not make the request path wait on external refresh work. Retain per-ID negative caching, cross-worker refresh coalescing and explicit no-redirect/response-size bounds for miss-triggered upstream requests.
+- Password-login protection must retain independent per-IP and account-wide buckets. Account-wide Redis state must use private HMAC fingerprints rather than plaintext identifiers; cooldowns remain bounded and must not extend on blocked requests, and a successful login clears the account failure/cooldown state.
 - Terminal tournament states freeze organizer match administration.
 - Preserve the live HTTPS/domain/secure-cookie contour unless a reviewed release changes it.
 - Rollback switches application releases; it does not automatically downgrade Alembic.
