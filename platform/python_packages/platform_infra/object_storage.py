@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
@@ -16,12 +15,6 @@ def object_key_from_upload_url(url: str | None) -> str | None:
     if not key or path.is_absolute() or ".." in path.parts:
         return None
     return str(path)
-
-
-@dataclass(frozen=True)
-class StoredObject:
-    content: bytes
-    content_type: str
 
 
 class ObjectStorage:
@@ -68,31 +61,6 @@ class ObjectStorage:
         path = Path(self.settings.platform_upload_dir) / key
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
-
-    def get(self, key: str) -> StoredObject | None:
-        if self.backend == "r2":
-            from botocore.exceptions import ClientError
-
-            try:
-                response = self._client.get_object(
-                    Bucket=self.settings.platform_r2_bucket_name,
-                    Key=key,
-                )
-            except ClientError as exc:
-                if exc.response.get("Error", {}).get("Code") in {"NoSuchKey", "404"}:
-                    return self._get_local(key)
-                raise
-            return StoredObject(
-                content=response["Body"].read(),
-                content_type=response.get("ContentType") or "application/octet-stream",
-            )
-        return self._get_local(key)
-
-    def _get_local(self, key: str) -> StoredObject | None:
-        path = Path(self.settings.platform_upload_dir) / key
-        if not path.is_file():
-            return None
-        return StoredObject(content=path.read_bytes(), content_type="application/octet-stream")
 
     def delete(self, key: str) -> None:
         if self.backend == "r2":
