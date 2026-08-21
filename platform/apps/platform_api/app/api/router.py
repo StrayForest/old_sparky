@@ -14,8 +14,12 @@ from apps.platform_api.app.api.routes import (
     registration,
     security_reports,
     stats,
+    tournament_participants,
     tournaments,
     users,
+)
+from apps.platform_api.app.services.tournament_participant_policy import (
+    enforce_tournament_participant_policy,
 )
 from apps.platform_api.app.services.tournament_workspace_access import (
     ensure_private_tournament_read_membership_is_active,
@@ -33,11 +37,22 @@ api_router.include_router(users.router, prefix="/users", tags=["users"])
 api_router.include_router(profiles.router, prefix="/profiles", tags=["profiles"])
 api_router.include_router(profile_workspace.router, prefix="/profiles", tags=["profiles"])
 api_router.include_router(media.router, prefix="/media", tags=["media"])
+
+tournament_dependencies = [
+    Depends(ensure_private_tournament_read_membership_is_active),
+    Depends(enforce_tournament_participant_policy),
+]
 api_router.include_router(
     tournaments.router,
     prefix="/tournaments",
     tags=["tournaments"],
-    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+    dependencies=tournament_dependencies,
+)
+api_router.include_router(
+    tournament_participants.router,
+    prefix="/tournaments",
+    tags=["tournaments"],
+    dependencies=tournament_dependencies,
 )
 api_router.include_router(stats.router, prefix="/stats", tags=["stats"])
 api_router.include_router(admin.router, prefix="/admin", tags=["admin"])
