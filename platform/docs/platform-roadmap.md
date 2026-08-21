@@ -8,10 +8,9 @@ For the production baseline and immediate engineering target, read [`CURRENT.md`
 
 ## P1 — security and correctness
 
-1. **AS-02 privileged route access / MFA — operator-owned**
-   - protect `/platform-ops*` and `/api/v1/admin*` with the approved Cloudflare/operator control;
-   - retain application RBAC and audit events;
-   - close only after direct dashboard/live evidence.
+No open P1 security/correctness item remains.
+
+AS-02 privileged-route Access/MFA is resolved with operator/dashboard/live evidence for `/platform-ops*` and `/api/v1/admin*`; application RBAC remains authoritative. Closure evidence is retained in [`archive/as-02-cloudflare-access-mfa.md`](archive/as-02-cloudflare-access-mfa.md).
 
 AS-03 tournament concurrency is resolved and archived with implementation, concurrency-test and production-deployment evidence in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md).
 
@@ -35,14 +34,16 @@ AS-09 distributed login guessing protection is resolved and archived with accoun
 
 ## Operational / owner-controlled
 
-- Verify Cloudflare HSTS, DNSSEC, CAA, WAF/rates, edge TLS and R2 settings with direct dashboard evidence.
+- AS-14 HSTS ownership/state is resolved: Cloudflare owns visitor HSTS with a six-month max-age, `includeSubDomains` Off and preload Off. Evidence is retained in [`archive/as-14-cloudflare-hsts-ownership.md`](archive/as-14-cloudflare-hsts-ownership.md).
+- Cloudflare Full(strict), minimum TLS 1.2, TLS 1.3/HTTP3 and DNSSEC were operator-confirmed on 2026-08-21.
+- Verify remaining Cloudflare CAA, WAF/rates and R2 settings with direct dashboard evidence where still marked `VERIFY`/`TODO` in the production checklist.
 - Classify new enforced CSP reports and perform real-user follow-up; confirmed first-party regressions use the documented rollback path rather than a widened allowlist.
 - Purge/revalidate stale immutable asset metadata when required.
 - Keep password-manager/browser matrix checks for password UI releases.
 
 ## Product work after security blockers
 
-Ordinary feature expansion remains behind the P1 security/correctness work unless a feature is explicitly required to fix production behavior or an accepted business priority overrides the sequence.
+Ordinary feature expansion remains behind accepted security/correctness work unless a feature is explicitly required to fix production behavior or an accepted business priority overrides the sequence.
 
 ## Release gate
 
