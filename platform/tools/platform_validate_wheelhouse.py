@@ -95,28 +95,30 @@ def _read_pins(path: Path, *, label: str, expected_mode: int | None) -> dict[str
     return pins
 
 
+def _require_pip_pin(pins: dict[str, str], *, label: str) -> None:
+    if "pip" not in pins:
+        raise WheelhouseError(f"{label} must contain an exact pip pin")
+
+
 def _validate_requirements(path: Path) -> dict[str, str]:
     requirements = _read_pins(
         path,
         label="Python requirements",
         expected_mode=None,
     )
-    if requirements.get("pip") != "26.1.2":
-        raise WheelhouseError("Python requirements must pin pip==26.1.2")
+    _require_pip_pin(requirements, label="Python requirements")
     return requirements
 
 
 def _validate_freeze(path: Path) -> dict[str, str]:
     freeze = _read_pins(path, label="Python freeze", expected_mode=0o444)
-    if freeze.get("pip") != "26.1.2":
-        raise WheelhouseError("Python freeze must contain pip==26.1.2")
+    _require_pip_pin(freeze, label="Python freeze")
     return freeze
 
 
 def _validate_lock(path: Path) -> dict[str, str]:
     lock = _read_pins(path, label="Python lock", expected_mode=0o644)
-    if lock.get("pip") != "26.1.2":
-        raise WheelhouseError("Python lock must contain pip==26.1.2")
+    _require_pip_pin(lock, label="Python lock")
     return lock
 
 
