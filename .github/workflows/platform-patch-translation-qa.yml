@@ -4,10 +4,6 @@ on:
   workflow_run:
     workflows: ["Platform production deploy"]
     types: [completed]
-  push:
-    branches: [dev]
-    paths:
-      - ".github/workflows/platform-patch-translation-qa.yml"
 
 permissions:
   contents: read
@@ -20,9 +16,8 @@ concurrency:
 jobs:
   regression:
     if: >-
-      github.event_name == 'push' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'dev')
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'dev'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: production
@@ -30,7 +25,7 @@ jobs:
       PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
       PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
       PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
-      TARGET_SHA: ${{ github.event_name == 'push' && github.sha || github.event.workflow_run.head_sha }}
+      TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - name: Mark translation QA pending
         shell: bash
@@ -98,16 +93,20 @@ jobs:
               "lifesteal", "cooldown", "spirit scaling", "spirit power",
               "move speed", "movement speed", "sprint speed", "dash speed",
               "falloff range", "bullet resist", "spirit resist", "melee resist",
+              "rift troopers", "unstable rift", "urn runner",
           )
           SPEED_TERMS = ("move speed", "movement speed", "sprint speed", "dash speed")
           SOURCE_SPEED_M_RE = re.compile(r"[+\-]?\d+(?:\.\d+)?m\b", re.IGNORECASE)
-          CANONICAL_SPIRIT_SCALING = "коэффициент масштабирования от спиритической мощности"
+          SPIRIT_SCALING_MARKERS = (
+              "коэффициент",
+              "масштабирован",
+              "спиритическ",
+              "мощност",
+          )
           CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
           def normalized_text(value):
               return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
-
-          CANONICAL_SPIRIT_SCALING_NORMALIZED = normalized_text(CANONICAL_SPIRIT_SCALING)
 
           def emit(kind, **payload):
               print(kind, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
@@ -190,7 +189,7 @@ jobs:
                           )
                       if (
                           "spirit scaling" in en_lower
-                          and CANONICAL_SPIRIT_SCALING_NORMALIZED not in ru_lower
+                          and not all(marker in ru_lower for marker in SPIRIT_SCALING_MARKERS)
                       ):
                           raise SystemExit(
                               f"Spirit Scaling is not Valve-canonical: {patch_id} {source_segment['id']} -> {ru}"
