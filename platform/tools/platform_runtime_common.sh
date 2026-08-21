@@ -57,6 +57,27 @@ export PLATFORM_ENV_FILE
 export PLATFORM_PYTHON_BIN
 export PLATFORM_NODE_BIN
 
+platform_require_isolated_service_env() {
+  local expected_service="$1"
+  local declared_service="${PLATFORM_RUNTIME_SERVICE:-}"
+  if [[ -z "$declared_service" ]]; then
+    return 0
+  fi
+  if [[ "$declared_service" != "$expected_service" ]]; then
+    echo "Runtime service mismatch: expected $expected_service, got $declared_service." >&2
+    exit 1
+  fi
+  local expected_env="$PLATFORM_SHARED_DIR/env/${expected_service}.env"
+  if [[ "$PLATFORM_ENV_FILE" != "$expected_env" ]]; then
+    echo "$expected_service must use isolated env $expected_env, not $PLATFORM_ENV_FILE." >&2
+    exit 1
+  fi
+  if [[ ! -f "$PLATFORM_ENV_FILE" || -L "$PLATFORM_ENV_FILE" ]]; then
+    echo "Isolated runtime env is missing or unsafe: $PLATFORM_ENV_FILE" >&2
+    exit 1
+  fi
+}
+
 platform_load_env_file() {
   if [[ -f "$PLATFORM_ENV_FILE" ]]; then
     set -a

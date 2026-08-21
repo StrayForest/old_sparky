@@ -2,8 +2,6 @@
 set -euo pipefail
 
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
-SERVICE_USER="oldsparky-platform"
-SERVICE_GROUP="oldsparky-platform"
 APPLY=0
 
 while [[ $# -gt 0 ]]; do
@@ -20,8 +18,9 @@ while [[ $# -gt 0 ]]; do
       cat <<'EOF'
 Usage: platform_prepare_service_user.sh [--app-dir PATH] [--apply]
 
-Dry-run by default. With --apply, creates the locked system account used by
-the API/web/worker units and prepares only their required writable paths.
+Dry-run by default. With --apply, creates isolated locked system identities for
+web/API/worker, renders least-privilege runtime env files, and prepares only the
+writable paths each service needs.
 EOF
       exit 0
       ;;
@@ -37,18 +36,23 @@ if [[ "$APP_DIR" == "/" || -z "$APP_DIR" ]]; then
   exit 1
 fi
 
-ENV_FILE="$APP_DIR/shared/.env.platform"
+CANONICAL_ENV="$APP_DIR/shared/.env.platform"
+RUNTIME_ENV_DIR="$APP_DIR/shared/env"
 MEDIA_STAGING_DIR="$APP_DIR/shared/media-staging"
 WORKER_STATE_DIR="$APP_DIR/shared/worker-state"
 WEB_CACHE_DIR="$APP_DIR/current/apps/platform_web/.next/cache"
+MEDIA_GROUP="oldsparky-media"
+SERVICE_USERS=(oldsparky-web oldsparky-api oldsparky-worker)
 
 if [[ "$APPLY" -eq 0 ]]; then
   cat <<EOF
-[DRY-RUN] Ensure locked system user/group: $SERVICE_USER
-[DRY-RUN] Set $ENV_FILE to root:$SERVICE_GROUP mode 0640
-[DRY-RUN] Prepare writable media staging: $MEDIA_STAGING_DIR
-[DRY-RUN] Prepare writable worker state: $WORKER_STATE_DIR
-[DRY-RUN] Prepare writable current web cache: $WEB_CACHE_DIR
+[DRY-RUN] Ensure private service identities: ${SERVICE_USERS[*]}
+[DRY-RUN] Ensure shared staging group: $MEDIA_GROUP (API + worker only)
+[DRY-RUN] Lock canonical env to root:root mode 0600: $CANONICAL_ENV
+[DRY-RUN] Render root-owned per-service envs under: $RUNTIME_ENV_DIR
+[DRY-RUN] Prepare API/worker staging: $MEDIA_STAGING_DIR
+[DRY-RUN] Prepare worker-only state: $WORKER_STATE_DIR
+[DRY-RUN] Prepare web-only cache: $WEB_CACHE_DIR
 EOF
   exit 0
 fi
@@ -57,54 +61,126 @@ if [[ "$(id -u)" -ne 0 ]]; then
   echo "--apply must run as root." >&2
   exit 1
 fi
-if [[ ! -d "$APP_DIR/shared" || ! -L "$APP_DIR/current" || ! -f "$ENV_FILE" ]]; then
-  echo "Platform release/shared layout is incomplete under $APP_DIR." >&2
+if [[ ! -d "$APP_DIR/shared" || ! -L "$APP_DIR/current" || ! -f "$CANONICAL_ENV" || -L "$CANONICAL_ENV" ]]; then
+  echo "Platform release/shared layout is incomplete or unsafe under $APP_DIR." >&2
   exit 1
 fi
 
-if ! getent group "$SERVICE_GROUP" >/dev/null; then
-  groupadd --system "$SERVICE_GROUP"
-fi
-if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-  useradd --system --gid "$SERVICE_GROUP" --home-dir /nonexistent \
-    --shell /usr/sbin/nologin --no-create-home "$SERVICE_USER"
-fi
-
-install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$MEDIA_STAGING_DIR"
-install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$WORKER_STATE_DIR"
-install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$WEB_CACHE_DIR"
-chown root:"$SERVICE_GROUP" "$ENV_FILE"
-chmod 0640 "$ENV_FILE"
-
-if [[ "$(stat -c '%U:%G:%a' "$ENV_FILE")" != "root:$SERVICE_GROUP:640" ]]; then
-  echo "Shared env ownership verification failed." >&2
-  exit 1
-fi
-for writable_dir in "$MEDIA_STAGING_DIR" "$WORKER_STATE_DIR" "$WEB_CACHE_DIR"; do
-  if [[ "$(stat -c '%U:%G' "$writable_dir")" != "$SERVICE_USER:$SERVICE_GROUP" ]]; then
-    echo "Service writable-directory ownership verification failed: $writable_dir" >&2
-    exit 1
+for service_user in "${SERVICE_USERS[@]}"; do
+  if ! getent group "$service_user" >/dev/null; then
+    groupadd --system "$service_user"
   fi
-  if ! runuser -u "$SERVICE_USER" -- test -w "$writable_dir"; then
-    echo "Service user cannot write required directory: $writable_dir" >&2
+  if ! id "$service_user" >/dev/null 2>&1; then
+    useradd --system --gid "$service_user" --home-dir /nonexistent \
+      --shell /usr/sbin/nologin --no-create-home "$service_user"
+  fi
+  primary_group="$(id -gn "$service_user")"
+  if [[ "$primary_group" != "$service_user" ]]; then
+    echo "$service_user must use its private primary group." >&2
     exit 1
   fi
 done
-if ! runuser -u "$SERVICE_USER" -- test -r "$ENV_FILE"; then
-  echo "Service user cannot read the shared env file." >&2
+
+if ! getent group "$MEDIA_GROUP" >/dev/null; then
+  groupadd --system "$MEDIA_GROUP"
+fi
+usermod -a -G "$MEDIA_GROUP" oldsparky-api
+usermod -a -G "$MEDIA_GROUP" oldsparky-worker
+
+# The canonical operator env is the one source of truth, but no runtime identity
+# may read it directly.
+chown root:root "$CANONICAL_ENV"
+chmod 0600 "$CANONICAL_ENV"
+
+install -d -o root -g root -m 0711 "$RUNTIME_ENV_DIR"
+install -d -o root -g "$MEDIA_GROUP" -m 2770 "$MEDIA_STAGING_DIR"
+install -d -o oldsparky-worker -g oldsparky-worker -m 0700 "$WORKER_STATE_DIR"
+install -d -o oldsparky-web -g oldsparky-web -m 0750 "$WEB_CACHE_DIR"
+
+# Migrate state created by the former shared service identity. Symlinks are
+# rejected before recursive ownership changes so an unexpected path cannot
+# escape these dedicated runtime directories.
+for mutable_dir in "$MEDIA_STAGING_DIR" "$WORKER_STATE_DIR" "$WEB_CACHE_DIR"; do
+  if find "$mutable_dir" -xdev -type l -print -quit | grep -q .; then
+    echo "Refusing symlink inside mutable runtime directory: $mutable_dir" >&2
+    exit 1
+  fi
+done
+chown -R root:"$MEDIA_GROUP" "$MEDIA_STAGING_DIR"
+find "$MEDIA_STAGING_DIR" -xdev -type d -exec chmod 2770 {} +
+find "$MEDIA_STAGING_DIR" -xdev -type f -exec chmod 0660 {} +
+chown -R oldsparky-worker:oldsparky-worker "$WORKER_STATE_DIR"
+find "$WORKER_STATE_DIR" -xdev -type d -exec chmod 0700 {} +
+find "$WORKER_STATE_DIR" -xdev -type f -exec chmod 0600 {} +
+chown -R oldsparky-web:oldsparky-web "$WEB_CACHE_DIR"
+find "$WEB_CACHE_DIR" -xdev -type d -exec chmod 0750 {} +
+find "$WEB_CACHE_DIR" -xdev -type f -exec chmod 0640 {} +
+
+python3 "$APP_DIR/current/tools/platform_render_service_envs.py" \
+  --source "$CANONICAL_ENV" \
+  --output-dir "$RUNTIME_ENV_DIR" \
+  --apply
+
+if [[ "$(stat -c '%U:%G:%a' "$CANONICAL_ENV")" != "root:root:600" ]]; then
+  echo "Canonical env ownership verification failed." >&2
   exit 1
 fi
-if runuser -u "$SERVICE_USER" -- test -w "$ENV_FILE"; then
-  echo "Service user must not be able to write the shared env file." >&2
+
+declare -A ENV_PATHS=(
+  [oldsparky-web]="$RUNTIME_ENV_DIR/web.env"
+  [oldsparky-api]="$RUNTIME_ENV_DIR/api.env"
+  [oldsparky-worker]="$RUNTIME_ENV_DIR/worker.env"
+)
+for service_user in "${SERVICE_USERS[@]}"; do
+  own_env="${ENV_PATHS[$service_user]}"
+  if ! runuser -u "$service_user" -- test -r "$own_env"; then
+    echo "$service_user cannot read its runtime env." >&2
+    exit 1
+  fi
+  if runuser -u "$service_user" -- test -r "$CANONICAL_ENV"; then
+    echo "$service_user must not be able to read the canonical env." >&2
+    exit 1
+  fi
+  for other_user in "${SERVICE_USERS[@]}"; do
+    if [[ "$other_user" == "$service_user" ]]; then
+      continue
+    fi
+    if runuser -u "$service_user" -- test -r "${ENV_PATHS[$other_user]}"; then
+      echo "$service_user must not read ${other_user}'s runtime env." >&2
+      exit 1
+    fi
+  done
+done
+
+for service_user in oldsparky-api oldsparky-worker; do
+  if ! runuser -u "$service_user" -- test -x "$APP_DIR/shared/venv/bin/python"; then
+    echo "$service_user cannot execute the shared Python runtime." >&2
+    exit 1
+  fi
+  if ! runuser -u "$service_user" -- test -w "$MEDIA_STAGING_DIR"; then
+    echo "$service_user cannot write media staging." >&2
+    exit 1
+  fi
+done
+if runuser -u oldsparky-web -- test -w "$MEDIA_STAGING_DIR"; then
+  echo "Web runtime must not write media staging." >&2
   exit 1
 fi
-if ! runuser -u "$SERVICE_USER" -- test -x "$APP_DIR/shared/venv/bin/python"; then
-  echo "Service user cannot execute the shared Python runtime." >&2
+if ! runuser -u oldsparky-worker -- test -w "$WORKER_STATE_DIR"; then
+  echo "Worker cannot write its state directory." >&2
+  exit 1
+fi
+if runuser -u oldsparky-api -- test -w "$WORKER_STATE_DIR" \
+  || runuser -u oldsparky-web -- test -w "$WORKER_STATE_DIR"; then
+  echo "Only worker may write worker state." >&2
+  exit 1
+fi
+if ! runuser -u oldsparky-web -- test -w "$WEB_CACHE_DIR"; then
+  echo "Web cannot write its cache directory." >&2
   exit 1
 fi
 
 cat <<EOF
-[OK] Prepared $SERVICE_USER without changing or restarting running services.
-Next: install the reviewed units, daemon-reload, restart one service at a time,
-and verify rollback before continuing.
+[OK] Runtime identities, env boundaries and writable paths are isolated.
+Canonical secrets remain root-only; service envs were regenerated from that source.
 EOF

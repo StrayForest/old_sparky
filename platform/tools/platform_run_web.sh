@@ -5,6 +5,7 @@ TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$TOOLS_DIR/platform_runtime_common.sh"
 
+platform_require_isolated_service_env web
 platform_load_env_file
 
 cd "$PLATFORM_ROOT_DIR/apps/platform_web"
