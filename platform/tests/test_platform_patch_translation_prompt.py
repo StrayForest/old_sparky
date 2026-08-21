@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 
 from apps.platform_api.app.services import patch_translation_runtime as runtime
@@ -97,7 +98,15 @@ class PatchTranslationPromptInputTests(unittest.TestCase):
         )
 
     def test_prompt_cache_key_is_stable_per_translation_version(self) -> None:
-        self.assertEqual(runtime._PROMPT_CACHE_KEY, "oldsparky-patch-ru-ru-v8")
+        self.assertEqual(runtime._PROMPT_CACHE_KEY, "oldsparky-patch-ru-ru-v9")
+
+    def test_ru_v9_prompt_locks_valve_scaling_and_speed_unit_regressions(self) -> None:
+        source = inspect.getsource(runtime._request_openai)
+
+        self.assertIn("коэффициент масштабирования от спиритической", source)
+        self.assertIn("Move speed bonus reduced from +3.5m to +2m", source)
+        self.assertIn("MUST be rendered as m/s", source)
+        self.assertIn("Distance, range and radius values remain m", source)
 
 
 if __name__ == "__main__":
