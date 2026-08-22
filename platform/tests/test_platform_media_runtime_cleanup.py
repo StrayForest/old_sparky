@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import unittest
 
 from apps.platform_api.app.api.schemas import MediaDescriptorResponse, MediaVariantResponse
@@ -8,6 +9,14 @@ from apps.platform_api.app.services.media import compatibility_media_url
 
 
 class MediaRuntimeCleanupTests(unittest.TestCase):
+    def test_nginx_does_not_publish_legacy_uploads(self) -> None:
+        platform_root = Path(__file__).resolve().parents[1]
+        nginx_config = (
+            platform_root / "deploy" / "nginx" / "deadlock-platform.conf"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("location /api/v1/uploads/", nginx_config)
+
     def test_legacy_upload_route_is_not_registered(self) -> None:
         route_paths = {
             route.path

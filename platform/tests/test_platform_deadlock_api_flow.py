@@ -595,6 +595,16 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(outsider_profile_response.status_code, 403, outsider_profile_response.text)
 
+        async with session_factory()() as db_session:
+            profile = await db_session.scalar(
+                select(PlayerProfile).where(
+                    PlayerProfile.user_id == target_profile_user_id
+                )
+            )
+            self.assertIsNotNone(profile)
+            profile.steam_id = "76561198000000000"
+            await db_session.commit()
+
         participant_profile_payload = self._assert_status(
             await players[1]["client"].get(
                 f"/api/v1/tournaments/{slug}/profiles/{target_profile_user_id}"
@@ -602,6 +612,8 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             200,
         )
         self.assertEqual(participant_profile_payload["profile"]["user_id"], target_profile_user_id)
+        self.assertNotIn("contact_email", participant_profile_payload["profile"])
+        self.assertEqual(participant_profile_payload["profile"]["steam_id"], "76561198000000000")
         self.assertIn("deadlock_profile", participant_profile_payload)
         self.assertEqual(len(participant_profile_payload["dream_slots"]), 6)
 

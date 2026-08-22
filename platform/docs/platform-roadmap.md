@@ -41,7 +41,6 @@ AS-09 distributed login guessing protection is resolved and archived with accoun
 
 AS-11 public worker-error sanitization is resolved with a persistence-boundary guard, irreversible historical-data cleanup migration and a public-response regression proving arbitrary exception text cannot leave the API. Closure evidence is retained in [`archive/as-11-worker-error-sanitization.md`](archive/as-11-worker-error-sanitization.md).
 
-- **AS-10 — product/security decision:** decide whether duplicate-registration UX justifies existing-email disclosure; otherwise move to a generic accepted flow with comparable timing and Turnstile behavior.
 - **Next — AS-12:** fail closed on production bind/proxy invariants and keep Nginx/Cloudflare/UFW trust ranges reconciled.
 - **AS-13:** revalidate the current CI fail-closed isolation contour before changing it.
 - After the media grace period, remove the runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers once no migration/reconciliation path depends on them.

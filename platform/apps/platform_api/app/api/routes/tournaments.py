@@ -42,7 +42,6 @@ from apps.platform_api.app.api.schemas import (
     MediaAcceptedResponse,
     MediaDeleteAcceptedResponse,
     MediaDescriptorResponse,
-    ProfileResponse,
     TournamentCreateRequest,
     TournamentInviteClaimRequest,
     TournamentInviteCodeAvailabilityResponse,
@@ -66,6 +65,7 @@ from apps.platform_api.app.api.schemas import (
     TournamentProfileStatsResponse,
     TournamentResponse,
     TournamentScopedProfileResponse,
+    TournamentProfileResponse,
     TournamentStatusUpdateRequest,
     TournamentWorkspaceResponse,
 )
@@ -5823,7 +5823,7 @@ async def get_tournament_scoped_profile(
     banner_media = (
         profile_media.get(profile.banner_asset_id) if profile.banner_asset_id else None
     )
-    profile_response = ProfileResponse.model_validate(profile).model_copy(
+    profile_response = TournamentProfileResponse.model_validate(profile).model_copy(
         update={
             "avatar_url": compatibility_media_url(
                 avatar_media,

@@ -39,9 +39,9 @@ database guards and applies migration `20260822_0040`. Exact commit
 `gha-32574455599-1-87525bab34c4-20260822T125945Z`; closure evidence is in
 [`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md).
 
-No repository-owned P1 correctness remediation remains open. AS-10 remains a
-product/security decision; AS-12 is the next operational hardening item and
-AS-13 remains separate CI revalidation work.
+No repository-owned P1 correctness remediation remains open. AS-12 is the
+next operational hardening item and AS-13 remains separate CI revalidation
+work.
 
 ## Production invariants
 

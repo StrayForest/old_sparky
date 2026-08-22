@@ -1067,7 +1067,7 @@ class AuthSecurityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             first = await self._register(first_client, email=email)
             self.assertEqual(first.status_code, 201, first.text)
             self.assertTrue(first.json()["verification_required"])
-            user_id = first.json()["user"]["id"]
+            self.assertIsNone(first.json()["user"])
             first_code = mail.await_args.kwargs["code"]
 
             mail.reset_mock()
@@ -1084,7 +1084,7 @@ class AuthSecurityIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(restarted.status_code, 201, restarted.text)
             self.assertTrue(restarted.json()["verification_required"])
-            self.assertEqual(restarted.json()["user"]["id"], user_id)
+            self.assertIsNone(restarted.json()["user"])
             mail.assert_awaited_once()
             second_code = mail.await_args.kwargs["code"]
             self.assertNotEqual(first_code, second_code)
@@ -1113,6 +1113,71 @@ class AuthSecurityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(new_password_login.status_code, 200, new_password_login.text)
 
+    async def test_verified_registration_hides_existing_active_accounts(self) -> None:
+        email = f"{self.prefix}-active@example.com"
+        existing_client = await self._new_client()
+        existing = await self._register(existing_client, email=email)
+        self.assertEqual(existing.status_code, 201, existing.text)
+
+        attacker = await self._new_client()
+        fresh_client = await self._new_client()
+        mail = AsyncMock()
+        settings = PlatformSettings(
+            _env_file=None,
+            platform_email_verification_required=True,
+            platform_support_smtp_host="smtp.example.com",
+            platform_support_smtp_sender_email="noreply@old-sparky.com",
+            platform_auth_generic_response_min_seconds=0,
+            platform_auth_delivery_cooldown_seconds=30,
+        )
+
+        with (
+            patch.object(auth_routes, "get_settings", return_value=settings),
+            patch.object(auth_routes, "send_email_verification_email", mail),
+            patch.object(
+                auth_routes,
+                "reserve_auth_delivery_cooldown",
+                AsyncMock(),
+            ),
+        ):
+            duplicate = await attacker.post(
+                "/api/v1/auth/register",
+                json={
+                    "email": email,
+                    "password": "attacker-replacement-password",
+                    "display_name": "attacker",
+                },
+            )
+            fresh = await self._register(
+                fresh_client,
+                email=f"{self.prefix}-fresh@example.com",
+            )
+
+        self.assertEqual(duplicate.status_code, 201, duplicate.text)
+        self.assertEqual(fresh.status_code, 201, fresh.text)
+        self.assertEqual(duplicate.json(), fresh.json())
+        self.assertEqual(
+            duplicate.json(),
+            {
+                "user": None,
+                "expires_at": None,
+                "verification_required": True,
+                "retry_after_seconds": 30,
+            },
+        )
+        self.assertEqual(mail.await_count, 1)
+
+        original_login = await existing_client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": self.password},
+        )
+        attacker_login = await attacker.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "attacker-replacement-password"},
+        )
+        self.assertEqual(original_login.status_code, 200, original_login.text)
+        self.assertEqual(attacker_login.status_code, 401, attacker_login.text)
+
     async def test_email_verification_is_digest_only_one_time_and_gates_login(self) -> None:
         email = f"{self.prefix}-verify@example.com"
         client = await self._new_client()
@@ -1132,7 +1197,12 @@ class AuthSecurityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(registered.status_code, 201, registered.text)
             self.assertTrue(registered.json()["verification_required"])
             self.assertIsNone(registered.json()["expires_at"])
-            user_id = registered.json()["user"]["id"]
+            self.assertIsNone(registered.json()["user"])
+            async with session_factory()() as db_session:
+                user_id = await db_session.scalar(
+                    select(User.id).where(User.email == email)
+                )
+            self.assertIsNotNone(user_id)
             mail.assert_awaited_once()
             first_verification_code = mail.await_args.kwargs["code"]
 

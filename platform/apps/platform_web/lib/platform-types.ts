@@ -58,7 +58,7 @@ export type PlatformMediaDeleteAccepted = {
 };
 
 export type PlatformAuthRegistrationResponse = {
-  user: PlatformUser;
+  user: PlatformUser | null;
   expires_at: string | null;
   verification_required: boolean;
   retry_after_seconds?: number;
