@@ -360,11 +360,14 @@ test("live tournament detail and bracket routes render from the current public d
   await expectNoHorizontalOverflow(page);
 });
 
-test("live admin route is protected for anonymous users", async ({ page }) => {
-  await page.goto("/platform-ops");
-  expect(new URL(page.url()).hostname).toMatch(/\.cloudflareaccess\.com$/u);
-  await expect(page.getByTestId("admin-console")).toHaveCount(0);
-  await page.waitForLoadState("networkidle");
+test("live admin route is protected for anonymous users", async ({ page, request }) => {
+  const platformOpsResponse = await request.get("/platform-ops", { maxRedirects: 0 });
+  expect(platformOpsResponse.status()).toBe(302);
+  const accessLocation = platformOpsResponse.headers().location;
+  expect(accessLocation).toBeTruthy();
+  expect(new URL(accessLocation!, "https://old-sparky.com").hostname).toMatch(
+    /\.cloudflareaccess\.com$/u
+  );
 
   await page.goto("/admin");
   await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
@@ -447,7 +450,7 @@ test("live patch renders separate Urn and Rift objectives with source icons", as
     (image) => (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
   ))).toBe(true);
   await expectNoHorizontalOverflow(page);
-  if (testInfo.project.name !== "live-webkit-mobile") {
+  if (testInfo.project.name === "live-desktop") {
     await page.screenshot({
       animations: "allow",
       caret: "initial",
