@@ -75,7 +75,6 @@ jobs:
       PLATFORM_DB_SCHEMA: platform
       PLATFORM_SECRET_KEY: ci-only-secret-key-with-at-least-32-characters
       PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
-      PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
       PLATFORM_CELERY_BROKER_URL: redis://127.0.0.1:6379/13
       PLATFORM_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/14
     steps:
@@ -160,6 +159,7 @@ jobs:
       PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
       PLATFORM_DB_SCHEMA: platform
       PLATFORM_SECRET_KEY: ci-only-secret-key-with-at-least-32-characters
+      PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
