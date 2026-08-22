@@ -7,6 +7,16 @@ on:
         description: "Canonical deployed platform origin (must be https://old-sparky.com)"
         required: true
         type: string
+      provision:
+        description: "Provision the one-time root-only CSP QA bundle before the run"
+        required: true
+        default: false
+        type: boolean
+      marker:
+        description: "Fresh liveqa marker, required when provision is true"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -21,6 +31,8 @@ jobs:
       PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
       PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       LIVE_BASE_URL: ${{ inputs.base_url }}
+      LIVE_PROVISION: ${{ inputs.provision }}
+      LIVE_MARKER: ${{ inputs.marker }}
     steps:
       - name: Validate production browser gate inputs
         shell: bash
@@ -54,12 +66,41 @@ jobs:
             -o ConnectTimeout=10 \
             -i ~/.ssh/old_sparky_prod \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$LIVE_BASE_URL" <<'REMOTE' | tee live-launch-report.txt
+            bash -s -- "$LIVE_BASE_URL" "$LIVE_PROVISION" "$LIVE_MARKER" <<'REMOTE' | tee live-launch-report.txt
           set -Eeuo pipefail
           base_url="$1"
+          provision="$2"
+          marker="$3"
           test "$(id -u)" -eq 0 || { echo "Live browser supervisor must run as root" >&2; exit 1; }
           test "$base_url" = "https://old-sparky.com" \
             || { echo "Unexpected production origin" >&2; exit 1; }
+          case "$provision" in
+            true)
+              [[ "$marker" =~ ^liveqa-[a-z0-9-]{6,56}$ ]] \
+                || { echo "Provisioning requires a fresh liveqa marker" >&2; exit 2; }
+              test ! -e /root/.oldsparky/liveqa/csp-live-qa.json \
+                || { echo "Refusing to replace the existing live QA bundle" >&2; exit 2; }
+              install -d -o root -g root -m 0700 /root/.oldsparky/liveqa
+              /root/old_sparky/platform/tools/platform_install_live_qa_user.sh --apply
+              install -o root -g root -m 0500 \
+                /root/old_sparky/platform/tools/platform_live_qa_mailbox_helper.py \
+                /root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py
+              PLATFORM_APP_DIR=/opt/oldsparky/platform \
+              /root/old_sparky/platform/tools/platform_provision_live_csp_qa.sh \
+                --marker "$marker" \
+                --bundle-path /root/.oldsparky/liveqa/csp-live-qa.json \
+                --primary-email liveqa@auth.old-sparky.com \
+                --mailbox-helper /root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py
+              ;;
+            false)
+              test -z "$marker" \
+                || { echo "marker is allowed only with provision=true" >&2; exit 2; }
+              ;;
+            *)
+              echo "provision must be true or false" >&2
+              exit 2
+              ;;
+          esac
           PLATFORM_APP_DIR=/opt/oldsparky/platform \
           PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
           PLAYWRIGHT_LIVE_BASE_URL="$base_url" \
