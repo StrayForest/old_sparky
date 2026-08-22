@@ -39,6 +39,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("ssh " + "\\", source)
         self.assertIn("platform_live_browser_qa.sh public", source)
         self.assertIn("LIVE_BROWSER_QA_SUCCESS", source)
+        self.assertIn("type: boolean", source)
+        self.assertIn("LIVE_PROVISION", source)
+        self.assertIn("LIVE_MARKER", source)
+        self.assertIn("platform_provision_live_csp_qa.sh", source)
+        self.assertIn("Refusing to replace the existing live QA bundle", source)
         self.assertNotIn("npm ci", source)
         self.assertNotIn("npm run test:live", source)
 

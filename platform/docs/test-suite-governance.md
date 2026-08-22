@@ -72,6 +72,26 @@ requires the `LIVE_BROWSER_QA_SUCCESS` marker before publishing the report.
 Direct root Playwright, `--no-sandbox`, arbitrary production URLs and runner-
 side production browser execution are invalid.
 
+If the production host has not yet been provisioned, the first workflow run
+may explicitly create the root-only CSP QA bundle with a fresh marker. This
+mode refuses to replace an existing bundle and does not print generated
+credentials:
+
+```bash
+gh workflow run platform-live-launch.yml \
+  -f base_url=https://old-sparky.com \
+  -f provision=true \
+  -f marker=liveqa-csp-candidate-<unique>
+```
+
+After that one-time provisioning, run the public gate without provisioning:
+
+```bash
+gh workflow run platform-live-launch.yml \
+  -f base_url=https://old-sparky.com \
+  -f provision=false
+```
+
 ## Adding or moving a test
 
 1. State the production behavior and failure path the test protects.
