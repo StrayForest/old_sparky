@@ -7,11 +7,14 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from fastapi import HTTPException
 from sqlalchemy import delete, func, select
 
 from apps.platform_api.app.services.tournament_workflow import (
+    TournamentWorkflowError,
     finalize_deadlock_assignment_with_commitments,
     generate_deadlock_auto_assignment_run_for_tournament,
+    transition_tournament_status,
 )
 from apps.platform_api.app.services.player_commitments import (
     assignment_roster_members,
@@ -207,6 +210,85 @@ class PlatformPlayerCommitmentTests(unittest.IsolatedAsyncioTestCase):
                     member.user_id for member in assignment_roster_members(run_row)
                 },
             }
+
+    async def _cancel_tournament(self, tournament_id: str, actor_user_id: str) -> None:
+        async with session_factory()() as db_session:
+            await transition_tournament_status(
+                db_session,
+                tournament_id=tournament_id,
+                next_status="cancelled",
+                now=datetime.now(UTC),
+                actor_user_id=actor_user_id,
+                audit_action="test.tournament.cancel",
+            )
+            await db_session.commit()
+
+    async def test_generation_rechecks_status_after_stale_tournament_read(self) -> None:
+        user_ids, tournament_ids = await self._seed_parallel_assignment_inputs()
+        tournament_id = tournament_ids[0]
+
+        async with session_factory()() as stale_session:
+            stale_tournament = await stale_session.get(Tournament, tournament_id)
+            self.assertIsNotNone(stale_tournament)
+            await self._cancel_tournament(tournament_id, user_ids[0])
+
+            with patch(
+                "apps.platform_api.app.services.tournament_workflow.AutoAssignmentEngine",
+                FastAssignmentEngine,
+            ), self.assertRaises(HTTPException) as raised:
+                await generate_deadlock_auto_assignment_run_for_tournament(
+                    stale_session,
+                    tournament=stale_tournament,
+                    actor_user_id=user_ids[0],
+                )
+            self.assertEqual(raised.exception.status_code, 409)
+            await stale_session.rollback()
+
+        async with session_factory()() as db_session:
+            run_count = await db_session.scalar(
+                select(func.count(TournamentDeadlockAssignmentRun.id)).where(
+                    TournamentDeadlockAssignmentRun.tournament_id == tournament_id
+                )
+            )
+        self.assertEqual(run_count, 0)
+
+    async def test_roster_lock_rechecks_status_after_stale_tournament_read(self) -> None:
+        user_ids, tournament_ids = await self._seed_parallel_assignment_inputs()
+        tournament_id = tournament_ids[0]
+        with patch(
+            "apps.platform_api.app.services.tournament_workflow.AutoAssignmentEngine",
+            FastAssignmentEngine,
+        ):
+            run_id = await self._generate_and_publish(tournament_id, user_ids[0])
+
+        async with session_factory()() as stale_session:
+            stale_tournament = await stale_session.get(Tournament, tournament_id)
+            run_row = await stale_session.get(TournamentDeadlockAssignmentRun, run_id)
+            self.assertIsNotNone(stale_tournament)
+            self.assertIsNotNone(run_row)
+            await self._cancel_tournament(tournament_id, user_ids[0])
+
+            with self.assertRaises(TournamentWorkflowError):
+                await finalize_deadlock_assignment_with_commitments(
+                    stale_session,
+                    tournament=stale_tournament,
+                    run_row=run_row,
+                    actor_user_id=user_ids[0],
+                    now=datetime.now(UTC),
+                )
+            await stale_session.rollback()
+
+        async with session_factory()() as db_session:
+            active_commitment_count = await db_session.scalar(
+                select(func.count(PlayerTournamentCommitment.id)).where(
+                    PlayerTournamentCommitment.tournament_id == tournament_id,
+                    PlayerTournamentCommitment.released_at.is_(None),
+                )
+            )
+            final_run = await db_session.get(TournamentDeadlockAssignmentRun, run_id)
+        self.assertEqual(active_commitment_count, 0)
+        self.assertIsNotNone(final_run)
+        self.assertEqual(final_run.status, "published")
 
     async def test_parallel_finalization_builds_disjoint_complete_rosters(self) -> None:
         user_ids, tournament_ids = await self._seed_parallel_assignment_inputs()

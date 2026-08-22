@@ -8,11 +8,32 @@ For the production baseline and immediate engineering target, read [`CURRENT.md`
 
 ## P1 — security and correctness
 
-No open P1 security/correctness item remains.
+### AS-15 — Deadlock persistence and workflow concurrency integrity
+
+**Open — first repository-owned remediation target.** The 2026-08-22
+persistence audit confirmed that the AS-03 invite/capacity fix does not cover
+all Deadlock writers.
+
+- Lock the tournament row and revalidate lifecycle state in every ready-check,
+  captain, assignment, publish and roster-lock path, including worker and
+  automation paths.
+- Add migration-backed final guards for active ready-checks and canonical
+  captain/assignment/published-or-locked roster state; use conditional writes
+  for vote lifecycle/eligibility.
+- Serialize replace-all profile dream slots and enforce their supported slot
+  range.
+- Apply invite lifecycle eligibility under the existing claim lock.
+- Make unique-index migrations safe for historical duplicates, interrupted
+  concurrent-index creation and retry; add focused independent-session
+  concurrency and postcondition tests.
+
+AS-03 remains resolved for its documented scope: invite claim/revoke and
+active-participant capacity. Its archived evidence must not be cited as proof
+of AS-15 workflow correctness.
 
 AS-02 privileged-route Access/MFA is resolved with operator/dashboard/live evidence for `/platform-ops*` and `/api/v1/admin*`; application RBAC remains authoritative. Closure evidence is retained in [`archive/as-02-cloudflare-access-mfa.md`](archive/as-02-cloudflare-access-mfa.md).
 
-AS-03 tournament concurrency is resolved and archived with implementation, concurrency-test and production-deployment evidence in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md).
+AS-03 tournament invite/capacity concurrency is resolved and archived with implementation, concurrency-test and production-deployment evidence in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md).
 
 AS-05 public/private data-boundary work is resolved and archived with audit, public-contract tests and production-deployment evidence in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md).
 
@@ -29,7 +50,7 @@ AS-09 distributed login guessing protection is resolved and archived with accoun
 AS-11 public worker-error sanitization is resolved with a persistence-boundary guard, irreversible historical-data cleanup migration and a public-response regression proving arbitrary exception text cannot leave the API. Closure evidence is retained in [`archive/as-11-worker-error-sanitization.md`](archive/as-11-worker-error-sanitization.md).
 
 - **AS-10 — product/security decision:** decide whether duplicate-registration UX justifies existing-email disclosure; otherwise move to a generic accepted flow with comparable timing and Turnstile behavior.
-- **Next code-owned target — AS-12:** fail closed on production bind/proxy invariants and keep Nginx/Cloudflare/UFW trust ranges reconciled.
+- **Next after AS-15 — AS-12:** fail closed on production bind/proxy invariants and keep Nginx/Cloudflare/UFW trust ranges reconciled.
 - **AS-13:** revalidate the current CI fail-closed isolation contour before changing it.
 - After the media grace period, remove the runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers once no migration/reconciliation path depends on them.
 - Continue reducing legacy/duplicate runtime and documentation paths after each replacement is proven.

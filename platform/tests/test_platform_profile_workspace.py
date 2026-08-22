@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import AsyncExitStack
 import unittest
 from uuid import uuid4
@@ -78,6 +79,31 @@ class PlatformProfileWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 201, response.text)
         return client
+
+    async def _assert_user_lock_serializes_slot_write(
+        self,
+        owner: httpx.AsyncClient,
+        request,
+    ) -> httpx.Response:
+        me = await owner.get("/api/v1/users/me")
+        self.assertEqual(me.status_code, 200, me.text)
+        user_id = me.json()["id"]
+
+        async with session_factory()() as blocker:
+            await blocker.execute(
+                select(User.id).where(User.id == user_id).with_for_update()
+            )
+            task = asyncio.create_task(request())
+            await asyncio.sleep(0.15)
+            was_blocked = not task.done()
+            await blocker.rollback()
+
+        response = await task
+        self.assertTrue(
+            was_blocked,
+            "replace-all dream-slot writes must wait on the shared User row lock",
+        )
+        return response
 
     async def test_workspace_returns_deadlock_priority_and_complete_dream_slots(self) -> None:
         owner = await self._register("snapshot")
@@ -175,3 +201,48 @@ class PlatformProfileWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["profile"]["captain_team_name"], "Alpha Team")
         self.assertEqual(payload["dream_slots"][0]["allowed_roles"], ["Carry"])
         self.assertEqual(payload["dream_slots"][0]["desired_heroes"], ["Abrams"])
+
+    async def test_dream_slot_update_waits_for_shared_user_lock(self) -> None:
+        owner = await self._register("slot-lock")
+
+        response = await self._assert_user_lock_serializes_slot_write(
+            owner,
+            lambda: owner.put(
+                "/api/v1/profiles/me/deadlock/dream-slots",
+                json={
+                    "slots": [
+                        {
+                            "slot_number": 1,
+                            "allowed_roles": ["Carry"],
+                            "desired_heroes": ["Abrams"],
+                        }
+                    ]
+                },
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()[0]["desired_heroes"], ["Abrams"])
+
+    async def test_captain_update_waits_for_shared_user_lock(self) -> None:
+        owner = await self._register("captain-lock")
+
+        response = await self._assert_user_lock_serializes_slot_write(
+            owner,
+            lambda: owner.put(
+                "/api/v1/profiles/me/captain",
+                json={
+                    "captain_team_name": "Alpha Team",
+                    "slots": [
+                        {
+                            "slot_number": 2,
+                            "allowed_roles": ["Support"],
+                            "desired_heroes": ["Ivy"],
+                        }
+                    ],
+                },
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["dream_slots"][1]["desired_heroes"], ["Ivy"])

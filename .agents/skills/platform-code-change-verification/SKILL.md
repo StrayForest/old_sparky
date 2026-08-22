@@ -17,6 +17,17 @@ Select the smallest relevant verification set.
   from repo root: it can collide with Python's stdlib `platform` module and
   leave `apps.*` imports unresolved.
 - Migration: `cd platform && tools/platform_run_alembic.sh upgrade head`
+- Workflow concurrency: run focused tests with independent database sessions
+  for competing starts, vote-versus-close/exclusion, publish/lock-versus-status
+  transition, worker-versus-route, and dream-slot replace-all. Assert the
+  final persisted rows and constraints, not only HTTP outcomes.
+- Migration-backed workflow guards: test upgrade from a populated compatible
+  fixture, constraint rejection, and retry/recovery after a failed or
+  interrupted concurrent unique-index build. Confirm no invalid index remains
+  before marking the revision applied.
+- Database assertions: query for duplicate active/canonical workflow rows,
+  post-close/ineligible votes, invalid dream-slot numbers and active
+  commitments after a terminal tournament state.
 - Web: run from `platform/` as
   `tools/platform_run_quiet.sh "web build" -- tools/platform_web_npm.sh --prefix apps/platform_web run build`.
 - Release from the repository root:

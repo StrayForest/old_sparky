@@ -1,8 +1,18 @@
 # Deadlock Workflow Invariants
 
 - Profile-level dream-team slots are the source of truth.
+- Dream-slot replace-all writes lock the owning user/profile and leave exactly
+  one request payload; slots stay within the supported range.
 - Tournament-scoped dream-slot API/model/table must not return.
 - Ready-check, captain round, assignment run, roster publish, and roster lock state stay scoped to eligible participants and organizers.
+- Every durable workflow writer — route, automation and worker — locks the
+  tournament row first, revalidates lifecycle state under that lock and uses a
+  documented secondary-row lock order. Redis is advisory coalescing only.
+- The database prevents ambiguous cardinal workflow rows: one active
+  ready-check and one canonical captain/assignment/published-or-locked roster
+  state as defined by the model. Application checks are not the final guard.
+- A ready vote may persist only for an active round and eligible active
+  participant; closing or excluding cannot race a late vote into persistence.
 - Withdrawn or disqualified participants are excluded from ready-check eligibility and downstream captain/assignment inputs.
 - Registration, ready confirmation, and captain candidacy do not make a player globally unavailable.
 - A locked roster creates one active `player_tournament_commitments` row per roster member. The partial unique index on `user_id` is the final concurrency guard: one player cannot have two active team commitments.

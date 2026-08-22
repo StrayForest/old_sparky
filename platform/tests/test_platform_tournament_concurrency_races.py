@@ -202,6 +202,27 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
         self.assertEqual(await self._invite_state(code), (1, 1))
         self.assertEqual(await self._participant_count(slug), 0)
 
+    async def test_closed_registration_invite_claim_does_not_grant_access(self) -> None:
+        organizer = await self._register_user("closed-invite-organizer")
+        player = await self._register_user("closed-invite-player")
+        code = f"{self.prefix.replace('-', '')[:16]}C1".upper()
+        await self._seed_tournament(
+            organizer_user_id=organizer["user_id"],
+            suffix="closed-invite",
+            visibility="invite_only",
+            status="registration_closed",
+            invite_code=code,
+        )
+
+        with patch.object(tournament_routes, "check_invite_rate_limit", new=AsyncMock()):
+            response = await player["client"].post(
+                "/api/v1/tournaments/invites/claim",
+                json={"code": code, "entry_type": "solo", "team_name": None},
+            )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(await self._invite_state(code), (0, 0))
+
 
     async def test_concurrent_self_joins_serialize_capacity_check(self) -> None:
         organizer = await self._register_user("join-organizer")

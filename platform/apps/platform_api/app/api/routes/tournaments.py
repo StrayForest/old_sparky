@@ -104,7 +104,6 @@ from apps.platform_api.app.services.tournament_allowances import (
 )
 from apps.platform_api.app.services.tournament_workflow import (
     ReadyRoundStateSnapshot,
-    ReadyVotePreflight,
     TournamentCompletionError,
     TournamentStatusTransitionError,
     build_deadlock_ready_round_state_snapshot,
@@ -171,6 +170,7 @@ from python_packages.platform_domain.tournaments import (
     ensure_tournament_capacity_allows_join,
     ensure_tournament_rank_allows_join,
     ensure_organizer_can_moderate_participants,
+    ensure_invite_claimable,
     can_self_join_tournament,
     can_self_leave_tournament,
     eliminated_team_id_for_single_elimination,
@@ -3062,16 +3062,22 @@ async def redeem_tournament_invite(
         tournament_id=tournament.id,
         user_id=auth_session.user.id,
     )
-    if not invite_is_active(
-        max_uses=invite.max_uses,
-        use_count=invite.use_count,
-        revoked_at=invite.revoked_at,
-        expires_at=invite.expires_at,
-        now=auth_session.now,
-    ) and access is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Invite code is not active.")
-
     if access is None:
+        try:
+            ensure_invite_claimable(
+                tournament_visibility=tournament.visibility,
+                tournament_status=tournament.status,
+                max_uses=invite.max_uses,
+                use_count=invite.use_count,
+                revoked_at=invite.revoked_at,
+                expires_at=invite.expires_at,
+                now=auth_session.now,
+            )
+        except TournamentWorkflowError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
         access = TournamentInviteAccess(
             tournament_id=tournament.id,
             user_id=auth_session.user.id,
@@ -4466,6 +4472,8 @@ async def start_deadlock_ready_check(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockReadyRoundResponse:
     tournament = await get_tournament_or_404(db_session, slug)
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
+    await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
     ensure_tournament_organizer(auth_session, tournament)
     try:
@@ -4551,14 +4559,49 @@ async def vote_deadlock_ready_check(
         slug=slug,
         user_id=current_user_id,
     )
-    tournament = route_preflight.tournament
-    ensure_deadlock_tournament_format(tournament)
-    preflight = ReadyVotePreflight(
-        active_round=route_preflight.active_round,
-        has_participant=route_preflight.has_participant,
-        has_deadlock_profile=route_preflight.has_deadlock_profile,
-        has_locked_roster=route_preflight.has_locked_roster,
+    tournament_id = route_preflight.tournament.id
+    if ready_vote_requires_automation(
+        route_preflight.tournament,
+        route_preflight.active_round,
+        now=auth_session.now,
+    ):
+        from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
+
+        await advance_deadlock_tournament_automation(
+            db_session,
+            tournament=route_preflight.tournament,
+            now=auth_session.now,
+            allow_assignment_generation=False,
+        )
+
+    tournament = await lock_tournament_for_workflow(db_session, tournament_id)
+    await db_session.refresh(tournament)
+    preflight = await deadlock_ready_vote_preflight(
+        db_session,
+        tournament_id=tournament.id,
+        user_id=current_user_id,
     )
+    if ready_vote_requires_automation(tournament, preflight.active_round, now=auth_session.now):
+        # The scheduling transition commits its own transaction.  Release this
+        # read-only lock, advance under the automation writer lock, then take
+        # the workflow lock again before validating and writing the vote.
+        await db_session.rollback()
+        tournament = await get_tournament_or_404(db_session, slug)
+        await advance_deadlock_tournament_automation(
+            db_session,
+            tournament=tournament,
+            now=auth_session.now,
+            allow_assignment_generation=False,
+        )
+        tournament = await lock_tournament_for_workflow(db_session, tournament_id)
+        await db_session.refresh(tournament)
+        preflight = await deadlock_ready_vote_preflight(
+            db_session,
+            tournament_id=tournament.id,
+            user_id=current_user_id,
+        )
+
+    ensure_deadlock_tournament_format(tournament)
     try:
         ensure_deadlock_roster_staging_allowed(
             format_slug=tournament.format_slug,
@@ -4574,21 +4617,6 @@ async def vote_deadlock_ready_check(
             detail="Only joined participants can vote in deadlock ready-check.",
         )
     active_round = preflight.active_round
-    if ready_vote_requires_automation(tournament, active_round, now=auth_session.now):
-        from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
-
-        await advance_deadlock_tournament_automation(
-            db_session,
-            tournament=tournament,
-            now=auth_session.now,
-            allow_assignment_generation=False,
-        )
-        preflight = await deadlock_ready_vote_preflight(
-            db_session,
-            tournament_id=tournament.id,
-            user_id=current_user_id,
-        )
-        active_round = preflight.active_round
     if active_round is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -4637,6 +4665,8 @@ async def close_deadlock_ready_check(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockReadyRoundResponse:
     tournament = await get_tournament_or_404(db_session, slug)
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
+    await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
     ensure_tournament_organizer(auth_session, tournament)
     try:
@@ -4829,6 +4859,8 @@ async def start_deadlock_captain_round(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockCaptainRoundResponse:
     tournament = await get_tournament_or_404(db_session, slug)
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
+    await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
     ensure_tournament_organizer(auth_session, tournament)
     try:
@@ -4874,6 +4906,16 @@ async def start_deadlock_captain_round(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Close a ready-check round before starting captain selection.",
+        )
+    existing_captain_round_id = await db_session.scalar(
+        select(TournamentDeadlockCaptainRound.id).where(
+            TournamentDeadlockCaptainRound.source_ready_round_id == source_ready_round.id,
+        )
+    )
+    if existing_captain_round_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Deadlock captain selection already exists for this ready-check round.",
         )
 
     candidate_rows = await deadlock_ready_candidate_rows_for_round(
@@ -5350,6 +5392,8 @@ async def publish_deadlock_auto_assignment_run(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockAutoAssignmentRunResponse:
     tournament = await get_tournament_or_404(db_session, slug)
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
+    await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
     ensure_tournament_organizer(auth_session, tournament)
     try:
@@ -5452,6 +5496,8 @@ async def lock_deadlock_auto_assignment_run(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockAutoAssignmentRunResponse:
     tournament = await get_tournament_or_404(db_session, slug)
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
+    await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
     ensure_tournament_organizer(auth_session, tournament)
     try:

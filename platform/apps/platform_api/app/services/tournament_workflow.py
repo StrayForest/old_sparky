@@ -91,6 +91,7 @@ async def lock_tournament_for_workflow(
         select(Tournament)
         .where(Tournament.id == tournament_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if tournament is None:
         raise TournamentWorkflowError("Tournament no longer exists.")
@@ -1351,6 +1352,10 @@ async def generate_deadlock_auto_assignment_run_for_tournament(
     tournament: Tournament,
     actor_user_id: str | None,
 ) -> TournamentDeadlockAssignmentRun:
+    # This service is also called by the worker, which does not share the API
+    # route dependency locks. Refresh the authoritative parent under the
+    # workflow lock before inspecting roster state or committing a new run.
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
     try:
         ensure_deadlock_roster_staging_allowed(
             format_slug=tournament.format_slug,
@@ -1499,6 +1504,10 @@ async def finalize_deadlock_assignment_with_commitments(
     actor_user_id: str | None,
     now: datetime,
 ) -> tuple[bool, tuple[str, ...]]:
+    # API and automation callers already take this lock, but the service is
+    # intentionally safe for worker/direct callers as well.  It must not turn
+    # a roster into commitments after a concurrent terminal state transition.
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
     locked_run = await db_session.scalar(
         select(TournamentDeadlockAssignmentRun)
         .where(
@@ -1515,6 +1524,15 @@ async def finalize_deadlock_assignment_with_commitments(
         return False, ()
     if run_row.status != "published":
         raise TournamentWorkflowError("Publish the roster before locking it.")
+    ensure_deadlock_roster_staging_allowed(
+        format_slug=tournament.format_slug,
+        tournament_status=tournament.status,
+        has_locked_deadlock_roster=await tournament_has_locked_deadlock_roster(
+            db_session,
+            tournament=tournament,
+        ),
+        action_name="Deadlock roster locking",
+    )
 
     captain_round = await db_session.scalar(
         select(TournamentDeadlockCaptainRound)

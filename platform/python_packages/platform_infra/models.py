@@ -412,6 +412,10 @@ class DeadlockProfile(TimestampMixin, Base):
 class DeadlockDreamSlot(TimestampMixin, Base):
     __tablename__ = "deadlock_dream_slots"
     __table_args__ = (
+        CheckConstraint(
+            "slot_number BETWEEN 1 AND 6",
+            name="slot_number_in_range",
+        ),
         UniqueConstraint(
             "user_id",
             "slot_number",
@@ -432,6 +436,21 @@ class DeadlockDreamSlot(TimestampMixin, Base):
 
 class Tournament(TimestampMixin, Base):
     __tablename__ = "tournaments"
+    __table_args__ = (
+        CheckConstraint(
+            "visibility IN ('public', 'invite_only')",
+            name="visibility_allowed",
+        ),
+        CheckConstraint(
+            "status IN ('registration_open', 'registration_closed', 'in_progress', 'completed', 'cancelled')",
+            name="status_allowed",
+        ),
+        CheckConstraint(
+            "max_participants IS NULL OR max_participants > 0",
+            name="max_participants_positive",
+        ),
+        CheckConstraint("bracket_revision >= 0", name="bracket_revision_nonnegative"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     slug: Mapped[str] = mapped_column(String(140), unique=True)
@@ -645,6 +664,11 @@ class TournamentMatch(TimestampMixin, Base):
 
 class TournamentInvite(TimestampMixin, Base):
     __tablename__ = "tournament_invites"
+    __table_args__ = (
+        CheckConstraint("max_uses > 0", name="max_uses_positive"),
+        CheckConstraint("use_count >= 0", name="use_count_nonnegative"),
+        CheckConstraint("use_count <= max_uses", name="use_count_within_limit"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     tournament_id: Mapped[str] = mapped_column(
@@ -682,6 +706,16 @@ class TournamentInvite(TimestampMixin, Base):
 class TournamentDeadlockReadyRound(TimestampMixin, Base):
     __tablename__ = "tournament_deadlock_ready_rounds"
     __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'closed', 'stopped')",
+            name="status_allowed",
+        ),
+        Index(
+            "uq_tournament_deadlock_ready_rounds_active_tournament",
+            "tournament_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
         Index(
             "ix_tournament_deadlock_ready_rounds_tournament_status_latest",
             "tournament_id",
@@ -713,6 +747,7 @@ class TournamentDeadlockReadyRound(TimestampMixin, Base):
 class TournamentDeadlockReadyVote(TimestampMixin, Base):
     __tablename__ = "tournament_deadlock_ready_votes"
     __table_args__ = (
+        CheckConstraint("choice IN ('yes', 'no')", name="choice_allowed"),
         Index(
             "ix_tournament_deadlock_ready_votes_round_choice",
             "round_id",
@@ -755,6 +790,23 @@ class TournamentDeadlockReadyVoteCountShard(TimestampMixin, Base):
 
 class TournamentDeadlockCaptainRound(TimestampMixin, Base):
     __tablename__ = "tournament_deadlock_captain_rounds"
+    __table_args__ = (
+        CheckConstraint("teams_count > 0", name="teams_count_positive"),
+        CheckConstraint(
+            "status IN ('active', 'closed', 'finalized')",
+            name="status_allowed",
+        ),
+        UniqueConstraint(
+            "source_ready_round_id",
+            name="uq_tournament_deadlock_captain_rounds_source_ready_round",
+        ),
+        Index(
+            "uq_tournament_deadlock_captain_rounds_active_tournament",
+            "tournament_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     tournament_id: Mapped[str] = mapped_column(
@@ -785,6 +837,11 @@ class TournamentDeadlockCaptainRound(TimestampMixin, Base):
 class TournamentDeadlockCaptainEntry(TimestampMixin, Base):
     __tablename__ = "tournament_deadlock_captain_entries"
     __table_args__ = (
+        CheckConstraint("offer_order > 0", name="offer_order_positive"),
+        CheckConstraint(
+            "state IN ('queued', 'offered', 'accepted', 'declined', 'cancelled', 'assigned')",
+            name="state_allowed",
+        ),
         UniqueConstraint(
             "round_id",
             "user_id",
@@ -814,6 +871,18 @@ class TournamentDeadlockCaptainEntry(TimestampMixin, Base):
 
 class TournamentDeadlockAssignmentRun(TimestampMixin, Base):
     __tablename__ = "tournament_deadlock_assignment_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('generated', 'published', 'superseded', 'locked')",
+            name="status_allowed",
+        ),
+        Index(
+            "uq_tournament_deadlock_assignment_runs_current_tournament",
+            "tournament_id",
+            unique=True,
+            postgresql_where=text("status IN ('published', 'locked')"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     tournament_id: Mapped[str] = mapped_column(
