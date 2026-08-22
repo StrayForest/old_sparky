@@ -714,7 +714,7 @@ class LiveCspQaProvisionerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     slug=f"external-{self.unique}",
                     name=f"External {self.unique}",
                     description="Not live QA scope.",
-                    visibility="private",
+                    visibility="invite_only",
                     format_slug="deadlock",
                     organizer_user_id=owner_id,
                 )
@@ -780,7 +780,7 @@ class LiveCspQaProvisionerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         "Accelerated live browser acceptance "
                         f"{self.candidate_marker}."
                     ),
-                    visibility="private",
+                    visibility="invite_only",
                     format_slug="deadlock",
                     organizer_user_id=str(accounts[0]["id"]),
                 )

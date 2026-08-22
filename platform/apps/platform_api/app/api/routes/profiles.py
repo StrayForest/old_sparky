@@ -54,6 +54,7 @@ from python_packages.platform_infra.models import (
     DeadlockProfile,
     ExternalIdentity,
     PlayerProfile,
+    User,
 )
 from python_packages.platform_infra.security import (
     get_authenticated_session,
@@ -591,6 +592,14 @@ async def upsert_my_deadlock_dream_slots(
             "desired_heroes": list(normalized["desired_heroes"]),
         }
 
+    # Serialize replace-all slot writes from the profile and captain workspace
+    # endpoints on the stable parent row.  Locking only existing slot rows
+    # permits concurrent writes to an empty slot set to merge unintentionally.
+    await db_session.scalar(
+        select(User)
+        .where(User.id == auth_session.user.id)
+        .with_for_update()
+    )
     await db_session.execute(
         delete(DeadlockDreamSlot).where(DeadlockDreamSlot.user_id == auth_session.user.id)
     )
@@ -621,5 +630,9 @@ async def upsert_my_deadlock_dream_slots(
             ],
         },
     )
-    await db_session.commit()
+    try:
+        await db_session.commit()
+    except Exception:
+        await db_session.rollback()
+        raise
     return await list_profile_dream_slots(db_session, user_id=auth_session.user.id)

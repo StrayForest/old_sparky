@@ -31,9 +31,36 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-No operator-owned or repository-owned P1 implementation/verification task remains after AS-02 and AS-14 closure.
+**AS-15 — Deadlock persistence and workflow concurrency integrity** is the
+first repository-owned remediation target. It closes the gap identified by the
+2026-08-22 persistence audit: AS-03 remains closed for tournament invite
+claim/revoke and active-participant-capacity serialization only; it does not
+certify ready-check, captain, assignment, roster, worker or profile-slot
+writers.
 
-AS-02 privileged-route Access/MFA, AS-11 public worker-error sanitization and AS-14 HSTS ownership/state are closed and archived. AS-10 remains a product/security decision on registration-enumeration behavior; the next bounded code-owned remediation target is AS-12 proxy/firewall configuration-drift hardening, followed by AS-13 CI isolation revalidation.
+Deliver AS-15 as one migration-backed correctness package:
+
+1. Serialize every Deadlock workflow writer (manual route, automation and
+   worker) on the tournament row with `SELECT ... FOR UPDATE`, then re-read
+   lifecycle state before writing secondary rows.
+2. Make the database the final guard for one active ready-check, one canonical
+   captain/assignment lifecycle and one current published/locked roster as
+   required by the chosen state model. Use partial unique constraints/indexes,
+   not application checks alone.
+3. Make ready votes conditional on an active round and eligible active
+   participant so close/exclusion cannot be followed by a late vote commit.
+4. Serialize profile dream-slot replacement on its owning user/profile row;
+   prevent replace-all requests from merging or failing on concurrent slot
+   writes.
+5. Ship compatible migrations with duplicate/precondition handling and
+   recovery coverage for concurrent unique-index creation. Normalize the
+   retired stored `private` visibility alias to `invite_only` explicitly before
+   enforcing the current API values; prove the result with independent-session
+   concurrency tests and final-state assertions.
+
+AS-02 privileged-route Access/MFA, AS-11 public worker-error sanitization and
+AS-14 HSTS ownership/state are closed and archived. AS-10 remains a
+product/security decision. AS-12 and AS-13 follow AS-15.
 
 ## Production invariants
 
@@ -41,6 +68,20 @@ AS-02 privileged-route Access/MFA, AS-11 public worker-error sanitization and AS
 - Invite-only workspace reads require active participant membership or explicit organizer/admin authority; historical inactive participant rows are not authorization grants, including for an already-open private bracket SSE stream.
 - Organizer exclusion must retain the tournament participant row as `disqualified`; self-rejoin and same-tournament invite redemption remain blocked until the organizer deliberately restores an active status. This is tournament-scoped and must not become a platform-wide ban.
 - Invite use and active-participant capacity are transaction-scoped PostgreSQL invariants: invite claim/revoke locks the stable tournament and invite rows in tournament-to-invite order; active-roster mutations serialize on the tournament row and capacity is rechecked before an inactive retained participant becomes active.
+- Every Deadlock ready-check, captain, assignment generation, roster publish
+  and roster-lock write path — API, automation and worker alike — locks its
+  tournament row before checking lifecycle state. It re-reads terminal/staging
+  status under that lock and locks secondary rows in one documented order.
+  Redis may coalesce work but never replaces this durable transaction boundary.
+- Ready-check votes must be committed only while their round is active and the
+  voter remains an eligible active participant. A close or exclusion cannot
+  leave a post-close or ineligible vote in persistence.
+- The database is the final concurrency guard for cardinal workflow state:
+  active ready-checks and the selected captain/assignment/roster state must not
+  have ambiguous concurrent rows even if a future writer bypasses a service.
+- Dream-slot replacement is serialized on the owning profile/user row. A
+  replace-all request leaves exactly its selected profile-level slots, never a
+  merge of concurrent payloads; slot values remain in the supported range.
 - Public API contracts are explicit allowlists. Account/contact email and Steam authentication identity do not belong to anonymous public-profile DTOs, participant moderation metadata belongs only to organizer-management DTOs, and public automation error fields must never contain arbitrary exception text. A future public email feature requires a separate explicit opt-in contract rather than reusing account contact data.
 - Public bracket SSE must retain layered application/Nginx connection caps, fail closed when Redis-backed admission state is unavailable, release leases on normal termination and retain bounded expiry recovery after abnormal termination. Stream lifetime and reconnect timing must remain bounded.
 - Public media rendering must remain `R2 -> CDN -> browser`; normal API runtime must not proxy R2 objects, serve legacy upload paths or fall back to local-disk reads. Legacy URL columns and migration helpers may remain only while runtime-inert and migration/grace-period scoped.

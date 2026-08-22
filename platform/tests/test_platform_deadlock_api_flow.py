@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 import unittest
 from typing import Any
+from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
@@ -13,6 +15,7 @@ from sqlalchemy import delete, func, select
 from apps.platform_api.app.services.tournament_workflow import (
     generate_deadlock_auto_assignment_run_for_tournament,
 )
+from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
 from python_packages.platform_infra.db import dispose_engine, session_factory
@@ -21,6 +24,8 @@ from python_packages.platform_infra.models import (
     PlayerProfile,
     PlayerTournamentCommitment,
     Tournament,
+    TournamentDeadlockReadyRound,
+    TournamentDeadlockReadyVote,
     User,
 )
 
@@ -148,6 +153,184 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             run_id = str(run_row.id)
             await db_session.commit()
             return run_id
+
+    async def test_ready_check_start_serializes_concurrent_organizer_requests(self) -> None:
+        organizer = await self._register_user(
+            label="concurrent-ready-organizer",
+            rank="Eternus",
+            subrank=6,
+            captain_priority="yes",
+        )
+        await self._grant_public_creation(str(organizer["user_id"]))
+        tournament_payload = self._assert_status(
+            await organizer["client"].post(
+                "/api/v1/tournaments",
+                json={
+                    "name": f"{self.prefix}-cr",
+                    "description": "Ready-check writer serialization.",
+                    "visibility": "public",
+                    "format_slug": "solo",
+                },
+            ),
+            201,
+        )
+        slug = tournament_payload["slug"]
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_open"},
+            ),
+            200,
+        )
+        self._assert_status(
+            await organizer["client"].post(
+                f"/api/v1/tournaments/{slug}/join",
+                json={"entry_type": "solo"},
+            ),
+            201,
+        )
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_closed"},
+            ),
+            200,
+        )
+
+        first_response, second_response = await asyncio.gather(
+            organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"),
+            organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"),
+        )
+        self.assertEqual(
+            sorted((first_response.status_code, second_response.status_code)),
+            [201, 409],
+            {"first": first_response.text, "second": second_response.text},
+        )
+
+        async with session_factory()() as db_session:
+            tournament_id = await db_session.scalar(select(Tournament.id).where(Tournament.slug == slug))
+            self.assertIsNotNone(tournament_id)
+            active_round_count = await db_session.scalar(
+                select(func.count(TournamentDeadlockReadyRound.id)).where(
+                    TournamentDeadlockReadyRound.tournament_id == tournament_id,
+                    TournamentDeadlockReadyRound.status == "active",
+                )
+            )
+        self.assertEqual(active_round_count, 1)
+
+    async def test_ready_vote_holds_workflow_lock_until_the_round_is_closed(self) -> None:
+        organizer = await self._register_user(
+            label="vote-lock-organizer",
+            rank="Eternus",
+            subrank=6,
+            captain_priority="yes",
+        )
+        voter = await self._register_user(
+            label="vote-lock-player",
+            rank="Ascendant",
+            subrank=6,
+        )
+        await self._grant_public_creation(str(organizer["user_id"]))
+        tournament_payload = self._assert_status(
+            await organizer["client"].post(
+                "/api/v1/tournaments",
+                json={
+                    "name": f"{self.prefix}-vl",
+                    "description": "Ready vote close serialization.",
+                    "visibility": "public",
+                    "format_slug": "solo",
+                },
+            ),
+            201,
+        )
+        slug = tournament_payload["slug"]
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_open"},
+            ),
+            200,
+        )
+        for user in (organizer, voter):
+            self._assert_status(
+                await user["client"].post(
+                    f"/api/v1/tournaments/{slug}/join",
+                    json={"entry_type": "solo"},
+                ),
+                201,
+            )
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_closed"},
+            ),
+            200,
+        )
+        self._assert_status(
+            await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"),
+            201,
+        )
+
+        vote_at_upsert = asyncio.Event()
+        release_vote = asyncio.Event()
+        original_upsert = tournament_routes.upsert_deadlock_ready_vote
+
+        async def gated_upsert(*args: Any, **kwargs: Any) -> bool:
+            vote_at_upsert.set()
+            await release_vote.wait()
+            return await original_upsert(*args, **kwargs)
+
+        vote_task: asyncio.Task[httpx.Response] | None = None
+        close_task: asyncio.Task[httpx.Response] | None = None
+        try:
+            with patch.object(
+                tournament_routes,
+                "upsert_deadlock_ready_vote",
+                side_effect=gated_upsert,
+            ):
+                vote_task = asyncio.create_task(
+                    voter["client"].post(
+                        f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                        json={"choice": "yes"},
+                    )
+                )
+                await asyncio.wait_for(vote_at_upsert.wait(), timeout=10)
+                close_task = asyncio.create_task(
+                    organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close")
+                )
+                await asyncio.sleep(0.1)
+                self.assertFalse(
+                    close_task.done(),
+                    "Ready-check closure must wait for the in-flight vote writer lock.",
+                )
+                release_vote.set()
+                vote_response, close_response = await asyncio.wait_for(
+                    asyncio.gather(vote_task, close_task),
+                    timeout=10,
+                )
+        finally:
+            release_vote.set()
+            pending_tasks = [task for task in (vote_task, close_task) if task is not None]
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        self.assertEqual(vote_response.status_code, 200, vote_response.text)
+        self.assertEqual(close_response.status_code, 200, close_response.text)
+        async with session_factory()() as db_session:
+            round_row = await db_session.scalar(
+                select(TournamentDeadlockReadyRound)
+                .join(Tournament)
+                .where(Tournament.slug == slug)
+            )
+            self.assertIsNotNone(round_row)
+            vote_count = await db_session.scalar(
+                select(func.count(TournamentDeadlockReadyVote.id)).where(
+                    TournamentDeadlockReadyVote.round_id == round_row.id,
+                    TournamentDeadlockReadyVote.user_id == voter["user_id"],
+                )
+            )
+        self.assertEqual(round_row.status, "closed")
+        self.assertEqual(vote_count, 1)
 
     async def test_deadlock_api_flow_covers_ready_check_assignment_lock_and_handoff(self) -> None:
         organizer = await self._register_user(
@@ -305,6 +488,16 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captain_start_payload["offered_count"], 0)
         self.assertEqual(captain_start_payload["assigned_count"], 2)
         self.assertEqual(captain_start_payload["declined_count"], 0)
+
+        captain_retry = await organizer["client"].post(
+            f"/api/v1/tournaments/{slug}/deadlock/captain-round/start",
+            json={"teams_count": 2},
+        )
+        self.assertEqual(captain_retry.status_code, 409, captain_retry.text)
+        self.assertIn(
+            "already exists for this ready-check round",
+            captain_retry.json()["detail"],
+        )
 
         captain_state_payload = self._assert_status(
             await organizer["client"].get(f"/api/v1/tournaments/{slug}/deadlock/captain-round"),

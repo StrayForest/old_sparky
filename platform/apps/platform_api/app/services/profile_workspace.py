@@ -23,6 +23,7 @@ from python_packages.platform_infra.models import (
     DeadlockProfile,
     ExternalIdentity,
     PlayerProfile,
+    User,
 )
 from python_packages.platform_infra.security import invalidate_user_session_cache
 
@@ -203,6 +204,11 @@ async def update_captain_profile(
             "desired_heroes": list(normalized["desired_heroes"]),
         }
 
+    # The dedicated dream-slots endpoint uses this same parent-row lock.
+    # It serializes replace-all updates even while no child rows exist.
+    await db_session.scalar(
+        select(User).where(User.id == user.id).with_for_update()
+    )
     profile = await db_session.scalar(
         select(PlayerProfile).where(PlayerProfile.user_id == user.id)
     )
