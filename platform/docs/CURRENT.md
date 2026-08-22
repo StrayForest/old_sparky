@@ -31,10 +31,14 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-**AS-16 — Test-suite audit and executable CI/live ownership** is in progress.
+**AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
+live-validated in production.
 The audit remediation is tracked in [`test-suite-governance.md`](test-suite-governance.md):
 deterministic backend/migration/web groups must run in CI, and production
 browser QA must execute through the dedicated server wrapper.
+The runtime release at `04d691b95b6ba9fde5982aed658523fe2e896407` passed the
+security/build gate (`32589822458`), production deployment (`32590065060`) and
+the full production browser gate (`32590276914`).
 
 AS-15 — Deadlock persistence and workflow concurrency integrity is resolved and deployed. The release locks durable workflow/profile writers on
 their stable parent rows, revalidates lifecycle state under lock, adds final
