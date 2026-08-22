@@ -46,12 +46,16 @@ for production_name in sorted(production_names):
     try:
         production_accounts.append(pwd.getpwnam(production_name))
     except KeyError:
-        if production_name in {"oldsparky", "oldsparky-platform"}:
+        # oldsparky is a legacy identity and may be absent. The active
+        # production runtime identity is the only mandatory boundary.
+        if production_name in {"oldsparky-platform"}:
             raise SystemExit(1)
     try:
         production_groups.append(grp.getgrnam(production_name))
     except KeyError:
-        if production_name in {"oldsparky", "oldsparky-platform"}:
+        # oldsparky is a legacy identity and may be absent. The active
+        # production runtime identity is the only mandatory boundary.
+        if production_name in {"oldsparky-platform"}:
             raise SystemExit(1)
 passwd_matches = [entry.pw_name for entry in pwd.getpwall() if entry.pw_uid == account.pw_uid]
 group_matches = [entry.gr_name for entry in grp.getgrall() if entry.gr_gid == account.pw_gid]
