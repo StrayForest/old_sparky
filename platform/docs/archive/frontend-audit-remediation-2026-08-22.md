@@ -2,7 +2,7 @@
 
 - Scope: `platform/apps/platform_web`
 - Audit type: read-only full frontend/API-contract review
-- Status: resolved; release publication pending
+- Status: resolved and deployed
 - Owner: Platform web maintainers
 
 ## Confirmed findings
@@ -54,7 +54,7 @@ Passed before release publication:
 - full platform test suite (`[OK] platform tests`)
 - `platform docs: ok`
 
-The release package still requires release preflight, immutable build publication, deploy smoke, and the final commit/merge evidence. No migration is expected.
+Release preflight, immutable build publication, install, service restart, nginx validation, deploy smoke, and final commit/merge evidence are complete. No migration was required.
 
 ## Release evidence
 
