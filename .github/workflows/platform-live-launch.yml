@@ -81,6 +81,118 @@ jobs:
               test ! -e /root/.oldsparky/liveqa/csp-live-qa.json \
                 || { echo "Refusing to replace the existing live QA bundle" >&2; exit 2; }
               install -d -o root -g root -m 0700 /root/.oldsparky/liveqa
+              /usr/bin/python3.12 - <<'PY'
+          import grp
+          import json
+          import pwd
+
+          names = (
+              "oldsparky",
+              "oldsparky-platform",
+              "oldsparky-api",
+              "oldsparky-web",
+              "oldsparky-worker",
+              "oldsparky-liveqa",
+          )
+          users = {}
+          groups = {}
+          for name in names:
+              try:
+                  entry = pwd.getpwnam(name)
+              except KeyError:
+                  users[name] = None
+              else:
+                  users[name] = {
+                      "uid": entry.pw_uid,
+                      "gid": entry.pw_gid,
+                      "home": entry.pw_dir,
+                      "shell": entry.pw_shell,
+                  }
+              try:
+                  entry = grp.getgrnam(name)
+              except KeyError:
+                  groups[name] = None
+              else:
+                  groups[name] = {"gid": entry.gr_gid}
+          failures = []
+          qa_user = users.get("oldsparky-liveqa")
+          qa_group = groups.get("oldsparky-liveqa")
+          if qa_user is None:
+              failures.append("user_missing")
+          if qa_group is None:
+              failures.append("group_missing")
+          required = ("oldsparky", "oldsparky-platform")
+          for name in required:
+              if users.get(name) is None:
+                  failures.append(f"{name}_user_missing")
+              if groups.get(name) is None:
+                  failures.append(f"{name}_group_missing")
+          if qa_user is not None and qa_group is not None:
+              if qa_user["uid"] == 0 or any(
+                  name != "oldsparky-liveqa"
+                  and value is not None
+                  and value["uid"] == qa_user["uid"]
+                  for name, value in users.items()
+              ):
+                  failures.append("uid_collision")
+              if qa_user["gid"] == 0 or any(
+                  name != "oldsparky-liveqa"
+                  and value is not None
+                  and value["gid"] == qa_user["gid"]
+                  for name, value in users.items()
+              ) or any(
+                  name != "oldsparky-liveqa"
+                  and value is not None
+                  and value["gid"] == qa_user["gid"]
+                  for name, value in groups.items()
+              ):
+                  failures.append("gid_collision")
+              if qa_user["gid"] != qa_group["gid"]:
+                  failures.append("user_group_gid_mismatch")
+              if qa_user["home"] != "/nonexistent":
+                  failures.append("home_mismatch")
+              if qa_user["shell"] != "/usr/sbin/nologin":
+                  failures.append("shell_mismatch")
+              passwd_matches = [
+                  entry.pw_name
+                  for entry in pwd.getpwall()
+                  if entry.pw_uid == qa_user["uid"]
+              ]
+              if passwd_matches != ["oldsparky-liveqa"]:
+                  failures.append("uid_duplicate")
+              group_matches = [
+                  entry.gr_name
+                  for entry in grp.getgrall()
+                  if entry.gr_gid == qa_user["gid"]
+              ]
+              if group_matches != ["oldsparky-liveqa"]:
+                  failures.append("gid_duplicate")
+              supplementary = [
+                  entry.gr_name
+                  for entry in grp.getgrall()
+                  if entry.gr_gid != qa_user["gid"]
+                  and "oldsparky-liveqa" in entry.gr_mem
+              ]
+              if supplementary:
+                  failures.append("supplementary_groups")
+          print(
+              "LIVE_QA_IDENTITY "
+              + json.dumps(
+                  {
+                      "status": "invalid" if failures else "valid",
+                      "reasons": failures,
+                      "qa_user": qa_user,
+                      "qa_group": qa_group,
+                      "required_identities_present": all(
+                          users.get(name) is not None and groups.get(name) is not None
+                          for name in required
+                      ),
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
+          )
+          PY
               /root/old_sparky/platform/tools/platform_install_live_qa_user.sh --apply
               install -o root -g root -m 0500 \
                 /root/old_sparky/platform/tools/platform_live_qa_mailbox_helper.py \
