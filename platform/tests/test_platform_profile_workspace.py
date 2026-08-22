@@ -246,3 +246,53 @@ class PlatformProfileWorkspaceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["dream_slots"][1]["desired_heroes"], ["Ivy"])
+
+    async def test_concurrent_captain_replace_all_keeps_exactly_one_payload(self) -> None:
+        owner = await self._register("concurrent-replace-all")
+        payloads = [
+            {
+                "captain_team_name": "Alpha Team",
+                "slots": [
+                    {
+                        "slot_number": 1,
+                        "allowed_roles": ["Carry"],
+                        "desired_heroes": ["Abrams"],
+                    }
+                ],
+            },
+            {
+                "captain_team_name": "Beta Team",
+                "slots": [
+                    {
+                        "slot_number": 6,
+                        "allowed_roles": ["Support"],
+                        "desired_heroes": ["Ivy"],
+                    }
+                ],
+            },
+        ]
+
+        responses = await asyncio.gather(
+            *(owner.put("/api/v1/profiles/me/captain", json=payload) for payload in payloads)
+        )
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+
+        workspace = await owner.get("/api/v1/profiles/me/workspace")
+        self.assertEqual(workspace.status_code, 200, workspace.text)
+        payload = workspace.json()
+        observed = (
+            payload["profile"]["captain_team_name"],
+            tuple(
+                (slot["slot_number"], tuple(slot["desired_heroes"]))
+                for slot in payload["dream_slots"]
+                if slot["desired_heroes"]
+            ),
+        )
+        self.assertIn(
+            observed,
+            {
+                ("Alpha Team", ((1, ("Abrams",)),)),
+                ("Beta Team", ((6, ("Ivy",)),)),
+            },
+            "a replace-all write must not merge the two concurrent payloads",
+        )

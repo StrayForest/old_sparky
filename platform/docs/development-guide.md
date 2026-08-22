@@ -57,6 +57,12 @@ All Node commands go through `tools/platform_node.sh` or `tools/platform_web_npm
 8. For production-bound work, follow the deployment runbook through live validation.
 9. Commit each coherent verified change/package and push it to the matching GitHub branch before handoff unless explicitly requested otherwise.
 
+The test-group ownership and runner contract is maintained in
+[`test-suite-governance.md`](test-suite-governance.md). CI must use
+`tools/platform_run_tests.sh` for backend tests and `npm run test:hermetic` for
+all deterministic Playwright specs; do not use grep exclusions to define test
+ownership.
+
 ## Commit and push safety
 
 From the repository root:

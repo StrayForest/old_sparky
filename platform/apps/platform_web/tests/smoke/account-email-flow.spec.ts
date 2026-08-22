@@ -171,7 +171,8 @@ test("invalid account email is rejected by shared Save before an API request", a
   const emailInput = page.getByTestId("profile-account-email");
   const profileSaveButton = page.getByTestId("profile-save-account-button");
   await emailInput.fill("broken-address@");
-  await expect(profileSaveButton).toBeEnabled();
+  await emailInput.blur();
+  await expect(profileSaveButton).toHaveAttribute("aria-disabled", "false");
   await profileSaveButton.click();
 
   await expect(page.getByText("Введите корректную почту.")).toBeVisible();

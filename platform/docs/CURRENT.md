@@ -31,8 +31,12 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-**AS-15 — Deadlock persistence and workflow concurrency integrity** is
-resolved and deployed. The release locks durable workflow/profile writers on
+**AS-16 — Test-suite audit and executable CI/live ownership** is in progress.
+The audit remediation is tracked in [`test-suite-governance.md`](test-suite-governance.md):
+deterministic backend/migration/web groups must run in CI, and production
+browser QA must execute through the dedicated server wrapper.
+
+AS-15 — Deadlock persistence and workflow concurrency integrity is resolved and deployed. The release locks durable workflow/profile writers on
 their stable parent rows, revalidates lifecycle state under lock, adds final
 database guards and applies migration `20260822_0040`. Exact commit
 `87525bab34c473ac51708eba1e242b7baa6a1462` is active as release

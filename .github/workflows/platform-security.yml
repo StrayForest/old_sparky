@@ -75,6 +75,7 @@ jobs:
       PLATFORM_DB_SCHEMA: platform
       PLATFORM_SECRET_KEY: ci-only-secret-key-with-at-least-32-characters
       PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
+      PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
       PLATFORM_CELERY_BROKER_URL: redis://127.0.0.1:6379/13
       PLATFORM_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/14
     steps:
@@ -107,7 +108,7 @@ jobs:
       - name: Unit and integration tests
         run: >-
           sudo -EH bash -lc 'cd /root/old_sparky/platform &&
-          .venv_platform/bin/python -m unittest discover -s tests'
+          tools/platform_run_tests.sh discover -s tests'
       - name: Static and dependency security gates
         run: |
           sudo -EH bash -lc '
@@ -137,8 +138,44 @@ jobs:
       - run: npm run lint
       - run: npm run build
 
+  migration:
+    name: Migration scenarios
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: platformdb_test
+          POSTGRES_USER: platform_user
+          POSTGRES_PASSWORD: platform_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U platform_user -d platformdb_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      PLATFORM_ENVIRONMENT: test
+      PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+      PLATFORM_DB_SCHEMA: platform
+      PLATFORM_SECRET_KEY: ci-only-secret-key-with-at-least-32-characters
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install pinned dependencies
+        run: |
+          python -m venv platform/.venv_platform
+          platform/.venv_platform/bin/python -m pip install -r platform/requirements-platform.lock.txt
+      - name: Run populated legacy migration scenario
+        run: >-
+          cd platform &&
+          .venv_platform/bin/python tools/platform_migration_scenario.py
+
   smoke:
-    name: Web smoke
+    name: Web hermetic
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -158,12 +195,8 @@ jobs:
         timeout-minutes: 12
         run: npx playwright install chromium
 
-      - name: Run web smoke tests
-        run: >-
-          npm run test:smoke --
-          --project=desktop
-          --project=mobile-layout
-          --grep-invert="Steam-only account is immediately usable and attaches optional email only after code confirmation|account email changes only after inline code confirmation|captain profile uses one full-width dream-slot hero picker|registered player outside the published roster sees the unassigned state"
+      - name: Run all web hermetic tests
+        run: npm run test:hermetic
         env:
           CI: "true"
 

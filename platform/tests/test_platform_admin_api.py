@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
@@ -23,6 +24,7 @@ from python_packages.platform_infra.models import (
     TournamentMatch,
     TournamentParticipant,
     User,
+    UserSession,
     UserRole,
 )
 
@@ -57,6 +59,9 @@ class PlatformAdminApiTests(unittest.IsolatedAsyncioTestCase):
             )
             if user_ids:
                 await db_session.execute(delete(AuditLog).where(AuditLog.actor_user_id.in_(user_ids)))
+                await db_session.execute(
+                    delete(MediaAsset).where(MediaAsset.owner_user_id.in_(user_ids))
+                )
             await db_session.execute(delete(Tournament).where(Tournament.slug.like(f"{self.prefix}%")))
             await db_session.execute(delete(PreprodTestRun).where(PreprodTestRun.marker.like(f"{self.prefix}%")))
             if user_ids:
@@ -886,3 +891,118 @@ class PlatformAdminApiTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNotNone(audit)
             self.assertEqual(audit.payload["slug"], slug)
+
+    async def test_superadmin_user_delete_enforces_boundaries_and_invalidates_cache(self) -> None:
+        regular_admin = await self._register_user("user-delete-admin")
+        superadmin = await self._register_user("user-delete-superadmin")
+        target = await self._register_user("user-delete-target")
+        target_superadmin = await self._register_user("user-delete-target-superadmin")
+        target_owner = await self._register_user("user-delete-owner")
+        target_media = await self._register_user("user-delete-media")
+        await self._grant_role(regular_admin["user_id"], "admin")
+        await self._grant_role(superadmin["user_id"], "superadmin")
+        await self._grant_role(target_superadmin["user_id"], "superadmin")
+
+        forbidden = await regular_admin["client"].request(
+            "DELETE",
+            f"/api/v1/admin/users/{target['user_id']}",
+            json={"confirmation": target["email"], "note": "Not allowed."},
+        )
+        self.assertEqual(forbidden.status_code, 403, forbidden.text)
+
+        self_delete = await superadmin["client"].request(
+            "DELETE",
+            f"/api/v1/admin/users/{superadmin['user_id']}",
+            json={"confirmation": superadmin["email"], "note": "Do not self delete."},
+        )
+        self.assertEqual(self_delete.status_code, 409, self_delete.text)
+
+        protected_role = await superadmin["client"].request(
+            "DELETE",
+            f"/api/v1/admin/users/{target_superadmin['user_id']}",
+            json={"confirmation": target_superadmin["email"], "note": "Protect superadmin."},
+        )
+        self.assertEqual(protected_role.status_code, 409, protected_role.text)
+
+        wrong_confirmation = await superadmin["client"].request(
+            "DELETE",
+            f"/api/v1/admin/users/{target['user_id']}",
+            json={"confirmation": "wrong", "note": "Check exact confirmation."},
+        )
+        self.assertEqual(wrong_confirmation.status_code, 422, wrong_confirmation.text)
+
+        async with session_factory()() as db_session:
+            owner = await db_session.scalar(select(User).where(User.id == target_owner["user_id"]))
+            self.assertIsNotNone(owner)
+            owner.public_tournament_credits = 1
+            db_session.add(
+                MediaAsset(
+                    id=str(uuid4()),
+                    owner_user_id=target_media["user_id"],
+                    purpose="profile_avatar",
+                    status="ready",
+                    source_mime="image/png",
+                    source_bytes=128,
+                    source_sha256="1" * 64,
+                    version_id=str(uuid4()),
+                )
+            )
+            await db_session.commit()
+
+        owned_tournament = self._assert_status(
+            await target_owner["client"].post(
+                "/api/v1/tournaments",
+                json={
+                    "name": f"{self.prefix}-owned",
+                    "visibility": "public",
+                    "format_slug": "solo",
+                },
+            ),
+            201,
+        )
+        blocked_owner = await superadmin["client"].request(
+            "DELETE",
+            f"/api/v1/admin/users/{target_owner['user_id']}",
+            json={"confirmation": target_owner["email"], "note": "Owned tournament must block."},
+        )
+        self.assertEqual(blocked_owner.status_code, 409, blocked_owner.text)
+        self.assertEqual(blocked_owner.json()["detail"]["code"], "user_owns_tournaments")
+        self.assertTrue(owned_tournament["id"])
+
+        blocked_media = await superadmin["client"].request(
+            "DELETE",
+            f"/api/v1/admin/users/{target_media['user_id']}",
+            json={"confirmation": target_media["email"], "note": "Active media must block."},
+        )
+        self.assertEqual(blocked_media.status_code, 409, blocked_media.text)
+        self.assertEqual(blocked_media.json()["detail"]["code"], "user_media_cleanup_required")
+
+        with patch(
+            "apps.platform_api.app.api.routes.admin_user_delete.invalidate_user_session_cache"
+        ) as invalidate_cache:
+            deleted = await superadmin["client"].request(
+                "DELETE",
+                f"/api/v1/admin/users/{target['user_id']}",
+                json={"confirmation": target["email"], "note": "Remove the approved account."},
+            )
+        self.assertEqual(deleted.status_code, 204, deleted.text)
+        invalidate_cache.assert_called_once_with(target["user_id"])
+
+        async with session_factory()() as db_session:
+            self.assertIsNone(await db_session.get(User, target["user_id"]))
+            self.assertEqual(
+                await db_session.scalar(
+                    select(UserSession.id).where(UserSession.user_id == target["user_id"])
+                ),
+                None,
+            )
+            audit = await db_session.scalar(
+                select(AuditLog)
+                .where(
+                    AuditLog.action == "admin.user.delete",
+                    AuditLog.subject_id == target["user_id"],
+                )
+                .order_by(AuditLog.id.desc())
+            )
+            self.assertIsNotNone(audit)
+            self.assertEqual(audit.payload["note"], "Remove the approved account.")

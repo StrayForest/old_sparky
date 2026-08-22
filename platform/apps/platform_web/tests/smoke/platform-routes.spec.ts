@@ -746,6 +746,7 @@ test("mobile profile banners show their complete descriptions", async ({ page },
 test("admin console loads operational data and keeps audited actions explicit", async ({ page }) => {
   let overrideBody: Record<string, unknown> | null = null;
   let deleteBody: Record<string, unknown> | null = null;
+  let deleteUserBody: Record<string, unknown> | null = null;
   let creditsBody: Record<string, unknown> | null = null;
   let roleBody: Record<string, unknown> | null = null;
   let tournament = {
@@ -875,6 +876,11 @@ test("admin console loads operational data and keeps audited actions explicit", 
   });
 
   await page.route("**/api/v1/admin/users**", async (route) => {
+    if (route.request().method() === "DELETE") {
+      deleteUserBody = route.request().postDataJSON() as Record<string, unknown>;
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
     if (route.request().method() === "PATCH") {
       if (route.request().url().endsWith("/admin-role")) {
         roleBody = route.request().postDataJSON() as Record<string, unknown>;
@@ -968,6 +974,28 @@ test("admin console loads operational data and keeps audited actions explicit", 
   expect(roleBody).toMatchObject({
     is_admin: true,
     note: "Add another platform administrator."
+  });
+
+  const userDeletion = page.getByTestId("admin-user-deletion-console");
+  await expect(userDeletion).toBeVisible();
+  await userDeletion.getByTestId("admin-delete-user-search").fill("managed");
+  const managedDeletionRow = userDeletion.locator("tbody tr").filter({ hasText: "managed@example.com" });
+  await expect(managedDeletionRow).toBeVisible();
+  await managedDeletionRow.click();
+  const deleteUserButton = userDeletion.getByTestId("admin-delete-user");
+  await expect(deleteUserButton).toBeDisabled();
+  await userDeletion.getByTestId("admin-delete-user-confirmation").fill("managed@example.com");
+  await userDeletion.getByTestId("admin-delete-user-note").fill("Remove the approved smoke user.");
+  await expect(deleteUserButton).toBeEnabled();
+  await deleteUserButton.click();
+  await expect.poll(() => deleteUserBody).toMatchObject({
+    confirmation: "managed@example.com",
+    note: "Remove the approved smoke user."
+  });
+  await expect(userDeletion.getByText("Аккаунт Managed Player удалён из базы данных.")).toBeVisible();
+  expect(deleteUserBody).toMatchObject({
+    confirmation: "managed@example.com",
+    note: "Remove the approved smoke user."
   });
 
   await page.getByRole("tab", { name: /Preprod QA/ }).click();
@@ -2896,9 +2924,12 @@ test("Steam-only account is immediately usable and attaches optional email only 
   await expect(page.getByRole("button", { name: "Привязать Steam" })).toHaveCount(0);
   await expect(page.getByText(/Почта не обязательна для профиля и участия в турнирах/u)).toBeVisible();
 
-  await page.getByRole("button", { name: "Привязать почту" }).click();
-  await page.getByLabel("Новая почта").fill("linked@example.test");
-  await page.getByRole("button", { name: "Отправить код" }).click();
+  const emailInput = page.getByTestId("profile-account-email");
+  const profileSaveButton = page.getByTestId("profile-save-account-button");
+  await expect(emailInput).toHaveValue("");
+  await emailInput.fill("linked@example.test");
+  await expect(profileSaveButton).toBeEnabled();
+  await profileSaveButton.click();
   await expect(page.getByText("Код отправлен на linked@example.test")).toBeVisible();
   const resend = page.getByRole("button", { name: /Отправить ещё раз/u });
   await expect(resend).toBeDisabled();
@@ -2911,7 +2942,7 @@ test("Steam-only account is immediately usable and attaches optional email only 
   await expect(resend).toBeEnabled();
 
   await page.getByLabel("Код подтверждения").fill("654321");
-  const emailConfirmClick = page.getByRole("button", { name: "ОК" }).click();
+  const emailConfirmClick = page.getByRole("button", { name: "Подтвердить", exact: true }).click();
   await expect.poll(() => emailLinkPayloads).toHaveLength(3);
   await expect(resend).toBeDisabled();
   await expect(page.getByLabel("Код подтверждения")).toBeDisabled();
@@ -3389,11 +3420,18 @@ test("team panels stay hidden for visitors who are not registered", async ({ pag
 });
 
 test("registered player outside the published roster sees the unassigned state", async ({ page }) => {
-  await page.context().addCookies([{
-    name: "team-unassigned-smoke",
-    value: "1",
-    url: "http://127.0.0.1:3100"
-  }]);
+  await page.context().addCookies([
+    {
+      name: "deadlock_platform_session",
+      value: "team-unassigned-smoke",
+      url: "http://127.0.0.1:3100"
+    },
+    {
+      name: "team-unassigned-smoke",
+      value: "1",
+      url: "http://127.0.0.1:3100"
+    }
+  ]);
   await page.goto("/tournaments/night-veil-open-5");
   await expect(page.getByTestId("tournament-team-unassigned")).toContainText(
     "К сожалению, вы не попали ни в одну команду"
@@ -3797,7 +3835,7 @@ test("profile editor saves tournament profile through API", async ({ page }, tes
   const passwordFieldTops = await page.locator(".account-security-fields > .account-field").evaluateAll(
     (fields) => fields.map((field) => Math.round(field.getBoundingClientRect().top))
   );
-  expect(new Set(passwordFieldTops).size).toBe(2);
+  expect(new Set(passwordFieldTops).size).toBe(3);
   const signoffHeight = await page.locator(".account-signoff-card").evaluate((card) => card.getBoundingClientRect().height);
   expect(signoffHeight).toBeLessThan(280);
   const signoffGeometry = await page.locator(".account-signoff-card").evaluate((card) => {
@@ -3835,7 +3873,7 @@ test("profile editor saves tournament profile through API", async ({ page }, tes
   await expect(nicknameInput).toHaveAttribute("maxlength", "15");
   await expect(emailIdentityButton).toContainText("player@example.com");
   await expect(page.getByLabel("Новая почта")).toHaveCount(0);
-  await expect(page.getByLabel("Текущий пароль")).toHaveCount(0);
+  await expect(page.getByLabel("Текущий пароль")).toHaveCount(1);
   await expect(accountSaveButton).toBeDisabled();
   await expect(accountCancelButton).toBeDisabled();
 
@@ -3868,16 +3906,14 @@ test("profile editor saves tournament profile through API", async ({ page }, tes
   await accountNewPassword.fill("New-password-2");
   await expect(accountConfirmPassword).toHaveValue("");
   await accountConfirmPassword.fill("New-password-2");
+  await accountSecurityForm.getByLabel("Текущий пароль").fill("Current-password-1");
   await accountNewPassword.fill("New-password-3");
   await expect(accountConfirmPassword).toHaveValue("New-password-2");
   await accountConfirmPassword.press("Enter");
-  await expect(page.getByText("Новый пароль и подтверждение не совпадают.")).toBeVisible();
+  await expect(page.getByTestId("profile-security-validation")).toContainText("Новый пароль и подтверждение не совпадают.");
   await expect(page.getByRole("dialog", { name: "Подтвердите изменение" })).toHaveCount(0);
   await accountNewPassword.fill("New-password-2");
   await accountConfirmPassword.press("Enter");
-  await expect(page.getByRole("dialog", { name: "Подтвердите изменение" })).toBeVisible();
-  await page.getByLabel("Текущий пароль").fill("Current-password-1");
-  await page.getByRole("button", { name: "Подтвердить", exact: true }).click();
   await expect.poll(() => securityRequestBody).toMatchObject({
     current_password: "Current-password-1",
     email: null,
@@ -3971,18 +4007,27 @@ test("account email changes only after inline code confirmation", async ({ page 
   });
 
   await page.goto("/profile/me?tab=account");
+  await page.getByRole("button", { name: "Турнирный профиль", exact: true }).click();
+  await expect(page.locator("#profile-panel-tournament")).not.toHaveAttribute("hidden", "");
+  await page.getByRole("button", { name: "Аккаунт", exact: true }).click();
+  await expect(page.locator("#profile-panel-account")).not.toHaveAttribute("hidden", "");
 
-  await page.locator(".account-email-identity .account-identity-button").click();
-  await page.getByLabel("Новая почта").fill("pending-new@example.test");
-  await page.getByLabel("Текущий пароль").fill("CurrentPassword123!");
-  await page.getByRole("button", { name: "Отправить код" }).click();
+  const emailInput = page.getByTestId("profile-account-email");
+  const profileSaveButton = page.getByTestId("profile-save-account-button");
+  await expect(emailInput).toHaveValue("player@example.com");
+  await emailInput.fill("pending-new@example.test");
+  await expect(profileSaveButton).toHaveAttribute("aria-disabled", "false");
+  await profileSaveButton.click();
+  await expect(page.getByRole("dialog", { name: "Подтвердите смену почты" })).toBeVisible();
+  await page.getByRole("dialog", { name: "Подтвердите смену почты" }).getByLabel("Текущий пароль").fill("CurrentPassword123!");
+  await page.getByRole("button", { name: "Продолжить", exact: true }).click();
 
   await expect(
     page.getByText("Код отправлен на pending-new@example.test")
   ).toBeVisible();
 
   await page.getByLabel("Код подтверждения").fill("654321");
-  await page.getByRole("button", { name: "ОК" }).click();
+  await page.getByRole("button", { name: "Подтвердить", exact: true }).click();
 
   await expect(
     page.getByText("pending-new@example.test", { exact: true })
@@ -3996,7 +4041,7 @@ test("account email changes only after inline code confirmation", async ({ page 
     { email: "pending-new@example.test", code: "654321" }
   ]);
 
-  expect(profilePutCount).toBe(0);
+  expect(profilePutCount).toBe(1);
 });
 
 test("profile editor validation blocks empty role payload before API", async ({ page }) => {
@@ -4060,7 +4105,11 @@ test("profile editor validation blocks empty role payload before API", async ({ 
 });
 
 test("captain profile uses one full-width dream-slot hero picker", async ({ page }) => {
-  let requestBody: { slots: Array<{ slot_number: number; allowed_roles: string[]; desired_heroes: string[] }> } | null = null;
+  type CaptainRequest = {
+    captain_team_name?: string;
+    slots: Array<{ slot_number: number; allowed_roles: string[]; desired_heroes: string[] }>;
+  };
+  let requestBody: CaptainRequest | null = null;
   let captainProfileBody: Record<string, unknown> | null = null;
   let requestCount = 0;
 
@@ -4097,20 +4146,28 @@ test("captain profile uses one full-width dream-slot hero picker", async ({ page
     });
   });
 
-  await page.route("**/api/v1/profiles/me/deadlock/dream-slots", async (route) => {
-    if (route.request().method() === "PUT") {
-      requestBody = route.request().postDataJSON();
-      requestCount += 1;
-    }
-    const slots = requestBody?.slots ?? [];
+  await page.route("**/api/v1/profiles/me/captain", async (route) => {
+    const payload = route.request().postDataJSON() as CaptainRequest;
+    requestBody = payload;
+    captainProfileBody = payload;
+    requestCount += 1;
+    const slots = payload.slots;
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(slots.map((slot) => ({
-        user_id: "u_lisalexy",
-        ...slot,
-        updated_at: new Date().toISOString()
-      })))
+      body: JSON.stringify({
+        captain_team_name: payload.captain_team_name ?? "OldTeam",
+        dream_slots: Array.from({ length: 6 }, (_, index) => {
+          const slot = slots.find((item) => item.slot_number === index + 1);
+          return {
+            user_id: "u_lisalexy",
+            slot_number: index + 1,
+            allowed_roles: slot?.allowed_roles ?? [],
+            desired_heroes: slot?.desired_heroes ?? [],
+            updated_at: new Date().toISOString()
+          };
+        })
+      })
     });
   });
 

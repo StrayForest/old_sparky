@@ -19,6 +19,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Latest four-patch translation QA checkpoint | [Patch translation QA — 2026-08-22](patch-translation-qa-2026-08-22.md) |
 | UI system and responsive rules | [Visual theme](platform-visual-theme.md) |
 | Normal release or rollback | [Deployment runbook](deployment-runbook.md) |
+| Test-suite ownership and CI/live runners | [Test-suite governance](test-suite-governance.md) |
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |
 | Services, storage, media and performance | [Operations runbook](operations-runbook.md) |

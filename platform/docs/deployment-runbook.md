@@ -94,6 +94,7 @@ After rollback, repeat preflight plus origin/SNI and public smoke against the re
 Open only when applicable:
 
 - CSP candidate/enforcement changes, live browser QA, Turnstile/auth contour, AppArmor Chromium sandbox and CSP observation gates: [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md).
+- The live public browser workflow is owned by [`test-suite-governance.md`](test-suite-governance.md) and must invoke the dedicated server wrapper over SSH. Do not run production Playwright on the GitHub runner.
 - Backup/restore: [`backup-restore-runbook.md`](backup-restore-runbook.md).
 - Security policy and CSP ownership: [`security-runbook.md`](security-runbook.md).
 - Incident response: [`incident-response.md`](incident-response.md).

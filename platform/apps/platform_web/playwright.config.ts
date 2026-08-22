@@ -16,9 +16,9 @@ export default defineConfig({
     "live-launch.spec.ts",
     "tournament-participant-progressive.spec.ts"
   ],
-  // Legacy broad flows are covered by focused profile/account and tournament
-  // smoke tests with explicit authentication state.
-  grepInvert: /captain profile uses one full-width dream-slot hero picker|profile editor saves tournament profile through API|registered player outside the published roster sees the unassigned state/u,
+  // The participant-progressive flow owns a separate API/server contour and is
+  // run by test:hermetic after this suite. All other deterministic specs run
+  // here without name-based exclusions.
   outputDir: "./test-results",
   timeout: 30_000,
   expect: {

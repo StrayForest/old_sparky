@@ -1,5 +1,6 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { expect, test } from "@playwright/test";
+import type { PlatformTournament } from "../../lib/platform-types";
 
 const apiHost = "127.0.0.1";
 const apiPort = 18019;
@@ -238,27 +239,36 @@ test("bracket shell omits the duplicate current-user workspace snapshot", async 
 function workspacePayload(slug: string, authenticated: boolean, includeCurrentUser: boolean) {
   const isReady = slug === readyTournamentSlug;
   const currentUser = authenticated && includeCurrentUser ? platformUser() : null;
+  type WorkspaceTournamentFixture = Pick<
+    PlatformTournament,
+    "id" | "slug" | "name" | "description" | "visibility" | "status"
+      | "format_slug" | "organizer_user_id" | "organizer_display_name"
+      | "participant_count" | "max_participants" | "current_user_participant_status"
+      | "starts_at" | "registration_closes_at" | "ready_check_starts_at"
+      | "ready_check_ends_at" | "captain_selection_starts_at" | "allowed_ranks"
+  >;
+  const tournament: WorkspaceTournamentFixture = {
+    id: `t_${slug}`,
+    slug,
+    name: isReady ? "Lean Ready Cup" : "Lean Detail Cup",
+    description: "Lean tournament detail smoke tournament.",
+    visibility: "public",
+    status: isReady ? "registration_closed" : "registration_open",
+    format_slug: "solo",
+    organizer_user_id: "user-organizer",
+    organizer_display_name: "Roster Organizer",
+    participant_count: 26,
+    max_participants: 64,
+    current_user_participant_status: authenticated ? "registered" : null,
+    starts_at: "2026-07-20T18:00:00Z",
+    registration_closes_at: "2026-07-20T16:00:00Z",
+    ready_check_starts_at: "2026-07-20T16:05:00Z",
+    ready_check_ends_at: "2026-07-20T16:20:00Z",
+    captain_selection_starts_at: "2026-07-20T16:30:00Z",
+    allowed_ranks: ["r1", "r2"]
+  };
   return {
-    tournament: {
-      id: `t_${slug}`,
-      slug,
-      name: isReady ? "Lean Ready Cup" : "Lean Detail Cup",
-      description: "Lean tournament detail smoke tournament.",
-      visibility: "public",
-      status: isReady ? "registration_closed" : "registration_open",
-      format_slug: "solo",
-      organizer_user_id: "user-organizer",
-      organizer_display_name: "Roster Organizer",
-      participant_count: 26,
-      max_participants: 64,
-      current_user_participant_status: authenticated ? "registered" : null,
-      starts_at: "2026-07-20T18:00:00Z",
-      registration_closes_at: "2026-07-20T16:00:00Z",
-      ready_check_starts_at: "2026-07-20T16:05:00Z",
-      ready_check_ends_at: "2026-07-20T16:20:00Z",
-      team_formation_starts_at: "2026-07-20T16:30:00Z",
-      allowed_ranks: ["r1", "r2"]
-    },
+    tournament,
     current_user: currentUser,
     participants: [],
     participants_total: 26,

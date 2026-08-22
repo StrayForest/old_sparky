@@ -69,9 +69,13 @@ export function AdminUserDeletion() {
   }, [isSuperadmin, search]);
 
   useEffect(() => {
+    if (!selectedUserId) {
+      setConfirmation("");
+      setNote("");
+      return;
+    }
     setConfirmation("");
     setNote("");
-    setMessage("");
     setError("");
   }, [selectedUserId]);
 
@@ -96,10 +100,8 @@ export function AdminUserDeletion() {
       });
       setMessage(`Аккаунт ${selected.display_name} удалён из базы данных.`);
       setUsers((current) => current.filter((item) => item.id !== selected.id));
-      setSelectedUserId("");
       setConfirmation("");
       setNote("");
-      setSearch("");
     } catch (requestError) {
       setError(platformApiMessage(requestError, "Не удалось удалить аккаунт."));
     } finally {
@@ -108,7 +110,10 @@ export function AdminUserDeletion() {
   }
 
   return (
-    <section className="admin-console" data-testid="admin-user-deletion-console">
+    <section
+      className="admin-console"
+      data-testid="admin-user-deletion-console"
+    >
       <header className="admin-console-header">
         <div>
           <div className="admin-eyebrow"><Trash2 size={16} />Удаление аккаунта</div>
@@ -116,6 +121,11 @@ export function AdminUserDeletion() {
           <p>Операция доступна только superadmin и необратимо удаляет аккаунт и связанные каскадные данные.</p>
         </div>
       </header>
+      {message ? (
+        <div className="admin-feedback success" data-testid="admin-delete-user-success" role="status">
+          {message}
+        </div>
+      ) : null}
 
       <div className="admin-section">
         <div className="admin-toolbar admin-users-toolbar">
@@ -226,7 +236,6 @@ export function AdminUserDeletion() {
                     />
                   </label>
 
-                  {message ? <div className="admin-feedback success">{message}</div> : null}
                   {error ? <div className="admin-feedback error">{error}</div> : null}
 
                   <button
