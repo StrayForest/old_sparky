@@ -149,6 +149,14 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("rollback_partial_identity", source)
         self.assertIn("--no-user-group", source)
         self.assertIn("/usr/bin/getent", source)
+        self.assertIn(
+            'if production_name in {"oldsparky-platform"}',
+            source,
+        )
+        self.assertNotIn(
+            'if production_name in {"oldsparky", "oldsparky-platform"}',
+            source,
+        )
 
     def test_installer_owns_a_narrow_revision_pinned_apparmor_profile(self) -> None:
         installer = WRAPPERS[0].read_text(encoding="utf-8")
