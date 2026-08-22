@@ -1,6 +1,6 @@
 # AS-16 — test-suite audit remediation
 
-- Status: implemented on `codex/test-suite-audit-remediation`
+- Status: resolved and live-validated on `dev` at `04d691b95b6ba9fde5982aed658523fe2e896407`
 - Scope: `platform/tests`, deterministic frontend tests and the production code needed to verify their behavior
 - Audit rule: findings were evaluated as regression risk and executable behavior, not as coverage percentages
 
@@ -29,5 +29,12 @@ The production browser workflow deliberately does not install Playwright or run 
 - Full `npm run test:hermetic` across desktop, wide, tablet and mobile: passed.
 - Web typecheck, lint and production build: passed.
 - Ruff, Python compile, docs checker, YAML parsing and secret scan: passed.
+- Security/build workflow `32589822458`: passed.
+- Production deployment workflow `32590065060`: passed.
+- Production browser gate workflow `32590276914`: passed, including the
+  server-owned supervisor, Access-protected admin boundary and the live public
+  browser suite.
 
-Release commit, merge and production workflow run IDs are recorded in the release handoff after publication.
+The release was merged into `dev` and published after the live gate passed;
+the final repository state and documentation publication are verified by the
+release handoff.
