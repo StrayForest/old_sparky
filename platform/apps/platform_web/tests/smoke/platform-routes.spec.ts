@@ -1836,6 +1836,15 @@ test("create tournament page hides the form from anonymous users", async ({ page
   await expect(page.locator('form[aria-label="Форма создания турнира"]')).toHaveCount(0);
 });
 
+test("create tournament page distinguishes an unavailable session from anonymous access", async ({ page }) => {
+  await authenticateTestUser(page, [{ name: "users-me-unavailable-smoke", value: "1" }]);
+  await page.goto("/tournaments/new");
+
+  await expect(page.getByRole("heading", { name: "Сессию временно не удалось проверить" })).toBeVisible();
+  await expect(page.getByRole("main").getByRole("link", { name: "Войти", exact: true })).toHaveCount(0);
+  await expect(page.locator('form[aria-label="Форма создания турнира"]')).toHaveCount(0);
+});
+
 test("registration action panel has balanced top and bottom spacing", async ({ page }) => {
   await page.goto("/tournaments/night-veil-open-5");
 
@@ -1874,13 +1883,13 @@ test("create tournament form posts to API and navigates to detail", async ({ pag
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({ code: "SMOKE2026", available: true })
+        body: JSON.stringify({ code: "SMOKE2026X", available: true })
       });
       return;
     }
 
     if (url.pathname.endsWith("/invites/code-status")) {
-      const code = url.searchParams.get("code") ?? "SMOKE2026";
+      const code = url.searchParams.get("code") ?? "SMOKE2026X";
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -1941,8 +1950,8 @@ test("create tournament form posts to API and navigates to detail", async ({ pag
   await page.getByLabel("Макс. команд").fill("128");
   const inviteCodeInput = page.getByLabel(/Код приглашения/);
   await inviteCodeInput.clear();
-  await inviteCodeInput.fill("SMOKE2026");
-  await expect(inviteCodeInput).toHaveValue("SMOKE2026");
+  await inviteCodeInput.fill("SMOKE2026X");
+  await expect(inviteCodeInput).toHaveValue("SMOKE2026X");
   await page.getByLabel("Загрузить обложку турнира").setInputFiles({
     name: "banner.webp",
     mimeType: "image/webp",
@@ -1958,7 +1967,7 @@ test("create tournament form posts to API and navigates to detail", async ({ pag
     max_participants: 999999999,
     teams_count: 128,
     visibility: "invite_only",
-    invite_code: "SMOKE2026",
+    invite_code: "SMOKE2026X",
     format_slug: "solo",
     match_format: "bo1",
     final_format: "bo3",
@@ -2280,6 +2289,36 @@ test("locked public visibility keeps both tournament visibility buttons aligned"
   expect(privateBox).not.toBeNull();
   expect(publicBox!.width).toBe(privateBox!.width);
   expect(publicBox!.height).toBe(privateBox!.height);
+});
+
+test("private tournament creation is disabled when the allowance is exhausted", async ({ page }) => {
+  await authenticateTestUser(page, [{ name: "private-allowance-exhausted-smoke", value: "1" }]);
+  await page.goto("/tournaments/new");
+
+  const privateButton = page.getByRole("button", { name: "Приватный турнир недоступен" });
+  await expect(privateButton).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Создать турнир" })).toBeDisabled();
+  await page.getByRole("button", { name: "Информация о доступе к турнирам" }).click();
+  await expect(page.getByText("Доступно приватных турниров в этом месяце: 0/1.")).toBeVisible();
+});
+
+test("create tournament rejects an invite code shorter than the API contract before submit", async ({ page }) => {
+  await authenticateTestUser(page);
+  let requestCount = 0;
+  await page.route("**/api/v1/tournaments", async (route) => {
+    requestCount += 1;
+    await route.fulfill({ status: 500, body: "unexpected request" });
+  });
+
+  await page.goto("/tournaments/new");
+  await page.locator('form[aria-label="Форма создания турнира"]').getByLabel(/Название турнира/).fill("Invite Contract Test");
+  await page.getByLabel(/Краткое описание/).fill("Contract validation");
+  await page.getByLabel("Макс. команд").fill("128");
+  await page.getByLabel(/Код приглашения/).fill("SHORT1234");
+  await page.getByRole("button", { name: "Создать турнир" }).click();
+
+  await expect(page.getByText("Код должен содержать минимум 10 букв или цифр.")).toBeVisible();
+  expect(requestCount).toBe(0);
 });
 
 test("create tournament form validation blocks invalid payload before API", async ({ page }) => {

@@ -250,6 +250,7 @@ class UserResponse(BaseModel):
     steam_id: str | None = None
     steam_linked: bool = False
     has_password: bool = False
+    can_unlink_steam: bool = False
 
 
 class AdminUserResponse(UserResponse):

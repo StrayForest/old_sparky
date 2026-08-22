@@ -97,11 +97,17 @@ export function AdminConsole() {
   const activeTournamentFilters = useRef(requestedTournamentFilters);
   activeTournamentFilters.current = requestedTournamentFilters;
   const consoleRequestGeneration = useRef(0);
+  const userSearchGeneration = useRef(0);
+  const userSearchController = useRef<AbortController | null>(null);
   const tournamentPageController = useRef<AbortController | null>(null);
   const loadMoreInFlight = useRef(false);
 
   const loadConsole = useCallback(async (refresh = false) => {
     const requestGeneration = ++consoleRequestGeneration.current;
+    const usersRequestGeneration = ++userSearchGeneration.current;
+    userSearchController.current?.abort();
+    userSearchController.current = null;
+    setIsLoadingUsers(false);
     const filtersAtRequest = activeTournamentFilters.current;
     const queryKeyAtRequest = adminTournamentQueryKey(filtersAtRequest);
     tournamentPageController.current?.abort();
@@ -150,7 +156,9 @@ export function AdminConsole() {
       setHasMoreTournaments(nextTournamentPage.hasMore);
       setNextTournamentOffset(nextTournamentPage.offset + nextTournamentPage.limit);
       setResolvedTournamentQueryKey(queryKeyAtRequest);
-      setUsers(nextUsers);
+      if (usersRequestGeneration === userSearchGeneration.current) {
+        setUsers(nextUsers);
+      }
       setAuditLogs(nextAuditLogs);
       setPreprodRuns(nextPreprodRuns);
       setSelectedTournamentSlug((current) => (
@@ -158,11 +166,13 @@ export function AdminConsole() {
           ? current
           : nextTournaments[0]?.slug ?? null
       ));
-      setSelectedUserId((current) => (
-        current && nextUsers.some((item) => item.id === current)
-          ? current
-          : nextUsers[0]?.id ?? null
-      ));
+      if (usersRequestGeneration === userSearchGeneration.current) {
+        setSelectedUserId((current) => (
+          current && nextUsers.some((item) => item.id === current)
+            ? current
+            : nextUsers[0]?.id ?? null
+        ));
+      }
       setSelectedAuditId((current) => (
         current && nextAuditLogs.some((item) => item.id === current)
           ? current
@@ -192,11 +202,20 @@ export function AdminConsole() {
   }, [currentUser, t]);
 
   const loadUsers = useCallback(async (search = "") => {
+    const requestGeneration = ++userSearchGeneration.current;
+    userSearchController.current?.abort();
+    const controller = new AbortController();
+    userSearchController.current = controller;
     setIsLoadingUsers(true);
     setUserLoadError("");
     try {
       const query = search.trim() ? `?search=${encodeURIComponent(search.trim())}` : "";
-      const nextUsers = await platformApiRequest<PlatformUser[]>(`/admin/users${query}`);
+      const nextUsers = await platformApiRequest<PlatformUser[]>(`/admin/users${query}`, {
+        signal: controller.signal
+      });
+      if (requestGeneration !== userSearchGeneration.current || controller.signal.aborted) {
+        return;
+      }
       setUsers(nextUsers);
       setSelectedUserId((current) => (
         current && nextUsers.some((item) => item.id === current)
@@ -204,9 +223,16 @@ export function AdminConsole() {
           : nextUsers[0]?.id ?? null
       ));
     } catch (error) {
-      setUserLoadError(platformApiMessage(error, t("admin.loadFailed")));
+      if (requestGeneration === userSearchGeneration.current && !controller.signal.aborted) {
+        setUserLoadError(platformApiMessage(error, t("admin.loadFailed")));
+      }
     } finally {
-      setIsLoadingUsers(false);
+      if (requestGeneration === userSearchGeneration.current) {
+        setIsLoadingUsers(false);
+        if (userSearchController.current === controller) {
+          userSearchController.current = null;
+        }
+      }
     }
   }, [t]);
 

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Activity, BarChart3, CheckCircle2, Swords, Trophy, Users } from "lucide-react";
 import { Hero } from "@/components/layout/hero";
+import { translate } from "@/lib/i18n";
 import { getPlatformStatsOverview } from "@/lib/platform-api";
 
 export const dynamic = "force-dynamic";
@@ -25,7 +26,7 @@ export default async function StatsPage() {
       icon: Activity,
       label: "Активные и будущие",
       value: stats.active_upcoming_tournaments,
-      meta: "registration и in progress"
+      meta: translate("stats.activeUpcomingMeta")
     },
     {
       icon: Users,
@@ -49,7 +50,7 @@ export default async function StatsPage() {
       icon: BarChart3,
       label: "Ранги в статистике",
       value: stats.deadlock_rank_distribution.length,
-      meta: "live platformdb"
+      meta: translate("stats.sourceMeta")
     }
   ];
 
@@ -63,12 +64,12 @@ export default async function StatsPage() {
       <main className="main stats-page">
         <section className="panel stats-toolbar">
           <div>
-            <h2 className="panel-title">Phase 7 stats MVP</h2>
+            <h2 className="panel-title">{translate("stats.title")}</h2>
             <p className="section-copy">
-              Данные считаются из `platformdb` и не обращаются к legacy Telegram bot runtime.
+              {translate("stats.sourceCopy")}
             </p>
           </div>
-          <span className="status-chip status-chip-green">Live</span>
+          <span className="status-chip status-chip-green">{translate("stats.live")}</span>
         </section>
 
         <section className="stats-card-grid" aria-label="Ключевые показатели">

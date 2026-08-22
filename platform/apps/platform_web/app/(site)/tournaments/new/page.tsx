@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { cookies } from "next/headers";
 import Link from "next/link";
+import { SessionUnavailableState } from "@/components/auth/session-unavailable-state";
 import { Hero } from "@/components/layout/hero";
 import { CreateTournamentForm } from "@/components/tournaments/create-tournament-form";
 import { getServerCurrentUser, platformSessionCookieName } from "@/lib/server-auth";
@@ -29,6 +30,8 @@ export default async function NewTournamentPage() {
       <main className="main">
         {currentUser ? (
           <CreateTournamentForm currentUser={currentUser} serverNowIso={new Date().toISOString()} />
+        ) : authSnapshot?.status === "unavailable" ? (
+          <SessionUnavailableState />
         ) : (
           <div className="auth-layout">
             <section className="panel panel-pad auth-panel create-auth-panel">

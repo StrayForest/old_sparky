@@ -15,6 +15,7 @@ export type PlatformUser = {
   steam_id?: string | null;
   steam_linked?: boolean;
   has_password?: boolean;
+  can_unlink_steam?: boolean;
 };
 
 export type PlatformAuthSessionResponse = {

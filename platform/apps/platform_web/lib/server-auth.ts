@@ -108,5 +108,6 @@ function isPlatformUser(value: unknown): value is PlatformUser {
     && (candidate.avatar_media === undefined || candidate.avatar_media === null || typeof candidate.avatar_media === "object")
     && isOptionalNullableString(candidate.steam_id)
     && isOptionalBoolean(candidate.steam_linked)
-    && isOptionalBoolean(candidate.has_password);
+    && isOptionalBoolean(candidate.has_password)
+    && isOptionalBoolean(candidate.can_unlink_steam);
 }

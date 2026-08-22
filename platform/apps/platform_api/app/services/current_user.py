@@ -48,6 +48,11 @@ async def serialize_current_user(
             )
         )
     ) is not None
+    can_unlink_steam = bool(
+        user.email
+        and user.email_verified_at is not None
+        and has_password
+    )
     avatar_media = None
     avatar_url = None
     if profile is not None:
@@ -86,4 +91,5 @@ async def serialize_current_user(
         steam_id=steam_identity.subject if steam_identity is not None else None,
         steam_linked=steam_identity is not None,
         has_password=has_password,
+        can_unlink_steam=can_unlink_steam,
     )

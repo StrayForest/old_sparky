@@ -15,6 +15,18 @@ Use when changing `platform/apps/platform_web`.
   explicitly restores multilingual support.
 - Use `lib/platform-api.ts` and `lib/platform-types.ts`.
 - Check mobile/desktop overflow, overlap, loading/error/empty/disabled states, and stable control sizing.
+- Treat backend DTO capability fields as the source of truth for permission-gated
+  actions; do not infer destructive-action eligibility from a partial client
+  profile. Keep server rejection handling specific enough to avoid displaying a
+  different validation error.
+- For debounced or repeated requests, abort the previous request and guard every
+  state/error/loading update with a request generation. A cleanup that only
+  clears a timer is not sufficient once the network request has started.
+- Add a route-level retry boundary when a server-rendered page depends on an
+  initial API call. Keep transient session-unavailable state distinct from an
+  anonymous session.
+- Use App Router navigation for internal routes; reserve `window.location` for
+  external redirects such as OAuth.
 - Run from `platform/`:
   `tools/platform_run_quiet.sh "web build" -- tools/platform_web_npm.sh --prefix apps/platform_web run build`;
   add platform tests if API contracts changed.

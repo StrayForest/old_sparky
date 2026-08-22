@@ -1,7 +1,7 @@
 "use client";
 
 import { AlertTriangle, Search, Trash2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { platformApiMessage, platformApiRequest } from "@/lib/platform-api";
 import type { PlatformUser } from "@/lib/platform-types";
@@ -17,6 +17,8 @@ export function AdminUserDeletion() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const searchGeneration = useRef(0);
+  const searchController = useRef<AbortController | null>(null);
 
   const isSuperadmin = currentUser?.roles.includes("superadmin") === true;
   const selected = useMemo(
@@ -35,6 +37,10 @@ export function AdminUserDeletion() {
   );
 
   useEffect(() => {
+    const requestGeneration = ++searchGeneration.current;
+    searchController.current?.abort();
+    searchController.current = null;
+    setIsSearching(false);
     if (!isSuperadmin) {
       return;
     }
@@ -45,12 +51,18 @@ export function AdminUserDeletion() {
       return;
     }
     const timeout = window.setTimeout(async () => {
+      const controller = new AbortController();
+      searchController.current = controller;
       setIsSearching(true);
       setError("");
       try {
         const found = await platformApiRequest<PlatformUser[]>(
-          `/admin/users?search=${encodeURIComponent(query)}`
+          `/admin/users?search=${encodeURIComponent(query)}`,
+          { signal: controller.signal }
         );
+        if (requestGeneration !== searchGeneration.current || controller.signal.aborted) {
+          return;
+        }
         setUsers(found);
         setSelectedUserId((current) => (
           current && found.some((item) => item.id === current)
@@ -58,14 +70,27 @@ export function AdminUserDeletion() {
             : found[0]?.id ?? ""
         ));
       } catch (requestError) {
-        setUsers([]);
-        setSelectedUserId("");
-        setError(platformApiMessage(requestError, "Не удалось найти пользователя."));
+        if (requestGeneration === searchGeneration.current && !controller.signal.aborted) {
+          setUsers([]);
+          setSelectedUserId("");
+          setError(platformApiMessage(requestError, "Не удалось найти пользователя."));
+        }
       } finally {
-        setIsSearching(false);
+        if (requestGeneration === searchGeneration.current) {
+          setIsSearching(false);
+          if (searchController.current === controller) {
+            searchController.current = null;
+          }
+        }
       }
     }, 300);
-    return () => window.clearTimeout(timeout);
+    return () => {
+      window.clearTimeout(timeout);
+      if (requestGeneration === searchGeneration.current) {
+        searchController.current?.abort();
+        searchController.current = null;
+      }
+    };
   }, [isSuperadmin, search]);
 
   useEffect(() => {

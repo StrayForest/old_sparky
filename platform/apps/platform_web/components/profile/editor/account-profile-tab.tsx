@@ -535,6 +535,7 @@ export function AccountProfileTab({
               onChange={(value) => updateContact("Discord", value)}
             />
             <AccountSteamIdentity
+              canUnlinkSteam={user?.can_unlink_steam === true}
               steamAuthStatus={steamAuthStatus}
               steamId={user?.steam_id ?? null}
               steamLinked={user?.steam_linked === true}

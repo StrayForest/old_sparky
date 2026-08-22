@@ -464,6 +464,8 @@ function MatchCard({
     away: match.scoreB === null ? "" : String(match.scoreB),
   });
   const [schedule, setSchedule] = useState<ScheduleDraft>(() => scheduleDraftFromIso(match.scheduledAt));
+  const scheduleEditedRef = useRef(false);
+  const scheduleMatchIdRef = useRef(match.id);
 
   useEffect(() => {
     setScore({
@@ -473,7 +475,27 @@ function MatchCard({
   }, [match.scoreA, match.scoreB, match.id]);
 
   useEffect(() => {
-    setSchedule(scheduleDraftFromIso(match.scheduledAt));
+    if (scheduleMatchIdRef.current !== match.id) {
+      scheduleMatchIdRef.current = match.id;
+      scheduleEditedRef.current = false;
+    }
+    const serverSchedule = scheduleDraftFromIso(match.scheduledAt);
+    setSchedule((current) => {
+      const currentIso = scheduleDraftToIso(current);
+      const matchesServerSchedule = Boolean(
+        currentIso
+        && match.scheduledAt
+        && Date.parse(currentIso) === Date.parse(match.scheduledAt)
+      );
+      if (matchesServerSchedule) {
+        scheduleEditedRef.current = false;
+        return serverSchedule;
+      }
+      if (scheduleEditedRef.current) {
+        return current;
+      }
+      return serverSchedule;
+    });
   }, [match.id, match.scheduledAt]);
 
   const slots = [
@@ -542,6 +564,7 @@ function MatchCard({
               min={minDraft.date}
               onInput={(event) => {
                 const date = event.currentTarget.value;
+                scheduleEditedRef.current = true;
                 setSchedule((current) => ({ ...current, date }));
               }}
               type="date"
@@ -554,6 +577,7 @@ function MatchCard({
               min={selectedDate === minDraft.date ? minDraft.time : undefined}
               onInput={(event) => {
                 const time = event.currentTarget.value;
+                scheduleEditedRef.current = true;
                 setSchedule((current) => ({ ...current, time }));
               }}
               step="600"
