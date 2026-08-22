@@ -1,5 +1,6 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Calendar, Check, CheckCircle, ChevronDown, ChevronUp, Circle, Clock, Copy, Infinity as InfinityIcon, Info, Lock, RefreshCcw, Upload } from "lucide-react";
 import type { FormEvent } from "react";
@@ -70,7 +71,7 @@ const createSchema = z.object({
     (value) => countDescriptionLines(value) <= MAX_DESCRIPTION_LINES
   ),
   visibility: z.enum(["public", "private"]),
-  inviteCode: z.string().trim().min(6).max(24),
+  inviteCode: z.string().trim().min(10).max(24),
   maxTeams: z.coerce.number().int().min(2).max(8192),
   allowedRankCodes: z.array(z.string()).min(1)
 });
@@ -83,6 +84,7 @@ export function CreateTournamentForm({
   serverNowIso: string;
 }) {
   const { t } = useI18n();
+  const router = useRouter();
   const parsedServerNowMs = Date.parse(serverNowIso);
   const serverNowMs = Number.isFinite(parsedServerNowMs) ? parsedServerNowMs : Date.now();
   const inviteCodeTouchedRef = useRef(false);
@@ -105,6 +107,8 @@ export function CreateTournamentForm({
   const canCreatePublic = canUserCreatePublic(currentUser);
   const privateMonthlyLimit = currentUser.private_tournament_monthly_limit ?? 1;
   const privateMonthlyRemaining = currentUser.private_tournament_monthly_remaining ?? privateMonthlyLimit;
+  const privateTournamentCredits = currentUser.private_tournament_credits ?? 0;
+  const canCreatePrivate = privateMonthlyRemaining > 0 || privateTournamentCredits > 0;
 
   useEffect(() => {
     let cancelled = false;
@@ -158,10 +162,20 @@ export function CreateTournamentForm({
     if (!parsed.success) {
       setStatus("invalid");
       setFormMessage("Проверьте название, код приглашения, расписание и допустимые ранги.");
-      if (!normalizedValues.inviteCode || normalizedValues.inviteCode.length < 6) {
+      if (!normalizedValues.inviteCode || normalizedValues.inviteCode.length < 10) {
         setInviteCodeStatus("taken");
-        setFormMessage("Код должен содержать минимум 6 букв или цифр.");
+        setFormMessage(t("organizer.inviteCodeMinimum"));
       }
+      return;
+    }
+    const canCreateSelectedTournament = normalizedValues.visibility === "public"
+      ? canCreatePublic
+      : canCreatePrivate;
+    if (!canCreateSelectedTournament) {
+      setStatus("invalid");
+      setFormMessage(normalizedValues.visibility === "public"
+        ? t("organizer.publicCreationContact")
+        : t("organizer.privateAllowanceExhausted"));
       return;
     }
     if (!isScheduleValid(normalizedValues)) {
@@ -199,12 +213,16 @@ export function CreateTournamentForm({
         return;
       }
 
-      window.location.assign(`/tournaments/${result.slug}`);
+      router.push(`/tournaments/${result.slug}`);
     } catch (error) {
       if (error instanceof PlatformApiError && error.status === 409) {
         setStatus("invalid");
-        setInviteCodeStatus("taken");
-        setFormMessage("Код приглашения занят.");
+        if (error.message.toLowerCase().includes("private tournament")) {
+          setFormMessage(t("organizer.privateAllowanceExhausted"));
+        } else {
+          setInviteCodeStatus("taken");
+          setFormMessage("Код приглашения занят.");
+        }
         return;
       }
       if (error instanceof PlatformApiError && error.status === 422) {
@@ -380,9 +398,9 @@ export function CreateTournamentForm({
 
   async function verifyInviteCode(code: string): Promise<boolean> {
     const normalizedCode = normalizeInviteCode(code);
-    if (normalizedCode.length < 6) {
+    if (normalizedCode.length < 10) {
       setInviteCodeStatus("taken");
-      setFormMessage("Код должен содержать минимум 6 букв или цифр.");
+      setFormMessage(t("organizer.inviteCodeMinimum"));
       return false;
     }
     setInviteCodeStatus("checking");
@@ -558,7 +576,9 @@ export function CreateTournamentForm({
                   Публичный
                 </button>
                 <button
-                  className={`segment visibility-segment${values.visibility === "private" ? " active" : ""}`}
+                  aria-label={canCreatePrivate ? "Приватный" : "Приватный турнир недоступен"}
+                  className={`segment visibility-segment${values.visibility === "private" ? " active" : ""}${canCreatePrivate ? "" : " locked"}`}
+                  disabled={!canCreatePrivate}
                   type="button"
                   onClick={() => update({ visibility: "private" })}
                 >
@@ -753,13 +773,13 @@ export function CreateTournamentForm({
         </div>
         <button
           className="primary-button"
-          disabled={status === "saving"}
+          disabled={status === "saving" || (values.visibility === "public" ? !canCreatePublic : !canCreatePrivate)}
           form="create-tournament-form"
           type={createdTournamentSlug ? "button" : "submit"}
           onClick={createdTournamentSlug && coverFile ? () => {
             void uploadCreatedTournamentBanner(createdTournamentSlug, coverFile).then((uploaded) => {
               if (uploaded) {
-                window.location.assign(`/tournaments/${createdTournamentSlug}`);
+                router.push(`/tournaments/${createdTournamentSlug}`);
               }
             });
           } : undefined}

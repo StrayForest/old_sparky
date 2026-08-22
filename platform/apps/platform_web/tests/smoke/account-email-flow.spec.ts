@@ -140,6 +140,8 @@ test("Steam-only account links optional email through shared profile Save", asyn
 
   await expect(page.getByRole("dialog", { name: "Подтвердите смену почты" })).toHaveCount(0);
   await expect(page.getByRole("dialog", { name: "Подтвердите новую почту" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Отвязать Steam" })).toHaveCount(0);
+  await expect(page.getByText("Для отвязки сначала подтвердите почту и установите пароль.")).toBeVisible();
   await expect.poll(() => requestPayloads[0]).toEqual({ email: "linked@example.test" });
 
   await page.getByLabel("Код подтверждения").fill("654321");

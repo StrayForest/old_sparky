@@ -142,6 +142,10 @@ class AuthIdentityIntegrationTests(unittest.IsolatedAsyncioTestCase):
         verified_client, verified_user_id = await self._register("verified")
         await self._seed_identity(verified_user_id, "76561198000010001")
 
+        verified_me = await verified_client.get("/api/v1/users/me")
+        self.assertEqual(verified_me.status_code, 200, verified_me.text)
+        self.assertTrue(verified_me.json()["can_unlink_steam"])
+
         unlinked = await verified_client.delete("/api/v1/auth/identities/steam")
         self.assertEqual(unlinked.status_code, 200, unlinked.text)
         self.assertFalse(unlinked.json()["steam_linked"])
@@ -175,6 +179,10 @@ class AuthIdentityIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 delete(PasswordCredential).where(PasswordCredential.user_id == steam_only_user_id)
             )
             await db_session.commit()
+
+        steam_only_me = await steam_only_client.get("/api/v1/users/me")
+        self.assertEqual(steam_only_me.status_code, 200, steam_only_me.text)
+        self.assertFalse(steam_only_me.json()["can_unlink_steam"])
 
         blocked = await steam_only_client.delete("/api/v1/auth/identities/steam")
         self.assertEqual(blocked.status_code, 409, blocked.text)

@@ -64,6 +64,7 @@ export function AccountEmailIdentity({
   const [isResending, setIsResending] = useState(false);
   const lastSaveRequestRef = useRef(saveRequestId);
   const lastCancelRequestRef = useRef(cancelRequestId);
+  const lastEmailRef = useRef(email);
   const resendCooldown = useResendCooldown();
 
   const currentEmail = normalizeEmail(email ?? "");
@@ -84,8 +85,12 @@ export function AccountEmailIdentity({
   }, [email]);
 
   useEffect(() => {
+    if (lastEmailRef.current === email) {
+      return;
+    }
+    lastEmailRef.current = email;
     resetEmailDraft();
-  }, [resetEmailDraft]);
+  }, [email, resetEmailDraft]);
 
   useEffect(() => {
     onDirtyChange(emailChanged);
@@ -386,10 +391,12 @@ export function AccountEmailIdentity({
 }
 
 export function AccountSteamIdentity({
+  canUnlinkSteam,
   steamAuthStatus,
   steamId,
   steamLinked
 }: {
+  canUnlinkSteam: boolean;
   steamAuthStatus?: "error" | "success";
   steamId: string | null;
   steamLinked: boolean;
@@ -452,14 +459,16 @@ export function AccountSteamIdentity({
           <div className="account-identity-linked-row">
             <SteamIcon aria-hidden="true" size={20} />
             <span className="account-identity-value">{currentSteamId ?? "Steam привязан"}</span>
-            <button
-              aria-label="Отвязать Steam"
-              className="account-identity-unlink"
-              onClick={() => setConfirmUnlink(true)}
-              type="button"
-            >
-              <X aria-hidden="true" size={20} />
-            </button>
+            {canUnlinkSteam ? (
+              <button
+                aria-label="Отвязать Steam"
+                className="account-identity-unlink"
+                onClick={() => setConfirmUnlink(true)}
+                type="button"
+              >
+                <X aria-hidden="true" size={20} />
+              </button>
+            ) : null}
           </div>
         ) : (
           <button
@@ -472,6 +481,9 @@ export function AccountSteamIdentity({
             <span>{isStarting ? t("auth.steamStarting") : "Привязать Steam"}</span>
           </button>
         )}
+        {currentSteamLinked && !canUnlinkSteam ? (
+          <span className="account-identity-hint">{t("profile.steamUnlinkRequiresPassword")}</span>
+        ) : null}
         {steamAuthStatus === "success" && currentSteamLinked ? (
           <span className="sr-only" role="status">{t("profile.steamLinkSuccess")}</span>
         ) : null}
@@ -601,6 +613,14 @@ function IdentityStyles() {
         display: block;
         margin-top: 8px;
         color: var(--red);
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      .account-identity-hint {
+        display: block;
+        margin-top: 8px;
+        color: var(--text-muted, var(--ui-muted, #8e8a82));
         font-size: 12px;
         line-height: 1.4;
       }

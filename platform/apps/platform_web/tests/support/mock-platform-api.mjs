@@ -509,7 +509,7 @@ const server = createServer((request, response) => {
     return;
   }
   if (path === "/api/v1/tournaments/invites/suggest-code") {
-    json(response, 200, { code: "SMOKE2026", available: true });
+    json(response, 200, { code: "SMOKE2026X", available: true });
     return;
   }
   if (path === "/api/v1/tournaments/invites/code-status") {
@@ -648,12 +648,14 @@ const server = createServer((request, response) => {
       roles: actor.roles,
       can_create_public_tournaments: actor.roles.includes("admin") || actor.roles.includes("superadmin"),
       public_tournament_credits: actor.id === "u_limited_creator" ? 0 : 2,
-      private_tournament_credits: 4,
-      private_tournament_monthly_remaining: (request.headers.cookie ?? "").includes("private-monthly-used-smoke=1") ? 0 : 1,
+      private_tournament_credits: (request.headers.cookie ?? "").includes("private-allowance-exhausted-smoke=1") ? 0 : 4,
+      private_tournament_monthly_remaining: (request.headers.cookie ?? "").includes("private-monthly-used-smoke=1")
+        || (request.headers.cookie ?? "").includes("private-allowance-exhausted-smoke=1") ? 0 : 1,
       private_tournament_monthly_limit: 1,
       steam_id: actor.steam_id ?? (actor.id === "u_lisalexy" ? "76561198000000000" : null),
       steam_linked: Boolean(actor.steam_id || actor.id === "u_lisalexy"),
-      has_password: actor.has_password ?? true
+      has_password: actor.has_password ?? true,
+      can_unlink_steam: Boolean(actor.email && (actor.has_password ?? true))
     } : { detail: "Not authenticated." });
     return;
   }
