@@ -138,6 +138,9 @@ from apps.platform_api.app.services.tournament_workflow import (
     transition_tournament_status,
     upsert_deadlock_ready_vote,
 )
+from apps.platform_api.app.services.tournament_runtime_cache import (
+    register_tournament_runtime_cache_invalidator,
+)
 from python_packages.platform_domain.deadlock import (
     AutoAssignmentError,
     AutoAssignmentRunFreshness,
@@ -518,6 +521,9 @@ def invalidate_tournament_runtime_caches(tournament_id: str) -> None:
         _bracket_response_cache.pop(key, None)
     _invalidate_participant_page_cache(tournament_id)
     _invalidate_ready_check_state_cache(tournament_id)
+
+
+register_tournament_runtime_cache_invalidator(invalidate_tournament_runtime_caches)
 
 
 def _ready_round_snapshot_for_user(

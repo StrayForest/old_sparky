@@ -835,7 +835,9 @@ async def admin_delete_tournament(
     )
     await db_session.commit()
 
-    from apps.platform_api.app.api.routes.tournaments import invalidate_tournament_runtime_caches
+    from apps.platform_api.app.services.tournament_runtime_cache import (
+        invalidate_tournament_runtime_caches,
+    )
 
     invalidate_tournament_runtime_caches(tournament_id)
     if cover_key is not None:

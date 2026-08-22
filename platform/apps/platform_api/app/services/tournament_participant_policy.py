@@ -5,6 +5,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.platform_api.app.services.player_commitments import release_active_commitments
+from apps.platform_api.app.services.tournament_runtime_cache import (
+    invalidate_tournament_runtime_caches,
+)
+from apps.platform_api.app.services.tournament_workflow import (
+    participant_status_is_inactive,
+    prune_participant_from_active_captain_round,
+    prune_participant_from_active_ready_round,
+)
 from python_packages.platform_domain.tournaments import (
     TournamentWorkflowError,
     ensure_organizer_can_moderate_participants,
@@ -125,13 +133,11 @@ async def _soft_exclude_participant(
         participant.moderated_at = auth_session.now
         participant.moderated_by_user_id = auth_session.user.id
 
-        from apps.platform_api.app.api.routes import tournaments as tournament_routes
-
         if (
             is_solo_tournament_format(tournament.format_slug)
-            and not tournament_routes.participant_status_is_inactive(previous_status)
+            and not participant_status_is_inactive(previous_status)
         ):
-            await tournament_routes.prune_participant_from_active_ready_round(
+            await prune_participant_from_active_ready_round(
                 db_session,
                 tournament=tournament,
                 user_id=participant.user_id,
@@ -139,7 +145,7 @@ async def _soft_exclude_participant(
                 now=auth_session.now,
                 participant_status=participant.status,
             )
-            await tournament_routes.prune_participant_from_active_captain_round(
+            await prune_participant_from_active_captain_round(
                 db_session,
                 tournament=tournament,
                 user_id=participant.user_id,
@@ -170,7 +176,7 @@ async def _soft_exclude_participant(
             },
         )
         await db_session.commit()
-        tournament_routes.invalidate_tournament_runtime_caches(tournament.id)
+        invalidate_tournament_runtime_caches(tournament.id)
 
     raise HTTPException(status_code=status.HTTP_204_NO_CONTENT)
 

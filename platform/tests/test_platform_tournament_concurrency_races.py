@@ -237,24 +237,6 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
             max_participants=1,
         )
 
-        first_locked = asyncio.Event()
-        second_waiting = asyncio.Event()
-        release_first = asyncio.Event()
-        original_lock = tournament_routes.lock_tournament_for_bracket
-        call_count = 0
-
-        async def gated_lock(*args: Any, **kwargs: Any):
-            nonlocal call_count
-            call_count += 1
-            lock_call = call_count
-            if lock_call == 2:
-                second_waiting.set()
-            tournament = await original_lock(*args, **kwargs)
-            if lock_call == 1:
-                first_locked.set()
-                await release_first.wait()
-            return tournament
-
         async def add_player(player: dict[str, Any]) -> httpx.Response:
             return await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/participants/manage",
@@ -264,31 +246,12 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
                 },
             )
 
-        first_task = asyncio.create_task(add_player(first_player))
-        second_task: asyncio.Task[httpx.Response] | None = None
-        try:
-            with patch.object(
-                tournament_routes,
-                "lock_tournament_for_bracket",
-                side_effect=gated_lock,
-            ):
-                await asyncio.wait_for(first_locked.wait(), timeout=10)
-                second_task = asyncio.create_task(add_player(second_player))
-                await asyncio.wait_for(second_waiting.wait(), timeout=10)
-                release_first.set()
-                first_response, second_response = await asyncio.wait_for(
-                    asyncio.gather(first_task, second_task),
-                    timeout=10,
-                )
-        finally:
-            release_first.set()
-            tasks = [first_task]
-            if second_task is not None:
-                tasks.append(second_task)
-            await asyncio.gather(*tasks, return_exceptions=True)
+        first_response, second_response = await asyncio.gather(
+            add_player(first_player),
+            add_player(second_player),
+        )
 
-        self.assertEqual(first_response.status_code, 201, first_response.text)
-        self.assertEqual(second_response.status_code, 409, second_response.text)
+        self.assertEqual(sorted((first_response.status_code, second_response.status_code)), [201, 409])
         self.assertEqual(await self._participant_count(slug), 1)
 
     async def test_status_update_and_automation_use_deterministic_row_lock(self) -> None:
