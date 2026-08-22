@@ -177,6 +177,9 @@ class PlatformPublicDataBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_openapi_public_contracts_exclude_private_fields(self) -> None:
         schemas = self.app.openapi()["components"]["schemas"]
         public_profile_fields = set(schemas["PublicProfileResponse"]["properties"])
+        tournament_profile_fields = set(
+            schemas["TournamentProfileResponse"]["properties"]
+        )
         public_participant_fields = set(
             schemas["TournamentParticipantResponse"]["properties"]
         )
@@ -189,6 +192,8 @@ class PlatformPublicDataBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 public_profile_fields
             )
         )
+        self.assertNotIn("contact_email", tournament_profile_fields)
+        self.assertIn("steam_id", tournament_profile_fields)
         self.assertTrue(
             {"moderation_note", "moderated_at", "moderated_by_user_id"}.isdisjoint(
                 public_participant_fields

@@ -275,7 +275,10 @@ class AuthSessionResponse(BaseModel):
 
 
 class RegistrationResponse(BaseModel):
-    user: UserResponse
+    # Verified registration withholds the account object. A duplicate active
+    # account receives the same accepted result as a new/pending registration,
+    # so account fields cannot become an enumeration oracle.
+    user: UserResponse | None = None
     expires_at: datetime | None = None
     verification_required: bool = False
     retry_after_seconds: int | None = Field(default=None, ge=1, le=3600)
@@ -886,8 +889,33 @@ class PlatformStatsOverviewResponse(BaseModel):
     deadlock_rank_distribution: list[StatsRankDistributionItemResponse] = Field(default_factory=list)
 
 
+class TournamentProfileResponse(BaseModel):
+    """Profile fields intentionally shared with tournament participants.
+
+    Account contact email remains private. Steam ID is deliberately visible
+    within the tournament profile scope.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    user_id: str
+    display_name: str
+    handle: str | None
+    avatar_url: str | None
+    banner_url: str | None
+    avatar_media: MediaDescriptorResponse | None = None
+    banner_media: MediaDescriptorResponse | None = None
+    bio: str | None
+    region: str | None
+    steam_id: str | None
+    steam_linked: bool = False
+    discord_account: str | None
+    captain_team_name: str | None = None
+    updated_at: datetime
+
+
 class TournamentScopedProfileResponse(BaseModel):
-    profile: ProfileResponse
+    profile: TournamentProfileResponse
     deadlock_profile: DeadlockProfileResponse | None = None
     dream_slots: list[DeadlockDreamSlotResponse] = Field(default_factory=list)
     stats: TournamentProfileStatsResponse

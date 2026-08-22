@@ -514,7 +514,11 @@ class SteamAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         self.assertEqual(registered.status_code, 201, registered.text)
-        user_id = registered.json()["user"]["id"]
+        self.assertIsNone(registered.json()["user"])
+        async with session_factory()() as db_session:
+            user_id = await db_session.scalar(select(User.id).where(User.email == email))
+        self.assertIsNotNone(user_id)
+        assert user_id is not None
         self.created_user_ids.add(user_id)
 
         reset_mail = AsyncMock()
@@ -620,7 +624,12 @@ class SteamAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "/api/v1/auth/email-verification/confirm",
                 json={"email": email, "code": code},
             )
-        self.created_user_ids.add(registered.json()["user"]["id"])
+        self.assertIsNone(registered.json()["user"])
+        async with session_factory()() as db_session:
+            user_id = await db_session.scalar(select(User.id).where(User.email == email))
+        self.assertIsNotNone(user_id)
+        assert user_id is not None
+        self.created_user_ids.add(user_id)
         self.assertEqual(standalone_resend.status_code, 202, standalone_resend.text)
         mail.assert_not_awaited()
         self.assertEqual(rejected.status_code, 400, rejected.text)

@@ -11,7 +11,6 @@ This document contains only findings that still require action or direct operato
 
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
-| AS-10 | Low / P2 | High | Registration can reveal an existing email address | Open; product/security decision required |
 | AS-12 | Medium / P2 | High | Proxy, Cloudflare-range, UFW and startup validation can drift independently | Open |
 | AS-13 | Low / P2 | Medium | CI fail-closed isolation contour requires revalidation against the current workflow | Open; revalidate before changing |
 
@@ -32,9 +31,6 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 
 ## Active findings
 
-### AS-10 — Existing-email enumeration at registration
-Decide whether duplicate-registration UX justifies disclosure; otherwise use a generic accepted flow with comparable timing/Turnstile behavior. **Open; product/security decision required**.
-
 ### AS-12 — Proxy and firewall configuration drift
 Fail closed on production bind/proxy invariants and keep Nginx/Cloudflare/UFW trust ranges reconciled. **Open.**
 
@@ -43,8 +39,7 @@ The current workflow has been restored and is green, but the older finding must 
 
 ## Remediation order
 
-1. AS-10 remains a product/security decision.
-2. AS-12 is the next operational hardening item; AS-13 remains separate CI revalidation work.
+1. AS-12 is the next operational hardening item; AS-13 remains separate CI revalidation work.
 
 Resolved AS-02 evidence is retained in [`archive/as-02-cloudflare-access-mfa.md`](archive/as-02-cloudflare-access-mfa.md). Resolved AS-03 invite/capacity evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md). Resolved AS-06 evidence is retained in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md). Resolved AS-07 evidence is retained in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Resolved AS-08 evidence is retained in [`archive/as-08-patch-miss-hardening.md`](archive/as-08-patch-miss-hardening.md). Resolved AS-09 evidence is retained in [`archive/as-09-distributed-login-guessing.md`](archive/as-09-distributed-login-guessing.md). Resolved AS-11 evidence is retained in [`archive/as-11-worker-error-sanitization.md`](archive/as-11-worker-error-sanitization.md). Resolved AS-14 evidence is retained in [`archive/as-14-cloudflare-hsts-ownership.md`](archive/as-14-cloudflare-hsts-ownership.md). Resolved AS-15 evidence is retained in [`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md).
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import time
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
@@ -11,6 +12,7 @@ from apps.platform_api.app.api.routes import auth as auth_routes
 from apps.platform_api.app.api.schemas import RegisterRequest, RegistrationResponse
 from apps.platform_api.app.services.current_user import serialize_current_user
 from python_packages.platform_infra.audit import write_audit_log
+from python_packages.platform_infra.auth_rate_limit import check_registration_rate_limit
 from python_packages.platform_infra.auth_lifecycle import (
     consume_user_email_verification_tokens,
     consume_user_password_reset_tokens,
@@ -39,6 +41,36 @@ from python_packages.platform_infra.security import (
 router = APIRouter()
 
 
+async def _verification_registration_accepted(
+    response: Response,
+    *,
+    normalized_email: str,
+    settings,
+    started_at: float,
+) -> RegistrationResponse:
+    """Return the indistinguishable accepted result for verified registration.
+
+    Both a fresh/pending account and an existing active account enter this
+    response contour. The latter never receives a verification delivery or
+    account object and its credentials remain untouched.
+    """
+
+    await auth_routes._wait_for_generic_auth_response(started_at, settings)
+    response.headers["Cache-Control"] = "no-store"
+    clear_session_cookies(response)
+    issue_auth_flow_cookie(
+        response,
+        purpose="verification",
+        account_key=normalized_email,
+        settings=settings,
+    )
+    return RegistrationResponse(
+        user=None,
+        verification_required=True,
+        retry_after_seconds=settings.platform_auth_delivery_cooldown_seconds,
+    )
+
+
 @router.post("/register", response_model=RegistrationResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     payload: RegisterRequest,
@@ -49,6 +81,7 @@ async def register(
 ) -> RegistrationResponse:
     # Keep registration wired through the established auth module for shared
     # settings, protection hooks and mail delivery semantics.
+    started_at = time.monotonic()
     settings = auth_routes.get_settings()
     if not public_registration_enabled(settings):
         raise HTTPException(
@@ -65,7 +98,7 @@ async def register(
 
     normalized_email = payload.email.lower()
     display_name = payload.display_name.strip()
-    rate_limit_state = await auth_routes.check_registration_rate_limit(
+    rate_limit_state = await check_registration_rate_limit(
         request,
         settings=settings,
     )
@@ -85,6 +118,18 @@ async def register(
         or existing_user.status != "pending_verification"
         or existing_user.email_verified_at is not None
     ):
+        # Production always requires verification. Hash the supplied password
+        # before returning the generic result so this path remains comparable
+        # to a new registration, but never alter an existing account.
+        if verification_required:
+            hash_password(payload.password)
+            await db_session.rollback()
+            return await _verification_registration_accepted(
+                response,
+                normalized_email=normalized_email,
+                settings=settings,
+                started_at=started_at,
+            )
         await db_session.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -183,6 +228,13 @@ async def register(
             await db_session.flush()
         except IntegrityError as exc:
             await db_session.rollback()
+            if verification_required:
+                return await _verification_registration_accepted(
+                    response,
+                    normalized_email=normalized_email,
+                    settings=settings,
+                    started_at=started_at,
+                )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Email is already registered.",
@@ -253,8 +305,6 @@ async def register(
         )
 
     await db_session.commit()
-    response.headers["Cache-Control"] = "no-store"
-
     if issued_verification is not None:
         background_tasks.add_task(
             auth_routes._deliver_email_verification,
@@ -264,24 +314,19 @@ async def register(
         )
 
     if auth_session is None:
-        clear_session_cookies(response)
-        issue_auth_flow_cookie(
+        return await _verification_registration_accepted(
             response,
-            purpose="verification",
-            account_key=normalized_email,
+            normalized_email=normalized_email,
             settings=settings,
+            started_at=started_at,
         )
-    else:
-        set_session_cookie(response, auth_session.token)
-        issue_csrf_token(response, auth_session.token, settings)
+
+    response.headers["Cache-Control"] = "no-store"
+    set_session_cookie(response, auth_session.token)
+    issue_csrf_token(response, auth_session.token, settings)
 
     return RegistrationResponse(
         user=await serialize_current_user(db_session, user),
-        expires_at=auth_session.session.expires_at if auth_session is not None else None,
-        verification_required=verification_required,
-        retry_after_seconds=(
-            settings.platform_auth_delivery_cooldown_seconds
-            if verification_required
-            else None
-        ),
+        expires_at=auth_session.session.expires_at,
+        verification_required=False,
     )

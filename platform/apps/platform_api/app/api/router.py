@@ -30,9 +30,8 @@ from apps.platform_api.app.services.tournament_write_serialization import (
 
 api_router = APIRouter()
 api_router.include_router(health.router, prefix="/health", tags=["health"])
-# Registration is intentionally mounted before the legacy auth router so the
-# pending-account restart flow owns POST /auth/register without disturbing the
-# rest of the authentication endpoints.
+# Registration owns POST /auth/register while the remaining authentication
+# routes stay in their established module.
 api_router.include_router(registration.router, prefix="/auth", tags=["auth"])
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 api_router.include_router(auth_identities.router, prefix="/auth", tags=["auth"])
