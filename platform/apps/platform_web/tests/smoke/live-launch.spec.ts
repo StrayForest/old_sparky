@@ -7,6 +7,10 @@ type BrowserEvidence = {
     blockedURI: string;
     disposition: string;
     effectiveDirective: string;
+    documentURI: string;
+    sourceFile: string;
+    lineNumber: number;
+    columnNumber: number;
   }>;
   pageErrors: string[];
   requestFailures: string[];
@@ -95,15 +99,31 @@ test.beforeEach(async ({ page }) => {
         blockedURI: string;
         disposition: string;
         effectiveDirective: string;
+        documentURI: string;
+        sourceFile: string;
+        lineNumber: number;
+        columnNumber: number;
       }) => Promise<void>;
       __platformCspViolations?: Array<{
         blockedURI: string;
         disposition: string;
         effectiveDirective: string;
+        documentURI: string;
+        sourceFile: string;
+        lineNumber: number;
+        columnNumber: number;
       }>;
     };
     target.__platformCspViolations = [];
     document.addEventListener("securitypolicyviolation", (event) => {
+      const summarizeLocation = (value: string) => {
+        try {
+          const parsed = new URL(value);
+          return `${parsed.origin}${parsed.pathname}`;
+        } catch {
+          return value.length <= 160 ? value : `${value.slice(0, 157)}...`;
+        }
+      };
       let blockedURI = event.blockedURI;
       try {
         const parsed = new URL(blockedURI);
@@ -117,6 +137,10 @@ test.beforeEach(async ({ page }) => {
         blockedURI,
         disposition: event.disposition,
         effectiveDirective: event.effectiveDirective,
+        documentURI: summarizeLocation(event.documentURI),
+        sourceFile: summarizeLocation(event.sourceFile),
+        lineNumber: event.lineNumber,
+        columnNumber: event.columnNumber,
       };
       target.__platformCspViolations?.push(violation);
       void target.__platformRecordCspViolation?.(violation);
@@ -338,7 +362,7 @@ test("live tournament detail and bracket routes render from the current public d
 
 test("live admin route is protected for anonymous users", async ({ page }) => {
   await page.goto("/platform-ops");
-  await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
+  expect(new URL(page.url()).hostname).toMatch(/\.cloudflareaccess\.com$/u);
   await expect(page.getByTestId("admin-console")).toHaveCount(0);
   await page.waitForLoadState("networkidle");
 
