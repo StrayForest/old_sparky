@@ -66,7 +66,7 @@ jobs:
             -o ConnectTimeout=10 \
             -i ~/.ssh/old_sparky_prod \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$LIVE_BASE_URL" "$LIVE_PROVISION" "$LIVE_MARKER" <<'REMOTE' | tee live-launch-report.txt
+            bash -s -- live-launch-supervisor "$LIVE_BASE_URL" "$LIVE_PROVISION" "$LIVE_MARKER" <<'REMOTE' | tee live-launch-report.txt
           set -Eeuo pipefail
           base_url="$1"
           provision="$2"
