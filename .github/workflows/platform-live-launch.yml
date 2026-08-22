@@ -66,11 +66,11 @@ jobs:
             -o ConnectTimeout=10 \
             -i ~/.ssh/old_sparky_prod \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- live-launch-supervisor "$LIVE_BASE_URL" "$LIVE_PROVISION" "$LIVE_MARKER" <<'REMOTE' | tee live-launch-report.txt
+            bash -s -- "$LIVE_BASE_URL" "$LIVE_PROVISION" "$LIVE_MARKER" <<'REMOTE' | tee live-launch-report.txt
           set -Eeuo pipefail
           base_url="$1"
           provision="$2"
-          marker="$3"
+          marker="${3-}"
           test "$(id -u)" -eq 0 || { echo "Live browser supervisor must run as root" >&2; exit 1; }
           test "$base_url" = "https://old-sparky.com" \
             || { echo "Unexpected production origin" >&2; exit 1; }
