@@ -98,6 +98,10 @@ jobs:
           )
           SPEED_TERMS = ("move speed", "movement speed", "sprint speed", "dash speed")
           SOURCE_SPEED_M_RE = re.compile(r"[+\-]?\d+(?:\.\d+)?m\b", re.IGNORECASE)
+          SPIRIT_SCALING_SOURCE_RE = re.compile(
+              r"^(?:t[123]\s+)?spirit scaling\b",
+              re.IGNORECASE,
+          )
           SPIRIT_SCALING_CANONICAL = CANONICAL_GLOSSARY["Spirit Scaling"][0].casefold()
           CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
@@ -184,7 +188,7 @@ jobs:
                               f"Melee Lifesteal item reference was translated: {patch_id} {source_segment['id']}"
                           )
                       if (
-                          "spirit scaling" in en_lower
+                          SPIRIT_SCALING_SOURCE_RE.search(en_lower)
                           and SPIRIT_SCALING_CANONICAL not in ru_lower
                       ):
                           raise SystemExit(
