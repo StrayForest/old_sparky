@@ -81,6 +81,19 @@ jobs:
               test ! -e /root/.oldsparky/liveqa/csp-live-qa.json \
                 || { echo "Refusing to replace the existing live QA bundle" >&2; exit 2; }
               install -d -o root -g root -m 0700 /root/.oldsparky/liveqa
+              for path in \
+                /opt/oldsparky \
+                /opt/oldsparky/platform \
+                /opt/oldsparky/platform/shared \
+                /opt/oldsparky/platform/shared/.env.platform; do
+                if [[ -e "$path" || -L "$path" ]]; then
+                  /usr/bin/stat -c \
+                    'LIVE_QA_ENV_PATH path=%n uid=%u gid=%g mode=%a type=%F' \
+                    "$path"
+                else
+                  echo "LIVE_QA_ENV_PATH path=$path status=missing"
+                fi
+              done
               /usr/bin/python3.12 - <<'PY'
           import grp
           import json

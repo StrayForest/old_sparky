@@ -43,6 +43,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("LIVE_PROVISION", source)
         self.assertIn("LIVE_MARKER", source)
         self.assertIn("LIVE_QA_IDENTITY", source)
+        self.assertIn("LIVE_QA_ENV_PATH", source)
         self.assertIn("uid_collision", source)
         self.assertIn("platform_provision_live_csp_qa.sh", source)
         self.assertIn("Refusing to replace the existing live QA bundle", source)
