@@ -76,6 +76,7 @@ jobs:
           from apps.platform_api.app.services import home_content
           from apps.platform_api.app.services.patch_detail import get_patch_detail, get_patch_detail_source
           from apps.platform_api.app.services.patch_translation import (
+              CANONICAL_GLOSSARY,
               PATCH_TRANSLATION_VERSION,
               extract_translation_segments,
               translate_patch_to_russian,
@@ -97,12 +98,7 @@ jobs:
           )
           SPEED_TERMS = ("move speed", "movement speed", "sprint speed", "dash speed")
           SOURCE_SPEED_M_RE = re.compile(r"[+\-]?\d+(?:\.\d+)?m\b", re.IGNORECASE)
-          SPIRIT_SCALING_MARKERS = (
-              "коэффициент",
-              "масштабирован",
-              "спиритическ",
-              "мощност",
-          )
+          SPIRIT_SCALING_CANONICAL = CANONICAL_GLOSSARY["Spirit Scaling"][0].casefold()
           CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
           def normalized_text(value):
@@ -189,7 +185,7 @@ jobs:
                           )
                       if (
                           "spirit scaling" in en_lower
-                          and not all(marker in ru_lower for marker in SPIRIT_SCALING_MARKERS)
+                          and SPIRIT_SCALING_CANONICAL not in ru_lower
                       ):
                           raise SystemExit(
                               f"Spirit Scaling is not Valve-canonical: {patch_id} {source_segment['id']} -> {ru}"
