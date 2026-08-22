@@ -10,9 +10,9 @@ from apps.platform_api.app.api.routes.tournaments import (
     WORKSPACE_MANAGER_POLL_MS,
     WORKSPACE_PARTICIPANT_POLL_MS,
     ready_check_poll_delay_ms,
-    ready_vote_requires_automation,
     tournament_workspace_poll_delay_ms,
 )
+from apps.platform_api.app.services.tournament_workflow import ready_vote_requires_automation
 from apps.platform_api.app.api.schemas import TournamentDeadlockReadyRoundResponse
 
 

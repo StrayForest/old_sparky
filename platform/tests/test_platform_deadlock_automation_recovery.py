@@ -84,6 +84,7 @@ class PlatformDeadlockAutomationRecoveryTests(unittest.IsolatedAsyncioTestCase):
             _db_session: object,
             *,
             tournament: SimpleNamespace,
+            now: datetime,
         ) -> bool:
             tournament.status = "registration_closed"
             return True
@@ -135,7 +136,7 @@ class PlatformDeadlockAutomationRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(
-                automation.tournament_routes,
+                automation,
                 "tournament_has_locked_deadlock_roster",
                 AsyncMock(return_value=False),
             ),
@@ -280,7 +281,7 @@ class PlatformDeadlockAutomationRecoveryTests(unittest.IsolatedAsyncioTestCase):
         active_captain_round = SimpleNamespace(id=22, status="active")
 
         with patch.object(
-            automation.tournament_routes,
+            automation,
             "deadlock_ready_round_for_tournament",
             AsyncMock(return_value=active_ready_round),
         ):
@@ -291,7 +292,7 @@ class PlatformDeadlockAutomationRecoveryTests(unittest.IsolatedAsyncioTestCase):
             )
 
         with patch.object(
-            automation.tournament_routes,
+            automation,
             "deadlock_captain_round_for_tournament",
             AsyncMock(return_value=active_captain_round),
         ):
@@ -335,37 +336,37 @@ class PlatformDeadlockAutomationRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(
-                automation.tournament_routes,
+                automation,
                 "deadlock_published_auto_assignment_run_for_tournament",
                 AsyncMock(return_value=None),
             ),
             patch.object(
-                automation.tournament_routes,
+                automation,
                 "deadlock_captain_round_for_tournament",
                 AsyncMock(return_value=None),
             ),
             patch.object(
-                automation.tournament_routes,
+                automation,
                 "deadlock_finalized_captain_round_for_tournament",
                 AsyncMock(return_value=captain_round),
             ),
             patch.object(
-                automation.tournament_routes,
+                automation,
                 "reconcile_finalized_captain_round_for_availability",
                 AsyncMock(return_value=()),
             ) as reconcile_availability,
             patch.object(
-                automation.tournament_routes,
+                automation,
                 "build_deadlock_auto_assignment_inputs",
                 AsyncMock(return_value=current_inputs),
             ),
             patch.object(
-                automation.tournament_routes,
+                automation,
                 "deadlock_auto_assignment_run_for_tournament",
                 AsyncMock(return_value=latest_run),
             ),
             patch.object(
-                automation.tournament_routes,
+                automation,
                 "deadlock_auto_assignment_run_freshness",
                 AsyncMock(return_value=SimpleNamespace(is_stale=False)),
             ),
@@ -375,7 +376,7 @@ class PlatformDeadlockAutomationRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value=False),
             ) as ensure_handoff,
             patch.object(
-                automation.tournament_routes,
+                automation,
                 "AutoAssignmentEngine",
                 engine_factory,
             ),

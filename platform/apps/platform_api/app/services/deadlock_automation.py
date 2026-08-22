@@ -7,17 +7,46 @@ from typing import Any
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_api.app.services.bracket_events import publish_bracket_event
 from apps.platform_api.app.services.brackets import create_full_bracket_graph
 from apps.platform_api.app.services.brackets import bracket_event_payload
-from python_packages.platform_domain.deadlock import AutoAssignmentError, CaptainRoundState
+from apps.platform_api.app.services.tournament_workflow import (
+    INACTIVE_PARTICIPANT_STATUSES,
+    build_deadlock_auto_assignment_inputs,
+    deadlock_auto_assignment_run_for_tournament,
+    deadlock_auto_assignment_run_freshness,
+    deadlock_captain_entries_for_round,
+    deadlock_captain_round_for_tournament,
+    deadlock_closed_ready_round_for_tournament,
+    deadlock_finalized_captain_round_for_tournament,
+    deadlock_published_auto_assignment_run_for_tournament,
+    deadlock_ready_candidate_rows_for_round,
+    deadlock_ready_round_for_tournament,
+    finalize_deadlock_assignment_with_commitments,
+    lock_tournament_for_workflow,
+    prepare_deadlock_captain_candidate_rows,
+    reconcile_finalized_captain_round_for_availability,
+    tournament_has_locked_deadlock_roster,
+    transition_locked_tournament_status,
+)
+from python_packages.platform_domain.deadlock import (
+    AutoAssignmentEngine,
+    CaptainRoundState,
+    assign_captain_team_numbers,
+    prepare_captain_round_entries,
+    prepare_ready_check_start,
+    resolve_effective_teams_count,
+)
 from python_packages.platform_domain.tournaments import (
     SOLO_TOURNAMENT_FORMAT,
     TournamentWorkflowError,
     ensure_deadlock_roster_staging_allowed,
     is_solo_tournament_format,
-    transition_tournament_status,
+)
+from python_packages.platform_domain.deadlock import (
+    transition_auto_assignment_run_status,
+    AutoAssignmentRunWorkflowError,
+    AutoAssignmentError,
 )
 from python_packages.platform_infra.audit import write_audit_log
 from python_packages.platform_infra.config import get_settings
@@ -252,7 +281,7 @@ def _deadlock_automation_cohort_statement(*, now: datetime, limit: int) -> Any:
         )
         .where(
             TournamentParticipant.status.not_in(
-                tournament_routes.INACTIVE_PARTICIPANT_STATUSES
+                INACTIVE_PARTICIPANT_STATUSES
             )
         )
         .group_by(TournamentParticipant.tournament_id)
@@ -353,9 +382,10 @@ async def run_deadlock_automation_tick(
     for candidate in candidates:
         tournament_id = candidate.tournament_id
         try:
-            tournament = await db_session.scalar(select(Tournament).where(Tournament.id == tournament_id))
-            if tournament is None:
-                continue
+            tournament = await lock_tournament_for_workflow(
+                db_session,
+                tournament_id,
+            )
             previous_bracket_revision = int(tournament.bracket_revision or 0)
             step_result = await _advance_tournament(
                 db_session,
@@ -406,6 +436,10 @@ async def advance_deadlock_tournament_automation(
     allow_assignment_generation: bool = True,
 ) -> DeadlockAutomationResult:
     tournament_id = tournament.id
+    tournament = await lock_tournament_for_workflow(
+        db_session,
+        tournament_id,
+    )
     previous_bracket_revision = int(tournament.bracket_revision or 0)
     try:
         result = await _advance_tournament(
@@ -449,7 +483,7 @@ async def _advance_tournament(
 ) -> DeadlockAutomationResult:
     if not is_solo_tournament_format(tournament.format_slug):
         return DeadlockAutomationResult()
-    if await tournament_routes.tournament_has_locked_deadlock_roster(db_session, tournament=tournament):
+    if await tournament_has_locked_deadlock_roster(db_session, tournament=tournament):
         return DeadlockAutomationResult()
 
     result = DeadlockAutomationResult()
@@ -462,19 +496,14 @@ async def _advance_tournament(
         )
         and tournament.status == "registration_closed"
     ):
-        tournament.status = transition_tournament_status(
-            tournament.status,
-            "registration_open",
-            format_slug=tournament.format_slug,
-            has_locked_deadlock_roster=False,
-        )
-        await write_audit_log(
+        await transition_locked_tournament_status(
             db_session,
+            tournament=tournament,
+            next_status="registration_open",
+            now=now,
             actor_user_id=AUTOMATION_ACTOR_USER_ID,
-            action="tournament.automation.registration.open",
-            subject_type="tournament",
-            subject_id=tournament.id,
-            payload={"tournament_slug": tournament.slug},
+            audit_action="tournament.automation.registration.open",
+            expected_status="registration_closed",
         )
         result = _increment(result, "registration_opened")
 
@@ -483,7 +512,7 @@ async def _advance_tournament(
         and now >= tournament.registration_closes_at
         and tournament.status == "registration_open"
     ):
-        if await _ensure_registration_closed(db_session, tournament=tournament):
+        if await _ensure_registration_closed(db_session, tournament=tournament, now=now):
             result = _increment(result, "registration_closed")
 
     if tournament.ready_check_starts_at is not None and now >= tournament.ready_check_starts_at:
@@ -540,22 +569,18 @@ async def _ensure_registration_closed(
     db_session: AsyncSession,
     *,
     tournament: Tournament,
+    now: datetime,
 ) -> bool:
     if tournament.status != "registration_open":
         return False
-    tournament.status = transition_tournament_status(
-        tournament.status,
-        "registration_closed",
-        format_slug=tournament.format_slug,
-        has_locked_deadlock_roster=False,
-    )
-    await write_audit_log(
+    await transition_locked_tournament_status(
         db_session,
+        tournament=tournament,
+        next_status="registration_closed",
+        now=now,
         actor_user_id=AUTOMATION_ACTOR_USER_ID,
-        action="tournament.automation.registration.close",
-        subject_type="tournament",
-        subject_id=tournament.id,
-        payload={"tournament_slug": tournament.slug},
+        audit_action="tournament.automation.registration.close",
+        expected_status="registration_open",
     )
     return True
 
@@ -567,7 +592,7 @@ async def _ensure_ready_check_started(
     now: datetime,
 ) -> bool:
     if tournament.status == "registration_open":
-        await _ensure_registration_closed(db_session, tournament=tournament)
+        await _ensure_registration_closed(db_session, tournament=tournament, now=now)
 
     ensure_deadlock_roster_staging_allowed(
         format_slug=tournament.format_slug,
@@ -576,7 +601,7 @@ async def _ensure_ready_check_started(
         action_name="Deadlock ready-check",
     )
 
-    active_round = await tournament_routes.deadlock_ready_round_for_tournament(
+    active_round = await deadlock_ready_round_for_tournament(
         db_session,
         tournament_id=tournament.id,
         active_only=True,
@@ -591,12 +616,12 @@ async def _ensure_ready_check_started(
             await db_session.scalars(
                 select(TournamentParticipant.user_id).where(
                     TournamentParticipant.tournament_id == tournament.id,
-                    TournamentParticipant.status.not_in(tournament_routes.INACTIVE_PARTICIPANT_STATUSES),
+                    TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
                 )
             )
         ).all()
     ]
-    decision = tournament_routes.prepare_ready_check_start(participant_user_ids, has_active_round=False)
+    decision = prepare_ready_check_start(participant_user_ids, has_active_round=False)
     if not decision.should_create_round:
         raise TournamentWorkflowError("No participants are available for automated ready-check.")
 
@@ -629,13 +654,13 @@ async def _ensure_ready_check_closed(
     tournament: Tournament,
     now: datetime,
 ) -> bool:
-    active_round = await tournament_routes.deadlock_ready_round_for_tournament(
+    active_round = await deadlock_ready_round_for_tournament(
         db_session,
         tournament_id=tournament.id,
         active_only=True,
     )
     if active_round is None:
-        latest_round = await tournament_routes.deadlock_ready_round_for_tournament(
+        latest_round = await deadlock_ready_round_for_tournament(
             db_session,
             tournament_id=tournament.id,
             active_only=False,
@@ -664,7 +689,7 @@ async def _ensure_captain_round_started(
     tournament: Tournament,
     now: datetime,
 ) -> bool:
-    active_round = await tournament_routes.deadlock_captain_round_for_tournament(
+    active_round = await deadlock_captain_round_for_tournament(
         db_session,
         tournament_id=tournament.id,
         active_only=True,
@@ -673,19 +698,19 @@ async def _ensure_captain_round_started(
         tournament.automation_captain_round_started_at = now
         return False
 
-    source_ready_round = await tournament_routes.deadlock_closed_ready_round_for_tournament(
+    source_ready_round = await deadlock_closed_ready_round_for_tournament(
         db_session,
         tournament_id=tournament.id,
     )
     if source_ready_round is None:
         raise TournamentWorkflowError("Close a ready-check round before automated captain selection.")
 
-    candidate_rows = await tournament_routes.deadlock_ready_candidate_rows_for_round(
+    candidate_rows = await deadlock_ready_candidate_rows_for_round(
         db_session,
         tournament_id=tournament.id,
         round_id=source_ready_round.id,
     )
-    teams_count = tournament_routes.resolve_effective_teams_count(
+    teams_count = resolve_effective_teams_count(
         requested_teams_count=tournament.teams_count,
         ready_player_count=len(candidate_rows),
     )
@@ -702,8 +727,8 @@ async def _ensure_captain_round_started(
     db_session.add(round_row)
     await db_session.flush()
 
-    prepared_entries = tournament_routes.prepare_captain_round_entries(
-        tournament_routes.prepare_deadlock_captain_candidate_rows(candidate_rows),
+    prepared_entries = prepare_captain_round_entries(
+        prepare_deadlock_captain_candidate_rows(candidate_rows),
         teams_count,
         auto_assign=True,
     )
@@ -747,7 +772,7 @@ async def _expire_stale_captain_offers(
     if deadline_minutes < 1:
         return 0
 
-    active_round = await tournament_routes.deadlock_captain_round_for_tournament(
+    active_round = await deadlock_captain_round_for_tournament(
         db_session,
         tournament_id=tournament.id,
         active_only=True,
@@ -755,7 +780,7 @@ async def _expire_stale_captain_offers(
     if active_round is None:
         return 0
 
-    entry_rows = await tournament_routes.deadlock_captain_entries_for_round(db_session, round_id=active_round.id)
+    entry_rows = await deadlock_captain_entries_for_round(db_session, round_id=active_round.id)
     expires_before = now - timedelta(minutes=deadline_minutes)
     expired_user_ids = [
         row.user_id
@@ -823,13 +848,13 @@ async def _ensure_captain_round_finalized(
     tournament: Tournament,
     now: datetime,
 ) -> bool:
-    active_round = await tournament_routes.deadlock_captain_round_for_tournament(
+    active_round = await deadlock_captain_round_for_tournament(
         db_session,
         tournament_id=tournament.id,
         active_only=True,
     )
     if active_round is None:
-        finalized_round = await tournament_routes.deadlock_finalized_captain_round_for_tournament(
+        finalized_round = await deadlock_finalized_captain_round_for_tournament(
             db_session,
             tournament_id=tournament.id,
         )
@@ -837,7 +862,7 @@ async def _ensure_captain_round_finalized(
             tournament.automation_captain_round_finalized_at = finalized_round.finalized_at or now
         return False
 
-    entry_rows = await tournament_routes.deadlock_captain_entries_for_round(db_session, round_id=active_round.id)
+    entry_rows = await deadlock_captain_entries_for_round(db_session, round_id=active_round.id)
     round_state = CaptainRoundState.active(
         round_id=active_round.id,
         teams_count=active_round.teams_count,
@@ -866,7 +891,7 @@ async def _ensure_captain_round_finalized(
         .join(DeadlockProfile, DeadlockProfile.user_id == User.id)
         .where(User.id.in_(accepted_user_ids))
     )
-    assignments = tournament_routes.assign_captain_team_numbers(
+    assignments = assign_captain_team_numbers(
         [dict(row._mapping) for row in accepted_candidates]
     )
     assigned_team_by_user_id = {assignment.user_id: assignment.team_id for assignment in assignments}
@@ -907,14 +932,14 @@ async def _ensure_assignment_generated(
     tournament: Tournament,
     now: datetime,
 ) -> bool:
-    published_run = await tournament_routes.deadlock_published_auto_assignment_run_for_tournament(
+    published_run = await deadlock_published_auto_assignment_run_for_tournament(
         db_session,
         tournament_id=tournament.id,
     )
     if published_run is not None and published_run.status == "locked":
         return False
 
-    active_captain_round = await tournament_routes.deadlock_captain_round_for_tournament(
+    active_captain_round = await deadlock_captain_round_for_tournament(
         db_session,
         tournament_id=tournament.id,
         active_only=True,
@@ -922,30 +947,30 @@ async def _ensure_assignment_generated(
     if active_captain_round is not None:
         return False
 
-    captain_round = await tournament_routes.deadlock_finalized_captain_round_for_tournament(
+    captain_round = await deadlock_finalized_captain_round_for_tournament(
         db_session,
         tournament_id=tournament.id,
     )
     if captain_round is None:
         return False
 
-    await tournament_routes.reconcile_finalized_captain_round_for_availability(
+    await reconcile_finalized_captain_round_for_availability(
         db_session,
         tournament=tournament,
         captain_round=captain_round,
         now=now,
     )
-    current_inputs = await tournament_routes.build_deadlock_auto_assignment_inputs(
+    current_inputs = await build_deadlock_auto_assignment_inputs(
         db_session,
         tournament_id=tournament.id,
         captain_round=captain_round,
     )
-    latest_run = await tournament_routes.deadlock_auto_assignment_run_for_tournament(
+    latest_run = await deadlock_auto_assignment_run_for_tournament(
         db_session,
         tournament_id=tournament.id,
     )
     if latest_run is not None:
-        latest_run_freshness = await tournament_routes.deadlock_auto_assignment_run_freshness(
+        latest_run_freshness = await deadlock_auto_assignment_run_freshness(
             db_session,
             tournament_id=tournament.id,
             run_row=latest_run,
@@ -965,7 +990,7 @@ async def _ensure_assignment_generated(
     if len(captain_rows) != captain_round.teams_count:
         raise TournamentWorkflowError("The finalized captain round does not have the required assigned captains.")
 
-    engine = tournament_routes.AutoAssignmentEngine()
+    engine = AutoAssignmentEngine()
     with measure_compute_block():
         run = engine.solve(
             captain_rows,
@@ -1022,11 +1047,11 @@ async def _ensure_assignment_handoff_completed(
     changed = False
     if run_row.status == "generated":
         try:
-            run_row.status = tournament_routes.transition_auto_assignment_run_status(
+            run_row.status = transition_auto_assignment_run_status(
                 run_row.status,
                 "published",
             )
-        except tournament_routes.AutoAssignmentRunWorkflowError as exc:
+        except AutoAssignmentRunWorkflowError as exc:
             raise TournamentWorkflowError(str(exc)) from exc
         run_row.published_at = run_row.published_at or now
         run_row.published_by_user_id = run_row.published_by_user_id or AUTOMATION_ACTOR_USER_ID
@@ -1043,7 +1068,7 @@ async def _ensure_assignment_handoff_completed(
     if run_row.status == "published":
         try:
             rebalanced, unavailable_user_ids = (
-                await tournament_routes.finalize_deadlock_assignment_with_commitments(
+                await finalize_deadlock_assignment_with_commitments(
                     db_session,
                     tournament=tournament,
                     run_row=run_row,
@@ -1052,8 +1077,8 @@ async def _ensure_assignment_handoff_completed(
                 )
             )
         except (
-            tournament_routes.AutoAssignmentError,
-            tournament_routes.AutoAssignmentRunWorkflowError,
+            AutoAssignmentError,
+            AutoAssignmentRunWorkflowError,
             TournamentWorkflowError,
         ) as exc:
             raise TournamentWorkflowError(str(exc)) from exc

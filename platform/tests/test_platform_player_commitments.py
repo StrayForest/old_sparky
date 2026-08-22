@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from sqlalchemy import delete, func, select
 
-from apps.platform_api.app.api.routes.tournaments import (
+from apps.platform_api.app.services.tournament_workflow import (
     finalize_deadlock_assignment_with_commitments,
     generate_deadlock_auto_assignment_run_for_tournament,
 )
@@ -211,7 +211,7 @@ class PlatformPlayerCommitmentTests(unittest.IsolatedAsyncioTestCase):
     async def test_parallel_finalization_builds_disjoint_complete_rosters(self) -> None:
         user_ids, tournament_ids = await self._seed_parallel_assignment_inputs()
         with patch(
-            "apps.platform_api.app.api.routes.tournaments.AutoAssignmentEngine",
+            "apps.platform_api.app.services.tournament_workflow.AutoAssignmentEngine",
             FastAssignmentEngine,
         ):
             run_ids = [

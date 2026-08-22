@@ -10,7 +10,9 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy import delete, func, select
 
-from apps.platform_api.app.api.routes.tournaments import generate_deadlock_auto_assignment_run_for_tournament
+from apps.platform_api.app.services.tournament_workflow import (
+    generate_deadlock_auto_assignment_run_for_tournament,
+)
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
 from python_packages.platform_infra.db import dispose_engine, session_factory

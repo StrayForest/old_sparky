@@ -25,6 +25,9 @@ from apps.platform_api.app.services.patch_translation import (
     translate_patch_to_russian,
 )
 from apps.platform_api.app.services.player_commitments import reconcile_player_commitments
+from apps.platform_api.app.services.tournament_workflow import (
+    generate_deadlock_auto_assignment_run_for_tournament,
+)
 from python_packages.platform_infra.auth_lifecycle import cleanup_auth_lifecycle_records
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
@@ -411,8 +414,6 @@ async def _run_locked_deadlock_auto_assignment(
     tournament_id: str,
     actor_user_id: str,
 ) -> dict[str, Any]:
-    from apps.platform_api.app.api.routes import tournaments as tournament_routes
-
     client = redis_client()
     lock_key = f"{AUTO_ASSIGNMENT_LOCK_PREFIX}{tournament_id}"
     lock_token = token_urlsafe(24)
@@ -445,7 +446,7 @@ async def _run_locked_deadlock_auto_assignment(
                     "error": "Tournament not found.",
                 }
             try:
-                run_row = await tournament_routes.generate_deadlock_auto_assignment_run_for_tournament(
+                run_row = await generate_deadlock_auto_assignment_run_for_tournament(
                     db_session,
                     tournament=tournament,
                     actor_user_id=actor_user_id,
