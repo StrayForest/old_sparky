@@ -63,11 +63,11 @@ def _open_component(
 
 def _production_component_owners() -> tuple[int, ...]:
     try:
-        oldsparky_uid = pwd.getpwnam("oldsparky").pw_uid
+        platform_uid = pwd.getpwnam("oldsparky-platform").pw_uid
     except KeyError as exc:
         raise SafeEnvError("required production owner account is unavailable") from exc
     # /, /opt, /opt/oldsparky, /opt/oldsparky/platform, .../shared
-    return (0, 0, oldsparky_uid, 0, 0)
+    return (0, 0, platform_uid, 0, 0)
 
 
 def _validate_directory(metadata: os.stat_result, *, expected_uid: int) -> None:

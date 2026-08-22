@@ -22,6 +22,18 @@ SPEC.loader.exec_module(safe_env)
 
 
 class SafeEnvExecTests(unittest.TestCase):
+    def test_production_path_uses_the_active_platform_owner_identity(self) -> None:
+        with mock.patch.object(
+            safe_env.pwd,
+            "getpwnam",
+            return_value=mock.Mock(pw_uid=996),
+        ) as getpwnam:
+            self.assertEqual(
+                safe_env._production_component_owners(),
+                (0, 0, 996, 0, 0),
+            )
+        getpwnam.assert_called_once_with("oldsparky-platform")
+
     def test_dotenv_is_parsed_as_data_without_shell_expansion(self) -> None:
         values = safe_env.parse_dotenv(
             b"PLATFORM_ENVIRONMENT=production\n"
