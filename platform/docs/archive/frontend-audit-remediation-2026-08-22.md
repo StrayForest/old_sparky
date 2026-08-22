@@ -58,4 +58,14 @@ The release package still requires release preflight, immutable build publicatio
 
 ## Release evidence
 
-Release commit, branch merge, release artifact, deploy target, smoke result, and rollback reference will be recorded here after deployment.
+- Fix commit: `8c341f37` (`fix: remediate frontend audit findings`).
+- Feature branch: `codex/frontend-audit-remediation`, pushed to origin.
+- Merge commit on `dev`: `f67f1b369dae2472dca2fe4502b18049690ffa6f`.
+- Release: `frontend-audit-remediation-20260822T204107Z`.
+- Source commit recorded by `RELEASE.json`: `f67f1b369dae2472dca2fe4502b18049690ffa6f`.
+- Artifact SHA-256: `3759cbebc04036b473c2b7d99278fefec26e80580452a84e0cba97e755fc85de`.
+- Production current: `/opt/oldsparky/platform/releases/frontend-audit-remediation-20260822T204107Z`.
+- Previous rollback target: `/opt/oldsparky/platform/releases/gha-32590867346-1-112c4b0dee19-20260822T183002Z`.
+- Preflight passed before and after deployment; Alembic remained at `20260822_0040` and the restore-verified backup was valid.
+- Loopback/SNI and public `https://old-sparky.com` deploy smoke passed with enforced CSP.
+- No migration was introduced; rollback is the immutable `previous` release above, using the repository release rollback tooling and post-rollback smoke checks.
