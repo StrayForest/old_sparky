@@ -42,6 +42,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("type: boolean", source)
         self.assertIn("LIVE_PROVISION", source)
         self.assertIn("LIVE_MARKER", source)
+        self.assertIn('bash -s -- live-launch-supervisor "$LIVE_BASE_URL"', source)
         self.assertIn("LIVE_QA_IDENTITY", source)
         self.assertIn("LIVE_QA_ENV_PATH", source)
         self.assertIn("uid_collision", source)
