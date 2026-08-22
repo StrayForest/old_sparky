@@ -14,6 +14,7 @@
     "start": "../../tools/platform_node.sh ./node_modules/next/dist/bin/next start -p 3000",
     "lint": "../../tools/platform_node.sh ./node_modules/eslint/bin/eslint.js .",
     "test:smoke": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test",
+    "test:hermetic": "npm run test:smoke && npm run test:participant-progressive",
     "test:participant-progressive": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.participant.config.ts",
     "test:live": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-launch.spec.ts",
     "test:live:webkit": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-launch.spec.ts --project=live-webkit-mobile",

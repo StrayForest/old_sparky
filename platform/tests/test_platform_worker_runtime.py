@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from fastapi import HTTPException
+
+from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_worker import worker
 
 
@@ -90,6 +94,124 @@ class PlatformWorkerRuntimeTests(unittest.TestCase):
         self.assertEqual(
             worker.auth_lifecycle_cleanup.name,
             "platform.auth_lifecycle_cleanup",
+        )
+
+    def test_auto_assignment_task_has_the_expected_celery_contract(self) -> None:
+        self.assertEqual(worker.deadlock_auto_assignment_run.name, "platform.deadlock_auto_assignment_run")
+        self.assertFalse(worker.deadlock_auto_assignment_run.ignore_result)
+
+
+class PlatformAutoAssignmentTaskTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_persists_generated_run_and_releases_lock(self) -> None:
+        class FakeRedis:
+            def __init__(self) -> None:
+                self.released = False
+
+            async def set(self, *args, **kwargs):
+                return True
+
+            async def eval(self, *args, **kwargs):
+                self.released = True
+                return 1
+
+            async def aclose(self) -> None:
+                return None
+
+        fake_redis = FakeRedis()
+        fake_session = SimpleNamespace(
+            scalar=AsyncMock(return_value=SimpleNamespace(id="tournament-1")),
+        )
+        session_context = AsyncMock()
+        session_context.__aenter__.return_value = fake_session
+        session_context.__aexit__.return_value = False
+        generated = SimpleNamespace(id="run-1")
+
+        with (
+            patch.object(worker, "redis_client", return_value=fake_redis),
+            patch.object(worker, "session_factory", return_value=lambda: session_context),
+            patch.object(
+                worker,
+                "generate_deadlock_auto_assignment_run_for_tournament",
+                new=AsyncMock(return_value=generated),
+            ) as generate_run,
+        ):
+            result = await worker._run_locked_deadlock_auto_assignment("tournament-1", "user-1")
+
+        self.assertEqual(result, {
+            "ok": True,
+            "status": "generated",
+            "tournament_id": "tournament-1",
+            "run_id": "run-1",
+        })
+        generate_run.assert_awaited_once()
+        self.assertTrue(fake_redis.released)
+
+    async def test_worker_failure_is_reported_and_lock_is_still_released(self) -> None:
+        class FakeRedis:
+            async def set(self, *args, **kwargs):
+                return True
+
+            async def eval(self, *args, **kwargs):
+                return 1
+
+            async def aclose(self) -> None:
+                return None
+
+        fake_session = SimpleNamespace(
+            scalar=AsyncMock(return_value=SimpleNamespace(id="tournament-1")),
+        )
+        session_context = AsyncMock()
+        session_context.__aenter__.return_value = fake_session
+        session_context.__aexit__.return_value = False
+
+        with (
+            patch.object(worker, "redis_client", return_value=FakeRedis()),
+            patch.object(worker, "session_factory", return_value=lambda: session_context),
+            patch.object(
+                worker,
+                "generate_deadlock_auto_assignment_run_for_tournament",
+                new=AsyncMock(side_effect=HTTPException(status_code=409, detail="staging closed")),
+            ),
+        ):
+            result = await worker._run_locked_deadlock_auto_assignment("tournament-1", "user-1")
+
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["http_status"], 409)
+        self.assertEqual(result["error"], "staging closed")
+
+
+class PlatformAutoAssignmentRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_route_enqueues_the_registered_worker_with_expiry(self) -> None:
+        tournament = SimpleNamespace(
+            id="tournament-1",
+            format_slug="solo",
+            status="registration_closed",
+            organizer_user_id="user-1",
+            slug="test-tournament",
+        )
+        auth_session = SimpleNamespace(user=SimpleNamespace(id="user-1"))
+        task = Mock(id="celery-task-1")
+
+        with (
+            patch.object(tournament_routes, "get_tournament_or_404", new=AsyncMock(return_value=tournament)),
+            patch.object(tournament_routes, "ensure_deadlock_tournament_format"),
+            patch.object(tournament_routes, "ensure_tournament_organizer"),
+            patch.object(tournament_routes, "tournament_has_locked_deadlock_roster", new=AsyncMock(return_value=False)),
+            patch.object(tournament_routes, "ensure_deadlock_roster_staging_allowed"),
+            patch("apps.platform_worker.worker.deadlock_auto_assignment_run") as celery_task,
+        ):
+            celery_task.apply_async.return_value = task
+            response = await tournament_routes.queue_deadlock_auto_assignment(
+                "test-tournament",
+                auth_session=auth_session,
+                db_session=SimpleNamespace(),
+            )
+
+        self.assertEqual(response.task_id, "celery-task-1")
+        celery_task.apply_async.assert_called_once_with(
+            args=["tournament-1", "user-1"],
+            expires=900,
         )
 
 

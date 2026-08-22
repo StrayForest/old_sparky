@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       base_url:
-        description: "Deployed platform origin, including scheme"
+        description: "Canonical deployed platform origin (must be https://old-sparky.com)"
         required: true
         type: string
 
@@ -14,27 +14,64 @@ permissions:
 jobs:
   live-sanity:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: platform/apps/platform_web
+    timeout-minutes: 45
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      LIVE_BASE_URL: ${{ inputs.base_url }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "26"
-          cache: npm
-          cache-dependency-path: platform/apps/platform_web/package-lock.json
-      - run: npm ci
-      - run: npx playwright install --with-deps chromium webkit
-      - run: npm run test:live
-        env:
-          CI: "true"
-          PLAYWRIGHT_LIVE_BASE_URL: ${{ inputs.base_url }}
-      - name: Upload Playwright report
+      - name: Validate production browser gate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$LIVE_BASE_URL" = "https://old-sparky.com" \
+            || { echo "Production browser QA requires the canonical origin" >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
+          chmod 600 ~/.ssh/old_sparky_prod
+          ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Run the dedicated production browser supervisor
+        shell: bash
+        run: |
+          set -o pipefail
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$LIVE_BASE_URL" <<'REMOTE' | tee live-launch-report.txt
+          set -Eeuo pipefail
+          base_url="$1"
+          test "$(id -u)" -eq 0 || { echo "Live browser supervisor must run as root" >&2; exit 1; }
+          test "$base_url" = "https://old-sparky.com" \
+            || { echo "Unexpected production origin" >&2; exit 1; }
+          PLATFORM_APP_DIR=/opt/oldsparky/platform \
+          PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
+          PLAYWRIGHT_LIVE_BASE_URL="$base_url" \
+          /root/old_sparky/platform/tools/platform_live_browser_qa.sh public
+          REMOTE
+          grep -Eq '^LIVE_BROWSER_QA_SUCCESS source_commit=[0-9a-f]{40}$' live-launch-report.txt
+
+      - name: Upload browser gate report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: platform-live-playwright-report
-          path: platform/apps/platform_web/playwright-report-live
-          if-no-files-found: ignore
+          path: live-launch-report.txt
+          if-no-files-found: error
           retention-days: 14

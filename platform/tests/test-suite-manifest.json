@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "purpose": "Behavioral test ownership and execution contours for OldSparky platform",
+  "groups": [
+    {
+      "id": "backend-unit",
+      "owner": "api-domain",
+      "command": "tools/platform_run_tests.sh focused unittest selector",
+      "environment": "PLATFORM_ENVIRONMENT=test; database=platformdb_test",
+      "deterministic": true
+    },
+    {
+      "id": "backend-integration",
+      "owner": "api-domain",
+      "command": "tools/platform_run_tests.sh discover -s tests",
+      "environment": "PLATFORM_ENVIRONMENT=test; database=platformdb_test; PostgreSQL and Redis",
+      "deterministic": true
+    },
+    {
+      "id": "migration",
+      "owner": "persistence",
+      "command": ".venv_platform/bin/python tools/platform_migration_scenario.py",
+      "environment": "disposable PostgreSQL database named platformdb_test",
+      "deterministic": true
+    },
+    {
+      "id": "web-hermetic",
+      "owner": "web",
+      "command": "npm run test:hermetic",
+      "environment": "mocked API; standalone Next.js; Chromium",
+      "deterministic": true
+    },
+    {
+      "id": "server-smoke",
+      "owner": "release",
+      "command": "platform_deploy_smoke.py and release preflight",
+      "environment": "deployed server",
+      "deterministic": false
+    },
+    {
+      "id": "live-public",
+      "owner": "production-operator",
+      "command": "platform_live_browser_qa.sh public through platform-live-launch.yml",
+      "environment": "https://old-sparky.com; dedicated server QA UID",
+      "deterministic": false
+    },
+    {
+      "id": "live-user-destructive",
+      "owner": "production-operator",
+      "command": "approved platform_live_user_qa.sh workflow only",
+      "environment": "production; marked fixture data and mandatory cleanup",
+      "deterministic": false
+    }
+  ]
+}

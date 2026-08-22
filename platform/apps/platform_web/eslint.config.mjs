@@ -3,7 +3,15 @@ import tseslint from "typescript-eslint";
 
 const eslintConfig = tseslint.config(
   {
-    ignores: [".next/**", "node_modules/**", "next-env.d.ts"]
+    ignores: [
+      ".next/**",
+      "node_modules/**",
+      "next-env.d.ts",
+      "test-results/**",
+      "test-results-*/*",
+      "playwright-report/**",
+      "playwright-report-live/**"
+    ]
   },
   ...tseslint.configs.recommended,
   nextPlugin.configs["core-web-vitals"],

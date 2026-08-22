@@ -145,3 +145,5 @@ trap cleanup_gate EXIT INT TERM HUP
       test \
       --config="$RUNTIME_CACHE/web/playwright.live.config.ts" \
       "$RUNTIME_CACHE/web/tests/smoke/live-launch.spec.ts"
+
+printf 'LIVE_BROWSER_QA_SUCCESS source_commit=%s\n' "$SOURCE_COMMIT"

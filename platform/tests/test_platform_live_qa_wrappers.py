@@ -10,6 +10,7 @@ import unittest
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = PLATFORM_ROOT.parent
 TOOLS_ROOT = PLATFORM_ROOT / "tools"
 APPARMOR_PROFILE = PLATFORM_ROOT / "deploy/apparmor/oldsparky-liveqa-chromium"
 LIVE_USER_JOURNEY = (
@@ -30,6 +31,17 @@ BROWSER_WRAPPERS = WRAPPERS[1:3]
 
 
 class LiveQaWrapperContractTests(unittest.TestCase):
+    def test_live_launch_workflow_delegates_to_server_supervisor(self) -> None:
+        source = (REPO_ROOT / ".github/workflows/platform-live-launch.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("PROD_SSH_HOST", source)
+        self.assertIn("ssh " + "\\", source)
+        self.assertIn("platform_live_browser_qa.sh public", source)
+        self.assertIn("LIVE_BROWSER_QA_SUCCESS", source)
+        self.assertNotIn("npm ci", source)
+        self.assertNotIn("npm run test:live", source)
+
     def test_all_wrappers_disable_xtrace_before_any_work(self) -> None:
         for wrapper in WRAPPERS:
             with self.subTest(wrapper=wrapper.name):
