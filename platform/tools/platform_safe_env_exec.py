@@ -13,7 +13,6 @@ import argparse
 import grp
 import os
 from pathlib import Path
-import pwd
 import re
 import shlex
 import stat
@@ -62,12 +61,10 @@ def _open_component(
 
 
 def _production_component_owners() -> tuple[int, ...]:
-    try:
-        platform_uid = pwd.getpwnam("oldsparky-platform").pw_uid
-    except KeyError as exc:
-        raise SafeEnvError("required production owner account is unavailable") from exc
+    # The deployed production contour is root-owned at every fixed path
+    # component; runtime service identities own only their service data.
     # /, /opt, /opt/oldsparky, /opt/oldsparky/platform, .../shared
-    return (0, 0, platform_uid, 0, 0)
+    return (0, 0, 0, 0, 0)
 
 
 def _validate_directory(metadata: os.stat_result, *, expected_uid: int) -> None:
