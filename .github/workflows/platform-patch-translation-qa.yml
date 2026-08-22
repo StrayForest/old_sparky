@@ -1,6 +1,7 @@
 name: Platform patch translation QA
 
 on:
+  workflow_dispatch:
   workflow_run:
     workflows: ["Platform production deploy"]
     types: [completed]
@@ -16,8 +17,9 @@ concurrency:
 jobs:
   regression:
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'dev'
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'dev')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: production
@@ -25,7 +27,7 @@ jobs:
       PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
       PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
       PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
-      TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
     steps:
       - name: Mark translation QA pending
         shell: bash
@@ -65,6 +67,11 @@ jobs:
           runtime=/opt/oldsparky/platform
           cd "$runtime/current"
           export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
+          test -r "$PLATFORM_ENV_FILE"
+          set -a
+          . "$PLATFORM_ENV_FILE"
+          set +a
+          export PLATFORM_ENV_FILE
           export PYTHONPATH="$runtime/current"
 
           "$runtime/shared/venv/bin/python" - <<'PY'
