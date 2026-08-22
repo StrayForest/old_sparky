@@ -11,7 +11,6 @@ This document contains only findings that still require action or direct operato
 
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
-| AS-15 | High / P1 | High | Deadlock workflow and profile-slot writers lack complete durable concurrency guards | Open; first repository-owned remediation target |
 | AS-10 | Low / P2 | High | Registration can reveal an existing email address | Open; product/security decision required |
 | AS-12 | Medium / P2 | High | Proxy, Cloudflare-range, UFW and startup validation can drift independently | Open |
 | AS-13 | Low / P2 | Medium | CI fail-closed isolation contour requires revalidation against the current workflow | Open; revalidate before changing |
@@ -31,30 +30,7 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 | Admin console/API | No | No | No | No by organizer role alone | Yes | Yes |
 | Role grants and destructive pre-production cleanup | No | No | No | No | No | Yes |
 
-## P1 findings
-
-### AS-15 — Deadlock workflow persistence and concurrency integrity
-
-Manual, worker and automation writers do not yet share a complete PostgreSQL
-serialization boundary for ready-check, captain, assignment, roster publish
-and roster lock. The schema also lacks final cardinality guards for several
-workflow states, and profile dream-slot replacement is an unlocked
-delete-and-reinsert sequence.
-
-Two requests can therefore create competing active/canonical workflow rows,
-commit a vote after a round closes or a participant is excluded, lock a roster
-after a terminal status change, or merge/fail concurrent dream-slot payloads.
-The remediation is AS-15 in [`platform-roadmap.md`](platform-roadmap.md): lock
-the tournament (or owning profile) row, revalidate under lock, use conditional
-lifecycle writes and migration-backed constraints, and prove final states with
-independent-session concurrency tests. **Open; P1.**
-
-AS-03 remains closed only for invite claim/revoke and participant-capacity
-serialization. AS-02 privileged-route Access/MFA and AS-14 HSTS
-ownership/state were closed on 2026-08-21 with direct operator/dashboard/live
-evidence; retained evidence is archived below.
-
-## P2 findings
+## Active findings
 
 ### AS-10 — Existing-email enumeration at registration
 Decide whether duplicate-registration UX justifies disclosure; otherwise use a generic accepted flow with comparable timing/Turnstile behavior. **Open; product/security decision required**.
@@ -67,10 +43,9 @@ The current workflow has been restored and is green, but the older finding must 
 
 ## Remediation order
 
-1. AS-15 is the first repository-owned P1 correctness package.
-2. AS-10 remains a product/security decision.
-3. AS-12 follows AS-15; AS-13 remains separate CI revalidation work.
+1. AS-10 remains a product/security decision.
+2. AS-12 is the next operational hardening item; AS-13 remains separate CI revalidation work.
 
-Resolved AS-02 evidence is retained in [`archive/as-02-cloudflare-access-mfa.md`](archive/as-02-cloudflare-access-mfa.md). Resolved AS-03 invite/capacity evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md). Resolved AS-06 evidence is retained in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md). Resolved AS-07 evidence is retained in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Resolved AS-08 evidence is retained in [`archive/as-08-patch-miss-hardening.md`](archive/as-08-patch-miss-hardening.md). Resolved AS-09 evidence is retained in [`archive/as-09-distributed-login-guessing.md`](archive/as-09-distributed-login-guessing.md). Resolved AS-11 evidence is retained in [`archive/as-11-worker-error-sanitization.md`](archive/as-11-worker-error-sanitization.md). Resolved AS-14 evidence is retained in [`archive/as-14-cloudflare-hsts-ownership.md`](archive/as-14-cloudflare-hsts-ownership.md).
+Resolved AS-02 evidence is retained in [`archive/as-02-cloudflare-access-mfa.md`](archive/as-02-cloudflare-access-mfa.md). Resolved AS-03 invite/capacity evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md). Resolved AS-06 evidence is retained in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md). Resolved AS-07 evidence is retained in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Resolved AS-08 evidence is retained in [`archive/as-08-patch-miss-hardening.md`](archive/as-08-patch-miss-hardening.md). Resolved AS-09 evidence is retained in [`archive/as-09-distributed-login-guessing.md`](archive/as-09-distributed-login-guessing.md). Resolved AS-11 evidence is retained in [`archive/as-11-worker-error-sanitization.md`](archive/as-11-worker-error-sanitization.md). Resolved AS-14 evidence is retained in [`archive/as-14-cloudflare-hsts-ownership.md`](archive/as-14-cloudflare-hsts-ownership.md). Resolved AS-15 evidence is retained in [`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md).
 
 Any newly confirmed Critical issue or direct authentication bypass blocks production installation. Do not widen CSP, disable Turnstile, add privileged-route bypasses or weaken application RBAC to simplify testing.

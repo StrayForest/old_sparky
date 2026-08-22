@@ -26,41 +26,22 @@ Read this file for the current production baseline and next engineering priority
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
 - Password-login guessing protection uses independent source-IP and account-wide Redis state. Account identifiers are represented by HMAC fingerprints, shared failures drive adaptive Turnstile and a bounded cooldown, and successful login clears account failure/cooldown state.
-- Alembic head: `20260821_0039`.
+- Alembic head: `20260822_0040`.
 - Production contains the verified operator account and no test tournaments.
 
 ## Current engineering priority
 
-**AS-15 — Deadlock persistence and workflow concurrency integrity** is the
-first repository-owned remediation target. It closes the gap identified by the
-2026-08-22 persistence audit: AS-03 remains closed for tournament invite
-claim/revoke and active-participant-capacity serialization only; it does not
-certify ready-check, captain, assignment, roster, worker or profile-slot
-writers.
+**AS-15 — Deadlock persistence and workflow concurrency integrity** is
+resolved and deployed. The release locks durable workflow/profile writers on
+their stable parent rows, revalidates lifecycle state under lock, adds final
+database guards and applies migration `20260822_0040`. Exact commit
+`87525bab34c473ac51708eba1e242b7baa6a1462` is active as release
+`gha-32574455599-1-87525bab34c4-20260822T125945Z`; closure evidence is in
+[`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md).
 
-Deliver AS-15 as one migration-backed correctness package:
-
-1. Serialize every Deadlock workflow writer (manual route, automation and
-   worker) on the tournament row with `SELECT ... FOR UPDATE`, then re-read
-   lifecycle state before writing secondary rows.
-2. Make the database the final guard for one active ready-check, one canonical
-   captain/assignment lifecycle and one current published/locked roster as
-   required by the chosen state model. Use partial unique constraints/indexes,
-   not application checks alone.
-3. Make ready votes conditional on an active round and eligible active
-   participant so close/exclusion cannot be followed by a late vote commit.
-4. Serialize profile dream-slot replacement on its owning user/profile row;
-   prevent replace-all requests from merging or failing on concurrent slot
-   writes.
-5. Ship compatible migrations with duplicate/precondition handling and
-   recovery coverage for concurrent unique-index creation. Normalize the
-   retired stored `private` visibility alias to `invite_only` explicitly before
-   enforcing the current API values; prove the result with independent-session
-   concurrency tests and final-state assertions.
-
-AS-02 privileged-route Access/MFA, AS-11 public worker-error sanitization and
-AS-14 HSTS ownership/state are closed and archived. AS-10 remains a
-product/security decision. AS-12 and AS-13 follow AS-15.
+No repository-owned P1 correctness remediation remains open. AS-10 remains a
+product/security decision; AS-12 is the next operational hardening item and
+AS-13 remains separate CI revalidation work.
 
 ## Production invariants
 
