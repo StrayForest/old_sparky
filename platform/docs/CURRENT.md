@@ -107,10 +107,12 @@ against the current web/api/worker identities and units.
   failure retains a recovery receipt and blocks an unrelated second install.
 - Canonical production env remains root-only `root:root 0600`; preflight checks
   that scoped service env files are freshly rendered from it.
-- Normal production deployment is manual-dispatch through the GitHub Actions
-  `Platform production deploy` workflow from `dev`; direct server invocation is
-  recovery/rollback-only. Fully automatic push deployment remains disabled by
-  policy while live Cloudflare/Nginx/UFW proof remains operator-owned.
+- Normal production deployment is automatically dispatched only after the
+  `Platform security and build` workflow completes successfully for a push to
+  the current `dev` HEAD. The auto-deploy gate refuses stale successful CI
+  results and skips SHAs that already report `platform-production-deploy=success`.
+  The manual `Platform production deploy` workflow remains an operator fallback;
+  direct server invocation is recovery/rollback-only.
 
 ## Deferred / operator-owned work
 
