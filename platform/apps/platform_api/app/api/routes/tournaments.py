@@ -5135,9 +5135,138 @@ async def respond_deadlock_captain_round(
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockCaptainRoundResponse:
-    raise HTTPException(
-        status_code=status.HTTP_410_GONE,
-        detail="Captain offer responses are retired; captain selection is automatic.",
+    tournament = await get_tournament_or_404(db_session, slug)
+    ensure_deadlock_tournament_format(tournament)
+    current_user_id = auth_session.user.id
+    if payload.decision == "decline":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Captain decline is disabled; captains are selected automatically.",
+        )
+    try:
+        ensure_deadlock_roster_staging_allowed(
+            format_slug=tournament.format_slug,
+            tournament_status=tournament.status,
+            has_locked_deadlock_roster=await tournament_has_locked_deadlock_roster(
+                db_session,
+                tournament=tournament,
+            ),
+            action_name="Deadlock captain offers",
+        )
+    except TournamentWorkflowError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    participant = await joined_participant_for_user(
+        db_session,
+        tournament_id=tournament.id,
+        user_id=current_user_id,
+    )
+    if participant is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only joined participants can respond to captain offers.",
+        )
+    from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
+
+    await advance_deadlock_tournament_automation(
+        db_session,
+        tournament=tournament,
+        now=auth_session.now,
+        allow_assignment_generation=False,
+    )
+
+    active_round = await deadlock_captain_round_for_tournament(
+        db_session,
+        tournament_id=tournament.id,
+        active_only=True,
+    )
+    if active_round is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Deadlock captain round is not active.",
+        )
+
+    entry_rows = await deadlock_captain_entries_for_round(
+        db_session,
+        round_id=active_round.id,
+        for_update=True,
+    )
+    round_state = CaptainRoundState.active(
+        round_id=active_round.id,
+        teams_count=active_round.teams_count,
+        entries=[
+            {
+                "user_id": row.user_id,
+                "offer_order": row.offer_order,
+                "state": row.state,
+                "assigned_team_id": row.assigned_team_id,
+            }
+            for row in entry_rows
+        ],
+    )
+    next_state, decision = round_state.respond(current_user_id, payload.decision)
+    if decision.status == "missing":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Captain offer for the current user was not found.",
+        )
+    if decision.status == "closed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Deadlock captain round is already closed.",
+        )
+    if decision.status == "filled":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Captain slots are already filled.",
+        )
+    if decision.status not in {"updated", "accepted", "declined"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Captain offer is currently {decision.status}.",
+        )
+
+    if decision.status == "updated":
+        entry_rows_by_user_id = {row.user_id: row for row in entry_rows}
+        next_entries_by_user_id = {entry.user_id: entry for entry in next_state.entries}
+        for user_id, row in entry_rows_by_user_id.items():
+            next_entry = next_entries_by_user_id[user_id]
+            if row.state == next_entry.state and row.assigned_team_id == next_entry.assigned_team_id:
+                continue
+            row.state = next_entry.state
+            row.assigned_team_id = next_entry.assigned_team_id
+            if next_entry.state in {"accepted", "declined", "cancelled"}:
+                row.responded_at = auth_session.now
+
+        await write_audit_log(
+            db_session,
+            actor_user_id=current_user_id,
+            action="tournament.deadlock.captain_round.respond",
+            subject_type="tournament_deadlock_captain_round",
+            subject_id=str(active_round.id),
+            payload={
+                "tournament_slug": tournament.slug,
+                "decision": payload.decision,
+                "newly_offered_user_ids": list(decision.newly_offered_user_ids),
+                "cancelled_user_ids": list(decision.cancelled_user_ids),
+                "accepted_count": decision.accepted_count,
+                "offered_count": decision.offered_count,
+            },
+        )
+        await db_session.commit()
+
+    refreshed_round = await db_session.scalar(
+        select(TournamentDeadlockCaptainRound).where(TournamentDeadlockCaptainRound.id == active_round.id)
+    )
+    if refreshed_round is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Captain round not found.",
+        )
+    return await serialize_deadlock_captain_round(
+        db_session,
+        refreshed_round,
+        current_user_id=current_user_id,
+        include_entries=tournament.organizer_user_id == current_user_id,
     )
 
 
@@ -5151,9 +5280,77 @@ async def close_deadlock_captain_round(
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockCaptainRoundResponse:
-    raise HTTPException(
-        status_code=status.HTTP_410_GONE,
-        detail="Manual captain-round close is retired; captain selection is automatic.",
+    tournament = await get_tournament_or_404(db_session, slug)
+    ensure_deadlock_tournament_format(tournament)
+    ensure_tournament_organizer(auth_session, tournament)
+    try:
+        ensure_deadlock_roster_staging_allowed(
+            format_slug=tournament.format_slug,
+            tournament_status=tournament.status,
+            has_locked_deadlock_roster=await tournament_has_locked_deadlock_roster(
+                db_session,
+                tournament=tournament,
+            ),
+            action_name="Deadlock captain selection",
+        )
+    except TournamentWorkflowError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    active_round = await deadlock_captain_round_for_tournament(
+        db_session,
+        tournament_id=tournament.id,
+        active_only=True,
+    )
+    if active_round is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Deadlock captain round is not active.",
+        )
+
+    entry_rows = await deadlock_captain_entries_for_round(
+        db_session,
+        round_id=active_round.id,
+        for_update=True,
+    )
+    round_state = CaptainRoundState.active(
+        round_id=active_round.id,
+        teams_count=active_round.teams_count,
+        entries=[
+            {
+                "user_id": row.user_id,
+                "offer_order": row.offer_order,
+                "state": row.state,
+                "assigned_team_id": row.assigned_team_id,
+            }
+            for row in entry_rows
+        ],
+    ).close()
+
+    next_entries_by_user_id = {entry.user_id: entry for entry in round_state.entries}
+    for row in entry_rows:
+        next_entry = next_entries_by_user_id[row.user_id]
+        if row.state != next_entry.state:
+            row.state = next_entry.state
+            if next_entry.state == "cancelled":
+                row.responded_at = auth_session.now
+
+    active_round.status = "closed"
+    active_round.closed_at = auth_session.now
+    await write_audit_log(
+        db_session,
+        actor_user_id=auth_session.user.id,
+        action="tournament.deadlock.captain_round.close",
+        subject_type="tournament_deadlock_captain_round",
+        subject_id=str(active_round.id),
+        payload={"tournament_slug": tournament.slug},
+    )
+    await db_session.commit()
+    await db_session.refresh(active_round)
+    return await serialize_deadlock_captain_round(
+        db_session,
+        active_round,
+        current_user_id=auth_session.user.id,
+        include_entries=True,
     )
 
 
@@ -5167,9 +5364,105 @@ async def finalize_deadlock_captain_round(
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockCaptainRoundResponse:
-    raise HTTPException(
-        status_code=status.HTTP_410_GONE,
-        detail="Manual captain-round finalization is retired; captain selection is automatic.",
+    tournament = await get_tournament_or_404(db_session, slug)
+    ensure_deadlock_tournament_format(tournament)
+    ensure_tournament_organizer(auth_session, tournament)
+    try:
+        ensure_deadlock_roster_staging_allowed(
+            format_slug=tournament.format_slug,
+            tournament_status=tournament.status,
+            has_locked_deadlock_roster=await tournament_has_locked_deadlock_roster(
+                db_session,
+                tournament=tournament,
+            ),
+            action_name="Deadlock captain finalization",
+        )
+    except TournamentWorkflowError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    active_round = await deadlock_captain_round_for_tournament(
+        db_session,
+        tournament_id=tournament.id,
+        active_only=True,
+    )
+    if active_round is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Deadlock captain round is not active.",
+        )
+
+    entry_rows = await deadlock_captain_entries_for_round(
+        db_session,
+        round_id=active_round.id,
+        for_update=True,
+    )
+    round_state = CaptainRoundState.active(
+        round_id=active_round.id,
+        teams_count=active_round.teams_count,
+        entries=[
+            {
+                "user_id": row.user_id,
+                "offer_order": row.offer_order,
+                "state": row.state,
+                "assigned_team_id": row.assigned_team_id,
+            }
+            for row in entry_rows
+        ],
+    )
+    if not round_state.can_finalize:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Captain round cannot be finalized until every slot is accepted.",
+        )
+
+    accepted_user_ids = [entry.user_id for entry in round_state.entries if entry.state == "accepted"]
+    accepted_candidates = await db_session.execute(
+        select(
+            User.id.label("user_id"),
+            DeadlockProfile.rank,
+            DeadlockProfile.subrank,
+            DeadlockProfile.playtime,
+        )
+        .select_from(User)
+        .join(DeadlockProfile, DeadlockProfile.user_id == User.id)
+        .where(User.id.in_(accepted_user_ids))
+    )
+    assignments = assign_captain_team_numbers([dict(row._mapping) for row in accepted_candidates])
+    assigned_team_by_user_id = {assignment.user_id: assignment.team_id for assignment in assignments}
+
+    for row in entry_rows:
+        if row.user_id in assigned_team_by_user_id:
+            row.state = "assigned"
+            row.assigned_team_id = assigned_team_by_user_id[row.user_id]
+            row.responded_at = row.responded_at or auth_session.now
+        elif row.state in {"queued", "offered"}:
+            row.state = "cancelled"
+            row.responded_at = auth_session.now
+
+    active_round.status = "finalized"
+    active_round.finalized_at = auth_session.now
+    active_round.closed_at = active_round.closed_at or auth_session.now
+    await write_audit_log(
+        db_session,
+        actor_user_id=auth_session.user.id,
+        action="tournament.deadlock.captain_round.finalize",
+        subject_type="tournament_deadlock_captain_round",
+        subject_id=str(active_round.id),
+        payload={
+            "tournament_slug": tournament.slug,
+            "assigned_captains": [
+                {"user_id": user_id, "team_id": team_id}
+                for user_id, team_id in sorted(assigned_team_by_user_id.items(), key=lambda item: int(item[1]))
+            ],
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(active_round)
+    return await serialize_deadlock_captain_round(
+        db_session,
+        active_round,
+        current_user_id=auth_session.user.id,
+        include_entries=True,
     )
 
 
