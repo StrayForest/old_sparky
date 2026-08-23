@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Sword } from "lucide-react";
 import { CspImage } from "@/components/media/csp-image";
 import {
@@ -59,6 +59,7 @@ export function TournamentProfileTab({
     useState<CaptainPreference>(initialCaptainPreference);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [validationMessage, setValidationMessage] = useState("");
+  const saveInFlightRef = useRef(false);
 
   const hasChanges = !tournamentProfileEqual(
     draft,
@@ -68,6 +69,9 @@ export function TournamentProfileTab({
   );
 
   function applyDraft(next: PlayerProfile) {
+    if (saveInFlightRef.current) {
+      return;
+    }
     setDraft(next);
     onPreview(next);
     setSaveState("idle");
@@ -98,12 +102,18 @@ export function TournamentProfileTab({
   }
 
   function updateCaptainPreference(value: CaptainPreference) {
+    if (saveInFlightRef.current) {
+      return;
+    }
     setCaptainPreference(value);
     setSaveState("idle");
     setValidationMessage("");
   }
 
   async function saveProfile() {
+    if (saveInFlightRef.current) {
+      return;
+    }
     const parsed = profileUpdateSchema.safeParse({
       rank: draft.rank,
       subrank: draft.subrank,
@@ -120,6 +130,7 @@ export function TournamentProfileTab({
       return;
     }
 
+    saveInFlightRef.current = true;
     setSaveState("saving");
     setValidationMessage("");
     try {
@@ -144,10 +155,15 @@ export function TournamentProfileTab({
     } catch {
       setSaveState("error");
       setValidationMessage("Не удалось сохранить профиль. Попробуйте еще раз.");
+    } finally {
+      saveInFlightRef.current = false;
     }
   }
 
   function cancelChanges() {
+    if (saveInFlightRef.current) {
+      return;
+    }
     const next = cloneTournamentProfile(saved);
     setDraft(next);
     setCaptainPreference(savedCaptainPreference);
@@ -157,7 +173,7 @@ export function TournamentProfileTab({
   }
 
   return (
-    <section>
+    <section aria-busy={saveState === "saving"}>
       <ProfileBanner
         icon={<Sword size={40} />}
         title="Турнирные данные во время регистрации"
@@ -171,30 +187,35 @@ export function TournamentProfileTab({
               <div className="contact-list profile-settings-list">
                 <RankPicker
                   active={draft.rank}
+                  disabled={saveState === "saving"}
                   onSelect={(value) => setSingle("rank", value)}
                 />
                 <PillRow
                   label="Подранг"
                   values={subrankOptions}
                   active={draft.subrank}
+                  disabled={saveState === "saving"}
                   onSelect={(value) => setSingle("subrank", value)}
                 />
                 <PillRow
                   label="Часов в игре"
                   values={hoursOptions}
                   active={draft.hoursRange}
+                  disabled={saveState === "saving"}
                   onSelect={(value) => setSingle("hoursRange", value)}
                 />
                 <PillRow
                   label="Роли"
                   values={roleOptions}
                   active={draft.roles}
+                  disabled={saveState === "saving"}
                   onSelect={toggleRole}
                 />
                 <PillRow
                   label="Вероятность стать капитаном"
                   values={captainPreferenceOptions}
                   active={captainPreference}
+                  disabled={saveState === "saving"}
                   onSelect={(value) =>
                     updateCaptainPreference(value as CaptainPreference)
                   }
@@ -219,7 +240,7 @@ export function TournamentProfileTab({
                       }`}
                       type="button"
                       key={hero.name}
-                      disabled={unavailable}
+                      disabled={saveState === "saving" || unavailable}
                       onClick={() => toggleHero(hero.name)}
                     >
                       <CspImage
@@ -264,11 +285,13 @@ function PillRow({
   label,
   values,
   active,
+  disabled = false,
   onSelect,
 }: {
   label: string;
   values: readonly string[];
   active: string | string[];
+  disabled?: boolean;
   onSelect: (value: string) => void;
 }) {
   const activeValues = Array.isArray(active) ? active : [active];
@@ -282,6 +305,7 @@ function PillRow({
             data-testid={`profile-pill-${value
               .toLowerCase()
               .replace(/\s+/g, "-")}`}
+            disabled={disabled}
             type="button"
             key={value}
             onClick={() => onSelect(value)}
@@ -296,9 +320,11 @@ function PillRow({
 
 function RankPicker({
   active,
+  disabled = false,
   onSelect,
 }: {
   active: string;
+  disabled?: boolean;
   onSelect: (value: string) => void;
 }) {
   return (
@@ -309,6 +335,7 @@ function RankPicker({
             aria-label={`Ранг ${rank}`}
             className={active === rank ? "profile-rank-card active" : "profile-rank-card"}
             data-testid={`profile-pill-${rank.toLowerCase()}`}
+            disabled={disabled}
             key={rank}
             onClick={() => onSelect(rank)}
             type="button"
