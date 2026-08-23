@@ -58,9 +58,13 @@ after rollback pointer switch through the old `current` helper. Recovery uses a
 root-owned shared bundle and compatibility shim, while migration uncertainty
 remains fail-closed and no automatic Alembic downgrade is added. Closure evidence is in
 [`archive/as-17-release-transaction-recovery-2026-08-23.md`](archive/as-17-release-transaction-recovery-2026-08-23.md).
-The final GitHub security/build gate (`32637809369`) passed before production
-deployment `32638099084`; the deploy workflow now fails closed for any target
-SHA without `platform-security-build=success`.
+The final GitHub security/build gate (`32638426827`) passed before production
+deployment `32638711370`; the deploy workflow now fails closed for any target
+SHA without `platform-security-build=success`. The deployed release is
+`gha-32638711370-1-09574590cd80-20260823T121307Z`, and the server-side
+production diagnostics run `32639026796` also passed. Post-deploy content
+diagnostics (`32638938744`) and patch translation warm-up (`32638938742`)
+passed for the same SHA.
 AS-12 has code-side fail-closed validation and a read-only parity gate, while
 the VPS proof remains operator-owned. AS-13's CI contour is being revalidated
 against the current web/api/worker identities and units.

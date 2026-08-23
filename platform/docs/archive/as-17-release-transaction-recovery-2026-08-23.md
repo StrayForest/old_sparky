@@ -4,11 +4,13 @@
 - Closed: 2026-08-23
 - Implementation commit: `f5189826613d4afa2d48f834d6fbf006f4c024dd`
 - CI/CD gate hardening commit: `bbe10ae17c0686f3145695714f7b2dcc01a3063c`
-- Security/build run: `32637809369`
-- Production deployment run: `32638099084`
-- Production deployment: [GitHub Actions run](https://github.com/StrayForest/old_sparky/actions/runs/32638099084)
-- Verified production release: `gha-32638099084-1-bbe10ae17c06-20260823T120031Z`
-- Previous release retained: `gha-32636564272-1-f5189826613d-20260823T112755Z`
+- CI/documentation routing commit: `09574590cd80238b7441d93ef8377ddfd3b4cc07`
+- Security/build run: `32638426827`
+- Production deployment run: `32638711370`
+- Production deployment: [GitHub Actions run](https://github.com/StrayForest/old_sparky/actions/runs/32638711370)
+- Verified production release: `gha-32638711370-1-09574590cd80-20260823T121307Z`
+- Previous release retained: `gha-32638099084-1-bbe10ae17c06-20260823T120031Z`
+- Server-side production diagnostics: [GitHub Actions run](https://github.com/StrayForest/old_sparky/actions/runs/32639026796)
 - Alembic head: `20260822_0040`; no automatic downgrade was added
 
 ## Original finding
@@ -46,18 +48,19 @@ pointers, venv, units, Nginx, restart, smoke, activation commit and final
 receipt cleanup. The two-process regression also kills rollback after pointer
 switch, invokes the old `current/tools/platform_release_rollback.sh`, and
 verifies receipt, pointers, venv, units and Nginx recovery through the shared
-bundle. The final GitHub security/build run `32637809369` passed backend,
+bundle. The final GitHub security/build run `32638426827` passed backend,
 migration, web, web-hermetic, documentation, static/security and aggregate
-status gates. Server-side media/content diagnostics for the exact SHA also
-passed in runs `32637809378` and `32637809347`.
+status gates. Post-deploy server-side content diagnostics and patch translation
+warm-up for the exact SHA passed in runs `32638938744` and `32638938742`; the
+explicit production diagnostics workflow passed in run `32639026796`.
 
-Production run `32638099084` passed the fail-closed exact-SHA security gate,
+Production run `32638711370` passed the fail-closed exact-SHA security gate,
 preflight, immutable build/checksum,
 release deployment, service/unit preparation, Nginx dry-run/apply, origin and
 public deployment smoke, and the success deployment status. Live checks showed
 active API/worker/web/Nginx services, API and web readiness `200`, successful
 Nginx syntax validation, Alembic head `20260822_0040`, and
-`current`=`gha-32638099084-1-bbe10ae17c06-20260823T120031Z` with the previous
+`current`=`gha-32638711370-1-09574590cd80-20260823T121307Z` with the previous
 release retained as the explicit rollback target.
 
 ## Retained invariant
