@@ -36,7 +36,12 @@ def create_app() -> FastAPI:
             allow_origins=[settings.platform_web_origin],
             allow_credentials=True,
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-            allow_headers=["Content-Type", "X-CSRF-Token", "X-Platform-QA-Phase"],
+            allow_headers=[
+                "Content-Type",
+                "Idempotency-Key",
+                "X-CSRF-Token",
+                "X-Platform-QA-Phase",
+            ],
             expose_headers=[
                 "X-CSRF-Token",
                 "X-Total-Count",

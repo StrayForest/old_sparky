@@ -350,6 +350,16 @@ async def _select_deadlock_automation_cohort(
     return selected, max(total_candidates - len(selected), 0)
 
 
+async def _lock_tournament_for_failure_state(
+    db_session: AsyncSession,
+    tournament_id: str,
+) -> Tournament | None:
+    try:
+        return await lock_tournament_for_workflow(db_session, tournament_id)
+    except TournamentWorkflowError:
+        return None
+
+
 async def run_deadlock_automation_once(now: datetime | None = None) -> dict[str, int]:
     async with session_factory()() as db_session:
         result = await run_deadlock_automation_tick(db_session, now=now)
@@ -417,7 +427,7 @@ async def run_deadlock_automation_tick(
             )
         except Exception as exc:  # pragma: no cover - defensive boundary for worker loop
             await db_session.rollback()
-            fresh_tournament = await db_session.scalar(select(Tournament).where(Tournament.id == tournament_id))
+            fresh_tournament = await _lock_tournament_for_failure_state(db_session, tournament_id)
             if fresh_tournament is not None:
                 _record_automation_failure(
                     fresh_tournament,
@@ -451,7 +461,7 @@ async def advance_deadlock_tournament_automation(
         )
     except (AutoAssignmentError, TournamentWorkflowError) as exc:
         await db_session.rollback()
-        fresh_tournament = await db_session.scalar(select(Tournament).where(Tournament.id == tournament_id))
+        fresh_tournament = await _lock_tournament_for_failure_state(db_session, tournament_id)
         if fresh_tournament is not None:
             _record_automation_failure(
                 fresh_tournament,

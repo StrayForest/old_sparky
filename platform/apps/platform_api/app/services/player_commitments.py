@@ -299,15 +299,56 @@ async def reactivate_viable_tournament_commitments(
     )
 
 
+async def lock_active_commitment_tournaments(
+    db_session: AsyncSession,
+) -> tuple[str, ...]:
+    tournament_ids = tuple(
+        sorted(
+            {
+                str(tournament_id)
+                for tournament_id in (
+                    await db_session.scalars(
+                        select(PlayerTournamentCommitment.tournament_id).where(
+                            PlayerTournamentCommitment.released_at.is_(None)
+                        )
+                    )
+                ).all()
+            }
+        )
+    )
+    if not tournament_ids:
+        return ()
+    locked_ids = (
+        await db_session.scalars(
+            select(Tournament.id)
+            .where(Tournament.id.in_(tournament_ids))
+            .order_by(Tournament.id.asc())
+            .with_for_update()
+        )
+    ).all()
+    return tuple(str(tournament_id) for tournament_id in locked_ids)
+
+
 async def reconcile_player_commitments(
     db_session: AsyncSession,
     *,
     now: datetime,
 ) -> CommitmentReconciliationResult:
+    # Reconciliation is a workflow writer.  Lock every affected stable parent
+    # row first, in deterministic id order, before deriving release decisions.
+    locked_tournament_ids = await lock_active_commitment_tournaments(db_session)
+    if not locked_tournament_ids:
+        return CommitmentReconciliationResult(
+            terminal_released=0,
+            eliminated_released=0,
+            mismatched_released=0,
+        )
+
     terminal_result = await db_session.execute(
         update(PlayerTournamentCommitment)
         .where(
             PlayerTournamentCommitment.released_at.is_(None),
+            PlayerTournamentCommitment.tournament_id.in_(locked_tournament_ids),
             exists(
                 select(1).where(
                     Tournament.id == PlayerTournamentCommitment.tournament_id,
@@ -324,6 +365,7 @@ async def reconcile_player_commitments(
         update(PlayerTournamentCommitment)
         .where(
             PlayerTournamentCommitment.released_at.is_(None),
+            PlayerTournamentCommitment.tournament_id.in_(locked_tournament_ids),
             exists(
                 select(1).where(
                     TournamentMatch.tournament_id == PlayerTournamentCommitment.tournament_id,
@@ -351,7 +393,10 @@ async def reconcile_player_commitments(
                 PlayerTournamentCommitment.user_id,
                 PlayerTournamentCommitment.team_id,
                 PlayerTournamentCommitment.assignment_run_id,
-            ).where(PlayerTournamentCommitment.released_at.is_(None))
+            ).where(
+                PlayerTournamentCommitment.released_at.is_(None),
+                PlayerTournamentCommitment.tournament_id.in_(locked_tournament_ids),
+            )
         )
     ).all()
     run_ids = sorted({str(row.assignment_run_id) for row in active_rows})

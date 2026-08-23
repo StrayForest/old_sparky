@@ -11,7 +11,7 @@ from hmac import compare_digest
 
 from fastapi import Depends, HTTPException, Request, Response, status
 from pwdlib import PasswordHash
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,7 +21,7 @@ from python_packages.platform_infra.auth_lifecycle import (
 )
 from python_packages.platform_infra.config import PlatformSettings, get_settings
 from python_packages.platform_infra.csrf import clear_csrf_cookie
-from python_packages.platform_infra.db import get_db_session
+from python_packages.platform_infra.db import get_db_session, session_factory
 from python_packages.platform_infra.models import Role, User, UserRole, UserSession
 from python_packages.platform_infra.turnstile import (
     normalized_turnstile_mode,
@@ -447,9 +447,15 @@ async def invalidate_user_sessions(
 
 
 async def _touch_authenticated_session(
-    db_session: AsyncSession,
     auth_session: AuthenticatedSession,
 ) -> None:
+    """Persist last-seen metadata without committing the caller's transaction.
+
+    Authentication is a dependency of mutation serializers.  A session touch
+    therefore must use its own short transaction so a metadata write can never
+    release Tournament/Invite locks already owned by the request session.
+    """
+
     settings = get_settings()
     touch_before = auth_session.now - timedelta(
         seconds=settings.platform_session_touch_interval_seconds
@@ -457,16 +463,24 @@ async def _touch_authenticated_session(
     last_seen_at = auth_session.session.last_seen_at
     if last_seen_at is not None and last_seen_at > touch_before:
         return
-    await db_session.execute(
-        update(UserSession)
-        .where(
-            UserSession.id == auth_session.session.id,
-            UserSession.invalidated_at.is_(None),
+
+    factory = session_factory()
+    async with factory() as touch_session:
+        result = await touch_session.execute(
+            update(UserSession)
+            .where(
+                UserSession.id == auth_session.session.id,
+                UserSession.invalidated_at.is_(None),
+                or_(
+                    UserSession.last_seen_at.is_(None),
+                    UserSession.last_seen_at <= touch_before,
+                ),
+            )
+            .values(last_seen_at=auth_session.now)
         )
-        .values(last_seen_at=auth_session.now)
-    )
-    await db_session.commit()
-    auth_session.session.last_seen_at = auth_session.now
+        await touch_session.commit()
+    if int(result.rowcount or 0) > 0:
+        auth_session.session.last_seen_at = auth_session.now
 
 
 async def get_authenticated_session(
@@ -509,7 +523,7 @@ async def get_authenticated_session(
 
     roles = frozenset(str(role_slug) for _, _, role_slug in rows if role_slug)
     auth_session = AuthenticatedSession(user=user, session=user_session, role_slugs=roles, now=now)
-    await _touch_authenticated_session(db_session, auth_session)
+    await _touch_authenticated_session(auth_session)
     remember_authenticated_session(token_digest, auth_session)
     return auth_session
 
@@ -580,6 +594,6 @@ async def get_optional_authenticated_session(
 
     roles = frozenset(str(role_slug) for _, _, role_slug in rows if role_slug)
     auth_session = AuthenticatedSession(user=user, session=user_session, role_slugs=roles, now=now)
-    await _touch_authenticated_session(db_session, auth_session)
+    await _touch_authenticated_session(auth_session)
     remember_authenticated_session(token_digest, auth_session)
     return auth_session

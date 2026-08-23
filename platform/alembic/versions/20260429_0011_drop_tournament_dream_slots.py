@@ -11,12 +11,25 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
-        DELETE FROM platform.tournaments
-        WHERE format_slug <> 'solo_balanced_deadlock'
-        """
+    legacy_tournament_count = int(
+        op.get_bind().scalar(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM platform.tournaments
+                WHERE format_slug <> 'solo_balanced_deadlock'
+                """
+            )
+        )
+        or 0
     )
+    if legacy_tournament_count:
+        raise RuntimeError(
+            "Cannot apply 20260429_0011 safely: found "
+            f"{legacy_tournament_count} non-solo tournament(s). "
+            "Migrate or archive those rows explicitly before retrying; "
+            "this migration will not delete tournament data."
+        )
     op.drop_index(
         "ix_tournament_deadlock_dream_slots_user_id",
         table_name="tournament_deadlock_dream_slots",
