@@ -109,6 +109,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('sudo -EH env \\\n            PLATFORM_RELEASE_OUTPUT_DIR=', workflow)
         self.assertIn('sudo find "$ci_build_root/platform/dist/releases"', workflow)
         self.assertIn('sudo chown "$(id -u):$(id -g)"', workflow)
+        self.assertIn(
+            '(cd "$release_output" && sha256sum -c "$(basename "$release_checksum")")',
+            workflow,
+        )
         remote_start = workflow.index("<<'REMOTE'")
         remote_script = workflow[remote_start:]
         self.assertNotIn("platform_build_release.sh", remote_script)
