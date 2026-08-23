@@ -3,10 +3,12 @@
 - Status: Archived / resolved
 - Closed: 2026-08-23
 - Implementation commit: `f5189826613d4afa2d48f834d6fbf006f4c024dd`
-- Production deployment run: `32636564272`
-- Production deployment: [GitHub Actions run](https://github.com/StrayForest/old_sparky/actions/runs/32636564272)
-- Verified production release: `gha-32636564272-1-f5189826613d-20260823T112755Z`
-- Previous release retained: `gha-32634067684-1-356d7832d480-20260823T103422Z`
+- CI/CD gate hardening commit: `bbe10ae17c0686f3145695714f7b2dcc01a3063c`
+- Security/build run: `32637809369`
+- Production deployment run: `32638099084`
+- Production deployment: [GitHub Actions run](https://github.com/StrayForest/old_sparky/actions/runs/32638099084)
+- Verified production release: `gha-32638099084-1-bbe10ae17c06-20260823T120031Z`
+- Previous release retained: `gha-32636564272-1-f5189826613d-20260823T112755Z`
 - Alembic head: `20260822_0040`; no automatic downgrade was added
 
 ## Original finding
@@ -44,15 +46,18 @@ pointers, venv, units, Nginx, restart, smoke, activation commit and final
 receipt cleanup. The two-process regression also kills rollback after pointer
 switch, invokes the old `current/tools/platform_release_rollback.sh`, and
 verifies receipt, pointers, venv, units and Nginx recovery through the shared
-bundle. The full platform test gate, docs check, shell/Python syntax checks and
-secret scan passed.
+bundle. The final GitHub security/build run `32637809369` passed backend,
+migration, web, web-hermetic, documentation, static/security and aggregate
+status gates. Server-side media/content diagnostics for the exact SHA also
+passed in runs `32637809378` and `32637809347`.
 
-Production run `32636564272` passed preflight, immutable build/checksum,
+Production run `32638099084` passed the fail-closed exact-SHA security gate,
+preflight, immutable build/checksum,
 release deployment, service/unit preparation, Nginx dry-run/apply, origin and
 public deployment smoke, and the success deployment status. Live checks showed
 active API/worker/web/Nginx services, API and web readiness `200`, successful
 Nginx syntax validation, Alembic head `20260822_0040`, and
-`current`=`gha-32636564272-1-f5189826613d-20260823T112755Z` with the previous
+`current`=`gha-32638099084-1-bbe10ae17c06-20260823T120031Z` with the previous
 release retained as the explicit rollback target.
 
 ## Retained invariant
