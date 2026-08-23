@@ -135,7 +135,6 @@ from apps.platform_api.app.services.tournament_workflow import (
     ready_vote_requires_automation,
     serialize_deadlock_ready_round,
     tournament_has_locked_deadlock_roster,
-    transition_locked_tournament_status,
     transition_tournament_status,
     upsert_deadlock_ready_vote,
 )
