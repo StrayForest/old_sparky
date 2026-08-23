@@ -54,6 +54,18 @@ For completed substantive work:
 
 A local-only commit is not a completed handoff. Never automatically use `--force` or `--force-with-lease`; reconcile any divergence first.
 
+## Production deployment
+
+- Normal production releases must be started through the GitHub Actions
+  `Platform production deploy` workflow from the reviewed `dev` branch:
+  `gh workflow run platform-production-deploy.yml --repo StrayForest/old_sparky --ref dev --field mode=deploy`.
+- Wait for and report the GitHub Actions run and its live deployment result;
+  a successful branch push is not a production deployment.
+- Do not invoke `platform_build_release.sh` or `platform_release_deploy.sh`
+  directly from the Codex shell or production host for a normal release.
+  Direct host commands are reserved for an explicitly authorized recovery or
+  rollback procedure.
+
 ## Verification
 
 - Platform tests: from `platform/`, `tools/platform_run_quiet.sh "platform tests" -- tools/platform_run_tests.sh discover -s tests`.

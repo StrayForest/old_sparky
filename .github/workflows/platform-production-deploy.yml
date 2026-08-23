@@ -62,6 +62,14 @@ jobs:
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
 
+      - name: Require reviewed dev branch for deployment
+        if: ${{ env.DEPLOY_MODE == 'deploy' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Production deploys must target the reviewed dev branch." >&2; exit 1; }
+
       - name: Checkout the CI-verified source
         if: ${{ env.DEPLOY_MODE == 'deploy' }}
         uses: actions/checkout@v6

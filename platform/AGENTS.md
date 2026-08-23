@@ -29,6 +29,18 @@
 - Completed substantive work must be committed and pushed to the matching GitHub branch; verify local `HEAD` equals `origin/<branch>` after push.
 - Never force-push automatically.
 
+## Production deployment
+
+- Start normal production releases only through the GitHub Actions `Platform
+  production deploy` workflow from the reviewed `dev` branch:
+  `gh workflow run platform-production-deploy.yml --repo StrayForest/old_sparky --ref dev --field mode=deploy`.
+- Wait for the Actions run and include its run ID/URL and live result in the
+  handoff. A push to `dev` alone is not a deployment.
+- Do not run `tools/platform_build_release.sh` or
+  `tools/platform_release_deploy.sh` directly from an agent shell for a normal
+  release; direct server execution is recovery/rollback-only and requires
+  explicit operator authorization.
+
 ## Verification
 
 - API/domain: `.venv_platform/bin/python -m unittest discover -s tests` from this directory.
