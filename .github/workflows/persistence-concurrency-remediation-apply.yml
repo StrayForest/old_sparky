@@ -9,11 +9,26 @@ on:
 
 permissions:
   contents: write
+  statuses: write
 
 jobs:
   apply:
     runs-on: ubuntu-latest
     steps:
+      - name: Mark remediation apply pending
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            --data "{\"state\":\"pending\",\"context\":\"persistence-remediation-apply\",\"description\":\"Persistence remediation is applying\",\"target_url\":\"${run_url}\"}"
       - uses: actions/checkout@v6
         with:
           ref: dev
@@ -50,3 +65,25 @@ jobs:
           fi
           git commit -m "fix(platform): harden persistence concurrency invariants"
           git push origin HEAD:dev
+      - name: Publish remediation apply result
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ job.status }}" == "success" ]]; then
+            state=success
+            description="Persistence remediation applied"
+          else
+            state=failure
+            description="Persistence remediation apply failed"
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            --data "{\"state\":\"${state}\",\"context\":\"persistence-remediation-apply\",\"description\":\"${description}\",\"target_url\":\"${run_url}\"}"
