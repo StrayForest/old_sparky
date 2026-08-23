@@ -60,11 +60,13 @@ remains fail-closed and no automatic Alembic downgrade is added. Closure evidenc
 [`archive/as-17-release-transaction-recovery-2026-08-23.md`](archive/as-17-release-transaction-recovery-2026-08-23.md).
 The final GitHub security/build gate (`32638426827`) passed before production
 deployment `32638711370`; the deploy workflow now fails closed for any target
-SHA without `platform-security-build=success`. The deployed release is
-`gha-32638711370-1-09574590cd80-20260823T121307Z`, and the server-side
-production diagnostics run `32639026796` also passed. Post-deploy content
-diagnostics (`32638938744`) and patch translation warm-up (`32638938742`)
-passed for the same SHA.
+SHA without `platform-security-build=success`. The final runtime release is
+`gha-32638711370-1-09574590cd80-20260823T121307Z`; the subsequent docs-only
+release `gha-32639416463-1-7b7224feb13e-20260823T122756Z` was deployed through
+the same gate and retained that runtime state. Server-side production
+diagnostics passed for both release SHAs in runs `32639026796` and
+`32639662616`; post-deploy content diagnostics (`32638938744`, `32639641466`)
+and patch translation warm-up (`32638938742`, `32639641488`) also passed.
 AS-12 has code-side fail-closed validation and a read-only parity gate, while
 the VPS proof remains operator-owned. AS-13's CI contour is being revalidated
 against the current web/api/worker identities and units.

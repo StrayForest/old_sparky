@@ -11,6 +11,8 @@
 - Verified production release: `gha-32638711370-1-09574590cd80-20260823T121307Z`
 - Previous release retained: `gha-32638099084-1-bbe10ae17c06-20260823T120031Z`
 - Server-side production diagnostics: [GitHub Actions run](https://github.com/StrayForest/old_sparky/actions/runs/32639026796)
+- Docs-only follow-up deployment: [GitHub Actions run](https://github.com/StrayForest/old_sparky/actions/runs/32639416463)
+- Docs-only release: `gha-32639416463-1-7b7224feb13e-20260823T122756Z`
 - Alembic head: `20260822_0040`; no automatic downgrade was added
 
 ## Original finding
@@ -53,6 +55,9 @@ migration, web, web-hermetic, documentation, static/security and aggregate
 status gates. Post-deploy server-side content diagnostics and patch translation
 warm-up for the exact SHA passed in runs `32638938744` and `32638938742`; the
 explicit production diagnostics workflow passed in run `32639026796`.
+The docs-only follow-up deployment `32639416463` and its server-side
+production diagnostics `32639662616` also passed; it did not change the
+runtime implementation or migration state.
 
 Production run `32638711370` passed the fail-closed exact-SHA security gate,
 preflight, immutable build/checksum,
