@@ -128,26 +128,28 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)"
-          ci_build_root="$RUNNER_TEMP/old-sparky-release-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          rm -rf -- "$ci_build_root"
-          install -d -m 0755 "$ci_build_root"
-          cp -a "$GITHUB_WORKSPACE/." "$ci_build_root/"
-          python3 -m venv "$ci_build_root/platform/.venv_platform"
-          sudo install -d -o root -g root -m 0755 "$ci_build_root/platform/dist"
+          ci_build_root=/root/old_sparky
+          sudo rm -rf -- "$ci_build_root"
+          sudo install -d -o root -g root -m 0755 "$ci_build_root"
+          sudo cp -a "$GITHUB_WORKSPACE/." "$ci_build_root/"
+          sudo chown -R root:root "$ci_build_root"
+          sudo -EH python3 -m venv "$ci_build_root/platform/.venv_platform"
           sudo install -d -o root -g root -m 0755 "$ci_build_root/platform/dist/releases"
           sudo -EH env \
             PLATFORM_RELEASE_OUTPUT_DIR="$ci_build_root/platform/dist/releases" \
             "$ci_build_root/platform/tools/platform_build_release.sh" "$RELEASE_SLUG"
-          sudo chown -R "$(id -u):$(id -g)" "$ci_build_root/platform/dist/releases"
-          release_archive="$(find "$ci_build_root/platform/dist/releases" -maxdepth 1 -type f -name "${RELEASE_SLUG}-*.tar.gz" -print -quit)"
+          release_archive="$(sudo find "$ci_build_root/platform/dist/releases" -maxdepth 1 -type f -name "${RELEASE_SLUG}-*.tar.gz" -print -quit)"
           test -n "$release_archive" || { echo "CI release artifact was not produced" >&2; exit 1; }
           release_checksum="${release_archive}.sha256"
-          test -f "$release_checksum"
+          sudo test -f "$release_checksum"
           release_output="$GITHUB_WORKSPACE/ci-release"
           rm -rf -- "$release_output"
           install -d -m 0755 "$release_output"
-          install -m 0644 "$release_archive" "$release_output/$(basename "$release_archive")"
-          install -m 0644 "$release_checksum" "$release_output/$(basename "$release_checksum")"
+          sudo install -m 0644 "$release_archive" "$release_output/$(basename "$release_archive")"
+          sudo install -m 0644 "$release_checksum" "$release_output/$(basename "$release_checksum")"
+          sudo chown "$(id -u):$(id -g)" \
+            "$release_output/$(basename "$release_archive")" \
+            "$release_output/$(basename "$release_checksum")"
           sha256sum -c "$release_output/$(basename "$release_checksum")"
 
       - name: Publish immutable release artifact
