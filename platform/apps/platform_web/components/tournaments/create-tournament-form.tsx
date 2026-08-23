@@ -1037,7 +1037,7 @@ function SchedulePicker({
   );
 }
 
-const WEEKDAY_LABELS = ("Пн Вт Ср Чт Пт Вс").split(" ");
+const WEEKDAY_LABELS = ("Пн Вт Ср Чт Пт Сб Вс").split(" ");
 
 function buildTimeOptions(minTime?: string): string[] {
   const minimumMinutes = minTime ? roundTimeUpToTen(timeToMinutes(minTime)) : 0;
