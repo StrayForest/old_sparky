@@ -41,6 +41,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("--abort-retained", deploy)
         self.assertIn("MIGRATION_NOT_REVERSED", deploy)
         self.assertIn('"$TOOLS_DIR/platform_release_preflight.sh"', deploy)
+        self.assertIn("acquire_release_lock", deploy)
         self.assertIn("platform_install_systemd_units.sh", deploy)
         self.assertIn("platform_deploy_smoke.py", deploy)
 

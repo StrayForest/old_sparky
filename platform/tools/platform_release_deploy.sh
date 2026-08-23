@@ -127,11 +127,6 @@ if [[ ! -d "$APP_DIR" || -L "$APP_DIR" || ! -d "$SHARED_DIR" || -L "$SHARED_DIR"
   exit 1
 fi
 exec {RELEASE_LOCK_FD}<"$SHARED_DIR"
-if ! /usr/bin/flock -n "$RELEASE_LOCK_FD"; then
-  echo "Another platform install or rollback operation holds the release lock." >&2
-  exit 3
-fi
-
 json_field() {
   local field="$1"
   /usr/bin/python3 -I -c \
@@ -188,6 +183,13 @@ print_retained_state() {
 }
 trap print_retained_state EXIT
 
+acquire_release_lock() {
+  if ! /usr/bin/flock -n "$RELEASE_LOCK_FD"; then
+    echo "Another platform install or rollback operation holds the release lock." >&2
+    exit 3
+  fi
+}
+
 abort_retained_release() {
   local retained_phase="$1"
   case "$retained_phase" in
@@ -233,6 +235,7 @@ abort_retained_release() {
 }
 
 if [[ "$ABORT_RETAINED" -eq 1 ]]; then
+  acquire_release_lock
   if [[ ! -f "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
     echo "No retained release transaction exists to abort." >&2
     exit 1
@@ -251,6 +254,8 @@ if [[ "$RESUME" -eq 0 ]]; then
   release_preflight
   "$INSTALL_TOOL" --stage-only "$ARTIFACT" "$APP_DIR"
 fi
+
+acquire_release_lock
 
 if [[ ! -f "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
   echo "No durable release transaction is available." >&2
