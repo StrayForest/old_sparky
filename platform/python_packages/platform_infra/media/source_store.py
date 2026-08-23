@@ -287,8 +287,16 @@ class MediaSourceStore:
     @contextmanager
     def _quota_lock(self) -> Iterator[None]:
         lock_path = self.root / ".quota.lock"
-        with lock_path.open("a+b") as lock_file:
-            os.chmod(lock_path, 0o600)
+        lock_descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
+            0o600,
+        )
+        with os.fdopen(lock_descriptor, "a+b") as lock_file:
+            if os.fstat(lock_file.fileno()).st_mode & 0o007:
+                raise PermissionError(
+                    f"Media staging quota lock must not be world-accessible: {lock_path}"
+                )
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
                 yield

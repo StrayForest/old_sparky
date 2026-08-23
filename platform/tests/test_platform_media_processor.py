@@ -49,6 +49,20 @@ class MediaSourceStoreTests(unittest.TestCase):
 
             self.assertEqual(os.stat(root).st_mode & 0o7777, 0o2770)
 
+    def test_preserves_permissions_of_prepared_shared_quota_lock(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "shared"
+            root.mkdir(mode=0o700)
+            os.chmod(root, 0o2770)
+            lock_path = root / ".quota.lock"
+            lock_path.touch(mode=0o600)
+            os.chmod(lock_path, 0o660)
+
+            store = MediaSourceStore(root)
+            store.cleanup_stale_temporary_files(older_than_epoch=0, limit=1)
+
+            self.assertEqual(os.stat(lock_path).st_mode & 0o777, 0o660)
+
     def test_rejects_world_accessible_staging_directory(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "shared"
