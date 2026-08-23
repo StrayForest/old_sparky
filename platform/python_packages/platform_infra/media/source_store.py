@@ -76,7 +76,15 @@ class MediaSourceStore:
         self.max_staged_bytes = max_staged_bytes
         self.max_staged_files = max_staged_files
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
+        root_mode = self.root.stat().st_mode
+        if root_mode & 0o007:
+            raise PermissionError(
+                f"Media staging directory must not be world-accessible: {self.root}"
+            )
+        if not os.access(self.root, os.W_OK | os.X_OK):
+            raise PermissionError(
+                f"Media staging directory is not writable: {self.root}"
+            )
 
     def path_for(self, asset_id: str) -> Path:
         return self.root / f"{validate_asset_id(asset_id)}.source"

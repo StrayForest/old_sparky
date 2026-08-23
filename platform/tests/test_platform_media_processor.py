@@ -39,6 +39,25 @@ class MediaSourceStoreTests(unittest.TestCase):
             self.assertEqual(os.stat(staged.path).st_mode & 0o777, 0o600)
             self.assertEqual(tuple(store.staged_asset_ids(limit=4)), (asset_id,))
 
+    def test_preserves_permissions_of_prepared_shared_staging_directory(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "shared"
+            root.mkdir(mode=0o700)
+            os.chmod(root, 0o2770)
+
+            MediaSourceStore(root)
+
+            self.assertEqual(os.stat(root).st_mode & 0o7777, 0o2770)
+
+    def test_rejects_world_accessible_staging_directory(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "shared"
+            root.mkdir(mode=0o700)
+            os.chmod(root, 0o755)
+
+            with self.assertRaisesRegex(PermissionError, "world-accessible"):
+                MediaSourceStore(root)
+
     def test_rejects_trailing_polyglot_data_and_removes_temporary_file(self) -> None:
         with TemporaryDirectory() as directory:
             store = MediaSourceStore(Path(directory) / "private", max_input_bytes=1024)
