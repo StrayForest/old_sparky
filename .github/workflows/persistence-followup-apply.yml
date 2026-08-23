@@ -1,16 +1,13 @@
 name: Apply persistence follow-up hardening
 
-on:
-  push:
-    branches: [automation/persistence-remediation-20260823]
-    paths:
-      - ".github/workflows/persistence-followup-apply.yml"
+on: push
 
 permissions:
   contents: write
 
 jobs:
   apply:
+    if: github.ref == 'refs/heads/automation/persistence-remediation-20260823'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
