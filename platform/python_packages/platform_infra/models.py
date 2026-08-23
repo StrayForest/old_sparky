@@ -665,11 +665,9 @@ class TournamentMatch(TimestampMixin, Base):
         CheckConstraint(
             "status <> 'completed' OR ("
             "(winner_side = 'home' AND home_score IS NOT NULL AND away_score IS NOT NULL "
-            "AND home_score > away_score AND home_team_id IS NOT NULL "
-            "AND winner_team_id = home_team_id) OR "
+            "AND home_score > away_score) OR "
             "(winner_side = 'away' AND home_score IS NOT NULL AND away_score IS NOT NULL "
-            "AND away_score > home_score AND away_team_id IS NOT NULL "
-            "AND winner_team_id = away_team_id))",
+            "AND away_score > home_score))",
             name="completed_result_consistent",
         ),
     )
