@@ -105,6 +105,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("PUBLISHED_ARTIFACT_DIGEST", workflow)
         self.assertIn("RELEASE.provenance.json", workflow)
         self.assertIn("artifact_sha256", workflow)
+        self.assertIn(
+            'ci_build_root="$RUNNER_TEMP/old-sparky-release-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+            workflow,
+        )
+        self.assertNotIn("sudo rm -rf -- /root/old_sparky", workflow)
         remote_start = workflow.index("<<'REMOTE'")
         remote_script = workflow[remote_start:]
         self.assertNotIn("platform_build_release.sh", remote_script)

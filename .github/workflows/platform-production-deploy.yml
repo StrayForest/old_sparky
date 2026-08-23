@@ -128,16 +128,15 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)"
-          sudo rm -rf -- /root/old_sparky
-          sudo install -d -o root -g root -m 0755 /root/old_sparky
-          sudo cp -a "$GITHUB_WORKSPACE/." /root/old_sparky/
-          sudo chown -R root:root /root/old_sparky
-          sudo -EH python3 -m venv /root/old_sparky/platform/.venv_platform
-          sudo install -d -o root -g root -m 0755 /root/old_sparky/platform/dist/releases
-          sudo -EH env \
-            PLATFORM_RELEASE_OUTPUT_DIR=/root/old_sparky/platform/dist/releases \
-            /root/old_sparky/platform/tools/platform_build_release.sh "$RELEASE_SLUG"
-          release_archive="$(find /root/old_sparky/platform/dist/releases -maxdepth 1 -type f -name "${RELEASE_SLUG}-*.tar.gz" -print -quit)"
+          ci_build_root="$RUNNER_TEMP/old-sparky-release-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf -- "$ci_build_root"
+          install -d -m 0755 "$ci_build_root"
+          cp -a "$GITHUB_WORKSPACE/." "$ci_build_root/"
+          python3 -m venv "$ci_build_root/platform/.venv_platform"
+          install -d -m 0755 "$ci_build_root/platform/dist/releases"
+          PLATFORM_RELEASE_OUTPUT_DIR="$ci_build_root/platform/dist/releases" \
+            "$ci_build_root/platform/tools/platform_build_release.sh" "$RELEASE_SLUG"
+          release_archive="$(find "$ci_build_root/platform/dist/releases" -maxdepth 1 -type f -name "${RELEASE_SLUG}-*.tar.gz" -print -quit)"
           test -n "$release_archive" || { echo "CI release artifact was not produced" >&2; exit 1; }
           release_checksum="${release_archive}.sha256"
           test -f "$release_checksum"
