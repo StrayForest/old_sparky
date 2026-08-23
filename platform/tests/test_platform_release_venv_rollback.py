@@ -824,14 +824,17 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         (release / ".env.platform.example").write_text("PLATFORM_TESTING=1\n")
         (release / "requirements-platform.txt").write_text("pip==26.1.2\n")
         lock = release / "requirements-platform.lock.txt"
-        lock.write_text("pip==26.1.2\n")
-        lock.chmod(0o644)
         freeze = release / "requirements-platform.freeze.txt"
         freeze.write_text("pip==26.1.2\n")
         freeze.chmod(0o444)
         wheelhouse = release / "wheelhouse"
         wheelhouse.mkdir()
-        self.add_fake_pip_wheel(wheelhouse, result=pip_result)
+        pip_wheel = self.add_fake_pip_wheel(wheelhouse, result=pip_result)
+        lock.write_text(
+            "pip==26.1.2 --hash=sha256:"
+            f"{hashlib.sha256(pip_wheel.read_bytes()).hexdigest()}\n"
+        )
+        lock.chmod(0o644)
         platform_validate_wheelhouse.create_manifest(
             wheelhouse,
             release / "requirements-platform.txt",
