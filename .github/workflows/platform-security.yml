@@ -104,7 +104,9 @@ jobs:
           sudo ln -s /opt/oldsparky/platform/releases/ci-current /opt/oldsparky/platform/previous
           sudo ln -s /usr/bin/python3 /opt/oldsparky/platform/shared/venv/bin/python
           sudo mkdir -p /opt/oldsparky/platform/current/apps/platform_web/.next/cache
-          sudo install -o root -g root -m 0600 /dev/null /opt/oldsparky/platform/shared/.env.platform
+          sudo install -o root -g root -m 0600 \
+            /root/old_sparky/platform/.env.platform.example \
+            /opt/oldsparky/platform/shared/.env.platform
           sudo mkdir -p /tmp/oldsparky-systemd
           sudo env \
             PLATFORM_APP_DIR=/opt/oldsparky/platform \
