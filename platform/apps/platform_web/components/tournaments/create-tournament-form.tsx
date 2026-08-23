@@ -89,6 +89,8 @@ export function CreateTournamentForm({
   const serverNowMs = Number.isFinite(parsedServerNowMs) ? parsedServerNowMs : Date.now();
   const inviteCodeTouchedRef = useRef(false);
   const inviteCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inviteRequestGenerationRef = useRef(0);
+  const submitInFlightRef = useRef(false);
   const [values, setValues] = useState<CreateFormValues>(() => ({
     ...buildDefaultValues(serverNowMs),
     organizerName: currentUser.display_name,
@@ -126,6 +128,7 @@ export function CreateTournamentForm({
   }, []);
 
   useEffect(() => () => {
+    inviteRequestGenerationRef.current += 1;
     if (inviteCopyTimerRef.current) {
       clearTimeout(inviteCopyTimerRef.current);
     }
@@ -133,12 +136,13 @@ export function CreateTournamentForm({
 
   useEffect(() => {
     let cancelled = false;
+    const requestGeneration = ++inviteRequestGenerationRef.current;
 
     void generateInviteCode().then((suggestion) => {
-      if (cancelled) {
+      if (cancelled || requestGeneration !== inviteRequestGenerationRef.current || inviteCodeTouchedRef.current) {
         return;
       }
-      setValues((current) => inviteCodeTouchedRef.current ? current : { ...current, inviteCode: suggestion.code });
+      setValues((current) => ({ ...current, inviteCode: suggestion.code }));
       setInviteCodeStatus(suggestion.verified ? "available" : "unknown");
     });
 
@@ -149,53 +153,58 @@ export function CreateTournamentForm({
 
   async function handleCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (submitInFlightRef.current || createdTournamentSlug) {
+      return;
+    }
+    submitInFlightRef.current = true;
     setStatus("saving");
     setFormMessage(null);
-    const normalizedValues = {
-      ...values,
-      inviteCode: normalizeInviteCode(values.inviteCode)
-    };
-    if (normalizedValues.inviteCode !== values.inviteCode) {
-      setValues(normalizedValues);
-    }
-    const parsed = createSchema.safeParse(normalizedValues);
-    if (!parsed.success) {
-      setStatus("invalid");
-      setFormMessage("Проверьте название, код приглашения, расписание и допустимые ранги.");
-      if (!normalizedValues.inviteCode || normalizedValues.inviteCode.length < 10) {
-        setInviteCodeStatus("taken");
-        setFormMessage(t("organizer.inviteCodeMinimum"));
-      }
-      return;
-    }
-    const canCreateSelectedTournament = normalizedValues.visibility === "public"
-      ? canCreatePublic
-      : canCreatePrivate;
-    if (!canCreateSelectedTournament) {
-      setStatus("invalid");
-      setFormMessage(normalizedValues.visibility === "public"
-        ? t("organizer.publicCreationContact")
-        : t("organizer.privateAllowanceExhausted"));
-      return;
-    }
-    if (!isScheduleValid(normalizedValues)) {
-      setStatus("invalid");
-      setFormMessage("Проверьте порядок расписания: закрытие регистрации, подтверждение, команды, старт.");
-      return;
-    }
-    if (!isScheduleInFuture(normalizedValues, serverNowMs)) {
-      setStatus("invalid");
-      setFormMessage(t("organizer.scheduleMustBeFuture"));
-      return;
-    }
-
-    const inviteAvailable = await verifyInviteCode(normalizedValues.inviteCode);
-    if (!inviteAvailable) {
-      setStatus("invalid");
-      return;
-    }
 
     try {
+      const normalizedValues = {
+        ...values,
+        inviteCode: normalizeInviteCode(values.inviteCode)
+      };
+      if (normalizedValues.inviteCode !== values.inviteCode) {
+        setValues(normalizedValues);
+      }
+      const parsed = createSchema.safeParse(normalizedValues);
+      if (!parsed.success) {
+        setStatus("invalid");
+        setFormMessage("Проверьте название, код приглашения, расписание и допустимые ранги.");
+        if (!normalizedValues.inviteCode || normalizedValues.inviteCode.length < 10) {
+          setInviteCodeStatus("taken");
+          setFormMessage(t("organizer.inviteCodeMinimum"));
+        }
+        return;
+      }
+      const canCreateSelectedTournament = normalizedValues.visibility === "public"
+        ? canCreatePublic
+        : canCreatePrivate;
+      if (!canCreateSelectedTournament) {
+        setStatus("invalid");
+        setFormMessage(normalizedValues.visibility === "public"
+          ? t("organizer.publicCreationContact")
+          : t("organizer.privateAllowanceExhausted"));
+        return;
+      }
+      if (!isScheduleValid(normalizedValues)) {
+        setStatus("invalid");
+        setFormMessage("Проверьте порядок расписания: закрытие регистрации, подтверждение, команды, старт.");
+        return;
+      }
+      if (!isScheduleInFuture(normalizedValues, serverNowMs)) {
+        setStatus("invalid");
+        setFormMessage(t("organizer.scheduleMustBeFuture"));
+        return;
+      }
+
+      const inviteAvailable = await verifyInviteCode(normalizedValues.inviteCode);
+      if (!inviteAvailable) {
+        setStatus("invalid");
+        return;
+      }
+
       const payload = buildPayload(normalizedValues, selectedCoverTemplateUrl);
       const result = await createTournament(
         process.env.NEXT_PUBLIC_PLATFORM_ACTOR_USER_ID ?? "u_lisalexy",
@@ -232,6 +241,8 @@ export function CreateTournamentForm({
       }
       setStatus("error");
       setFormMessage("Не удалось создать турнир. Проверьте данные и попробуйте еще раз.");
+    } finally {
+      submitInFlightRef.current = false;
     }
   }
 
@@ -265,25 +276,38 @@ export function CreateTournamentForm({
   }
 
   function update(next: Partial<CreateFormValues>) {
+    if (submitInFlightRef.current) {
+      return;
+    }
     setValues((current) => ({ ...current, ...next }));
     setStatus("idle");
     setFormMessage(null);
   }
 
   function updateInviteCode(value: string) {
+    if (submitInFlightRef.current) {
+      return;
+    }
     inviteCodeTouchedRef.current = true;
+    inviteRequestGenerationRef.current += 1;
     resetInviteCopyState();
     update({ inviteCode: normalizeInviteCode(value) });
     setInviteCodeStatus("idle");
   }
 
   function updateSchedule(next: Partial<CreateFormValues>) {
+    if (submitInFlightRef.current) {
+      return;
+    }
     setValues((current) => normalizeSchedule({ ...current, ...next }, serverNowMs));
     setStatus("idle");
     setFormMessage(null);
   }
 
   function toggleRank(rankCode: string) {
+    if (submitInFlightRef.current) {
+      return;
+    }
     setValues((current) => {
       const exists = current.allowedRankCodes.includes(rankCode);
       const allowedRankCodes = exists
@@ -291,9 +315,14 @@ export function CreateTournamentForm({
         : sortRanksByStrengthDesc([...current.allowedRankCodes, rankCode]);
       return { ...current, allowedRankCodes };
     });
+    setStatus("idle");
+    setFormMessage(null);
   }
 
   function updateCover(file: File | null): boolean {
+    if (submitInFlightRef.current) {
+      return false;
+    }
     if (file && file.size > TOURNAMENT_COVER_UPLOAD_MAX_BYTES) {
       setStatus("invalid");
       setFormMessage(t("organizer.bannerTooLarge"));
@@ -316,6 +345,9 @@ export function CreateTournamentForm({
   }
 
   function selectCoverTemplate(url: string) {
+    if (submitInFlightRef.current) {
+      return;
+    }
     if (coverPreviewUrl?.startsWith("blob:")) {
       URL.revokeObjectURL(coverPreviewUrl);
     }
@@ -363,10 +395,17 @@ export function CreateTournamentForm({
   }
 
   async function refreshInviteCode() {
+    if (submitInFlightRef.current) {
+      return;
+    }
     inviteCodeTouchedRef.current = true;
     resetInviteCopyState();
+    const requestGeneration = ++inviteRequestGenerationRef.current;
     setInviteCodeStatus("checking");
     const suggestion = await generateInviteCode();
+    if (requestGeneration !== inviteRequestGenerationRef.current || submitInFlightRef.current) {
+      return;
+    }
     setValues((current) => ({ ...current, inviteCode: suggestion.code }));
     setInviteCodeStatus(suggestion.verified ? "available" : "unknown");
   }
@@ -398,14 +437,20 @@ export function CreateTournamentForm({
 
   async function verifyInviteCode(code: string): Promise<boolean> {
     const normalizedCode = normalizeInviteCode(code);
+    const requestGeneration = ++inviteRequestGenerationRef.current;
     if (normalizedCode.length < 10) {
-      setInviteCodeStatus("taken");
-      setFormMessage(t("organizer.inviteCodeMinimum"));
+      if (requestGeneration === inviteRequestGenerationRef.current) {
+        setInviteCodeStatus("taken");
+        setFormMessage(t("organizer.inviteCodeMinimum"));
+      }
       return false;
     }
     setInviteCodeStatus("checking");
     try {
       const result = await checkTournamentInviteCode(normalizedCode);
+      if (requestGeneration !== inviteRequestGenerationRef.current) {
+        return result.available;
+      }
       setValues((current) => ({ ...current, inviteCode: result.code || normalizedCode }));
       if (!result.available) {
         setInviteCodeStatus("taken");
@@ -415,7 +460,9 @@ export function CreateTournamentForm({
       setInviteCodeStatus("available");
       return true;
     } catch {
-      setInviteCodeStatus("unknown");
+      if (requestGeneration === inviteRequestGenerationRef.current) {
+        setInviteCodeStatus("unknown");
+      }
       return true;
     }
   }
@@ -436,7 +483,7 @@ export function CreateTournamentForm({
     },
     {
       label: "Видимость и код приглашения",
-      done: values.inviteCode.length >= 6 && !inviteCodeInvalid
+      done: values.inviteCode.length >= 10 && !inviteCodeInvalid
     },
     {
       label: "Расписание",
@@ -454,293 +501,303 @@ export function CreateTournamentForm({
 
   return (
     <div className="create-layout" data-server-now={serverNowIso}>
-      <form className="form-stack" id="create-tournament-form" aria-label="Форма создания турнира" onSubmit={handleCreate}>
-        <article className="panel panel-pad create-main-panel">
-          <h2 className="panel-title"><span>A.</span> Основное</h2>
-          <div className="field-grid grid-2 create-main-grid">
-            <label className="field create-title-field">
-              <span className="label">Название турнира <span className="counter">{values.title.length}/{MAX_TITLE_LENGTH}</span></span>
-              <input
-                className="input"
-                maxLength={MAX_TITLE_LENGTH}
-                placeholder={TITLE_PLACEHOLDER}
-                value={values.title}
-                onChange={(event) => update({ title: normalizeTournamentTitle(event.target.value) })}
-              />
-              <div className="account-hint create-empty-hint" aria-hidden="true">&nbsp;</div>
-            </label>
-            <label className="field create-organizer-field">
-              <span className="label">Организатор</span>
-              <input
-                className="input"
-                value={values.organizerName}
-                onChange={(event) => update({ organizerName: event.target.value })}
-                readOnly
-              />
-              <div className="account-hint">
-                Взято из имени аккаунта
-              </div>
-            </label>
-            <label className="field create-description-field">
-              <span className="label">Краткое описание <span className="counter">{values.description.length}/{MAX_DESCRIPTION_LENGTH} · {countDescriptionLines(values.description)}/{MAX_DESCRIPTION_LINES}</span></span>
-              <textarea
-                className="textarea create-description-textarea"
-                maxLength={MAX_DESCRIPTION_LENGTH}
-                placeholder={DESCRIPTION_PLACEHOLDER}
-                value={values.description}
-                onChange={(event) => update({ description: normalizeTournamentDescription(event.target.value) })}
-              />
-            </label>
-          </div>
-        </article>
-
-        <article className="panel panel-pad">
-          <h2 className="panel-title"><span>B.</span> Обложка турнира</h2>
-          <div className="cover-upload-frame">
-            <div className="cover-box">
-              {coverPreviewUrl ? (
-                <CspImage
-                  alt=""
-                  className="cover-preview-image"
-                  fill
-                  loading="eager"
-                  src={tournamentCoverAssetUrl(coverPreviewUrl)}
+      <form className="form-stack" id="create-tournament-form" aria-label="Форма создания турнира" aria-busy={status === "saving"} onSubmit={handleCreate}>
+        <fieldset className="create-form-fields" disabled={status === "saving"}>
+          <article className="panel panel-pad create-main-panel">
+            <h2 className="panel-title"><span>A.</span> Основное</h2>
+            <div className="field-grid grid-2 create-main-grid">
+              <label className="field create-title-field">
+                <span className="label">Название турнира <span className="counter">{values.title.length}/{MAX_TITLE_LENGTH}</span></span>
+                <input
+                  className="input"
+                  maxLength={MAX_TITLE_LENGTH}
+                  placeholder={TITLE_PLACEHOLDER}
+                  value={values.title}
+                  onChange={(event) => update({ title: normalizeTournamentTitle(event.target.value) })}
                 />
-              ) : null}
+                <div className="account-hint create-empty-hint" aria-hidden="true">&nbsp;</div>
+              </label>
+              <label className="field create-organizer-field">
+                <span className="label">Организатор</span>
+                <input
+                  className="input"
+                  value={values.organizerName}
+                  onChange={(event) => update({ organizerName: event.target.value })}
+                  readOnly
+                />
+                <div className="account-hint">
+                  Взято из имени аккаунта
+                </div>
+              </label>
+              <label className="field create-description-field">
+                <span className="label">Краткое описание <span className="counter">{values.description.length}/{MAX_DESCRIPTION_LENGTH} · {countDescriptionLines(values.description)}/{MAX_DESCRIPTION_LINES}</span></span>
+                <textarea
+                  className="textarea create-description-textarea"
+                  maxLength={MAX_DESCRIPTION_LENGTH}
+                  placeholder={DESCRIPTION_PLACEHOLDER}
+                  value={values.description}
+                  onChange={(event) => update({ description: normalizeTournamentDescription(event.target.value) })}
+                />
+              </label>
             </div>
-            <div className="cover-upload-footer">
-              <div className="hint cover-upload-hint">
-                <span>{TOURNAMENT_COVER_UPLOAD_HINT}</span>
-              </div>
-              <div className="cover-choice-actions">
-                <label className="upload-button">
-                  <Upload size={18} aria-hidden="true" />
-                  Загрузить обложку
-                  <input
-                    accept="image/jpeg,image/png,image/webp"
-                    aria-label="Загрузить обложку турнира"
-                    onChange={(event) => {
-                      if (!updateCover(event.target.files?.[0] ?? null)) {
-                        event.currentTarget.value = "";
-                      }
-                    }}
-                    className="cover-file-input"
-                    type="file"
+          </article>
+
+          <article className="panel panel-pad">
+            <h2 className="panel-title"><span>B.</span> Обложка турнира</h2>
+            <div className="cover-upload-frame">
+              <div className="cover-box">
+                {coverPreviewUrl ? (
+                  <CspImage
+                    alt=""
+                    className="cover-preview-image"
+                    fill
+                    loading="eager"
+                    src={tournamentCoverAssetUrl(coverPreviewUrl)}
                   />
-                </label>
-                {TOURNAMENT_COVER_TEMPLATES.map((template) => (
+                ) : null}
+              </div>
+              <div className="cover-upload-footer">
+                <div className="hint cover-upload-hint">
+                  <span>{TOURNAMENT_COVER_UPLOAD_HINT}</span>
+                </div>
+                <div className="cover-choice-actions">
+                  <label className="upload-button">
+                    <Upload size={18} aria-hidden="true" />
+                    Загрузить обложку
+                    <input
+                      accept="image/jpeg,image/png,image/webp"
+                      aria-label="Загрузить обложку турнира"
+                      onChange={(event) => {
+                        if (!updateCover(event.target.files?.[0] ?? null)) {
+                          event.currentTarget.value = "";
+                        }
+                      }}
+                      className="cover-file-input"
+                      type="file"
+                    />
+                  </label>
+                  {TOURNAMENT_COVER_TEMPLATES.map((template) => (
+                    <button
+                      className={selectedCoverTemplateUrl === template.url ? "cover-template-button active" : "cover-template-button"}
+                      key={template.url}
+                      type="button"
+                      onClick={() => selectCoverTemplate(template.url)}
+                    >
+                      {template.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article className="panel panel-pad create-participation-panel">
+            <h2 className="panel-title panel-title-with-info">
+              <span className="visibility-title-text"><span>C.</span> Видимость и участие</span>
+              <span className="visibility-info-wrap">
+                <button className="visibility-info-button" type="button" aria-label="Информация о доступе к турнирам">i</button>
+                <span className="visibility-tooltip" role="tooltip">
+                  <span>{t("organizer.privateMonthlyAllowance", { remaining: privateMonthlyRemaining, limit: privateMonthlyLimit })}</span>
+                  {(currentUser.private_tournament_credits ?? 0) > 0 ? (
+                    <span>{t("organizer.additionalPrivateCredits", { count: currentUser.private_tournament_credits ?? 0 })}</span>
+                  ) : null}
+                  <span>
+                    {canCreatePublic
+                      ? t("organizer.publicCreationAllowed")
+                      : t("organizer.publicCreationContact")}
+                  </span>
+                </span>
+              </span>
+            </h2>
+            <div className="field-grid grid-4 participation-grid">
+              <div className="field">
+                <span className="label">Видимость турнира</span>
+                <div className="segmented visibility-segmented">
                   <button
-                    className={selectedCoverTemplateUrl === template.url ? "cover-template-button active" : "cover-template-button"}
-                    key={template.url}
+                    className={`segment visibility-segment${values.visibility === "public" ? " active" : ""}${canCreatePublic ? "" : " locked"}`}
                     type="button"
-                    onClick={() => selectCoverTemplate(template.url)}
+                    disabled={!canCreatePublic}
+                    onClick={() => update({ visibility: "public" })}
+                    aria-label={canCreatePublic ? "Публичный турнир" : "Публичный турнир заблокирован"}
                   >
-                    {template.label}
+                    {canCreatePublic ? null : <Lock size={14} aria-hidden="true" />}
+                    Публичный
+                  </button>
+                  <button
+                    aria-label={canCreatePrivate ? "Приватный" : "Приватный турнир недоступен"}
+                    className={`segment visibility-segment${values.visibility === "private" ? " active" : ""}${canCreatePrivate ? "" : " locked"}`}
+                    disabled={!canCreatePrivate}
+                    type="button"
+                    onClick={() => update({ visibility: "private" })}
+                  >
+                    Приватный
+                  </button>
+                </div>
+              </div>
+              <label className={inviteCodeInvalid ? "field invite-code-field invalid" : "field invite-code-field"}>
+                <span className="label">Код приглашения</span>
+                <span className="inline-group">
+                  <input
+                    className="input"
+                    maxLength={24}
+                    value={values.inviteCode}
+                    onChange={(event) => updateInviteCode(event.target.value)}
+                    onBlur={() => void verifyInviteCode(values.inviteCode)}
+                  />
+                  <span className="invite-code-actions">
+                    <button className="icon-button" aria-label="Сгенерировать" type="button" onClick={() => void refreshInviteCode()}><RefreshCcw size={18} /></button>
+                    <button
+                      className={inviteCopied ? "icon-button copied" : "icon-button"}
+                      aria-label={inviteCopied ? "Скопировано" : "Скопировать"}
+                      disabled={inviteCopied || !values.inviteCode}
+                      type="button"
+                      onClick={() => void copyInviteCode()}
+                    >
+                      {inviteCopied ? <Check aria-hidden="true" size={17} /> : <Copy aria-hidden="true" size={17} />}
+                    </button>
+                  </span>
+                </span>
+              </label>
+              <label className="field team-count-field">
+                <span className="label">Макс. команд</span>
+                <span className="number-row">
+                  <span className="number-control team-count-control">
+                    <input
+                      aria-label="Макс. команд"
+                      className="input"
+                      inputMode="numeric"
+                      max={8192}
+                      min={2}
+                      type="number"
+                      value={values.maxTeams === "8192" ? "" : values.maxTeams}
+                      onBlur={normalizeMaxTeams}
+                      onChange={(event) => updateMaxTeams(event.target.value)}
+                    />
+                    <span className="arrows" aria-label="Управление лимитом команд">
+                      <button type="button" onClick={() => stepMaxTeams(1)} aria-label="Увеличить количество команд"><ChevronUp aria-hidden="true" size={14} /></button>
+                      <button type="button" onClick={() => stepMaxTeams(-1)} aria-label="Уменьшить количество команд"><ChevronDown aria-hidden="true" size={14} /></button>
+                    </span>
+                  </span>
+                  <button
+                    aria-label="Максимум команд"
+                    className={values.maxTeams === "8192" ? "limit-button infinity-limit-button active" : "limit-button infinity-limit-button"}
+                    title="Максимум команд"
+                    type="button"
+                    onClick={() => update({ maxTeams: "8192" })}
+                  >
+                    <InfinityIcon aria-hidden="true" className="infinity-symbol" size={28} strokeWidth={2.8} />
+                  </button>
+                </span>
+              </label>
+              <label className="field">
+                <span className="label">Макс. регистраций</span>
+                <span className="number-row">
+                  <span className="number-control">
+                    <input
+                      className="input"
+                      max={MAX_MANUAL_PARTICIPANTS}
+                      min={1}
+                      type="number"
+                      value={unlimitedParticipants ? "" : values.maxParticipants}
+                      onChange={(event) => updateMaxParticipants(event.target.value)}
+                    />
+                    <span className="arrows" aria-label="Управление лимитом участников">
+                      <button type="button" onClick={() => stepMaxParticipants(1)} aria-label="Увеличить лимит"><ChevronUp aria-hidden="true" size={14} /></button>
+                      <button type="button" onClick={() => stepMaxParticipants(-1)} aria-label="Уменьшить лимит"><ChevronDown aria-hidden="true" size={14} /></button>
+                    </span>
+                  </span>
+                  <button
+                    aria-label="Без ограничений"
+                    className={unlimitedParticipants ? "limit-button infinity-limit-button active" : "limit-button infinity-limit-button"}
+                    title="Без ограничений"
+                    type="button"
+                    onClick={() => update({ maxParticipants: String(UNLIMITED_PARTICIPANTS) })}
+                  ><InfinityIcon aria-hidden="true" className="infinity-symbol" size={28} strokeWidth={2.8} /></button>
+                </span>
+              </label>
+            </div>
+          </article>
+
+          <article className="panel panel-pad">
+            <h2 className="panel-title"><span>D.</span> Расписание</h2>
+            <div className="field-grid schedule-grid">
+              <ScheduleField label="1. Закрытие регистрации" dateValue={values.registrationClosesDate} timeValue={values.registrationClosesAt} minDate={scheduleMinimums.registration.date} minTime={scheduleMinimums.registration.time} onDateChange={(registrationClosesDate) => updateSchedule({ registrationClosesDate })} onTimeChange={(registrationClosesAt) => updateSchedule({ registrationClosesAt })} />
+              <ScheduleField label="2. Подтверждение участия" dateValue={values.checkInStartsDate} timeValue={values.checkInStartsAt} minDate={scheduleMinimums.checkIn.date} minTime={scheduleMinimums.checkIn.time} onDateChange={(checkInStartsDate) => updateSchedule({ checkInStartsDate })} onTimeChange={(checkInStartsAt) => updateSchedule({ checkInStartsAt })} />
+              <ScheduleField label="3. Формирование команд" dateValue={values.teamsFormDate} timeValue={values.teamsFormAt} minDate={scheduleMinimums.teams.date} minTime={scheduleMinimums.teams.time} onDateChange={(teamsFormDate) => updateSchedule({ teamsFormDate })} onTimeChange={(teamsFormAt) => updateSchedule({ teamsFormAt })} />
+              <ScheduleField label="4. Начало турнира" dateValue={values.startsDate} timeValue={values.startsAt} minDate={scheduleMinimums.start.date} minTime={scheduleMinimums.start.time} onDateChange={(startsDate) => updateSchedule({ startsDate })} onTimeChange={(startsAt) => updateSchedule({ startsAt })} />
+            </div>
+          </article>
+
+          <article className="panel panel-pad">
+            <h2 className="panel-title"><span>E.</span> Допустимые ранги</h2>
+            <div className="rank-select-layout">
+              <div className="rank-grid">
+                {ranks.map((rank) => (
+                  <button
+                    className={values.allowedRankCodes.includes(rank.code) ? "rank-pill active" : "rank-pill"}
+                    type="button"
+                    key={rank.code}
+                    onClick={() => toggleRank(rank.code)}
+                  >
+                    <CspImage
+                      alt=""
+                      className="rank-icon"
+                      height={40}
+                      onError={(event) => {
+                        event.currentTarget.onerror = null;
+                        event.currentTarget.src = deadlockRankPlaceholderPath;
+                      }}
+                      src={deadlockRankIconPath(rank.code)}
+                      width={40}
+                    />
+                    <span>{rank.label}</span>
                   </button>
                 ))}
               </div>
-            </div>
-          </div>
-        </article>
-
-        <article className="panel panel-pad create-participation-panel">
-          <h2 className="panel-title panel-title-with-info">
-            <span className="visibility-title-text"><span>C.</span> Видимость и участие</span>
-            <span className="visibility-info-wrap">
-              <button className="visibility-info-button" type="button" aria-label="Информация о доступе к турнирам">i</button>
-              <span className="visibility-tooltip" role="tooltip">
-                <span>{t("organizer.privateMonthlyAllowance", { remaining: privateMonthlyRemaining, limit: privateMonthlyLimit })}</span>
-                {(currentUser.private_tournament_credits ?? 0) > 0 ? (
-                  <span>{t("organizer.additionalPrivateCredits", { count: currentUser.private_tournament_credits ?? 0 })}</span>
-                ) : null}
-                <span>
-                  {canCreatePublic
-                    ? t("organizer.publicCreationAllowed")
-                    : t("organizer.publicCreationContact")}
-                </span>
-              </span>
-            </span>
-          </h2>
-          <div className="field-grid grid-4 participation-grid">
-            <div className="field">
-              <span className="label">Видимость турнира</span>
-              <div className="segmented visibility-segmented">
-                <button
-                  className={`segment visibility-segment${values.visibility === "public" ? " active" : ""}${canCreatePublic ? "" : " locked"}`}
-                  type="button"
-                  disabled={!canCreatePublic}
-                  onClick={() => update({ visibility: "public" })}
-                  aria-label={canCreatePublic ? "Публичный турнир" : "Публичный турнир заблокирован"}
-                >
-                  {canCreatePublic ? null : <Lock size={14} aria-hidden="true" />}
-                  Публичный
-                </button>
-                <button
-                  aria-label={canCreatePrivate ? "Приватный" : "Приватный турнир недоступен"}
-                  className={`segment visibility-segment${values.visibility === "private" ? " active" : ""}${canCreatePrivate ? "" : " locked"}`}
-                  disabled={!canCreatePrivate}
-                  type="button"
-                  onClick={() => update({ visibility: "private" })}
-                >
-                  Приватный
-                </button>
+              <div className="rank-actions">
+                <button className={values.allowedRankCodes.length === ranks.length ? "secondary-button active" : "secondary-button"} type="button" onClick={() => update({ allowedRankCodes: ranks.map((rank) => rank.code) })}>Все ранги</button>
+                <button className="secondary-button" type="button" onClick={() => update({ allowedRankCodes: [] })}>Очистить выбор</button>
               </div>
             </div>
-            <label className={inviteCodeInvalid ? "field invite-code-field invalid" : "field invite-code-field"}>
-              <span className="label">Код приглашения</span>
-              <span className="inline-group">
-                <input
-                  className="input"
-                  maxLength={24}
-                  value={values.inviteCode}
-                  onChange={(event) => updateInviteCode(event.target.value)}
-                  onBlur={() => void verifyInviteCode(values.inviteCode)}
-                />
-                <span className="invite-code-actions">
-                  <button className="icon-button" aria-label="Сгенерировать" type="button" onClick={() => void refreshInviteCode()}><RefreshCcw size={18} /></button>
-                  <button
-                    className={inviteCopied ? "icon-button copied" : "icon-button"}
-                    aria-label={inviteCopied ? "Скопировано" : "Скопировать"}
-                    disabled={inviteCopied || !values.inviteCode}
-                    type="button"
-                    onClick={() => void copyInviteCode()}
-                  >
-                    {inviteCopied ? <Check aria-hidden="true" size={17} /> : <Copy aria-hidden="true" size={17} />}
-                  </button>
-                </span>
-              </span>
-            </label>
-            <label className="field team-count-field">
-              <span className="label">Макс. команд</span>
-              <span className="number-row">
-                <span className="number-control team-count-control">
-                  <input
-                    aria-label="Макс. команд"
-                    className="input"
-                    inputMode="numeric"
-                    max={8192}
-                    min={2}
-                    type="number"
-                    value={values.maxTeams === "8192" ? "" : values.maxTeams}
-                    onBlur={normalizeMaxTeams}
-                    onChange={(event) => updateMaxTeams(event.target.value)}
-                  />
-                  <span className="arrows" aria-label="Управление лимитом команд">
-                    <button type="button" onClick={() => stepMaxTeams(1)} aria-label="Увеличить количество команд"><ChevronUp aria-hidden="true" size={14} /></button>
-                    <button type="button" onClick={() => stepMaxTeams(-1)} aria-label="Уменьшить количество команд"><ChevronDown aria-hidden="true" size={14} /></button>
-                  </span>
-                </span>
-                <button
-                  aria-label="Максимум команд"
-                  className={values.maxTeams === "8192" ? "limit-button infinity-limit-button active" : "limit-button infinity-limit-button"}
-                  title="Максимум команд"
-                  type="button"
-                  onClick={() => update({ maxTeams: "8192" })}
-                >
-                  <InfinityIcon aria-hidden="true" className="infinity-symbol" size={28} strokeWidth={2.8} />
-                </button>
-              </span>
-            </label>
-            <label className="field">
-              <span className="label">Макс. регистраций</span>
-              <span className="number-row">
-                <span className="number-control">
-                  <input
-                    className="input"
-                    max={MAX_MANUAL_PARTICIPANTS}
-                    min={1}
-                    type="number"
-                    value={unlimitedParticipants ? "" : values.maxParticipants}
-                    onChange={(event) => updateMaxParticipants(event.target.value)}
-                  />
-                  <span className="arrows" aria-label="Управление лимитом участников">
-                    <button type="button" onClick={() => stepMaxParticipants(1)} aria-label="Увеличить лимит"><ChevronUp aria-hidden="true" size={14} /></button>
-                    <button type="button" onClick={() => stepMaxParticipants(-1)} aria-label="Уменьшить лимит"><ChevronDown aria-hidden="true" size={14} /></button>
-                  </span>
-                </span>
-                <button
-                  aria-label="Без ограничений"
-                  className={unlimitedParticipants ? "limit-button infinity-limit-button active" : "limit-button infinity-limit-button"}
-                  title="Без ограничений"
-                  type="button"
-                  onClick={() => update({ maxParticipants: String(UNLIMITED_PARTICIPANTS) })}
-                ><InfinityIcon aria-hidden="true" className="infinity-symbol" size={28} strokeWidth={2.8} /></button>
-              </span>
-            </label>
-          </div>
-        </article>
+          </article>
 
-        <article className="panel panel-pad">
-          <h2 className="panel-title"><span>D.</span> Расписание</h2>
-          <div className="field-grid schedule-grid">
-            <ScheduleField label="1. Закрытие регистрации" dateValue={values.registrationClosesDate} timeValue={values.registrationClosesAt} minDate={scheduleMinimums.registration.date} minTime={scheduleMinimums.registration.time} onDateChange={(registrationClosesDate) => updateSchedule({ registrationClosesDate })} onTimeChange={(registrationClosesAt) => updateSchedule({ registrationClosesAt })} />
-            <ScheduleField label="2. Подтверждение участия" dateValue={values.checkInStartsDate} timeValue={values.checkInStartsAt} minDate={scheduleMinimums.checkIn.date} minTime={scheduleMinimums.checkIn.time} onDateChange={(checkInStartsDate) => updateSchedule({ checkInStartsDate })} onTimeChange={(checkInStartsAt) => updateSchedule({ checkInStartsAt })} />
-            <ScheduleField label="3. Формирование команд" dateValue={values.teamsFormDate} timeValue={values.teamsFormAt} minDate={scheduleMinimums.teams.date} minTime={scheduleMinimums.teams.time} onDateChange={(teamsFormDate) => updateSchedule({ teamsFormDate })} onTimeChange={(teamsFormAt) => updateSchedule({ teamsFormAt })} />
-            <ScheduleField label="4. Начало турнира" dateValue={values.startsDate} timeValue={values.startsAt} minDate={scheduleMinimums.start.date} minTime={scheduleMinimums.start.time} onDateChange={(startsDate) => updateSchedule({ startsDate })} onTimeChange={(startsAt) => updateSchedule({ startsAt })} />
-          </div>
-        </article>
-
-        <article className="panel panel-pad">
-          <h2 className="panel-title"><span>E.</span> Допустимые ранги</h2>
-          <div className="rank-select-layout">
-            <div className="rank-grid">
-              {ranks.map((rank) => (
-                <button
-                  className={values.allowedRankCodes.includes(rank.code) ? "rank-pill active" : "rank-pill"}
-                  type="button"
-                  key={rank.code}
-                  onClick={() => toggleRank(rank.code)}
-                >
-                  <CspImage
-                    alt=""
-                    className="rank-icon"
-                    height={40}
-                    onError={(event) => {
-                      event.currentTarget.onerror = null;
-                      event.currentTarget.src = deadlockRankPlaceholderPath;
-                    }}
-                    src={deadlockRankIconPath(rank.code)}
-                    width={40}
-                  />
-                  <span>{rank.label}</span>
-                </button>
-              ))}
+          <article className="panel panel-pad">
+            <h2 className="panel-title"><span>F.</span> Форматы</h2>
+            <div className="field-grid grid-2">
+              <label className="field">
+                <span className="label">Формат матчей</span>
+                <span className="filter-control select-control create-select-control">
+                  <select className="filter-select" value={values.matchFormat} onChange={(event) => update({ matchFormat: event.target.value as CreateFormValues["matchFormat"] })}>
+                    <option value="bo1">BO1 (до 1 победы)</option>
+                    <option value="bo3">BO3 (до 2 побед)</option>
+                    <option value="bo5">BO5 (до 3 побед)</option>
+                  </select>
+                  <ChevronDown size={17} aria-hidden="true" />
+                </span>
+              </label>
+              <label className="field">
+                <span className="label">Формат финала</span>
+                <span className="filter-control select-control create-select-control">
+                  <select className="filter-select" value={values.finalFormat} onChange={(event) => update({ finalFormat: event.target.value as CreateFormValues["finalFormat"] })}>
+                    <option value="bo1">BO1 (до 1 победы)</option>
+                    <option value="bo3">BO3 (до 2 побед)</option>
+                    <option value="bo5">BO5 (до 3 побед)</option>
+                  </select>
+                  <ChevronDown size={17} aria-hidden="true" />
+                </span>
+              </label>
             </div>
-            <div className="rank-actions">
-              <button className={values.allowedRankCodes.length === ranks.length ? "secondary-button active" : "secondary-button"} type="button" onClick={() => update({ allowedRankCodes: ranks.map((rank) => rank.code) })}>Все ранги</button>
-              <button className="secondary-button" type="button" onClick={() => update({ allowedRankCodes: [] })}>Очистить выбор</button>
-            </div>
-          </div>
-        </article>
-
-        <article className="panel panel-pad">
-          <h2 className="panel-title"><span>F.</span> Форматы</h2>
-          <div className="field-grid grid-2">
-            <label className="field">
-              <span className="label">Формат матчей</span>
-              <span className="filter-control select-control create-select-control">
-                <select className="filter-select" value={values.matchFormat} onChange={(event) => update({ matchFormat: event.target.value as CreateFormValues["matchFormat"] })}>
-                  <option value="bo1">BO1 (до 1 победы)</option>
-                  <option value="bo3">BO3 (до 2 побед)</option>
-                  <option value="bo5">BO5 (до 3 побед)</option>
-                </select>
-                <ChevronDown size={17} aria-hidden="true" />
-              </span>
-            </label>
-            <label className="field">
-              <span className="label">Формат финала</span>
-              <span className="filter-control select-control create-select-control">
-                <select className="filter-select" value={values.finalFormat} onChange={(event) => update({ finalFormat: event.target.value as CreateFormValues["finalFormat"] })}>
-                  <option value="bo1">BO1 (до 1 победы)</option>
-                  <option value="bo3">BO3 (до 2 побед)</option>
-                  <option value="bo5">BO5 (до 3 побед)</option>
-                </select>
-                <ChevronDown size={17} aria-hidden="true" />
-              </span>
-            </label>
-          </div>
-        </article>
-
+          </article>
+        </fieldset>
+        <style jsx>{`
+          .create-form-fields {
+            border: 0;
+            margin: 0;
+            min-width: 0;
+            padding: 0;
+            display: contents;
+          }
+        `}</style>
       </form>
 
       <aside className="side-stack" aria-label="Предпросмотр и подсказки">
@@ -980,7 +1037,7 @@ function SchedulePicker({
   );
 }
 
-const WEEKDAY_LABELS = ("Пн Вт Ср Чт Пт Сб Вс").split(" ");
+const WEEKDAY_LABELS = ("Пн Вт Ср Чт Пт Вс").split(" ");
 
 function buildTimeOptions(minTime?: string): string[] {
   const minimumMinutes = minTime ? roundTimeUpToTen(timeToMinutes(minTime)) : 0;
