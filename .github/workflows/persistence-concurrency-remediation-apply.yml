@@ -36,6 +36,18 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - name: Disambiguate audited selector
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/scripts/persistence_concurrency_remediation_20260823.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''    count = text.count(old)\n    if count != 1:\n        raise RuntimeError(f"{label}: expected one exact match, found {count}")\n    return text.replace(old, new, 1)\n'''
+          new = '''    count = text.count(old)\n    if label == "deadlock profile lock" and count == 2:\n        head, separator, tail = text.rpartition(old)\n        if not separator:\n            raise RuntimeError(f"{label}: target disappeared")\n        return head + new + tail\n    if count != 1:\n        raise RuntimeError(f"{label}: expected one exact match, found {count}")\n    return text.replace(old, new, 1)\n'''
+          if text.count(old) != 1:
+              raise SystemExit('unexpected applicator helper shape')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
       - name: Apply audited remediation
         run: python .github/scripts/persistence_concurrency_remediation_20260823.py
       - name: Syntax and diff validation
