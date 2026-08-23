@@ -113,6 +113,15 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             '(cd "$release_output" && sha256sum -c "$(basename "$release_checksum")")',
             workflow,
         )
+        self.assertIn(
+            'bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"',
+            workflow,
+        )
+        self.assertIn('--extract-to "$bootstrap_dir"', workflow)
+        self.assertIn(
+            'candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"',
+            workflow,
+        )
         remote_start = workflow.index("<<'REMOTE'")
         remote_script = workflow[remote_start:]
         self.assertNotIn("platform_build_release.sh", remote_script)

@@ -310,6 +310,7 @@ jobs:
           current="$runtime/current"
           artifact_path=""
           provenance_path="$artifact_dir/RELEASE.provenance.json"
+          bootstrap_dir=""
 
           fail() {
             printf 'ERROR: %s\n' "$*" >&2
@@ -319,6 +320,9 @@ jobs:
           cleanup() {
             if [[ -n "$artifact_dir" && -d "$artifact_dir" && ! -L "$artifact_dir" ]]; then
               rm -rf -- "$artifact_dir"
+            fi
+            if [[ -n "$bootstrap_dir" && -d "$bootstrap_dir" && ! -L "$bootstrap_dir" ]]; then
+              rm -rf -- "$bootstrap_dir"
             fi
           }
           trap cleanup EXIT
@@ -361,10 +365,13 @@ jobs:
           artifact_slug="${artifact_name%.tar.gz}"
           (cd "$artifact_dir" && sha256sum -c "$(basename "$artifact_checksum")") \
             || fail "CI release artifact digest mismatch"
+          bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"
+          chmod 0700 "$bootstrap_dir"
           "$current/tools/platform_validate_release_artifact.py" \
             --artifact "$artifact_path" \
             --checksum "$artifact_checksum" \
             --release-slug "$artifact_slug" \
+            --extract-to "$bootstrap_dir" \
             || fail "CI release artifact provenance is invalid"
           if ! /usr/bin/python3 - "$artifact_path" "$artifact_slug" "$target_sha" "$provenance_path" <<'PY'
           import hashlib
@@ -405,7 +412,9 @@ jobs:
             --require-edge-parity \
             --backup-max-age-hours 24
 
-          LC_ALL=C.UTF-8 "$current/tools/platform_release_deploy.sh" \
+          candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"
+          test -x "$candidate_deploy" || fail "candidate release deploy tool is missing"
+          LC_ALL=C.UTF-8 "$candidate_deploy" \
             --artifact "$artifact_path" \
             --app-dir "$runtime" \
             --edge-origin https://127.0.0.1 \
