@@ -13,37 +13,31 @@ The machine-readable group manifest is `platform/tests/test-suite-manifest.json`
 
 | Group | Owner | Runner | Environment |
 | --- | --- | --- | --- |
-| `backend-unit` | API/domain owners | `tools/platform_run_tests.sh` with focused `unittest` selectors | test PostgreSQL/Redis |
-| `backend-integration` | API/domain owners | `tools/platform_run_tests.sh discover -s tests` | test PostgreSQL/Redis |
-| `migration` | persistence owner | `tools/platform_migration_scenario.py` | disposable PostgreSQL, first at `20260821_0039` |
-| `web-hermetic` | web owner | `npm run test:hermetic` | mocked API and standalone Next.js |
-| `server-smoke` | release owner | `platform_deploy_smoke.py` and release preflight | deployed server |
-| `live-public` | production operator | `platform_live_browser_qa.sh public` through `platform-live-launch.yml` | canonical production origin, dedicated QA UID |
-| `live-user-destructive` | production operator | approved `platform_live_user_qa.sh` workflow only | production, marked fixture data and mandatory cleanup |
+| `backend-unit` | API/domain owners | `platform-security.yml` / `backend` job (focused selectors when needed) | GitHub runner with test PostgreSQL/Redis |
+| `backend-integration` | API/domain owners | `platform-security.yml` / `backend` job | GitHub runner with test PostgreSQL/Redis |
+| `migration` | persistence owner | `platform-security.yml` / `Migration scenarios` job | GitHub runner with disposable PostgreSQL |
+| `web-hermetic` | web owner | `platform-security.yml` / `Web hermetic` job | GitHub runner with mocked API and Chromium |
+| `server-smoke` | release owner | `platform-production-deploy.yml` / `deploy` mode | production server over GitHub Actions SSH |
+| `live-public` | production operator | `platform_live_browser_qa.sh public` through `platform-live-launch.yml` | canonical production origin, dedicated server QA UID |
+| `live-user-destructive` | production operator | `platform-live-user-qa.yml` dispatches `platform_live_user_qa.sh` over SSH | production server; marked fixture data and mandatory cleanup |
 
 The ordinary CI workflow runs all deterministic backend, migration, web
-hermetic, typecheck, lint and build checks. Live-user and destructive browser
-journeys remain explicit release/operator gates and are never silently hidden
-by a grep exclusion.
+hermetic, documentation, typecheck, lint and build checks. Server-side smoke
+and browser journeys are dispatched through GitHub Actions and execute on the
+production server over the controlled SSH wrappers. Live-user and destructive
+journeys remain explicit operator gates and are never silently hidden by a
+grep exclusion.
 
-## Local commands
+## GitHub execution
 
-From `platform/`, with `PLATFORM_ENVIRONMENT=test` and
-`platformdb_test` configured:
+Run deterministic checks through the GitHub security workflow on the reviewed
+`dev` ref:
 
 ```bash
-tools/platform_run_quiet.sh "platform tests" -- \
-  tools/platform_run_tests.sh discover -s tests
-tools/platform_run_quiet.sh "migration scenario" -- \
-  .venv_platform/bin/python tools/platform_migration_scenario.py
-tools/platform_run_quiet.sh "web hermetic" -- \
-  tools/platform_web_npm.sh --prefix apps/platform_web run test:hermetic
-tools/platform_run_quiet.sh "web typecheck" -- \
-  tools/platform_web_npm.sh --prefix apps/platform_web run typecheck
-tools/platform_run_quiet.sh "web lint" -- \
-  tools/platform_web_npm.sh --prefix apps/platform_web run lint
-tools/platform_run_quiet.sh "web build" -- \
-  tools/platform_web_npm.sh --prefix apps/platform_web run build
+gh workflow run platform-security.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev
+gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
 The migration scenario is destructive to its disposable database. It must not
@@ -52,6 +46,11 @@ legacy `private` tournament and an intentionally duplicated active workflow
 row, confirms the first upgrade fails without applying the revision, repairs
 the duplicate, retries the upgrade, and verifies normalized visibility and the
 final constraints.
+
+Do not substitute a manually run local test for the GitHub workflow. Local
+commands are implementation details for explicit CI-failure diagnosis only;
+the GitHub jobs and their aggregate `platform-security-build` status are the
+release authority.
 
 ## Production browser gate
 

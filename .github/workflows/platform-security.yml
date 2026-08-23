@@ -4,16 +4,12 @@ on:
   pull_request:
     paths:
       - "platform/**"
-      - ".github/workflows/platform-security.yml"
-      - ".github/workflows/platform-production-deploy.yml"
-      - ".github/workflows/platform-patch-translation-qa.yml"
+      - ".github/workflows/**"
   push:
     branches: [dev]
     paths:
       - "platform/**"
-      - ".github/workflows/platform-security.yml"
-      - ".github/workflows/platform-production-deploy.yml"
-      - ".github/workflows/platform-patch-translation-qa.yml"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:
@@ -26,7 +22,7 @@ concurrency:
 
 jobs:
   status-start:
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - name: Mark platform security build pending
@@ -157,6 +153,14 @@ jobs:
       - run: npm run lint
       - run: npm run build
 
+  docs:
+    name: Documentation consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check platform documentation
+        run: python3 platform/tools/platform_docs_check.py
+
   migration:
     name: Migration scenarios
     runs-on: ubuntu-latest
@@ -230,8 +234,8 @@ jobs:
           retention-days: 14
 
   status-final:
-    if: ${{ always() && github.event_name == 'push' }}
-    needs: [status-start, backend, web, migration, smoke]
+    if: ${{ always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    needs: [status-start, backend, web, docs, migration, smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Report platform security build result
@@ -240,13 +244,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BACKEND_RESULT: ${{ needs.backend.result }}
           WEB_RESULT: ${{ needs.web.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
           MIGRATION_RESULT: ${{ needs.migration.result }}
           SMOKE_RESULT: ${{ needs.smoke.result }}
         run: |
           set -euo pipefail
           state=failure
           description="Platform security or build failed"
-          if [[ "$BACKEND_RESULT" == "success" && "$WEB_RESULT" == "success" && "$MIGRATION_RESULT" == "success" && "$SMOKE_RESULT" == "success" ]]; then
+          if [[ "$BACKEND_RESULT" == "success" && "$WEB_RESULT" == "success" && "$DOCS_RESULT" == "success" && "$MIGRATION_RESULT" == "success" && "$SMOKE_RESULT" == "success" ]]; then
             state=success
             description="Platform security and build passed"
           fi

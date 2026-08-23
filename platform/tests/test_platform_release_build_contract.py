@@ -83,6 +83,28 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             workflow.index("Mark production deployment pending"),
         )
 
+    def test_security_workflow_runs_docs_and_reports_all_required_jobs(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-security.yml").read_text()
+
+        self.assertIn('".github/workflows/**"', workflow)
+        self.assertIn("docs:", workflow)
+        self.assertIn("platform_docs_check.py", workflow)
+        self.assertIn("docs, migration, smoke", workflow)
+        self.assertIn("DOCS_RESULT", workflow)
+        self.assertIn('github.event_name == \'workflow_dispatch\'', workflow)
+
+    def test_server_diagnostics_have_github_dispatch_contours(self) -> None:
+        for workflow_name in (
+            "platform-media-migration-diagnostics.yml",
+            "platform-production-content-diagnostics.yml",
+            "platform-production-diagnostics.yml",
+            "platform-live-launch.yml",
+            "platform-live-user-qa.yml",
+        ):
+            with self.subTest(workflow=workflow_name):
+                workflow = (REPO_ROOT / ".github/workflows" / workflow_name).read_text()
+                self.assertIn("workflow_dispatch:", workflow)
+
     def test_release_ref_is_rejected_before_any_build_or_network_work(self) -> None:
         unsafe_refs = ("../escape", "bad/ref", 'bad"json', "-leading", "x" * 101)
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,0 +1,93 @@
+name: Platform live user QA
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RUN-LIVE-USER-QA to run the destructive automated production contour"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-live-user-qa
+  cancel-in-progress: false
+
+jobs:
+  live-user-qa:
+    name: Automated live-user QA on production server
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      QA_CONFIRMATION: ${{ inputs.confirmation }}
+      TARGET_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Validate explicit production QA confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$QA_CONFIRMATION" = "RUN-LIVE-USER-QA" \
+            || { echo "Refusing destructive live-user QA without exact confirmation." >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
+          chmod 600 ~/.ssh/old_sparky_prod
+          ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Run live-user QA on the production server
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -i ~/.ssh/old_sparky_prod \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" <<'REMOTE'
+          set -Eeuo pipefail
+          confirmation="$1"
+          target_sha="$2"
+          test "$confirmation" = "RUN-LIVE-USER-QA"
+
+          repo=/root/old_sparky
+          runtime=/opt/oldsparky/platform
+          test -d "$repo/.git" || { echo "Trusted production QA checkout is missing" >&2; exit 1; }
+          test -L "$runtime/current" || { echo "Active production release is missing" >&2; exit 1; }
+          test "$(git -C "$repo" rev-parse --verify HEAD)" = "$target_sha" \
+            || { echo "Trusted QA checkout does not match the dispatched target SHA" >&2; exit 1; }
+
+          export PLATFORM_APP_DIR="$runtime"
+          export PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json
+          export PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com
+          /root/old_sparky/platform/tools/platform_live_user_qa.sh
+          echo "LIVE_USER_QA_SUCCESS source_commit=$target_sha"
+          REMOTE
+
+      - name: QA summary
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          {
+            echo "### Platform live-user QA"
+            echo
+            echo "- Target SHA: \`$TARGET_SHA\`"
+            echo "- Status: passed on production server"
+          } >> "$GITHUB_STEP_SUMMARY"

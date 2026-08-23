@@ -52,6 +52,17 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertNotIn("npm ci", source)
         self.assertNotIn("npm run test:live", source)
 
+    def test_live_user_qa_is_dispatchable_and_runs_on_the_server(self) -> None:
+        source = (REPO_ROOT / ".github/workflows/platform-live-user-qa.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("workflow_dispatch:", source)
+        self.assertIn("RUN-LIVE-USER-QA", source)
+        self.assertIn("platform_live_user_qa.sh", source)
+        self.assertIn("ssh", source)
+        self.assertIn("LIVE_USER_QA_SUCCESS", source)
+
     def test_all_wrappers_disable_xtrace_before_any_work(self) -> None:
         for wrapper in WRAPPERS:
             with self.subTest(wrapper=wrapper.name):

@@ -1,6 +1,7 @@
 name: Platform production content diagnostics
 
 on:
+  workflow_dispatch:
   workflow_run:
     workflows: ["Platform production deploy"]
     types: [completed]
@@ -16,6 +17,7 @@ permissions:
 jobs:
   content-diagnostics:
     if: >-
+      github.event_name == 'workflow_dispatch' ||
       github.event_name == 'push' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'dev')
@@ -27,7 +29,7 @@ jobs:
       PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
       PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
       PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
-      TARGET_SHA: ${{ github.event_name == 'push' && github.sha || github.event.workflow_run.head_sha }}
+      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
     steps:
       - name: Mark content diagnostics pending
