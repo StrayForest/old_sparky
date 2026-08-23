@@ -1,0 +1,52 @@
+name: Apply persistence concurrency remediation
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - ".github/scripts/persistence_concurrency_remediation_20260823.py"
+      - ".github/workflows/persistence-concurrency-remediation-apply.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: dev
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Apply audited remediation
+        run: python .github/scripts/persistence_concurrency_remediation_20260823.py
+      - name: Syntax and diff validation
+        run: |
+          set -euo pipefail
+          python -m compileall -q \
+            platform/apps/platform_api/app \
+            platform/apps/platform_worker \
+            platform/python_packages \
+            platform/alembic/versions \
+            platform/tests/test_platform_persistence_concurrency_remediation.py
+          git diff --check
+      - name: Remove one-shot applicator
+        run: |
+          rm -f .github/scripts/persistence_concurrency_remediation_20260823.py
+          rm -f .github/workflows/persistence-concurrency-remediation-apply.yml
+      - name: Commit remediation to dev
+        run: |
+          set -euo pipefail
+          git config user.name "oldsparky-remediation-bot"
+          git config user.email "oldsparky-remediation-bot@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "No remediation changes to commit"
+            exit 0
+          fi
+          git commit -m "fix(platform): harden persistence concurrency invariants"
+          git push origin HEAD:dev
