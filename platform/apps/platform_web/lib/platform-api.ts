@@ -63,6 +63,7 @@ type ApiTournamentListItem = {
   match_format?: string | null;
   final_format?: string | null;
   current_user_participant_status?: string | null;
+  current_user_has_invite_access?: boolean | null;
   next_poll_after_ms?: number | null;
   state_version?: number | null;
 };
@@ -1204,6 +1205,7 @@ function mapTournamentSummary(item: ApiTournamentListItem): TournamentSummary {
     maxParticipants: item.max_participants ?? null,
     teamsCount: item.teams_count ?? 128,
     currentUserParticipantStatus: item.current_user_participant_status ?? null,
+    currentUserHasInviteAccess: Boolean(item.current_user_has_invite_access),
     nextPollAfterMs: item.next_poll_after_ms ?? null,
     stateVersion: item.state_version ?? null
   };
