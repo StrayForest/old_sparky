@@ -20,7 +20,11 @@ Runtime layout:
 /opt/oldsparky/platform/shared
 ```
 
-Build/install tools create immutable artifacts and move `current`/`previous`
-atomically. Nginx installation validates and updates the vhost plus shared
-security-header snippet as one rollback unit. Do not edit live files without
-the documented installer and smoke path.
+Build/install tools create immutable artifacts; the release deploy wrapper
+retains a durable transaction through migration, restart/readiness, Nginx and
+smoke before committing `current`/`previous`. Nginx installation validates and
+updates the vhost plus shared security-header snippet as one rollback unit.
+The systemd installer installs all API/web/worker, health, Cloudflare,
+maintenance and off-site-backup units; only the reviewed recurring timers are
+enabled automatically. Do not edit live files without the documented state
+machine and smoke path.

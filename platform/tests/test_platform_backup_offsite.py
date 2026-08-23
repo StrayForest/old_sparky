@@ -142,7 +142,6 @@ class PlatformBackupOffsiteTests(unittest.TestCase):
             platform_env_path = root / ".env.platform"
             _write_private(env_path, _backup_env(public_key))
             _write_private(platform_env_path, _platform_env())
-            platform_env_path.chmod(0o640)
 
             config = offsite.load_config(env_path, platform_env_path, apply=False)
 

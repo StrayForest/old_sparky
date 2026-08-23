@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-16
+- Last reviewed: 2026-08-23
 
 ## Scope boundary
 
@@ -54,7 +54,9 @@ All Node commands go through `tools/platform_node.sh` or `tools/platform_web_npm
 5. Add regression coverage before broad gates.
 6. Remove replaced imports, CSS, mocks, routes and stale documentation.
 7. Run focused checks, then the relevant full gates.
-8. For production-bound work, follow the deployment runbook through live validation.
+8. For production-bound work, follow the deployment runbook and the
+   [release state machine](release-state-machine.md) through live validation;
+   do not call the low-level release installer directly.
 9. Commit each coherent verified change/package and push it to the matching GitHub branch before handoff unless explicitly requested otherwise.
 
 The test-group ownership and runner contract is maintained in

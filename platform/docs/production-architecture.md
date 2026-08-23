@@ -70,7 +70,12 @@ FastAPI exposes no `/api/v1/uploads/*` media-serving route and has no uploads `S
 
 ## Release and recovery
 
-`platform_build_release.sh` creates a checksummed immutable artifact. `platform_release_install.sh` expands it under `releases/` and atomically moves `current`/`previous`. DB changes are expand-first. Rollback switches code and never downgrades Alembic automatically.
+`platform_build_release.sh` creates a checksummed release artifact.
+`platform_release_deploy.sh` stages it, makes the migration decision, then
+retains a durable receipt through pointer activation, runtime readiness, Nginx
+apply and smoke before committing. DB changes are expand-first. Rollback
+switches code and never downgrades Alembic automatically. See
+[`release-state-machine.md`](release-state-machine.md).
 
 Daily maintenance restore-verifies DB backups before pruning known artifacts. Off-host encrypted backup remains an operator gate until separate bucket/token and offline key-recovery evidence exist.
 

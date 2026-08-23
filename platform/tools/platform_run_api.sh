@@ -9,6 +9,13 @@ platform_require_isolated_service_env api
 platform_load_env_file
 platform_require_python
 
+if [[ "${PLATFORM_ENVIRONMENT:-}" == "production" ]]; then
+  [[ "${PLATFORM_API_HOST:-127.0.0.1}" == "127.0.0.1" ]] \
+    || { echo "Production API must bind to loopback only." >&2; exit 1; }
+  [[ "${PLATFORM_API_FORWARDED_ALLOW_IPS:-127.0.0.1}" == "127.0.0.1" ]] \
+    || { echo "Production forwarded headers must trust loopback only." >&2; exit 1; }
+fi
+
 cd "$PLATFORM_ROOT_DIR"
 export PYTHONPATH="$PLATFORM_ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export FORWARDED_ALLOW_IPS="${PLATFORM_API_FORWARDED_ALLOW_IPS:-127.0.0.1}"

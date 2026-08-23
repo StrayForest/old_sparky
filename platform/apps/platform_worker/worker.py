@@ -29,7 +29,7 @@ from apps.platform_api.app.services.tournament_workflow import (
     generate_deadlock_auto_assignment_run_for_tournament,
 )
 from python_packages.platform_infra.auth_lifecycle import cleanup_auth_lifecycle_records
-from python_packages.platform_infra.config import get_settings
+from python_packages.platform_infra.config import get_settings, validate_platform_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.media.tasks import (
     media_runtime_enabled,
@@ -42,6 +42,7 @@ from python_packages.platform_infra.redis import redis_client
 T = TypeVar("T")
 
 settings = get_settings()
+validate_platform_settings(settings)
 logger = logging.getLogger(__name__)
 _worker_loop: asyncio.AbstractEventLoop | None = None
 _worker_loop_pid: int | None = None

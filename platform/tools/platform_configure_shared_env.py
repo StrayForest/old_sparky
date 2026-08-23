@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import shlex
 import stat
+import subprocess
+import sys
 import tempfile
 
 
@@ -229,12 +231,47 @@ def atomic_write(path: Path, content: str, metadata: os.stat_result) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
+def sync_runtime_envs(env_file: Path) -> bool:
+    """Refresh service-scoped env files when the service boundary exists."""
+
+    output_dir = env_file.parent / "env"
+    if not output_dir.is_dir():
+        return False
+    renderer = Path(__file__).with_name("platform_render_service_envs.py")
+    subprocess.run(
+        [
+            sys.executable,
+            str(renderer),
+            "--source",
+            str(env_file),
+            "--output-dir",
+            str(output_dir),
+            "--apply",
+        ],
+        check=True,
+    )
+    return True
+
+
 def main() -> int:
     args = parse_args()
     lines, _values, metadata = read_env(args.env_file)
     content, changed = merge_baseline(lines)
     if args.apply:
+        previous_content = args.env_file.read_bytes()
         atomic_write(args.env_file, content, metadata)
+        try:
+            sync_runtime_envs(args.env_file)
+        except Exception:
+            atomic_write(args.env_file, previous_content.decode("utf-8"), metadata)
+            try:
+                sync_runtime_envs(args.env_file)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "Shared env changed but its service-scoped rollback failed; "
+                    "stop services and reconcile canonical/runtime envs manually."
+                ) from rollback_error
+            raise
     report = {
         "ok": True,
         "mode": "apply" if args.apply else "dry-run",

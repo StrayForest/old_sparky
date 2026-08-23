@@ -160,12 +160,7 @@ class SafeEnvExecTests(unittest.TestCase):
             st_gid=0,
             st_size=10,
         )
-        with (
-            mock.patch.object(
-                safe_env.grp, "getgrnam", return_value=mock.Mock(gr_gid=988)
-            ),
-            self.assertRaisesRegex(safe_env.SafeEnvError, "metadata is unsafe"),
-        ):
+        with self.assertRaisesRegex(safe_env.SafeEnvError, "metadata is unsafe"):
             safe_env._validate_env_file(metadata)
 
 

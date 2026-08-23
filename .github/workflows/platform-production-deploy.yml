@@ -11,9 +11,6 @@ on:
         options:
           - preflight
           - deploy
-  workflow_run:
-    workflows: ["Platform security and build"]
-    types: [completed]
 
 permissions:
   contents: read
@@ -26,11 +23,8 @@ concurrency:
 jobs:
   production:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'dev' &&
-       github.event.workflow_run.event == 'push')
-    name: ${{ github.event_name == 'workflow_run' && 'Deploy production' || (inputs.mode == 'deploy' && 'Deploy production' || 'Production preflight') }}
+      github.event_name == 'workflow_dispatch'
+    name: ${{ inputs.mode == 'deploy' && 'Deploy production' || 'Production preflight' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: production
@@ -38,8 +32,8 @@ jobs:
       PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
       PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
       PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
-      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-      DEPLOY_MODE: ${{ github.event_name == 'workflow_run' && 'deploy' || inputs.mode }}
+      TARGET_SHA: ${{ github.sha }}
+      DEPLOY_MODE: ${{ inputs.mode }}
       RELEASE_SLUG: gha-${{ github.run_id }}-${{ github.run_attempt }}
       SOURCE_ARCHIVE: /tmp/old-sparky-source-${{ github.run_id }}-${{ github.run_attempt }}.tar.gz
 
@@ -174,6 +168,7 @@ jobs:
           "$current/tools/platform_release_preflight.sh" \
             --require-previous \
             --require-verified-backup \
+            --require-edge-parity \
             --backup-max-age-hours 24
 
           if [[ "$deploy_mode" == "preflight" ]]; then
@@ -214,46 +209,17 @@ jobs:
           "$current/tools/platform_release_preflight.sh" \
             --require-previous \
             --require-verified-backup \
+            --require-edge-parity \
             --backup-max-age-hours 24
 
           release_archive="$(find platform/dist/releases -maxdepth 1 -type f -name "${release_slug}-*.tar.gz" -print -quit)"
           test -n "$release_archive" || fail "release archive was not produced"
 
-          LC_ALL=C.UTF-8 platform/tools/platform_release_install.sh \
-            "$release_archive" \
-            "$runtime"
-
-          cd "$runtime/current"
-          tools/platform_run_alembic.sh upgrade head
-          tools/platform_install_systemd_units.sh
-
-          "$runtime/shared/venv/bin/python" \
-            tools/platform_install_nginx.py --json
-
-          systemctl restart deadlock-api deadlock-worker deadlock-web
-
-          for service in deadlock-api deadlock-worker deadlock-web; do
-            systemctl is-active --quiet "$service" || fail "$service failed after restart"
-          done
-
-          "$runtime/shared/venv/bin/python" \
-            tools/platform_install_nginx.py --apply --reload --json
-
-          "$runtime/current/tools/platform_release_preflight.sh" \
-            --require-previous \
-            --require-verified-backup \
-            --backup-max-age-hours 24
-
-          "$runtime/shared/venv/bin/python" \
-            tools/platform_deploy_smoke.py \
+          LC_ALL=C.UTF-8 "$current/tools/platform_release_deploy.sh" \
+            --artifact "$release_archive" \
+            --app-dir "$runtime" \
             --edge-origin https://127.0.0.1 \
             --edge-host old-sparky.com \
-            --edge-insecure-loopback \
-            --expected-csp-mode enforce
-
-          "$runtime/shared/venv/bin/python" \
-            tools/platform_deploy_smoke.py \
-            --edge-origin https://old-sparky.com \
             --expected-csp-mode enforce
 
           printf 'Production deployment completed for %s.\n' "$target_sha"

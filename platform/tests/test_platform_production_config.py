@@ -57,6 +57,20 @@ class PlatformProductionConfigTests(unittest.TestCase):
     def test_complete_production_configuration_passes(self) -> None:
         validate_platform_settings(self.production_settings())
 
+    def test_production_bind_and_forwarded_trust_are_loopback_only(self) -> None:
+        for overrides, expected in (
+            ({"platform_api_host": "0.0.0.0"}, "API must bind"),
+            ({"platform_web_bind_host": "0.0.0.0"}, "web must bind"),
+            (
+                {"platform_api_forwarded_allow_ips": "0.0.0.0"},
+                "forwarded headers",
+            ),
+        ):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                RuntimeError, expected
+            ):
+                validate_platform_settings(self.production_settings(**overrides))
+
     def test_steam_callback_must_use_exact_public_origin_and_api_path(self) -> None:
         for callback_url in (
             None,

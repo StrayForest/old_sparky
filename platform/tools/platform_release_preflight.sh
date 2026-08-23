@@ -4,6 +4,7 @@ set -euo pipefail
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
 REQUIRE_PREVIOUS=0
 REQUIRE_VERIFIED_BACKUP=0
+REQUIRE_EDGE_PARITY=0
 BACKUP_MAX_AGE_HOURS="24"
 
 while [[ $# -gt 0 ]]; do
@@ -24,6 +25,10 @@ while [[ $# -gt 0 ]]; do
       REQUIRE_VERIFIED_BACKUP=1
       shift
       ;;
+    --require-edge-parity)
+      REQUIRE_EDGE_PARITY=1
+      shift
+      ;;
     --backup-max-age-hours)
       if [[ $# -lt 2 ]]; then
         echo "--backup-max-age-hours requires a number." >&2
@@ -35,7 +40,8 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       cat <<'EOF'
 Usage: platform_release_preflight.sh [--app-dir <path>] [--require-previous]
-       [--require-verified-backup] [--backup-max-age-hours <hours>]
+       [--require-verified-backup] [--require-edge-parity]
+       [--backup-max-age-hours <hours>]
 
 Validates the live platform release layout before or after a deploy.
 EOF
@@ -76,8 +82,10 @@ else
   echo "[WARN] Previous release is not present."
 fi
 
-[[ -f "$ENV_FILE" ]] || fail "Shared env file is missing: $ENV_FILE"
-pass "Shared env file present"
+[[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]] || fail "Shared env file is missing or unsafe: $ENV_FILE"
+[[ "$(stat -c '%u:%g:%a:%h' "$ENV_FILE")" == "0:0:600:1" ]] \
+  || fail "Canonical env must remain root:root 0600 with one link."
+pass "Shared env file present with root-only permissions"
 
 [[ -x "$PYTHON_BIN" ]] || fail "Shared Python runtime is missing: $PYTHON_BIN"
 pass "Shared Python runtime present"
@@ -102,6 +110,21 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+
+[[ -d "$SHARED_DIR/env" ]] || fail "Rendered service env directory is missing: $SHARED_DIR/env"
+"$PYTHON_BIN" "$CURRENT_TARGET/tools/platform_render_service_envs.py" \
+  --source "$ENV_FILE" \
+  --output-dir "$SHARED_DIR/env" \
+  --verify >/dev/null \
+  || fail "Rendered service envs are stale or unsafe."
+pass "Rendered service envs match canonical configuration"
+
+if [[ "$REQUIRE_EDGE_PARITY" -eq 1 ]]; then
+  "$PYTHON_BIN" "$CURRENT_TARGET/tools/platform_validate_edge_policy.py" \
+    --json >/dev/null \
+    || fail "Cloudflare/Nginx/UFW trust-range parity check failed."
+  pass "Cloudflare/Nginx/UFW trust-range parity passed"
+fi
 
 for required_env_key in \
   PLATFORM_DATABASE_URL \

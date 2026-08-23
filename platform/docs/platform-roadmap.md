@@ -2,11 +2,22 @@
 
 - Status: Active backlog and priority map
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-22
+- Last reviewed: 2026-08-23
 
 For the production baseline and immediate engineering target, read [`CURRENT.md`](CURRENT.md). This file deliberately omits release diaries and detailed audit evidence.
 
 ## P1 — security and correctness
+
+### AS-17 — End-to-end release transaction and recovery
+
+**Implementation in progress.** The release path now stages a candidate and
+retains durable phases through migration, pointer activation, restart/readiness,
+Nginx apply and smoke. Migration-uncertain phases fail closed and require
+operator resume/rollback review; automatic Alembic downgrade is not introduced.
+The production workflow is manual-dispatch only until live proof and signed
+artifact gates are complete. Closure requires a VPS interruption/recovery drill
+and evidence that no failed post-install step leaves an untracked pointer,
+runtime, service or Nginx state.
 
 ### AS-15 — Deadlock persistence and workflow concurrency integrity
 
@@ -41,8 +52,12 @@ AS-09 distributed login guessing protection is resolved and archived with accoun
 
 AS-11 public worker-error sanitization is resolved with a persistence-boundary guard, irreversible historical-data cleanup migration and a public-response regression proving arbitrary exception text cannot leave the API. Closure evidence is retained in [`archive/as-11-worker-error-sanitization.md`](archive/as-11-worker-error-sanitization.md).
 
-- **Next — AS-12:** fail closed on production bind/proxy invariants and keep Nginx/Cloudflare/UFW trust ranges reconciled.
-- **AS-13:** revalidate the current CI fail-closed isolation contour before changing it.
+- **AS-12:** code-side fail-closed bind/proxy validation and a read-only
+  Cloudflare/Nginx/UFW parity gate are implemented; live listener, UFW, Nginx
+  and direct-origin evidence remains required before closure.
+- **AS-13:** CI now creates the actual web/api/worker identities, installs the
+  current systemd units and exercises the runtime env boundary; retain the
+  workflow result as revalidation evidence before closure.
 - After the media grace period, remove the runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers once no migration/reconciliation path depends on them.
 - Continue reducing legacy/duplicate runtime and documentation paths after each replacement is proven.
 
@@ -70,5 +85,7 @@ A production-bound package must have:
 - healthy disk/resources;
 - preflight, deploy smoke, affected live checks and clean journals;
 - no automatic migration downgrade.
+- a completed release transaction receipt with explicit recovery outcome; a
+  post-migration failure is not silently marked rolled back.
 
 Detailed active findings belong in [`application-security-audit.md`](application-security-audit.md). Historical findings and completed remediation evidence belong in [`archive/`](archive/). CSP policy/operations belong in [`security-runbook.md`](security-runbook.md). Release commands and rollback procedure belong in [`deployment-runbook.md`](deployment-runbook.md).

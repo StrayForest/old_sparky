@@ -27,6 +27,11 @@ Use before editing platform behavior or data flow.
 - For replace-all collections such as dream slots, serialize the owning row;
   add optimistic revision semantics when clients need conflict detection.
 - Define behavior, data/schema impact, permissions, tests, rollback risk, and legacy-bot boundary.
+- For release/runtime changes, model the whole candidate → migration decision →
+  activation → readiness/smoke state machine. Keep a durable recovery receipt
+  through the final commit; never treat pointer activation as deploy completion.
+  Migration uncertainty must be fail-closed because rollback does not downgrade
+  Alembic.
 - Design concurrent-index migrations for populated databases: preflight or
   repair duplicate data, handle invalid interrupted indexes on retry, and test
   upgrade/retry compatibility as well as the fresh schema.

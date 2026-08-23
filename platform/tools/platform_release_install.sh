@@ -5,6 +5,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 SKIP_PYTHON_DEPS=0
 SEED_ENV_FROM=""
+STAGE_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -20,9 +21,13 @@ while [[ $# -gt 0 ]]; do
       SEED_ENV_FROM="$2"
       shift 2
       ;;
+    --stage-only)
+      STAGE_ONLY=1
+      shift
+      ;;
     --help|-h)
       cat <<'EOF'
-Usage: platform_release_install.sh [--skip-python-deps] [--seed-env-from <env_file>] <artifact.tar.gz> [app_dir]
+Usage: platform_release_install.sh [--stage-only] [--skip-python-deps] [--seed-env-from <env_file>] <artifact.tar.gz> [app_dir]
 
 Installs a verified, prebuilt platform release into the standard:
   <app_dir>/releases
@@ -33,6 +38,12 @@ Installs a verified, prebuilt platform release into the standard:
 The default Python path builds and verifies a fresh offline venv before an
 atomic swap. --skip-python-deps is accepted only when the existing shared venv
 already passes pip check and exactly matches the artifact freeze.
+
+--stage-only leaves a durable transaction at the staged candidate without
+changing current/previous. It is the only mode used by the end-to-end deploy
+orchestrator. Without it, this low-level installer retains the legacy pointer
+activation behavior for recovery/test compatibility; production deploys must
+never call that mode directly.
 
 By default, app_dir is /opt/oldsparky/platform.
 EOF
@@ -45,7 +56,7 @@ EOF
 done
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "Usage: platform_release_install.sh [--skip-python-deps] [--seed-env-from <env_file>] <artifact.tar.gz> [app_dir]" >&2
+  echo "Usage: platform_release_install.sh [--stage-only] [--skip-python-deps] [--seed-env-from <env_file>] <artifact.tar.gz> [app_dir]" >&2
   exit 1
 fi
 if [[ "$EUID" -ne 0 ]]; then
@@ -72,7 +83,6 @@ if [[ "$APP_DIR" != /* ]]; then
   echo "Application directory must be an absolute path." >&2
   exit 1
 fi
-
 if [[ -n "$SEED_ENV_FROM" ]]; then
   if [[ ! -f "$SEED_ENV_FROM" || -L "$SEED_ENV_FROM" ]]; then
     echo "Seed env file is missing or unsafe: $SEED_ENV_FROM" >&2
@@ -110,6 +120,10 @@ else
   install -d -o root -g root -m 0755 "$APP_DIR"
 fi
 APP_DIR="$(readlink -f "$APP_DIR")"
+if [[ "$STAGE_ONLY" -eq 0 && "$APP_DIR" == "/opt/oldsparky/platform" ]]; then
+  echo "Direct production pointer activation is disabled; use platform_release_deploy.sh." >&2
+  exit 1
+fi
 RELEASES_DIR="$APP_DIR/releases"
 SHARED_DIR="$APP_DIR/shared"
 SHARED_VENV_DIR="$SHARED_DIR/venv"
@@ -286,12 +300,11 @@ if [[ "$ENV_UID" != "0" || "$ENV_LINKS" != "1" \
   echo "Shared env file ownership or permissions are unsafe." >&2
   exit 1
 fi
-if getent group oldsparky-platform >/dev/null 2>&1; then
-  chown root:oldsparky-platform "$SHARED_ENV_FILE"
-  chmod 0640 "$SHARED_ENV_FILE"
-else
-  chmod 0600 "$SHARED_ENV_FILE"
-fi
+# The canonical env contains database/session/R2 credentials. Keep it root-only
+# for the entire install transaction; the service preparer later renders scoped
+# copies without ever widening this file's permissions.
+chown root:root "$SHARED_ENV_FILE"
+chmod 0600 "$SHARED_ENV_FILE"
 
 run_isolated_python() {
   local python_bin="$1"
@@ -534,6 +547,30 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
     --state "$TRANSACTION_STATE" \
     --expected prepared \
     --phase venv-transitioned
+fi
+
+if [[ "$STAGE_ONLY" -eq 1 ]]; then
+  trap '' HUP INT TERM
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+    --state "$TRANSACTION_STATE" \
+    --expected "$([[ "$SKIP_PYTHON_DEPS" -eq 0 && "${TRANSACTION_TRANSITION:-}" == "exchange" ]] && echo snapshot-placed || echo venv-transitioned)" \
+    --phase staged
+  trap - HUP INT TERM
+  INSTALL_COMPLETE=1
+  trap - EXIT
+  cat <<EOF
+Platform release staged.
+
+Candidate release:
+  $RELEASE_DIR
+Transaction state:
+  $TRANSACTION_STATE
+
+The end-to-end deploy orchestrator must now make the migration decision,
+activate the pointers, restart/readiness-check services, run smoke and commit
+the transaction. Do not remove the transaction state manually.
+EOF
+  exit 0
 fi
 
 POINTER_PHASE="venv-transitioned"

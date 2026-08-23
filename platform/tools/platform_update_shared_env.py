@@ -11,7 +11,12 @@ import sys
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLATFORM_ROOT))
 
-from tools.platform_configure_shared_env import atomic_write, read_env, shell_env_value
+from tools.platform_configure_shared_env import (
+    atomic_write,
+    read_env,
+    shell_env_value,
+    sync_runtime_envs,
+)
 
 
 DEFAULT_ENV_FILE = Path("/opt/oldsparky/platform/shared/.env.platform")
@@ -105,7 +110,20 @@ def main() -> int:
     lines, _values, metadata = read_env(args.env_file)
     content, changed = merge_updates(lines, updates)
     if args.apply:
+        previous_content = args.env_file.read_bytes()
         atomic_write(args.env_file, content, metadata)
+        try:
+            sync_runtime_envs(args.env_file)
+        except Exception:
+            atomic_write(args.env_file, previous_content.decode("utf-8"), metadata)
+            try:
+                sync_runtime_envs(args.env_file)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "Shared env changed but its service-scoped rollback failed; "
+                    "stop services and reconcile canonical/runtime envs manually."
+                ) from rollback_error
+            raise
     report = {
         "ok": True,
         "mode": "apply" if args.apply else "dry-run",

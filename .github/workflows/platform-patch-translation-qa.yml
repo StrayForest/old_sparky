@@ -1,7 +1,13 @@
-name: Platform patch translation QA
+name: Platform patch translation warm-up
 
 on:
   workflow_dispatch:
+    inputs:
+      max_openai_calls:
+        description: "Maximum translation cache-miss calls permitted in this controlled warm-up"
+        required: true
+        default: "4"
+        type: string
   workflow_run:
     workflows: ["Platform production deploy"]
     types: [completed]
@@ -28,6 +34,7 @@ jobs:
       PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
       PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      MAX_OPENAI_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_openai_calls || '4' }}
     steps:
       - name: Mark translation QA pending
         shell: bash
@@ -42,7 +49,7 @@ jobs:
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"pending\",\"context\":\"platform-patch-translation-qa\",\"description\":\"Four-patch Russian translation QA is running\",\"target_url\":\"${run_url}\"}"
+            --data "{\"state\":\"pending\",\"context\":\"platform-patch-translation-warmup\",\"description\":\"Controlled four-patch Russian translation warm-up is running\",\"target_url\":\"${run_url}\"}"
 
       - name: Configure SSH
         shell: bash
@@ -77,6 +84,7 @@ jobs:
           "$runtime/shared/venv/bin/python" - <<'PY'
           import asyncio
           import json
+          import os
           import re
           import unicodedata
 
@@ -86,6 +94,7 @@ jobs:
               CANONICAL_GLOSSARY,
               PATCH_TRANSLATION_VERSION,
               extract_translation_segments,
+              get_cached_patch_translation,
               translate_patch_to_russian,
           )
           from apps.platform_api.app.services.patch_translation_terms import fact_fingerprint
@@ -96,6 +105,11 @@ jobs:
               "1839041357039193",
               "1836506165584438",
           )
+          MAX_OPENAI_CALLS = int(os.environ.get("MAX_OPENAI_CALLS", "4"))
+          if MAX_OPENAI_CALLS < 1 or MAX_OPENAI_CALLS > len(PATCH_IDS):
+              raise SystemExit(
+                  f"MAX_OPENAI_CALLS must be between 1 and {len(PATCH_IDS)}"
+              )
           RIFT_SUBJECT_PATCH_ID = "1836506165584438"
           WATCH_TERMS = (
               "lifesteal", "cooldown", "spirit scaling", "spirit power",
@@ -119,14 +133,20 @@ jobs:
               print(kind, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
           async def main():
+              translation_calls = 0
               catalog = await home_content.get_deadlock_asset_catalog()
               for patch_id in PATCH_IDS:
                   source = await get_patch_detail_source(patch_id)
                   if source is None:
                       raise SystemExit(f"missing source patch {patch_id}")
 
+                  cached_translation = await get_cached_patch_translation(source)
+                  if cached_translation is None and translation_calls >= MAX_OPENAI_CALLS:
+                      raise SystemExit("translation warm-up OpenAI call budget exhausted")
                   result = await translate_patch_to_russian(source, catalog)
                   emit("TRANSLATION_RUN", patch_id=patch_id, result=result)
+                  if cached_translation is None and result.get("status") == "translated":
+                      translation_calls += 1
                   if not result.get("ok"):
                       raise SystemExit(f"translation failed for {patch_id}: {result}")
                   if result.get("status") == "locked":
@@ -234,9 +254,11 @@ jobs:
                       watched_samples=len(samples),
                   )
 
-              print("PATCH_TRANSLATION_QA status=passed version=" + PATCH_TRANSLATION_VERSION)
-
           asyncio.run(main())
+          print(
+              "PATCH_TRANSLATION_WARMUP status=passed "
+              f"version={PATCH_TRANSLATION_VERSION} openai_calls<={MAX_OPENAI_CALLS}"
+          )
           PY
 
           echo '=== Recent translation usage logs ==='
@@ -260,7 +282,7 @@ jobs:
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"success\",\"context\":\"platform-patch-translation-qa\",\"description\":\"Four-patch Russian translation QA passed\",\"target_url\":\"${run_url}\"}"
+            --data "{\"state\":\"success\",\"context\":\"platform-patch-translation-warmup\",\"description\":\"Controlled four-patch Russian translation warm-up passed\",\"target_url\":\"${run_url}\"}"
 
       - name: Mark translation QA failed
         if: ${{ failure() }}
@@ -276,4 +298,4 @@ jobs:
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"failure\",\"context\":\"platform-patch-translation-qa\",\"description\":\"Four-patch Russian translation QA failed\",\"target_url\":\"${run_url}\"}"
+            --data "{\"state\":\"failure\",\"context\":\"platform-patch-translation-warmup\",\"description\":\"Controlled four-patch Russian translation warm-up failed\",\"target_url\":\"${run_url}\"}"

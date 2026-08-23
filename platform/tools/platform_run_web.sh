@@ -8,6 +8,12 @@ source "$TOOLS_DIR/platform_runtime_common.sh"
 platform_require_isolated_service_env web
 platform_load_env_file
 
+if [[ "${PLATFORM_ENVIRONMENT:-}" == "production" \
+  && "${PLATFORM_WEB_BIND_HOST:-127.0.0.1}" != "127.0.0.1" ]]; then
+  echo "Production web must bind to loopback only." >&2
+  exit 1
+fi
+
 cd "$PLATFORM_ROOT_DIR/apps/platform_web"
 
 if [[ ! -f .next/standalone/server.js ]]; then

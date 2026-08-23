@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-22
+- Last reviewed: 2026-08-23
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -48,9 +48,12 @@ database guards and applies migration `20260822_0040`. Exact commit
 `gha-32574455599-1-87525bab34c4-20260822T125945Z`; closure evidence is in
 [`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md).
 
-No repository-owned P1 correctness remediation remains open. AS-12 is the
-next operational hardening item and AS-13 remains separate CI revalidation
-work.
+AS-17 — End-to-end release transaction and recovery is in progress. The normal
+release path now retains a durable receipt through migration, restart/readiness,
+Nginx and smoke; migration uncertainty never triggers an automatic downgrade.
+AS-12 has code-side fail-closed validation and a read-only parity gate, while
+the VPS proof remains operator-owned. AS-13's CI contour is being revalidated
+against the current web/api/worker identities and units.
 
 ## Production invariants
 
@@ -82,11 +85,22 @@ work.
 - Terminal tournament states freeze organizer match administration.
 - Preserve the live HTTPS/domain/secure-cookie contour unless a reviewed release changes it.
 - Rollback switches application releases; it does not automatically downgrade Alembic.
-- New production changes use immutable releases and pass the applicable preflight, smoke and focused live checks.
+- New production changes use the durable release state machine in
+  [`release-state-machine.md`](release-state-machine.md); a post-migration
+  failure retains a recovery receipt and blocks an unrelated second install.
+- Canonical production env remains root-only `root:root 0600`; preflight checks
+  that scoped service env files are freshly rendered from it.
+- Fully automatic production deployment is disabled while signed CI artifact
+  provenance and live Cloudflare/Nginx/UFW proof remain open.
 
 ## Deferred / operator-owned work
 
 - Remaining Cloudflare dashboard follow-up for CAA, WAF/rates and R2 settings where the operator checklist still marks work `VERIFY`/`TODO`.
+- VPS-owned AS-12 evidence: loopback-only listeners, `FORWARDED_ALLOW_IPS=127.0.0.1`,
+  exact Cloudflare CIDR parity across UFW/Nginx, and a direct-origin negative
+  test. Repository checks do not prove live state.
+- CI-built/signed release artifact, hash-locked Python wheelhouse and deploy by
+  published digest remain open provenance work.
 - Real-user CSP follow-up and classification of new enforcement reports.
 - Post-grace physical removal of runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers when no longer required.
 - Non-security feature expansion that does not remove a launch or production blocker.

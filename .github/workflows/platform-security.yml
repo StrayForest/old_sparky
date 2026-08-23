@@ -85,15 +85,31 @@ jobs:
       - name: Prepare production-like root checkout and identities
         run: |
           set -euo pipefail
-          sudo groupadd --system oldsparky-platform
-          sudo useradd --system --home-dir /opt/oldsparky --gid oldsparky-platform --shell /usr/sbin/nologin oldsparky
+          for identity in oldsparky-web oldsparky-api oldsparky-worker; do
+            sudo groupadd --system "$identity"
+            sudo useradd --system --home-dir /nonexistent --no-create-home \
+              --gid "$identity" --shell /usr/sbin/nologin "$identity"
+          done
+          sudo groupadd --system oldsparky-media
           sudo mkdir -p /opt/oldsparky
-          sudo chown oldsparky:oldsparky-platform /opt/oldsparky
+          sudo chown root:root /opt/oldsparky
           sudo chmod 0755 /opt/oldsparky
           sudo rm -rf /root/old_sparky
           sudo mkdir -p /root/old_sparky
           sudo cp -a "$GITHUB_WORKSPACE/." /root/old_sparky/
           sudo chown -R root:root /root/old_sparky
+          sudo mkdir -p /opt/oldsparky/platform/{releases,shared/env,shared/venv/bin}
+          sudo cp -a /root/old_sparky/platform/. /opt/oldsparky/platform/releases/ci-current
+          sudo ln -s /opt/oldsparky/platform/releases/ci-current /opt/oldsparky/platform/current
+          sudo ln -s /opt/oldsparky/platform/releases/ci-current /opt/oldsparky/platform/previous
+          sudo ln -s /usr/bin/python3 /opt/oldsparky/platform/shared/venv/bin/python
+          sudo mkdir -p /opt/oldsparky/platform/current/apps/platform_web/.next/cache
+          sudo install -o root -g root -m 0600 /dev/null /opt/oldsparky/platform/shared/.env.platform
+          sudo env \
+            PLATFORM_APP_DIR=/opt/oldsparky/platform \
+            PLATFORM_SYSTEMD_DIR=/tmp/oldsparky-systemd \
+            PLATFORM_ENABLE_SYSTEMD_UNITS=0 \
+            /root/old_sparky/platform/tools/platform_install_systemd_units.sh
       - name: Install pinned dependencies
         run: |
           sudo -EH python -m venv /root/old_sparky/platform/.venv_platform
@@ -211,7 +227,7 @@ jobs:
 
   status-final:
     if: ${{ always() && github.event_name == 'push' }}
-    needs: [status-start, backend, web, smoke]
+    needs: [status-start, backend, web, migration, smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Report platform security build result
@@ -220,12 +236,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BACKEND_RESULT: ${{ needs.backend.result }}
           WEB_RESULT: ${{ needs.web.result }}
+          MIGRATION_RESULT: ${{ needs.migration.result }}
           SMOKE_RESULT: ${{ needs.smoke.result }}
         run: |
           set -euo pipefail
           state=failure
           description="Platform security or build failed"
-          if [[ "$BACKEND_RESULT" == "success" && "$WEB_RESULT" == "success" && "$SMOKE_RESULT" == "success" ]]; then
+          if [[ "$BACKEND_RESULT" == "success" && "$WEB_RESULT" == "success" && "$MIGRATION_RESULT" == "success" && "$SMOKE_RESULT" == "success" ]]; then
             state=success
             description="Platform security and build passed"
           fi

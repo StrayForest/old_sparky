@@ -217,6 +217,11 @@ def main() -> int:
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify rendered files match the canonical source without writing.",
+    )
     args = parser.parse_args()
 
     values = parse_env_lines(args.source)
@@ -224,6 +229,18 @@ def main() -> int:
         service: render_service_env(service, values)
         for service in SERVICE_GROUPS
     }
+
+    if args.apply and args.verify:
+        raise RuntimeError("--apply and --verify cannot be combined.")
+
+    if args.verify:
+        verify_runtime_files(args.output_dir)
+        for service, content in rendered.items():
+            path = args.output_dir / f"{service}.env"
+            if path.read_text(encoding="utf-8") != content:
+                raise RuntimeError(f"Runtime env is stale for service: {service}")
+        print("Runtime service envs are current and metadata-safe.")
+        return 0
 
     if not args.apply:
         for service in SERVICE_GROUPS:

@@ -30,9 +30,11 @@ Select the smallest relevant verification set.
   commitments after a terminal tournament state.
 - Web: run from `platform/` as
   `tools/platform_run_quiet.sh "web build" -- tools/platform_web_npm.sh --prefix apps/platform_web run build`.
-- Release from the repository root:
-  `platform/tools/platform_run_quiet.sh "release preflight" -- platform/tools/platform_release_preflight.sh --require-previous`;
-  `platform/tools/platform_run_quiet.sh "deploy smoke" -- platform/.venv_platform/bin/python platform/tools/platform_deploy_smoke.py`.
+- Release from the repository root: syntax-check the release state machine and,
+  on a live host, run
+  `platform/tools/platform_run_quiet.sh "release preflight" -- platform/tools/platform_release_preflight.sh --require-previous --require-edge-parity`;
+  deploy only through `platform/tools/platform_release_deploy.sh`. A retained
+  migration/post-restart state is a recovery outcome, not a passing release.
 - Codex/docs-only: syntax checks only; do not run app tests unless behavior changed.
 
 Successful checks should emit only their final status line. Read the retained

@@ -121,6 +121,71 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         )
         self.assertFalse(any(self.shared_dir.glob(".venv-install-*")))
 
+    def test_migration_uncertain_state_refuses_automatic_recovery(self) -> None:
+        current_release = self.add_installed_release("current-release")
+        protected_release = self.add_installed_release("protected-release")
+        (self.app_dir / "current").symlink_to(current_release)
+        (self.app_dir / "previous").symlink_to(protected_release)
+        self.add_fake_shared_venv(marker="old")
+        artifact = self.build_artifact("migration-uncertain", pip_result="new")
+
+        self.run_script(
+            INSTALL_SCRIPT,
+            "--stage-only",
+            str(artifact),
+            str(self.app_dir),
+        )
+        state = self.shared_dir / TRANSACTION_STATE_NAME
+        self.assertEqual(json.loads(state.read_text())["phase"], "staged")
+        self.run_script(
+            TRANSACTION_TOOL,
+            "phase",
+            "--state",
+            str(state),
+            "--expected",
+            "staged",
+            "--phase",
+            "migration-pending",
+        )
+
+        result = self.run_script(
+            TRANSACTION_TOOL,
+            "recover",
+            "--state",
+            str(state),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("migration outcome is not safely reversible", result.stderr)
+        self.assertTrue(state.exists())
+
+        result = self.run_script(
+            TRANSACTION_TOOL,
+            "authorize-recovery",
+            "--state",
+            str(state),
+            "--confirm",
+            "WRONG_CONFIRMATION",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(state.exists())
+        self.run_script(
+            TRANSACTION_TOOL,
+            "authorize-recovery",
+            "--state",
+            str(state),
+            "--confirm",
+            "MIGRATION_NOT_REVERSED",
+        )
+        self.assertEqual(json.loads(state.read_text())["phase"], "recovery-authorized")
+        self.run_script(TRANSACTION_TOOL, "recover", "--state", str(state))
+        self.assertEqual((self.app_dir / "current").resolve(), current_release)
+        self.assertEqual((self.app_dir / "previous").resolve(), protected_release)
+        self.assertEqual((self.shared_dir / "venv" / "deps-version").read_text(), "old\n")
+        self.assertFalse(state.exists())
+
     def test_skip_python_deps_refuses_an_existing_venv_that_does_not_match_freeze(
         self,
     ) -> None:

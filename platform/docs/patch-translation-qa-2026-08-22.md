@@ -1,5 +1,11 @@
 # Deadlock patch translation QA — 2026-08-22
 
+The post-deploy workflow for this regression set is a controlled translation
+warm-up. It can create Redis locks/cache entries and call OpenAI on a cache
+miss; the workflow input caps those cache-miss calls. This checkpoint is
+evidence for the content contract, not a claim that the production operation
+is read-only.
+
 ## Scope
 
 This checkpoint turns the latest four production patches into the standing translation regression set:

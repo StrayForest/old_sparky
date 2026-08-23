@@ -26,6 +26,9 @@ class PlatformSettings(BaseSettings):
     platform_web_origin: str = "http://127.0.0.1:3000"
     platform_api_host: str = "127.0.0.1"
     platform_api_port: int = 8010
+    platform_api_forwarded_allow_ips: str = "127.0.0.1"
+    platform_web_bind_host: str = "127.0.0.1"
+    platform_web_port: int = 3000
     platform_database_url: str = (
         "postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb"
     )
@@ -223,6 +226,15 @@ def validate_platform_settings(settings: PlatformSettings) -> None:
         return
     if environment != "production":
         return
+
+    if settings.platform_api_host != "127.0.0.1":
+        raise RuntimeError("Production API must bind to loopback only.")
+    if settings.platform_web_bind_host != "127.0.0.1":
+        raise RuntimeError("Production web must bind to loopback only.")
+    if settings.platform_api_forwarded_allow_ips != "127.0.0.1":
+        raise RuntimeError(
+            "Production forwarded headers must be trusted only from loopback."
+        )
 
     secret = settings.platform_secret_key.strip()
     if len(secret) < 32 or secret == DEVELOPMENT_SECRET_KEY:

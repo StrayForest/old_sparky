@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-import grp
 import http.client
 import json
 import os
@@ -266,21 +265,6 @@ def _existing_user_ids(*names: str) -> frozenset[int]:
     return frozenset(resolved)
 
 
-def _existing_group_ids(*names: str) -> frozenset[int]:
-    resolved: set[int] = set()
-    for name in names:
-        try:
-            resolved.add(grp.getgrnam(name).gr_gid)
-        except KeyError:
-            continue
-    return frozenset(resolved)
-
-
-ALLOWED_SHARED_ENV_GROUP_GIDS = _existing_group_ids(
-    "oldsparky-platform",
-)
-
-
 def _directory_owner_is_allowed(_path: Path, owner_uid: int) -> bool:
     return owner_uid == 0
 
@@ -372,10 +356,7 @@ def _validate_private_file_metadata(
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != 0
         or mode not in allowed_modes
-        or (
-            mode == 0o640
-            and metadata.st_gid not in ALLOWED_SHARED_ENV_GROUP_GIDS
-        )
+        or mode != 0o600
         or metadata.st_size < 1
         or metadata.st_size > max_bytes
     ):

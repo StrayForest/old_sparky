@@ -30,9 +30,56 @@ PHASES = {
     "current-switched",
     "previous-switched",
     "pointers-switched",
+    "staged",
+    "migration-pending",
+    "migration-failed",
+    "migration-applied",
+    "activation-pending",
+    "services-restarted",
+    "nginx-applied",
+    "smoke-passed",
+    "activation-committed",
+    "recovery-authorized",
     "restart-pending",
     "recovery-restored",
 }
+PHASE_TRANSITIONS = {
+    "prepared": {"venv-transitioned"},
+    "venv-transitioned": {
+        "snapshot-placed",
+        "previous-switched",
+        "pointers-switched",
+        "staged",
+        "current-switched",
+    },
+    "snapshot-placed": {"previous-switched", "pointers-switched", "staged"},
+    "previous-switched": {"pointers-switched"},
+    "current-switched": {"pointers-switched"},
+    "pointers-switched": {"restart-pending"},
+    "staged": {"migration-pending"},
+    "migration-pending": {"migration-failed", "migration-applied", "recovery-authorized"},
+    "migration-failed": {"migration-pending", "migration-applied", "recovery-authorized"},
+    "migration-applied": {"activation-pending", "recovery-authorized"},
+    "activation-pending": {"services-restarted", "recovery-authorized"},
+    "services-restarted": {"nginx-applied", "recovery-authorized"},
+    "nginx-applied": {"smoke-passed", "recovery-authorized"},
+    "smoke-passed": {"activation-committed", "recovery-authorized"},
+    "activation-committed": {"recovery-authorized"},
+    "recovery-authorized": set(),
+    "restart-pending": set(),
+    "recovery-restored": set(),
+}
+MIGRATION_OUTCOME_UNCERTAIN_PHASES = {
+    "migration-pending",
+    "migration-failed",
+    "migration-applied",
+    "activation-pending",
+    "services-restarted",
+    "nginx-applied",
+    "smoke-passed",
+    "activation-committed",
+}
+RECOVERY_CONFIRMATION = "MIGRATION_NOT_REVERSED"
 RECORD_KEYS = {
     "version",
     "operation",
@@ -516,7 +563,28 @@ def set_phase(state: Path, *, expected: str, phase: str) -> None:
         )
     if phase not in PHASES:
         raise TransactionError("release operation phase is invalid")
+    if phase not in PHASE_TRANSITIONS.get(expected, set()):
+        raise TransactionError(
+            f"release operation phase transition is invalid: {expected} -> {phase}"
+        )
     record["phase"] = phase
+    _write_record(state, _record_for_write(record), creating=False)
+
+
+def authorize_recovery(state: Path, *, confirmation: str) -> None:
+    if confirmation != RECOVERY_CONFIRMATION:
+        raise TransactionError(
+            "explicit recovery confirmation must be MIGRATION_NOT_REVERSED"
+        )
+    record = _load_record(state)
+    if record["operation"] != "install":
+        raise TransactionError("explicit migration recovery applies only to installs")
+    phase = cast(str, record["phase"])
+    if phase not in MIGRATION_OUTCOME_UNCERTAIN_PHASES:
+        raise TransactionError(
+            f"release operation phase does not require migration recovery authorization: {phase}"
+        )
+    record["phase"] = "recovery-authorized"
     _write_record(state, _record_for_write(record), creating=False)
 
 
@@ -820,6 +888,14 @@ def _cleanup_recovered_install(state: Path, record: dict[str, object]) -> None:
 
 def recover(state: Path) -> None:
     record = _load_record(state)
+    if (
+        record["operation"] == "install"
+        and record["phase"] in MIGRATION_OUTCOME_UNCERTAIN_PHASES
+    ):
+        raise TransactionError(
+            "migration outcome is not safely reversible; retain the state and "
+            "resume the deployment or make an explicit operator rollback decision"
+        )
     if record["phase"] == "restart-pending":
         raise TransactionError(
             "rollback filesystem state is complete but its service restart is pending"
@@ -902,7 +978,11 @@ def _validate_success(record: dict[str, object]) -> None:
 
 def complete(state: Path) -> None:
     record = _load_record(state)
-    if record["phase"] not in {"pointers-switched", "restart-pending"}:
+    if record["phase"] not in {
+        "pointers-switched",
+        "restart-pending",
+        "activation-committed",
+    }:
         raise TransactionError("release operation pointers are not durably switched")
     _validate_success(record)
     state.unlink()
@@ -947,10 +1027,14 @@ def _build_parser() -> argparse.ArgumentParser:
     pointer.add_argument("--target", default="")
     recover_parser = commands.add_parser("recover")
     recover_parser.add_argument("--state", required=True, type=Path)
+    authorize_parser = commands.add_parser("authorize-recovery")
+    authorize_parser.add_argument("--state", required=True, type=Path)
+    authorize_parser.add_argument("--confirm", required=True)
     complete_parser = commands.add_parser("complete")
     complete_parser.add_argument("--state", required=True, type=Path)
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--state", required=True, type=Path)
+    status_parser.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -983,13 +1067,30 @@ def main() -> int:
             switch_pointer(args.state, name=args.name, target_value=args.target)
         elif args.command == "recover":
             recover(args.state)
+        elif args.command == "authorize-recovery":
+            authorize_recovery(args.state, confirmation=args.confirm)
         elif args.command == "complete":
             complete(args.state)
         else:
             record = _load_record(args.state)
             if record["phase"] == "restart-pending":
                 _validate_success(record)
-            print(f"{record['operation']} {record['phase']}")
+            if args.as_json:
+                print(
+                    json.dumps(
+                        {
+                            "operation": record["operation"],
+                            "phase": record["phase"],
+                            "app_dir": record["app_dir"],
+                            "current_before": record["current_before"],
+                            "previous_before": record["previous_before"],
+                            "candidate_release": record["candidate_release"],
+                        },
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"{record['operation']} {record['phase']}")
         return 0
     except TransactionError as exc:
         print(f"Release transaction refused: {exc}", file=sys.stderr)

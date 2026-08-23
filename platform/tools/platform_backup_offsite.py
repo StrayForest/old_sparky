@@ -139,7 +139,6 @@ def _read_env(
     path: Path,
     *,
     apply: bool,
-    allow_group_read: bool = False,
 ) -> dict[str, str]:
     try:
         file_stat = path.lstat()
@@ -153,21 +152,16 @@ def _read_env(
             f"Private environment path must be a regular non-symlink file: {path}.",
             ExitCode.CONFIGURATION,
         )
-    allowed_modes = {0o600, 0o640} if allow_group_read else {0o600}
-    if stat.S_IMODE(file_stat.st_mode) not in allowed_modes:
-        expected_modes = "0600 or 0640" if allow_group_read else "0600"
+    if stat.S_IMODE(file_stat.st_mode) != 0o600:
         raise OffsiteBackupError(
-            f"Private environment file must have mode {expected_modes}: {path}.",
+            f"Private environment file must have mode 0600: {path}.",
             ExitCode.CONFIGURATION,
         )
     required_owner = 0 if apply else os.geteuid()
-    required_group = None if allow_group_read else (0 if apply else os.getegid())
-    if file_stat.st_uid != required_owner or (
-        required_group is not None and file_stat.st_gid != required_group
-    ):
+    required_group = 0 if apply else os.getegid()
+    if file_stat.st_uid != required_owner or file_stat.st_gid != required_group:
         expected = "root" if apply else "the invoking user"
-        if not allow_group_read:
-            expected += ":root" if apply else " and group"
+        expected += ":root" if apply else " and group"
         raise OffsiteBackupError(
             f"Private environment file must be owned by {expected}: {path}.",
             ExitCode.CONFIGURATION,
@@ -245,11 +239,7 @@ def load_config(
             ExitCode.CONFIGURATION,
         )
     values = _read_env(env_path, apply=apply)
-    platform_values = _read_env(
-        platform_env_path,
-        apply=apply,
-        allow_group_read=True,
-    )
+    platform_values = _read_env(platform_env_path, apply=apply)
 
     visibility = _required(values, "PLATFORM_BACKUP_R2_BUCKET_VISIBILITY").lower()
     confirmed_private = _required(

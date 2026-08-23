@@ -259,20 +259,13 @@ class MailboxHelperTests(unittest.TestCase):
                 max_bytes=32,
             )
 
-    def test_fixed_env_permissions_accept_production_0640_contour(self) -> None:
-        self.assertTrue(MODULE.ALLOWED_SHARED_ENV_GROUP_GIDS)
-        for allowed_gid in MODULE.ALLOWED_SHARED_ENV_GROUP_GIDS:
-            with self.subTest(gid=allowed_gid):
-                MODULE._validate_private_file_metadata(
-                    SimpleNamespace(
-                        st_mode=0o100640,
-                        st_uid=0,
-                        st_gid=allowed_gid,
-                        st_size=100,
-                    ),
-                    allowed_modes=frozenset({0o600, 0o640}),
-                    max_bytes=1024,
-                )
+    def test_fixed_env_permissions_reject_group_read_contour(self) -> None:
+        with self.assertRaises(MODULE.MailboxHelperError):
+            MODULE._validate_private_file_metadata(
+                SimpleNamespace(st_mode=0o100640, st_uid=0, st_gid=0, st_size=100),
+                allowed_modes=frozenset({0o600, 0o640}),
+                max_bytes=1024,
+            )
         for controlled_path in (
             Path("/opt/oldsparky"),
             Path("/opt/oldsparky/platform"),
@@ -282,21 +275,6 @@ class MailboxHelperTests(unittest.TestCase):
             )
             self.assertFalse(
                 MODULE._directory_owner_is_allowed(controlled_path, 1000)
-            )
-
-        rejected_gid = max(MODULE.ALLOWED_SHARED_ENV_GROUP_GIDS, default=0) + 1
-        while rejected_gid in MODULE.ALLOWED_SHARED_ENV_GROUP_GIDS:
-            rejected_gid += 1
-        with self.assertRaises(MODULE.MailboxHelperError):
-            MODULE._validate_private_file_metadata(
-                SimpleNamespace(
-                    st_mode=0o100640,
-                    st_uid=0,
-                    st_gid=rejected_gid,
-                    st_size=100,
-                ),
-                allowed_modes=frozenset({0o600, 0o640}),
-                max_bytes=1024,
             )
 
         for unsafe_mode in (0o100660, 0o100644):
@@ -359,7 +337,7 @@ class MailboxHelperTests(unittest.TestCase):
         )
         MODULE._validate_private_file_metadata(
             MODULE.SHARED_ENV_PATH.lstat(),
-            allowed_modes=frozenset({0o600, 0o640}),
+            allowed_modes=frozenset({0o600}),
             max_bytes=MODULE.MAX_ENV_BYTES,
         )
 

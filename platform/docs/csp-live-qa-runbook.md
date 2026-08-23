@@ -52,26 +52,19 @@ repeats this check and refuses malformed archives before extraction:
   sha256sum -c <release-slug>.tar.gz.sha256)
 ```
 
-## Install and activate
+## Stage and activate
 
 ```bash
 cd /opt/oldsparky/platform/current
 tools/platform_release_preflight.sh \
-  --require-previous --require-verified-backup --backup-max-age-hours 24
+  --require-previous --require-verified-backup --require-edge-parity \
+  --backup-max-age-hours 24
 
 cd /root/old_sparky
-platform/tools/platform_release_install.sh \
-  platform/dist/releases/<release-slug>.tar.gz \
-  /opt/oldsparky/platform
-
-cd /opt/oldsparky/platform/current
-tools/platform_run_alembic.sh upgrade head
-tools/platform_install_systemd_units.sh
-/opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_install_nginx.py --json
-systemctl restart deadlock-api deadlock-worker deadlock-web
-/opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_install_nginx.py --apply --reload --json
+platform/tools/platform_release_deploy.sh \
+  --artifact platform/dist/releases/<release-slug>.tar.gz \
+  --app-dir /opt/oldsparky/platform \
+  --expected-csp-mode enforce
 tools/platform_release_preflight.sh \
   --require-previous --require-verified-backup --backup-max-age-hours 24
 /opt/oldsparky/platform/shared/venv/bin/python \

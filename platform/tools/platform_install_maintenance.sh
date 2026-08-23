@@ -17,6 +17,10 @@ install -m 0644 "$SYSTEMD_SRC_DIR/deadlock-maintenance.service" \
   "$SYSTEMD_DEST_DIR/deadlock-maintenance.service"
 install -m 0644 "$SYSTEMD_SRC_DIR/deadlock-maintenance.timer" \
   "$SYSTEMD_DEST_DIR/deadlock-maintenance.timer"
+install -m 0644 "$SYSTEMD_SRC_DIR/deadlock-offsite-backup.service" \
+  "$SYSTEMD_DEST_DIR/deadlock-offsite-backup.service"
+install -m 0644 "$SYSTEMD_SRC_DIR/deadlock-offsite-backup.timer" \
+  "$SYSTEMD_DEST_DIR/deadlock-offsite-backup.timer"
 install -d -m 0755 "$JOURNALD_DEST_DIR"
 install -m 0644 "$JOURNALD_SRC" \
   "$JOURNALD_DEST_DIR/60-deadlock-platform-retention.conf"

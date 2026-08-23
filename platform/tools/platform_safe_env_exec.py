@@ -10,7 +10,6 @@ is copied into the child environment.
 from __future__ import annotations
 
 import argparse
-import grp
 import os
 from pathlib import Path
 import re
@@ -77,22 +76,14 @@ def _validate_directory(metadata: os.stat_result, *, expected_uid: int) -> None:
 
 
 def _validate_env_file(metadata: os.stat_result) -> None:
-    try:
-        platform_gid = grp.getgrnam("oldsparky-platform").gr_gid
-    except KeyError as exc:
-        raise SafeEnvError(
-            "required production environment group is unavailable"
-        ) from exc
     mode = stat.S_IMODE(metadata.st_mode)
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
         or metadata.st_uid != 0
         or metadata.st_size > MAX_ENV_BYTES
-        or not (
-            (mode == 0o600 and metadata.st_gid == 0)
-            or (mode == 0o640 and metadata.st_gid == platform_gid)
-        )
+        or mode != 0o600
+        or metadata.st_gid != 0
     ):
         raise SafeEnvError("production environment file metadata is unsafe")
 

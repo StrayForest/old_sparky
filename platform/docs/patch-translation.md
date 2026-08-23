@@ -202,7 +202,14 @@ Pay particular attention to movement speed, cooldown, spirit power/scaling, bull
 
 If a real patch exposes a missing important concept, add that canonical term to the checked-in glossary and rerun the same regression set. Do not introduce dynamic glossary discovery or per-request filtering.
 
-Structural production QA is fail-fast. It may inspect or directly generate the four translations once, but must not sit in a polling loop waiting for background translations.
+Structural production checks are fail-fast, but the post-deploy workflow is a
+controlled cache warm-up rather than read-only QA: a cache miss acquires a
+Redis lock, may call OpenAI and writes the translation cache. The workflow is
+named `Platform patch translation warm-up`, requires an explicit maximum number
+of cache-miss/OpenAI calls (four by default), and reports the mutation budget in
+its result. It must not run in a polling loop or be described as a pure QA
+check. A read-only check must fail on cache miss instead of invoking the
+translator.
 
 Manual/diagnostic comparison is still required when changing prompt/glossary behavior because numeric correctness alone cannot detect terminology mistakes, item/mechanic ambiguity, prose truncation or awkward Russian phrasing.
 

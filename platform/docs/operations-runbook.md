@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-08-21
+- Last reviewed: 2026-08-23
 
 ## Runtime checks
 
@@ -23,6 +23,20 @@ platform dependencies.
 service, disk, memory, backup-age and certificate-expiry gate.
 `deadlock-maintenance.timer` runs the daily restore-verified backup and bounded
 retention workflow.
+
+The read-only edge proof is:
+
+```bash
+cd /opt/oldsparky/platform/current
+/opt/oldsparky/platform/shared/venv/bin/python \
+  tools/platform_validate_edge_policy.py --json
+```
+
+It compares the current Cloudflare ranges with both the Nginx real-IP include
+and managed UFW rules. It does not prove that a direct-origin request is
+blocked; perform that negative test separately from an approved external
+network. A release preflight with `--require-edge-parity` fails closed when the
+range proof is unavailable or mismatched.
 
 ## Retention and disk safety
 

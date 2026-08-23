@@ -633,5 +633,5 @@ SHA256:
   $ARTIFACT_SHA_PATH
 
 Next step:
-  platform/tools/platform_release_install.sh "$ARTIFACT_PATH" /opt/oldsparky/platform
+  platform/tools/platform_release_deploy.sh --artifact "$ARTIFACT_PATH" --app-dir /opt/oldsparky/platform
 EOF

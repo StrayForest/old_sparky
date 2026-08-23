@@ -33,6 +33,21 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "Install units and prepare release-specific writable paths",
             release_installer,
         )
+        deploy = (REPO_ROOT / "platform/tools/platform_release_deploy.sh").read_text()
+        self.assertIn("--stage-only", release_installer)
+        self.assertIn("--artifact", deploy)
+        self.assertIn("migration-pending", deploy)
+        self.assertIn("--resume", deploy)
+        self.assertIn("--abort-retained", deploy)
+        self.assertIn("MIGRATION_NOT_REVERSED", deploy)
+        self.assertIn("platform_install_systemd_units.sh", deploy)
+        self.assertIn("platform_deploy_smoke.py", deploy)
+
+        systemd_units = (
+            REPO_ROOT / "platform/tools/platform_install_systemd_units.sh"
+        ).read_text()
+        self.assertIn("deadlock-offsite-backup.service", systemd_units)
+        self.assertIn("deadlock-offsite-backup.timer", systemd_units)
 
     def test_release_ref_is_rejected_before_any_build_or_network_work(self) -> None:
         unsafe_refs = ("../escape", "bad/ref", 'bad"json', "-leading", "x" * 101)
