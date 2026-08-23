@@ -49,6 +49,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         rollback = (REPO_ROOT / "platform/tools/platform_release_rollback.sh").read_text()
         self.assertIn("rollback-runtime-pending", rollback)
         self.assertIn("platform_release_restore_runtime.sh", rollback)
+        self.assertIn(".release-recovery", rollback)
+        self.assertIn("install_recovery_shim", rollback)
+        recovery_shim = (
+            REPO_ROOT / "platform/tools/platform_release_recovery_shim.sh"
+        ).read_text()
+        self.assertIn('RECOVERY_DIR="$SHARED_DIR/.release-recovery"', recovery_shim)
+        self.assertIn('RECOVERY_TOOL="$RECOVERY_DIR/platform_release_rollback.sh"', recovery_shim)
 
         systemd_units = (
             REPO_ROOT / "platform/tools/platform_install_systemd_units.sh"

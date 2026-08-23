@@ -54,6 +54,9 @@ If an install or rollback was interrupted, --recover-pending restores the exact
 pre-operation pointers and venv from shared/.release-operation.json, removes an
 unactivated install candidate, and exits. A rollback already in restart-pending
 instead repeats the service restart and durably completes that same rollback.
+The rollback path prepares shared/.release-recovery before switching current;
+the previous release's rollback entrypoint delegates there if a second process
+must recover after that pointer switch.
 Retry the intended operation afterward only after pre-operation recovery.
 EOF
       exit 0
@@ -91,6 +94,7 @@ RELEASES_DIR="$APP_DIR/releases"
 SHARED_DIR="$APP_DIR/shared"
 SHARED_VENV_DIR="$SHARED_DIR/venv"
 TRANSACTION_STATE="$SHARED_DIR/.release-operation.json"
+RECOVERY_BUNDLE_DIR="$SHARED_DIR/.release-recovery"
 
 for SAFE_DIR in "$APP_DIR" "$RELEASES_DIR" "$SHARED_DIR"; do
   if [[ ! -d "$SAFE_DIR" || -L "$SAFE_DIR" ]]; then
@@ -261,6 +265,50 @@ validate_root_directory() {
   fi
 }
 
+prepare_recovery_bundle() {
+  if [[ -e "$RECOVERY_BUNDLE_DIR" || -L "$RECOVERY_BUNDLE_DIR" ]]; then
+    validate_root_directory "$RECOVERY_BUNDLE_DIR" "Stable recovery bundle"
+  else
+    install -d -o root -g root -m 0755 "$RECOVERY_BUNDLE_DIR"
+  fi
+
+  local filename source temporary destination
+  for filename in \
+    platform_release_rollback.sh \
+    platform_release_transaction.py \
+    platform_release_restore_runtime.sh \
+    platform_release_recovery_shim.sh; do
+    source="$TOOLS_DIR/$filename"
+    destination="$RECOVERY_BUNDLE_DIR/$filename"
+    if [[ ! -f "$source" || -L "$source" ]]; then
+      echo "Recovery bundle source is unavailable: $source" >&2
+      return 1
+    fi
+    temporary="$(mktemp "$RECOVERY_BUNDLE_DIR/.$filename.XXXXXX")"
+    install -o root -g root -m 0755 "$source" "$temporary"
+    mv -T -- "$temporary" "$destination"
+  done
+}
+
+install_recovery_shim() {
+  local release="$1"
+  local release_tools="$release/tools"
+  local source="$RECOVERY_BUNDLE_DIR/platform_release_recovery_shim.sh"
+  local destination="$release_tools/platform_release_rollback.sh"
+  local temporary
+  validate_root_directory "$release_tools" "Previous release tools"
+  if [[ ! -f "$source" || -L "$source" || ! -x "$source" ]]; then
+    echo "Stable recovery shim is unavailable: $source" >&2
+    return 1
+  fi
+  if [[ -f "$destination" && ! -L "$destination" ]] && cmp -s "$source" "$destination"; then
+    return 0
+  fi
+  temporary="$(mktemp "$release_tools/.platform_release_rollback.sh.recovery.XXXXXX")"
+  install -o root -g root -m 0755 "$source" "$temporary"
+  mv -T -- "$temporary" "$destination"
+}
+
 read_safe_record() {
   local path="$1"
   local label="$2"
@@ -408,6 +456,13 @@ EOF
 if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
+
+# A rollback changes current to the previous release. Install a stable,
+# release-independent recovery bundle and a tiny handoff shim before that
+# pointer switch, so a second process launched through the old current can
+# still recover the new receipt and runtime phases.
+prepare_recovery_bundle
+install_recovery_shim "$PREVIOUS_TARGET"
 
 ROLLBACK_COMPLETE=0
 cleanup_failed_rollback() {

@@ -14,9 +14,11 @@ For the production baseline and immediate engineering target, read [`CURRENT.md`
 `nginx-pending` uncertainty boundary, idempotent resume from
 `activation-committed`, and retained recovery that restores release-specific
 units and Nginx before restart/smoke. Rollback restores the previous code,
-venv, units and Nginx, while migration uncertainty remains fail-closed and no
-automatic Alembic downgrade is introduced. Fault-injection regression tests
-cover every requested side-effect boundary; closure evidence is retained in
+venv, units and Nginx, and a shared recovery bundle plus previous-release shim
+keeps that recovery available after `current` switches. Migration uncertainty
+remains fail-closed and no automatic Alembic downgrade is introduced.
+Fault-injection regression tests cover every requested side-effect boundary;
+closure evidence is retained in
 [`archive/as-17-release-transaction-recovery-2026-08-23.md`](archive/as-17-release-transaction-recovery-2026-08-23.md).
 
 ### AS-15 — Deadlock persistence and workflow concurrency integrity

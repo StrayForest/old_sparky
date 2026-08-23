@@ -109,7 +109,22 @@ Dry-run is the default. Apply only after policy validation and `nginx -t` succee
 
 ## Rollback
 
-Use the repository rollback tooling and the exact previous immutable release. Rollback switches application release pointers; it does **not** automatically downgrade Alembic. Do not bypass a missing or mismatched rollback receipt or dependency-freeze proof.
+Use the shared recovery/rollback tooling and the exact previous release.
+Rollback switches application release pointers; it does **not** automatically
+downgrade Alembic. Do not bypass a missing or mismatched rollback receipt or
+dependency-freeze proof. The rollback tool prepares a root-owned shared
+recovery bundle and a compatibility handoff in the previous release before
+switching `current`, so recovery remains available if the process dies after
+the pointer switch.
+
+If a rollback is interrupted, recover with the stable bundle (or the
+`current/tools/platform_release_rollback.sh` shim, which delegates to it):
+
+```bash
+/opt/oldsparky/platform/shared/.release-recovery/platform_release_rollback.sh \
+  --recover-pending \
+  --app-dir /opt/oldsparky/platform
+```
 
 After rollback, repeat preflight plus origin/SNI and public smoke against the restored release.
 

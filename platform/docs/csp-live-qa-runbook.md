@@ -487,11 +487,12 @@ reports rather than documentation.
 
 Install and rollback share a durable transaction record. If either command
 reports a pending operation, do not retry, edit symlinks or remove the record.
-Recover the inode-checked operation first from the reviewed checkout:
+Recover the inode-checked operation first from the stable shared bundle. If the
+rollback pointer has already switched, `current/tools/platform_release_rollback.sh`
+is a compatibility shim to the same bundle:
 
 ```bash
-cd /root/old_sparky
-platform/tools/platform_release_rollback.sh \
+/opt/oldsparky/platform/shared/.release-recovery/platform_release_rollback.sh \
   --recover-pending \
   --app-dir /opt/oldsparky/platform
 ```

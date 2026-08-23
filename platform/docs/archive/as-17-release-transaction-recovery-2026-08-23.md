@@ -28,22 +28,32 @@ Nginx, then restarts/readiness-smokes before receipt cleanup.
 Rollback now records `rollback-runtime-pending`, installs the previous
 release's units and Nginx before restart/smoke, and retains enough state to
 either finish an interrupted restart-pending rollback or restore the exact
-pre-rollback pointers, venv, units and Nginx. The transaction schema remains
-expand-compatible; no Alembic downgrade path was introduced.
+pre-rollback pointers, venv, units and Nginx. The previous release's
+transaction code is not required after the pointer switch: before switching,
+rollback refreshes a root-owned shared recovery bundle and installs a
+compatibility shim at the previous release's rollback entrypoint. A second
+process launched through the switched `current` delegates to that bundle. The
+transaction schema remains expand-compatible; no Alembic downgrade path was
+introduced.
 
 ## Verification and deployment
 
 The pre-fix regression scenarios reproduced all three reported failures on the
 original HEAD. The focused release suite then passed with fault injection after
 pointers, venv, units, Nginx, restart, smoke, activation commit and final
-receipt cleanup. The full platform test gate, docs check, shell/Python syntax
-checks and secret scan passed.
+receipt cleanup. The two-process regression also kills rollback after pointer
+switch, invokes the old `current/tools/platform_release_rollback.sh`, and
+verifies receipt, pointers, venv, units and Nginx recovery through the shared
+bundle. The full platform test gate, docs check, shell/Python syntax checks and
+secret scan passed.
 
-Production run `32634067684` passed preflight, immutable build/checksum,
-release deployment, service/unit preparation, Nginx dry-run/apply, origin and
-public deployment smoke, and the success deployment status. The live release
-was `gha-32634067684-1-356d7832d480-20260823T103422Z`; the previous release
-remains installed and is the explicit rollback target.
+The prior production run `32634067684` passed preflight, immutable
+build/checksum, release deployment, service/unit preparation, Nginx
+dry-run/apply, origin and public deployment smoke, and the success deployment
+status. The live release was `gha-32634067684-1-356d7832d480-20260823T103422Z`;
+the previous release remains installed and is the explicit rollback target.
+The follow-up compatibility fix is pending its production deployment; its
+final commit and run are recorded here before closure is published.
 
 ## Retained invariant
 

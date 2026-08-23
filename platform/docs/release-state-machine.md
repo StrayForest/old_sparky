@@ -45,6 +45,15 @@ the receipt is in `rollback-runtime-pending`, before any restart or smoke.
 `--no-restart` still restores units and Nginx but deliberately omits service
 restart and smoke.
 
+Before a rollback pointer switch, the rollback tool refreshes the root-owned
+`shared/.release-recovery/` bundle and installs a small compatibility shim as
+the previous release's `tools/platform_release_rollback.sh`. If the rollback
+process crashes after `current` has switched, a new invocation through the old
+`current` therefore delegates to the shared bundle rather than the old
+release's transaction code. The application files and runtime tools of the
+previous release remain unchanged; only its rollback entrypoint is replaced by
+the recovery handoff needed for this cross-release boundary.
+
 ## Failure behavior
 
 - A failure before `staged` is recovered by the installer while the original
@@ -79,7 +88,8 @@ restart and smoke.
 - A rollback runtime failure retains `rollback-runtime-pending` (or its later
   phase). Recovery either completes the already committed restart-pending
   rollback or restores the exact pre-rollback pointers, venv, units and Nginx
-  while the receipt remains durable.
+  while the receipt remains durable. Recovery is invoked through the shared
+  bundle, including when `current` already resolves to the previous release.
 - `activation-committed` is resumable and idempotently calls final receipt
   completion. A crash after activation commit therefore cannot report success
   while leaving the receipt to block the next install.

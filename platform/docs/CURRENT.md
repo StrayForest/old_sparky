@@ -53,7 +53,10 @@ The release receipt now has an explicit Nginx uncertainty boundary, idempotent
 `activation-committed` completion, retained runtime recovery, and rollback
 restoration of the previous release's code, venv, units and Nginx before
 restart/smoke. Fault-injection coverage spans pointer/venv, units, Nginx,
-restart, smoke, activation commit and receipt cleanup. Closure evidence is in
+restart, smoke, activation commit, receipt cleanup and the two-process crash
+after rollback pointer switch through the old `current` helper. Recovery uses a
+root-owned shared bundle and compatibility shim, while migration uncertainty
+remains fail-closed and no automatic Alembic downgrade is added. Closure evidence is in
 [`archive/as-17-release-transaction-recovery-2026-08-23.md`](archive/as-17-release-transaction-recovery-2026-08-23.md).
 AS-12 has code-side fail-closed validation and a read-only parity gate, while
 the VPS proof remains operator-owned. AS-13's CI contour is being revalidated

@@ -21,6 +21,7 @@ INSTALL_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_install.sh
 ROLLBACK_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_rollback.sh"
 TRANSACTION_TOOL = REPO_ROOT / "platform" / "tools" / "platform_release_transaction.py"
 RUNTIME_RESTORE_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_restore_runtime.sh"
+RECOVERY_SHIM_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_recovery_shim.sh"
 TRANSACTION_STATE_NAME = ".release-operation.json"
 BUILT_AT = "20260811T120000Z"
 
@@ -710,6 +711,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         shutil.copy2(ROLLBACK_SCRIPT, release_tools / ROLLBACK_SCRIPT.name)
         shutil.copy2(TRANSACTION_TOOL, release_tools / TRANSACTION_TOOL.name)
         shutil.copy2(RUNTIME_RESTORE_SCRIPT, release_tools / RUNTIME_RESTORE_SCRIPT.name)
+        shutil.copy2(RECOVERY_SHIM_SCRIPT, release_tools / RECOVERY_SHIM_SCRIPT.name)
         invoked_through_current = (
             self.app_dir / "current" / "tools" / ROLLBACK_SCRIPT.name
         )

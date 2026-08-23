@@ -338,6 +338,65 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                     (self.shared / "venv" / "deps-version").read_text(), "new\n"
                 )
 
+    def test_pointer_switch_crash_recovers_through_old_current_helper(self) -> None:
+        current, previous = self.prepare_rollback_state()
+        legacy_helper = previous / "tools/platform_release_rollback.sh"
+        legacy_helper.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' legacy-helper-used > \"$PLATFORM_LEGACY_HELPER_STATE\"\n"
+            "exit 77\n"
+        )
+        legacy_helper.chmod(0o755)
+        legacy_state = self.root / "legacy-helper.state"
+        runtime = self.copy_runtime_with_fault(
+            "runtime-after-pointer-switch-kill.sh",
+            '  PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"\n',
+            '  PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"\n'
+            '  /bin/kill -KILL "$PPID"\n',
+        )
+        interrupted = self.copy_rollback_with_runtime(
+            "rollback-after-pointer-switch-kill.sh", runtime
+        )
+
+        result = self.run_script(
+            interrupted,
+            "--app-dir",
+            str(self.app_dir),
+            "--no-restart",
+            env={
+                **self.runtime_env(label="previous"),
+                "PLATFORM_LEGACY_HELPER_STATE": str(legacy_state),
+            },
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state_phase(), "rollback-runtime-pending")
+        self.assertEqual((self.app_dir / "current").resolve(), previous)
+        self.assertIn(
+            "RECOVERY_DIR=\"$SHARED_DIR/.release-recovery\"",
+            (previous / "tools/platform_release_rollback.sh").read_text(),
+        )
+
+        recovery = self.app_dir / "current/tools/platform_release_rollback.sh"
+        result = self.run_script(
+            recovery,
+            "--recover-pending",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="current"),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+        self.assertFalse(legacy_state.exists())
+        self.assertEqual(
+            (self.shared / "venv" / "deps-version").read_text(), "new\n"
+        )
+
     def prepare_deploy_state(self, phase: str) -> tuple[Path, Path, Path]:
         current, previous, candidate = self.prepare_install_state(
             with_fake_python=True
