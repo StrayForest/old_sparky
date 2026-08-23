@@ -4,10 +4,12 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import grp
 from hashlib import sha256
 import mmap
 import os
 from pathlib import Path
+import stat
 import tempfile
 from uuid import UUID
 import zlib
@@ -19,6 +21,9 @@ from python_packages.platform_infra.media.errors import (
 
 
 ALLOWED_SOURCE_MIMES = frozenset({"image/jpeg", "image/png", "image/webp"})
+SHARED_MEDIA_GROUP = "oldsparky-media"
+PRIVATE_FILE_MODE = 0o600
+SHARED_FILE_MODE = 0o660
 
 
 @dataclass(frozen=True)
@@ -76,7 +81,16 @@ class MediaSourceStore:
         self.max_staged_bytes = max_staged_bytes
         self.max_staged_files = max_staged_files
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        root_mode = self.root.stat().st_mode
+        root_metadata = self.root.lstat()
+        if stat.S_ISLNK(root_metadata.st_mode):
+            raise PermissionError(
+                f"Media staging directory must not be a symlink: {self.root}"
+            )
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise PermissionError(
+                f"Media staging path must be a directory: {self.root}"
+            )
+        root_mode = stat.S_IMODE(root_metadata.st_mode)
         if root_mode & 0o007:
             raise PermissionError(
                 f"Media staging directory must not be world-accessible: {self.root}"
@@ -85,6 +99,25 @@ class MediaSourceStore:
             raise PermissionError(
                 f"Media staging directory is not writable: {self.root}"
             )
+        self.is_shared_staging_root = self._is_validated_shared_root(root_metadata)
+        self._file_mode = (
+            SHARED_FILE_MODE if self.is_shared_staging_root else PRIVATE_FILE_MODE
+        )
+
+    @staticmethod
+    def _is_validated_shared_root(root_metadata: os.stat_result) -> bool:
+        try:
+            media_group_gid = grp.getgrnam(SHARED_MEDIA_GROUP).gr_gid
+        except KeyError:
+            return False
+        mode = stat.S_IMODE(root_metadata.st_mode)
+        return (
+            root_metadata.st_uid == 0
+            and root_metadata.st_gid == media_group_gid
+            and bool(root_metadata.st_mode & stat.S_ISGID)
+            and mode & 0o770 == 0o770
+            and not mode & 0o007
+        )
 
     def path_for(self, asset_id: str) -> Path:
         return self.root / f"{validate_asset_id(asset_id)}.source"
@@ -131,7 +164,7 @@ class MediaSourceStore:
                 delete=False,
             ) as temporary:
                 temporary_path = Path(temporary.name)
-                os.chmod(temporary.name, 0o600)
+                os.fchmod(temporary.fileno(), self._file_mode)
                 for chunk in chunks:
                     if not isinstance(chunk, bytes):
                         raise TypeError("Media upload chunks must be bytes")
@@ -287,13 +320,23 @@ class MediaSourceStore:
     @contextmanager
     def _quota_lock(self) -> Iterator[None]:
         lock_path = self.root / ".quota.lock"
-        lock_descriptor = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
-            0o600,
-        )
+        lock_flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            lock_descriptor = os.open(
+                lock_path,
+                lock_flags | os.O_CREAT | os.O_EXCL,
+                self._file_mode,
+            )
+            os.fchmod(lock_descriptor, self._file_mode)
+        except FileExistsError:
+            lock_descriptor = os.open(lock_path, lock_flags)
         with os.fdopen(lock_descriptor, "a+b") as lock_file:
-            if os.fstat(lock_file.fileno()).st_mode & 0o007:
+            lock_metadata = os.fstat(lock_file.fileno())
+            if not stat.S_ISREG(lock_metadata.st_mode):
+                raise PermissionError(
+                    f"Media staging quota lock must be a regular file: {lock_path}"
+                )
+            if stat.S_IMODE(lock_metadata.st_mode) & 0o007:
                 raise PermissionError(
                     f"Media staging quota lock must not be world-accessible: {lock_path}"
                 )
