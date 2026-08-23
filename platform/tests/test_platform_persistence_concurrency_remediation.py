@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
-
-from fastapi import HTTPException
 
 from apps.platform_api.app.api.routes import profiles, tournaments
 from apps.platform_api.app.services import deadlock_automation, player_commitments
