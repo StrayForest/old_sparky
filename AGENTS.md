@@ -54,11 +54,34 @@ For completed substantive work:
 
 A local-only commit is not a completed handoff. Never automatically use `--force` or `--force-with-lease`; reconcile any divergence first.
 
+## GitHub CI/CD is the release authority
+
+- Do not run platform tests, builds or migrations manually from the Codex shell
+  for normal work. These checks are owned by GitHub Actions; a local result is
+  neither required nor sufficient for release authorization.
+- If a GitHub job fails, use its GitHub Actions logs as the first diagnostic
+  source. Run a local reproduction only when explicitly requested or when it
+  is necessary to isolate the CI failure, and never treat that reproduction as
+  the release gate.
+- After pushing to `dev`, wait for the GitHub Actions
+  `Platform security and build` workflow for the exact target SHA to finish.
+  Inspect the backend job and every required job; the aggregate
+  `platform-security-build` commit status must be `success`.
+- Never dispatch `Platform production deploy` while the security/build workflow
+  is pending, failing or still running. Do not run deployment in parallel with
+  CI, even when local verification is green.
+- If local and GitHub results differ, treat the GitHub result as authoritative
+  for release gating, investigate the environment difference, fix it, push the
+  fix and repeat the complete CI gate.
+
 ## Production deployment
 
 - Normal production releases must be started through the GitHub Actions
   `Platform production deploy` workflow from the reviewed `dev` branch:
   `gh workflow run platform-production-deploy.yml --repo StrayForest/old_sparky --ref dev --field mode=deploy`.
+- The deploy workflow must fail closed unless the exact target SHA has a green
+  `platform-security-build` status. This gate is checked by GitHub Actions
+  before packaging, SSH or any production release side effect.
 - Wait for and report the GitHub Actions run and its live deployment result;
   a successful branch push is not a production deployment.
 - Do not invoke `platform_build_release.sh` or `platform_release_deploy.sh`
@@ -68,10 +91,14 @@ A local-only commit is not a completed handoff. Never automatically use `--force
 
 ## Verification
 
-- Platform tests: from `platform/`, `tools/platform_run_quiet.sh "platform tests" -- tools/platform_run_tests.sh discover -s tests`.
-- Migration: `cd platform && tools/platform_run_alembic.sh upgrade head`.
-- Web build: from `platform/`, `tools/platform_run_quiet.sh "web build" -- tools/platform_web_npm.sh --prefix apps/platform_web run build`.
-- Docs: `cd platform && .venv_platform/bin/python tools/platform_docs_check.py`.
-- Release: use the current commands in `platform/docs/deployment-runbook.md`.
+- Push the reviewed commit to `dev` and wait for the GitHub Actions
+  `Platform security and build` workflow. It owns backend tests, migration
+  scenarios, web build/hermetic checks, smoke checks and the aggregate
+  `platform-security-build` status.
+- Use `gh run watch <run-id> --repo StrayForest/old_sparky --exit-status` and
+  inspect the backend job plus every required job before deployment.
+- Release verification and live smoke are performed by the GitHub Actions
+  `Platform production deploy` workflow described in
+  `platform/docs/deployment-runbook.md`.
 
 Done means verified and published to GitHub, or any skipped verification/publication is explicitly named with the reason.

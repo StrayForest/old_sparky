@@ -66,6 +66,23 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("deadlock-offsite-backup.service", systemd_units)
         self.assertIn("deadlock-offsite-backup.timer", systemd_units)
 
+    def test_production_deploy_requires_green_security_status(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text()
+
+        self.assertIn("Require successful platform security build", workflow)
+        self.assertIn(
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status"',
+            workflow,
+        )
+        self.assertIn('item.get("context") == "platform-security-build"', workflow)
+        self.assertIn('test "$security_state" = success', workflow)
+        self.assertLess(
+            workflow.index("Require successful platform security build"),
+            workflow.index("Mark production deployment pending"),
+        )
+
     def test_release_ref_is_rejected_before_any_build_or_network_work(self) -> None:
         unsafe_refs = ("../escape", "bad/ref", 'bad"json', "-leading", "x" * 101)
         with tempfile.TemporaryDirectory() as temp_dir:

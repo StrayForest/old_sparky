@@ -38,6 +38,46 @@ jobs:
       SOURCE_ARCHIVE: /tmp/old-sparky-source-${{ github.run_id }}-${{ github.run_attempt }}.tar.gz
 
     steps:
+      - name: Require successful platform security build
+        if: ${{ env.DEPLOY_MODE == 'deploy' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          status_json="$(
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status"
+          )"
+          security_state="$(
+            printf '%s' "$status_json" | /usr/bin/python3 -c '
+          import json
+          import sys
+
+          payload = json.load(sys.stdin)
+          statuses = [
+              item for item in payload.get("statuses", [])
+              if item.get("context") == "platform-security-build"
+          ]
+          if not statuses:
+              raise SystemExit("platform-security-build status is missing")
+          latest = max(
+              statuses,
+              key=lambda item: item.get("updated_at")
+              or item.get("created_at")
+              or "",
+          )
+          print(latest.get("state") or "")
+          '
+          )"
+          test "$security_state" = success || {
+            echo "Refusing production deploy: platform-security-build=$security_state for $TARGET_SHA" >&2
+            exit 1
+          }
+
       - name: Mark production deployment pending
         if: ${{ env.DEPLOY_MODE == 'deploy' }}
         shell: bash

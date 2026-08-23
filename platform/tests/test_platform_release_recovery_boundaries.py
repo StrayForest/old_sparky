@@ -377,6 +377,11 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "RECOVERY_DIR=\"$SHARED_DIR/.release-recovery\"",
             (previous / "tools/platform_release_rollback.sh").read_text(),
         )
+        recovery_runtime = self.write_test_runtime_restore()
+        shutil.copy2(
+            recovery_runtime,
+            self.shared / ".release-recovery/platform_release_restore_runtime.sh",
+        )
 
         recovery = self.app_dir / "current/tools/platform_release_rollback.sh"
         result = self.run_script(

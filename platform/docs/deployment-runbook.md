@@ -8,8 +8,10 @@ Use this document for the normal immutable release path. CSP mode changes and pr
 
 ## Preconditions
 
-1. Work from a clean, reviewed commit; release metadata records `HEAD`.
-2. Run the focused verification required by the changed owners.
+1. Work from a clean, reviewed commit; release metadata records the exact
+   GitHub target SHA.
+2. Push the reviewed commit to `dev` and wait for the GitHub Actions security
+   and build gate; do not substitute a manually run local test.
 3. Confirm migration expand/rollback compatibility.
 4. Confirm services are healthy, disk has at least 5 GiB free and is below 85%, and `current`/`previous` releases are protected.
 5. Create a fresh restore-verified backup.
@@ -17,8 +19,9 @@ Use this document for the normal immutable release path. CSP mode changes and pr
 ## Normal production deploy through GitHub Actions
 
 Normal production deployment is initiated from GitHub Actions, never by an
-agent directly invoking release scripts on the server. Dispatch the reviewed
-`dev` branch and wait for the run to finish:
+agent directly invoking release scripts on the server. After the exact-SHA
+security/build workflow is green, dispatch the reviewed `dev` branch and wait
+for the run to finish:
 
 ```bash
 gh workflow run platform-production-deploy.yml \
@@ -34,6 +37,11 @@ gh run list \
 
 gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
 ```
+
+For `mode=deploy`, the workflow fails closed until the exact target SHA has a
+successful `platform-security-build` commit status. A pending, failed or
+missing backend/security/build result cannot reach packaging, SSH or the
+production release state machine.
 
 Use `--field mode=preflight` when only the production gate is needed. The
 workflow checks out the exact GitHub commit, packages the clean source,
