@@ -133,9 +133,12 @@ jobs:
           install -d -m 0755 "$ci_build_root"
           cp -a "$GITHUB_WORKSPACE/." "$ci_build_root/"
           python3 -m venv "$ci_build_root/platform/.venv_platform"
-          install -d -m 0755 "$ci_build_root/platform/dist/releases"
-          PLATFORM_RELEASE_OUTPUT_DIR="$ci_build_root/platform/dist/releases" \
+          sudo install -d -o root -g root -m 0755 "$ci_build_root/platform/dist"
+          sudo install -d -o root -g root -m 0755 "$ci_build_root/platform/dist/releases"
+          sudo -EH env \
+            PLATFORM_RELEASE_OUTPUT_DIR="$ci_build_root/platform/dist/releases" \
             "$ci_build_root/platform/tools/platform_build_release.sh" "$RELEASE_SLUG"
+          sudo chown -R "$(id -u):$(id -g)" "$ci_build_root/platform/dist/releases"
           release_archive="$(find "$ci_build_root/platform/dist/releases" -maxdepth 1 -type f -name "${RELEASE_SLUG}-*.tar.gz" -print -quit)"
           test -n "$release_archive" || { echo "CI release artifact was not produced" >&2; exit 1; }
           release_checksum="${release_archive}.sha256"

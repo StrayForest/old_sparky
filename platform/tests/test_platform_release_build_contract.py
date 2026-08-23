@@ -109,6 +109,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             'ci_build_root="$RUNNER_TEMP/old-sparky-release-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
             workflow,
         )
+        self.assertIn('sudo -EH env \\\n            PLATFORM_RELEASE_OUTPUT_DIR=', workflow)
+        self.assertIn('sudo chown -R "$(id -u):$(id -g)"', workflow)
         self.assertNotIn("sudo rm -rf -- /root/old_sparky", workflow)
         remote_start = workflow.index("<<'REMOTE'")
         remote_script = workflow[remote_start:]
