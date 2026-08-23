@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import grp
 from importlib.util import find_spec
 from io import BytesIO
 import os
 from pathlib import Path
+import pwd
+import shutil
+import subprocess
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from uuid import uuid4
 
 from python_packages.platform_infra.media.errors import MediaStateError, MediaValidationError
 from python_packages.platform_infra.media.image_processor import ImagePolicy, ImageProcessor
 from python_packages.platform_infra.media.source_store import MediaSourceStore
+from python_packages.platform_infra.media.tasks import build_media_service
 
 
 TINY_PNG = (
@@ -22,6 +28,19 @@ TINY_PNG = (
 
 
 class MediaSourceStoreTests(unittest.TestCase):
+    @staticmethod
+    def _prepare_shared_root(root: Path) -> int:
+        if os.geteuid() != 0:
+            raise unittest.SkipTest("root is needed to prepare the shared media group")
+        try:
+            media_gid = grp.getgrnam("oldsparky-media").gr_gid
+        except KeyError:
+            raise unittest.SkipTest("oldsparky-media group is not available") from None
+        root.mkdir(mode=0o700)
+        os.chown(root, 0, media_gid)
+        os.chmod(root, 0o2770)
+        return media_gid
+
     def test_chunked_stage_is_private_atomic_and_hashes_valid_container(self) -> None:
         asset_id = str(uuid4())
         with TemporaryDirectory() as directory:
@@ -37,31 +56,92 @@ class MediaSourceStoreTests(unittest.TestCase):
             self.assertEqual(staged.path.read_bytes(), TINY_PNG)
             self.assertEqual(os.stat(store.root).st_mode & 0o777, 0o700)
             self.assertEqual(os.stat(staged.path).st_mode & 0o777, 0o600)
+            self.assertEqual(
+                os.stat(store.root / ".quota.lock").st_mode & 0o777,
+                0o600,
+            )
             self.assertEqual(tuple(store.staged_asset_ids(limit=4)), (asset_id,))
 
-    def test_preserves_permissions_of_prepared_shared_staging_directory(self) -> None:
+    def test_shared_staging_uses_group_read_write_file_permissions(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "shared"
-            root.mkdir(mode=0o700)
-            os.chmod(root, 0o2770)
+            media_gid = self._prepare_shared_root(root)
 
-            MediaSourceStore(root)
+            store = MediaSourceStore(root, max_input_bytes=1024)
+            staged = store.stage(
+                str(uuid4()), (TINY_PNG,), declared_mime="image/png"
+            )
 
             self.assertEqual(os.stat(root).st_mode & 0o7777, 0o2770)
+            self.assertTrue(store.is_shared_staging_root)
+            self.assertEqual(os.stat(staged.path).st_mode & 0o777, 0o660)
+            self.assertEqual(os.stat(staged.path).st_gid, media_gid)
+            self.assertEqual(os.stat(root / ".quota.lock").st_mode & 0o777, 0o660)
 
     def test_preserves_permissions_of_prepared_shared_quota_lock(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "shared"
-            root.mkdir(mode=0o700)
-            os.chmod(root, 0o2770)
+            media_gid = self._prepare_shared_root(root)
             lock_path = root / ".quota.lock"
             lock_path.touch(mode=0o600)
+            os.chown(lock_path, 0, media_gid)
             os.chmod(lock_path, 0o660)
 
             store = MediaSourceStore(root)
             store.cleanup_stale_temporary_files(older_than_epoch=0, limit=1)
 
             self.assertEqual(os.stat(lock_path).st_mode & 0o777, 0o660)
+            self.assertEqual(os.stat(lock_path).st_gid, media_gid)
+
+    def test_unvalidated_setgid_root_keeps_private_file_permissions(self) -> None:
+        if os.geteuid() != 0:
+            raise unittest.SkipTest("root is needed to prepare an unvalidated root")
+        try:
+            media_gid = grp.getgrnam("oldsparky-media").gr_gid
+            root_gid = grp.getgrnam("root").gr_gid
+        except KeyError:
+            raise unittest.SkipTest("required system groups are not available") from None
+        if root_gid == media_gid:
+            raise unittest.SkipTest("root and media groups unexpectedly match")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "setgid-but-private"
+            root.mkdir(mode=0o700)
+            os.chown(root, 0, root_gid)
+            os.chmod(root, 0o2770)
+
+            store = MediaSourceStore(root, max_input_bytes=1024)
+            staged = store.stage(
+                str(uuid4()), (TINY_PNG,), declared_mime="image/png"
+            )
+
+            self.assertFalse(store.is_shared_staging_root)
+            self.assertEqual(os.stat(staged.path).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(root / ".quota.lock").st_mode & 0o777, 0o600)
+
+    def test_rejects_symlink_staging_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "target"
+            target.mkdir(mode=0o700)
+            link = base / "link"
+            link.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(PermissionError, "must not be a symlink"):
+                MediaSourceStore(link)
+
+    def test_production_media_builder_rejects_unvalidated_staging_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = SimpleNamespace(
+                platform_object_storage_backend="r2",
+                platform_media_processing_concurrency=1,
+                platform_upload_dir=root / "uploads",
+                platform_media_staging_dir=root / "private-staging",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "root-owned setgid"):
+                build_media_service(object(), settings=settings)
 
     def test_rejects_world_accessible_staging_directory(self) -> None:
         with TemporaryDirectory() as directory:
@@ -138,6 +218,133 @@ class MediaSourceStoreTests(unittest.TestCase):
             self.assertEqual(removed, 1)
             self.assertFalse(stale.exists())
             self.assertTrue(recent.exists())
+
+    def test_real_service_identities_share_files_without_web_access(self) -> None:
+        if os.geteuid() != 0:
+            raise unittest.SkipTest("root is needed to exercise service identities")
+        runuser = shutil.which("runuser")
+        python = shutil.which("python3")
+        test_binary = shutil.which("test")
+        if not runuser or not python or not test_binary:
+            raise unittest.SkipTest("runuser, python3 and test are required")
+        try:
+            media_gid = grp.getgrnam("oldsparky-media").gr_gid
+            service_users = {
+                name: pwd.getpwnam(name).pw_uid
+                for name in ("oldsparky-api", "oldsparky-worker", "oldsparky-web")
+            }
+        except KeyError:
+            raise unittest.SkipTest("deployed service identities are not available") from None
+
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            os.chmod(base, 0o711)
+            staging_root = base / "media-staging"
+            staging_root.mkdir(mode=0o700)
+            os.chown(staging_root, 0, media_gid)
+            os.chmod(staging_root, 0o2770)
+
+            code_root = base / "runtime"
+            media_package = code_root / "python_packages" / "platform_infra" / "media"
+            media_package.mkdir(parents=True, mode=0o755)
+            os.chmod(code_root, 0o755)
+            shutil.copyfile(
+                Path(__file__).parents[1]
+                / "python_packages/platform_infra/media/source_store.py",
+                media_package / "source_store.py",
+            )
+            shutil.copyfile(
+                Path(__file__).parents[1]
+                / "python_packages/platform_infra/media/errors.py",
+                media_package / "errors.py",
+            )
+            for path in (media_package / "source_store.py", media_package / "errors.py"):
+                os.chmod(path, 0o644)
+
+            asset_id = str(uuid4())
+            source_path = staging_root / f"{asset_id}.source"
+            environment = {
+                "LC_ALL": "C",
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "PYTHONPATH": str(code_root),
+            }
+
+            def run_as(username: str, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        runuser,
+                        "-u",
+                        username,
+                        "--",
+                        python,
+                        "-c",
+                        script,
+                        *arguments,
+                    ],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+
+            api = run_as(
+                "oldsparky-api",
+                """
+from pathlib import Path
+import sys
+from python_packages.platform_infra.media.source_store import MediaSourceStore
+store = MediaSourceStore(Path(sys.argv[1]), max_input_bytes=1024)
+staged = store.stage(sys.argv[2], (bytes.fromhex(sys.argv[3]),), declared_mime="image/png")
+print(f"source_mode={staged.path.stat().st_mode & 0o777:o}")
+print(f"lock_mode={(staged.path.parent / '.quota.lock').stat().st_mode & 0o777:o}")
+""",
+                str(staging_root),
+                asset_id,
+                TINY_PNG.hex(),
+            )
+            self.assertEqual(api.returncode, 0, api.stderr)
+            self.assertIn("source_mode=660", api.stdout)
+            self.assertIn("lock_mode=660", api.stdout)
+            self.assertEqual(os.stat(source_path).st_uid, service_users["oldsparky-api"])
+            self.assertEqual(os.stat(source_path).st_gid, media_gid)
+
+            for username in ("oldsparky-web", "nobody"):
+                try:
+                    pwd.getpwnam(username)
+                except KeyError:
+                    if username == "nobody":
+                        continue
+                    raise
+                denied = subprocess.run(
+                    [runuser, "-u", username, "--", test_binary, "-r", str(source_path)],
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertNotEqual(denied.returncode, 0, username)
+
+            worker = run_as(
+                "oldsparky-worker",
+                """
+from pathlib import Path
+import sys
+from python_packages.platform_infra.media.source_store import MediaSourceStore
+store = MediaSourceStore(Path(sys.argv[1]), max_input_bytes=1024)
+store.cleanup_stale_temporary_files(older_than_epoch=0, limit=1)
+staged = store.describe(sys.argv[2])
+print(f"worker_size={staged.byte_size}")
+store.delete(sys.argv[2])
+""",
+                str(staging_root),
+                asset_id,
+            )
+            self.assertEqual(worker.returncode, 0, worker.stderr)
+            self.assertIn(f"worker_size={len(TINY_PNG)}", worker.stdout)
+            self.assertFalse(source_path.exists())
 
 
 @unittest.skipUnless(find_spec("PIL"), "Pillow is not installed in the current test environment")

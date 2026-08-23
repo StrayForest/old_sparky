@@ -59,6 +59,11 @@ def build_media_service(
         ),
         max_staged_files=int(getattr(resolved, "platform_media_max_staged_files", 256)),
     )
+    if not source_store.is_shared_staging_root:
+        raise RuntimeError(
+            "Production media staging must be a root-owned setgid "
+            "oldsparky-media directory"
+        )
     processor = ImageProcessor(
         ImagePolicy(
             max_pixels=int(getattr(resolved, "platform_media_max_pixels", 25_000_000)),

@@ -39,6 +39,7 @@ fi
 CANONICAL_ENV="$APP_DIR/shared/.env.platform"
 RUNTIME_ENV_DIR="$APP_DIR/shared/env"
 MEDIA_STAGING_DIR="$APP_DIR/shared/media-staging"
+MEDIA_QUOTA_LOCK="$MEDIA_STAGING_DIR/.quota.lock"
 WORKER_STATE_DIR="$APP_DIR/shared/worker-state"
 WEB_CACHE_DIR="$APP_DIR/current/apps/platform_web/.next/cache"
 MEDIA_GROUP="oldsparky-media"
@@ -106,9 +107,19 @@ for mutable_dir in "$MEDIA_STAGING_DIR" "$WORKER_STATE_DIR" "$WEB_CACHE_DIR"; do
     exit 1
   fi
 done
+if [[ -L "$MEDIA_QUOTA_LOCK" || ( -e "$MEDIA_QUOTA_LOCK" && ! -f "$MEDIA_QUOTA_LOCK" ) ]]; then
+  echo "Refusing unsafe media quota lock path: $MEDIA_QUOTA_LOCK" >&2
+  exit 1
+fi
 chown -R root:"$MEDIA_GROUP" "$MEDIA_STAGING_DIR"
 find "$MEDIA_STAGING_DIR" -xdev -type d -exec chmod 2770 {} +
 find "$MEDIA_STAGING_DIR" -xdev -type f -exec chmod 0660 {} +
+if [[ ! -e "$MEDIA_QUOTA_LOCK" ]]; then
+  install -o root -g "$MEDIA_GROUP" -m 0660 /dev/null "$MEDIA_QUOTA_LOCK"
+else
+  chown root:"$MEDIA_GROUP" "$MEDIA_QUOTA_LOCK"
+  chmod 0660 "$MEDIA_QUOTA_LOCK"
+fi
 chown -R oldsparky-worker:oldsparky-worker "$WORKER_STATE_DIR"
 find "$WORKER_STATE_DIR" -xdev -type d -exec chmod 0700 {} +
 find "$WORKER_STATE_DIR" -xdev -type f -exec chmod 0600 {} +
