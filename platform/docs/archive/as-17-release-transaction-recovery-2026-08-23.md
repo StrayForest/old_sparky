@@ -2,11 +2,11 @@
 
 - Status: Archived / resolved
 - Closed: 2026-08-23
-- Implementation commit: `356d7832d480fb6557d1b3692823c3b036dffb43`
-- Production deployment run: `32634067684`
-- Production deployment: [GitHub Actions run](https://github.com/StrayForest/old_sparky/actions/runs/32634067684)
-- Verified production release: `gha-32634067684-1-356d7832d480-20260823T103422Z`
-- Previous release retained: `gha-32631736423-1-f3b85310e553-20260823T094325Z`
+- Implementation commit: `f5189826613d4afa2d48f834d6fbf006f4c024dd`
+- Production deployment run: `32636564272`
+- Production deployment: [GitHub Actions run](https://github.com/StrayForest/old_sparky/actions/runs/32636564272)
+- Verified production release: `gha-32636564272-1-f5189826613d-20260823T112755Z`
+- Previous release retained: `gha-32634067684-1-356d7832d480-20260823T103422Z`
 - Alembic head: `20260822_0040`; no automatic downgrade was added
 
 ## Original finding
@@ -47,13 +47,13 @@ verifies receipt, pointers, venv, units and Nginx recovery through the shared
 bundle. The full platform test gate, docs check, shell/Python syntax checks and
 secret scan passed.
 
-The prior production run `32634067684` passed preflight, immutable
-build/checksum, release deployment, service/unit preparation, Nginx
-dry-run/apply, origin and public deployment smoke, and the success deployment
-status. The live release was `gha-32634067684-1-356d7832d480-20260823T103422Z`;
-the previous release remains installed and is the explicit rollback target.
-The follow-up compatibility fix is pending its production deployment; its
-final commit and run are recorded here before closure is published.
+Production run `32636564272` passed preflight, immutable build/checksum,
+release deployment, service/unit preparation, Nginx dry-run/apply, origin and
+public deployment smoke, and the success deployment status. Live checks showed
+active API/worker/web/Nginx services, API and web readiness `200`, successful
+Nginx syntax validation, Alembic head `20260822_0040`, and
+`current`=`gha-32636564272-1-f5189826613d-20260823T112755Z` with the previous
+release retained as the explicit rollback target.
 
 ## Retained invariant
 
