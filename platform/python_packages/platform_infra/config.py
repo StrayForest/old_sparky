@@ -192,8 +192,17 @@ def get_settings() -> PlatformSettings:
     return PlatformSettings()
 
 
-def validate_platform_settings(settings: PlatformSettings) -> None:
-    """Fail closed when a production process starts with unsafe core settings."""
+def validate_platform_settings(
+    settings: PlatformSettings,
+    *,
+    require_api_secret: bool | None = None,
+) -> None:
+    """Fail closed when a production process starts with unsafe core settings.
+
+    The worker intentionally receives no API/session secret. When callers do
+    not specify the boundary explicitly, the isolated worker service identity
+    selects that reduced validation contract.
+    """
 
     environment = settings.platform_environment.strip().lower()
     if environment not in {"development", "test", "production"}:
@@ -227,6 +236,9 @@ def validate_platform_settings(settings: PlatformSettings) -> None:
     if environment != "production":
         return
 
+    if require_api_secret is None:
+        require_api_secret = os.environ.get("PLATFORM_RUNTIME_SERVICE") != "worker"
+
     if settings.platform_api_host != "127.0.0.1":
         raise RuntimeError("Production API must bind to loopback only.")
     if settings.platform_web_bind_host != "127.0.0.1":
@@ -236,11 +248,12 @@ def validate_platform_settings(settings: PlatformSettings) -> None:
             "Production forwarded headers must be trusted only from loopback."
         )
 
-    secret = settings.platform_secret_key.strip()
-    if len(secret) < 32 or secret == DEVELOPMENT_SECRET_KEY:
-        raise RuntimeError(
-            "Production requires an explicit PLATFORM_SECRET_KEY of at least 32 characters."
-        )
+    if require_api_secret:
+        secret = settings.platform_secret_key.strip()
+        if len(secret) < 32 or secret == DEVELOPMENT_SECRET_KEY:
+            raise RuntimeError(
+                "Production requires an explicit PLATFORM_SECRET_KEY of at least 32 characters."
+            )
     if settings.platform_object_storage_backend.strip().lower() != "r2":
         raise RuntimeError(
             "Production media storage must use PLATFORM_OBJECT_STORAGE_BACKEND=r2."

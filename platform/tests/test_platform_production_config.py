@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from python_packages.platform_infra.config import (
     DEVELOPMENT_SECRET_KEY,
@@ -56,6 +58,15 @@ class PlatformProductionConfigTests(unittest.TestCase):
 
     def test_complete_production_configuration_passes(self) -> None:
         validate_platform_settings(self.production_settings())
+
+    def test_worker_runtime_does_not_require_api_secret(self) -> None:
+        settings = self.production_settings(
+            platform_secret_key=DEVELOPMENT_SECRET_KEY,
+        )
+        with patch.dict(os.environ, {"PLATFORM_RUNTIME_SERVICE": "worker"}):
+            validate_platform_settings(settings)
+        with self.assertRaisesRegex(RuntimeError, "PLATFORM_SECRET_KEY"):
+            validate_platform_settings(settings, require_api_secret=True)
 
     def test_production_bind_and_forwarded_trust_are_loopback_only(self) -> None:
         for overrides, expected in (

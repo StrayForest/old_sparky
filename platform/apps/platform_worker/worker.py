@@ -42,7 +42,7 @@ from python_packages.platform_infra.redis import redis_client
 T = TypeVar("T")
 
 settings = get_settings()
-validate_platform_settings(settings)
+validate_platform_settings(settings, require_api_secret=False)
 logger = logging.getLogger(__name__)
 _worker_loop: asyncio.AbstractEventLoop | None = None
 _worker_loop_pid: int | None = None
