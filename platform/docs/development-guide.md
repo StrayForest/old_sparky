@@ -51,13 +51,12 @@ All Node commands go through `tools/platform_node.sh` or `tools/platform_web_npm
 2. Define behavior, permissions, data impact, rollback and focused tests.
 3. Keep routes thin; place workflow rules in domain/services and persistence in models/repositories.
 4. For schema work, use an expand migration compatible with the previous release. Never edit an applied migration.
-5. Add regression coverage before broad gates.
+5. Add regression coverage before broad gates. For async UI mutations, cover duplicate-submit, stale-response and editable-draft races when applicable; permission-sensitive UI must consume backend capabilities rather than infer access from visibility or presentation state.
 6. Remove replaced imports, CSS, mocks, routes and stale documentation.
-7. Run focused checks, then the relevant full gates.
-8. For production-bound work, follow the deployment runbook and the
-   [release state machine](release-state-machine.md) through live validation;
-   do not call the low-level release installer directly.
-9. Commit each coherent verified change/package and push it to the matching GitHub branch before handoff unless explicitly requested otherwise.
+7. Push the coherent reviewed package and use GitHub Actions as the release verification authority. Local checks may help diagnose a failure but are not the normal production gate.
+8. For production-bound work merged or pushed to `dev`, wait for the exact-SHA `Platform security and build` push run. When it succeeds for the current `dev` HEAD, `Platform production auto-deploy` is expected to validate that SHA and dispatch the immutable `Platform production deploy` workflow automatically.
+9. Follow the deployment runbook and the [release state machine](release-state-machine.md) through live validation. Do not manually dispatch production for the normal `dev` path and do not call the low-level release installer directly.
+10. Commit each coherent verified change/package and push it to the matching GitHub branch before handoff unless explicitly requested otherwise.
 
 The test-group ownership and runner contract is maintained in
 [`test-suite-governance.md`](test-suite-governance.md). CI must use
@@ -97,7 +96,7 @@ A local-only commit is not a completed GitHub handoff.
 
 ## Verification commands
 
-Use the quiet wrapper so successful checks emit one line:
+GitHub Actions owns the normal release gate. Use local verification only when explicitly needed for development or CI diagnosis, and keep it isolated from production resources. The standard local commands are:
 
 ```bash
 cd /root/old_sparky/platform
@@ -108,7 +107,15 @@ tools/platform_run_quiet.sh "web build" -- tools/platform_web_npm.sh --prefix ap
 .venv_platform/bin/python tools/platform_docs_check.py
 ```
 
-Run Ruff, Bandit, pip-audit, npm audit and `tools/platform_secret_scan.py` for a security or release package. Use Playwright at affected desktop/tablet/mobile viewports for meaningful UI changes.
+Run Ruff, Bandit, pip-audit, npm audit and `tools/platform_secret_scan.py` for a security or release package when reproducing or extending the corresponding CI checks. Use Playwright at affected desktop/tablet/mobile viewports for meaningful UI changes.
+
+For a production-bound `dev` change, final verification is the GitHub chain for the same current-head SHA:
+
+1. `Platform security and build` succeeds and publishes `platform-security-build=success`.
+2. `Platform production auto-deploy` accepts that SHA rather than skipping it as stale/already deployed.
+3. `Platform production deploy` succeeds, including immutable-artifact validation and live smoke.
+
+Manual `Platform production deploy` remains an operator fallback/read-only preflight tool, not the routine continuation of a successful `dev` push.
 
 ## Data and test safety
 
