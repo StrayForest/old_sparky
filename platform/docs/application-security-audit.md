@@ -52,11 +52,27 @@ test database isolated. **Open pending a successful run and retained evidence.**
   activation remains behind its restore-drill gate.
 - Post-deploy patch translation is reported as a controlled warm-up with an
   explicit OpenAI cache-miss call budget, not read-only QA.
-- The production workflow now builds and attests the immutable release and
+- The production workflow builds and attests the immutable release and
   artifact-bound wheelhouse in CI, publishes its digest, and sends only that
-  digest-verified artifact to the VPS. The VPS no longer resolves dependencies
-  or builds from a source checkout; fully automatic push deployment remains a
-  separate policy decision.
+  digest-verified artifact to the VPS. The VPS does not resolve dependencies or
+  build from a source checkout.
+- Normal production deployment is now automatically chained from a successful
+  `Platform security and build` push run for the current `dev` HEAD. The
+  `Platform production auto-deploy` gate rejects stale successful runs,
+  requires the exact `platform-security-build=success` status and skips SHAs
+  already marked `platform-production-deploy=success`; manual deploy remains an
+  operator fallback rather than the routine path.
+- The frontend audit follow-up hardens client authorization and asynchronous
+  mutation state: anonymous invite-only page reads become an explicit login
+  flow, private registration consumes the backend invite-access capability,
+  auth/security feature fallbacks fail closed, Steam link UI requires confirmed
+  runtime capability, tournament creation serializes submit/invite-code state,
+  profile editors block overlapping saves, destructive pre-production cleanup
+  no longer reports a committed cleanup as failed because a later reload failed,
+  and invite-code readiness uses the same 10-character minimum as validation.
+  Deterministic regression coverage in
+  `apps/platform_web/tests/smoke/frontend-audit-regressions.spec.ts` locks these
+  contracts.
 
 ## Remediation order
 
