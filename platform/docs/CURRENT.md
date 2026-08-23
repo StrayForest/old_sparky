@@ -25,6 +25,7 @@ Read this file for the current production baseline and next engineering priority
 - Public tournament automation errors are persistence-sanitized before commit: `automation_last_error` can contain only the stable generic retry message, while restricted logs retain only tournament/failure metadata and a one-way error fingerprint. Migration `20260821_0039` rewrites historical non-null values to the same safe message.
 - Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. Rejections are observable and stream lifetime/reconnect behavior is bounded.
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
+- Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
 - Password-login guessing protection uses independent source-IP and account-wide Redis state. Account identifiers are represented by HMAC fingerprints, shared failures drive adaptive Turnstile and a bounded cooldown, and successful login clears account failure/cooldown state.
 - Alembic head: `20260822_0040`.
@@ -108,9 +109,8 @@ against the current web/api/worker identities and units.
   that scoped service env files are freshly rendered from it.
 - Normal production deployment is manual-dispatch through the GitHub Actions
   `Platform production deploy` workflow from `dev`; direct server invocation is
-  recovery/rollback-only. Fully automatic push deployment remains disabled
-  while signed CI artifact provenance and live Cloudflare/Nginx/UFW proof remain
-  open.
+  recovery/rollback-only. Fully automatic push deployment remains disabled by
+  policy while live Cloudflare/Nginx/UFW proof remains operator-owned.
 
 ## Deferred / operator-owned work
 
@@ -118,8 +118,6 @@ against the current web/api/worker identities and units.
 - VPS-owned AS-12 evidence: loopback-only listeners, `FORWARDED_ALLOW_IPS=127.0.0.1`,
   exact Cloudflare CIDR parity across UFW/Nginx, and a direct-origin negative
   test. Repository checks do not prove live state.
-- CI-built/signed release artifact, hash-locked Python wheelhouse and deploy by
-  published digest remain open provenance work.
 - Real-user CSP follow-up and classification of new enforcement reports.
 - Post-grace physical removal of runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers when no longer required.
 - Non-security feature expansion that does not remove a launch or production blocker.

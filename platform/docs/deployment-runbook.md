@@ -44,10 +44,11 @@ missing backend/security/build result cannot reach packaging, SSH or the
 production release state machine.
 
 Use `--field mode=preflight` when only the production gate is needed. The
-workflow checks out the exact GitHub commit, packages the clean source,
-connects to production using the configured environment secrets, runs the
-preflight, builds and checksums the immutable artifact, invokes the guarded
-release state machine, and records the deployment status on the commit. Record
+deploy workflow checks out the exact GitHub commit, builds the immutable
+release and wheelhouse in CI, publishes and attests the artifact, verifies its
+digest and source commit, then transfers that exact artifact to production.
+The VPS performs no source checkout or dependency/build resolution; it only
+revalidates the artifact and invokes the guarded release state machine. Record
 the Actions run URL/ID, target SHA, release slug and final smoke result in the
 handoff.
 
@@ -136,9 +137,9 @@ If a rollback is interrupted, recover with the stable bundle (or the
 
 After rollback, repeat preflight plus origin/SNI and public smoke against the restored release.
 
-The production workflow is manual-dispatch only while artifact provenance and
-live edge proof remain open. A successful CI build or branch push must not be
-treated as production deployment approval.
+The production workflow is manual-dispatch only while live edge proof remains
+operator-owned. A successful CI build or branch push must not be treated as
+production deployment approval.
 
 ## Special release contours
 

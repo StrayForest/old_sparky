@@ -178,6 +178,102 @@ class PlatformProfilesApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cleared.status_code, 200, cleared.text)
         self.assertIsNone(cleared.json()["captain_team_name"])
 
+    async def test_explicit_null_clears_nullable_profile_fields_and_is_audited(self) -> None:
+        owner = await self._register("clear-fields")
+        initial = await owner.put(
+            "/api/v1/profiles/me",
+            json={
+                "handle": f"{self.prefix}-clear",
+                "bio": "Retained bio",
+                "contact_email": "private@example.com",
+                "region": "EU",
+                "discord_account": "old-discord",
+                "captain_team_name": "Old Team",
+            },
+        )
+        self.assertEqual(initial.status_code, 200, initial.text)
+
+        cleared = await owner.put(
+            "/api/v1/profiles/me",
+            json={
+                "handle": None,
+                "bio": None,
+                "contact_email": None,
+                "region": None,
+                "discord_account": None,
+                "captain_team_name": None,
+            },
+        )
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        payload = cleared.json()
+        for field in (
+            "handle",
+            "bio",
+            "contact_email",
+            "region",
+            "discord_account",
+            "captain_team_name",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNone(payload[field])
+
+        async with session_factory()() as db_session:
+            user = await db_session.scalar(
+                select(User).where(
+                    User.email == f"{self.prefix}-clear-fields@example.com"
+                )
+            )
+            self.assertIsNotNone(user)
+            profile = await db_session.scalar(
+                select(PlayerProfile).where(PlayerProfile.user_id == user.id)
+            )
+            self.assertIsNotNone(profile)
+            for field in (
+                "handle",
+                "bio",
+                "contact_email",
+                "region",
+                "discord_account",
+                "captain_team_name",
+            ):
+                with self.subTest(db_field=field):
+                    self.assertIsNone(getattr(profile, field))
+            audit = await db_session.scalar(
+                select(AuditLog)
+                .where(
+                    AuditLog.actor_user_id == user.id,
+                    AuditLog.action == "profile.update",
+                )
+                .order_by(AuditLog.id.desc())
+            )
+            self.assertIsNotNone(audit)
+            self.assertIsNone(audit.payload["contact_email"])
+            self.assertNotIn("display_name", audit.payload)
+
+    async def test_omitted_profile_fields_are_unchanged_and_display_name_null_is_rejected(self) -> None:
+        owner = await self._register("omit-fields")
+        saved = await owner.put(
+            "/api/v1/profiles/me",
+            json={
+                "handle": f"{self.prefix}-omit",
+                "bio": "Keep this bio",
+                "contact_email": "keep@example.com",
+            },
+        )
+        self.assertEqual(saved.status_code, 200, saved.text)
+
+        omitted = await owner.put("/api/v1/profiles/me", json={"region": None})
+        self.assertEqual(omitted.status_code, 200, omitted.text)
+        self.assertEqual(omitted.json()["handle"], f"{self.prefix}-omit")
+        self.assertEqual(omitted.json()["bio"], "Keep this bio")
+        self.assertEqual(omitted.json()["contact_email"], "keep@example.com")
+
+        invalid = await owner.put(
+            "/api/v1/profiles/me",
+            json={"display_name": None},
+        )
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+
     async def test_profile_update_rejects_arbitrary_media_urls(self) -> None:
         owner = await self._register("media-url")
         response = await owner.put(

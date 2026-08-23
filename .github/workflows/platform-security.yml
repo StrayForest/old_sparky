@@ -192,7 +192,7 @@ jobs:
       - name: Install pinned dependencies
         run: |
           python -m venv platform/.venv_platform
-          platform/.venv_platform/bin/python -m pip install -r platform/requirements-platform.lock.txt
+          platform/.venv_platform/bin/python -m pip install --require-hashes -r platform/requirements-platform.lock.txt
       - name: Run populated legacy migration scenario
         run: >-
           cd platform &&

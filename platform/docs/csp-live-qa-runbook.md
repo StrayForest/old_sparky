@@ -33,14 +33,15 @@ platform/tools/platform_build_release.sh \
   <enforcement-release-ref>
 ```
 
-That gate requires byte-identical direct requirements, tracked full Python
-lock, generated freeze, wheelhouse manifest and web package lock. Omission of
-the flag or any drift is a failed enforcement build, because the only accepted
-candidate-to-final runtime delta is the reviewed CSP header-mode line. Every
-build installs `requirements-platform.lock.txt`, regenerates the sorted freeze
-and refuses any byte difference before packaging. For this CSP candidate the
-tracked lock must also equal the accepted active production freeze; dependency
-updates require their own reviewed release. Release builds require the exact
+That gate requires byte-identical direct requirements, the tracked hash-locked
+Python lock, generated freeze, wheelhouse manifest and web package lock.
+Omission of the flag or any drift is a failed enforcement build, because the
+only accepted candidate-to-final runtime delta is the reviewed CSP header-mode
+line. Every build installs the hash-locked `requirements-platform.lock.txt`,
+regenerates the sorted freeze and refuses any package-pin difference before
+packaging. For this CSP candidate the tracked lock's package pins must also
+equal the accepted active production freeze; dependency updates require their
+own reviewed release. Release builds require the exact
 reviewed Node `26.3.1` and npm `11.16.0` toolchain recorded in `RELEASE.json`.
 
 Record the tarball path, SHA-256 and source commit from `RELEASE.json`.

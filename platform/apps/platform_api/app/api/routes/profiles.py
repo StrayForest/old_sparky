@@ -214,28 +214,34 @@ async def update_my_profile(
     profile = await db_session.scalar(
         select(PlayerProfile).where(PlayerProfile.user_id == auth_session.user.id)
     )
-    if payload.display_name is not None:
+    fields_set = payload.model_fields_set
+    if "display_name" in fields_set and payload.display_name is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="display_name cannot be cleared.",
+        )
+    if "display_name" in fields_set:
         profile.display_name = payload.display_name.strip()
         auth_session.user.display_name = profile.display_name
-    if payload.handle is not None:
-        profile.handle = payload.handle.strip() or None
-    if payload.bio is not None:
-        profile.bio = payload.bio.strip() or None
-    if payload.contact_email is not None:
-        profile.contact_email = payload.contact_email.strip() or None
-    if payload.region is not None:
-        profile.region = payload.region.strip() or None
-    if payload.discord_account is not None:
-        profile.discord_account = payload.discord_account.strip() or None
-    if payload.captain_team_name is not None:
-        profile.captain_team_name = payload.captain_team_name.strip() or None
+    if "handle" in fields_set:
+        profile.handle = payload.handle.strip() if payload.handle else None
+    if "bio" in fields_set:
+        profile.bio = payload.bio.strip() if payload.bio else None
+    if "contact_email" in fields_set:
+        profile.contact_email = payload.contact_email.strip() if payload.contact_email else None
+    if "region" in fields_set:
+        profile.region = payload.region.strip() if payload.region else None
+    if "discord_account" in fields_set:
+        profile.discord_account = payload.discord_account.strip() if payload.discord_account else None
+    if "captain_team_name" in fields_set:
+        profile.captain_team_name = payload.captain_team_name.strip() if payload.captain_team_name else None
     await write_audit_log(
         db_session,
         actor_user_id=auth_session.user.id,
         action="profile.update",
         subject_type="profile",
         subject_id=profile.user_id,
-        payload=payload.model_dump(exclude_none=True),
+        payload=payload.model_dump(exclude_unset=True),
     )
     try:
         await db_session.commit()

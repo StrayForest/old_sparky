@@ -45,6 +45,36 @@ class PlatformValidateEdgePolicyTests(unittest.TestCase):
                 {"1.1.1.0/24"},
             )
 
+    def test_ufw_rejects_unmanaged_narrow_http_rule(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "unmanaged"):
+            edge.ufw_ranges(
+                "80/tcp ALLOW IN 203.0.113.0/24\n"
+                "443/tcp ALLOW IN 1.1.1.0/24 # oldsparky-cloudflare-origin\n",
+                {"1.1.1.0/24"},
+            )
+
+    def test_ufw_supports_ipv6_and_rejects_duplicate_effective_rules(self) -> None:
+        desired = {"2001:db8::/32"}
+        status = "\n".join(
+            (
+                "80/tcp ALLOW IN 2001:db8::/32 # oldsparky-cloudflare-origin",
+                "443/tcp ALLOW IN 2001:db8::/32 # oldsparky-cloudflare-origin",
+            )
+        )
+        self.assertEqual(edge.ufw_ranges(status, desired), desired)
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            edge.ufw_ranges(
+                status + "\n443/tcp ALLOW IN 2001:db8::/32 # oldsparky-cloudflare-origin",
+                desired,
+            )
+
+    def test_ufw_application_profile_is_checked_as_http_rule(self) -> None:
+        desired = {"1.1.1.0/24"}
+        status = "Nginx Full ALLOW IN 1.1.1.0/24 # oldsparky-cloudflare-origin\n"
+        self.assertEqual(edge.ufw_ranges(status, desired), desired)
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            edge.ufw_ranges(status + status, desired)
+
     def test_ufw_baseline_requires_active_default_deny(self) -> None:
         edge.validate_ufw_baseline(
             "Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n"

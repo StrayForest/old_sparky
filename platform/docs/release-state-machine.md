@@ -127,5 +127,7 @@ recorded by the operator.
   translation workflow is now named and reported as a controlled warm-up with
   an explicit cache-miss/OpenAI call budget.
 - Building on the production host from a source archive is not immutable
-  provenance. Hash-locked dependencies and a CI-built, signed artifact remain
-  required before fully automatic production deployment can be reconsidered.
+  provenance and is not part of the normal workflow. CI now builds and attests
+  the immutable artifact and wheelhouse; the VPS verifies the artifact digest
+  and source commit before installation. Fully automatic push deployment
+  remains a separate policy decision.

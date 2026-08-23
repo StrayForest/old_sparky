@@ -39,6 +39,7 @@ ORGANIZER_MANAGED_PARTICIPANT_STATUSES = frozenset(
 ORGANIZER_MODERATED_PARTICIPANT_STATUSES = frozenset(
     {"registration_open", "registration_closed", "in_progress"}
 )
+PARTICIPANT_RESTORATION_STATUSES = frozenset({"registration_open", "registration_closed"})
 SOLO_TOURNAMENT_FORMAT = "solo"
 
 
@@ -324,6 +325,62 @@ def ensure_organizer_can_moderate_participants(current_status: str) -> None:
         raise TournamentWorkflowError(
             "Participant moderation is unavailable after the tournament ends."
         )
+
+
+def ensure_participant_restoration_allowed(
+    *,
+    tournament_status: str,
+    has_locked_deadlock_roster: bool,
+) -> None:
+    """Keep inactive-to-active restoration inside a rebuild-safe window.
+
+    Exclusion has an explicit reconciliation path, but restoration would need
+    to rebuild ready/captain eligibility and commitments from a canonical
+    roster snapshot. Until that path exists, an organizer may only restore a
+    retained participant before the Deadlock workflow starts and before a
+    roster is locked.
+    """
+
+    if tournament_status not in PARTICIPANT_RESTORATION_STATUSES:
+        raise TournamentWorkflowError(
+            "Inactive participants can only be restored before the tournament starts."
+        )
+    if has_locked_deadlock_roster:
+        raise TournamentWorkflowError(
+            "Inactive participants cannot be restored after a Deadlock roster is locked."
+        )
+
+
+def ensure_match_team_ids_are_locked(
+    *,
+    home_team_id: str | None,
+    away_team_id: str | None,
+    locked_team_ids: set[str] | frozenset[str],
+) -> tuple[str, str]:
+    """Require manual bracket sides to use the locked roster identity."""
+
+    normalized_home = str(home_team_id or "").strip()
+    normalized_away = str(away_team_id or "").strip()
+    if not normalized_home or not normalized_away:
+        raise TournamentWorkflowError(
+            "Manual matches must use canonical Team <id> labels from the locked roster."
+        )
+    if normalized_home == normalized_away:
+        raise TournamentWorkflowError(
+            "Manual matches must use two different locked teams."
+        )
+    unknown_team_ids = sorted(
+        {normalized_home, normalized_away}.difference(
+            {str(team_id).strip() for team_id in locked_team_ids}
+        )
+    )
+    if unknown_team_ids:
+        raise TournamentWorkflowError(
+            "Manual matches may use only teams from the locked roster: "
+            + ", ".join(unknown_team_ids)
+            + "."
+        )
+    return normalized_home, normalized_away
 
 
 def ensure_deadlock_roster_staging_allowed(

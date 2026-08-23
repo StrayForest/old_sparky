@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from collections.abc import Mapping
 
 try:
     from .platform_update_cloudflare_ips import (
@@ -26,6 +27,19 @@ DEFAULT_NGINX_INCLUDE = Path("/etc/nginx/cloudflare-real-ip.conf")
 WEB_PORTS = (80, 443)
 MANAGED_COMMENT = "oldsparky-cloudflare-origin"
 CIDR_RE = re.compile(r"(?<![A-Za-z0-9:])(?:[0-9a-fA-F:.]+)/(?:[0-9]{1,3})(?![A-Za-z0-9])")
+WEB_PROFILE_NAMES = frozenset(
+    {
+        "Apache",
+        "Apache Full",
+        "Apache Secure",
+        "Nginx Full",
+        "Nginx HTTP",
+        "Nginx HTTPS",
+        "WWW",
+        "WWW Full",
+        "WWW Secure",
+    }
+)
 
 
 def desired_ranges(timeout: float) -> set[str]:
@@ -49,33 +63,77 @@ def nginx_ranges(path: Path) -> set[str]:
     return ranges
 
 
-def ufw_ranges(status: str, desired: set[str]) -> set[str]:
+def _rule_name(line: str) -> str:
+    rule = line.split(" ALLOW IN", 1)[0].strip()
+    rule = re.sub(r"^\[\s*\d+\s*\]\s*", "", rule).strip()
+    return re.sub(r"\s+\(v6\)$", "", rule, flags=re.IGNORECASE)
+
+
+def _rule_networks(line: str) -> set[str]:
+    networks: set[str] = set()
+    for candidate in CIDR_RE.findall(line):
+        try:
+            networks.add(str(ipaddress.ip_network(candidate, strict=True)))
+        except ValueError:
+            continue
+    return networks
+
+
+def _explicit_web_ports(line: str) -> set[int]:
+    return {
+        int(value)
+        for value in re.findall(r"(?<![0-9])(80|443)(?=(?:,|/|\s|$))", line)
+    }
+
+
+def _web_ports_for_rule(
+    line: str,
+    profile_ports: Mapping[str, set[int]],
+) -> set[int]:
+    ports = _explicit_web_ports(line)
+    rule_name = _rule_name(line)
+    if not ports:
+        ports.update(profile_ports.get(rule_name, set()))
+        if rule_name in WEB_PROFILE_NAMES:
+            ports.update(WEB_PORTS)
+    return ports & set(WEB_PORTS)
+
+
+def ufw_ranges(
+    status: str,
+    desired: set[str],
+    *,
+    profile_ports: Mapping[str, set[int]] | None = None,
+) -> set[str]:
+    profile_ports = profile_ports or {}
     ranges: set[str] = set()
+    web_rules: dict[tuple[str, int], list[str]] = {}
     for line in status.splitlines():
         if "ALLOW IN" not in line:
             continue
-        if "Anywhere" in line and any(f"{port}/tcp" in line for port in WEB_PORTS):
+        web_ports = _web_ports_for_rule(line, profile_ports)
+        if not web_ports:
+            continue
+        if "Anywhere" in line:
             raise RuntimeError("UFW contains a broad public HTTP/S rule.")
         if MANAGED_COMMENT not in line:
-            continue
-        for candidate in CIDR_RE.findall(line):
-            try:
-                normalized = str(ipaddress.ip_network(candidate, strict=True))
-            except ValueError:
-                continue
-            if normalized not in desired:
-                raise RuntimeError(f"UFW contains an unexpected managed range: {normalized}")
-            ranges.add(normalized)
+            raise RuntimeError(
+                "UFW contains an unmanaged inbound HTTP/S rule: " f"{line.strip()}"
+            )
+        networks = _rule_networks(line)
+        if len(networks) != 1:
+            raise RuntimeError(
+                "Managed UFW HTTP/S rules must name exactly one source network."
+            )
+        network = next(iter(networks))
+        if network not in desired:
+            raise RuntimeError(f"UFW contains an unexpected managed range: {network}")
+        ranges.add(network)
+        for port in web_ports:
+            web_rules.setdefault((network, port), []).append(line)
     for network in sorted(desired):
         for port in WEB_PORTS:
-            matching = [
-                line
-                for line in status.splitlines()
-                if "ALLOW IN" in line
-                and MANAGED_COMMENT in line
-                and network in line
-                and f"{port}/tcp" in line
-            ]
+            matching = web_rules.get((network, port), [])
             if len(matching) != 1:
                 raise RuntimeError(
                     f"UFW must contain exactly one managed {port}/tcp rule for {network}."
@@ -91,6 +149,28 @@ def run_ufw(ufw_bin: str, *arguments: str) -> str:
         text=True,
     )
     return completed.stdout
+
+
+def parse_ufw_profile_ports(profile_info: str) -> set[int]:
+    return {
+        int(value)
+        for value in re.findall(
+            r"(?<![0-9])(80|443)(?=(?:,|/|\s|$))", profile_info
+        )
+    }
+
+
+def ufw_profile_ports(ufw_bin: str) -> dict[str, set[int]]:
+    profiles: dict[str, set[int]] = {}
+    listed = run_ufw(ufw_bin, "app", "list")
+    for raw_line in listed.splitlines():
+        profile = raw_line.strip()
+        if not profile or profile.lower().startswith("available applications"):
+            continue
+        ports = parse_ufw_profile_ports(run_ufw(ufw_bin, "app", "info", profile))
+        if ports:
+            profiles[profile] = ports
+    return profiles
 
 
 def validate_ufw_baseline(status: str) -> None:
@@ -122,7 +202,11 @@ def main() -> int:
             f"Nginx Cloudflare range parity failed: expected={len(desired)} actual={len(nginx)}."
         )
     validate_ufw_baseline(run_ufw(args.ufw_bin, "status", "verbose"))
-    ufw = ufw_ranges(run_ufw(args.ufw_bin, "status", "numbered"), desired)
+    ufw = ufw_ranges(
+        run_ufw(args.ufw_bin, "status", "numbered"),
+        desired,
+        profile_ports=ufw_profile_ports(args.ufw_bin),
+    )
     if ufw != desired:
         raise RuntimeError(
             f"UFW Cloudflare range parity failed: expected={len(desired)} actual={len(ufw)}."

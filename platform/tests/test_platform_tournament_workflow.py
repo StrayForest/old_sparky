@@ -27,6 +27,8 @@ from python_packages.platform_domain.tournaments import (
     ensure_tournament_completion_has_final_result,
     ensure_deadlock_registration_changes_allowed,
     ensure_deadlock_roster_staging_allowed,
+    ensure_match_team_ids_are_locked,
+    ensure_participant_restoration_allowed,
     ensure_invite_claimable,
     next_match_statuses,
     next_participant_statuses,
@@ -223,6 +225,52 @@ class PlatformTournamentWorkflowTests(unittest.TestCase):
             format_slug="solo",
             has_locked_deadlock_roster=True,
         )
+
+    def test_manual_match_team_ids_must_be_distinct_canonical_locked_ids(self):
+        locked_team_ids = {"1", "2"}
+        self.assertEqual(
+            ensure_match_team_ids_are_locked(
+                home_team_id="1",
+                away_team_id="2",
+                locked_team_ids=locked_team_ids,
+            ),
+            ("1", "2"),
+        )
+        for home_team_id, away_team_id in (
+            (None, "2"),
+            ("1", None),
+            ("1", "1"),
+            ("1", "99"),
+        ):
+            with self.subTest(home_team_id=home_team_id, away_team_id=away_team_id):
+                with self.assertRaises(TournamentWorkflowError):
+                    ensure_match_team_ids_are_locked(
+                        home_team_id=home_team_id,
+                        away_team_id=away_team_id,
+                        locked_team_ids=locked_team_ids,
+                    )
+
+    def test_participant_restoration_is_limited_to_pre_workflow_windows(self):
+        for tournament_status in ("registration_open", "registration_closed"):
+            with self.subTest(tournament_status=tournament_status):
+                ensure_participant_restoration_allowed(
+                    tournament_status=tournament_status,
+                    has_locked_deadlock_roster=False,
+                )
+
+        for tournament_status, has_locked_roster in (
+            ("in_progress", False),
+            ("registration_closed", True),
+        ):
+            with self.subTest(
+                tournament_status=tournament_status,
+                has_locked_roster=has_locked_roster,
+            ):
+                with self.assertRaises(TournamentWorkflowError):
+                    ensure_participant_restoration_allowed(
+                        tournament_status=tournament_status,
+                        has_locked_deadlock_roster=has_locked_roster,
+                    )
 
     def test_opening_round_seeding_uses_deadlock_team_pairing(self):
         seeded_matches = build_seeded_opening_round_matches(

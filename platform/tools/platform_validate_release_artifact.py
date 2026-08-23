@@ -551,17 +551,23 @@ def main() -> int:
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--checksum", type=Path, required=True)
     parser.add_argument("--release-slug", required=True)
+    parser.add_argument("--expected-source-commit")
     parser.add_argument("--extract-to", type=Path)
     args = parser.parse_args()
     try:
         if os.geteuid() != 0:
             raise ArtifactError("release artifact validation requires root")
         _checksum_contract(args.artifact, args.checksum)
-        validate_archive(
+        release_payload = validate_archive(
             args.artifact,
             release_slug=args.release_slug,
             extract_to=args.extract_to,
         )
+        if args.expected_source_commit is not None:
+            if not COMMIT_PATTERN.fullmatch(args.expected_source_commit):
+                raise ArtifactError("expected source commit is invalid")
+            if release_payload.get("source_git_commit") != args.expected_source_commit:
+                raise ArtifactError("release source commit does not match expected commit")
         action = "extracted" if args.extract_to is not None else "validated"
         print(
             f"Release artifact checksum, layout, and metadata are valid; {action} safely."

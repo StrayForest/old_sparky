@@ -171,6 +171,8 @@ from python_packages.platform_domain.tournaments import (
     ensure_tournament_capacity_allows_join,
     ensure_tournament_rank_allows_join,
     ensure_organizer_can_moderate_participants,
+    ensure_participant_restoration_allowed,
+    ensure_match_team_ids_are_locked,
     ensure_invite_claimable,
     can_self_join_tournament,
     can_self_leave_tournament,
@@ -3344,6 +3346,39 @@ async def organizer_remove_participant(
         tournament_id=tournament.id,
         participant_id=participant_id,
     )
+    previous_status = participant.status
+    participant.status = "disqualified"
+    participant.moderation_note = "Removed by organizer."
+    participant.moderated_at = auth_session.now
+    participant.moderated_by_user_id = auth_session.user.id
+    if (
+        is_solo_tournament_format(tournament.format_slug)
+        and not participant_status_is_inactive(previous_status)
+    ):
+        await prune_participant_from_active_ready_round(
+            db_session,
+            tournament=tournament,
+            user_id=participant.user_id,
+            actor_user_id=auth_session.user.id,
+            now=auth_session.now,
+            participant_status=participant.status,
+        )
+        await prune_participant_from_active_captain_round(
+            db_session,
+            tournament=tournament,
+            user_id=participant.user_id,
+            actor_user_id=auth_session.user.id,
+            now=auth_session.now,
+            participant_status=participant.status,
+        )
+        await release_active_commitments(
+            db_session,
+            tournament_id=tournament.id,
+            user_ids=[participant.user_id],
+            released_at=auth_session.now,
+            release_reason="participant_disqualified",
+        )
+
     await write_audit_log(
         db_session,
         actor_user_id=auth_session.user.id,
@@ -3353,10 +3388,9 @@ async def organizer_remove_participant(
         payload={
             "tournament_slug": tournament.slug,
             "user_id": participant.user_id,
+            "from_status": previous_status,
+            "to_status": participant.status,
         },
-    )
-    await db_session.execute(
-        delete(TournamentParticipant).where(TournamentParticipant.id == participant.id)
     )
     await db_session.commit()
     _invalidate_participant_page_cache(tournament.id)
@@ -3390,6 +3424,33 @@ async def organizer_moderate_participant(
     previous_status = participant.status
     previous_note = participant.moderation_note
     next_note = (payload.moderation_note or "").strip() or None
+
+    restoring_inactive_participant = (
+        participant_status_is_inactive(previous_status)
+        and not participant_status_is_inactive(payload.status)
+    )
+
+    # The write dependency already owns Tournament's row lock. Keep the
+    # secondary lock order as Tournament -> User -> workflow rows before
+    # checking the locked roster or mutating participant workflow state.
+    await db_session.execute(
+        select(User.id).where(User.id == participant.user_id).with_for_update()
+    )
+
+    if restoring_inactive_participant:
+        try:
+            ensure_participant_restoration_allowed(
+                tournament_status=tournament.status,
+                has_locked_deadlock_roster=await tournament_has_locked_deadlock_roster(
+                    db_session,
+                    tournament=tournament,
+                ),
+            )
+        except TournamentWorkflowError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
 
     try:
         participant.status = transition_participant_status(participant.status, payload.status)
@@ -3974,6 +4035,24 @@ async def create_tournament_match(
     home_label = payload.home_label.strip()
     away_label = payload.away_label.strip()
     ensure_distinct_match_sides(home_label, away_label)
+    locked_run = await deadlock_locked_auto_assignment_run_for_tournament(
+        db_session,
+        tournament_id=tournament.id,
+    )
+    try:
+        home_team_id, away_team_id = ensure_match_team_ids_are_locked(
+            home_team_id=deadlock_team_id_from_match_label(home_label),
+            away_team_id=deadlock_team_id_from_match_label(away_label),
+            locked_team_ids={
+                team_id
+                for label in locked_deadlock_team_labels_from_run(locked_run)
+                if (team_id := deadlock_team_id_from_match_label(label)) is not None
+            }
+            if locked_run is not None
+            else set(),
+        )
+    except TournamentWorkflowError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     match = TournamentMatch(
         tournament_id=tournament.id,
@@ -3982,8 +4061,8 @@ async def create_tournament_match(
         sequence_number=payload.sequence_number,
         home_label=home_label,
         away_label=away_label,
-        home_team_id=deadlock_team_id_from_match_label(home_label),
-        away_team_id=deadlock_team_id_from_match_label(away_label),
+        home_team_id=home_team_id,
+        away_team_id=away_team_id,
         scheduled_at=payload.scheduled_at,
         status="scheduled",
     )

@@ -80,7 +80,20 @@ def _read_pins(path: Path, *, label: str, expected_mode: int | None) -> dict[str
             if label in {"Python freeze", "Python lock"} and line:
                 raise WheelhouseError(f"{label} must contain only exact package pins")
             continue
-        match = PIN_PATTERN.fullmatch(line)
+        pin_line = line
+        hash_parts = line.split(" --hash=")
+        if len(hash_parts) > 1:
+            if label != "Python lock":
+                raise WheelhouseError(f"{label} must not contain package hashes")
+            pin_line = hash_parts[0]
+            if any(
+                re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+                for value in hash_parts[1:]
+            ):
+                raise WheelhouseError("Python lock contains an invalid package hash")
+        elif label == "Python lock":
+            raise WheelhouseError("Python lock must hash every package pin")
+        match = PIN_PATTERN.fullmatch(pin_line)
         if match is None:
             raise WheelhouseError(f"{label} must contain only exact package pins")
         name = _normalized_name(match.group(1))
@@ -127,13 +140,6 @@ def _validate_locked_freeze(lock_path: Path, freeze_path: Path) -> dict[str, str
     freeze = _validate_freeze(freeze_path)
     if lock != freeze:
         raise WheelhouseError("Python freeze does not exactly match the tracked lock")
-    try:
-        if lock_path.read_bytes() != freeze_path.read_bytes():
-            raise WheelhouseError(
-                "Python freeze bytes do not exactly match the tracked lock"
-            )
-    except OSError as exc:
-        raise WheelhouseError("Python lock or freeze changed while comparing") from exc
     return freeze
 
 

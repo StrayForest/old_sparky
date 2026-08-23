@@ -13,8 +13,11 @@ on:
           - deploy
 
 permissions:
+  actions: read
   contents: read
   statuses: write
+  id-token: write
+  attestations: write
 
 concurrency:
   group: platform-production-deploy
@@ -35,7 +38,7 @@ jobs:
       TARGET_SHA: ${{ github.sha }}
       DEPLOY_MODE: ${{ inputs.mode }}
       RELEASE_SLUG: gha-${{ github.run_id }}-${{ github.run_attempt }}
-      SOURCE_ARCHIVE: /tmp/old-sparky-source-${{ github.run_id }}-${{ github.run_attempt }}.tar.gz
+      ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Require successful platform security build
@@ -118,16 +121,108 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Package verified source checkout
+      - name: Build immutable release artifact in CI
         if: ${{ env.DEPLOY_MODE == 'deploy' }}
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)"
-          tar -C "$GITHUB_WORKSPACE" -czf "$SOURCE_ARCHIVE" \
-            --exclude='./platform/dist/releases' \
-            .
+          sudo rm -rf -- /root/old_sparky
+          sudo install -d -o root -g root -m 0755 /root/old_sparky
+          sudo cp -a "$GITHUB_WORKSPACE/." /root/old_sparky/
+          sudo chown -R root:root /root/old_sparky
+          sudo -EH python3 -m venv /root/old_sparky/platform/.venv_platform
+          sudo install -d -o root -g root -m 0755 /root/old_sparky/platform/dist/releases
+          sudo -EH env \
+            PLATFORM_RELEASE_OUTPUT_DIR=/root/old_sparky/platform/dist/releases \
+            /root/old_sparky/platform/tools/platform_build_release.sh "$RELEASE_SLUG"
+          release_archive="$(find /root/old_sparky/platform/dist/releases -maxdepth 1 -type f -name "${RELEASE_SLUG}-*.tar.gz" -print -quit)"
+          test -n "$release_archive" || { echo "CI release artifact was not produced" >&2; exit 1; }
+          release_checksum="${release_archive}.sha256"
+          test -f "$release_checksum"
+          release_output="$GITHUB_WORKSPACE/ci-release"
+          rm -rf -- "$release_output"
+          install -d -m 0755 "$release_output"
+          install -m 0644 "$release_archive" "$release_output/$(basename "$release_archive")"
+          install -m 0644 "$release_checksum" "$release_output/$(basename "$release_checksum")"
+          sha256sum -c "$release_output/$(basename "$release_checksum")"
+
+      - name: Publish immutable release artifact
+        if: ${{ env.DEPLOY_MODE == 'deploy' }}
+        id: publish-release-artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-release/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest immutable release artifact
+        if: ${{ env.DEPLOY_MODE == 'deploy' }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ci-release/*.tar.gz
+
+      - name: Download published release artifact for deployment
+        if: ${{ env.DEPLOY_MODE == 'deploy' }}
+        uses: actions/download-artifact@v6
+        with:
+          name: platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-release-published
+
+      - name: Verify published release artifact
+        if: ${{ env.DEPLOY_MODE == 'deploy' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHED_ARTIFACT_ID: ${{ steps.publish-release-artifact.outputs.artifact-id }}
+          PUBLISHED_ARTIFACT_DIGEST: ${{ steps.publish-release-artifact.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          test -n "$PUBLISHED_ARTIFACT_ID"
+          test -n "$PUBLISHED_ARTIFACT_DIGEST"
+          PUBLISHED_ARTIFACT_DIGEST="${PUBLISHED_ARTIFACT_DIGEST#sha256:}"
+          [[ "$PUBLISHED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "Published GitHub artifact digest is invalid" >&2; exit 1; }
+          artifact_zip="$RUNNER_TEMP/platform-release-artifact.zip"
+          curl --fail-with-body --silent --show-error --location \
+            --retry 3 --retry-delay 2 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${PUBLISHED_ARTIFACT_ID}/zip" \
+            --output "$artifact_zip"
+          printf '%s  %s\n' "$PUBLISHED_ARTIFACT_DIGEST" "$artifact_zip" | sha256sum -c -
+          printf 'Published GitHub artifact digest: %s\n' "$PUBLISHED_ARTIFACT_DIGEST"
+          release_archive="$(find ci-release-published -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$release_archive" || { echo "Published release artifact is missing" >&2; exit 1; }
+          release_checksum="${release_archive}.sha256"
+          test -f "$release_checksum" || { echo "Published release checksum is missing" >&2; exit 1; }
+          (cd "$(dirname "$release_archive")" && sha256sum -c "$(basename "$release_checksum")")
+          /usr/bin/python3 - "$release_archive" "$TARGET_SHA" "$PUBLISHED_ARTIFACT_ID" "$PUBLISHED_ARTIFACT_DIGEST" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          archive, target_sha, artifact_id, artifact_digest = sys.argv[1:]
+          archive_path = Path(archive)
+          payload = {
+              "artifact_id": artifact_id,
+              "artifact_digest": artifact_digest,
+              "artifact_file": archive_path.name,
+              "artifact_sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+              "source_git_commit": target_sha,
+          }
+          Path("ci-release-published/RELEASE.provenance.json").write_text(
+              json.dumps(payload, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          printf 'RELEASE_ARTIFACT=%s\n' "$GITHUB_WORKSPACE/$release_archive" >> "$GITHUB_ENV"
+          printf 'RELEASE_CHECKSUM=%s\n' "$GITHUB_WORKSPACE/$release_checksum" >> "$GITHUB_ENV"
+          printf 'RELEASE_PROVENANCE=%s\n' "$GITHUB_WORKSPACE/ci-release-published/RELEASE.provenance.json" >> "$GITHUB_ENV"
 
       - name: Configure SSH
         shell: bash
@@ -151,18 +246,39 @@ jobs:
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             'printf "SSH connection OK\n"'
 
-      - name: Upload verified source
+      - name: Upload verified CI artifact
         if: ${{ env.DEPLOY_MODE == 'deploy' }}
         shell: bash
         run: |
           set -euo pipefail
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "install -d -o root -g root -m 0700 '$ARTIFACT_REMOTE_DIR'"
           scp \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=10 \
             -i ~/.ssh/old_sparky_prod \
-            "$SOURCE_ARCHIVE" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST:$SOURCE_ARCHIVE"
+            "$RELEASE_ARTIFACT" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+          scp \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod \
+            "$RELEASE_PROVENANCE" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+          scp \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod \
+            "$RELEASE_CHECKSUM" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
 
       - name: Run production preflight or deployment
         shell: bash
@@ -178,17 +294,18 @@ jobs:
             -o ServerAliveCountMax=3 \
             -i ~/.ssh/old_sparky_prod \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$TARGET_SHA' '$release_slug' '$DEPLOY_MODE' '$SOURCE_ARCHIVE'" <<'REMOTE'
+            "bash -s -- '$TARGET_SHA' '$release_slug' '$DEPLOY_MODE' '$ARTIFACT_REMOTE_DIR'" <<'REMOTE'
           set -Eeuo pipefail
 
           target_sha="$1"
           release_slug="$2"
           deploy_mode="$3"
-          source_archive="$4"
+          artifact_dir="$4"
 
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
-          source_dir="/tmp/old-sparky-source-${release_slug}"
+          artifact_path=""
+          provenance_path="$artifact_dir/RELEASE.provenance.json"
 
           fail() {
             printf 'ERROR: %s\n' "$*" >&2
@@ -196,8 +313,9 @@ jobs:
           }
 
           cleanup() {
-            rm -rf -- "$source_dir"
-            rm -f -- "$source_archive"
+            if [[ -n "$artifact_dir" && -d "$artifact_dir" && ! -L "$artifact_dir" ]]; then
+              rm -rf -- "$artifact_dir"
+            fi
           }
           trap cleanup EXIT
 
@@ -216,6 +334,7 @@ jobs:
           "$current/tools/platform_release_preflight.sh" \
             --require-previous \
             --require-verified-backup \
+            --require-edge-parity \
             --backup-max-age-hours 24
 
           if [[ "$deploy_mode" == "preflight" ]]; then
@@ -224,49 +343,66 @@ jobs:
           fi
 
           [[ "$deploy_mode" == "deploy" ]] || fail "unsupported deployment mode"
-          test -f "$source_archive" && test ! -L "$source_archive" \
-            || fail "verified source archive is missing"
+          test -d "$artifact_dir" && test ! -L "$artifact_dir" \
+            || fail "CI release artifact directory is missing"
 
-          rm -rf -- "$source_dir"
-          install -d -o root -g root -m 0755 "$source_dir"
-          tar -xzf "$source_archive" -C "$source_dir"
-          chown -R root:root "$source_dir"
-          install -d -o root -g root -m 0755 "$source_dir/platform/dist"
-          test -x "$source_dir/platform/tools/platform_release_deploy.sh" \
-            || fail "uploaded source does not contain the release orchestrator"
+          artifact_path="$(find "$artifact_dir" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$artifact_path" || fail "CI release artifact is missing"
+          artifact_checksum="${artifact_path}.sha256"
+          test -f "$artifact_checksum" && test ! -L "$artifact_checksum" \
+            || fail "CI release checksum is missing"
+          test -f "$provenance_path" && test ! -L "$provenance_path" \
+            || fail "CI release provenance is missing"
+          artifact_name="$(basename "$artifact_path")"
+          artifact_slug="${artifact_name%.tar.gz}"
+          (cd "$artifact_dir" && sha256sum -c "$(basename "$artifact_checksum")") \
+            || fail "CI release artifact digest mismatch"
+          "$current/tools/platform_validate_release_artifact.py" \
+            --artifact "$artifact_path" \
+            --checksum "$artifact_checksum" \
+            --release-slug "$artifact_slug" \
+            || fail "CI release artifact provenance is invalid"
+          if ! /usr/bin/python3 - "$artifact_path" "$artifact_slug" "$target_sha" "$provenance_path" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          import tarfile
 
-          cd "$source_dir"
-          test "$(git rev-parse --verify HEAD)" = "$target_sha" \
-            || fail "uploaded source commit does not match CI-verified commit"
-          test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)" \
-            || fail "uploaded platform source is not clean"
-
-          python3 -m venv platform/.venv_platform
-          platform/.venv_platform/bin/python -m pip install -r platform/requirements-platform.lock.txt
-          platform/.venv_platform/bin/python -m pip freeze --all \
-            | LC_ALL=C.UTF-8 sort > /tmp/old-sparky-production-freeze.txt
-          if ! diff -u platform/requirements-platform.lock.txt /tmp/old-sparky-production-freeze.txt; then
-            printf 'Production build runtime freeze differs from the tracked lock; release build will enforce this mismatch.\n' >&2
+          artifact, slug, expected_commit, provenance_path = sys.argv[1:]
+          provenance = json.loads(Path(provenance_path).read_text(encoding="utf-8"))
+          if not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("artifact_digest"))):
+              raise SystemExit("published artifact digest is invalid")
+          if provenance.get("source_git_commit") != expected_commit:
+              raise SystemExit("provenance source commit does not match expected commit")
+          if provenance.get("artifact_file") != Path(artifact).name:
+              raise SystemExit("provenance artifact name does not match uploaded artifact")
+          actual_sha256 = hashlib.sha256(Path(artifact).read_bytes()).hexdigest()
+          if provenance.get("artifact_sha256") != actual_sha256:
+              raise SystemExit("provenance artifact checksum does not match uploaded artifact")
+          with tarfile.open(Path(artifact), mode="r:gz") as archive:
+              member = archive.getmember(f"{slug}/RELEASE.json")
+              handle = archive.extractfile(member)
+              if handle is None:
+                  raise SystemExit("RELEASE.json is missing")
+              payload = json.load(handle)
+          if payload.get("source_git_commit") != expected_commit:
+              raise SystemExit("release source commit does not match expected commit")
+          PY
+          then
+            fail "CI release source commit does not match target SHA"
           fi
 
-          LC_ALL=C.UTF-8 platform/tools/platform_build_release.sh "$release_slug"
-          (
-            cd platform/dist/releases
-            sha256sum -c "${release_slug}"-*.tar.gz.sha256
-          )
-
-          "$source_dir/platform/tools/platform_release_preflight.sh" \
+          "$current/tools/platform_release_preflight.sh" \
             --app-dir "$runtime" \
             --require-previous \
             --require-verified-backup \
             --require-edge-parity \
             --backup-max-age-hours 24
 
-          release_archive="$(find platform/dist/releases -maxdepth 1 -type f -name "${release_slug}-*.tar.gz" -print -quit)"
-          test -n "$release_archive" || fail "release archive was not produced"
-
-          LC_ALL=C.UTF-8 "$source_dir/platform/tools/platform_release_deploy.sh" \
-            --artifact "$release_archive" \
+          LC_ALL=C.UTF-8 "$current/tools/platform_release_deploy.sh" \
+            --artifact "$artifact_path" \
             --app-dir "$runtime" \
             --edge-origin https://127.0.0.1 \
             --edge-host old-sparky.com \

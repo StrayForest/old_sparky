@@ -6,7 +6,7 @@ import unittest
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from apps.platform_api.app.main import create_app
 from python_packages.platform_infra.db import dispose_engine, session_factory
@@ -16,6 +16,7 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockAssignmentRun,
     TournamentDeadlockCaptainRound,
     TournamentDeadlockReadyRound,
+    TournamentMatch,
     User,
 )
 
@@ -121,7 +122,14 @@ class PlatformMatchProgressionApiTests(unittest.IsolatedAsyncioTestCase):
                     locked_at=now,
                     locked_by_user_id=organizer_user_id,
                     summary_text="Test locked Deadlock roster.",
-                    result_snapshot={"teams": [{"team_id": "1"}, {"team_id": "2"}]},
+                    result_snapshot={
+                        "teams": [
+                            {"team_id": "1"},
+                            {"team_id": "2"},
+                            {"team_id": "3"},
+                            {"team_id": "4"},
+                        ]
+                    },
                     candidate_pool_user_ids=[],
                     leftover_user_ids=[],
                 )
@@ -617,6 +625,61 @@ class PlatformMatchProgressionApiTests(unittest.IsolatedAsyncioTestCase):
             "Matches cannot be added after the tournament is completed or cancelled.",
             blocked_after_final.json()["detail"],
         )
+
+    async def test_manual_match_creation_rejects_non_locked_team_ids(self) -> None:
+        organizer = await self._register_user("locked-team-organizer")
+        tournament_payload = self._assert_status(
+            await organizer["client"].post(
+                "/api/v1/tournaments",
+                json={
+                    "name": f"{self.prefix}-lt",
+                    "visibility": "invite_only",
+                    "format_slug": "solo",
+                },
+            ),
+            201,
+        )
+        slug = tournament_payload["slug"]
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_open"},
+            ),
+            200,
+        )
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_closed"},
+            ),
+            200,
+        )
+        await self._lock_deadlock_roster(slug, str(organizer["user_id"]))
+
+        for home_label, away_label in (
+            ("Team 1", "Team 99"),
+            ("team 1", "Team 2"),
+            ("Team 1", " Team 1"),
+        ):
+            with self.subTest(home_label=home_label, away_label=away_label):
+                response = await organizer["client"].post(
+                    f"/api/v1/tournaments/{slug}/matches",
+                    json={
+                        "round_number": 1,
+                        "sequence_number": 1,
+                        "home_label": home_label,
+                        "away_label": away_label,
+                    },
+                )
+                self.assertIn(response.status_code, (409, 422), response.text)
+
+        async with session_factory()() as db_session:
+            match_count = await db_session.scalar(
+                select(func.count()).select_from(TournamentMatch).where(
+                    TournamentMatch.tournament_id == tournament_payload["id"]
+                )
+            )
+            self.assertEqual(match_count, 0)
 
     async def test_latest_round_recovery_can_unwind_and_reseed_bracket(self) -> None:
         organizer = await self._register_user("organizer")

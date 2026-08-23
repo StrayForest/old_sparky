@@ -60,6 +60,9 @@ AS-11 public worker-error sanitization is resolved with a persistence-boundary g
 - **AS-13:** CI now creates the actual web/api/worker identities, installs the
   current systemd units and exercises the runtime env boundary; retain the
   workflow result as revalidation evidence before closure.
+- Production-host release provenance is resolved in the current deployment
+  workflow: CI builds and attests the immutable artifact and wheelhouse, while
+  the VPS verifies the published digest and source commit before installation.
 - After the media grace period, remove the runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers once no migration/reconciliation path depends on them.
 - Continue reducing legacy/duplicate runtime and documentation paths after each replacement is proven.
 

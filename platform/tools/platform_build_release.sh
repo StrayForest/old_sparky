@@ -342,6 +342,7 @@ mkdir -m 0700 "$WHEELHOUSE_DIR"
   --only-binary=:all: \
   --index-url https://pypi.org/simple \
   --dest "$WHEELHOUSE_DIR" \
+  --require-hashes \
   --requirement "$STAGING_DIR/requirements-platform.lock.txt"
 VERIFY_VENV="$STAGING_DIR/.wheelhouse-verify-venv"
 /usr/bin/python3 -I -m venv "$VERIFY_VENV"
@@ -353,7 +354,7 @@ import sys
 
 lock = Path(sys.argv[1])
 versions = [
-    line.removeprefix("pip==").strip()
+    line.split(" --hash=", 1)[0].removeprefix("pip==").strip()
     for line in lock.read_text(encoding="utf-8").splitlines()
     if line.startswith("pip==")
 ]
@@ -390,6 +391,7 @@ fi
     --only-binary=:all: \
     --upgrade \
     --force-reinstall \
+    --require-hashes \
     --requirement "$STAGING_DIR/requirements-platform.lock.txt"
 /usr/bin/env -i \
   HOME=/nonexistent \
@@ -412,9 +414,29 @@ fi
   | /usr/bin/sort >"$STAGING_DIR/requirements-platform.freeze.txt"
 chmod 0444 "$STAGING_DIR/requirements-platform.freeze.txt"
 rm -rf "$VERIFY_VENV"
-if ! /usr/bin/cmp -s \
+if ! /usr/bin/python3 -I - \
   "$STAGING_DIR/requirements-platform.lock.txt" \
-  "$STAGING_DIR/requirements-platform.freeze.txt"; then
+  "$STAGING_DIR/requirements-platform.freeze.txt" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+
+def pins(path: Path) -> list[str]:
+    values = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        pin = line.split(" --hash=", 1)[0]
+        if re.fullmatch(r"[A-Za-z0-9_.-]+==[A-Za-z0-9_.+!-]+", pin) is None:
+            raise SystemExit(f"invalid exact package pin in {path}")
+        values.append(pin)
+    return values
+
+
+lock, freeze = (pins(Path(path)) for path in sys.argv[1:])
+if lock != freeze:
+    raise SystemExit(1)
+PY
+then
   echo "Resolved Python freeze does not match the tracked lock." >&2
   exit 1
 fi

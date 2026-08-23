@@ -52,16 +52,15 @@ test database isolated. **Open pending a successful run and retained evidence.**
   activation remains behind its restore-drill gate.
 - Post-deploy patch translation is reported as a controlled warm-up with an
   explicit OpenAI cache-miss call budget, not read-only QA.
-- Production-host dynamic dependency resolution and builder-created checksums
-  remain open provenance work. Fully automatic production deploy stays disabled
-  until CI-built/signed artifacts, hash-locked dependencies and published
-  digest verification are implemented.
+- The production workflow now builds and attests the immutable release and
+  artifact-bound wheelhouse in CI, publishes its digest, and sends only that
+  digest-verified artifact to the VPS. The VPS no longer resolves dependencies
+  or builds from a source checkout; fully automatic push deployment remains a
+  separate policy decision.
 
 ## Remediation order
 
 1. Complete AS-12 live proof and AS-13 CI evidence.
-2. Replace production-host source builds with CI-built, signed, digest-pinned
-   artifacts and hash-locked dependency verification.
 
 Resolved AS-02 evidence is retained in [`archive/as-02-cloudflare-access-mfa.md`](archive/as-02-cloudflare-access-mfa.md). Resolved AS-03 invite/capacity evidence is retained in [`archive/as-03-tournament-write-serialization.md`](archive/as-03-tournament-write-serialization.md). Resolved AS-05 evidence is retained in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md). Resolved AS-06 evidence is retained in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md). Resolved AS-07 evidence is retained in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Resolved AS-08 evidence is retained in [`archive/as-08-patch-miss-hardening.md`](archive/as-08-patch-miss-hardening.md). Resolved AS-09 evidence is retained in [`archive/as-09-distributed-login-guessing.md`](archive/as-09-distributed-login-guessing.md). Resolved AS-11 evidence is retained in [`archive/as-11-worker-error-sanitization.md`](archive/as-11-worker-error-sanitization.md). Resolved AS-14 evidence is retained in [`archive/as-14-cloudflare-hsts-ownership.md`](archive/as-14-cloudflare-hsts-ownership.md). Resolved AS-15 evidence is retained in [`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md). Resolved AS-17 evidence is retained in [`archive/as-17-release-transaction-recovery-2026-08-23.md`](archive/as-17-release-transaction-recovery-2026-08-23.md).
 

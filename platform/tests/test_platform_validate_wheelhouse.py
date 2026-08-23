@@ -22,10 +22,15 @@ class PlatformWheelhouseValidationTests(unittest.TestCase):
         self.freeze.write_text("demo==1.0\npip==26.1.2\n")
         self.freeze.chmod(0o444)
         self.lock = self.root / "requirements-platform.lock.txt"
-        self.lock.write_bytes(self.freeze.read_bytes())
+        demo_wheel = self.add_wheel("demo", "1.0")
+        pip_wheel = self.add_wheel("pip", "26.1.2")
+        self.lock.write_text(
+            "demo==1.0 --hash=sha256:"
+            f"{hashlib.sha256(demo_wheel.read_bytes()).hexdigest()}\n"
+            "pip==26.1.2 --hash=sha256:"
+            f"{hashlib.sha256(pip_wheel.read_bytes()).hexdigest()}\n"
+        )
         self.lock.chmod(0o644)
-        self.add_wheel("demo", "1.0")
-        self.add_wheel("pip", "26.1.2")
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -174,14 +179,25 @@ class PlatformWheelhouseValidationTests(unittest.TestCase):
                     )
         self.requirements.write_text("pip==26.1.2\ndemo==1.0\n")
 
-    def test_tracked_lock_must_be_canonical_and_byte_equal_to_freeze(self) -> None:
+    def test_tracked_lock_must_be_hashed_canonical_and_match_freeze_pins(self) -> None:
         self.lock.chmod(0o600)
         with self.assertRaisesRegex(validator.WheelhouseError, "metadata is unsafe"):
             self.make_manifest()
 
         self.lock.chmod(0o644)
-        self.lock.write_text("demo==2.0\npip==26.1.2\n")
+        self.lock.write_text(
+            "demo==2.0 --hash=sha256:"
+            + "0" * 64
+            + "\npip==26.1.2 --hash=sha256:"
+            + "0" * 64
+            + "\n"
+        )
         with self.assertRaisesRegex(validator.WheelhouseError, "tracked lock"):
+            self.make_manifest()
+
+    def test_tracked_lock_requires_hash_for_every_pin(self) -> None:
+        self.lock.write_text("demo==1.0\npip==26.1.2 --hash=sha256:" + "0" * 64 + "\n")
+        with self.assertRaisesRegex(validator.WheelhouseError, "hash every"):
             self.make_manifest()
 
     def test_wheel_metadata_identity_is_authoritative(self) -> None:

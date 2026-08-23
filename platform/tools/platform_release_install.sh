@@ -427,6 +427,7 @@ else
     --only-binary=:all: \
     --upgrade \
     --force-reinstall \
+    --require-hashes \
     --requirement "$RELEASE_DIR/requirements-platform.lock.txt"
   relocate_venv_paths "$NEW_VENV_DIR" "$SHARED_VENV_DIR"
   verify_venv "$NEW_VENV_DIR" "$FREEZE_CHECK_FILE"

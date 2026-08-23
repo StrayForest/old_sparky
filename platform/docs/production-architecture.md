@@ -70,7 +70,10 @@ FastAPI exposes no `/api/v1/uploads/*` media-serving route and has no uploads `S
 
 ## Release and recovery
 
-`platform_build_release.sh` creates a checksummed release artifact.
+The GitHub production workflow builds, publishes and attests the immutable
+release artifact and its hash-locked wheelhouse. The VPS verifies the
+published digest/source commit and installs that artifact; it does not resolve
+dependencies or build from a source checkout.
 `platform_release_deploy.sh` stages it, makes the migration decision, then
 retains a durable receipt through pointer activation, runtime readiness, Nginx
 apply and smoke before committing. DB changes are expand-first. Rollback

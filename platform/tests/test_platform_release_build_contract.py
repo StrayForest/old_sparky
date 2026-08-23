@@ -83,6 +83,45 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             workflow.index("Mark production deployment pending"),
         )
 
+    def test_production_preflight_requires_edge_parity_before_preflight_exit(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text()
+        preflight_start = workflow.index('"$current/tools/platform_release_preflight.sh"')
+        preflight_exit = workflow.index(
+            'if [[ "$deploy_mode" == "preflight" ]]',
+            preflight_start,
+        )
+        initial_preflight = workflow[preflight_start:preflight_exit]
+        self.assertIn("--require-edge-parity", initial_preflight)
+
+    def test_production_deploy_consumes_ci_artifact_without_host_build(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text()
+        self.assertIn("Build immutable release artifact in CI", workflow)
+        self.assertIn("actions/upload-artifact", workflow)
+        self.assertIn("actions/download-artifact", workflow)
+        self.assertIn("PUBLISHED_ARTIFACT_DIGEST", workflow)
+        self.assertIn("RELEASE.provenance.json", workflow)
+        self.assertIn("artifact_sha256", workflow)
+        remote_start = workflow.index("<<'REMOTE'")
+        remote_script = workflow[remote_start:]
+        self.assertNotIn("platform_build_release.sh", remote_script)
+        self.assertNotIn("pip install -r platform/requirements-platform.lock.txt", remote_script)
+        validator = (REPO_ROOT / "platform/tools/platform_validate_release_artifact.py").read_text()
+        self.assertIn("source_git_commit", workflow)
+        self.assertIn("expected source commit", validator)
+
+    def test_production_env_contract_matches_runtime_policy(self) -> None:
+        example = (REPO_ROOT / "platform/.env.platform.example").read_text()
+        preflight = (REPO_ROOT / "platform/tools/platform_release_preflight.sh").read_text()
+        operations = (REPO_ROOT / "platform/docs/operations-runbook.md").read_text()
+        self.assertIn("127.0.0.1:5432/platformdb", example)
+        self.assertNotIn("127.0.0.1:6432", example)
+        self.assertIn('root:root 0600', preflight)
+        self.assertIn("directly to PostgreSQL", operations)
+
     def test_security_workflow_runs_docs_and_reports_all_required_jobs(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-security.yml").read_text()
 
@@ -150,6 +189,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             '"$ROOT_DIR/.venv_platform/bin/python" -I -m pip download', script
         )
         self.assertIn("--only-binary=:all:", script)
+        self.assertIn("--require-hashes", script)
         self.assertIn('/usr/bin/python3 -I -m venv "$VERIFY_VENV"', script)
         self.assertIn('"$VERIFY_VENV/bin/python" -I -m pip check', script)
         self.assertNotIn('bin/python" -m pip', script)
@@ -195,6 +235,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             '--requirement "$RELEASE_DIR/requirements-platform.lock.txt"',
             install,
         )
+        self.assertIn("--require-hashes", install)
         self.assertNotIn('"$SHARED_VENV_DIR/bin/pip" install', install)
 
     def test_build_lock_contention_exits_before_source_or_target_mutation(self) -> None:
