@@ -502,7 +502,6 @@ export function CreateTournamentForm({
   return (
     <div className="create-layout" data-server-now={serverNowIso}>
       <form className="form-stack" id="create-tournament-form" aria-label="Форма создания турнира" aria-busy={status === "saving"} onSubmit={handleCreate}>
-        <fieldset className="create-form-fields" disabled={status === "saving"}>
           <article className="panel panel-pad create-main-panel">
             <h2 className="panel-title"><span>A.</span> Основное</h2>
             <div className="field-grid grid-2 create-main-grid">
@@ -788,16 +787,6 @@ export function CreateTournamentForm({
               </label>
             </div>
           </article>
-        </fieldset>
-        <style jsx>{`
-          .create-form-fields {
-            border: 0;
-            margin: 0;
-            min-width: 0;
-            padding: 0;
-            display: contents;
-          }
-        `}</style>
       </form>
 
       <aside className="side-stack" aria-label="Предпросмотр и подсказки">
