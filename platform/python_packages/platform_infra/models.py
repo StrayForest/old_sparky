@@ -219,6 +219,30 @@ class UserSession(Base):
     )
 
 
+class ApiMutationIdempotencyKey(TimestampMixin, Base):
+    __tablename__ = "api_mutation_idempotency_keys"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_user_id",
+            "scope",
+            "key",
+            name="uq_api_mutation_idempotency_keys_actor_scope_key",
+        ),
+        CheckConstraint("length(request_fingerprint) = 64", name="request_fingerprint_length"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    actor_user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("platform.users.id", ondelete="CASCADE"),
+        index=True,
+    )
+    scope: Mapped[str] = mapped_column(String(200))
+    key: Mapped[str] = mapped_column(String(128))
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    resource_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
 class PasswordResetToken(Base):
     __tablename__ = "password_reset_tokens"
     __table_args__ = (
@@ -573,6 +597,11 @@ class TournamentParticipant(TimestampMixin, Base):
             "user_id",
             name="uq_tournament_participants_tournament_user",
         ),
+        CheckConstraint("entry_type = 'solo'", name="entry_type_solo"),
+        CheckConstraint(
+            "status IN ('registered', 'confirmed', 'checked_in', 'withdrawn', 'disqualified')",
+            name="status_allowed",
+        ),
         Index(
             "ix_tournament_participants_active_tournament",
             "tournament_id",
@@ -614,6 +643,30 @@ class TournamentMatch(TimestampMixin, Base):
             "round_number",
             "sequence_number",
             name="uq_tournament_matches_tournament_round_sequence",
+        ),
+        CheckConstraint("round_number > 0", name="round_number_positive"),
+        CheckConstraint("sequence_number > 0", name="sequence_number_positive"),
+        CheckConstraint(
+            "status IN ('scheduled', 'live', 'completed', 'cancelled')",
+            name="status_allowed",
+        ),
+        CheckConstraint(
+            "winner_side IS NULL OR winner_side IN ('home', 'away')",
+            name="winner_side_allowed",
+        ),
+        CheckConstraint(
+            "home_score IS NULL OR home_score >= 0",
+            name="home_score_nonnegative",
+        ),
+        CheckConstraint(
+            "away_score IS NULL OR away_score >= 0",
+            name="away_score_nonnegative",
+        ),
+        CheckConstraint(
+            "status <> 'completed' OR "
+            "(home_score IS NOT NULL AND away_score IS NOT NULL "
+            "AND home_score <> away_score AND winner_side IS NOT NULL)",
+            name="completed_result_consistent",
         ),
     )
 
@@ -778,6 +831,11 @@ class TournamentDeadlockReadyVote(TimestampMixin, Base):
 
 class TournamentDeadlockReadyVoteCountShard(TimestampMixin, Base):
     __tablename__ = "tournament_deadlock_ready_vote_count_shards"
+    __table_args__ = (
+        CheckConstraint("choice IN ('yes', 'no')", name="choice_allowed"),
+        CheckConstraint("shard >= 0", name="shard_nonnegative"),
+        CheckConstraint("vote_count >= 0", name="vote_count_nonnegative"),
+    )
 
     round_id: Mapped[int] = mapped_column(
         ForeignKey("platform.tournament_deadlock_ready_rounds.id", ondelete="CASCADE"),

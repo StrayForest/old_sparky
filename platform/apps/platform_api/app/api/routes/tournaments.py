@@ -99,6 +99,12 @@ from apps.platform_api.app.services.player_commitments import (
     reactivate_team_commitments,
     release_active_commitments,
 )
+from apps.platform_api.app.services.mutation_idempotency import (
+    bind_mutation_idempotency_resource,
+    mutation_payload_fingerprint,
+    request_idempotency_key,
+    reserve_mutation_idempotency,
+)
 from apps.platform_api.app.services.tournament_allowances import (
     PRIVATE_TOURNAMENT_MONTHLY_LIMIT,
     private_tournament_monthly_remaining,
@@ -2773,6 +2779,7 @@ async def list_my_tournaments(
 @router.post("", response_model=TournamentResponse, status_code=status.HTTP_201_CREATED)
 async def create_tournament(
     payload: TournamentCreateRequest,
+    request: Request,
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentResponse:
@@ -2782,6 +2789,38 @@ async def create_tournament(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
     ensure_tournament_schedule_is_future(payload, now=auth_session.now)
+    idempotency = await reserve_mutation_idempotency(
+        db_session,
+        actor_user_id=auth_session.user.id,
+        scope="tournament.create",
+        key=request_idempotency_key(request),
+        request_fingerprint=mutation_payload_fingerprint(
+            payload.model_dump(mode="json")
+        ),
+    )
+    if idempotency is not None and idempotency.replay:
+        resource_id = idempotency.record.resource_id
+        if resource_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The idempotent request completed without a resource reference.",
+            )
+        existing_tournament = await db_session.scalar(
+            select(Tournament).where(Tournament.id == resource_id)
+        )
+        if existing_tournament is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The resource for this Idempotency-Key no longer exists.",
+            )
+        return serialize_tournament(
+            existing_tournament,
+            auth_session.user.display_name,
+            await participant_count_for_tournament(
+                db_session, tournament_id=existing_tournament.id
+            ),
+        )
+
     normalized_name = await lock_tournament_name(db_session, name=payload.name)
     if await public_tournament_name_exists(
         db_session,
@@ -2842,6 +2881,7 @@ async def create_tournament(
             status_code=status.HTTP_409_CONFLICT,
             detail="Турнир с таким публичным названием уже существует.",
         ) from exc
+    bind_mutation_idempotency_resource(idempotency, tournament.id)
     invite_code = normalize_invite_code(payload.invite_code or "")
     if payload.invite_code is not None and len(invite_code) < 10:
         raise HTTPException(
@@ -3559,13 +3599,45 @@ async def create_tournament_invite(
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentInviteResponse:
+    tournament = await get_tournament_or_404(db_session, slug)
+    ensure_tournament_organizer(auth_session, tournament)
+    idempotency = await reserve_mutation_idempotency(
+        db_session,
+        actor_user_id=auth_session.user.id,
+        scope=f"tournament.invite.create:{tournament.id}",
+        key=request_idempotency_key(request),
+        request_fingerprint=mutation_payload_fingerprint(
+            {
+                "tournament_id": tournament.id,
+                "payload": payload.model_dump(mode="json"),
+            }
+        ),
+    )
+    if idempotency is not None and idempotency.replay:
+        resource_id = idempotency.record.resource_id
+        if resource_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The idempotent request completed without a resource reference.",
+            )
+        existing_invite = await db_session.scalar(
+            select(TournamentInvite).where(
+                TournamentInvite.id == resource_id,
+                TournamentInvite.tournament_id == tournament.id,
+            )
+        )
+        if existing_invite is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The resource for this Idempotency-Key no longer exists.",
+            )
+        return serialize_invite(tournament, existing_invite, now=datetime.now(UTC))
+
     await check_invite_rate_limit(
         request,
         user_id=auth_session.user.id,
         operation="manage",
     )
-    tournament = await get_tournament_or_404(db_session, slug)
-    ensure_tournament_organizer(auth_session, tournament)
     try:
         ensure_organizer_can_manage_participants(tournament.status)
         ensure_deadlock_registration_changes_allowed(
@@ -3589,6 +3661,7 @@ async def create_tournament_invite(
     )
     db_session.add(invite)
     await db_session.flush()
+    bind_mutation_idempotency_resource(idempotency, invite.id)
     await write_audit_log(
         db_session,
         actor_user_id=auth_session.user.id,
@@ -5801,6 +5874,14 @@ async def leave_tournament(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="You are not registered in this tournament.",
+        )
+    if participant.status == "disqualified":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Disqualified participant records are retained until the organizer "
+                "explicitly restores the participant."
+            ),
         )
     if participant.status in {"confirmed", "checked_in"}:
         raise HTTPException(

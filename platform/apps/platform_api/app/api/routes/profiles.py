@@ -100,6 +100,17 @@ def serialize_my_profile(
     )
 
 
+async def lock_profile_owner(db_session: AsyncSession, user_id: str) -> None:
+    locked_user_id = await db_session.scalar(
+        select(User.id).where(User.id == user_id).with_for_update()
+    )
+    if locked_user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Profile owner not found.",
+        )
+
+
 async def profile_media_descriptors(
     db_session: AsyncSession,
     profile: PlayerProfile,
@@ -211,9 +222,14 @@ async def update_my_profile(
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> MyProfileResponse:
+    await lock_profile_owner(db_session, auth_session.user.id)
     profile = await db_session.scalar(
-        select(PlayerProfile).where(PlayerProfile.user_id == auth_session.user.id)
+        select(PlayerProfile)
+        .where(PlayerProfile.user_id == auth_session.user.id)
+        .execution_options(populate_existing=True)
     )
+    if profile is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
     fields_set = payload.model_fields_set
     if "display_name" in fields_set and payload.display_name is None:
         raise HTTPException(
@@ -524,8 +540,11 @@ async def upsert_my_deadlock_profile(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
+    await lock_profile_owner(db_session, auth_session.user.id)
     profile = await db_session.scalar(
-        select(DeadlockProfile).where(DeadlockProfile.user_id == auth_session.user.id)
+        select(DeadlockProfile)
+        .where(DeadlockProfile.user_id == auth_session.user.id)
+        .execution_options(populate_existing=True)
     )
     if profile is None:
         profile = DeadlockProfile(
@@ -601,11 +620,7 @@ async def upsert_my_deadlock_dream_slots(
     # Serialize replace-all slot writes from the profile and captain workspace
     # endpoints on the stable parent row.  Locking only existing slot rows
     # permits concurrent writes to an empty slot set to merge unintentionally.
-    await db_session.scalar(
-        select(User)
-        .where(User.id == auth_session.user.id)
-        .with_for_update()
-    )
+    await lock_profile_owner(db_session, auth_session.user.id)
     await db_session.execute(
         delete(DeadlockDreamSlot).where(DeadlockDreamSlot.user_id == auth_session.user.id)
     )
