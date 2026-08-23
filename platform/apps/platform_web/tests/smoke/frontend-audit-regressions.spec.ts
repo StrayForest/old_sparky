@@ -48,7 +48,7 @@ test("tournament creation serializes submit and invite-code async state", () => 
   expect(createForm).toContain("const inviteRequestGenerationRef = useRef(0)");
   expect(createForm).toContain("const submitInFlightRef = useRef(false)");
   expect(createForm).toContain("if (submitInFlightRef.current || createdTournamentSlug)");
-  expect(createForm).toContain("disabled={status === \"saving\"}");
+  expect(createForm).toContain("disabled={status === \"saving\" ||");
   expect(createForm).toContain("values.inviteCode.length >= 10");
   expect(createForm).not.toContain("values.inviteCode.length >= 6");
   expect(createForm).toContain("Пн Вт Ср Чт Пт Сб Вс");
