@@ -52,13 +52,14 @@ function fallbackSecurityConfig(): PlatformAuthSecurityConfig | null {
     return null;
   }
   return {
-    public_registration_enabled: true,
-    email_verification_required: false,
+    // A build-time Turnstile key can keep password login usable while the
+    // runtime config endpoint is unavailable, but it is not authority to open
+    // registration or relax verification policy. Those capabilities fail
+    // closed until the backend contract is available again.
+    public_registration_enabled: false,
+    email_verification_required: true,
     turnstile_mode: "always",
     turnstile_site_key: fallbackTurnstileSiteKey,
-    // Steam is server-controlled and fails closed when the runtime security
-    // contract cannot be loaded; a build-time Turnstile key is not authority
-    // to enable an external identity provider.
     steam_login_enabled: false
   };
 }
