@@ -2,6 +2,7 @@
 set -euo pipefail
 
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REQUIRE_PREVIOUS=0
 REQUIRE_VERIFIED_BACKUP=0
 REQUIRE_EDGE_PARITY=0
@@ -120,7 +121,12 @@ set +a
 pass "Rendered service envs match canonical configuration"
 
 if [[ "$REQUIRE_EDGE_PARITY" -eq 1 ]]; then
-  "$PYTHON_BIN" "$CURRENT_TARGET/tools/platform_validate_edge_policy.py" \
+  EDGE_POLICY_TOOL="$SCRIPT_DIR/platform_validate_edge_policy.py"
+  if [[ ! -f "$EDGE_POLICY_TOOL" ]]; then
+    EDGE_POLICY_TOOL="$CURRENT_TARGET/tools/platform_validate_edge_policy.py"
+  fi
+  [[ -f "$EDGE_POLICY_TOOL" ]] || fail "Edge policy validator is missing."
+  "$PYTHON_BIN" "$EDGE_POLICY_TOOL" \
     --json >/dev/null \
     || fail "Cloudflare/Nginx/UFW trust-range parity check failed."
   pass "Cloudflare/Nginx/UFW trust-range parity passed"

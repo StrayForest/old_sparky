@@ -168,7 +168,6 @@ jobs:
           "$current/tools/platform_release_preflight.sh" \
             --require-previous \
             --require-verified-backup \
-            --require-edge-parity \
             --backup-max-age-hours 24
 
           if [[ "$deploy_mode" == "preflight" ]]; then
@@ -185,6 +184,8 @@ jobs:
           tar -xzf "$source_archive" -C "$source_dir"
           chown -R root:root "$source_dir"
           install -d -o root -g root -m 0755 "$source_dir/platform/dist"
+          test -x "$source_dir/platform/tools/platform_release_deploy.sh" \
+            || fail "uploaded source does not contain the release orchestrator"
 
           cd "$source_dir"
           test "$(git rev-parse --verify HEAD)" = "$target_sha" \
@@ -206,7 +207,8 @@ jobs:
             sha256sum -c "${release_slug}"-*.tar.gz.sha256
           )
 
-          "$current/tools/platform_release_preflight.sh" \
+          "$source_dir/platform/tools/platform_release_preflight.sh" \
+            --app-dir "$runtime" \
             --require-previous \
             --require-verified-backup \
             --require-edge-parity \
@@ -215,7 +217,7 @@ jobs:
           release_archive="$(find platform/dist/releases -maxdepth 1 -type f -name "${release_slug}-*.tar.gz" -print -quit)"
           test -n "$release_archive" || fail "release archive was not produced"
 
-          LC_ALL=C.UTF-8 "$current/tools/platform_release_deploy.sh" \
+          LC_ALL=C.UTF-8 "$source_dir/platform/tools/platform_release_deploy.sh" \
             --artifact "$release_archive" \
             --app-dir "$runtime" \
             --edge-origin https://127.0.0.1 \

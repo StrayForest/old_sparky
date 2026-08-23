@@ -171,7 +171,7 @@ run_candidate() {
 }
 
 release_preflight() {
-  "$APP_DIR/current/tools/platform_release_preflight.sh" \
+  "$TOOLS_DIR/platform_release_preflight.sh" \
     --app-dir "$APP_DIR" \
     --require-previous \
     --require-verified-backup \
