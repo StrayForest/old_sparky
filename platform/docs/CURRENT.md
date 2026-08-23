@@ -48,9 +48,13 @@ database guards and applies migration `20260822_0040`. Exact commit
 `gha-32574455599-1-87525bab34c4-20260822T125945Z`; closure evidence is in
 [`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md).
 
-AS-17 — End-to-end release transaction and recovery is in progress. The normal
-release path now retains a durable receipt through migration, restart/readiness,
-Nginx and smoke; migration uncertainty never triggers an automatic downgrade.
+AS-17 — End-to-end release transaction and recovery is resolved and deployed.
+The release receipt now has an explicit Nginx uncertainty boundary, idempotent
+`activation-committed` completion, retained runtime recovery, and rollback
+restoration of the previous release's code, venv, units and Nginx before
+restart/smoke. Fault-injection coverage spans pointer/venv, units, Nginx,
+restart, smoke, activation commit and receipt cleanup. Closure evidence is in
+[`archive/as-17-release-transaction-recovery-2026-08-23.md`](archive/as-17-release-transaction-recovery-2026-08-23.md).
 AS-12 has code-side fail-closed validation and a read-only parity gate, while
 the VPS proof remains operator-owned. AS-13's CI contour is being revalidated
 against the current web/api/worker identities and units.

@@ -10,14 +10,14 @@ For the production baseline and immediate engineering target, read [`CURRENT.md`
 
 ### AS-17 — End-to-end release transaction and recovery
 
-**Implementation in progress.** The release path now stages a candidate and
-retains durable phases through migration, pointer activation, restart/readiness,
-Nginx apply and smoke. Migration-uncertain phases fail closed and require
-operator resume/rollback review; automatic Alembic downgrade is not introduced.
-The production workflow is manual-dispatch only until live proof and signed
-artifact gates are complete. Closure requires a VPS interruption/recovery drill
-and evidence that no failed post-install step leaves an untracked pointer,
-runtime, service or Nginx state.
+**Resolved and deployed.** The release state machine now has an explicit
+`nginx-pending` uncertainty boundary, idempotent resume from
+`activation-committed`, and retained recovery that restores release-specific
+units and Nginx before restart/smoke. Rollback restores the previous code,
+venv, units and Nginx, while migration uncertainty remains fail-closed and no
+automatic Alembic downgrade is introduced. Fault-injection regression tests
+cover every requested side-effect boundary; closure evidence is retained in
+[`archive/as-17-release-transaction-recovery-2026-08-23.md`](archive/as-17-release-transaction-recovery-2026-08-23.md).
 
 ### AS-15 — Deadlock persistence and workflow concurrency integrity
 
