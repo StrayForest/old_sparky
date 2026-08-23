@@ -17,6 +17,7 @@ candidate artifact
     -> migration-applied
     -> activation-pending
     -> services-restarted
+    -> nginx-pending
     -> nginx-applied
     -> smoke-passed
     -> activation-committed
@@ -27,6 +28,22 @@ shared-runtime transition, and leaves `shared/.release-operation.json` at
 `staged`. The deploy wrapper then owns the migration decision, pointer switch,
 service preparation/restart, readiness, Nginx apply and origin/public smoke.
 The state file is removed only after the final commit phase.
+
+Rollback uses the same receipt discipline after switching pointers:
+
+```text
+pointer/venv switch
+    -> rollback-runtime-pending
+    -> restart-pending
+    -> services-restarted
+    -> smoke-passed
+    -> rollback-runtime-applied
+```
+
+The rollback target's systemd units and Nginx configuration are installed while
+the receipt is in `rollback-runtime-pending`, before any restart or smoke.
+`--no-restart` still restores units and Nginx but deliberately omits service
+restart and smoke.
 
 ## Failure behavior
 
@@ -55,6 +72,17 @@ The state file is removed only after the final commit phase.
   failure. Do not delete the state file, downgrade Alembic, or run a second
   unrelated install. Resume first; rollback remains a code/runtime operation
   and never reverses database migrations automatically.
+- `nginx-pending` is an explicit uncertainty boundary. If the process stops
+  after Nginx has been mutated but before `nginx-applied`, abort recovery first
+  restores the recorded pointers/venv and then reinstalls the previous
+  release's units and Nginx configuration before restart/readiness/smoke.
+- A rollback runtime failure retains `rollback-runtime-pending` (or its later
+  phase). Recovery either completes the already committed restart-pending
+  rollback or restores the exact pre-rollback pointers, venv, units and Nginx
+  while the receipt remains durable.
+- `activation-committed` is resumable and idempotently calls final receipt
+  completion. A crash after activation commit therefore cannot report success
+  while leaving the receipt to block the next install.
 
 The retained state is the recovery receipt: it records the original pointers,
 candidate identity and shared-venv identities. A restart/readiness or smoke

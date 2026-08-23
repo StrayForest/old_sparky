@@ -117,6 +117,7 @@ fi
 TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 INSTALL_TOOL="$TOOLS_DIR/platform_release_install.sh"
 TRANSACTION_TOOL="$TOOLS_DIR/platform_release_transaction.py"
+RUNTIME_RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"
 APP_DIR="$(readlink -f "$APP_DIR")"
 SHARED_DIR="$APP_DIR/shared"
 TRANSACTION_STATE="$SHARED_DIR/.release-operation.json"
@@ -183,6 +184,17 @@ print_retained_state() {
 }
 trap print_retained_state EXIT
 
+restore_previous_runtime() {
+  local release="$1"
+  "$RUNTIME_RESTORE_TOOL" \
+    --app-dir "$APP_DIR" \
+    --release "$release" \
+    --expected-csp-mode "$EXPECTED_CSP_MODE" \
+    --edge-origin "$EDGE_ORIGIN" \
+    --edge-host "$EDGE_HOST" \
+    --public-edge-origin "$PUBLIC_EDGE_ORIGIN"
+}
+
 acquire_release_lock() {
   if ! /usr/bin/flock -n "$RELEASE_LOCK_FD"; then
     echo "Another platform install or rollback operation holds the release lock." >&2
@@ -194,7 +206,8 @@ abort_retained_release() {
   local retained_phase="$1"
   case "$retained_phase" in
     migration-pending|migration-failed|migration-applied|activation-pending|\
-    services-restarted|nginx-applied|smoke-passed|activation-committed|recovery-authorized)
+    services-restarted|nginx-pending|nginx-applied|smoke-passed|\
+    activation-committed|recovery-authorized|recovery-restored)
       ;;
     staged)
       echo "The staged transaction has no migration uncertainty; use --recover-pending." >&2
@@ -205,30 +218,39 @@ abort_retained_release() {
       return 1
       ;;
   esac
-  if [[ "$retained_phase" != "recovery-authorized" ]]; then
-    /usr/bin/python3 -I "$TRANSACTION_TOOL" authorize-recovery \
-      --state "$TRANSACTION_STATE" \
-      --confirm MIGRATION_NOT_REVERSED
-  fi
-  /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --state "$TRANSACTION_STATE"
-
   case "$retained_phase" in
-    activation-pending|services-restarted|nginx-applied|smoke-passed|activation-committed|recovery-authorized)
-      PLATFORM_APP_DIR="$APP_DIR" "$APP_DIR/current/tools/platform_install_systemd_units.sh"
-      /usr/bin/systemctl restart deadlock-api deadlock-worker deadlock-web
-      for service in deadlock-api deadlock-worker deadlock-web; do
-        /usr/bin/systemctl is-active --quiet "$service"
-      done
-      /usr/bin/curl --fail --silent --show-error --max-time 10 \
-        http://127.0.0.1:8010/api/v1/health/ready >/dev/null
-      /usr/bin/curl --fail --silent --show-error --max-time 10 \
-        http://127.0.0.1:3000/ >/dev/null
+    activation-pending|services-restarted|nginx-pending|nginx-applied|\
+    smoke-passed|activation-committed|recovery-authorized|recovery-restored)
+      local original_current
+      original_current="$(transaction_json | json_field current_before)"
+      if [[ -z "$original_current" ]]; then
+        original_current="$(transaction_json | json_field previous_before)"
+      fi
+      if [[ "$retained_phase" != "recovery-restored" ]]; then
+        if [[ "$retained_phase" != "recovery-authorized" ]]; then
+          /usr/bin/python3 -I "$TRANSACTION_TOOL" authorize-recovery \
+            --state "$TRANSACTION_STATE" \
+            --confirm MIGRATION_NOT_REVERSED
+        fi
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+          --retain \
+          --state "$TRANSACTION_STATE"
+      else
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+          --retain \
+          --state "$TRANSACTION_STATE"
+      fi
+      restore_previous_runtime "$original_current"
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+        --state "$TRANSACTION_STATE"
       ;;
-  esac
-  case "$retained_phase" in
-    nginx-applied|smoke-passed|activation-committed|recovery-authorized)
-      PLATFORM_APP_DIR="$APP_DIR" "$SHARED_VENV/bin/python" \
-        "$APP_DIR/current/tools/platform_install_nginx.py" --apply --reload --json
+    migration-pending|migration-failed|migration-applied)
+      if [[ "$retained_phase" != "recovery-authorized" ]]; then
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" authorize-recovery \
+          --state "$TRANSACTION_STATE" \
+          --confirm MIGRATION_NOT_REVERSED
+      fi
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --state "$TRANSACTION_STATE"
       ;;
   esac
   echo "Retained release aborted after explicit migration review; database was not downgraded." >&2
@@ -287,7 +309,8 @@ case "$phase" in
     set_phase migration-pending migration-applied
     phase=migration-applied
     ;;
-  migration-applied|activation-pending|services-restarted|nginx-applied|smoke-passed|activation-committed)
+  migration-applied|activation-pending|services-restarted|nginx-pending|\
+  nginx-applied|smoke-passed|activation-committed)
     ;;
   *)
     echo "Unsupported release transaction phase for deploy: $phase" >&2
@@ -335,11 +358,16 @@ if [[ "$phase" == "activation-pending" ]]; then
 fi
 
 if [[ "$phase" == "services-restarted" ]]; then
+  set_phase services-restarted nginx-pending
+  phase=nginx-pending
+fi
+
+if [[ "$phase" == "nginx-pending" ]]; then
   candidate_env
   "$SHARED_VENV/bin/python" "$CANDIDATE/tools/platform_install_nginx.py" --json
   "$SHARED_VENV/bin/python" "$CANDIDATE/tools/platform_install_nginx.py" \
     --apply --reload --json
-  set_phase services-restarted nginx-applied
+  set_phase nginx-pending nginx-applied
   phase=nginx-applied
 fi
 
@@ -364,6 +392,10 @@ fi
 
 if [[ "$phase" == "smoke-passed" ]]; then
   set_phase smoke-passed activation-committed
+  phase=activation-committed
+fi
+
+if [[ "$phase" == "activation-committed" ]]; then
   /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
 fi
 

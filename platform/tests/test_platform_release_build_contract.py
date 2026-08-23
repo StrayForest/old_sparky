@@ -37,6 +37,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("--stage-only", release_installer)
         self.assertIn("--artifact", deploy)
         self.assertIn("migration-pending", deploy)
+        self.assertIn("nginx-pending", deploy)
         self.assertIn("--resume", deploy)
         self.assertIn("--abort-retained", deploy)
         self.assertIn("MIGRATION_NOT_REVERSED", deploy)
@@ -44,6 +45,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("acquire_release_lock", deploy)
         self.assertIn("platform_install_systemd_units.sh", deploy)
         self.assertIn("platform_deploy_smoke.py", deploy)
+        self.assertIn("platform_release_restore_runtime.sh", deploy)
+        rollback = (REPO_ROOT / "platform/tools/platform_release_rollback.sh").read_text()
+        self.assertIn("rollback-runtime-pending", rollback)
+        self.assertIn("platform_release_restore_runtime.sh", rollback)
 
         systemd_units = (
             REPO_ROOT / "platform/tools/platform_install_systemd_units.sh"

@@ -20,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_install.sh"
 ROLLBACK_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_rollback.sh"
 TRANSACTION_TOOL = REPO_ROOT / "platform" / "tools" / "platform_release_transaction.py"
+RUNTIME_RESTORE_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_restore_runtime.sh"
 TRANSACTION_STATE_NAME = ".release-operation.json"
 BUILT_AT = "20260811T120000Z"
 
@@ -592,12 +593,21 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         systemctl = (
             "/usr/bin/systemctl restart deadlock-api deadlock-worker deadlock-web"
         )
-        interrupted = self.write_replaced_script(
-            ROLLBACK_SCRIPT,
-            "platform_release_rollback_restart_kill.sh",
-            systemctl,
-            '/bin/kill -KILL "$$" # test interrupted restart',
+        interrupted_runtime = self.root / "platform_release_restore_runtime_restart_kill.sh"
+        interrupted_runtime.write_text(
+            RUNTIME_RESTORE_SCRIPT.read_text().replace(
+                systemctl, '/bin/kill -KILL "$PPID" # test interrupted restart', 1
+            )
         )
+        interrupted_runtime.chmod(0o755)
+        interrupted_text = self._script_with_physical_tools(ROLLBACK_SCRIPT).replace(
+            'RUNTIME_RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"',
+            f'RUNTIME_RESTORE_TOOL="{interrupted_runtime}"',
+            1,
+        )
+        interrupted = self.root / "platform_release_rollback_restart_kill.sh"
+        interrupted.write_text(interrupted_text)
+        interrupted.chmod(0o755)
 
         result = self.run_script(
             interrupted,
@@ -617,12 +627,17 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         )
         self.assertEqual((snapshot / "deps-version").read_text(), "new\n")
 
-        recovery = self.write_replaced_script(
-            ROLLBACK_SCRIPT,
-            "platform_release_rollback_restart_recover.sh",
-            systemctl,
-            "/usr/bin/true # test service restart",
+        recovery_runtime = self.root / "platform_release_restore_runtime_recover.sh"
+        recovery_runtime.write_text("#!/usr/bin/env sh\nexit 0\n")
+        recovery_runtime.chmod(0o755)
+        recovery_text = self._script_with_physical_tools(ROLLBACK_SCRIPT).replace(
+            'RUNTIME_RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"',
+            f'RUNTIME_RESTORE_TOOL="{recovery_runtime}"',
+            1,
         )
+        recovery = self.root / "platform_release_rollback_restart_recover.sh"
+        recovery.write_text(recovery_text)
+        recovery.chmod(0o755)
         self.run_script(
             recovery,
             "--recover-pending",
@@ -691,9 +706,10 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
     def test_rollback_helper_path_survives_current_symlink_switch(self) -> None:
         current_release, previous_release, _snapshot = self.prepare_rollback_fixture()
         release_tools = current_release / "tools"
-        release_tools.mkdir()
+        release_tools.mkdir(exist_ok=True)
         shutil.copy2(ROLLBACK_SCRIPT, release_tools / ROLLBACK_SCRIPT.name)
         shutil.copy2(TRANSACTION_TOOL, release_tools / TRANSACTION_TOOL.name)
+        shutil.copy2(RUNTIME_RESTORE_SCRIPT, release_tools / RUNTIME_RESTORE_SCRIPT.name)
         invoked_through_current = (
             self.app_dir / "current" / "tools" / ROLLBACK_SCRIPT.name
         )
@@ -774,6 +790,16 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
     def add_installed_release(self, name: str) -> Path:
         release = self.releases_dir / name
         release.mkdir()
+        tools = release / "tools"
+        tools.mkdir()
+        for tool_name in (
+            "platform_install_systemd_units.sh",
+            "platform_install_nginx.py",
+            "platform_deploy_smoke.py",
+        ):
+            tool = tools / tool_name
+            tool.write_text("#!/usr/bin/env sh\nexit 0\n")
+            tool.chmod(0o755)
         return release
 
     def build_artifact(self, release_ref: str, *, pip_result: str) -> Path:

@@ -36,11 +36,14 @@ PHASES = {
     "migration-applied",
     "activation-pending",
     "services-restarted",
+    "nginx-pending",
     "nginx-applied",
     "smoke-passed",
     "activation-committed",
     "recovery-authorized",
     "restart-pending",
+    "rollback-runtime-pending",
+    "rollback-runtime-applied",
     "recovery-restored",
 }
 PHASE_TRANSITIONS = {
@@ -55,18 +58,34 @@ PHASE_TRANSITIONS = {
     "snapshot-placed": {"previous-switched", "pointers-switched", "staged"},
     "previous-switched": {"pointers-switched"},
     "current-switched": {"pointers-switched"},
-    "pointers-switched": {"restart-pending"},
+    "pointers-switched": {"restart-pending", "rollback-runtime-pending"},
     "staged": {"migration-pending"},
     "migration-pending": {"migration-failed", "migration-applied", "recovery-authorized"},
     "migration-failed": {"migration-pending", "migration-applied", "recovery-authorized"},
     "migration-applied": {"activation-pending", "recovery-authorized"},
     "activation-pending": {"services-restarted", "recovery-authorized"},
-    "services-restarted": {"nginx-applied", "recovery-authorized"},
+    "services-restarted": {
+        "nginx-pending",
+        "nginx-applied",
+        "smoke-passed",
+        "recovery-authorized",
+    },
+    "nginx-pending": {"nginx-applied", "recovery-authorized"},
     "nginx-applied": {"smoke-passed", "recovery-authorized"},
-    "smoke-passed": {"activation-committed", "recovery-authorized"},
+    "smoke-passed": {
+        "activation-committed",
+        "rollback-runtime-applied",
+        "recovery-authorized",
+    },
     "activation-committed": {"recovery-authorized"},
     "recovery-authorized": set(),
-    "restart-pending": set(),
+    "restart-pending": {"services-restarted", "recovery-authorized"},
+    "rollback-runtime-pending": {
+        "restart-pending",
+        "rollback-runtime-applied",
+        "recovery-authorized",
+    },
+    "rollback-runtime-applied": {"recovery-authorized"},
     "recovery-restored": set(),
 }
 MIGRATION_OUTCOME_UNCERTAIN_PHASES = {
@@ -75,6 +94,7 @@ MIGRATION_OUTCOME_UNCERTAIN_PHASES = {
     "migration-applied",
     "activation-pending",
     "services-restarted",
+    "nginx-pending",
     "nginx-applied",
     "smoke-passed",
     "activation-committed",
@@ -886,7 +906,7 @@ def _cleanup_recovered_install(state: Path, record: dict[str, object]) -> None:
         _fsync_directory(state.parent)
 
 
-def recover(state: Path) -> None:
+def recover(state: Path, *, retain: bool = False) -> None:
     record = _load_record(state)
     if (
         record["operation"] == "install"
@@ -896,7 +916,10 @@ def recover(state: Path) -> None:
             "migration outcome is not safely reversible; retain the state and "
             "resume the deployment or make an explicit operator rollback decision"
         )
-    if record["phase"] == "restart-pending":
+    if (
+        record["phase"] == "restart-pending"
+        and not (retain and record["operation"] == "rollback")
+    ):
         raise TransactionError(
             "rollback filesystem state is complete but its service restart is pending"
         )
@@ -908,6 +931,21 @@ def recover(state: Path) -> None:
     else:
         _verify_original_pointers(record)
         _restore_venv(record)
+    if retain:
+        return
+    if record["operation"] == "install":
+        _cleanup_recovered_install(state, record)
+    else:
+        state.unlink()
+        _fsync_directory(state.parent)
+
+
+def complete_recovery(state: Path) -> None:
+    record = _load_record(state)
+    if record["phase"] != "recovery-restored":
+        raise TransactionError("release operation recovery is not durably restored")
+    _verify_original_pointers(record)
+    _restore_venv(record)
     if record["operation"] == "install":
         _cleanup_recovered_install(state, record)
     else:
@@ -982,6 +1020,7 @@ def complete(state: Path) -> None:
         "pointers-switched",
         "restart-pending",
         "activation-committed",
+        "rollback-runtime-applied",
     }:
         raise TransactionError("release operation pointers are not durably switched")
     _validate_success(record)
@@ -1027,11 +1066,14 @@ def _build_parser() -> argparse.ArgumentParser:
     pointer.add_argument("--target", default="")
     recover_parser = commands.add_parser("recover")
     recover_parser.add_argument("--state", required=True, type=Path)
+    recover_parser.add_argument("--retain", action="store_true")
     authorize_parser = commands.add_parser("authorize-recovery")
     authorize_parser.add_argument("--state", required=True, type=Path)
     authorize_parser.add_argument("--confirm", required=True)
     complete_parser = commands.add_parser("complete")
     complete_parser.add_argument("--state", required=True, type=Path)
+    complete_recovery_parser = commands.add_parser("complete-recovery")
+    complete_recovery_parser.add_argument("--state", required=True, type=Path)
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--state", required=True, type=Path)
     status_parser.add_argument("--json", action="store_true", dest="as_json")
@@ -1066,11 +1108,13 @@ def main() -> int:
         elif args.command == "switch-pointer":
             switch_pointer(args.state, name=args.name, target_value=args.target)
         elif args.command == "recover":
-            recover(args.state)
+            recover(args.state, retain=args.retain)
         elif args.command == "authorize-recovery":
             authorize_recovery(args.state, confirmation=args.confirm)
         elif args.command == "complete":
             complete(args.state)
+        elif args.command == "complete-recovery":
+            complete_recovery(args.state)
         else:
             record = _load_record(args.state)
             if record["phase"] == "restart-pending":

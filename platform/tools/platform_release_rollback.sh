@@ -81,6 +81,7 @@ fi
 
 TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TRANSACTION_TOOL="$TOOLS_DIR/platform_release_transaction.py"
+RUNTIME_RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"
 if [[ ! -d "$APP_DIR" || -L "$APP_DIR" ]]; then
   echo "Application directory is missing or unsafe: $APP_DIR" >&2
   exit 1
@@ -110,6 +111,48 @@ if ! /usr/bin/flock -n "$RELEASE_LOCK_FD"; then
   exit 3
 fi
 
+transaction_json() {
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" status \
+    --state "$TRANSACTION_STATE" --json
+}
+
+json_field() {
+  local field="$1"
+  /usr/bin/python3 -I -c \
+    'import json,sys; value=json.load(sys.stdin)[sys.argv[1]]; print("" if value is None else value)' \
+    "$field"
+}
+
+restore_release_runtime() {
+  local release="$1"
+  if [[ "$RESTART_AFTER" -eq 1 ]]; then
+    "$RUNTIME_RESTORE_TOOL" \
+      --app-dir "$APP_DIR" \
+      --release "$release"
+  else
+    "$RUNTIME_RESTORE_TOOL" \
+      --app-dir "$APP_DIR" \
+      --release "$release" \
+      --no-restart
+  fi
+}
+
+recover_rollback_to_original() {
+  local phase="$1"
+  local original_current
+  original_current="$(transaction_json | json_field current_before)"
+  if [[ -z "$original_current" ]]; then
+    original_current="$(transaction_json | json_field previous_before)"
+  fi
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+    --retain \
+    --state "$TRANSACTION_STATE"
+  restore_release_runtime "$original_current"
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+    --state "$TRANSACTION_STATE"
+  echo "Rollback recovery restored the original release from phase: $phase." >&2
+}
+
 if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
   if [[ "$RECOVER_PENDING" -eq 0 ]]; then
     cat >&2 <<EOF
@@ -123,12 +166,35 @@ EOF
   TRANSACTION_STATUS="$(
     /usr/bin/python3 -I "$TRANSACTION_TOOL" status --state "$TRANSACTION_STATE"
   )"
-  if [[ "$TRANSACTION_STATUS" == "rollback restart-pending" ]]; then
+  PENDING_OPERATION="${TRANSACTION_STATUS%% *}"
+  PENDING_PHASE="${TRANSACTION_STATUS#* }"
+  if [[ "$PENDING_OPERATION" == "rollback" \
+    && "$PENDING_PHASE" == "restart-pending" ]]; then
     trap '' HUP INT TERM
-    /usr/bin/systemctl restart deadlock-api deadlock-worker deadlock-web
+    PENDING_RELEASE="$(readlink -f "$APP_DIR/current")"
+    "$RUNTIME_RESTORE_TOOL" \
+      --app-dir "$APP_DIR" \
+      --release "$PENDING_RELEASE"
     /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
     trap - HUP INT TERM
     echo "Pending rollback service restart completed; the rollback remains active."
+  elif [[ "$PENDING_OPERATION" == "rollback" \
+    && "$PENDING_PHASE" == "rollback-runtime-pending" ]]; then
+    trap '' HUP INT TERM
+    recover_rollback_to_original "$PENDING_PHASE"
+    trap - HUP INT TERM
+  elif [[ "$PENDING_OPERATION" == "rollback" \
+    && "$PENDING_PHASE" == "rollback-runtime-applied" ]]; then
+    trap '' HUP INT TERM
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
+    trap - HUP INT TERM
+    echo "Pending rollback receipt completed after runtime restoration."
+  elif [[ "$PENDING_OPERATION" == "rollback" \
+    && ( "$PENDING_PHASE" == "services-restarted" \
+      || "$PENDING_PHASE" == "smoke-passed" ) ]]; then
+    trap '' HUP INT TERM
+    recover_rollback_to_original "$PENDING_PHASE"
+    trap - HUP INT TERM
   else
     /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --state "$TRANSACTION_STATE"
     echo "Pending platform release operation recovered to its exact pre-operation state."
@@ -349,7 +415,23 @@ cleanup_failed_rollback() {
     return
   fi
   if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
-    if ! /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --state "$TRANSACTION_STATE"; then
+    local pending_status pending_operation pending_phase
+    pending_status="$(
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" status --state "$TRANSACTION_STATE" \
+        2>/dev/null || true
+    )"
+    pending_operation="${pending_status%% *}"
+    pending_phase="${pending_status#* }"
+    if [[ "$pending_operation" == "rollback" && ( \
+      "$pending_phase" == "rollback-runtime-pending" || \
+      "$pending_phase" == "restart-pending" || \
+      "$pending_phase" == "services-restarted" || \
+      "$pending_phase" == "smoke-passed" || \
+      "$pending_phase" == "rollback-runtime-applied" ) ]]; then
+      if ! recover_rollback_to_original "$pending_phase"; then
+        echo "CRITICAL: rollback runtime recovery failed; durable state was retained." >&2
+      fi
+    elif ! /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --state "$TRANSACTION_STATE"; then
       echo "CRITICAL: rollback recovery failed; durable state was retained." >&2
     fi
   fi
@@ -404,22 +486,51 @@ trap '' HUP INT TERM
   --phase pointers-switched
 trap - HUP INT TERM
 
+trap '' HUP INT TERM
+/usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+  --state "$TRANSACTION_STATE" \
+  --expected pointers-switched \
+  --phase rollback-runtime-pending
+
+"$RUNTIME_RESTORE_TOOL" \
+  --app-dir "$APP_DIR" \
+  --release "$PREVIOUS_TARGET" \
+  --prepare-only
+
 if [[ "$RESTART_AFTER" -eq 1 ]]; then
-  trap '' HUP INT TERM
   /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
     --state "$TRANSACTION_STATE" \
-    --expected pointers-switched \
+    --expected rollback-runtime-pending \
     --phase restart-pending
-  /usr/bin/systemctl restart deadlock-api deadlock-worker deadlock-web
-  /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
-  ROLLBACK_COMPLETE=1
-  trap - HUP INT TERM
+  "$RUNTIME_RESTORE_TOOL" \
+    --app-dir "$APP_DIR" \
+    --release "$PREVIOUS_TARGET" \
+    --restart-only
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+    --state "$TRANSACTION_STATE" \
+    --expected restart-pending \
+    --phase services-restarted
+  "$RUNTIME_RESTORE_TOOL" \
+    --app-dir "$APP_DIR" \
+    --release "$PREVIOUS_TARGET" \
+    --smoke-only
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+    --state "$TRANSACTION_STATE" \
+    --expected services-restarted \
+    --phase smoke-passed
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+    --state "$TRANSACTION_STATE" \
+    --expected smoke-passed \
+    --phase rollback-runtime-applied
 else
-  trap '' HUP INT TERM
-  /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
-  ROLLBACK_COMPLETE=1
-  trap - HUP INT TERM
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+    --state "$TRANSACTION_STATE" \
+    --expected rollback-runtime-pending \
+    --phase rollback-runtime-applied
 fi
+/usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
+ROLLBACK_COMPLETE=1
+trap - HUP INT TERM
 trap - EXIT
 
 cat <<EOF
