@@ -64,7 +64,7 @@ jobs:
         run: |
           rm -f .github/scripts/persistence_concurrency_remediation_20260823.py
           rm -f .github/workflows/persistence-concurrency-remediation-apply.yml
-      - name: Commit remediation to dev
+      - name: Commit remediation to temporary branch
         run: |
           set -euo pipefail
           git config user.name "oldsparky-remediation-bot"
@@ -76,7 +76,7 @@ jobs:
             exit 0
           fi
           git commit -m "fix(platform): harden persistence concurrency invariants"
-          git push origin HEAD:dev
+          git push --force origin HEAD:refs/heads/automation/persistence-remediation-20260823
       - name: Publish remediation apply result
         if: always()
         shell: bash
@@ -86,7 +86,7 @@ jobs:
           set -euo pipefail
           if [[ "${{ job.status }}" == "success" ]]; then
             state=success
-            description="Persistence remediation applied"
+            description="Persistence remediation staged"
           else
             state=failure
             description="Persistence remediation apply failed"
