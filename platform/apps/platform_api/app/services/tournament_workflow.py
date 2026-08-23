@@ -22,6 +22,7 @@ from python_packages.platform_domain.deadlock import (
     AutoAssignmentEngine,
     AutoAssignmentError,
     AutoAssignmentRunFreshness,
+    AutoAssignmentRunWorkflowError,
     CaptainRoundState,
     ReadyCheckRoundState,
     build_auto_assignment_input_fingerprint,
@@ -776,39 +777,42 @@ async def prune_participant_from_active_ready_round(
     now: datetime,
     participant_status: str,
 ) -> TournamentDeadlockReadyRound | None:
-    active_round = await deadlock_ready_round_for_tournament(
+    active_round, latest_round = await deadlock_ready_state_round_for_tournament(
         db_session,
         tournament_id=tournament.id,
-        active_only=True,
     )
-    if active_round is None:
+    round_row = active_round or latest_round
+    if round_row is None:
         return None
 
     vote_rows = (
         await db_session.scalars(
             select(TournamentDeadlockReadyVote).where(
-                TournamentDeadlockReadyVote.round_id == active_round.id
+                TournamentDeadlockReadyVote.round_id == round_row.id
             )
         )
     ).all()
     round_state = ReadyCheckRoundState.active(
-        round_id=active_round.id,
-        eligible_user_ids=list(active_round.eligible_user_ids or []),
+        round_id=round_row.id,
+        eligible_user_ids=list(round_row.eligible_user_ids or []),
         votes=[
             {"user_id": row.user_id, "choice": row.choice}
             for row in vote_rows
         ],
     )
+    if round_row.status != "active":
+        round_state = round_state.close(status=round_row.status)
     next_state = round_state.exclude_user(user_id)
     if next_state == round_state:
         return None
 
-    active_round.status = next_state.status
-    active_round.eligible_user_ids = list(next_state.eligible_user_ids)
-    active_round.closed_at = now if next_state.status != "active" else None
+    round_row.status = next_state.status
+    round_row.eligible_user_ids = list(next_state.eligible_user_ids)
+    if next_state.status != "active":
+        round_row.closed_at = round_row.closed_at or now
     await db_session.execute(
         delete(TournamentDeadlockReadyVote).where(
-            TournamentDeadlockReadyVote.round_id == active_round.id,
+            TournamentDeadlockReadyVote.round_id == round_row.id,
             TournamentDeadlockReadyVote.user_id == user_id,
         )
     )
@@ -817,16 +821,16 @@ async def prune_participant_from_active_ready_round(
         actor_user_id=actor_user_id,
         action="tournament.deadlock.ready_check.exclude_participant",
         subject_type="tournament_deadlock_ready_round",
-        subject_id=str(active_round.id),
+        subject_id=str(round_row.id),
         payload={
             "tournament_slug": tournament.slug,
             "user_id": user_id,
             "participant_status": participant_status,
-            "round_status": active_round.status,
-            "eligible_participant_count": len(active_round.eligible_user_ids or []),
+            "round_status": round_row.status,
+            "eligible_participant_count": len(round_row.eligible_user_ids or []),
         },
     )
-    return active_round
+    return round_row
 
 async def prune_participant_from_active_captain_round(
     db_session: AsyncSession,
@@ -1188,6 +1192,32 @@ async def deadlock_published_auto_assignment_run_for_tournament(
             TournamentDeadlockAssignmentRun.created_at.desc(),
         )
     )
+
+async def supersede_published_deadlock_assignment_run_for_tournament(
+    db_session: AsyncSession,
+    *,
+    tournament_id: str,
+    replacement_run_id: str | None = None,
+) -> TournamentDeadlockAssignmentRun | None:
+    current_published = await deadlock_published_auto_assignment_run_for_tournament(
+        db_session,
+        tournament_id=tournament_id,
+    )
+    if current_published is None or current_published.id == replacement_run_id:
+        return current_published
+    if current_published.status == "locked":
+        raise TournamentWorkflowError(
+            "The currently published roster is locked and cannot be replaced."
+        )
+    try:
+        current_published.status = transition_auto_assignment_run_status(
+            current_published.status,
+            "superseded",
+        )
+    except AutoAssignmentRunWorkflowError as exc:
+        raise TournamentWorkflowError(str(exc)) from exc
+    return current_published
+
 
 async def deadlock_auto_assignment_state_runs_for_tournament(
     db_session: AsyncSession,

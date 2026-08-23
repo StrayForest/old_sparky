@@ -26,6 +26,7 @@ from apps.platform_api.app.services.tournament_workflow import (
     lock_tournament_for_workflow,
     prepare_deadlock_captain_candidate_rows,
     reconcile_finalized_captain_round_for_availability,
+    supersede_published_deadlock_assignment_run_for_tournament,
     tournament_has_locked_deadlock_roster,
     transition_locked_tournament_status,
 )
@@ -1046,6 +1047,11 @@ async def _ensure_assignment_handoff_completed(
 ) -> bool:
     changed = False
     if run_row.status == "generated":
+        await supersede_published_deadlock_assignment_run_for_tournament(
+            db_session,
+            tournament_id=tournament.id,
+            replacement_run_id=run_row.id,
+        )
         try:
             run_row.status = transition_auto_assignment_run_status(
                 run_row.status,

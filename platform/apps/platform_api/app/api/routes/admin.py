@@ -56,6 +56,9 @@ from python_packages.platform_infra.tournament_names import (
     lock_tournament_name,
     public_tournament_name_exists,
 )
+from apps.platform_api.app.services.tournament_workflow import (
+    supersede_published_deadlock_assignment_run_for_tournament,
+)
 from apps.platform_api.app.services.player_commitments import (
     PlayerCommitmentConflict,
     reactivate_viable_tournament_commitments,
@@ -64,6 +67,7 @@ from apps.platform_api.app.services.player_commitments import (
 
 router = APIRouter()
 PREPROD_CLEANUP_CHUNK_SIZE = 10_000
+INACTIVE_PARTICIPANT_STATUSES = ("withdrawn", "disqualified")
 
 
 def ensure_admin_role(auth_session) -> None:
@@ -242,6 +246,8 @@ def admin_tournament_with_counts_stmt(tournament_page=None):
     participant_counts_stmt = select(
         TournamentParticipant.tournament_id.label("tournament_id"),
         func.count(TournamentParticipant.id).label("participant_count"),
+    ).where(
+        TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES)
     )
     locked_roster_counts_stmt = select(
         TournamentDeadlockAssignmentRun.tournament_id.label("tournament_id"),
@@ -1024,6 +1030,10 @@ async def admin_override_tournament(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Registration cannot be opened while the Deadlock roster is locked.",
                 )
+            await supersede_published_deadlock_assignment_run_for_tournament(
+                db_session,
+                tournament_id=tournament.id,
+            )
             schedule_values = (
                 payload.registration_closes_at,
                 payload.ready_check_starts_at,
