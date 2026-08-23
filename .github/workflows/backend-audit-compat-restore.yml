@@ -1,0 +1,42 @@
+name: Backend audit compatibility restore
+
+on:
+  push:
+    branches:
+      - fix/backend-audit-remediation-20260823
+    paths:
+      - ".github/scripts/backend_audit_compat_restore.py"
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    if: ${{ !contains(github.event.head_commit.message, '[backend-audit-compat-restored]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/backend-audit-remediation-20260823
+          fetch-depth: 1
+      - name: Fetch dev baseline
+        run: git fetch origin dev --depth=1
+      - name: Restore compatibility handlers
+        run: python .github/scripts/backend_audit_compat_restore.py
+      - name: Validate patch
+        run: |
+          git diff --check
+          python -m compileall -q platform/apps/platform_api/app/api/routes/tournaments.py
+      - name: Commit restored contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add platform/apps/platform_api/app/api/routes/tournaments.py
+          if git diff --cached --quiet; then
+            echo "No compatibility changes produced"
+            exit 1
+          fi
+          git commit -m "Restore captain compatibility contracts [backend-audit-compat-restored]"
+          git push origin HEAD:fix/backend-audit-remediation-20260823
