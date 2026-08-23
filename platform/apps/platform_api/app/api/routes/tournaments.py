@@ -140,7 +140,6 @@ from apps.platform_api.app.services.tournament_workflow import (
     upsert_deadlock_ready_vote,
 )
 from apps.platform_api.app.services.tournament_runtime_cache import (
-    invalidate_tournament_runtime_caches,
     register_tournament_runtime_cache_invalidator,
 )
 from python_packages.platform_domain.deadlock import (
