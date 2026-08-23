@@ -67,23 +67,34 @@ A local-only commit is not a completed handoff. Never automatically use `--force
   `Platform security and build` workflow for the exact target SHA to finish.
   Inspect the backend job and every required job; the aggregate
   `platform-security-build` commit status must be `success`.
-- Never dispatch `Platform production deploy` while the security/build workflow
-  is pending, failing or still running. Do not run deployment in parallel with
-  CI, even when local verification is green.
+- A successful security/build run caused by a push to the current `dev` HEAD
+  automatically feeds `Platform production auto-deploy`. That workflow must
+  re-check that the tested SHA is still the current `dev` HEAD, require the
+  exact-SHA security status and skip a SHA already marked successfully deployed.
+- Do not manually dispatch production while the security/build workflow is
+  pending, failing or still running. Manual `Platform production deploy` is an
+  operator fallback, not the normal release path.
 - If local and GitHub results differ, treat the GitHub result as authoritative
   for release gating, investigate the environment difference, fix it, push the
   fix and repeat the complete CI gate.
 
 ## Production deployment
 
-- Normal production releases must be started through the GitHub Actions
-  `Platform production deploy` workflow from the reviewed `dev` branch:
-  `gh workflow run platform-production-deploy.yml --repo StrayForest/old_sparky --ref dev --field mode=deploy`.
-- The deploy workflow must fail closed unless the exact target SHA has a green
-  `platform-security-build` status. This gate is checked by GitHub Actions
-  before packaging, SSH or any production release side effect.
-- Wait for and report the GitHub Actions run and its live deployment result;
-  a successful branch push is not a production deployment.
+- Normal production releases start automatically after a reviewed commit is
+  pushed to `dev` and the exact-SHA `Platform security and build` push run
+  succeeds. `Platform production auto-deploy` validates that successful run is
+  for the current `dev` HEAD and dispatches `Platform production deploy` with
+  `mode=deploy`.
+- The deploy workflow repeats the fail-closed exact-SHA
+  `platform-security-build=success` check before packaging, SSH or any
+  production release side effect.
+- Watch and report all three GitHub Actions stages for the same target SHA:
+  security/build, auto-deploy and production deploy/live smoke. A successful
+  branch push alone is not a production deployment; a successful current-head
+  security/build run is expected to continue into the automatic deploy chain.
+- Use manual `Platform production deploy` only as an explicitly justified
+  operator fallback or read-only preflight path. Never use it to bypass a
+  pending, failed, missing or stale security/build result.
 - Do not invoke `platform_build_release.sh` or `platform_release_deploy.sh`
   directly from the Codex shell or production host for a normal release.
   Direct host commands are reserved for an explicitly authorized recovery or
@@ -95,8 +106,12 @@ A local-only commit is not a completed handoff. Never automatically use `--force
   `Platform security and build` workflow. It owns backend tests, migration
   scenarios, web build/hermetic checks, smoke checks and the aggregate
   `platform-security-build` status.
+- After that exact-SHA push run succeeds, verify that
+  `Platform production auto-deploy` accepts the same current `dev` HEAD and
+  dispatches the production workflow. Then wait for the production deployment
+  and live smoke to finish.
 - Use `gh run watch <run-id> --repo StrayForest/old_sparky --exit-status` and
-  inspect the backend job plus every required job before deployment.
+  inspect failed GitHub Actions jobs before attempting any local reproduction.
 - Release verification and live smoke are performed by the GitHub Actions
   `Platform production deploy` workflow described in
   `platform/docs/deployment-runbook.md`.
