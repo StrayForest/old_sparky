@@ -1,0 +1,158 @@
+name: Platform production auto-deploy
+
+on:
+  workflow_run:
+    workflows:
+      - Platform security and build
+    types:
+      - completed
+    branches:
+      - dev
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: platform-production-auto-deploy
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'dev'
+    runs-on: ubuntu-latest
+    env:
+      TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Verify tested SHA is current dev head
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          branch_json="$(
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev"
+          )"
+          dev_sha="$(
+            printf '%s' "$branch_json" | /usr/bin/python3 -c '
+          import json
+          import sys
+          print(json.load(sys.stdin)["commit"]["sha"])
+          '
+          )"
+
+          if [[ "$dev_sha" != "$TARGET_SHA" ]]; then
+            echo "Skipping stale successful CI result for $TARGET_SHA; current dev is $dev_sha."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          status_json="$(
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status"
+          )"
+          readarray -t states < <(
+            printf '%s' "$status_json" | /usr/bin/python3 -c '
+          import json
+          import sys
+
+          payload = json.load(sys.stdin)
+          statuses = payload.get("statuses", [])
+
+          def latest_state(context):
+              rows = [item for item in statuses if item.get("context") == context]
+              if not rows:
+                  return "missing"
+              latest = max(
+                  rows,
+                  key=lambda item: item.get("updated_at")
+                  or item.get("created_at")
+                  or "",
+              )
+              return latest.get("state") or "missing"
+
+          print(latest_state("platform-security-build"))
+          print(latest_state("platform-production-deploy"))
+          '
+          )
+          security_state="${states[0]}"
+          deployment_state="${states[1]}"
+
+          test "$security_state" = success || {
+            echo "Refusing auto-deploy: platform-security-build=$security_state for $TARGET_SHA" >&2
+            exit 1
+          }
+
+          if [[ "$deployment_state" == success ]]; then
+            echo "Production already reports success for $TARGET_SHA; nothing to dispatch."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "deploy=true" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch production deployment
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          branch_json="$(
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev"
+          )"
+          dev_sha="$(
+            printf '%s' "$branch_json" | /usr/bin/python3 -c '
+          import json
+          import sys
+          print(json.load(sys.stdin)["commit"]["sha"])
+          '
+          )"
+          test "$dev_sha" = "$TARGET_SHA" || {
+            echo "Refusing stale dispatch: dev moved from $TARGET_SHA to $dev_sha." >&2
+            exit 1
+          }
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches" \
+            --data '{"ref":"dev","inputs":{"mode":"deploy"}}'
+
+      - name: Auto-deploy summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          SHOULD_DEPLOY: ${{ steps.gate.outputs.deploy }}
+          SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          {
+            echo "### Platform production auto-deploy"
+            echo
+            echo "- Tested commit: \`$TARGET_SHA\`"
+            echo "- Security/build run: $SOURCE_RUN_URL"
+            if [[ "$SHOULD_DEPLOY" == "true" ]]; then
+              echo "- Result: production deployment dispatched"
+            else
+              echo "- Result: no deployment required"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
