@@ -14,32 +14,43 @@ Use this document for the normal immutable release path. CSP mode changes and pr
 4. Confirm services are healthy, disk has at least 5 GiB free and is below 85%, and `current`/`previous` releases are protected.
 5. Create a fresh restore-verified backup.
 
-## Build
+## Normal production deploy through GitHub Actions
+
+Normal production deployment is initiated from GitHub Actions, never by an
+agent directly invoking release scripts on the server. Dispatch the reviewed
+`dev` branch and wait for the run to finish:
 
 ```bash
-cd /root/old_sparky
-platform/tools/platform_build_release.sh <release-slug>
-(cd platform/dist/releases && sha256sum -c <release-slug>.tar.gz.sha256)
+gh workflow run platform-production-deploy.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev \
+  --field mode=deploy
+
+gh run list \
+  --repo StrayForest/old_sparky \
+  --workflow platform-production-deploy.yml \
+  --branch dev \
+  --limit 5
+
+gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-Record the artifact path, SHA-256 and source commit from `RELEASE.json`. Release builds use the pinned Python/Node dependency inputs and must fail closed on lock/freeze drift.
+Use `--field mode=preflight` when only the production gate is needed. The
+workflow checks out the exact GitHub commit, packages the clean source,
+connects to production using the configured environment secrets, runs the
+preflight, builds and checksums the immutable artifact, invokes the guarded
+release state machine, and records the deployment status on the commit. Record
+the Actions run URL/ID, target SHA, release slug and final smoke result in the
+handoff.
 
-## Preflight, staged deploy and activation
+Do not run `platform_build_release.sh` or `platform_release_deploy.sh` directly
+for a normal release. Those commands are implementation details of the
+workflow; direct server execution is limited to an explicitly authorized
+recovery or rollback.
 
-```bash
-cd /opt/oldsparky/platform/current
-tools/platform_release_preflight.sh \
-  --require-previous --require-verified-backup --require-edge-parity \
-  --backup-max-age-hours 24
+## Release state, activation and recovery
 
-cd /root/old_sparky
-platform/tools/platform_release_deploy.sh \
-  --artifact platform/dist/releases/<release-slug>.tar.gz \
-  --app-dir /opt/oldsparky/platform \
-  --expected-csp-mode enforce
-```
-
-The wrapper leaves a durable transaction until migration, restart/readiness,
+The workflow's guarded wrapper leaves a durable transaction until migration, restart/readiness,
 Nginx apply and both smoke paths pass. It prepares service-owned runtime paths
 before restart, refreshes scoped env files, enables the reviewed health,
 Cloudflare and maintenance timers, and installs the off-site-backup unit/timer

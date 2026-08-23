@@ -90,8 +90,11 @@ against the current web/api/worker identities and units.
   failure retains a recovery receipt and blocks an unrelated second install.
 - Canonical production env remains root-only `root:root 0600`; preflight checks
   that scoped service env files are freshly rendered from it.
-- Fully automatic production deployment is disabled while signed CI artifact
-  provenance and live Cloudflare/Nginx/UFW proof remain open.
+- Normal production deployment is manual-dispatch through the GitHub Actions
+  `Platform production deploy` workflow from `dev`; direct server invocation is
+  recovery/rollback-only. Fully automatic push deployment remains disabled
+  while signed CI artifact provenance and live Cloudflare/Nginx/UFW proof remain
+  open.
 
 ## Deferred / operator-owned work
 
