@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { KeyRound, Mail, X } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { useAuthSecurityConfig } from "@/components/auth/use-auth-security-config";
 import { SteamIcon } from "@/components/icons/brand-icons";
 import { useResendCooldown } from "@/components/auth/use-resend-cooldown";
 import { useI18n } from "@/components/i18n-provider";
@@ -403,6 +404,7 @@ export function AccountSteamIdentity({
 }) {
   const { t } = useI18n();
   const { user, setUser } = useAuth();
+  const security = useAuthSecurityConfig();
   const [isStarting, setIsStarting] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [message, setMessage] = useState(
@@ -414,9 +416,10 @@ export function AccountSteamIdentity({
 
   const currentSteamLinked = user?.steam_linked ?? steamLinked;
   const currentSteamId = user?.steam_id ?? steamId;
+  const steamLinkEnabled = security.status === "ready" && security.config?.steam_login_enabled === true;
 
   async function startLink() {
-    if (isStarting || currentSteamLinked) {
+    if (isStarting || currentSteamLinked || !steamLinkEnabled) {
       return;
     }
     setIsStarting(true);
@@ -458,7 +461,7 @@ export function AccountSteamIdentity({
         {currentSteamLinked ? (
           <div className="account-identity-linked-row">
             <SteamIcon aria-hidden="true" size={20} />
-            <span className="account-identity-value">{currentSteamId ?? "Steam привязан"}</span>
+            <span className="account-identity-value">{currentSteamId ?? t("profile.steamLinked")}</span>
             {canUnlinkSteam ? (
               <button
                 aria-label="Отвязать Steam"
@@ -470,7 +473,7 @@ export function AccountSteamIdentity({
               </button>
             ) : null}
           </div>
-        ) : (
+        ) : steamLinkEnabled ? (
           <button
             className="account-steam-link-button"
             disabled={isStarting}
@@ -478,8 +481,13 @@ export function AccountSteamIdentity({
             type="button"
           >
             <SteamIcon aria-hidden="true" size={20} />
-            <span>{isStarting ? t("auth.steamStarting") : "Привязать Steam"}</span>
+            <span>{isStarting ? t("auth.steamStarting") : t("profile.steamLinkAction")}</span>
           </button>
+        ) : (
+          <div className="account-identity-linked-row" aria-disabled="true">
+            <SteamIcon aria-hidden="true" size={20} />
+            <span className="account-identity-value">{t("profile.steamNotLinked")}</span>
+          </div>
         )}
         {currentSteamLinked && !canUnlinkSteam ? (
           <span className="account-identity-hint">{t("profile.steamUnlinkRequiresPassword")}</span>
