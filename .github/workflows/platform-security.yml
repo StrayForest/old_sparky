@@ -99,6 +99,7 @@ jobs:
           sudo cp -a "$GITHUB_WORKSPACE/." /root/old_sparky/
           sudo chown -R root:root /root/old_sparky
           sudo mkdir -p /opt/oldsparky/platform/{releases,shared/env,shared/venv/bin}
+          sudo chmod 0755 /opt/oldsparky /opt/oldsparky/platform /opt/oldsparky/platform/shared
           sudo cp -a /root/old_sparky/platform/. /opt/oldsparky/platform/releases/ci-current
           sudo ln -s /opt/oldsparky/platform/releases/ci-current /opt/oldsparky/platform/current
           sudo ln -s /opt/oldsparky/platform/releases/ci-current /opt/oldsparky/platform/previous
