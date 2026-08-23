@@ -107,7 +107,18 @@ export function TournamentRegistrationActions({
   );
   const checkedIn = state.readyCheckChoice === "yes";
   const teamsFormed = tournament.teams.length > 0;
-  const canRegister = Boolean(actorUserId && tournament.status === "registration_open" && !registered && !teamsFormed);
+  const hasRegistrationAccess = Boolean(
+    tournament.visibility !== "private"
+    || tournament.currentUserHasInviteAccess
+    || (actorUserId && actorUserId === tournament.organizerUserId)
+  );
+  const canRegister = Boolean(
+    actorUserId
+    && hasRegistrationAccess
+    && tournament.status === "registration_open"
+    && !registered
+    && !teamsFormed
+  );
   const canCancelRegistration = Boolean(
     actorUserId
     && registered
@@ -121,9 +132,10 @@ export function TournamentRegistrationActions({
     && ((registered && !canCancelRegistration) || (!registered && teamsFormed))
   );
   const readyIsStatus = checkedIn && !canToggleReady && state.saving !== "ready";
+  const inviteAccessRequired = Boolean(actorUserId && !registered && !teamsFormed && !hasRegistrationAccess);
 
   async function handleRegister() {
-    if (state.saving || !actorUserId || registered) {
+    if (state.saving || !actorUserId || registered || !canRegister) {
       return;
     }
 
@@ -238,6 +250,8 @@ export function TournamentRegistrationActions({
       <div className={`step ${registered ? "done" : canRegister ? "active" : ""}`}>
         {!actorUserId ? (
           <div aria-disabled="true" className="disabled-action">{t("tournament.stepSignInAction")}</div>
+        ) : inviteAccessRequired ? (
+          <div aria-disabled="true" className="disabled-action">{t("tournament.visibilityInvite")}</div>
         ) : registrationIsStatus ? (
           <div className="status-action">{registrationActionLabel({ registered, canCancelRegistration, teamsFormed, saving: state.saving, t })}</div>
         ) : (
@@ -254,7 +268,9 @@ export function TournamentRegistrationActions({
         <div className="step-note">
           {state.errorStep === "registration" && state.error
             ? state.error
-            : t("tournament.stepRegistrationOpenUntil", { time: scheduleLabel(tournament, "registrationClosesAt") })}
+            : inviteAccessRequired
+              ? t("info.faq.private.answer")
+              : t("tournament.stepRegistrationOpenUntil", { time: scheduleLabel(tournament, "registrationClosesAt") })}
         </div>
       </div>
       <div className="arrow" />

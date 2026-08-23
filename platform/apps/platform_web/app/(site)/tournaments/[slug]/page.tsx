@@ -1,9 +1,9 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { cookies } from "next/headers";
 import { Hero } from "@/components/layout/hero";
 import { TournamentDetailView } from "@/components/tournaments/tournament-detail-view";
-import { getTournamentWorkspace } from "@/lib/platform-api";
+import { getTournamentWorkspace, PlatformApiError } from "@/lib/platform-api";
 import { getServerCurrentUser, platformSessionCookieName } from "@/lib/server-auth";
 
 export const metadata: Metadata = {
@@ -22,14 +22,25 @@ export default async function TournamentDetailPage({
   const actorUserIdPromise = requestCookies.has(platformSessionCookieName())
     ? getServerCurrentUser(cookieHeader).then((snapshot) => snapshot.user?.id ?? null)
     : Promise.resolve(null);
-  const [workspace, actorUserId] = await Promise.all([
-    getTournamentWorkspace(slug, requestHeaders, {
-      participantsLimit: 0,
-      workspaceView: "detail",
-      includeCurrentUser: false
-    }),
-    actorUserIdPromise
-  ]);
+
+  let workspace: Awaited<ReturnType<typeof getTournamentWorkspace>>;
+  let actorUserId: string | null;
+  try {
+    [workspace, actorUserId] = await Promise.all([
+      getTournamentWorkspace(slug, requestHeaders, {
+        participantsLimit: 0,
+        workspaceView: "detail",
+        includeCurrentUser: false
+      }),
+      actorUserIdPromise
+    ]);
+  } catch (error) {
+    if (error instanceof PlatformApiError && error.status === 401) {
+      redirect(`/auth/login?returnTo=${encodeURIComponent(`/tournaments/${slug}`)}`);
+    }
+    throw error;
+  }
+
   if (!workspace) {
     notFound();
   }

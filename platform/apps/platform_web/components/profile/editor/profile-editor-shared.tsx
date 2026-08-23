@@ -123,6 +123,7 @@ export function ProfileActionButtons({
 
 export function AccountField({
   autoComplete,
+  disabled = false,
   icon,
   inputRef,
   label,
@@ -134,6 +135,7 @@ export function AccountField({
   value,
 }: {
   autoComplete?: string;
+  disabled?: boolean;
   icon: ReactNode;
   inputRef?: Ref<HTMLInputElement>;
   label: string;
@@ -154,6 +156,7 @@ export function AccountField({
         <input
           autoComplete={autoComplete}
           className="input account-input"
+          disabled={disabled}
           id={inputId}
           ref={inputRef}
           maxLength={maxLength}

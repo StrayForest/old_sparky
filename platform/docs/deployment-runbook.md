@@ -10,24 +10,47 @@ Use this document for the normal immutable release path. CSP mode changes and pr
 
 1. Work from a clean, reviewed commit; release metadata records the exact
    GitHub target SHA.
-2. Push the reviewed commit to `dev` and wait for the GitHub Actions security
-   and build gate; do not substitute a manually run local test.
+2. Push the reviewed commit to `dev` and wait for the GitHub Actions
+   `Platform security and build` gate. A successful push run for the current
+   `dev` HEAD is the normal production approval signal and is consumed by the
+   automatic deployment workflow; do not substitute a manually run local test.
 3. Confirm migration expand/rollback compatibility.
 4. Confirm services are healthy, disk has at least 5 GiB free and is below 85%, and `current`/`previous` releases are protected.
 5. Create a fresh restore-verified backup.
 
 ## Normal production deploy through GitHub Actions
 
-Normal production deployment is initiated from GitHub Actions, never by an
-agent directly invoking release scripts on the server. After the exact-SHA
-security/build workflow is green, dispatch the reviewed `dev` branch and wait
-for the run to finish:
+Normal production deployment is automatic after the reviewed commit is pushed
+to `dev`. The chain is:
+
+1. `Platform security and build` runs for the push and publishes the
+   `platform-security-build` commit status for the exact SHA.
+2. `Platform production auto-deploy` receives the completed workflow event only
+   for a push to `dev`.
+3. The auto-deploy gate re-reads the current `dev` HEAD and refuses a stale
+   successful CI result. It also requires `platform-security-build=success` and
+   skips a SHA that already reports `platform-production-deploy=success`.
+4. When those checks pass, the auto-deploy workflow dispatches
+   `Platform production deploy` with `mode=deploy` on `dev`.
+5. The production workflow repeats the exact-SHA security/build check before
+   packaging, SSH or any production release side effect, then builds, attests,
+   transfers and installs the immutable artifact and runs production smoke.
+
+Do not manually dispatch the deploy workflow for a normal `dev` push. Observe
+the automatic chain and wait for the exact target SHA to finish:
 
 ```bash
-gh workflow run platform-production-deploy.yml \
+gh run list \
   --repo StrayForest/old_sparky \
-  --ref dev \
-  --field mode=deploy
+  --workflow platform-security.yml \
+  --branch dev \
+  --limit 5
+
+gh run list \
+  --repo StrayForest/old_sparky \
+  --workflow platform-production-autodeploy.yml \
+  --branch dev \
+  --limit 5
 
 gh run list \
   --repo StrayForest/old_sparky \
@@ -38,19 +61,25 @@ gh run list \
 gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-For `mode=deploy`, the workflow fails closed until the exact target SHA has a
-successful `platform-security-build` commit status. A pending, failed or
-missing backend/security/build result cannot reach packaging, SSH or the
-production release state machine.
-
-Use `--field mode=preflight` when only the production gate is needed. The
-deploy workflow checks out the exact GitHub commit, builds the immutable
+The deploy workflow checks out the exact GitHub commit, builds the immutable
 release and wheelhouse in CI, publishes and attests the artifact, verifies its
 digest and source commit, then transfers that exact artifact to production.
 The VPS performs no source checkout or dependency/build resolution; it only
 revalidates the artifact and invokes the guarded release state machine. Record
 the Actions run URL/ID, target SHA, release slug and final smoke result in the
 handoff.
+
+### Manual workflow fallback
+
+`Platform production deploy` keeps `workflow_dispatch` as an operator fallback,
+not as the normal release path. Use manual dispatch only when an operator has an
+explicit reason to repeat preflight/deploy for the current reviewed `dev` HEAD
+or when diagnosing the automatic contour. The same exact-SHA
+`platform-security-build=success` gate still applies to `mode=deploy`.
+
+For a read-only production gate without an install, an operator may dispatch
+`mode=preflight` explicitly. A manual fallback must never be used to bypass a
+pending, failed, missing or stale security/build result.
 
 Do not run `platform_build_release.sh` or `platform_release_deploy.sh` directly
 for a normal release. Those commands are implementation details of the
@@ -137,9 +166,10 @@ If a rollback is interrupted, recover with the stable bundle (or the
 
 After rollback, repeat preflight plus origin/SNI and public smoke against the restored release.
 
-The production workflow is manual-dispatch only while live edge proof remains
-operator-owned. A successful CI build or branch push must not be treated as
-production deployment approval.
+A successful `Platform security and build` run for a push to the current
+`dev` HEAD is expected to continue automatically into production deployment.
+A stale successful run must be ignored, and a failed or missing gate must stop
+the chain before production side effects.
 
 ## Special release contours
 

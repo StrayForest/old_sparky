@@ -1389,6 +1389,7 @@ function PreprodQaOperations({
     setIsCleaning(true);
     setMessage("");
     setError("");
+
     try {
       const path = all
         ? "/admin/preprod-test-runs/cleanup"
@@ -1406,9 +1407,17 @@ function PreprodQaOperations({
       }));
       setConfirm("");
       setNote("");
-      await onReload();
     } catch (requestError) {
       setError(platformApiMessage(requestError, t("admin.preprodCleanupFailed")));
+      setIsCleaning(false);
+      return;
+    }
+
+    try {
+      await onReload();
+    } catch {
+      // Cleanup is already committed. A refresh failure must not turn the
+      // successful destructive action into a false cleanup error.
     } finally {
       setIsCleaning(false);
     }

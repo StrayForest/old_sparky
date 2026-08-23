@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState, useTransition } from "react";
+import { useRef, useState, useTransition } from "react";
 import {
   Camera,
   HeartHandshake,
@@ -91,6 +91,7 @@ export function AccountProfileTab({
   const [emailSaveRequestId, setEmailSaveRequestId] = useState(0);
   const [emailCancelRequestId, setEmailCancelRequestId] = useState(0);
   const [isLoggingOut, startLogoutTransition] = useTransition();
+  const accountSaveInFlightRef = useRef(false);
 
   const contactValues = new Map(
     contacts.map((contact) => [contact.label, contact.value])
@@ -109,6 +110,9 @@ export function AccountProfileTab({
   }
 
   function updateContact(label: string, value: string) {
+    if (accountSaveInFlightRef.current) {
+      return;
+    }
     const limits: Record<string, number> = {
       Почта: 254,
       Discord: 64,
@@ -127,6 +131,9 @@ export function AccountProfileTab({
   }
 
   function updateDisplayName(value: string) {
+    if (accountSaveInFlightRef.current) {
+      return;
+    }
     const nextDisplayName = value.slice(0, 15);
     setDisplayName(nextDisplayName);
     emitPreview({ ...profile, displayName: nextDisplayName }, contacts);
@@ -135,6 +142,9 @@ export function AccountProfileTab({
   }
 
   async function saveAccount(): Promise<boolean> {
+    if (accountSaveInFlightRef.current) {
+      return false;
+    }
     const byLabel = new Map(
       contacts.map((contact) => [contact.label, contact.value.trim()])
     );
@@ -152,6 +162,7 @@ export function AccountProfileTab({
       region: byLabel.get("Регион") || null,
     };
 
+    accountSaveInFlightRef.current = true;
     setSaveState("saving");
     setMessage("");
     try {
@@ -186,10 +197,15 @@ export function AccountProfileTab({
         platformApiMessage(error, "Не удалось сохранить данные профиля.")
       );
       return false;
+    } finally {
+      accountSaveInFlightRef.current = false;
     }
   }
 
   function cancelAccountChanges() {
+    if (accountSaveInFlightRef.current) {
+      return;
+    }
     const nextContacts = cloneContacts(savedContacts);
     const nextProfile = {
       ...profile,
@@ -354,6 +370,9 @@ export function AccountProfileTab({
   }
 
   function requestProfileSave() {
+    if (accountSaveInFlightRef.current) {
+      return;
+    }
     if (emailDirty) {
       setEmailSaveRequestId((current) => current + 1);
       return;
@@ -416,7 +435,7 @@ export function AccountProfileTab({
   }
 
   return (
-    <section>
+    <section aria-busy={saveState === "saving" || emailBusy}>
       <ProfileBanner
         icon={<NotebookPen size={38} />}
         title="Данные профиля"
@@ -511,6 +530,7 @@ export function AccountProfileTab({
           <div className="account-form-grid">
             <AccountField
               autoComplete="nickname"
+              disabled={saveState === "saving"}
               icon={<UserRound size={18} />}
               label="Ник"
               maxLength={15}
@@ -528,6 +548,7 @@ export function AccountProfileTab({
               saveRequestId={emailSaveRequestId}
             />
             <AccountField
+              disabled={saveState === "saving"}
               icon={<DiscordIcon aria-hidden="true" size={18} />}
               label="Discord"
               maxLength={64}
@@ -541,6 +562,7 @@ export function AccountProfileTab({
               steamLinked={user?.steam_linked === true}
             />
             <AccountField
+              disabled={saveState === "saving"}
               icon={<MapPin size={18} />}
               label="Регион"
               maxLength={40}
