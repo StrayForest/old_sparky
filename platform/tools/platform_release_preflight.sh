@@ -113,7 +113,12 @@ source "$ENV_FILE"
 set +a
 
 [[ -d "$SHARED_DIR/env" ]] || fail "Rendered service env directory is missing: $SHARED_DIR/env"
-"$PYTHON_BIN" "$CURRENT_TARGET/tools/platform_render_service_envs.py" \
+RENDER_SERVICE_ENVS_TOOL="$SCRIPT_DIR/platform_render_service_envs.py"
+if [[ ! -f "$RENDER_SERVICE_ENVS_TOOL" ]]; then
+  RENDER_SERVICE_ENVS_TOOL="$CURRENT_TARGET/tools/platform_render_service_envs.py"
+fi
+[[ -f "$RENDER_SERVICE_ENVS_TOOL" ]] || fail "Service env renderer is missing."
+"$PYTHON_BIN" "$RENDER_SERVICE_ENVS_TOOL" \
   --source "$ENV_FILE" \
   --output-dir "$SHARED_DIR/env" \
   --verify >/dev/null \

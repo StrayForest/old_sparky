@@ -47,6 +47,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         systemd_units = (
             REPO_ROOT / "platform/tools/platform_install_systemd_units.sh"
         ).read_text()
+        preflight = (REPO_ROOT / "platform/tools/platform_release_preflight.sh").read_text()
+        self.assertIn('RENDER_SERVICE_ENVS_TOOL="$SCRIPT_DIR/platform_render_service_envs.py"', preflight)
+        self.assertIn('EDGE_POLICY_TOOL="$SCRIPT_DIR/platform_validate_edge_policy.py"', preflight)
         self.assertIn("deadlock-offsite-backup.service", systemd_units)
         self.assertIn("deadlock-offsite-backup.timer", systemd_units)
 
