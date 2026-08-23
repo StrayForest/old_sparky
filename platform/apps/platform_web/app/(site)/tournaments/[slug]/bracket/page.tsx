@@ -1,11 +1,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { cookies } from "next/headers";
 import { ArrowLeft } from "lucide-react";
 import { BracketBoard } from "@/components/bracket/bracket-board";
 import { Hero } from "@/components/layout/hero";
-import { getTournamentWorkspace } from "@/lib/platform-api";
+import { getTournamentWorkspace, PlatformApiError } from "@/lib/platform-api";
 
 export const metadata: Metadata = {
   title: "Сетка турнира"
@@ -19,11 +19,21 @@ export default async function TournamentBracketPage({
   const { slug } = await params;
   const cookieHeader = (await cookies()).toString();
   const requestHeaders: HeadersInit = cookieHeader ? { cookie: cookieHeader } : {};
-  const workspace = await getTournamentWorkspace(slug, requestHeaders, {
-    participantsLimit: 0,
-    workspaceView: "bracket_summary",
-    includeCurrentUser: false
-  });
+
+  let workspace: Awaited<ReturnType<typeof getTournamentWorkspace>>;
+  try {
+    workspace = await getTournamentWorkspace(slug, requestHeaders, {
+      participantsLimit: 0,
+      workspaceView: "bracket_summary",
+      includeCurrentUser: false
+    });
+  } catch (error) {
+    if (error instanceof PlatformApiError && error.status === 401) {
+      redirect(`/auth/login?returnTo=${encodeURIComponent(`/tournaments/${slug}/bracket`)}`);
+    }
+    throw error;
+  }
+
   if (!workspace) {
     notFound();
   }
