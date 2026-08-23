@@ -1057,11 +1057,29 @@ class TournamentBracketMatchResponse(BaseModel):
     scheduled_at: datetime | None = None
 
 
+class TournamentBracketCapabilitiesResponse(BaseModel):
+    """Authoritative actions available for the current tournament viewer."""
+
+    can_manage: bool = False
+    can_schedule_matches: bool = False
+    can_report_matches: bool = False
+
+
 class TournamentBracketResponse(BaseModel):
     tournament_id: str
+    tournament_status: Literal[
+        "registration_open",
+        "registration_closed",
+        "in_progress",
+        "completed",
+        "cancelled",
+    ]
     status: str
     revision: int = 0
     can_manage: bool = False
+    capabilities: TournamentBracketCapabilitiesResponse = Field(
+        default_factory=TournamentBracketCapabilitiesResponse,
+    )
     teams: list[TournamentBracketTeamResponse] = Field(default_factory=list)
     matches: list[TournamentBracketMatchResponse] = Field(default_factory=list)
     next_poll_after_ms: int | None = None

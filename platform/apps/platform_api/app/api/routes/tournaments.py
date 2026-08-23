@@ -49,6 +49,7 @@ from apps.platform_api.app.api.schemas import (
     TournamentInviteRedeemResponse,
     TournamentInviteResponse,
     TournamentBracketMatchResponse,
+    TournamentBracketCapabilitiesResponse,
     TournamentBracketResponse,
     TournamentBracketTeamMemberResponse,
     TournamentBracketTeamResponse,
@@ -107,6 +108,7 @@ from apps.platform_api.app.services.tournament_workflow import (
     TournamentCompletionError,
     TournamentStatusTransitionError,
     build_deadlock_ready_round_state_snapshot,
+    complete_locked_tournament_after_final_match,
     deadlock_assignment_run_by_id_for_tournament,
     deadlock_auto_assignment_run_for_tournament,
     deadlock_auto_assignment_run_freshness,
@@ -249,6 +251,24 @@ BRACKET_IDLE_POLL_MS = 30_000
 READY_CHECK_ACTIVE_PARTICIPANT_POLL_MS = 5_000
 READY_CHECK_ACTIVE_VIEWER_POLL_MS = 15_000
 TERMINAL_TOURNAMENT_STATUSES = frozenset(("completed", "cancelled"))
+
+
+def bracket_capabilities(
+    *,
+    tournament_status: str,
+    can_manage: bool,
+) -> TournamentBracketCapabilitiesResponse:
+    """Return action capabilities independently from the structural bracket state."""
+
+    can_manage_matches = bool(can_manage and tournament_status not in TERMINAL_TOURNAMENT_STATUSES)
+    return TournamentBracketCapabilitiesResponse(
+        can_manage=can_manage_matches,
+        can_schedule_matches=can_manage_matches,
+        can_report_matches=bool(
+            can_manage_matches
+            and tournament_status in {"registration_closed", "in_progress"}
+        ),
+    )
 
 
 def tournament_poll_state_version(
@@ -2057,9 +2077,14 @@ async def build_tournament_bracket_response(
         bracket_status = "teams_ready"
     response = TournamentBracketResponse(
         tournament_id=tournament.id,
+        tournament_status=tournament.status,
         status=bracket_status,
         revision=int(tournament.bracket_revision or 0),
         can_manage=can_manage,
+        capabilities=bracket_capabilities(
+            tournament_status=tournament.status,
+            can_manage=can_manage,
+        ),
         teams=teams,
         matches=[
             serialize_bracket_match_projection(
@@ -2113,9 +2138,14 @@ async def build_tournament_workspace_detail_bracket_response(
 
     return TournamentBracketResponse(
         tournament_id=tournament.id,
+        tournament_status=tournament.status,
         status=bracket_status,
         revision=int(tournament.bracket_revision or 0),
         can_manage=can_manage,
+        capabilities=bracket_capabilities(
+            tournament_status=tournament.status,
+            can_manage=can_manage,
+        ),
         teams=teams,
         matches=[],
         next_poll_after_ms=tournament_bracket_poll_delay_ms(
@@ -2134,9 +2164,14 @@ def build_tournament_workspace_bracket_summary_response(
     bracket_status = "ready" if int(tournament.bracket_revision or 0) > 0 else "pending"
     return TournamentBracketResponse(
         tournament_id=tournament.id,
+        tournament_status=tournament.status,
         status=bracket_status,
         revision=int(tournament.bracket_revision or 0),
         can_manage=can_manage,
+        capabilities=bracket_capabilities(
+            tournament_status=tournament.status,
+            can_manage=can_manage,
+        ),
         teams=[],
         matches=[],
         next_poll_after_ms=tournament_bracket_poll_delay_ms(
@@ -4297,19 +4332,27 @@ async def report_tournament_match(
         winner_team_id=match.winner_team_id,
     )
     if is_final_match:
-        transition = await transition_locked_tournament_status(
-            db_session,
-            tournament=tournament,
-            next_status="completed",
-            now=auth_session.now,
-            actor_user_id=auth_session.user.id,
-            audit_action="tournament.status.auto_complete",
-            expected_status=tournament.status,
-            audit_payload={
-                "final_match_id": match.id,
-                "winner_team_id": match.winner_team_id,
-            },
-        )
+        try:
+            transition = await complete_locked_tournament_after_final_match(
+                db_session,
+                tournament=tournament,
+                now=auth_session.now,
+                actor_user_id=auth_session.user.id,
+                audit_payload={
+                    "final_match_id": match.id,
+                    "winner_team_id": match.winner_team_id,
+                },
+            )
+        except TournamentStatusTransitionError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        except TournamentCompletionError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
         released_commitments = transition.released_commitments
     else:
         released_commitments = await release_active_commitments(

@@ -81,7 +81,8 @@ const bracketManagerTournament = {
   ...tournaments[0],
   id: "t_bracket_manager_smoke",
   slug: "bracket-manager-smoke",
-  name: "Bracket Manager Smoke"
+  name: "Bracket Manager Smoke",
+  status: "registration_closed"
 };
 
 const teams = [
@@ -240,6 +241,9 @@ function tournamentPage(url) {
 }
 
 function bracketPayload(slug, canManage = false, includeTeams = true) {
+  const tournamentStatus = tournaments.find((item) => item.slug === slug)?.status
+    ?? bracketManagerTournament.status;
+  const terminal = tournamentStatus === "completed" || tournamentStatus === "cancelled";
   const matches = ["night-veil-open-5", bracketManagerTournament.slug].includes(slug) ? [{
     id: "m_night_final",
     round_number: 1,
@@ -290,9 +294,16 @@ function bracketPayload(slug, canManage = false, includeTeams = true) {
     tournament_id: slug === bracketManagerTournament.slug
       ? bracketManagerTournament.id
       : tournaments.find((item) => item.slug === slug)?.id ?? "",
+    tournament_status: tournamentStatus,
     status: ["night-veil-open-5", bracketManagerTournament.slug].includes(slug) ? "ready" : "pending",
     revision: 0,
     can_manage: canManage,
+    capabilities: {
+      can_manage: canManage && !terminal,
+      can_schedule_matches: canManage && !terminal,
+      can_report_matches: canManage && !terminal
+        && (tournamentStatus === "registration_closed" || tournamentStatus === "in_progress")
+    },
     teams: includeTeams ? teams : [],
     matches
   };

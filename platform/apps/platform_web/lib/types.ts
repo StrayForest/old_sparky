@@ -138,10 +138,22 @@ export type Match = {
   scheduledAt: string | null;
 };
 
+export type BracketStatus = "pending" | "teams_ready" | "ready";
+
+export type TournamentBracketCapabilities = {
+  canManage: boolean;
+  canScheduleMatches: boolean;
+  canReportMatches: boolean;
+};
+
 export type Bracket = {
   tournamentId: string;
-  status: string;
+  /** Structural graph state; never use this as a permission signal. */
+  status: BracketStatus;
+  tournamentStatus: TournamentStatus;
   revision: number;
+  capabilities: TournamentBracketCapabilities;
+  /** @deprecated Use capabilities.canManage. Kept for existing API consumers. */
   canManage: boolean;
   teams: Team[];
   matches: Match[];

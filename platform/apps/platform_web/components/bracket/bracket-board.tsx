@@ -368,11 +368,16 @@ export function BracketBoard({
     );
   }
 
-  const matchHeight = bracket.canManage ? MATCH_H_MANAGE : MATCH_H_VIEW;
-  const model = buildLayout(bracket, matchHeight);
+  const terminalTournament = bracket.tournamentStatus === "completed"
+    || bracket.tournamentStatus === "cancelled";
+  const canManageMatches = bracket.capabilities.canManage && !terminalTournament;
+  const canScheduleMatches = bracket.capabilities.canScheduleMatches && !terminalTournament;
+  const canReportMatches = bracket.capabilities.canReportMatches && !terminalTournament;
+  const resolvedMatchHeight = canManageMatches ? MATCH_H_MANAGE : MATCH_H_VIEW;
+  const model = buildLayout(bracket, resolvedMatchHeight);
   const scale = zoom / 100;
   const layoutScope = `bracket-layout-${stableNumericId(bracket.tournamentId)}`;
-  const layoutCss = bracketLayoutCss(layoutScope, model, scale, matchHeight);
+  const layoutCss = bracketLayoutCss(layoutScope, model, scale, resolvedMatchHeight);
 
   return (
     <div className="bracket-wrap" id={layoutScope}>
@@ -427,6 +432,8 @@ export function BracketBoard({
               <MatchCard
                 bracket={bracket}
                 busy={busy}
+                canReportMatches={canReportMatches}
+                canScheduleMatches={canScheduleMatches}
                 layoutIndex={matchIndex}
                 key={match.id}
                 match={match}
@@ -445,6 +452,8 @@ export function BracketBoard({
 function MatchCard({
   bracket,
   busy,
+  canReportMatches,
+  canScheduleMatches,
   layoutIndex,
   match,
   mutate,
@@ -453,6 +462,8 @@ function MatchCard({
 }: {
   bracket: Bracket;
   busy: boolean;
+  canReportMatches: boolean;
+  canScheduleMatches: boolean;
   layoutIndex: number;
   match: Match;
   mutate: (path: string, init: RequestInit) => Promise<boolean>;
@@ -503,7 +514,6 @@ function MatchCard({
     { teamId: match.teamBId, label: match.awayLabel },
   ];
   const reportStatusAllowed = match.status === "scheduled" || match.status === "live";
-  const tournamentReportAllowed = bracket.status === "ready";
   const scoreValid = scoreMatchesFormat(score, match.matchFormat);
   const scheduleBounds = matchScheduleBounds(bracket.matches, match);
   const scheduleIso = scheduleDraftToIso(schedule);
@@ -518,7 +528,7 @@ function MatchCard({
   );
 
   const report = async () => {
-    if (!scoreValid) {
+    if (!canReportMatches || !scoreValid) {
       return;
     }
     await mutate(`/tournaments/${slug}/matches/${match.id}/report`, {
@@ -532,7 +542,7 @@ function MatchCard({
   };
 
   const saveSchedule = async () => {
-    if (!scheduleIso || !scheduleValid) {
+    if (!canScheduleMatches || !scheduleIso || !scheduleValid) {
       return;
     }
     await mutate(`/tournaments/${slug}/matches/${match.id}/schedule`, {
@@ -555,7 +565,7 @@ function MatchCard({
       data-testid="bracket-match"
     >
       <div className="match-schedule">
-        {bracket.canManage ? (
+        {canScheduleMatches ? (
           <div className="match-schedule-controls">
             <input
               aria-label={`${t("bracket.matchDate")} ${match.roundNumber}-${match.matchOrder}`}
@@ -619,12 +629,12 @@ function MatchCard({
         })}
       </div>
 
-      {bracket.canManage ? (
+      {canReportMatches ? (
         <div className="match-controls">
           <div className="match-score-controls">
             <input
               aria-label={t("tournament.homeScore")}
-              disabled={busy || !match.ready || !reportStatusAllowed || !tournamentReportAllowed}
+              disabled={busy || !match.ready || !reportStatusAllowed}
               max="99"
               min="0"
               onChange={(event) => setScore((current) => ({ ...current, home: event.target.value }))}
@@ -634,7 +644,7 @@ function MatchCard({
             <span>:</span>
             <input
               aria-label={t("tournament.awayScore")}
-              disabled={busy || !match.ready || !reportStatusAllowed || !tournamentReportAllowed}
+              disabled={busy || !match.ready || !reportStatusAllowed}
               max="99"
               min="0"
               onChange={(event) => setScore((current) => ({ ...current, away: event.target.value }))}
@@ -647,7 +657,6 @@ function MatchCard({
                 busy
                 || !match.ready
                 || !reportStatusAllowed
-                || !tournamentReportAllowed
                 || !scoreValid
               }
               onClick={() => void report()}

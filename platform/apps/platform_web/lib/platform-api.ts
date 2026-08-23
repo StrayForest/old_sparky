@@ -150,12 +150,20 @@ type ApiMatch = {
 type ApiBracket = {
   tournament_id?: string | null;
   status?: string | null;
+  tournament_status?: string | null;
   revision?: number | null;
   can_manage?: boolean | null;
+  capabilities?: ApiBracketCapabilities | null;
   teams?: ApiTeam[] | null;
   matches?: ApiMatch[] | null;
   next_poll_after_ms?: number | null;
   state_version?: number | null;
+};
+
+type ApiBracketCapabilities = {
+  can_manage?: boolean | null;
+  can_schedule_matches?: boolean | null;
+  can_report_matches?: boolean | null;
 };
 
 type ApiPlayerProfile = {
@@ -1211,7 +1219,7 @@ function mapTournamentDetail(
     activeCommitment?: TournamentDetail["activeCommitment"];
   } = {}
 ): TournamentDetail {
-  const mappedBracket = bracket ?? emptyBracket(item.id);
+  const mappedBracket = bracket ?? emptyBracket(item.id, mapStatus(item.status));
   const teams = mappedBracket.teams;
 
   return {
@@ -1492,11 +1500,30 @@ function teamIdFromMatchLabel(label: string | null | undefined): string | null {
 }
 
 function mapBracket(item: ApiBracket): Bracket {
+  const tournamentStatus = mapStatus(item.tournament_status);
+  const canManage = Boolean(item.capabilities?.can_manage ?? item.can_manage);
+  const terminal = tournamentStatus === "completed" || tournamentStatus === "cancelled";
+  const canScheduleMatches = Boolean(
+    item.capabilities?.can_schedule_matches
+      ?? (canManage && !terminal),
+  );
+  const canReportMatches = Boolean(
+    item.capabilities?.can_report_matches
+      ?? (canManage && !terminal && (
+        tournamentStatus === "registration_closed" || tournamentStatus === "in_progress"
+      )),
+  );
   return {
     tournamentId: item.tournament_id ?? "",
-    status: item.status ?? "pending",
+    status: mapBracketStatus(item.status),
+    tournamentStatus,
     revision: item.revision ?? 0,
-    canManage: Boolean(item.can_manage),
+    capabilities: {
+      canManage,
+      canScheduleMatches,
+      canReportMatches,
+    },
+    canManage,
     teams: (item.teams ?? []).map(mapTeam),
     matches: (item.matches ?? []).map(mapMatch),
     nextPollAfterMs: item.next_poll_after_ms ?? null,
@@ -1504,17 +1531,34 @@ function mapBracket(item: ApiBracket): Bracket {
   };
 }
 
-function emptyBracket(tournamentId: string): Bracket {
+function emptyBracket(tournamentId: string, tournamentStatus: TournamentStatus): Bracket {
   return {
     tournamentId,
     status: "pending",
+    tournamentStatus,
     revision: 0,
+    capabilities: {
+      canManage: false,
+      canScheduleMatches: false,
+      canReportMatches: false,
+    },
     canManage: false,
     teams: [],
     matches: [],
     nextPollAfterMs: null,
     stateVersion: null
   };
+}
+
+function mapBracketStatus(status: string | null | undefined): Bracket["status"] {
+  switch (status) {
+    case "teams_ready":
+    case "ready":
+    case "pending":
+      return status;
+    default:
+      return "pending";
+  }
 }
 
 function mapStatus(status: string | null | undefined): TournamentStatus {

@@ -425,6 +425,87 @@ class PlatformBracketGraphApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(semifinal["team_a_id"], opening[0]["home_team_id"])
 
+    async def test_bracket_contract_exposes_terminal_lifecycle_and_capabilities(self) -> None:
+        organizer = await self._register("capability-organizer")
+        await self._grant_public_creation(str(organizer["user_id"]))
+
+        tournament = self._payload(
+            await organizer["client"].post(
+                "/api/v1/tournaments",
+                json={
+                    "name": f"{self.prefix}-cap-cup",
+                    "description": "Bracket lifecycle capability fixture.",
+                    "visibility": "public",
+                    "format_slug": "solo",
+                    "match_format": "bo3",
+                    "final_format": "bo5",
+                },
+            ),
+            201,
+        )
+        slug = tournament["slug"]
+        for next_status in ("registration_open", "registration_closed"):
+            self._payload(
+                await organizer["client"].patch(
+                    f"/api/v1/tournaments/{slug}/status",
+                    json={"status": next_status},
+                ),
+                200,
+            )
+        await self._lock_eight_team_roster(
+            organizer_user_id=str(organizer["user_id"]),
+            slug=slug,
+        )
+        opening = self._payload(
+            await organizer["client"].post(
+                f"/api/v1/tournaments/{slug}/matches/seed-opening-round"
+            ),
+            201,
+        )
+        bracket = self._payload(
+            await organizer["client"].get(f"/api/v1/tournaments/{slug}/bracket"),
+            200,
+        )
+        self.assertEqual(bracket["tournament_status"], "registration_closed")
+        self.assertEqual(bracket["capabilities"], {
+            "can_manage": True,
+            "can_schedule_matches": True,
+            "can_report_matches": True,
+        })
+
+        self._payload(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "cancelled"},
+            ),
+            200,
+        )
+        terminal_bracket = self._payload(
+            await organizer["client"].get(f"/api/v1/tournaments/{slug}/bracket"),
+            200,
+        )
+        self.assertEqual(terminal_bracket["status"], "ready")
+        self.assertEqual(terminal_bracket["tournament_status"], "cancelled")
+        self.assertEqual(terminal_bracket["capabilities"], {
+            "can_manage": False,
+            "can_schedule_matches": False,
+            "can_report_matches": False,
+        })
+
+        for path, payload in (
+            (
+                f"/api/v1/tournaments/{slug}/matches/{opening[0]['id']}/schedule",
+                {"scheduled_at": None, "expected_revision": terminal_bracket["revision"]},
+            ),
+            (
+                f"/api/v1/tournaments/{slug}/matches/{opening[0]['id']}/report",
+                {"home_score": 2, "away_score": 0, "expected_revision": terminal_bracket["revision"]},
+            ),
+        ):
+            method = "PATCH" if path.endswith("/schedule") else "POST"
+            response = await organizer["client"].request(method, path, json=payload)
+            self.assertEqual(response.status_code, 409, response.text)
+
     async def test_bracket_sse_delivers_redis_event_within_two_seconds(self) -> None:
         tournament_id = f"{self.prefix}-realtime"
         stream = stream_bracket_events(tournament_id)

@@ -223,14 +223,6 @@ class PlatformMatchProgressionApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Complete every match", blocked_next_round.json()["detail"])
 
         self._assert_status(
-            await organizer["client"].patch(
-                f"/api/v1/tournaments/{slug}/status",
-                json={"status": "in_progress"},
-            ),
-            200,
-        )
-
-        self._assert_status(
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/matches/{semifinal_one['id']}/report",
                 json={"home_score": 2, "away_score": 0, "note": "Semifinal one complete."},
@@ -249,9 +241,9 @@ class PlatformMatchProgressionApiTests(unittest.IsolatedAsyncioTestCase):
             f"/api/v1/tournaments/{slug}/status",
             json={"status": "completed"},
         )
-        self.assertEqual(premature_completion.status_code, 409, premature_completion.text)
+        self.assertEqual(premature_completion.status_code, 422, premature_completion.text)
         self.assertIn(
-            "Finish the bracket with a single completed match in round 1",
+            "Cannot move tournament from registration_closed to completed.",
             premature_completion.json()["detail"],
         )
 
@@ -350,6 +342,101 @@ class PlatformMatchProgressionApiTests(unittest.IsolatedAsyncioTestCase):
             "Match administration is unavailable after the tournament is completed or cancelled.",
             frozen_report_update.json()["detail"],
         )
+
+    async def test_two_team_final_auto_starts_before_completion(self) -> None:
+        organizer = await self._register_user("two-team-organizer")
+
+        tournament_payload = self._assert_status(
+            await organizer["client"].post(
+                "/api/v1/tournaments",
+                json={
+                    "name": f"{self.prefix}-2f",
+                    "description": "Final lifecycle regression fixture",
+                    "visibility": "invite_only",
+                    "format_slug": "solo",
+                    "match_format": "bo3",
+                    "final_format": "bo5",
+                },
+            ),
+            201,
+        )
+        slug = tournament_payload["slug"]
+
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_open"},
+            ),
+            200,
+        )
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_closed"},
+            ),
+            200,
+        )
+        await self._lock_deadlock_roster(slug, str(organizer["user_id"]))
+
+        final_match = self._assert_status(
+            await organizer["client"].post(
+                f"/api/v1/tournaments/{slug}/matches",
+                json={
+                    "title": "Grand Final",
+                    "round_number": 1,
+                    "sequence_number": 1,
+                    "home_label": "Team 1",
+                    "away_label": "Team 2",
+                    "scheduled_at": None,
+                },
+            ),
+            201,
+        )
+
+        reported = self._assert_status(
+            await organizer["client"].post(
+                f"/api/v1/tournaments/{slug}/matches/{final_match['id']}/report",
+                json={"home_score": 3, "away_score": 1, "note": "Final complete."},
+            ),
+            200,
+        )
+        self.assertEqual(reported["status"], "completed")
+        completed_tournament = self._assert_status(
+            await organizer["client"].get(f"/api/v1/tournaments/{slug}"),
+            200,
+        )
+        self.assertEqual(completed_tournament["status"], "completed")
+
+        async with session_factory()() as db_session:
+            transitions = list(
+                (
+                    await db_session.scalars(
+                        select(AuditLog)
+                        .where(
+                            AuditLog.subject_type == "tournament",
+                            AuditLog.subject_id == tournament_payload["id"],
+                            AuditLog.action.in_(
+                                (
+                                    "tournament.status.auto_start",
+                                    "tournament.status.auto_complete",
+                                )
+                            ),
+                        )
+                        .order_by(AuditLog.created_at.asc(), AuditLog.id.asc())
+                    )
+                ).all()
+            )
+        self.assertEqual(
+            [entry.action for entry in transitions],
+            [
+                "tournament.status.auto_start",
+                "tournament.status.auto_complete",
+            ],
+        )
+        self.assertEqual(transitions[0].payload["from_status"], "registration_closed")
+        self.assertEqual(transitions[0].payload["to_status"], "in_progress")
+        self.assertEqual(transitions[1].payload["from_status"], "in_progress")
+        self.assertEqual(transitions[1].payload["to_status"], "completed")
 
     async def test_manual_match_creation_respects_round_progression_guardrails(self) -> None:
         organizer = await self._register_user("organizer")

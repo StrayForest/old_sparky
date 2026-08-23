@@ -222,6 +222,48 @@ async def transition_locked_tournament_status(
     )
 
 
+async def complete_locked_tournament_after_final_match(
+    db_session: AsyncSession,
+    *,
+    tournament: Tournament,
+    now: datetime,
+    actor_user_id: str | None,
+    audit_payload: dict[str, object] | None = None,
+) -> TournamentStatusTransition:
+    """Complete a bracket while preserving the explicit lifecycle order.
+
+    Match reports remain valid after registration closes, so a final result can
+    arrive before an organizer has manually moved the tournament in progress.
+    Keep that workflow legal without introducing a direct
+    ``registration_closed -> completed`` transition: both transitions run on
+    the already-locked tournament row and are committed by the caller as one
+    transaction.
+    """
+
+    if tournament.status == "registration_closed":
+        await transition_locked_tournament_status(
+            db_session,
+            tournament=tournament,
+            next_status="in_progress",
+            now=now,
+            actor_user_id=actor_user_id,
+            audit_action="tournament.status.auto_start",
+            expected_status="registration_closed",
+            audit_payload={"reason": "final_match_report"},
+        )
+
+    return await transition_locked_tournament_status(
+        db_session,
+        tournament=tournament,
+        next_status="completed",
+        now=now,
+        actor_user_id=actor_user_id,
+        audit_action="tournament.status.auto_complete",
+        expected_status="in_progress",
+        audit_payload=audit_payload,
+    )
+
+
 async def transition_tournament_status(
     db_session: AsyncSession,
     *,
