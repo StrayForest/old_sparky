@@ -54,6 +54,7 @@ export function CaptainProfileTab({
     useState<number | null>(null);
   const [teammateColumns, setTeammateColumns] = useState(3);
   const teammateGridRef = useRef<HTMLDivElement | null>(null);
+  const saveInFlightRef = useRef(false);
 
   const activeHeroSlot =
     dreamSlots.find((slot) => slot.slot_number === activeHeroSlotNumber) ?? null;
@@ -98,6 +99,9 @@ export function CaptainProfileTab({
   }, []);
 
   function applyTeamName(value: string) {
+    if (saveInFlightRef.current) {
+      return;
+    }
     const next = value.slice(0, 15);
     setTeamName(next);
     onPreview(next, dreamSlots);
@@ -106,6 +110,9 @@ export function CaptainProfileTab({
   }
 
   function applyDreamSlots(next: PlatformDeadlockDreamSlot[]) {
+    if (saveInFlightRef.current) {
+      return;
+    }
     setDreamSlots(next);
     onPreview(teamName, next);
     setSaveState("idle");
@@ -138,6 +145,9 @@ export function CaptainProfileTab({
   }
 
   async function saveCaptain() {
+    if (saveInFlightRef.current) {
+      return;
+    }
     if (!dreamSlots.every(isValidDreamSlotDraft)) {
       setSaveState("error");
       setValidationMessage(
@@ -146,6 +156,7 @@ export function CaptainProfileTab({
       return;
     }
 
+    saveInFlightRef.current = true;
     setSaveState("saving");
     setValidationMessage("");
     try {
@@ -160,10 +171,15 @@ export function CaptainProfileTab({
     } catch {
       setSaveState("error");
       setValidationMessage("Не удалось сохранить профиль капитана.");
+    } finally {
+      saveInFlightRef.current = false;
     }
   }
 
   function cancelChanges() {
+    if (saveInFlightRef.current) {
+      return;
+    }
     const nextSlots = savedDreamSlots.map(cloneDreamSlot);
     setTeamName(savedTeamName);
     setDreamSlots(nextSlots);
@@ -191,6 +207,7 @@ export function CaptainProfileTab({
           </div>
           <button
             className="ghost-button"
+            disabled={saveState === "saving"}
             type="button"
             onClick={() => setActiveHeroSlotNumber(null)}
           >
@@ -208,7 +225,7 @@ export function CaptainProfileTab({
                 data-testid={`profile-dream-slot-${
                   slot.slot_number
                 }-hero-${hero.name.toLowerCase().replace(/\s+/g, "-")}`}
-                disabled={unavailable}
+                disabled={saveState === "saving" || unavailable}
                 type="button"
                 key={hero.name}
                 onClick={() => toggleSlotHero(slot, hero.name)}
@@ -233,7 +250,7 @@ export function CaptainProfileTab({
   }
 
   return (
-    <section>
+    <section aria-busy={saveState === "saving"}>
       <ProfileBanner
         icon={<Crown size={40} />}
         title="Автоматическое формирование команд для капитана"
@@ -248,6 +265,7 @@ export function CaptainProfileTab({
             <input
               className="input"
               data-testid="profile-captain-team-name"
+              disabled={saveState === "saving"}
               maxLength={15}
               value={teamName}
               onChange={(event) => applyTeamName(event.target.value)}
@@ -290,6 +308,7 @@ export function CaptainProfileTab({
                               ? "pill active"
                               : "pill"
                           }
+                          disabled={saveState === "saving"}
                           type="button"
                           key={role}
                           onClick={() => toggleSlotRole(slot, role)}
@@ -343,6 +362,7 @@ export function CaptainProfileTab({
                           : "dream-hero-picker-toggle"
                       }
                       data-testid={`profile-dream-slot-${slot.slot_number}-heroes-toggle`}
+                      disabled={saveState === "saving"}
                       type="button"
                       onClick={() =>
                         setActiveHeroSlotNumber((current) =>
