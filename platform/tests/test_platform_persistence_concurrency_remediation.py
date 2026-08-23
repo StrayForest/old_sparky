@@ -73,6 +73,14 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         lock_statement = db_session.scalars.await_args_list[1].args[0]
         self.assertIsNotNone(lock_statement._for_update_arg)
 
+    def test_reconciliation_scopes_mutations_to_locked_tournaments(self) -> None:
+        source = Path(player_commitments.__file__).read_text(encoding="utf-8")
+        block = source.split("async def reconcile_player_commitments(", 1)[1]
+        self.assertGreaterEqual(
+            block.count("tournament_id.in_(locked_tournament_ids)"),
+            3,
+        )
+
     async def test_automation_failure_reload_reacquires_workflow_lock(self) -> None:
         tournament = SimpleNamespace(id="tournament")
         with patch.object(
@@ -107,6 +115,10 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIn(
             "ck_tournament_deadlock_ready_vote_count_shards_vote_count_nonnegative",
+            shard_constraints,
+        )
+        self.assertIn(
+            "ck_tournament_deadlock_ready_vote_count_shards_shard_in_range",
             shard_constraints,
         )
 

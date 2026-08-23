@@ -663,9 +663,13 @@ class TournamentMatch(TimestampMixin, Base):
             name="away_score_nonnegative",
         ),
         CheckConstraint(
-            "status <> 'completed' OR "
-            "(home_score IS NOT NULL AND away_score IS NOT NULL "
-            "AND home_score <> away_score AND winner_side IS NOT NULL)",
+            "status <> 'completed' OR ("
+            "(winner_side = 'home' AND home_score IS NOT NULL AND away_score IS NOT NULL "
+            "AND home_score > away_score AND home_team_id IS NOT NULL "
+            "AND winner_team_id = home_team_id) OR "
+            "(winner_side = 'away' AND home_score IS NOT NULL AND away_score IS NOT NULL "
+            "AND away_score > home_score AND away_team_id IS NOT NULL "
+            "AND winner_team_id = away_team_id))",
             name="completed_result_consistent",
         ),
     )
@@ -833,7 +837,7 @@ class TournamentDeadlockReadyVoteCountShard(TimestampMixin, Base):
     __tablename__ = "tournament_deadlock_ready_vote_count_shards"
     __table_args__ = (
         CheckConstraint("choice IN ('yes', 'no')", name="choice_allowed"),
-        CheckConstraint("shard >= 0", name="shard_nonnegative"),
+        CheckConstraint("shard BETWEEN 0 AND 31", name="shard_in_range"),
         CheckConstraint("vote_count >= 0", name="vote_count_nonnegative"),
     )
 
