@@ -5,10 +5,6 @@ on:
   workflow_run:
     workflows: ["Platform production deploy"]
     types: [completed]
-  push:
-    branches: [dev]
-    paths:
-      - ".github/workflows/platform-production-content-diagnostics.yml"
 
 permissions:
   contents: read
@@ -18,7 +14,6 @@ jobs:
   content-diagnostics:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'push' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'dev')
     name: Production content diagnostics
@@ -70,7 +65,16 @@ jobs:
             -o ConnectTimeout=10 \
             -i ~/.ssh/old_sparky_prod \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            'bash -s' <<'REMOTE'
+            "bash -s -- '$TARGET_SHA'" <<'REMOTE'
+          set -Eeuo pipefail
+          target_sha="$1"
+          runtime=/opt/oldsparky/platform
+          guard="$runtime/current/tools/platform_release_lock_exec.sh"
+          test -f "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          /bin/bash "$guard" \
+            --app-dir "$runtime" \
+            --expected-sha "$target_sha" \
+            -- /bin/bash -s <<'MUTATION'
           set -Eeuo pipefail
           runtime=/opt/oldsparky/platform
           cd "$runtime/current"
@@ -215,6 +219,7 @@ jobs:
             | grep -E 'youtube|home_content' \
             | tail -n 80 \
             || true
+          MUTATION
           REMOTE
 
       - name: Mark content diagnostics successful
