@@ -26,6 +26,7 @@ sys.path.insert(0, str(PLATFORM_ROOT))
 
 from python_packages.platform_domain.deadlock.constants import RANKS
 from python_packages.platform_infra.config import get_settings
+from python_packages.platform_infra.csrf import UNSAFE_METHODS
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.media.hard_delete import (
     MediaCleanupRequired,
@@ -1782,11 +1783,13 @@ class ProductionQa:
         self.journal_since: str | None = None
         self.journal_until: str | None = None
         self.session_cookie_name = get_settings().platform_session_cookie_name
+        self.csrf_cookie_name = f"{self.session_cookie_name}_csrf"
         self.password = secrets.token_urlsafe(18)
         self.clients: list[httpx.AsyncClient] = []
         self.users_by_id: dict[str, dict[str, Any]] = {}
         self.user_ids: list[str] = []
         self.session_tokens_by_user_id: dict[str, str] = {}
+        self.csrf_tokens_by_user_id: dict[str, str] = {}
         self.rostered_session_token_digest: str | None = None
         self.control_participant_session_token_digest: str | None = None
         self.tournament_id: str | None = None
@@ -1986,6 +1989,9 @@ class ProductionQa:
         json_payload: dict[str, Any] | None = None,
     ) -> Any:
         token = self.session_tokens_by_user_id[str(user["id"])]
+        csrf_token = None
+        if method.upper() in UNSAFE_METHODS:
+            csrf_token = await self.csrf_token_for_user(client, user)
         started_at = time.monotonic()
         status_code = 0
         ok = False
@@ -1996,7 +2002,16 @@ class ProductionQa:
                 path,
                 headers={
                     "Origin": self.origin,
-                    "Cookie": f"{self.session_cookie_name}={token}",
+                    "Cookie": "; ".join(
+                        filter(
+                            None,
+                            (
+                                f"{self.session_cookie_name}={token}",
+                                f"{self.csrf_cookie_name}={csrf_token}" if csrf_token else None,
+                            ),
+                        )
+                    ),
+                    **({"X-CSRF-Token": csrf_token} if csrf_token else {}),
                     **(
                         {"X-Platform-QA-Phase": self.current_phase}
                         if self.collect_performance
@@ -2030,6 +2045,57 @@ class ProductionQa:
         if not response.content:
             return None
         return response.json()
+
+    async def csrf_token_for_user(
+        self,
+        client: httpx.AsyncClient,
+        user: dict[str, Any],
+    ) -> str:
+        user_id = str(user["id"])
+        cached = self.csrf_tokens_by_user_id.get(user_id)
+        if cached:
+            return cached
+
+        session_token = self.session_tokens_by_user_id[user_id]
+        started_at = time.monotonic()
+        status_code = 0
+        response_bytes = 0
+        try:
+            response = await client.get(
+                "/auth/csrf",
+                headers={
+                    "Origin": self.origin,
+                    "Cookie": f"{self.session_cookie_name}={session_token}",
+                },
+            )
+            status_code = response.status_code
+            response_bytes = len(response.content or b"")
+        finally:
+            if self.collect_performance:
+                self.http_metrics.record(
+                    phase=self.current_phase,
+                    method="GET",
+                    path=self.metric_path("/auth/csrf"),
+                    status_code=status_code,
+                    elapsed_seconds=time.monotonic() - started_at,
+                    ok=status_code == 200,
+                    started_at=started_at,
+                    finished_at=time.monotonic(),
+                    response_bytes=response_bytes,
+                )
+        if response.status_code != 200:
+            raise QaFailure(
+                f"GET /auth/csrf as {user['label']}: expected 200, got "
+                f"{response.status_code}: {response.text[:1000]}"
+            )
+        try:
+            csrf_token = str(response.json()["csrf_token"])
+        except (KeyError, TypeError, ValueError):
+            raise QaFailure(f"GET /auth/csrf as {user['label']}: token missing") from None
+        if len(csrf_token) < 32:
+            raise QaFailure(f"GET /auth/csrf as {user['label']}: token invalid")
+        self.csrf_tokens_by_user_id[user_id] = csrf_token
+        return csrf_token
 
     async def wait_for_auto_assignment_run_as(
         self,
