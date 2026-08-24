@@ -141,7 +141,6 @@ jobs:
               "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/cleanup.log" \
               "$RUNNER_TEMP/production-retained-cleanup-artifacts/cleanup.log"
           fi
-          cp "$remote_log" "$RUNNER_TEMP/production-retained-cleanup-remote.log"
           exit "$remote_status"
 
       - name: Publish cleanup artifacts
