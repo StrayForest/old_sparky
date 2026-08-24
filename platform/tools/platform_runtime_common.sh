@@ -38,13 +38,13 @@ if [[ -z "${PLATFORM_PYTHON_BIN:-}" ]]; then
   fi
 fi
 
-_platform_shared_node_current_bin="$PLATFORM_SHARED_DIR/node-current/bin/node"
 _platform_shared_node_26_bin="$PLATFORM_SHARED_DIR/node-v26.3.1/bin/node"
+_platform_shared_node_current_bin="$PLATFORM_SHARED_DIR/node-current/bin/node"
 if [[ -z "${PLATFORM_NODE_BIN:-}" ]]; then
-  if [[ -x "$_platform_shared_node_current_bin" ]]; then
-    PLATFORM_NODE_BIN="$_platform_shared_node_current_bin"
-  elif [[ -x "$_platform_shared_node_26_bin" ]]; then
+  if [[ -x "$_platform_shared_node_26_bin" ]]; then
     PLATFORM_NODE_BIN="$_platform_shared_node_26_bin"
+  elif [[ -x "$_platform_shared_node_current_bin" ]]; then
+    PLATFORM_NODE_BIN="$_platform_shared_node_current_bin"
   else
     PLATFORM_NODE_BIN="/usr/bin/node"
   fi
@@ -79,12 +79,31 @@ platform_require_isolated_service_env() {
 }
 
 platform_load_env_file() {
-  if [[ -f "$PLATFORM_ENV_FILE" ]]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$PLATFORM_ENV_FILE"
-    set +a
+  if [[ ! -f "$PLATFORM_ENV_FILE" ]]; then
+    return 0
   fi
+  local safe_env_tool="$PLATFORM_ROOT_DIR/tools/platform_safe_env_exec.py"
+  if [[ ! -f "$safe_env_tool" || -L "$safe_env_tool" ]]; then
+    echo "Safe environment parser is missing or unsafe: $safe_env_tool" >&2
+    exit 1
+  fi
+  local encoded_assignments
+  if ! encoded_assignments="$(
+    /usr/bin/python3 -I "$safe_env_tool" export-b64 --path "$PLATFORM_ENV_FILE"
+  )"; then
+    echo "Refusing unsafe platform environment: $PLATFORM_ENV_FILE" >&2
+    exit 1
+  fi
+  local key encoded value
+  while IFS=$'\t' read -r key encoded; do
+    [[ -n "$key" ]] || continue
+    if ! value="$(printf '%s' "$encoded" | /usr/bin/base64 --decode)"; then
+      echo "Failed to decode platform environment value for: $key" >&2
+      exit 1
+    fi
+    printf -v "$key" '%s' "$value"
+    export "$key"
+  done <<<"$encoded_assignments"
 }
 
 platform_require_python() {
