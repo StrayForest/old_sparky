@@ -56,9 +56,11 @@ populated database.
 
 The participant-capacity representation is the only new durable state proposed
 for the join path. It must be reconciled against active participant rows and
-must not grant access by itself. Existing participant status and invite/capacity
-serialization rules remain authoritative. No database partitioning, PgBouncer,
-Redis-authoritative workflow state or global permission cache is introduced.
+must not grant access by itself. Ordinary capacities use a bounded free-slot
+inventory; capacities above the 1024-row inventory allocate sparse slot rows on
+demand. Existing participant status and invite/capacity serialization rules
+remain authoritative. No database partitioning, PgBouncer, Redis-authoritative
+workflow state or global permission cache is introduced.
 
 ## Verification and load criteria
 

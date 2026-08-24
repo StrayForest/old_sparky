@@ -16,6 +16,11 @@ down_revision = "20260823_0041"
 branch_labels = None
 depends_on = None
 
+# A tournament can legally advertise a very large capacity, but capacity
+# tokens must not be materialized one row at a time for that upper bound. The
+# service allocates sparse slots above this inventory window on demand.
+SLOT_MATERIALIZATION_LIMIT = 1024
+
 
 def upgrade() -> None:
     bind = op.get_bind()
@@ -99,27 +104,56 @@ def upgrade() -> None:
     )
 
     op.execute(
-        """
+        f"""
+        WITH ranked AS (
+            SELECT
+                participant.id AS participant_id,
+                participant.tournament_id,
+                participant.created_at AS claimed_at,
+                row_number() OVER (
+                    PARTITION BY participant.tournament_id
+                    ORDER BY participant.created_at, participant.id
+                ) AS slot_number
+            FROM platform.tournament_participants participant
+            WHERE participant.status NOT IN ('withdrawn', 'disqualified')
+        ), slot_rows AS (
+            SELECT
+                ranked.tournament_id,
+                ranked.slot_number::integer AS slot_number,
+                ranked.participant_id,
+                ranked.claimed_at
+            FROM ranked
+            JOIN platform.tournaments tournament
+              ON tournament.id = ranked.tournament_id
+             AND tournament.max_participants IS NOT NULL
+            UNION ALL
+            SELECT
+                tournament.id,
+                slots.slot_number,
+                NULL,
+                NULL
+            FROM platform.tournaments tournament
+            CROSS JOIN LATERAL generate_series(
+                1,
+                LEAST(tournament.max_participants, {SLOT_MATERIALIZATION_LIMIT})
+            ) AS slots(slot_number)
+            WHERE tournament.max_participants IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM ranked
+                  WHERE ranked.tournament_id = tournament.id
+                    AND ranked.slot_number = slots.slot_number
+              )
+        )
         INSERT INTO platform.tournament_participant_slots
             (id, tournament_id, slot_number, participant_id, claimed_at)
         SELECT
-            md5(t.id || ':' || slots.slot_number::text),
-            t.id,
-            slots.slot_number,
-            ranked.participant_id,
-            ranked.created_at
-        FROM platform.tournaments t
-        CROSS JOIN LATERAL generate_series(1, t.max_participants) AS slots(slot_number)
-        LEFT JOIN LATERAL (
-            SELECT participant.id AS participant_id, participant.created_at
-            FROM platform.tournament_participants participant
-            WHERE participant.tournament_id = t.id
-              AND participant.status NOT IN ('withdrawn', 'disqualified')
-            ORDER BY participant.created_at, participant.id
-            OFFSET slots.slot_number - 1
-            LIMIT 1
-        ) ranked ON true
-        WHERE t.max_participants IS NOT NULL
+            md5(slot_rows.tournament_id || ':' || slot_rows.slot_number::text),
+            slot_rows.tournament_id,
+            slot_rows.slot_number,
+            slot_rows.participant_id,
+            slot_rows.claimed_at
+        FROM slot_rows
         """
     )
     op.execute(
@@ -158,7 +192,10 @@ def upgrade() -> None:
                 md5(NEW.id || ':' || slots.slot_number::text),
                 NEW.id,
                 slots.slot_number
-            FROM generate_series(1, NEW.max_participants) AS slots(slot_number)
+            FROM generate_series(
+                1,
+                LEAST(NEW.max_participants, {SLOT_MATERIALIZATION_LIMIT})
+            ) AS slots(slot_number)
             ON CONFLICT (tournament_id, slot_number) DO NOTHING;
             RETURN NEW;
         END;

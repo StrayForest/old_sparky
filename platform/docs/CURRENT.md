@@ -106,7 +106,9 @@ against the current web/api/worker identities and units.
 - Participant capacity is represented by durable per-tournament slots. Join
   claims a free slot with `FOR UPDATE SKIP LOCKED`; inactive retained rows and
   deletes release capacity, while the unique `(tournament_id, user_id)` index
-  and idempotency record guard retries.
+  and idempotency record guard retries. The table materializes a bounded
+  inventory and allocates sparse rows above it on demand, so the permitted
+  nine-digit API capacity cannot trigger a massive slot backfill.
 - Bracket/workspace reads expose revision-derived private ETags and accept
   `If-None-Match`; unchanged reads return `304`. Active browser views poll at
   the existing short interval, hidden/passive/terminal views back off or stop,

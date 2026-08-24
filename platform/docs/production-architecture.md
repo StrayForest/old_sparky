@@ -15,7 +15,10 @@
   row, ordinary joins claim durable per-tournament slots with
   `FOR UPDATE SKIP LOCKED`, and inactive restoration retains the lifecycle
   lock before reactivation. The unique participant key and slot table remain
-  authoritative; Redis is not the capacity store.
+  authoritative; Redis is not the capacity store. The slot table keeps a
+  bounded free-slot inventory and allocates sparse slot rows on demand above
+  the inventory window, so a large advertised capacity never materializes
+  millions of rows.
 - Public bracket SSE uses layered admission protection: Redis-backed application leases bound global, source and authenticated-user concurrency, while Nginx retains an independent coarse source/global connection ceiling.
 - Public media rendering is one-way `R2 -> CDN -> browser`; the API does not proxy media object bytes or fall back to local-disk reads.
 

@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import Select, cast, delete, exists, func, or_, select, union
+from sqlalchemy import Select, and_, cast, delete, exists, func, or_, select, union
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -150,6 +150,7 @@ from apps.platform_api.app.services.tournament_runtime_cache import (
     register_tournament_runtime_cache_invalidator,
 )
 from apps.platform_api.app.services.tournament_participant_capacity import (
+    PARTICIPANT_SLOT_MATERIALIZATION_LIMIT,
     claim_participant_slot,
     claim_slot_for_existing_participant,
     has_free_participant_slot,
@@ -1225,6 +1226,21 @@ async def participant_join_preflight(
         )
         .limit(1)
         .exists()
+    )
+    active_participant_count = (
+        select(func.count(TournamentParticipant.id))
+        .where(
+            TournamentParticipant.tournament_id == Tournament.id,
+            TournamentParticipant.status.not_in(("withdrawn", "disqualified")),
+        )
+        .scalar_subquery()
+    )
+    free_slot = or_(
+        free_slot,
+        and_(
+            Tournament.max_participants > PARTICIPANT_SLOT_MATERIALIZATION_LIMIT,
+            active_participant_count < Tournament.max_participants,
+        ),
     )
     player_rank = (
         select(DeadlockProfile.rank)

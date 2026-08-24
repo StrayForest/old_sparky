@@ -146,6 +146,8 @@ class DeadlockPersistenceModelTests(unittest.TestCase):
         self.assertIn("skip_locked=True", capacity_service)
         self.assertIn("trg_release_inactive_tournament_participant_slot", capacity_migration)
         self.assertIn("AFTER INSERT OR UPDATE OF max_participants", capacity_migration)
+        self.assertIn("SLOT_MATERIALIZATION_LIMIT = 1024", capacity_migration)
+        self.assertIn("LEAST(tournament.max_participants, {SLOT_MATERIALIZATION_LIMIT})", capacity_migration)
         self.assertIn("ON CONFLICT (tournament_id, slot_number) DO NOTHING", capacity_migration)
         self.assertIn("trg_tournament_deadlock_ready_votes_open_round", ready_vote_migration)
 
