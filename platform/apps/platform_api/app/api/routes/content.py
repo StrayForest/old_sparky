@@ -15,12 +15,14 @@ from apps.platform_api.app.api.schemas import (
     SupportStatusResponse,
 )
 from apps.platform_api.app.services.home_content import (
-    get_deadlock_asset_catalog,
     public_deadlock_game_assets,
     resolve_deadlock_hero_image,
     resolve_deadlock_rank_image,
 )
-from apps.platform_api.app.services.home_content_runtime import refresh_home_content
+from apps.platform_api.app.services.home_content_security import (
+    get_deadlock_asset_catalog,
+    refresh_home_content,
+)
 from apps.platform_api.app.services.patch_detail_security import get_patch_detail
 from apps.platform_api.app.services.support_mail import (
     send_support_message,

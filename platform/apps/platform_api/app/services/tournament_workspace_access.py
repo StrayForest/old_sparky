@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import Depends, HTTPException, Request, status
@@ -9,17 +10,26 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from python_packages.platform_infra.db import get_db_session, session_factory
-from python_packages.platform_infra.models import Tournament, TournamentParticipant
+from python_packages.platform_infra.models import (
+    Role,
+    Tournament,
+    TournamentParticipant,
+    User,
+    UserRole,
+    UserSession,
+)
 from python_packages.platform_infra.security import get_optional_authenticated_session
 
 ACTIVE_PARTICIPANT_STATUSES = frozenset({"registered", "confirmed", "checked_in"})
+ADMIN_ROLE_SLUGS = ("admin", "superadmin")
 
 
 @dataclass(frozen=True, slots=True)
 class TournamentStreamAccessContext:
-    decision: Literal["allow", "deny", "active_participant"]
+    decision: Literal["public", "deny", "organizer", "admin", "active_participant"]
     slug: str
     user_id: str | None = None
+    session_id: str | None = None
 
 
 _tournament_stream_access_context: ContextVar[TournamentStreamAccessContext | None] = ContextVar(
@@ -67,23 +77,64 @@ def current_tournament_stream_access_context() -> TournamentStreamAccessContext 
     return _tournament_stream_access_context.get()
 
 
+def _auth_session_id(auth_session) -> str | None:
+    session = getattr(auth_session, "session", None)
+    value = str(getattr(session, "id", "") or "").strip()
+    return value or None
+
+
+async def _authenticated_stream_session_is_current(
+    db_session: AsyncSession,
+    *,
+    user_id: str,
+    session_id: str,
+) -> bool:
+    now = datetime.now(UTC)
+    session_user_id = await db_session.scalar(
+        select(UserSession.user_id)
+        .join(User, User.id == UserSession.user_id)
+        .where(
+            UserSession.id == session_id,
+            UserSession.user_id == user_id,
+            UserSession.invalidated_at.is_(None),
+            UserSession.expires_at > now,
+            User.status == "active",
+        )
+    )
+    return session_user_id is not None
+
+
+async def _user_still_has_admin_role(
+    db_session: AsyncSession,
+    *,
+    user_id: str,
+) -> bool:
+    role_slug = await db_session.scalar(
+        select(Role.slug)
+        .select_from(UserRole)
+        .join(Role, Role.id == UserRole.role_id)
+        .where(
+            UserRole.user_id == user_id,
+            Role.slug.in_(ADMIN_ROLE_SLUGS),
+        )
+        .limit(1)
+    )
+    return role_slug is not None
+
+
 async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
     """Revalidate long-lived tournament stream access before emitting data.
 
-    Private participant streams are checked against the current participant row
-    on every emission. Missing request context fails closed for existing private
-    tournaments while anonymous public streams are allowed after a visibility
-    lookup. A missing tournament is tolerated for the low-level Redis stream
-    helper, which is also exercised independently of HTTP routing in tests.
+    Public streams remain public-only. Every authenticated private stream
+    revalidates the exact server-side session plus the authority that admitted
+    it (organizer, platform admin, or active participant) before every event or
+    keepalive. Session logout/revocation and role removal therefore take effect
+    without waiting for the bounded SSE lifetime to expire.
     """
 
     access_context = current_tournament_stream_access_context()
     if access_context is not None:
-        if access_context.decision == "allow":
-            return True
         if access_context.decision == "deny":
-            return False
-        if not access_context.user_id:
             return False
 
         async with session_factory()() as db_session:
@@ -91,12 +142,16 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
                 await db_session.execute(
                     select(
                         Tournament.visibility,
+                        Tournament.organizer_user_id,
                         TournamentParticipant.status,
                     )
                     .outerjoin(
                         TournamentParticipant,
                         (TournamentParticipant.tournament_id == Tournament.id)
-                        & (TournamentParticipant.user_id == access_context.user_id),
+                        & (
+                            TournamentParticipant.user_id
+                            == (access_context.user_id or "")
+                        ),
                     )
                     .where(
                         Tournament.id == tournament_id,
@@ -104,11 +159,36 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
                     )
                 )
             ).first()
-        if row is None:
+            if row is None:
+                return False
+
+            tournament_visibility = str(row[0])
+            organizer_user_id = str(row[1])
+            participant_status = row[2]
+
+            if access_context.decision == "public":
+                return tournament_visibility == "public"
+            if tournament_visibility != "invite_only":
+                return True
+            if not access_context.user_id or not access_context.session_id:
+                return False
+            if not await _authenticated_stream_session_is_current(
+                db_session,
+                user_id=access_context.user_id,
+                session_id=access_context.session_id,
+            ):
+                return False
+
+            if access_context.decision == "admin":
+                return await _user_still_has_admin_role(
+                    db_session,
+                    user_id=access_context.user_id,
+                )
+            if access_context.decision == "organizer":
+                return organizer_user_id == access_context.user_id
+            if access_context.decision == "active_participant":
+                return participant_status in ACTIVE_PARTICIPANT_STATUSES
             return False
-        if row[0] != "invite_only":
-            return True
-        return row[1] in ACTIVE_PARTICIPANT_STATUSES
 
     async with session_factory()() as db_session:
         row = (
@@ -123,7 +203,7 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
     if row[1] != "public":
         return False
     _tournament_stream_access_context.set(
-        TournamentStreamAccessContext(decision="allow", slug=str(row[0]))
+        TournamentStreamAccessContext(decision="public", slug=str(row[0]))
     )
     return True
 
@@ -142,9 +222,8 @@ async def ensure_private_tournament_read_membership_is_active(
     remain independent of participant membership.
 
     The dependency also records a request-local stream decision. Long-lived
-    private participant streams revalidate the current participant status before
-    every emitted event or keepalive, so access is revoked after a withdrawal or
-    disqualification even when the SSE connection was opened earlier.
+    private streams revalidate the current server-side session and the authority
+    used at admission before every emitted event or keepalive.
     """
 
     _tournament_stream_access_context.set(None)
@@ -153,13 +232,19 @@ async def ensure_private_tournament_read_membership_is_active(
         return
     if auth_session_has_admin_role(auth_session):
         _tournament_stream_access_context.set(
-            TournamentStreamAccessContext(decision="allow", slug=slug)
+            TournamentStreamAccessContext(
+                decision="admin",
+                slug=slug,
+                user_id=auth_session.user.id,
+                session_id=_auth_session_id(auth_session),
+            )
         )
         return
     if auth_session is None:
         return
 
     user_id = auth_session.user.id
+    session_id = _auth_session_id(auth_session)
     row = (
         await db_session.execute(
             select(
@@ -184,14 +269,29 @@ async def ensure_private_tournament_read_membership_is_active(
     tournament_visibility = row[0]
     organizer_user_id = row[1]
     participant_status = row[2]
-    if tournament_visibility != "invite_only" or organizer_user_id == user_id:
+    if tournament_visibility != "invite_only":
         _tournament_stream_access_context.set(
-            TournamentStreamAccessContext(decision="allow", slug=slug)
+            TournamentStreamAccessContext(decision="public", slug=slug)
+        )
+        return
+    if organizer_user_id == user_id:
+        _tournament_stream_access_context.set(
+            TournamentStreamAccessContext(
+                decision="organizer",
+                slug=slug,
+                user_id=user_id,
+                session_id=session_id,
+            )
         )
         return
     if participant_status is None:
         _tournament_stream_access_context.set(
-            TournamentStreamAccessContext(decision="deny", slug=slug, user_id=user_id)
+            TournamentStreamAccessContext(
+                decision="deny",
+                slug=slug,
+                user_id=user_id,
+                session_id=session_id,
+            )
         )
         return
     if participant_status in ACTIVE_PARTICIPANT_STATUSES:
@@ -200,12 +300,18 @@ async def ensure_private_tournament_read_membership_is_active(
                 decision="active_participant",
                 slug=slug,
                 user_id=user_id,
+                session_id=session_id,
             )
         )
         return
 
     _tournament_stream_access_context.set(
-        TournamentStreamAccessContext(decision="deny", slug=slug, user_id=user_id)
+        TournamentStreamAccessContext(
+            decision="deny",
+            slug=slug,
+            user_id=user_id,
+            session_id=session_id,
+        )
     )
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,

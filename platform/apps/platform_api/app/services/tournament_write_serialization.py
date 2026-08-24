@@ -10,16 +10,20 @@ from python_packages.platform_domain.tournaments import (
     ensure_tournament_capacity_allows_join,
 )
 from python_packages.platform_infra.db import get_db_session
+from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
 from python_packages.platform_infra.models import (
     Tournament,
     TournamentInvite,
+    TournamentInviteAccess,
     TournamentParticipant,
+    User,
 )
 from python_packages.platform_infra.security import get_optional_authenticated_session
 
 
 ACTIVE_PARTICIPANT_STATUSES = ("registered", "confirmed", "checked_in")
 INACTIVE_PARTICIPANT_STATUSES = ("withdrawn", "disqualified")
+PARTICIPANT_ADD_NOT_AVAILABLE = "Participant could not be added."
 
 
 def _matched_route_path(request: Request) -> str:
@@ -42,6 +46,13 @@ def _is_invite_revoke_request(request: Request) -> bool:
     return (
         request.method.upper() == "DELETE"
         and _matched_route_path(request).endswith("/{slug}/invites/{invite_id}")
+    )
+
+
+def _is_organizer_participant_add_request(request: Request) -> bool:
+    return (
+        request.method.upper() == "POST"
+        and _matched_route_path(request).endswith("/{slug}/participants/manage")
     )
 
 
@@ -173,6 +184,37 @@ async def _lock_invite_revoke(
     )
 
 
+async def _ensure_scoped_participant_add_target(
+    request: Request,
+    *,
+    tournament_id: str,
+    db_session: AsyncSession,
+) -> None:
+    payload = await _request_json_object(request)
+    user_email = str(payload.get("user_email") or "").strip().lower()
+    if not user_email:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=PARTICIPANT_ADD_NOT_AVAILABLE,
+        )
+
+    target_user_id = await db_session.scalar(
+        select(User.id)
+        .join(
+            TournamentInviteAccess,
+            (TournamentInviteAccess.user_id == User.id)
+            & (TournamentInviteAccess.tournament_id == tournament_id),
+        )
+        .where(User.email == user_email)
+        .limit(1)
+    )
+    if target_user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=PARTICIPANT_ADD_NOT_AVAILABLE,
+        )
+
+
 async def _enforce_restore_capacity(
     request: Request,
     *,
@@ -251,6 +293,12 @@ async def _lock_participant_mutation(
     if locked is None:
         return
     tournament_id, max_participants, tournament_status = locked
+    if _is_organizer_participant_add_request(request):
+        await _ensure_scoped_participant_add_target(
+            request,
+            tournament_id=tournament_id,
+            db_session=db_session,
+        )
     if mutation_kind == "moderation":
         await _enforce_restore_capacity(
             request,
@@ -270,7 +318,9 @@ async def serialize_tournament_write_invariants(
 
     Locks are acquired in tournament -> invite order and remain owned by the
     request's shared database transaction until the route commits, rolls back,
-    or the dependency session closes.
+    or the dependency session closes. Organizer participant adds are rate
+    limited and may resolve only accounts that already redeemed an invite for
+    this tournament, so the endpoint cannot serve as a global account oracle.
     """
 
     if auth_session is None:
@@ -287,6 +337,13 @@ async def serialize_tournament_write_invariants(
             db_session=db_session,
         )
         return
+
+    if _is_organizer_participant_add_request(request):
+        await check_invite_rate_limit(
+            request,
+            user_id=auth_session.user.id,
+            operation="manage",
+        )
 
     mutation_kind = _participant_mutation_kind(request)
     if mutation_kind is not None:

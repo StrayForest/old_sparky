@@ -249,6 +249,11 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
             await self._claim_invite(self_joiner, invite["code"]),
             201,
         )
+        managed_invite = await self._create_invite(organizer, slug)
+        self._assert_status(
+            await self._claim_invite(managed_player, managed_invite["code"]),
+            201,
+        )
 
         async with session_factory()() as blocker:
             await blocker.execute(
