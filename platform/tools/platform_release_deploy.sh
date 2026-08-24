@@ -4,7 +4,7 @@ umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 # End-to-end release state machine. The low-level installer only stages the
-# filesystem candidate; this wrapper owns the migration/runtime/smoke boundary.
+# filesystem candidate; this wrapper owns quiesce/migration/runtime/smoke.
 
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
 ARTIFACT=""
@@ -63,14 +63,14 @@ Usage: platform_release_deploy.sh --artifact <artifact.tar.gz> [--app-dir <path>
          --confirm-migration-not-reversed [--app-dir <path>]
 
 Runs the durable production release state machine:
-  stage -> migration decision -> pointer activation -> restart/readiness
-  -> Nginx apply -> origin/public smoke -> transaction commit.
+  preflight -> quiesce writers -> stage -> migration decision -> pointer
+  activation -> restart/readiness -> Nginx apply -> origin/public smoke
+  -> transaction commit.
 
-The transaction is intentionally retained after any migration uncertainty.
-Alembic is never downgraded automatically. Use --resume after operator review
-of a retained state. If code/runtime rollback is explicitly chosen, use
---abort-retained with --confirm-migration-not-reversed; do not delete
-shared/.release-operation.json manually.
+API/worker writers are stopped before the shared Python runtime can transition
+and remain stopped through migration. The Cloudflare/Nginx timer is also
+stopped across that boundary. The transaction is intentionally retained after
+migration uncertainty; Alembic is never downgraded automatically.
 EOF
       exit 0
       ;;
@@ -122,6 +122,8 @@ APP_DIR="$(readlink -f "$APP_DIR")"
 SHARED_DIR="$APP_DIR/shared"
 TRANSACTION_STATE="$SHARED_DIR/.release-operation.json"
 SHARED_VENV="$SHARED_DIR/venv"
+WRITERS_QUIESCED=0
+CLOUDFLARE_TIMER_WAS_ACTIVE=0
 
 if [[ ! -d "$APP_DIR" || -L "$APP_DIR" || ! -d "$SHARED_DIR" || -L "$SHARED_DIR" ]]; then
   echo "Platform application/shared layout is missing or unsafe: $APP_DIR" >&2
@@ -202,6 +204,49 @@ acquire_release_lock() {
   fi
 }
 
+quiesce_runtime_writers() {
+  if [[ "$WRITERS_QUIESCED" -eq 1 ]]; then
+    return 0
+  fi
+  if /usr/bin/systemctl is-active --quiet deadlock-cloudflare-ips.timer; then
+    CLOUDFLARE_TIMER_WAS_ACTIVE=1
+  fi
+  /usr/bin/systemctl stop deadlock-cloudflare-ips.timer
+  for attempt in {1..60}; do
+    if ! /usr/bin/systemctl is-active --quiet deadlock-cloudflare-ips.service; then
+      break
+    fi
+    if [[ "$attempt" -eq 60 ]]; then
+      echo "Cloudflare/Nginx refresh did not become idle before release staging." >&2
+      return 1
+    fi
+    sleep 1
+  done
+  /usr/bin/systemctl stop deadlock-api deadlock-worker
+  if /usr/bin/systemctl is-active --quiet deadlock-api \
+    || /usr/bin/systemctl is-active --quiet deadlock-worker; then
+    echo "API/worker writers did not quiesce." >&2
+    return 1
+  fi
+  WRITERS_QUIESCED=1
+  echo "Production API/worker writers quiesced for release staging and migration."
+}
+
+restore_quiesced_runtime_if_safe() {
+  if [[ "$WRITERS_QUIESCED" -ne 1 ]]; then
+    return 0
+  fi
+  if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
+    echo "Writers remain quiesced because a durable release transaction exists." >&2
+    return 0
+  fi
+  /usr/bin/systemctl start deadlock-api deadlock-worker
+  if [[ "$CLOUDFLARE_TIMER_WAS_ACTIVE" -eq 1 ]]; then
+    /usr/bin/systemctl start deadlock-cloudflare-ips.timer
+  fi
+  WRITERS_QUIESCED=0
+}
+
 abort_retained_release() {
   local retained_phase="$1"
   case "$retained_phase" in
@@ -274,7 +319,14 @@ if [[ "$RESUME" -eq 0 ]]; then
   fi
   ARTIFACT="$(readlink -f "$ARTIFACT")"
   release_preflight
-  "$INSTALL_TOOL" --stage-only "$ARTIFACT" "$APP_DIR"
+  if ! quiesce_runtime_writers; then
+    restore_quiesced_runtime_if_safe || true
+    exit 1
+  fi
+  if ! "$INSTALL_TOOL" --stage-only "$ARTIFACT" "$APP_DIR"; then
+    restore_quiesced_runtime_if_safe || true
+    exit 1
+  fi
 fi
 
 acquire_release_lock
@@ -293,6 +345,17 @@ fi
 CANDIDATE="$(readlink -f "$CANDIDATE")"
 
 phase="$(printf '%s' "$TRANSACTION_JSON" | json_field phase)"
+if [[ "$RESUME" -eq 1 && ( "$phase" == "staged" \
+  || "$phase" == "migration-pending" || "$phase" == "migration-failed" ) ]]; then
+  quiesce_runtime_writers
+fi
+
+# Re-run the read-only gate while the release lock is held and writers are
+# quiesced. This closes the preflight -> stage TOCTOU window before migration.
+if [[ "$phase" == "staged" || "$phase" == "migration-pending" || "$phase" == "migration-failed" ]]; then
+  release_preflight
+fi
+
 case "$phase" in
   staged|migration-pending|migration-failed)
     if [[ "$phase" == "staged" ]]; then
@@ -353,6 +416,7 @@ if [[ "$phase" == "activation-pending" ]]; then
     fi
     sleep 1
   done
+  WRITERS_QUIESCED=0
   set_phase activation-pending services-restarted
   phase=services-restarted
 fi
@@ -365,8 +429,15 @@ fi
 if [[ "$phase" == "nginx-pending" ]]; then
   candidate_env
   "$SHARED_VENV/bin/python" "$CANDIDATE/tools/platform_install_nginx.py" --json
-  "$SHARED_VENV/bin/python" "$CANDIDATE/tools/platform_install_nginx.py" \
-    --apply --reload --json
+  if ! "$SHARED_VENV/bin/python" "$CANDIDATE/tools/platform_install_nginx.py" \
+    --apply --reload --json; then
+    if [[ -n "$CURRENT_BEFORE" && -f "$CURRENT_BEFORE/tools/platform_install_nginx.py" ]]; then
+      echo "Candidate Nginx activation failed; reloading previous release configuration." >&2
+      "$SHARED_VENV/bin/python" "$CURRENT_BEFORE/tools/platform_install_nginx.py" \
+        --apply --reload --json || true
+    fi
+    exit 1
+  fi
   set_phase nginx-pending nginx-applied
   phase=nginx-applied
 fi
