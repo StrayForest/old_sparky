@@ -1,0 +1,116 @@
+name: Platform production retained load abort
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type ABORT-PRODUCTION-RETAINED-LOAD to stop one exact run"
+        required: true
+        type: string
+      load_run_id:
+        description: "GitHub run ID of the canceled production retained-load workflow"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-retained-load-abort
+  cancel-in-progress: false
+
+jobs:
+  abort:
+    name: Abort one exact retained-load process tree on production
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      QA_CONFIRMATION: ${{ inputs.confirmation }}
+      LOAD_RUN_ID: ${{ inputs.load_run_id }}
+      TARGET_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Validate explicit abort confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Production abort must run from the reviewed dev branch." >&2; exit 1; }
+          test "$QA_CONFIRMATION" = "ABORT-PRODUCTION-RETAINED-LOAD" \
+            || { echo "Refusing abort without exact confirmation." >&2; exit 1; }
+          [[ "$LOAD_RUN_ID" =~ ^[0-9]+$ ]] \
+            || { echo "load_run_id must be numeric." >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
+
+      - name: Configure production SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-retained-abort-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" || {
+            echo "Expected exactly one production ED25519 host key" >&2
+            exit 1
+          }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" || {
+            echo "Production SSH host fingerprint mismatch" >&2
+            exit 1
+          }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Abort the exact production load process tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$RUNNER_TEMP/production-retained-abort-artifacts"
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            sudo -n -- /root/old_sparky/platform/tools/platform_abort_retained_load.py \
+              "$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" \
+            2>&1 | tee "$RUNNER_TEMP/production-retained-abort-artifacts/abort.log"
+
+      - name: Publish abort evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: platform-production-retained-abort-${{ github.run_id }}
+          path: ${{ runner.temp }}/production-retained-abort-artifacts/abort.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write abort summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo "### Production retained-load abort"
+            echo
+            echo "- Target load run: **$LOAD_RUN_ID**"
+            echo "- The abort helper matched only the exact browser-polling supervisor tree for this run ID."
+          } >> "$GITHUB_STEP_SUMMARY"

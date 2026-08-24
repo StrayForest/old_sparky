@@ -111,6 +111,17 @@ test "$run_root_uid" = "0" && test "$run_root_mode" = "700" || {
 shopt -s nullglob
 summaries=("$run_root"/*/matrix-summary.json)
 shopt -u nullglob
+if (( ${#summaries[@]} != 1 )) && [[ -d "$run_root/browser-polling" ]]; then
+  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+    --pythonpath "$PLATFORM_ROOT" \
+    -- "$QA_PYTHON" "$TOOLS_DIR/platform_recover_retained_browser_report.py" \
+    --run-root "$run_root" \
+    --load-run-id "$load_run_id" \
+    --control-email "$control_email"
+  shopt -s nullglob
+  summaries=("$run_root"/*/matrix-summary.json)
+  shopt -u nullglob
+fi
 if (( ${#summaries[@]} != 1 )); then
   echo "The selected load run must contain exactly one matrix summary." >&2
   exit 1

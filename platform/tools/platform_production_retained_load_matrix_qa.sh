@@ -13,6 +13,7 @@ SYSTEM_PYTHON="/usr/bin/python3.12"
 CONFIRMATION="RUN-PRODUCTION-RETAINED-LOAD-MATRIX"
 LOCK_PATH="/run/lock/oldsparky-retained-load-matrix.lock"
 EXPECTED_ORIGIN="https://old-sparky.com"
+MAX_RUNTIME="180m"
 
 if [[ "$EUID" -ne 0 ]]; then
   echo "Production retained load matrix supervisor must run as root." >&2
@@ -130,6 +131,7 @@ log_path="$run_root/matrix.log"
 
 if [[ "$profile" == "matrix" ]]; then
   set +e
+  timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_seed_retained_tournament_matrix.py" \
     --origin "$EXPECTED_ORIGIN" \
     --control-email "$control_email" \
@@ -148,6 +150,7 @@ else
   install -d -o root -g root -m 0700 "$browser_root"
   browser_report="$browser_root/browser-polling.json"
   set +e
+  timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_production_qa.py" \
     --mode browser-polling \
     --keep-data \

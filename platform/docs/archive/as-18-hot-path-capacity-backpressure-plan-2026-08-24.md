@@ -118,3 +118,13 @@ broad user/table delete.
 8. Commit, push/merge to `dev`, observe auto-deploy and production smoke.
 9. Run the approved retained load matrix, clean exact fixtures and archive
    compact before/after evidence.
+
+Operational finding from the first live browser-polling attempt (2026-08-24):
+the browser harness reached a long async-assignment wait and the GitHub
+runner cancellation stopped its SSH client without stopping the detached
+remote supervisor. The shared lock then correctly blocked three cleanup
+attempts. The retained-load contour now has a server-side 180-minute timeout,
+an exact run-ID abort workflow, and a fail-closed recovery path that rebuilds
+only the missing browser report from the matching durable `PreprodTestRun`
+row. This recovery is for deletion, not for turning an interrupted run into a
+passing performance result.

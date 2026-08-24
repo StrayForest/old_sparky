@@ -189,6 +189,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         cleanup_workflow = (
             REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml"
         ).read_text()
+        abort_workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-abort.yml"
+        ).read_text()
         load_supervisor = (
             REPO_ROOT / "platform/tools/platform_production_retained_load_matrix_qa.sh"
         ).read_text()
@@ -199,7 +202,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             REPO_ROOT / "platform/tools/platform_cleanup_retained_matrix.py"
         ).read_text()
 
-        for workflow in (load_workflow, cleanup_workflow):
+        for workflow in (load_workflow, cleanup_workflow, abort_workflow):
             self.assertIn("workflow_dispatch:", workflow)
             self.assertNotIn("schedule:", workflow)
             self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', workflow)
@@ -207,6 +210,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertIn("actions/upload-artifact@v6", workflow)
         self.assertIn("RUN-PRODUCTION-RETAINED-LOAD-MATRIX", load_workflow)
         self.assertIn("DELETE-PRODUCTION-RETAINED-LOAD", cleanup_workflow)
+        self.assertIn("ABORT-PRODUCTION-RETAINED-LOAD", abort_workflow)
         self.assertIn("https://old-sparky.com", load_supervisor)
         self.assertIn("https://old-sparky.com", cleanup_supervisor)
         self.assertIn("flock -n 9", load_supervisor)
@@ -216,6 +220,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("control account", cleanup_tool)
         self.assertIn("_validate_tournament_graph_boundary", cleanup_tool)
         self.assertIn("platform_cleanup_retained_matrix.py", load_supervisor + cleanup_supervisor)
+        self.assertIn("platform_recover_retained_browser_report.py", cleanup_supervisor)
+        self.assertIn("timeout --signal=TERM --kill-after=30s", load_supervisor)
 
     def test_release_ref_is_rejected_before_any_build_or_network_work(self) -> None:
         unsafe_refs = ("../escape", "bad/ref", 'bad"json', "-leading", "x" * 101)

@@ -46,7 +46,12 @@ execution checklist are maintained in
 [`archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md`](archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md).
 The protected-account/database reset gate is resolved for the supplied
 production identity. Migration, exact-SHA CI, deploy smoke and retained-load
-evidence remain release gates.
+evidence remain release gates. The canceled browser-polling run on 2026-08-24
+also exposed an operator-contour bug: canceling the GitHub SSH step did not
+propagate to the remote supervisor. The reviewed abort workflow, remote
+180-minute ceiling and durable-report recovery are now part of the retained
+load procedure; a canceled run remains a failed measurement and must be
+cleaned exactly.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.

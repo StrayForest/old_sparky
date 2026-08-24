@@ -161,6 +161,14 @@ gh workflow run platform-production-retained-load-cleanup.yml \
 gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
+If a retained production load is canceled while its SSH step is active, run
+`platform-production-retained-load-abort.yml` first with the exact canceled
+load run ID. The load supervisor has a 180-minute remote ceiling and the abort
+workflow terminates only that run's process tree, then verifies the shared
+lock is available. Cleanup can recover a missing browser report from the
+durable `PreprodTestRun.report`; it remains fail-closed and deletes nothing if
+the recovered identity is incomplete or overlaps unrelated data.
+
 Cleanup deletes only the selected run's marked synthetic users and their
 tournaments; tournament participants, invites, ready-check/captain/assignment
 rows, brackets, sessions, audit rows and eligible media metadata are removed

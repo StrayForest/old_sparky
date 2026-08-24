@@ -291,6 +291,27 @@ wait, database/lock pressure and Celery backlog. It is a polling test, not a
 request to raise the 10,000-user SSE ceiling. Clean the exact browser load run
 with the same cleanup workflow before starting another production load.
 
+Cancellation is a two-step operator action. Canceling the GitHub job stops the
+runner-side SSH client, but a detached remote process may continue until its
+server-side 180-minute ceiling. For an immediate, exact stop use the reviewed
+abort workflow with the canceled load workflow ID; it matches only that
+browser-polling supervisor's process tree, checks the current release SHA and
+verifies that the shared load lock is free:
+
+```bash
+gh workflow run platform-production-retained-load-abort.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=ABORT-PRODUCTION-RETAINED-LOAD \
+  -f load_run_id=<canceled-load-run-id>
+gh run watch <abort-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+If the canceled run has no final report, the exact cleanup supervisor rebuilds
+its browser report and one-row summary from the matching durable
+`PreprodTestRun.report`. It still performs every marker, email, tournament
+ownership and graph-boundary check before deleting anything. A recovered run
+is never considered a passed load measurement.
+
 The workflow summary includes the worst HTTP p95/p99, bottleneck classes and
 a manual-inspection table with links such as
 `https://old-sparky.com/tournaments/<slug>`. Open those links in a browser,
