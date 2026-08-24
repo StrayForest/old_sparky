@@ -1936,9 +1936,12 @@ class ProductionQa:
         response_bytes = 0
         try:
             headers = (
-                {"X-Platform-QA-Phase": self.current_phase}
+                {
+                    "Origin": self.origin,
+                    "X-Platform-QA-Phase": self.current_phase,
+                }
                 if self.collect_performance
-                else None
+                else {"Origin": self.origin}
             )
             response = await client.request(
                 method,
@@ -1992,6 +1995,7 @@ class ProductionQa:
                 method,
                 path,
                 headers={
+                    "Origin": self.origin,
                     "Cookie": f"{self.session_cookie_name}={token}",
                     **(
                         {"X-Platform-QA-Phase": self.current_phase}
