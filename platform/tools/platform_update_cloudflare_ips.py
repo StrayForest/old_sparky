@@ -79,16 +79,7 @@ def run_checked(command: list[str]) -> None:
     subprocess.run(command, check=True, text=True, capture_output=True)
 
 
-def install_candidate(output: Path, content: str, nginx_bin: str, reload_nginx: bool) -> bool:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    previous = output.read_text(encoding="utf-8") if output.exists() else None
-    if previous == content:
-        return False
-
-    if output.is_absolute() and not str(output).startswith("/tmp/") and os.geteuid() != 0:
-        raise PermissionError("--apply to the system Nginx include requires root.")
-
-    backup = output.with_suffix(output.suffix + ".previous")
+def _atomic_write(output: Path, content: str) -> None:
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -103,25 +94,58 @@ def install_candidate(output: Path, content: str, nginx_bin: str, reload_nginx: 
             os.fsync(handle.fileno())
             temporary_path = Path(handle.name)
         temporary_path.chmod(0o644)
-        if output.exists():
-            shutil.copy2(output, backup)
         os.replace(temporary_path, output)
         temporary_path = None
-        try:
-            run_checked([nginx_bin, "-t"])
-        except Exception:
-            if previous is None:
-                output.unlink(missing_ok=True)
-            else:
-                output.write_text(previous, encoding="utf-8")
-                output.chmod(0o644)
-            raise
-        if reload_nginx:
-            run_checked(["systemctl", "reload", "nginx.service"])
-        return True
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def install_candidate(output: Path, content: str, nginx_bin: str, reload_nginx: bool) -> bool:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    previous = output.read_text(encoding="utf-8") if output.exists() else None
+    if previous == content:
+        if reload_nginx:
+            run_checked([nginx_bin, "-t"])
+            run_checked(["systemctl", "reload", "nginx.service"])
+        return False
+
+    if output.is_absolute() and not str(output).startswith("/tmp/") and os.geteuid() != 0:
+        raise PermissionError("--apply to the system Nginx include requires root.")
+
+    backup = output.with_suffix(output.suffix + ".previous")
+    if output.exists():
+        shutil.copy2(output, backup)
+    _atomic_write(output, content)
+    try:
+        run_checked([nginx_bin, "-t"])
+        if reload_nginx:
+            run_checked(["systemctl", "reload", "nginx.service"])
+        return True
+    except Exception as install_error:
+        rollback_errors: list[str] = []
+        try:
+            if previous is None:
+                output.unlink(missing_ok=True)
+            else:
+                _atomic_write(output, previous)
+        except Exception as exc:  # pragma: no cover - catastrophic filesystem failure
+            rollback_errors.append(f"restore include: {exc}")
+        try:
+            run_checked([nginx_bin, "-t"])
+        except Exception as exc:  # pragma: no cover - live rollback failure
+            rollback_errors.append(f"validate restored nginx: {exc}")
+        if reload_nginx:
+            try:
+                run_checked(["systemctl", "reload", "nginx.service"])
+            except Exception as exc:  # pragma: no cover - live rollback failure
+                rollback_errors.append(f"reload restored nginx: {exc}")
+        if rollback_errors:
+            raise RuntimeError(
+                f"Cloudflare include update failed ({install_error}); rollback also failed: "
+                + "; ".join(rollback_errors)
+            ) from install_error
+        raise
 
 
 def main() -> int:
