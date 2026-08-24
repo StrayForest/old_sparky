@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
+import stat
+import tempfile
 import unittest
 from uuid import uuid4
 
@@ -20,6 +23,16 @@ SPEC.loader.exec_module(recovery)
 
 
 class RetainedBrowserReportRecoveryTests(unittest.TestCase):
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned file contract")
+    def test_existing_root_report_permissions_are_tightened(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "browser-polling.json"
+            report_path.write_text("{}", encoding="utf-8")
+            report_path.chmod(0o644)
+
+            self.assertTrue(recovery._regular_file(report_path, required=True))
+            self.assertEqual(stat.S_IMODE(report_path.stat().st_mode), 0o600)
+
     def test_recovered_summary_is_an_exact_single_row_cleanup_manifest(self) -> None:
         user_ids = [str(uuid4()), str(uuid4())]
         tournament_ids = [str(uuid4())]

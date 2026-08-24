@@ -54,13 +54,13 @@ def _regular_file(path: Path, *, required: bool) -> bool:
         if required:
             raise RuntimeError(f"required recovery file is missing: {path}") from None
         return False
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-    ):
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0:
         raise RuntimeError(f"recovery file must be a root-owned regular 0600 file: {path}")
+    # The interrupted root supervisor can leave a report created by Python's
+    # default 0644 mode before its final chmod pass. Tighten that exact file
+    # before reading it; never relax permissions or follow a link.
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        path.chmod(0o600)
     return True
 
 
@@ -280,13 +280,16 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def main() -> int:
-    args = parse_args()
+async def _async_main(args: argparse.Namespace) -> int:
     try:
-        asyncio.run(recover(args))
+        await recover(args)
     finally:
-        asyncio.run(dispose_engine())
+        await dispose_engine()
     return 0
+
+
+def main() -> int:
+    return asyncio.run(_async_main(parse_args()))
 
 
 if __name__ == "__main__":
