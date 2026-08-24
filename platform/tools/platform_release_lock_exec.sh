@@ -85,7 +85,7 @@ if [[ "${PLATFORM_RELEASE_GUARD_HELD:-0}" != "1" ]]; then
   forwarded+=(-- "$@")
   exec /usr/bin/flock -n -E 75 "$SHARED_DIR" \
     /usr/bin/env PLATFORM_RELEASE_GUARD_HELD=1 \
-    "$0" "${forwarded[@]}"
+    /bin/bash "$0" "${forwarded[@]}"
 fi
 
 if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
