@@ -77,3 +77,22 @@ if (( ${#RETIRED_UNITS[@]} > 0 )); then
   printf 'Removed retired managed units:\n'
   printf '  %s\n' "${RETIRED_UNITS[@]}"
 fi
+
+# The public SSH host-key fingerprint is intentionally emitted during real
+# production activation so CI can pin the already-trusted server in the next
+# release. This never reads or exposes the private host key.
+if [[ "$SYSTEMD_DEST_DIR" == "/etc/systemd/system" \
+  && -x /usr/bin/ssh-keygen \
+  && -f /etc/ssh/ssh_host_ed25519_key.pub \
+  && ! -L /etc/ssh/ssh_host_ed25519_key.pub ]]; then
+  host_key_meta="$(stat -c '%u:%g:%a:%h' /etc/ssh/ssh_host_ed25519_key.pub)"
+  if [[ "$host_key_meta" == "0:0:644:1" || "$host_key_meta" == "0:0:640:1" ]]; then
+    host_key_fingerprint="$(
+      /usr/bin/ssh-keygen -E sha256 -lf /etc/ssh/ssh_host_ed25519_key.pub \
+        | /usr/bin/awk '{print $2}'
+    )"
+    if [[ "$host_key_fingerprint" == SHA256:* ]]; then
+      printf 'PRODUCTION_SSH_ED25519_FINGERPRINT=%s\n' "$host_key_fingerprint"
+    fi
+  fi
+fi
