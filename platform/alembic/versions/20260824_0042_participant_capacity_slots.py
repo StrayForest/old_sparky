@@ -157,7 +157,7 @@ def upgrade() -> None:
         """
     )
     op.execute(
-        """
+        f"""
         CREATE OR REPLACE FUNCTION platform.initialize_tournament_participant_slots()
         RETURNS trigger
         LANGUAGE plpgsql
