@@ -149,6 +149,8 @@ class DeadlockPersistenceModelTests(unittest.TestCase):
         self.assertIn("SLOT_MATERIALIZATION_LIMIT = 1024", capacity_migration)
         self.assertIn("LEAST(tournament.max_participants, {SLOT_MATERIALIZATION_LIMIT})", capacity_migration)
         self.assertIn("ON CONFLICT (tournament_id, slot_number) DO NOTHING", capacity_migration)
+        self.assertIn("NEW.responded_at > ready_round_closed_at", ready_vote_migration)
+        self.assertIn("closed_at", ready_vote_migration)
         self.assertIn("trg_tournament_deadlock_ready_votes_open_round", ready_vote_migration)
 
 

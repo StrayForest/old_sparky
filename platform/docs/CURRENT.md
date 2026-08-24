@@ -100,9 +100,9 @@ against the current web/api/worker identities and units.
   — locks its tournament row before checking lifecycle state. Ordinary ready
   votes are the deliberate exception: they upsert the unique vote row and its
   32-way counter shard without taking the tournament-row lock; a deferred
-  database guard rejects votes after round closure or without active
-  participation. Redis may coalesce work but never replaces this durable
-  transaction boundary.
+  database guard rejects votes recorded after round closure or without active
+  participation, while preserving a vote timestamped before the close commit.
+  Redis may coalesce work but never replaces this durable transaction boundary.
 - Participant capacity is represented by durable per-tournament slots. Join
   claims a free slot with `FOR UPDATE SKIP LOCKED`; inactive retained rows and
   deletes release capacity, while the unique `(tournament_id, user_id)` index

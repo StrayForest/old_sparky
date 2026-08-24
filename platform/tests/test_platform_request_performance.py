@@ -39,8 +39,10 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
             )
 
         log_info.assert_called_once()
-        self.assertEqual(log_info.call_args.args[-4], 320)
-        self.assertEqual(log_info.call_args.args[-3:], ("-", "-", "-"))
+        self.assertEqual(log_info.call_args.args[-5], 320)
+        self.assertEqual(log_info.call_args.args[-4], "-")
+        self.assertEqual(log_info.call_args.args[-3], 0.0)
+        self.assertEqual(log_info.call_args.args[-2:], ("-", "-"))
 
     def test_fast_reads_are_not_logged_by_mutation_rule(self) -> None:
         middleware = performance.RequestPerformanceMiddleware(app=None)

@@ -25,13 +25,21 @@ def upgrade() -> None:
         AS $$
         DECLARE
             ready_round_status varchar(20);
+            ready_round_closed_at timestamptz;
         BEGIN
             SELECT status
+                 , closed_at
             INTO ready_round_status
+                , ready_round_closed_at
             FROM platform.tournament_deadlock_ready_rounds
             WHERE id = NEW.round_id;
 
-            IF ready_round_status IS NOT NULL AND ready_round_status <> 'active' THEN
+            IF ready_round_status IS NOT NULL
+               AND ready_round_status <> 'active'
+               AND (
+                   ready_round_closed_at IS NULL
+                   OR NEW.responded_at > ready_round_closed_at
+               ) THEN
                 RAISE EXCEPTION 'ready vote requires an active ready round'
                     USING ERRCODE = '23514',
                           CONSTRAINT = 'ck_tournament_deadlock_ready_votes_open_round';

@@ -22,6 +22,8 @@ of 10,000 persistent SSE connections.
 - Ready votes continue to use the existing 32 counter shards and the unique
   `(round_id, user_id)` vote key. Ordinary votes do not lock the tournament row;
   round close/start and participant exclusion remain lifecycle transactions.
+  The deferred database guard rejects a vote recorded after close while
+  preserving a vote timestamped before the close commit.
 - Polling responses expose a stable revision token. Unchanged conditional reads
   return `304 Not Modified`; changed reads use compact summaries and explicit
   `delta`/expanded views. Full rosters remain limited to active bracket and

@@ -218,7 +218,7 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(active_round_count, 1)
 
-    async def test_ready_vote_holds_workflow_lock_until_the_round_is_closed(self) -> None:
+    async def test_ready_vote_does_not_hold_tournament_lock_until_the_round_is_closed(self) -> None:
         organizer = await self._register_user(
             label="vote-lock-organizer",
             rank="Eternus",
@@ -298,10 +298,10 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
                 close_task = asyncio.create_task(
                     organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close")
                 )
-                await asyncio.sleep(0.1)
-                self.assertFalse(
+                await asyncio.wait_for(asyncio.shield(close_task), timeout=2)
+                self.assertTrue(
                     close_task.done(),
-                    "Ready-check closure must wait for the in-flight vote writer lock.",
+                    "Ready-check closure must not wait for the ordinary vote writer.",
                 )
                 release_vote.set()
                 vote_response, close_response = await asyncio.wait_for(
@@ -314,7 +314,7 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             if pending_tasks:
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
 
-        self.assertEqual(vote_response.status_code, 200, vote_response.text)
+        self.assertIn(vote_response.status_code, (200, 409), vote_response.text)
         self.assertEqual(close_response.status_code, 200, close_response.text)
         async with session_factory()() as db_session:
             round_row = await db_session.scalar(

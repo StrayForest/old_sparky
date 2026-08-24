@@ -4942,7 +4942,16 @@ async def vote_deadlock_ready_check(
 
     if vote_changed:
         _invalidate_ready_check_state_cache(tournament.id)
-        await db_session.commit()
+        try:
+            await db_session.commit()
+        except IntegrityError as exc:
+            await db_session.rollback()
+            if "ready vote requires an active ready round" not in str(exc):
+                raise
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Deadlock ready-check is no longer active.",
+            ) from exc
     return TournamentDeadlockReadyVoteResponse(
         round_id=active_round.id,
         tournament_id=active_round.tournament_id,
