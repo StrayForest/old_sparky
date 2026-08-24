@@ -7,7 +7,11 @@ import time
 from fastapi import HTTPException, Request, status
 from redis.exceptions import RedisError
 
-from python_packages.platform_infra.config import PlatformSettings, get_settings
+from python_packages.platform_infra.config import (
+    PlatformSettings,
+    get_settings,
+    is_load_test_source,
+)
 from python_packages.platform_infra.redis import redis_client
 
 
@@ -21,6 +25,17 @@ for index = 1, 3 do
   end
 end
 return {user_count, ip_count, user_bytes}
+"""
+
+MEDIA_UPLOAD_USER_INCREMENT_SCRIPT = """
+local user_count = redis.call('INCR', KEYS[1])
+local user_bytes = redis.call('INCRBY', KEYS[2], ARGV[2])
+for index = 1, 2 do
+  if redis.call('TTL', KEYS[index]) < 0 then
+    redis.call('EXPIREAT', KEYS[index], ARGV[1])
+  end
+end
+return {user_count, user_bytes}
 """
 
 
@@ -73,14 +88,26 @@ async def check_media_upload_rate_limit(
     )
     client = redis_client()
     try:
-        values = await client.eval(
-            MEDIA_UPLOAD_INCREMENT_SCRIPT,
-            3,
-            *keys,
-            expires_at,
-            max(0, upload_bytes),
-        )
-        user_count, ip_count, user_bytes = (int(value) for value in values)
+        if is_load_test_source(resolved, address):
+            values = await client.eval(
+                MEDIA_UPLOAD_USER_INCREMENT_SCRIPT,
+                2,
+                keys[0],
+                keys[2],
+                expires_at,
+                max(0, upload_bytes),
+            )
+            user_count, user_bytes = (int(value) for value in values)
+            ip_count = 0
+        else:
+            values = await client.eval(
+                MEDIA_UPLOAD_INCREMENT_SCRIPT,
+                3,
+                *keys,
+                expires_at,
+                max(0, upload_bytes),
+            )
+            user_count, ip_count, user_bytes = (int(value) for value in values)
     except RedisError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

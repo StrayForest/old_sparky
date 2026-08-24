@@ -8,7 +8,11 @@ from typing import Literal
 from fastapi import HTTPException, Request, status
 from redis.exceptions import RedisError
 
-from python_packages.platform_infra.config import PlatformSettings, get_settings
+from python_packages.platform_infra.config import (
+    PlatformSettings,
+    get_settings,
+    is_load_test_source,
+)
 from python_packages.platform_infra.redis import redis_client
 
 
@@ -21,6 +25,14 @@ for index = 1, 2 do
   end
 end
 return {user_count, ip_count}
+"""
+
+INVITE_USER_INCREMENT_SCRIPT = """
+local user_count = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+  redis.call('EXPIREAT', KEYS[1], ARGV[1])
+end
+return user_count
 """
 
 InviteOperation = Literal["lookup", "claim", "manage"]
@@ -79,14 +91,25 @@ async def check_invite_rate_limit(
     prefix = f"platform:invite-rate:v1:{bucket}:{operation}"
     client = redis_client()
     try:
-        values = await client.eval(
-            INVITE_INCREMENT_SCRIPT,
-            2,
-            f"{prefix}:user:{user_key}",
-            f"{prefix}:ip:{ip_key}",
-            expires_at,
-        )
-        user_count, ip_count = (int(value) for value in values)
+        if is_load_test_source(resolved, address):
+            user_count = int(
+                await client.eval(
+                    INVITE_USER_INCREMENT_SCRIPT,
+                    1,
+                    f"{prefix}:user:{user_key}",
+                    expires_at,
+                )
+            )
+            ip_count = 0
+        else:
+            values = await client.eval(
+                INVITE_INCREMENT_SCRIPT,
+                2,
+                f"{prefix}:user:{user_key}",
+                f"{prefix}:ip:{ip_key}",
+                expires_at,
+            )
+            user_count, ip_count = (int(value) for value in values)
     except RedisError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

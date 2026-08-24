@@ -148,6 +148,12 @@ grep '/bracket/events' /var/log/nginx/platform-access.log \
 
 The application logs a privacy-preserving source fingerprint rather than the raw source address for admission rejections. A failed immediate lease release is not by itself a leak: bounded expiry reclaims the slot, but repeated release failures indicate Redis/runtime trouble and require investigation. Do not raise SSE ceilings to suppress 429s without correlating them with legitimate concurrency and VPS/API/Redis resource evidence.
 
+Approved load generators may be listed in the exact-address setting
+`PLATFORM_LOAD_TEST_SOURCE_IPS`. The allowlist skips only per-source/IP
+throttles for authentication, invite and media paths; account, authenticated
+user, byte, application-global and Nginx capacity limits remain active. It
+accepts individual IPv4/IPv6 addresses only, never a CIDR or wildcard.
+
 ## Performance
 
 Targets under normal non-saturated load:
@@ -189,6 +195,13 @@ so email delivery, verification and anti-bot controls do not become the test
 subject. Profile saves and all tournament actions are real API requests. The
 matrix itself is started manually by an operator and is a load test, not a
 browser smoke run.
+
+The retained matrix is a 10,000-account data-volume test with bounded mutation
+concurrency. The separate browser-polling profile can model 10,000 concurrent
+virtual users with `--browser-polling-users-per-tournament 500`,
+`--browser-polling-active-users-only` and an explicit `--http-max-connections`
+value. This measures virtual-user polling, not 10,000 long-lived SSE sockets;
+the public SSE global/source ceilings remain capacity safeguards.
 
 The control account is passed at runtime and is never modified. The matrix
 places it in registered-only, ready-check and exactly one assignment-control

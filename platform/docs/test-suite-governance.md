@@ -34,6 +34,13 @@ loopback on that host. It must not run on an ordinary GitHub-hosted runner:
 the runner would measure its own CPU/network limits instead of the platform's
 database, workers and host resources.
 
+The retained matrix's 10,000 users are persisted scale-fixture accounts, not
+10,000 simultaneous request workers. The `browser-polling` profile is the
+concurrent virtual-user gate; use 20 tournaments × 500 users, active-users-only
+mode and an explicitly sized HTTP connection pool when that profile is the
+target. It does not represent 10,000 persistent SSE connections, which remain
+bounded by the application and Nginx capacity policy.
+
 The production retained-load group is a deliberate exception to the normal
 release gate: it is never scheduled, never part of ordinary CI, and never runs
 on a GitHub-hosted runner. It uses the one production VPS through the canonical

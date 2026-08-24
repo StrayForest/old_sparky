@@ -8,6 +8,7 @@ from unittest.mock import patch
 from python_packages.platform_infra.config import (
     DEVELOPMENT_SECRET_KEY,
     PlatformSettings,
+    parse_load_test_source_ips,
     validate_platform_settings,
 )
 
@@ -58,6 +59,21 @@ class PlatformProductionConfigTests(unittest.TestCase):
 
     def test_complete_production_configuration_passes(self) -> None:
         validate_platform_settings(self.production_settings())
+
+    def test_load_test_source_allowlist_accepts_exact_ipv4_and_ipv6_only(self) -> None:
+        self.assertEqual(
+            parse_load_test_source_ips("192.0.2.10, 2001:db8::10"),
+            frozenset({"192.0.2.10", "2001:db8::10"}),
+        )
+        for value in ("192.0.2.0/24", "0.0.0.0", "127.0.0.1", "not-an-ip"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_load_test_source_ips(value)
+
+    def test_production_rejects_invalid_load_test_source_allowlist(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "PLATFORM_LOAD_TEST_SOURCE_IPS"):
+            validate_platform_settings(
+                self.production_settings(platform_load_test_source_ips="0.0.0.0")
+            )
 
     def test_worker_runtime_does_not_require_api_secret(self) -> None:
         settings = self.production_settings(

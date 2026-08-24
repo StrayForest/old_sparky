@@ -18,7 +18,11 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from python_packages.platform_infra.auth_lifecycle import email_verification_required
-from python_packages.platform_infra.config import PlatformSettings, get_settings
+from python_packages.platform_infra.config import (
+    PlatformSettings,
+    get_settings,
+    is_load_test_source,
+)
 from python_packages.platform_infra.db import session_factory
 from python_packages.platform_infra.models import User, UserSession
 from python_packages.platform_infra.redis import redis_client
@@ -215,14 +219,17 @@ async def reserve_sse_connection(
     resolved_settings = settings or get_settings()
     now = int(time.time()) if now_epoch is None else now_epoch
     member = secrets.token_urlsafe(18)
-    keys = [
-        _global_key(),
-        _source_key(resolved_settings, source_address),
-    ]
+    keys = [_global_key()]
+    limits = [global_limit]
+    scopes = ["global"]
+    if not is_load_test_source(resolved_settings, source_address):
+        keys.append(_source_key(resolved_settings, source_address))
+        limits.append(source_limit)
+        scopes.append("source")
     await _reserve_keys(
         keys,
-        [global_limit, source_limit],
-        ["global", "source"],
+        limits,
+        scopes,
         member=member,
         lease_seconds=lease_seconds,
         now_epoch=now,

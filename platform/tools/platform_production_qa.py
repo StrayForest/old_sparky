@@ -128,6 +128,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale-users", type=int, default=10_000)
     parser.add_argument("--scale-teams", type=int, default=128)
     parser.add_argument("--concurrency", type=int, default=80)
+    parser.add_argument(
+        "--http-max-connections",
+        type=int,
+        default=None,
+        help="Explicit httpx connection-pool ceiling; required for high-concurrency virtual-user runs.",
+    )
     parser.add_argument("--collect-performance", action="store_true")
     parser.add_argument("--system-sample-interval", type=float, default=1.0)
     parser.add_argument("--scale-site-mix-users", type=int, default=None)
@@ -148,6 +154,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=BROWSER_POLLING_OPEN_STAGGER_SECONDS,
         help="Spread initial tab opens over this many seconds to avoid an artificial synchronized wave.",
+    )
+    parser.add_argument(
+        "--browser-polling-active-users-only",
+        action="store_true",
+        help="Keep every planned polling tab active instead of modeling hidden browser tabs.",
     )
     parser.add_argument(
         "--write-burst-profile",
@@ -1665,6 +1676,7 @@ class ProductionQa:
         scale_users: int = 10_000,
         scale_teams: int = 128,
         concurrency: int = 80,
+        http_max_connections: int | None = None,
         collect_performance: bool = False,
         system_sample_interval: float = 1.0,
         scale_site_mix_users: int | None = None,
@@ -1676,6 +1688,7 @@ class ProductionQa:
         browser_polling_duration: float = BROWSER_POLLING_DURATION_SECONDS,
         browser_polling_users_per_tournament: int = BROWSER_POLLING_USERS_PER_TOURNAMENT,
         browser_polling_open_stagger: float = BROWSER_POLLING_OPEN_STAGGER_SECONDS,
+        browser_polling_active_users_only: bool = False,
         write_burst_profile: str = "all",
         write_burst_users_per_tournament: int = WRITE_BURST_USERS_PER_TOURNAMENT,
         write_burst_time_scale: float = 1.0,
@@ -1743,6 +1756,7 @@ class ProductionQa:
             browser_polling_users_per_tournament,
         )
         self.browser_polling_open_stagger = max(0.0, browser_polling_open_stagger)
+        self.browser_polling_active_users_only = bool(browser_polling_active_users_only)
         self.write_burst_profile = write_burst_profile
         self.write_burst_users_per_tournament = max(14, write_burst_users_per_tournament)
         self.write_burst_time_scale = max(0.01, write_burst_time_scale)
@@ -1763,6 +1777,12 @@ class ProductionQa:
             self.scale_users = max(14, scale_users)
         self.scale_teams = max(2, min(128, scale_teams))
         self.concurrency = max(1, concurrency)
+        requested_http_connections = (
+            max(100, self.concurrency)
+            if http_max_connections is None
+            else http_max_connections
+        )
+        self.http_max_connections = max(1, min(10_000, requested_http_connections))
         self.collect_performance = collect_performance
         self.scale_site_mix_users = (
             self.scale_users
@@ -1901,6 +1921,7 @@ class ProductionQa:
                 "scale_users": self.scale_users,
                 "scale_teams": self.scale_teams,
                 "concurrency": self.concurrency,
+                "http_max_connections": self.http_max_connections,
                 "site_mix_users": self.scale_site_mix_users,
                 "bracket_view_users": self.scale_bracket_view_users,
                 "final_view_profile": self.scale_final_view_profile,
@@ -1908,6 +1929,7 @@ class ProductionQa:
                 "browser_polling_duration": self.browser_polling_duration,
                 "browser_polling_users_per_tournament": self.browser_polling_users_per_tournament,
                 "browser_polling_open_stagger": self.browser_polling_open_stagger,
+                "browser_polling_active_users_only": self.browser_polling_active_users_only,
                 "write_burst_profile": self.write_burst_profile,
                 "write_burst_users_per_tournament": self.write_burst_users_per_tournament,
                 "write_burst_time_scale": self.write_burst_time_scale,
@@ -1920,6 +1942,10 @@ class ProductionQa:
             base_url=self.api_origin,
             follow_redirects=True,
             timeout=httpx.Timeout(self.http_timeout),
+            limits=httpx.Limits(
+                max_connections=self.http_max_connections,
+                max_keepalive_connections=self.http_max_connections,
+            ),
         )
         self.clients.append(client)
         return client
@@ -3044,7 +3070,11 @@ class ProductionQa:
                     role = "participant"
                 else:
                     role = "viewer"
-                hidden_after_open = (len(tabs) % 10) in {0, 1, 2}
+                hidden_after_open = (
+                    False
+                    if self.browser_polling_active_users_only
+                    else (len(tabs) % 10) in {0, 1, 2}
+                )
                 route = f"/tournaments/{slug}"
                 route_label = "GET /tournaments/{slug}"
                 if category == "ready_check_active" and role == "participant":
@@ -5744,6 +5774,7 @@ async def async_main() -> int:
         scale_users=args.scale_users,
         scale_teams=args.scale_teams,
         concurrency=args.concurrency,
+        http_max_connections=args.http_max_connections,
         collect_performance=args.collect_performance,
         system_sample_interval=args.system_sample_interval,
         scale_site_mix_users=args.scale_site_mix_users,
@@ -5755,6 +5786,7 @@ async def async_main() -> int:
         browser_polling_duration=args.browser_polling_duration,
         browser_polling_users_per_tournament=args.browser_polling_users_per_tournament,
         browser_polling_open_stagger=args.browser_polling_open_stagger,
+        browser_polling_active_users_only=args.browser_polling_active_users_only,
         write_burst_profile=args.write_burst_profile,
         write_burst_users_per_tournament=args.write_burst_users_per_tournament,
         write_burst_time_scale=args.write_burst_time_scale,

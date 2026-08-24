@@ -9,7 +9,11 @@ from hashlib import sha256
 from fastapi import HTTPException, Request, status
 from redis.exceptions import RedisError
 
-from python_packages.platform_infra.config import PlatformSettings, get_settings
+from python_packages.platform_infra.config import (
+    PlatformSettings,
+    get_settings,
+    is_load_test_source,
+)
 from python_packages.platform_infra.redis import redis_client
 
 
@@ -145,6 +149,8 @@ async def check_login_rate_limit(
     if not auth_rate_limits_enabled(resolved_settings):
         return AuthRateLimitState()
     now = int(time.time()) if now_epoch is None else now_epoch
+    source_address = _remote_address(request)
+    source_exempt = is_load_test_source(resolved_settings, source_address)
     ip_fingerprint, account_fingerprint = _login_fingerprints(
         request,
         email,
@@ -152,13 +158,17 @@ async def check_login_rate_limit(
     )
     cache = redis_client()
     try:
-        ip_count, retry_after = await _increment_fixed_window(
-            cache,
-            scope="login-ip",
-            fingerprint=ip_fingerprint,
-            window_seconds=resolved_settings.platform_auth_login_window_seconds,
-            now_epoch=now,
-        )
+        if source_exempt:
+            ip_count = 0
+            retry_after = resolved_settings.platform_auth_login_window_seconds
+        else:
+            ip_count, retry_after = await _increment_fixed_window(
+                cache,
+                scope="login-ip",
+                fingerprint=ip_fingerprint,
+                window_seconds=resolved_settings.platform_auth_login_window_seconds,
+                now_epoch=now,
+            )
         account_failures = await _current_fixed_window_count(
             cache,
             scope="login-failure",
@@ -276,6 +286,8 @@ async def check_registration_rate_limit(
 ) -> AuthRateLimitState:
     resolved_settings = settings or get_settings()
     if not auth_rate_limits_enabled(resolved_settings):
+        return AuthRateLimitState()
+    if is_load_test_source(resolved_settings, _remote_address(request)):
         return AuthRateLimitState()
     now = int(time.time()) if now_epoch is None else now_epoch
     fingerprint = _fingerprint(resolved_settings, f"ip:{_remote_address(request)}")
@@ -447,6 +459,7 @@ async def _check_token_action_rate_limit(
         return AuthRateLimitState()
     now = int(time.time()) if now_epoch is None else now_epoch
     address = _remote_address(request)
+    source_exempt = is_load_test_source(resolved_settings, address)
     ip_fingerprint = _fingerprint(resolved_settings, f"{scope}-ip:{address}")
     account_fingerprint = _fingerprint(
         resolved_settings,
@@ -454,13 +467,17 @@ async def _check_token_action_rate_limit(
     )
     cache = redis_client()
     try:
-        ip_count, retry_after = await _increment_fixed_window(
-            cache,
-            scope=f"{scope}-ip",
-            fingerprint=ip_fingerprint,
-            window_seconds=resolved_settings.platform_auth_reset_window_seconds,
-            now_epoch=now,
-        )
+        if source_exempt:
+            ip_count = 0
+            retry_after = resolved_settings.platform_auth_reset_window_seconds
+        else:
+            ip_count, retry_after = await _increment_fixed_window(
+                cache,
+                scope=f"{scope}-ip",
+                fingerprint=ip_fingerprint,
+                window_seconds=resolved_settings.platform_auth_reset_window_seconds,
+                now_epoch=now,
+            )
         account_count, account_retry_after = await _increment_fixed_window(
             cache,
             scope=f"{scope}-account",

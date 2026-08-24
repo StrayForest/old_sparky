@@ -15,8 +15,10 @@ class FakeRedis:
         self.ip_count = 0
         self.closed = False
 
-    async def eval(self, _script: str, _count: int, *_args: object) -> list[int]:
+    async def eval(self, _script: str, count: int, *_args: object) -> int | list[int]:
         self.user_count += 1
+        if count == 1:
+            return self.user_count
         self.ip_count += 1
         return [self.user_count, self.ip_count]
 
@@ -91,6 +93,31 @@ class PlatformInviteRateLimitTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(fake.user_count, 1)
+
+    async def test_allowlisted_source_skips_ip_budget_but_keeps_user_budget(self) -> None:
+        fake = FakeRedis()
+        settings = self.settings(
+            platform_load_test_source_ips="192.0.2.10",
+            platform_invite_claim_user_limit=2,
+            platform_invite_claim_ip_limit=1,
+        )
+        with patch(
+            "python_packages.platform_infra.invite_rate_limit.redis_client",
+            return_value=fake,
+        ):
+            await check_invite_rate_limit(
+                request(), user_id="user-1", operation="claim", settings=settings, now_epoch=10
+            )
+            await check_invite_rate_limit(
+                request(), user_id="user-1", operation="claim", settings=settings, now_epoch=10
+            )
+            with self.assertRaises(HTTPException) as raised:
+                await check_invite_rate_limit(
+                    request(), user_id="user-1", operation="claim", settings=settings, now_epoch=10
+                )
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(fake.ip_count, 0)
 
 
 if __name__ == "__main__":

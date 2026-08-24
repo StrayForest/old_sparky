@@ -84,6 +84,24 @@ class ProductionQaPollingProfileTests(unittest.TestCase):
         self.assertNotEqual(initial[2], changed[2])
         self.assertEqual(len(initial[2]["slots"]), 6)
 
+    def test_browser_polling_can_model_10000_active_virtual_users(self) -> None:
+        qa = ProductionQa(
+            origin="http://127.0.0.1",
+            report_path=Path("/tmp/platform-production-qa-10k-test.json"),
+            browser_gate_dir=None,
+            browser_gate_timeout=1.0,
+            http_timeout=1.0,
+            keep_data=False,
+            mode="browser-polling",
+            browser_polling_users_per_tournament=500,
+            browser_polling_active_users_only=True,
+            http_max_connections=10_000,
+        )
+
+        self.assertEqual(qa.scale_users, 10_000)
+        self.assertEqual(qa.http_max_connections, 10_000)
+        self.assertTrue(qa.browser_polling_active_users_only)
+
     def test_polling_metrics_group_events(self) -> None:
         recorder = PollingMetricsRecorder()
         recorder.mark(

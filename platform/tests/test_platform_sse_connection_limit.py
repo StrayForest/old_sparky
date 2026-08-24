@@ -84,6 +84,31 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await asyncio.gather(*(lease.release() for lease in leases))
 
+    async def test_allowlisted_source_bypasses_source_cap_but_not_global_cap(self) -> None:
+        settings = self.settings.model_copy(
+            update={"platform_load_test_source_ips": "203.0.113.50"}
+        )
+        leases = [
+            await sse.reserve_sse_connection(
+                "203.0.113.50",
+                settings=settings,
+                global_limit=2,
+                source_limit=1,
+            )
+            for _ in range(2)
+        ]
+        try:
+            with self.assertRaises(sse.SseConnectionLimitExceeded) as context:
+                await sse.reserve_sse_connection(
+                    "203.0.113.50",
+                    settings=settings,
+                    global_limit=2,
+                    source_limit=1,
+                )
+            self.assertEqual(context.exception.scope, "global")
+        finally:
+            await asyncio.gather(*(lease.release() for lease in leases))
+
     async def test_user_limit_spans_distinct_source_addresses(self) -> None:
         leases = [
             await sse.reserve_sse_connection(

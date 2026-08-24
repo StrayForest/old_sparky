@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import ipaddress
 import os
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -27,6 +28,10 @@ class PlatformSettings(BaseSettings):
     platform_api_host: str = "127.0.0.1"
     platform_api_port: int = 8010
     platform_api_forwarded_allow_ips: str = "127.0.0.1"
+    # Exact egress addresses used by approved load generators. This only
+    # bypasses per-IP throttles; account, user, byte and global capacity
+    # protections remain authoritative.
+    platform_load_test_source_ips: str = ""
     platform_web_bind_host: str = "127.0.0.1"
     platform_web_port: int = 3000
     platform_database_url: str = (
@@ -192,6 +197,43 @@ def get_settings() -> PlatformSettings:
     return PlatformSettings()
 
 
+@lru_cache(maxsize=32)
+def parse_load_test_source_ips(raw_value: str) -> frozenset[str]:
+    """Parse the exact host addresses trusted for an approved load run.
+
+    CIDR ranges and wildcard/unspecified addresses are deliberately not
+    accepted. The value is configuration, never request input.
+    """
+
+    addresses: set[str] = set()
+    for raw_address in raw_value.split(","):
+        address_text = raw_address.strip()
+        if not address_text:
+            continue
+        try:
+            address = ipaddress.ip_address(address_text)
+        except ValueError as exc:
+            raise ValueError(
+                "PLATFORM_LOAD_TEST_SOURCE_IPS must contain exact IP addresses."
+            ) from exc
+        if address.is_unspecified or address.is_loopback or address.is_multicast:
+            raise ValueError(
+                "PLATFORM_LOAD_TEST_SOURCE_IPS cannot contain unspecified, loopback or multicast addresses."
+            )
+        addresses.add(str(address))
+    return frozenset(addresses)
+
+
+def is_load_test_source(settings: PlatformSettings, address: str) -> bool:
+    try:
+        normalized = str(ipaddress.ip_address(address.strip()))
+    except ValueError:
+        return False
+    return normalized in parse_load_test_source_ips(
+        settings.platform_load_test_source_ips
+    )
+
+
 def validate_platform_settings(
     settings: PlatformSettings,
     *,
@@ -226,6 +268,10 @@ def validate_platform_settings(
         raise RuntimeError(
             f"{environment.title()} must use the isolated platform schema."
         )
+    try:
+        parse_load_test_source_ips(settings.platform_load_test_source_ips)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     if environment == "test":
         redis_url = urlsplit(settings.platform_redis_url)
         if redis_url.scheme not in {"redis", "rediss"} or redis_url.path != "/15":

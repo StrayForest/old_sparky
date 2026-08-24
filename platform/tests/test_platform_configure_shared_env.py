@@ -39,6 +39,10 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
             content,
         )
         self.assertIn("PLATFORM_AUTH_DELIVERY_COOLDOWN_SECONDS=60", content)
+        self.assertIn(
+            "PLATFORM_LOAD_TEST_SOURCE_IPS=95.217.190.107,2a01:4f9:c012:8011::1",
+            content,
+        )
 
     def test_merge_defaults_new_and_invalid_steam_rollout_flags_to_disabled(self) -> None:
         missing_content, _changed = configure.merge_baseline([])
@@ -49,6 +53,19 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertIn("PLATFORM_STEAM_LOGIN_ENABLED=false", missing_content)
         self.assertIn("PLATFORM_STEAM_LOGIN_ENABLED=false", invalid_content)
         self.assertIn("PLATFORM_STEAM_LOGIN_ENABLED", changed)
+
+    def test_merge_can_select_one_reviewed_baseline_key(self) -> None:
+        content, changed = configure.merge_baseline(
+            ["PLATFORM_OPENAI_MODEL=existing-model"],
+            baseline={"PLATFORM_LOAD_TEST_SOURCE_IPS": configure.PUBLIC_BASELINE["PLATFORM_LOAD_TEST_SOURCE_IPS"]},
+        )
+
+        self.assertEqual(changed, ["PLATFORM_LOAD_TEST_SOURCE_IPS"])
+        self.assertIn(
+            "PLATFORM_LOAD_TEST_SOURCE_IPS=95.217.190.107,2a01:4f9:c012:8011::1",
+            content,
+        )
+        self.assertIn("PLATFORM_OPENAI_MODEL=existing-model", content)
 
     def test_atomic_write_preserves_private_owner_group_and_mode(self) -> None:
         with TemporaryDirectory() as directory:

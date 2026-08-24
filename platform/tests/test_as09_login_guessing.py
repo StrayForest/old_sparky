@@ -7,6 +7,7 @@ from fastapi import HTTPException, Request
 
 from python_packages.platform_infra import auth_rate_limit
 from python_packages.platform_infra.auth_rate_limit import (
+    check_password_reset_rate_limit,
     check_login_rate_limit,
     clear_login_failures,
     record_login_failure,
@@ -157,6 +158,34 @@ class DistributedLoginGuessingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account_failure_keys, [])
         self.assertNotIn("player@example.com", " ".join(cache.values).lower())
         self.assertNotIn("192.0.2.10", " ".join(cache.values))
+
+    async def test_allowlisted_source_skips_ip_budget_but_keeps_account_budget(self) -> None:
+        settings = self._settings(
+            platform_load_test_source_ips="192.0.2.10",
+            platform_auth_reset_ip_limit=1,
+            platform_auth_reset_account_limit=1,
+            platform_auth_reset_window_seconds=60,
+        )
+        cache = _FakeRedis()
+        with patch.object(auth_rate_limit, "redis_client", return_value=cache):
+            await check_password_reset_rate_limit(
+                self._request("192.0.2.10"),
+                "player@example.com",
+                operation="request",
+                settings=settings,
+                now_epoch=120,
+            )
+            with self.assertRaises(HTTPException) as raised:
+                await check_password_reset_rate_limit(
+                    self._request("192.0.2.10"),
+                    "player@example.com",
+                    operation="request",
+                    settings=settings,
+                    now_epoch=120,
+                )
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(len(cache.values), 1)
 
     async def test_active_cooldown_blocks_before_new_guess_and_does_not_extend(self) -> None:
         settings = self._settings()

@@ -25,6 +25,7 @@ PUBLIC_BASELINE = {
     "PLATFORM_WEB_BIND_HOST": "127.0.0.1",
     "PLATFORM_WEB_PORT": "3000",
     "PLATFORM_API_FORWARDED_ALLOW_IPS": "127.0.0.1",
+    "PLATFORM_LOAD_TEST_SOURCE_IPS": "95.217.190.107,2a01:4f9:c012:8011::1",
     "PLATFORM_SHARED_DIR": "/opt/oldsparky/platform/shared",
     "PLATFORM_UPLOAD_DIR": "/opt/oldsparky/platform/shared/uploads",
     "PLATFORM_DB_SCHEMA": "platform",
@@ -121,6 +122,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--confirm", default="")
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=None,
+        metavar="KEY",
+        help="Update only the named reviewed baseline key; may be repeated.",
+    )
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
     if args.apply and args.confirm != CONFIRMATION:
@@ -158,7 +166,12 @@ def read_env(path: Path) -> tuple[list[str], dict[str, str], os.stat_result]:
     return lines, values, metadata
 
 
-def merge_baseline(lines: list[str]) -> tuple[str, list[str]]:
+def merge_baseline(
+    lines: list[str],
+    *,
+    baseline: dict[str, str] | None = None,
+) -> tuple[str, list[str]]:
+    selected_baseline = PUBLIC_BASELINE if baseline is None else baseline
     output: list[str] = []
     seen: set[str] = set()
     changed: list[str] = []
@@ -169,7 +182,7 @@ def merge_baseline(lines: list[str]) -> tuple[str, list[str]]:
             continue
         key, old_value = stripped.split("=", 1)
         key = key.strip()
-        if key not in PUBLIC_BASELINE:
+        if key not in selected_baseline:
             output.append(raw_line)
             continue
         if key in seen:
@@ -183,12 +196,12 @@ def merge_baseline(lines: list[str]) -> tuple[str, list[str]]:
             output.append(raw_line)
             seen.add(key)
             continue
-        new_value = PUBLIC_BASELINE[key]
+        new_value = selected_baseline[key]
         output.append(f"{key}={shell_env_value(new_value)}")
         seen.add(key)
         if old_normalized != new_value:
             changed.append(key)
-    for key, value in PUBLIC_BASELINE.items():
+    for key, value in selected_baseline.items():
         if key in seen:
             continue
         output.append(f"{key}={shell_env_value(value)}")
@@ -255,8 +268,16 @@ def sync_runtime_envs(env_file: Path) -> bool:
 
 def main() -> int:
     args = parse_args()
+    selected_keys = PUBLIC_BASELINE
+    if args.only is not None:
+        unknown_keys = sorted(set(args.only) - PUBLIC_BASELINE.keys())
+        if unknown_keys:
+            raise RuntimeError(
+                "Unknown or unreviewed baseline key(s): " + ", ".join(unknown_keys)
+            )
+        selected_keys = {key: PUBLIC_BASELINE[key] for key in dict.fromkeys(args.only)}
     lines, _values, metadata = read_env(args.env_file)
-    content, changed = merge_baseline(lines)
+    content, changed = merge_baseline(lines, baseline=selected_keys)
     if args.apply:
         previous_content = args.env_file.read_bytes()
         atomic_write(args.env_file, content, metadata)
