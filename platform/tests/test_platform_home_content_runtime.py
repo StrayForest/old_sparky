@@ -301,7 +301,7 @@ class PlatformHomeContentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(
-                home_content_runtime.home_content,
+                home_content_runtime.home_content_security,
                 "refresh_home_content",
                 AsyncMock(return_value=cached_payload),
             ),
@@ -330,7 +330,7 @@ class PlatformHomeContentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         }
         with (
             patch.object(
-                home_content_runtime.home_content,
+                home_content_runtime.home_content_security,
                 "refresh_home_content",
                 AsyncMock(return_value=stale_payload),
             ),

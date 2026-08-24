@@ -11,7 +11,10 @@ from xml.etree import ElementTree
 
 import httpx
 
-from apps.platform_api.app.services import home_content
+from apps.platform_api.app.services import home_content, home_content_security
+from apps.platform_api.app.services.external_content_http import (
+    BoundedNoRedirectAsyncClient,
+)
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.redis import redis_client
 
@@ -547,14 +550,14 @@ async def _publish_recovered_payload(payload: dict[str, Any]) -> None:
 
 
 async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
-    payload = await home_content.refresh_home_content(force=force)
+    payload = await home_content_security.refresh_home_content(force=force)
     if not force:
         return payload
 
     settings = get_settings()
     timeout = httpx.Timeout(settings.platform_external_content_timeout_seconds)
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with BoundedNoRedirectAsyncClient(timeout=timeout) as client:
             videos = await fetch_youtube_videos(client)
     except Exception as error:  # noqa: BLE001
         logger.warning(
