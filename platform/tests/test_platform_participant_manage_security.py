@@ -14,7 +14,7 @@ from python_packages.platform_infra.models import AuditLog, Tournament, User
 
 class PlatformParticipantManageSecurityTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.prefix = f"it-participant-security-{uuid4().hex[:8]}"
+        self.prefix = f"it-pm-sec-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"
         self.app = create_app()
         self.clients = AsyncExitStack()

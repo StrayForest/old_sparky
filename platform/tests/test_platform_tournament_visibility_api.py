@@ -619,6 +619,29 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
         slug = tournament_payload["slug"]
 
         self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_open"},
+            ),
+            200,
+        )
+        invites = self._assert_status(
+            await organizer["client"].get(f"/api/v1/tournaments/{slug}/invites"),
+            200,
+        )
+        self.assertEqual(len(invites), 1)
+        self._assert_status(
+            await managed_player["client"].post(
+                "/api/v1/tournaments/invites/claim",
+                json={
+                    "code": invites[0]["code"],
+                    "entry_type": "solo",
+                    "team_name": None,
+                },
+            ),
+            201,
+        )
+        self._assert_status(
             await organizer["client"].post(
                 f"/api/v1/tournaments/{slug}/participants/manage",
                 json={
@@ -628,13 +651,6 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
                 },
             ),
             201,
-        )
-        self._assert_status(
-            await organizer["client"].patch(
-                f"/api/v1/tournaments/{slug}/status",
-                json={"status": "registration_open"},
-            ),
-            200,
         )
         self._assert_status(
             await organizer["client"].patch(

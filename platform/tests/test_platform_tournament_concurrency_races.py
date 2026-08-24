@@ -223,7 +223,6 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
         self.assertEqual(response.status_code, 409, response.text)
         self.assertEqual(await self._invite_state(code), (0, 0))
 
-
     async def test_concurrent_self_joins_serialize_capacity_check(self) -> None:
         organizer = await self._register_user("join-organizer")
         first_player = await self._register_user("join-first")
@@ -252,11 +251,29 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
         organizer = await self._register_user("manage-organizer")
         first_player = await self._register_user("manage-first")
         second_player = await self._register_user("manage-second")
+        code = f"{self.prefix.replace('-', '')[:16]}M1".upper()
         slug, _ = await self._seed_tournament(
             organizer_user_id=organizer["user_id"],
             suffix="manage",
+            visibility="invite_only",
             max_participants=1,
+            invite_code=code,
+            invite_max_uses=2,
         )
+
+        async def claim(player: dict[str, Any]) -> httpx.Response:
+            return await player["client"].post(
+                "/api/v1/tournaments/invites/claim",
+                json={"code": code, "entry_type": "solo", "team_name": None},
+            )
+
+        with patch.object(tournament_routes, "check_invite_rate_limit", new=AsyncMock()):
+            first_claim, second_claim = await asyncio.gather(
+                claim(first_player),
+                claim(second_player),
+            )
+        self.assertEqual(first_claim.status_code, 201, first_claim.text)
+        self.assertEqual(second_claim.status_code, 201, second_claim.text)
 
         async def add_player(player: dict[str, Any]) -> httpx.Response:
             return await organizer["client"].post(
