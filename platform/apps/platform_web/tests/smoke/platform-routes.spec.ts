@@ -3523,9 +3523,13 @@ test("tournament detail switches opponent roster panel and returns to team list"
   )).toBeLessThanOrEqual(1);
   expect(mySubrankBox!.x).toBeGreaterThan(myRankImageBox!.x + myRankImageBox!.width);
   await expect(myTeamPanel.getByText("Carry", { exact: true })).toHaveCount(0);
-  await expect(myTeamPanel.getByText("Капитан", { exact: true })).toBeVisible();
-  await expect(myTeamPanel.getByText("Игрок", { exact: true })).toBeVisible();
-  await expect(myTeamPanel.getByText("Замена", { exact: true })).toBeVisible();
+  await expect(myTeamPanel.locator('.team-player-role-icon[aria-label="Капитан"]')).toHaveCount(1);
+  await expect(myTeamPanel.locator('.team-player-role-icon[aria-label="Капитан"]')).toBeVisible();
+  await expect(myTeamPanel.locator('.team-player-role-icon[aria-label="Замена"]')).toHaveCount(1);
+  await expect(myTeamPanel.locator('.team-player-role-icon[aria-label="Замена"]')).toBeVisible();
+  await expect(myTeamPanel.getByText("Капитан", { exact: true })).toHaveCount(0);
+  await expect(myTeamPanel.getByText("Игрок", { exact: true })).toHaveCount(0);
+  await expect(myTeamPanel.getByText("Замена", { exact: true })).toHaveCount(0);
   await expect(myTeamPanel.getByText(/\/7 игроков$/)).toHaveCount(0);
   await expect(myIdentity.locator("a")).toHaveCount(0);
   await expect(myTeamPanel.getByRole("link", { name: "Профиль" }).first()).toHaveAttribute("href", "/profile/me");
@@ -3608,6 +3612,12 @@ test("tournament detail switches opponent roster panel and returns to team list"
   await expect(page.locator('.public-profile-contact-icon svg[data-brand="discord"]')).toHaveCount(1);
   await expect(page.locator('.public-profile-contact-icon svg[data-brand="steam"]')).toHaveCount(1);
   await expect(page.locator(".public-profile-hero img").first()).toHaveCSS("object-position", "50% 50%");
+  const publicProfileHeroes = page.locator(".public-profile-hero");
+  await expect(publicProfileHeroes).toHaveCount(3);
+  if ((page.viewportSize()?.width ?? 0) <= 520) {
+    const heroBoxes = await Promise.all([0, 1, 2].map((index) => publicProfileHeroes.nth(index).boundingBox()));
+    expect(heroBoxes.every((box) => Math.abs((box?.y ?? 0) - (heroBoxes[0]?.y ?? 0)) <= 1)).toBe(true);
+  }
   const profileBackLink = page.getByRole("link", { name: "Назад к турниру" });
   await expect(profileBackLink.locator("svg")).toBeVisible();
   expect(await profileBackLink.evaluate((node) => getComputedStyle(node).textDecorationLine)).toBe("none");
@@ -3619,7 +3629,8 @@ test("tournament detail switches opponent roster panel and returns to team list"
     (profileBackBox?.x ?? 0) + (profileBackBox?.width ?? 0)
     - ((profileMainBox?.x ?? 0) + (profileMainBox?.width ?? 0) - profileMainPaddingRight)
   )).toBeLessThanOrEqual(1);
-  await page.goBack();
+  await profileBackLink.click();
+  await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5$/);
   const restoredRosterControl = page.getByRole("button", { name: "Состав" }).first();
   await expect(restoredRosterControl).toBeVisible();
   const backControl = page.getByRole("button", { name: "Назад" });
