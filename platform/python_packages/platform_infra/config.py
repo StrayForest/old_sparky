@@ -205,6 +205,12 @@ def parse_load_test_source_ips(raw_value: str) -> frozenset[str]:
     accepted. The value is configuration, never request input.
     """
 
+    # A few infrastructure unit tests use a partial Mock for settings. Treat
+    # an absent/non-string value as the unset default, while keeping strict
+    # validation for all real environment/configuration strings.
+    if not isinstance(raw_value, str):
+        return frozenset()
+
     addresses: set[str] = set()
     for raw_address in raw_value.split(","):
         address_text = raw_address.strip()
