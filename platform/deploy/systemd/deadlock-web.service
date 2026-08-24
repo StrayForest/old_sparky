@@ -12,7 +12,7 @@ Environment=NODE_ENV=production
 Environment=PLATFORM_RUNTIME_SERVICE=web
 Environment=PLATFORM_SHARED_DIR=/opt/oldsparky/platform/shared
 Environment=PLATFORM_ENV_FILE=/opt/oldsparky/platform/shared/env/web.env
-Environment=PLATFORM_NODE_BIN=/opt/oldsparky/platform/shared/node-current/bin/node
+Environment=PLATFORM_NODE_BIN=/opt/oldsparky/platform/shared/node-v26.3.1/bin/node
 ExecStart=/opt/oldsparky/platform/current/tools/platform_run_web.sh
 SuccessExitStatus=143
 Restart=on-failure
