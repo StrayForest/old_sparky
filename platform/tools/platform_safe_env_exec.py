@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Safely parse the fixed production dotenv file and exec a clean command.
+"""Safely parse platform dotenv files and exec approved production commands.
 
-This module deliberately does not use a shell or ``python-dotenv``.  Each path
-component is opened relative to an already-open directory with ``O_NOFOLLOW``;
-the final file is parsed as data and only the platform configuration namespace
-is copied into the child environment.
+The parser deliberately does not use a shell or ``python-dotenv``. Production
+paths are opened without following symlinks and configuration values are always
+treated as data. The fixed production exec contour remains narrowly allowlisted.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 from pathlib import Path
 import re
@@ -20,6 +20,7 @@ from typing import Iterable
 
 
 PRODUCTION_ENV_FILE = Path("/opt/oldsparky/platform/shared/.env.platform")
+PRODUCTION_SHARED_DIR = PRODUCTION_ENV_FILE.parent
 MAX_ENV_BYTES = 256 * 1024
 KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 ALLOWED_PREFIXES = ("PLATFORM_", "NEXT_PUBLIC_PLATFORM_")
@@ -39,7 +40,7 @@ TRUSTED_DB_TOOLS = frozenset(
 
 
 class SafeEnvError(RuntimeError):
-    """A non-sensitive production-env boundary failure."""
+    """A non-sensitive platform-env boundary failure."""
 
 
 def _open_component(
@@ -54,14 +55,10 @@ def _open_component(
     try:
         return os.open(name, flags, dir_fd=directory_fd)
     except OSError as exc:
-        raise SafeEnvError(
-            "production environment path is unavailable or unsafe"
-        ) from exc
+        raise SafeEnvError("environment path is unavailable or unsafe") from exc
 
 
 def _production_component_owners() -> tuple[int, ...]:
-    # The deployed production contour is root-owned at every fixed path
-    # component; runtime service identities own only their service data.
     # /, /opt, /opt/oldsparky, /opt/oldsparky/platform, .../shared
     return (0, 0, 0, 0, 0)
 
@@ -72,10 +69,10 @@ def _validate_directory(metadata: os.stat_result, *, expected_uid: int) -> None:
         or metadata.st_uid != expected_uid
         or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
-        raise SafeEnvError("production environment path ownership is unsafe")
+        raise SafeEnvError("environment path ownership is unsafe")
 
 
-def _validate_env_file(metadata: os.stat_result) -> None:
+def _validate_production_env_file(metadata: os.stat_result) -> None:
     mode = stat.S_IMODE(metadata.st_mode)
     if (
         not stat.S_ISREG(metadata.st_mode)
@@ -87,6 +84,9 @@ def _validate_env_file(metadata: os.stat_result) -> None:
     ):
         raise SafeEnvError("production environment file metadata is unsafe")
 
+
+# Backward-compatible private helper used by metadata regression tests.
+_validate_env_file = _validate_production_env_file
 
 def _read_env_bytes_at(path: Path, *, owners: tuple[int, ...]) -> bytes:
     """Open an absolute path one trusted component at a time."""
@@ -124,31 +124,8 @@ def _read_env_bytes_at(path: Path, *, owners: tuple[int, ...]) -> bytes:
         )
         opened.append(file_fd)
         before = os.fstat(file_fd)
-        _validate_env_file(before)
-        chunks: list[bytes] = []
-        remaining = MAX_ENV_BYTES + 1
-        while remaining:
-            chunk = os.read(file_fd, min(64 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
-        after = os.fstat(file_fd)
-        if len(raw) > MAX_ENV_BYTES or (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ):
-            raise SafeEnvError("production environment changed while reading")
+        _validate_production_env_file(before)
+        raw = _read_open_file(file_fd, before)
         return raw
     finally:
         for descriptor in reversed(opened):
@@ -156,8 +133,36 @@ def _read_env_bytes_at(path: Path, *, owners: tuple[int, ...]) -> bytes:
         os.close(root_fd)
 
 
+def _read_open_file(file_fd: int, before: os.stat_result) -> bytes:
+    chunks: list[bytes] = []
+    remaining = MAX_ENV_BYTES + 1
+    while remaining:
+        chunk = os.read(file_fd, min(64 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
+    after = os.fstat(file_fd)
+    if len(raw) > MAX_ENV_BYTES or (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise SafeEnvError("environment changed while reading")
+    return raw
+
+
 def read_production_env_bytes(path: Path = PRODUCTION_ENV_FILE) -> bytes:
-    """Open the fixed environment path without following any symlink."""
+    """Open the fixed production environment without following any symlink."""
 
     if path != PRODUCTION_ENV_FILE or path.parts != (
         "/",
@@ -169,6 +174,67 @@ def read_production_env_bytes(path: Path = PRODUCTION_ENV_FILE) -> bytes:
     ):
         raise SafeEnvError("production environment path must be fixed")
     return _read_env_bytes_at(path, owners=_production_component_owners())
+
+
+def _is_production_shared_path(path: Path) -> bool:
+    if not path.is_absolute():
+        return False
+    try:
+        path.relative_to(PRODUCTION_SHARED_DIR)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_generic_path(path: Path, metadata: os.stat_result) -> None:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size > MAX_ENV_BYTES
+        or mode & 0o022
+    ):
+        raise SafeEnvError("environment file metadata is unsafe")
+    if _is_production_shared_path(path):
+        if metadata.st_uid != 0:
+            raise SafeEnvError("production runtime environment must be root-owned")
+        current = path.parent
+        while current != Path("/"):
+            current_metadata = current.lstat()
+            if (
+                stat.S_ISLNK(current_metadata.st_mode)
+                or not stat.S_ISDIR(current_metadata.st_mode)
+                or current_metadata.st_uid != 0
+                or stat.S_IMODE(current_metadata.st_mode) & 0o022
+            ):
+                raise SafeEnvError("production runtime environment path is unsafe")
+            current = current.parent
+
+
+def read_env_bytes(path: Path) -> bytes:
+    """Read a platform dotenv file without executing it or following the final link."""
+
+    if path == PRODUCTION_ENV_FILE:
+        return read_production_env_bytes(path)
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise SafeEnvError("environment file is unavailable") from exc
+    _validate_generic_path(path, metadata)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        file_fd = os.open(path, flags)
+    except OSError as exc:
+        raise SafeEnvError("environment file is unavailable or unsafe") from exc
+    try:
+        opened = os.fstat(file_fd)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise SafeEnvError("environment file changed during validation")
+        _validate_generic_path(path, opened)
+        return _read_open_file(file_fd, opened)
+    finally:
+        os.close(file_fd)
 
 
 def _parse_value(value: str, *, line_number: int) -> str:
@@ -191,15 +257,15 @@ def _parse_value(value: str, *, line_number: int) -> str:
 
 def parse_dotenv(raw: bytes) -> dict[str, str]:
     if len(raw) > MAX_ENV_BYTES:
-        raise SafeEnvError("production environment exceeds its size limit")
+        raise SafeEnvError("environment exceeds its size limit")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise SafeEnvError("production environment must be UTF-8") from exc
+        raise SafeEnvError("environment must be UTF-8") from exc
     if "\x00" in text or "\u0085" in text or "\u2028" in text or "\u2029" in text:
-        raise SafeEnvError("production environment contains an unsafe line separator")
+        raise SafeEnvError("environment contains an unsafe line separator")
     if "\r" in text.replace("\r\n", ""):
-        raise SafeEnvError("production environment contains a bare carriage return")
+        raise SafeEnvError("environment contains a bare carriage return")
     values: dict[str, str] = {}
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
@@ -217,8 +283,12 @@ def parse_dotenv(raw: bytes) -> dict[str, str]:
             raise SafeEnvError(f"invalid or duplicate dotenv key on line {line_number}")
         values[key] = _parse_value(raw_value.strip(), line_number=line_number)
     if not values:
-        raise SafeEnvError("production environment is empty")
+        raise SafeEnvError("environment is empty")
     return values
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    return parse_dotenv(read_env_bytes(path))
 
 
 def clean_child_environment(
@@ -380,21 +450,32 @@ def validate_trusted_runtime() -> None:
 
 def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Safely read the fixed platform dotenv and exec a clean command."
+        description="Safely read platform dotenv data and exec approved commands."
     )
     commands = parser.add_subparsers(dest="command", required=True)
     value = commands.add_parser("print-public-value")
     value.add_argument("name", choices=sorted(PUBLIC_VALUE_NAMES))
     commands.add_parser("validate-runtime")
+    export_values = commands.add_parser("export-b64")
+    export_values.add_argument("--path", required=True, type=Path)
     execute = commands.add_parser("exec")
     execute.add_argument("--pythonpath", required=True, type=Path)
     execute.add_argument("argv", nargs=argparse.REMAINDER)
     return parser.parse_args(argv)
 
 
+def _emit_base64_assignments(values: dict[str, str]) -> None:
+    for key in sorted(values):
+        encoded = base64.b64encode(values[key].encode("utf-8")).decode("ascii")
+        print(f"{key}\t{encoded}")
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
+        if args.command == "export-b64":
+            _emit_base64_assignments(load_env_file(args.path))
+            return 0
         if os.geteuid() != 0:
             raise SafeEnvError("safe production environment access requires root")
         if args.command == "validate-runtime":
@@ -418,10 +499,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             clean_child_environment(values, pythonpath=args.pythonpath),
         )
     except SafeEnvError as exc:
-        print(f"Safe production environment refused: {exc}", file=sys.stderr)
+        print(f"Safe platform environment refused: {exc}", file=sys.stderr)
         return 2
     except OSError:
-        print("Safe production environment exec failed.", file=sys.stderr)
+        print("Safe platform environment operation failed.", file=sys.stderr)
         return 1
     return 2
 

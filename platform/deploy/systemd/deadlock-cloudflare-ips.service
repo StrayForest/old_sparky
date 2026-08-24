@@ -9,7 +9,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/oldsparky/platform/current
 Environment=PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python
-ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_update_cloudflare_ips.py --apply --reload
+ExecStart=/bin/bash /opt/oldsparky/platform/current/tools/platform_release_lock_exec.sh --app-dir /opt/oldsparky/platform -- /opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_update_cloudflare_ips.py --apply --reload
 UMask=0022
 NoNewPrivileges=true
 PrivateTmp=true

@@ -8,8 +8,11 @@ import grp
 import os
 from pathlib import Path
 import pwd
+import shlex
 import stat
 import tempfile
+
+from platform_safe_env_exec import load_env_file
 
 DEFAULT_SOURCE = Path("/opt/oldsparky/platform/shared/.env.platform")
 DEFAULT_OUTPUT_DIR = Path("/opt/oldsparky/platform/shared/env")
@@ -113,22 +116,6 @@ SERVICE_GROUPS = {
 }
 
 
-def parse_env_lines(path: Path) -> dict[str, str]:
-    if not path.is_file() or path.is_symlink():
-        raise RuntimeError("Canonical env must be a regular file, not a symlink.")
-    values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _value = line.split("=", 1)
-        key = key.strip()
-        if not key or key in values:
-            raise RuntimeError(f"Canonical env contains an invalid or duplicate key: {key!r}")
-        values[key] = raw_line
-    return values
-
-
 def selected_keys(service: str, values: dict[str, str]) -> list[str]:
     if service == "web":
         keys = WEB_KEYS & values.keys()
@@ -155,7 +142,7 @@ def render_service_env(service: str, values: dict[str, str]) -> str:
         "# Generated from shared/.env.platform; do not edit.",
         f"# Runtime scope: {service}",
     ]
-    lines.extend(values[key] for key in keys)
+    lines.extend(f"{key}={shlex.quote(values[key])}" for key in keys)
     return "\n".join(lines) + "\n"
 
 
@@ -210,6 +197,9 @@ def verify_runtime_files(output_dir: Path) -> None:
         service_user = pwd.getpwnam(group_name)
         if service_user.pw_gid != expected_gid:
             raise RuntimeError(f"{group_name} must use its private primary group.")
+        # Re-parse the generated file with the exact runtime parser. This proves
+        # that rendering and runtime interpretation cannot silently diverge.
+        load_env_file(path)
 
 
 def main() -> int:
@@ -224,7 +214,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    values = parse_env_lines(args.source)
+    values = load_env_file(args.source)
     rendered = {
         service: render_service_env(service, values)
         for service in SERVICE_GROUPS

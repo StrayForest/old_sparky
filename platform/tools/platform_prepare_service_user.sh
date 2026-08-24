@@ -48,7 +48,8 @@ SERVICE_USERS=(oldsparky-web oldsparky-api oldsparky-worker)
 if [[ "$APPLY" -eq 0 ]]; then
   cat <<EOF
 [DRY-RUN] Ensure private service identities: ${SERVICE_USERS[*]}
-[DRY-RUN] Ensure shared staging group: $MEDIA_GROUP (API + worker only)
+[DRY-RUN] Ensure exact supplementary groups: web=none, API/worker=$MEDIA_GROUP
+[DRY-RUN] Validate unique system UID/GID range, nologin shell, /nonexistent home and locked passwords
 [DRY-RUN] Lock canonical env to root:root mode 0600: $CANONICAL_ENV
 [DRY-RUN] Render root-owned per-service envs under: $RUNTIME_ENV_DIR
 [DRY-RUN] Prepare API/worker staging: $MEDIA_STAGING_DIR
@@ -67,6 +68,84 @@ if [[ ! -d "$APP_DIR/shared" || ! -L "$APP_DIR/current" || ! -f "$CANONICAL_ENV"
   exit 1
 fi
 
+login_defs_number() {
+  local key="$1"
+  local fallback="$2"
+  local value
+  value="$(awk -v key="$key" '$1 == key && $2 ~ /^[0-9]+$/ {print $2; exit}' /etc/login.defs)"
+  printf '%s\n' "${value:-$fallback}"
+}
+
+SYS_UID_MIN="$(login_defs_number SYS_UID_MIN 100)"
+SYS_UID_MAX="$(login_defs_number SYS_UID_MAX 999)"
+SYS_GID_MIN="$(login_defs_number SYS_GID_MIN 100)"
+SYS_GID_MAX="$(login_defs_number SYS_GID_MAX 999)"
+
+validate_system_group() {
+  local group_name="$1"
+  local entry name _password gid members duplicate_count
+  entry="$(getent group "$group_name")" || {
+    echo "Required service group is missing: $group_name" >&2
+    return 1
+  }
+  IFS=: read -r name _password gid members <<<"$entry"
+  if [[ "$name" != "$group_name" || ! "$gid" =~ ^[0-9]+$ \
+    || "$gid" -eq 0 || "$gid" -lt "$SYS_GID_MIN" || "$gid" -gt "$SYS_GID_MAX" ]]; then
+    echo "$group_name must have a non-root system GID in $SYS_GID_MIN..$SYS_GID_MAX." >&2
+    return 1
+  fi
+  duplicate_count="$(getent group | awk -F: -v gid="$gid" '$3 == gid {count++} END {print count + 0}')"
+  if [[ "$duplicate_count" != "1" ]]; then
+    echo "$group_name GID must be unique; found $duplicate_count group entries for $gid." >&2
+    return 1
+  fi
+}
+
+validate_service_user() {
+  local service_user="$1"
+  local entry name _password uid gid _gecos home shell primary_gid duplicate_count password_state
+  entry="$(getent passwd "$service_user")" || {
+    echo "Required service user is missing: $service_user" >&2
+    return 1
+  }
+  IFS=: read -r name _password uid gid _gecos home shell <<<"$entry"
+  primary_gid="$(getent group "$service_user" | cut -d: -f3)"
+  if [[ "$name" != "$service_user" || ! "$uid" =~ ^[0-9]+$ \
+    || "$uid" -eq 0 || "$uid" -lt "$SYS_UID_MIN" || "$uid" -gt "$SYS_UID_MAX" ]]; then
+    echo "$service_user must have a non-root system UID in $SYS_UID_MIN..$SYS_UID_MAX." >&2
+    return 1
+  fi
+  if [[ "$gid" != "$primary_gid" ]]; then
+    echo "$service_user must use its private primary group." >&2
+    return 1
+  fi
+  if [[ "$home" != "/nonexistent" || "$shell" != "/usr/sbin/nologin" ]]; then
+    echo "$service_user must use /nonexistent and /usr/sbin/nologin." >&2
+    return 1
+  fi
+  duplicate_count="$(getent passwd | awk -F: -v uid="$uid" '$3 == uid {count++} END {print count + 0}')"
+  if [[ "$duplicate_count" != "1" ]]; then
+    echo "$service_user UID must be unique; found $duplicate_count passwd entries for $uid." >&2
+    return 1
+  fi
+  password_state="$(passwd -S "$service_user" | awk '{print $2}')"
+  if [[ "$password_state" != "L" ]]; then
+    echo "$service_user password must be locked." >&2
+    return 1
+  fi
+}
+
+clear_supplementary_groups() {
+  local service_user="$1"
+  local primary_group group_name
+  primary_group="$(id -gn "$service_user")"
+  for group_name in $(id -nG "$service_user"); do
+    if [[ "$group_name" != "$primary_group" ]]; then
+      gpasswd -d "$service_user" "$group_name" >/dev/null
+    fi
+  done
+}
+
 for service_user in "${SERVICE_USERS[@]}"; do
   if ! getent group "$service_user" >/dev/null; then
     groupadd --system "$service_user"
@@ -75,18 +154,38 @@ for service_user in "${SERVICE_USERS[@]}"; do
     useradd --system --gid "$service_user" --home-dir /nonexistent \
       --shell /usr/sbin/nologin --no-create-home "$service_user"
   fi
-  primary_group="$(id -gn "$service_user")"
-  if [[ "$primary_group" != "$service_user" ]]; then
-    echo "$service_user must use its private primary group." >&2
-    exit 1
-  fi
+  usermod --lock --home /nonexistent --shell /usr/sbin/nologin "$service_user"
+  validate_system_group "$service_user"
+  validate_service_user "$service_user"
+  clear_supplementary_groups "$service_user"
 done
 
 if ! getent group "$MEDIA_GROUP" >/dev/null; then
   groupadd --system "$MEDIA_GROUP"
 fi
+validate_system_group "$MEDIA_GROUP"
 usermod -a -G "$MEDIA_GROUP" oldsparky-api
 usermod -a -G "$MEDIA_GROUP" oldsparky-worker
+
+for service_user in "${SERVICE_USERS[@]}"; do
+  primary_group="$(id -gn "$service_user")"
+  supplementary="$(
+    id -nG "$service_user" \
+      | tr ' ' '\n' \
+      | grep -vxF "$primary_group" \
+      | sort \
+      | paste -sd, - \
+      || true
+  )"
+  expected=""
+  if [[ "$service_user" == "oldsparky-api" || "$service_user" == "oldsparky-worker" ]]; then
+    expected="$MEDIA_GROUP"
+  fi
+  if [[ "$supplementary" != "$expected" ]]; then
+    echo "$service_user supplementary groups are unsafe: ${supplementary:-none}; expected ${expected:-none}." >&2
+    exit 1
+  fi
+done
 
 # The canonical operator env is the one source of truth, but no runtime identity
 # may read it directly.

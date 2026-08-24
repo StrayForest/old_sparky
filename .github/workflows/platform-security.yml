@@ -144,7 +144,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: "26"
+          node-version: "26.3.1"
           cache: npm
           cache-dependency-path: platform/apps/platform_web/package-lock.json
       - run: npm ci
@@ -209,7 +209,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: "26"
+          node-version: "26.3.1"
           cache: npm
           cache-dependency-path: platform/apps/platform_web/package-lock.json
 

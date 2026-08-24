@@ -90,6 +90,11 @@ if [[ ! -d "$APP_DIR" || -L "$APP_DIR" ]]; then
   exit 1
 fi
 APP_DIR="$(readlink -f "$APP_DIR")"
+if [[ "$NO_RESTART_REQUESTED" -eq 1 && "$DRY_RUN" -eq 0 \
+  && "$APP_DIR" == "/opt/oldsparky/platform" ]]; then
+  echo "Production rollback requires restart, readiness and smoke; --no-restart is refused." >&2
+  exit 2
+fi
 RELEASES_DIR="$APP_DIR/releases"
 SHARED_DIR="$APP_DIR/shared"
 SHARED_VENV_DIR="$SHARED_DIR/venv"
