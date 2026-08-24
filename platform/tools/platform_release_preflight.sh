@@ -202,17 +202,18 @@ DB_CHECK_OUTPUT="$(
 [[ "$DB_CHECK_OUTPUT" == *"platform-db-ok"* ]] || fail "Database warm-up check failed."
 pass "Database connectivity check passed"
 
+# Do not route read-only Alembic introspection through the active release's
+# shell wrapper: during the transition deployment that wrapper may predate the
+# safe dotenv parser. The canonical env is already parsed and exported above.
 ALEMBIC_CURRENT="$(
   cd "$CURRENT_TARGET" && \
-  PLATFORM_ENV_FILE="$ENV_FILE" \
-  PLATFORM_PYTHON_BIN="$PYTHON_BIN" \
-  tools/platform_run_alembic.sh current 2>/dev/null | tail -n 1 | awk '{print $1}'
+  PYTHONPATH="$CURRENT_TARGET" \
+  "$PYTHON_BIN" -m alembic current 2>/dev/null | tail -n 1 | awk '{print $1}'
 )"
 ALEMBIC_HEAD="$(
   cd "$CURRENT_TARGET" && \
-  PLATFORM_ENV_FILE="$ENV_FILE" \
-  PLATFORM_PYTHON_BIN="$PYTHON_BIN" \
-  tools/platform_run_alembic.sh heads 2>/dev/null | tail -n 1 | awk '{print $1}'
+  PYTHONPATH="$CURRENT_TARGET" \
+  "$PYTHON_BIN" -m alembic heads 2>/dev/null | tail -n 1 | awk '{print $1}'
 )"
 
 [[ -n "$ALEMBIC_CURRENT" ]] || fail "Could not resolve current Alembic revision."
