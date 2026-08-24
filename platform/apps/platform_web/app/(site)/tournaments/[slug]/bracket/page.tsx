@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
-import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 import { cookies } from "next/headers";
 import { ArrowLeft } from "lucide-react";
 import { BracketBoard } from "@/components/bracket/bracket-board";
 import { Hero } from "@/components/layout/hero";
+import { HistoryBackLink } from "@/components/layout/history-back-link";
 import { getTournamentWorkspace, PlatformApiError } from "@/lib/platform-api";
 
 export const metadata: Metadata = {
@@ -44,10 +44,10 @@ export default async function TournamentBracketPage({
       <div className="page-noise" aria-hidden="true" />
       <Hero title={tournament.title} subtitle="Следите за командами и результатами по ходу турнира." />
       <main className="main">
-        <Link className="outline-button tournament-profile-back" href={`/tournaments/${encodeURIComponent(slug)}`}>
+        <HistoryBackLink className="outline-button tournament-profile-back" fallbackHref={`/tournaments/${encodeURIComponent(slug)}`}>
           <ArrowLeft aria-hidden="true" size={18} />
           Назад к турниру
-        </Link>
+        </HistoryBackLink>
         <BracketBoard initialBracket={tournament.bracket} slug={slug} />
       </main>
     </>

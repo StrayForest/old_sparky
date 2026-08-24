@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { ArrowLeft, ExternalLink, Info, Users } from "lucide-react";
+import { ArrowLeft, Crown, ExternalLink, Info, RefreshCw, Users } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { TournamentCard } from "@/components/tournaments/tournament-card";
@@ -281,10 +281,19 @@ function TeamTable({
             <tr key={member.userId}>
               <td className="player-cell">
                 <span className="team-player-identity">
-                  <span className="team-player-avatar" aria-hidden="true">
+                  <span className="team-player-avatar">
                     {member.avatarUrl ? (
                       <CspImage alt="" height={32} src={member.avatarUrl} width={32} />
                     ) : avatarInitials(member.handle)}
+                    {member.isCaptain ? (
+                      <span className="team-player-role-icon team-player-role-icon-captain" role="img" aria-label="Капитан">
+                        <Crown aria-hidden="true" size={14} strokeWidth={2.5} />
+                      </span>
+                    ) : member.isSubstitute ? (
+                      <span className="team-player-role-icon team-player-role-icon-substitute" role="img" aria-label="Замена">
+                        <RefreshCw aria-hidden="true" size={13} strokeWidth={2.5} />
+                      </span>
+                    ) : null}
                   </span>
                   <span>{member.handle}</span>
                 </span>
@@ -304,7 +313,6 @@ function TeamTable({
                   </span>
                 ) : null}
               </td>
-              <td className="team-role-cell">{teamMemberRole(member)}</td>
               <td className="team-action-cell">
                 {member.userId === actorUserId ? (
                   <Link className="team-control" href="/profile/me">{t("tournament.viewProfile")}</Link>
@@ -365,14 +373,4 @@ function OpponentTeamsTable({ teams, onSelectTeam }: { teams: Team[]; onSelectTe
 
 function avatarInitials(handle: string): string {
   return handle.trim().slice(0, 2).toUpperCase() || "?";
-}
-
-function teamMemberRole(member: Team["members"][number]): string {
-  if (member.isCaptain) {
-    return "Капитан";
-  }
-  if (member.isSubstitute) {
-    return "Замена";
-  }
-  return "Игрок";
 }

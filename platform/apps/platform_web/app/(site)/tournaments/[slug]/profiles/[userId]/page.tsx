@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 import { cookies } from "next/headers";
-import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
+import { HistoryBackLink } from "@/components/layout/history-back-link";
 import { Hero } from "@/components/layout/hero";
 import { PublicProfileView } from "@/components/profile/public-profile-view";
 import { getTournamentPlayerProfile } from "@/lib/platform-api";
@@ -35,10 +35,10 @@ export default async function TournamentPlayerProfilePage({
         subtitle="Турнирные данные участника сформированного состава."
       />
       <main className="main">
-        <Link className="outline-button tournament-profile-back" href={`/tournaments/${encodeURIComponent(slug)}`}>
+        <HistoryBackLink className="outline-button tournament-profile-back" fallbackHref={`/tournaments/${encodeURIComponent(slug)}`}>
           <ArrowLeft aria-hidden="true" size={16} />
           Назад к турниру
-        </Link>
+        </HistoryBackLink>
         <PublicProfileView profile={profile} />
       </main>
     </>
