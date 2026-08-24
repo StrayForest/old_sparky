@@ -18,7 +18,12 @@ TOURNAMENTS_PER_SIZE = 5
 DEFAULT_USERS_PER_TOURNAMENT = 500
 INVITE_MAX_USES = 500
 INVITE_EXTRA_CAPACITY = 64
-INVITE_MAX_USERS = INVITE_MAX_USES - INVITE_EXTRA_CAPACITY
+INVITE_CLAIM_IP_LIMIT = 60
+INVITE_RATE_LIMIT_HEADROOM = 12
+INVITE_MAX_USERS = min(
+    INVITE_MAX_USES - INVITE_EXTRA_CAPACITY,
+    INVITE_CLAIM_IP_LIMIT - INVITE_RATE_LIMIT_HEADROOM,
+)
 
 
 MATRIX_STATES = {
@@ -31,22 +36,22 @@ MATRIX_STATES = {
     ),
     16: (
         ("public", "ready"),
-        ("invite_only", None),
+        ("public", None),
         ("public", "registered"),
-        ("invite_only", None),
+        ("public", None),
         ("public", None),
     ),
     32: (
-        ("invite_only", "ready"),
+        ("public", "ready"),
         ("public", None),
-        ("invite_only", "registered"),
+        ("public", "registered"),
         ("public", None),
-        ("invite_only", None),
+        ("public", None),
     ),
     64: (
-        ("invite_only", "assigned"),
+        ("public", "assigned"),
         ("public", "ready"),
-        ("invite_only", "registered"),
+        ("public", "registered"),
         ("public", None),
         ("public", None),
     ),
@@ -126,7 +131,7 @@ def validate_matrix_plan(plan: list[dict[str, Any]]) -> None:
     if len(assigned_items) != 1 or int(assigned_items[0]["teams"]) != 64:
         raise RuntimeError("The assigned control state must be on the 64-team run")
     if Counter(str(item["visibility"]) for item in plan) != Counter(
-        {"public": 11, "invite_only": 9}
+        {"public": 18, "invite_only": 2}
     ):
         raise RuntimeError("Invalid tournament visibility matrix")
 
