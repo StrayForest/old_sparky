@@ -168,6 +168,52 @@ introduce a cache/schema rewrite without retained evidence. If both VPS cores
 remain saturated after unnecessary work is removed, classify a capacity limit
 instead of hiding it with more local workers.
 
+### Manual retained user/tournament load matrix
+
+The operator-owned pre-production matrix is a manual load-test gate. It is not
+the browser smoke suite and must not target the public production origin. The
+default plan runs 20 sequential retained scale runs with approximately 500
+generated users per tournament (10,000 generated users total; the exact
+assignment-control run uses 383 synthetic players plus the control account),
+11 public and 9 invite-only tournaments, five tournaments each at 8, 16, 32
+and 64 teams, and 600 teams overall. Every generated account exercises
+ordinary profile writes, Deadlock profile writes,
+captain-profile/dream-slot writes, a changed-and-saved revision of each, and a
+persisted workspace read. Tournament participants then use the real API for
+public registration or invite claim plus registration, ready-check votes,
+captain selection, asynchronous assignment, roster lock and opening-bracket
+creation.
+
+The 10,000 synthetic accounts are provisioned in the pre-production database
+so email delivery, verification and anti-bot controls do not become the test
+subject. Profile saves and all tournament actions are real API requests. The
+matrix itself is started manually by an operator and is a load test, not a
+browser smoke run.
+
+The control account is passed at runtime and is never modified. The matrix
+places it in registered-only, ready-check and exactly one assignment-control
+run so the operator can inspect the retained tournaments manually:
+
+```bash
+cd /root/old_sparky/platform
+.venv_platform/bin/python tools/platform_seed_retained_tournament_matrix.py \
+  --origin http://127.0.0.1 \
+  --control-email <existing-account-email>
+```
+
+The command retains its marked users and tournaments for inspection and writes
+one report per tournament plus `matrix-summary.json` under
+`/opt/oldsparky/platform/shared/preprod-retained-matrix/<batch-id>/`. Performance
+collection is enabled by default and records client phase latency, route-level
+request/SQL data, CPU/RAM/load, PostgreSQL connections/waits, worker lifecycle
+and a compact per-run and matrix-level bottleneck summary. Use `--skip-performance` or
+`--skip-profile-journey` only for a deliberately reduced diagnostic run.
+
+The matrix is destructive to pre-production data volume and must be followed
+by the marked pre-production cleanup procedure after manual inspection. Never
+put a real account password, session token or live production origin in the
+command or a report.
+
 ## Alert thresholds
 
 - failed/restarted service;

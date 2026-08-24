@@ -174,6 +174,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--tournament-visibility",
+        choices=("public", "invite_only"),
+        default="public",
+        help="Visibility for a retained scale tournament.",
+    )
+    parser.add_argument(
+        "--profile-journey",
+        action="store_true",
+        help=(
+            "Exercise ordinary profile, Deadlock profile and captain-profile "
+            "writes, changes and persisted reads for every scale user."
+        ),
+    )
+    parser.add_argument(
         "--tournament-name",
         default=None,
         help="Optional public tournament name for a retained scale QA run.",
@@ -201,6 +215,23 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Existing account to include before ready-check and auto-assignment. "
             "Allowed only for a retained scale run; its profile is read but never changed."
+        ),
+    )
+    parser.add_argument(
+        "--control-participant-email",
+        default=None,
+        help=(
+            "Existing account to join through the participant API in a retained "
+            "scale run; its profile is read but never changed."
+        ),
+    )
+    parser.add_argument(
+        "--control-participant-state",
+        choices=("registered", "ready", "assigned"),
+        default=None,
+        help=(
+            "Final control-account journey: registered only, ready-check voter, "
+            "or eligible for team assignment."
         ),
     )
     parser.add_argument("--keep-data", action="store_true")
@@ -1638,6 +1669,8 @@ class ProductionQa:
         scale_site_mix_users: int | None = None,
         scale_bracket_view_users: int | None = None,
         scale_final_view_profile: str = "current",
+        tournament_visibility: str = "public",
+        profile_journey: bool = False,
         browser_polling_profile: str = BROWSER_POLLING_PROFILE_NAME,
         browser_polling_duration: float = BROWSER_POLLING_DURATION_SECONDS,
         browser_polling_users_per_tournament: int = BROWSER_POLLING_USERS_PER_TOURNAMENT,
@@ -1649,6 +1682,8 @@ class ProductionQa:
         retained_participant_email: str | None = None,
         retained_participant_state: str = "registered",
         rostered_participant_email: str | None = None,
+        control_participant_email: str | None = None,
+        control_participant_state: str | None = None,
     ) -> None:
         timestamp = datetime.now(UTC).strftime("%y%m%d%H%M%S")
         prefix = "preprod" if mode in {"scale", "browser-polling", "write-burst"} else "qa"
@@ -1661,6 +1696,10 @@ class ProductionQa:
         if len(requested_tournament_name) > 25:
             raise ValueError("QA tournament name must not exceed 25 characters.")
         self.tournament_name = requested_tournament_name or f"PRE {self.marker}"[:25]
+        if tournament_visibility not in {"public", "invite_only"}:
+            raise ValueError("tournament_visibility must be public or invite_only")
+        self.tournament_visibility = tournament_visibility
+        self.profile_journey = bool(profile_journey)
         self.retained_participant_email = (retained_participant_email or "").strip().lower() or None
         self.retained_participant_state = (
             "ready-unassigned" if retained_participant_state == "ready-unassigned" else "registered"
@@ -1674,6 +1713,24 @@ class ProductionQa:
             raise ValueError(
                 "--rostered-participant-email requires --mode scale and --keep-data."
             )
+        self.control_participant_email = (control_participant_email or "").strip().lower() or None
+        if self.control_participant_email and (mode != "scale" or not keep_data):
+            raise ValueError(
+                "--control-participant-email requires --mode scale and --keep-data."
+            )
+        if self.control_participant_email and control_participant_state not in {
+            "registered",
+            "ready",
+            "assigned",
+        }:
+            raise ValueError(
+                "--control-participant-state is required with --control-participant-email."
+            )
+        if control_participant_state and not self.control_participant_email:
+            raise ValueError(
+                "--control-participant-email is required with --control-participant-state."
+            )
+        self.control_participant_state = control_participant_state
         self.browser_gate_dir = browser_gate_dir
         self.browser_gate_timeout = browser_gate_timeout
         self.http_timeout = max(1.0, http_timeout)
@@ -1731,6 +1788,7 @@ class ProductionQa:
         self.user_ids: list[str] = []
         self.session_tokens_by_user_id: dict[str, str] = {}
         self.rostered_session_token_digest: str | None = None
+        self.control_participant_session_token_digest: str | None = None
         self.tournament_id: str | None = None
         self.tournament_slug: str | None = None
         self.tournament_ids: list[str] = []
@@ -1745,9 +1803,12 @@ class ProductionQa:
             "report_path": str(report_path),
             "requested_users": self.scale_users if mode in {"scale", "browser-polling", "write-burst"} else None,
             "http_timeout_seconds": self.http_timeout,
+            "profile_journey": self.profile_journey,
             "scenarios": self.scenarios,
             "user_ids": self.user_ids,
             "tournament_ids": [],
+            "tournament_visibility": self.tournament_visibility,
+            "invite_code": None,
             "teams": [],
             "strength_ranking": [],
             "initial_pairings": [],
@@ -1760,6 +1821,7 @@ class ProductionQa:
             "write_burst": {},
             "retained_participant": None,
             "rostered_participant": None,
+            "control_participant": None,
         }
 
     def scenario(self, name: str, ok: bool, detail: Any = None) -> None:
@@ -2320,6 +2382,61 @@ class ProductionQa:
             await db_session.commit()
         self.rostered_session_token_digest = None
 
+    async def add_control_participant_session(self) -> dict[str, Any] | None:
+        if self.control_participant_email is None:
+            return None
+        async with session_factory()() as db_session:
+            row = (
+                await db_session.execute(
+                    select(User, PlayerProfile, DeadlockProfile)
+                    .join(PlayerProfile, PlayerProfile.user_id == User.id)
+                    .join(DeadlockProfile, DeadlockProfile.user_id == User.id)
+                    .where(func.lower(User.email) == self.control_participant_email)
+                )
+            ).one_or_none()
+            if row is None:
+                raise QaFailure(
+                    "control_participant: account and complete Deadlock profile are required"
+                )
+            user, profile, deadlock_profile = row
+            token = new_session_token()
+            token_digest = session_token_digest(token)
+            db_session.add(
+                UserSession(
+                    user_id=user.id,
+                    token_digest=token_digest,
+                    ip_address="127.0.0.1",
+                    user_agent=f"platform-production-qa-control:{self.marker}",
+                    expires_at=datetime.now(UTC) + timedelta(hours=1),
+                )
+            )
+            await db_session.commit()
+
+        self.session_tokens_by_user_id[user.id] = token
+        self.control_participant_session_token_digest = token_digest
+        return {
+            "id": user.id,
+            "label": "control-participant",
+            "email": user.email,
+            "display_name": profile.display_name,
+            "rank": deadlock_profile.rank,
+            "subrank": deadlock_profile.subrank,
+            "roles": list(deadlock_profile.roles or []),
+            "heroes": list(deadlock_profile.pool or []),
+        }
+
+    async def remove_control_participant_session(self) -> None:
+        if self.control_participant_session_token_digest is None:
+            return
+        async with session_factory()() as db_session:
+            await db_session.execute(
+                delete(UserSession).where(
+                    UserSession.token_digest == self.control_participant_session_token_digest
+                )
+            )
+            await db_session.commit()
+        self.control_participant_session_token_digest = None
+
     async def bounded_each(self, items: list[dict[str, Any]], task) -> None:
         semaphore = asyncio.Semaphore(self.concurrency)
 
@@ -2375,6 +2492,7 @@ class ProductionQa:
                         {
                             "id": user.id,
                             "label": label,
+                            "profile_index": index,
                             "email": user.email,
                             "display_name": user.display_name,
                             "rank": rank,
@@ -2425,6 +2543,168 @@ class ProductionQa:
 
         self.users_by_id.update({user["id"]: user for user in users})
         return users
+
+    def _profile_write_payloads(
+        self,
+        user: dict[str, Any],
+        *,
+        changed: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        index = int(user["profile_index"])
+        pattern_offset = 1 if changed else 0
+        roles = ROLE_PATTERNS[(index + pattern_offset) % len(ROLE_PATTERNS)]
+        heroes = HERO_PATTERNS[(index + pattern_offset) % len(HERO_PATTERNS)]
+        captain_priority = "yes" if index < self.scale_teams * 2 else "neutral"
+        if changed and index >= self.scale_teams * 2:
+            captain_priority = "no"
+        display_name = qa_display_name(
+            self.marker,
+            f"u{index:05d}" if not changed else f"v{index:05d}",
+        )
+        suffix = "b" if changed else "a"
+        general = {
+            "display_name": display_name,
+            "handle": f"{self.marker}-{index:05d}-{suffix}",
+            "bio": f"Load profile {self.marker} revision {suffix}.",
+            "region": "NA" if changed else "EU",
+            "discord_account": f"qa-{self.marker}-{index:05d}-{suffix}",
+            "captain_team_name": f"C{index:05d}{suffix}"[:15],
+        }
+        deadlock = {
+            "rank": VALID_RANKS[(index + pattern_offset) % len(VALID_RANKS)],
+            "subrank": ((index + pattern_offset) % 6) + 1,
+            "playtime": "2001-3000" if changed else "1501-2000",
+            "roles": list(roles),
+            "pool": list(heroes),
+            "captain_priority": captain_priority,
+        }
+        captain = {
+            "captain_team_name": f"C{index:05d}{suffix}"[:15],
+            "slots": [
+                {
+                    "slot_number": slot_number,
+                    "allowed_roles": [
+                        ROLE_PATTERNS[(index + pattern_offset + slot_number - 1) % len(ROLE_PATTERNS)][0]
+                    ],
+                    "desired_heroes": [
+                        HERO_PATTERNS[(index + pattern_offset + slot_number - 1) % len(HERO_PATTERNS)][0]
+                    ],
+                }
+                for slot_number in range(1, 7)
+            ],
+        }
+        return general, deadlock, captain
+
+    async def run_profile_journey(
+        self,
+        api_client: httpx.AsyncClient,
+        users: list[dict[str, Any]],
+    ) -> None:
+        if not users:
+            return
+
+        async def write_general(user: dict[str, Any], *, changed: bool) -> None:
+            general, _, _ = self._profile_write_payloads(user, changed=changed)
+            response = await self.request_as(
+                api_client,
+                user,
+                "PUT",
+                "/profiles/me",
+                expected=200,
+                json_payload=general,
+            )
+            if response.get("display_name") != general["display_name"]:
+                raise QaFailure(f"profile_general_persisted: {user['label']}")
+
+        async def write_deadlock(user: dict[str, Any], *, changed: bool) -> None:
+            _, deadlock, _ = self._profile_write_payloads(user, changed=changed)
+            response = await self.request_as(
+                api_client,
+                user,
+                "PUT",
+                "/profiles/me/deadlock",
+                expected=200,
+                json_payload=deadlock,
+            )
+            if response.get("rank") != deadlock["rank"]:
+                raise QaFailure(f"profile_deadlock_persisted: {user['label']}")
+
+        async def write_captain(user: dict[str, Any], *, changed: bool) -> None:
+            _, _, captain = self._profile_write_payloads(user, changed=changed)
+            response = await self.request_as(
+                api_client,
+                user,
+                "PUT",
+                "/profiles/me/captain",
+                expected=200,
+                json_payload=captain,
+            )
+            if response.get("captain_team_name") != captain["captain_team_name"]:
+                raise QaFailure(f"profile_captain_persisted: {user['label']}")
+            if len(response.get("dream_slots") or []) != len(captain["slots"]):
+                raise QaFailure(f"profile_captain_slots_persisted: {user['label']}")
+
+        async def verify_workspace(user: dict[str, Any], *, changed: bool) -> None:
+            general, deadlock, captain = self._profile_write_payloads(user, changed=changed)
+            workspace = await self.request_as(
+                api_client,
+                user,
+                "GET",
+                "/profiles/me/workspace",
+                expected=200,
+            )
+            profile = workspace.get("profile") or {}
+            deadlock_profile = workspace.get("deadlock_profile") or {}
+            dream_slots = workspace.get("dream_slots") or []
+            if (
+                profile.get("display_name") != general["display_name"]
+                or profile.get("captain_team_name") != captain["captain_team_name"]
+                or deadlock_profile.get("rank") != deadlock["rank"]
+                or len(dream_slots) != len(captain["slots"])
+            ):
+                raise QaFailure(f"profile_workspace_persisted: {user['label']}")
+
+        with self.phase("profile_general_initial"):
+            await self.bounded_each(users, lambda user: write_general(user, changed=False))
+        with self.phase("profile_deadlock_initial"):
+            await self.bounded_each(users, lambda user: write_deadlock(user, changed=False))
+        with self.phase("profile_captain_initial"):
+            await self.bounded_each(users, lambda user: write_captain(user, changed=False))
+        with self.phase("profile_workspace_initial_read"):
+            await self.bounded_each(users, lambda user: verify_workspace(user, changed=False))
+        with self.phase("profile_general_changed"):
+            await self.bounded_each(users, lambda user: write_general(user, changed=True))
+        with self.phase("profile_deadlock_changed"):
+            await self.bounded_each(users, lambda user: write_deadlock(user, changed=True))
+        with self.phase("profile_captain_changed"):
+            await self.bounded_each(users, lambda user: write_captain(user, changed=True))
+        with self.phase("profile_workspace_changed_read"):
+            await self.bounded_each(users, lambda user: verify_workspace(user, changed=True))
+
+        self.report["profile_journey"] = {
+            "users": len(users),
+            "writes_per_user": 6,
+            "verification_reads_per_user": 2,
+            "phases": [
+                "profile_general_initial",
+                "profile_deadlock_initial",
+                "profile_captain_initial",
+                "profile_workspace_initial_read",
+                "profile_general_changed",
+                "profile_deadlock_changed",
+                "profile_captain_changed",
+                "profile_workspace_changed_read",
+            ],
+        }
+        self.scenario(
+            "scale_profile_journey_persisted",
+            True,
+            {
+                "users": len(users),
+                "writes": len(users) * 6,
+                "verification_reads": len(users) * 2,
+            },
+        )
 
     async def configure_scale_captain_preferences(self, captain_ids: list[str]) -> None:
         slot_roles = ["Carry", "Semi-Carry", "Support", "Semi-Support", "Carry", "Support"]
@@ -3803,6 +4083,36 @@ class ProductionQa:
 
             await self.bounded_each(remaining, view_bracket)
 
+    async def join_scale_participant(
+        self,
+        api_client: httpx.AsyncClient,
+        user: dict[str, Any],
+        *,
+        invite_code: str | None,
+        organizer_id: str,
+    ) -> None:
+        if invite_code is not None and str(user["id"]) != organizer_id:
+            await self.request_as(
+                api_client,
+                user,
+                "POST",
+                "/tournaments/invites/claim",
+                expected=201,
+                json_payload={
+                    "code": invite_code,
+                    "entry_type": "solo",
+                    "team_name": None,
+                },
+            )
+        await self.request_as(
+            api_client,
+            user,
+            "POST",
+            f"/tournaments/{self.tournament_slug}/join",
+            expected=201,
+            json_payload={"entry_type": "solo"},
+        )
+
     async def register_user(
         self,
         *,
@@ -4017,6 +4327,8 @@ class ProductionQa:
                 len(users) == self.scale_users,
                 {"users": len(users)},
             )
+            if self.profile_journey:
+                await self.run_profile_journey(api_client, users)
 
             with self.phase("tournament_setup"):
                 created = await self.request_as(
@@ -4028,7 +4340,7 @@ class ProductionQa:
                     json_payload={
                         "name": self.tournament_name,
                         "description": f"Large preprod QA tournament {self.marker}.",
-                        "visibility": "public",
+                        "visibility": self.tournament_visibility,
                         "format_slug": "solo",
                         "allowed_ranks": VALID_RANKS,
                         "max_participants": self.scale_users + 64,
@@ -4053,8 +4365,30 @@ class ProductionQa:
                     expected=200,
                     json_payload={"status": "registration_open"},
                 )
+            invite_code: str | None = None
+            if self.tournament_visibility == "invite_only":
+                with self.phase("invite_setup"):
+                    invite = await self.request_as(
+                        api_client,
+                        organizer,
+                        "POST",
+                        f"/tournaments/{self.tournament_slug}/invites",
+                        expected=201,
+                        json_payload={
+                            "note": self.marker,
+                            "max_uses": self.scale_users + 64,
+                            "expires_at": None,
+                        },
+                    )
+                invite_code = str(invite["code"])
+                self.report["invite_code"] = invite_code
+                self.scenario(
+                    "scale_invite_only_code_created",
+                    bool(invite_code),
+                    {"visibility": self.tournament_visibility},
+                )
 
-            if self.scale_site_mix_users > 0:
+            if self.scale_site_mix_users > 0 and self.tournament_visibility == "public":
                 site_mix_started = time.monotonic()
                 with self.phase("public_site_mix"):
                     await self.run_scale_site_mix(
@@ -4075,24 +4409,51 @@ class ProductionQa:
                         "seconds": self.report["public_site_mix_seconds"],
                     },
                 )
+            elif self.scale_site_mix_users > 0:
+                self.report["public_site_mix_skipped"] = {
+                    "users": self.scale_site_mix_users,
+                    "reason": "invite_only participants must claim the invite before reads",
+                }
 
             join_participants = users
+            control_participant = await self.add_control_participant_session()
 
             async def join_user(user: dict[str, Any]) -> None:
-                await self.request_as(
+                await self.join_scale_participant(
                     api_client,
                     user,
-                    "POST",
-                    f"/tournaments/{self.tournament_slug}/join",
-                    expected=201,
-                    json_payload={"entry_type": "solo"},
+                    invite_code=invite_code,
+                    organizer_id=str(organizer["id"]),
                 )
 
             join_started = time.monotonic()
             with self.phase("join_tournament"):
                 await self.bounded_each(join_participants, join_user)
+                if control_participant is not None:
+                    await self.join_scale_participant(
+                        api_client,
+                        control_participant,
+                        invite_code=invite_code,
+                        organizer_id=str(organizer["id"]),
+                    )
                 rostered_participant = await self.add_rostered_participant()
-            workflow_users = users + ([rostered_participant] if rostered_participant is not None else [])
+            workflow_users = users + (
+                [rostered_participant] if rostered_participant is not None else []
+            )
+            if control_participant is not None and self.control_participant_state in {
+                "ready",
+                "assigned",
+            }:
+                workflow_users.append(control_participant)
+            if control_participant is not None:
+                self.report["control_participant"] = {
+                    "user_id": control_participant["id"],
+                    "email": control_participant["email"],
+                    "state": self.control_participant_state,
+                    "joined_via_api": True,
+                    "ready_choice": self.control_participant_state in {"ready", "assigned"},
+                    "assigned_to_team": False,
+                }
             join_seconds = time.monotonic() - join_started
             self.report["join_seconds"] = round(join_seconds, 4)
             self.scenario(
@@ -4226,9 +4587,13 @@ class ProductionQa:
                 },
             )
 
-            rostered_user_id = str(rostered_participant["id"]) if rostered_participant is not None else None
+            protected_user_ids = {
+                str(user["id"])
+                for user in (rostered_participant, control_participant)
+                if user is not None
+            }
             await self.configure_scale_captain_preferences(
-                [user_id for user_id in captain_ids if user_id != rostered_user_id]
+                [user_id for user_id in captain_ids if user_id not in protected_user_ids]
             )
             assignment_started = time.monotonic()
             with self.phase("auto_assignment_run"):
@@ -4298,6 +4663,37 @@ class ProductionQa:
                     assigned_team is not None,
                     rostered_report,
                 )
+            if control_participant is not None:
+                control_user_id = str(control_participant["id"])
+                assigned_team = next(
+                    (
+                        team
+                        for team in final_run["teams"]
+                        if str(team["captain"]["user_id"]) == control_user_id
+                        or any(
+                            str(slot["assigned_player"]["user_id"]) == control_user_id
+                            for slot in team.get("starter_slots") or []
+                        )
+                        or (
+                            team.get("reserve_slot") is not None
+                            and str(team["reserve_slot"]["assigned_player"]["user_id"])
+                            == control_user_id
+                        )
+                    ),
+                    None,
+                )
+                control_report = self.report["control_participant"]
+                control_report.update({
+                    "assigned_to_team": assigned_team is not None,
+                    "team_id": assigned_team.get("team_id") if assigned_team else None,
+                    "team_name": assigned_team.get("team_name") if assigned_team else None,
+                })
+                if self.control_participant_state == "assigned":
+                    self.scenario(
+                        "control_participant_assigned",
+                        assigned_team is not None,
+                        control_report,
+                    )
 
             with self.phase("bracket_seed"):
                 await self.request_as(
@@ -4460,6 +4856,8 @@ class ProductionQa:
             await self.stop_performance_collection()
             with suppress(Exception):
                 await self.remove_rostered_participant_session()
+            with suppress(Exception):
+                await self.remove_control_participant_session()
             for client in self.clients:
                 await client.aclose()
             if not self.keep_data:
@@ -5201,6 +5599,8 @@ def cli_report_summary(report: dict[str, Any]) -> dict[str, Any]:
         "tournament_slug": report.get("tournament_slug"),
         "created_users": report.get("created_users"),
         "requested_users": report.get("requested_users"),
+        "tournament_visibility": report.get("tournament_visibility"),
+        "profile_journey": report.get("profile_journey"),
         "teams": len(report.get("strength_ranking") or []),
         "matches": len(report.get("match_path") or []) or report.get("matches_count"),
         "duration_seconds": report.get("duration_seconds"),
@@ -5243,6 +5643,7 @@ def cli_report_summary(report: dict[str, Any]) -> dict[str, Any]:
         ),
         "rostered_participant": report.get("rostered_participant"),
         "retained_participant": report.get("retained_participant"),
+        "control_participant": report.get("control_participant"),
         "scenarios": [
             {
                 "name": scenario.get("name"),
@@ -5278,6 +5679,8 @@ async def async_main() -> int:
         scale_site_mix_users=args.scale_site_mix_users,
         scale_bracket_view_users=args.scale_bracket_view_users,
         scale_final_view_profile=args.scale_final_view_profile,
+        tournament_visibility=args.tournament_visibility,
+        profile_journey=args.profile_journey,
         browser_polling_profile=args.browser_polling_profile,
         browser_polling_duration=args.browser_polling_duration,
         browser_polling_users_per_tournament=args.browser_polling_users_per_tournament,
@@ -5289,6 +5692,8 @@ async def async_main() -> int:
         retained_participant_email=args.retained_participant_email,
         retained_participant_state=args.retained_participant_state,
         rostered_participant_email=args.rostered_participant_email,
+        control_participant_email=args.control_participant_email,
+        control_participant_state=args.control_participant_state,
     )
     try:
         if args.mode == "scale":

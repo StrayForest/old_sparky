@@ -29,6 +29,61 @@ class ProductionQaPollingProfileTests(unittest.TestCase):
 
         self.assertEqual(qa.rostered_participant_email, "owner@example.com")
 
+    def test_control_participant_requires_state_and_retained_scale_mode(self) -> None:
+        kwargs = {
+            "origin": "http://127.0.0.1",
+            "report_path": Path("/tmp/platform-production-qa-control-test.json"),
+            "browser_gate_dir": None,
+            "browser_gate_timeout": 1.0,
+            "http_timeout": 1.0,
+            "control_participant_email": "owner@example.com",
+        }
+
+        with self.assertRaisesRegex(ValueError, "control-participant-state"):
+            ProductionQa(keep_data=True, mode="scale", **kwargs)
+
+        with self.assertRaisesRegex(ValueError, "mode scale and --keep-data"):
+            ProductionQa(
+                keep_data=False,
+                mode="targeted",
+                control_participant_email="owner@example.com",
+                control_participant_state="assigned",
+                **{key: value for key, value in kwargs.items() if key != "control_participant_email"},
+            )
+
+        qa = ProductionQa(
+            keep_data=True,
+            mode="scale",
+            control_participant_state="assigned",
+            tournament_visibility="invite_only",
+            profile_journey=True,
+            **kwargs,
+        )
+        self.assertEqual(qa.tournament_visibility, "invite_only")
+        self.assertTrue(qa.profile_journey)
+        self.assertEqual(qa.control_participant_state, "assigned")
+
+    def test_profile_payloads_have_changeable_general_deadlock_and_captain_data(self) -> None:
+        qa = ProductionQa(
+            origin="http://127.0.0.1",
+            report_path=Path("/tmp/platform-production-qa-profile-test.json"),
+            browser_gate_dir=None,
+            browser_gate_timeout=1.0,
+            http_timeout=1.0,
+            keep_data=True,
+            mode="scale",
+            scale_users=20,
+            scale_teams=2,
+        )
+        user = {"id": "user", "label": "p", "profile_index": 0}
+        initial = qa._profile_write_payloads(user, changed=False)
+        changed = qa._profile_write_payloads(user, changed=True)
+
+        self.assertNotEqual(initial[0], changed[0])
+        self.assertNotEqual(initial[1], changed[1])
+        self.assertNotEqual(initial[2], changed[2])
+        self.assertEqual(len(initial[2]["slots"]), 6)
+
     def test_polling_metrics_group_events(self) -> None:
         recorder = PollingMetricsRecorder()
         recorder.mark(
