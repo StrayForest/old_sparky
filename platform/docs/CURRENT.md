@@ -122,6 +122,10 @@ against the current web/api/worker identities and units.
   baseline is API `2 x (3 + 1)` plus worker `2 x (2 + 0)` within a 12-connection
   budget. Celery uses high/default/low queues, prefetch one and late acks;
   backlog/retry pressure is part of the load evidence.
+- The final 20×500 browser-polling gate keeps fixture state bounded to at most
+  32 participants per tournament and uses four setup lanes plus one shared
+  request semaphore. Its five-minute auto-assignment wait is fail-fast; the
+  write-burst profile owns join/ready-vote contention measurements.
 - Ready-check votes must be committed only while their round is active and the
   voter remains an eligible active participant. A close or exclusion cannot
   leave a post-close or ineligible vote in persistence.

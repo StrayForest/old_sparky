@@ -114,10 +114,16 @@ broad user/table delete.
 6. **Completed in branch:** add metrics, focused tests, CI/pre-deploy test
    ownership, the 20×500 browser-polling profile and exact retained-load
    cleanup support; remove stale code/docs.
-7. Run documentation and focused checks, then the GitHub security/build gate.
-8. Commit, push/merge to `dev`, observe auto-deploy and production smoke.
-9. Run the approved retained load matrix, clean exact fixtures and archive
-   compact before/after evidence.
+7. **Completed in branch:** make the 10k browser profile measure polling rather
+   than fixture creation: use at most 32 persisted participants per tournament,
+   run state setup behind bounded gates, pass tournament slugs explicitly, and
+   fail auto-assignment setup after five minutes instead of waiting for the
+   retained-load ceiling. Join/ready-vote contention remains covered by the
+   write-burst profile.
+8. Run documentation and focused checks, then the GitHub security/build gate.
+9. Commit, push/merge to `dev`, observe auto-deploy and production smoke.
+10. Run the approved retained load matrix, clean exact fixtures and archive
+    compact before/after evidence.
 
 Operational finding from the first live browser-polling attempt (2026-08-24):
 the browser harness reached a long async-assignment wait and the GitHub

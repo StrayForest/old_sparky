@@ -101,6 +101,24 @@ class ProductionQaPollingProfileTests(unittest.TestCase):
         self.assertEqual(qa.scale_users, 10_000)
         self.assertEqual(qa.http_max_connections, 10_000)
         self.assertTrue(qa.browser_polling_active_users_only)
+        self.assertEqual(qa.browser_polling_state_participants, 32)
+
+    def test_browser_polling_fixture_roster_is_bounded_for_read_load(self) -> None:
+        qa = ProductionQa(
+            origin="http://127.0.0.1",
+            report_path=Path("/tmp/platform-production-qa-fixture-test.json"),
+            browser_gate_dir=None,
+            browser_gate_timeout=1.0,
+            http_timeout=180.0,
+            keep_data=True,
+            mode="browser-polling",
+            browser_polling_users_per_tournament=500,
+        )
+
+        users = [{"id": str(index)} for index in range(500)]
+
+        self.assertEqual(qa.browser_polling_state_participant_count(users), 32)
+        self.assertEqual(qa.browser_polling_state_participant_count(users[:10]), 9)
 
     def test_browser_polling_defaults_to_10000_virtual_users(self) -> None:
         qa = ProductionQa(

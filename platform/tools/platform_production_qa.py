@@ -95,6 +95,12 @@ BROWSER_POLLING_FIXED_INTERVAL_MS = 10_000
 BROWSER_POLLING_DEFAULT_INTERVAL_MS = 15_000
 BROWSER_POLLING_JITTER_MS = 3_000
 BROWSER_POLLING_READY_TEAMS = 2
+# The browser profile measures read fan-out, conditional responses and tab
+# lifecycle.  A small but valid roster keeps fixture creation from becoming a
+# second load test; join/vote contention is covered by the write-burst profile.
+BROWSER_POLLING_STATE_PARTICIPANTS = 32
+BROWSER_POLLING_SETUP_CONCURRENCY = 4
+BROWSER_POLLING_AUTO_ASSIGNMENT_TIMEOUT_SECONDS = 300.0
 BROWSER_POLLING_HOT_ROUTES = (
     "GET /tournaments/{slug}",
     "GET /tournaments/{slug}/workspace",
@@ -1810,6 +1816,10 @@ class ProductionQa:
             10,
             browser_polling_users_per_tournament,
         )
+        self.browser_polling_state_participants = min(
+            BROWSER_POLLING_STATE_PARTICIPANTS,
+            max(1, self.browser_polling_users_per_tournament - 1),
+        )
         self.browser_polling_open_stagger = max(0.0, browser_polling_open_stagger)
         self.browser_polling_active_users_only = bool(browser_polling_active_users_only)
         self.write_burst_profile = write_burst_profile
@@ -2199,19 +2209,24 @@ class ProductionQa:
         client: httpx.AsyncClient,
         user: dict[str, Any],
         *,
+        tournament_slug: str | None = None,
         previous_run_id: str | None = None,
         expected_teams: int | None = None,
     ) -> dict[str, Any]:
+        slug = tournament_slug or self.tournament_slug
+        if not slug:
+            raise QaFailure("Cannot wait for auto-assignment without a tournament slug.")
         job = await self.request_as(
             client,
             user,
             "POST",
-            f"/tournaments/{self.tournament_slug}/deadlock/auto-assignment/run-async",
+            f"/tournaments/{slug}/deadlock/auto-assignment/run-async",
             expected=202,
         )
         return await self._poll_auto_assignment_run_as(
             client,
             user,
+            tournament_slug=slug,
             previous_run_id=previous_run_id,
             expected_teams=expected_teams,
             task_id=str(job["task_id"]),
@@ -2221,17 +2236,22 @@ class ProductionQa:
         self,
         client: httpx.AsyncClient,
         *,
+        tournament_slug: str | None = None,
         previous_run_id: str | None = None,
         expected_teams: int | None = None,
     ) -> dict[str, Any]:
+        slug = tournament_slug or self.tournament_slug
+        if not slug:
+            raise QaFailure("Cannot wait for auto-assignment without a tournament slug.")
         job = await self.request(
             client,
             "POST",
-            f"/tournaments/{self.tournament_slug}/deadlock/auto-assignment/run-async",
+            f"/tournaments/{slug}/deadlock/auto-assignment/run-async",
             expected=202,
         )
         return await self._poll_auto_assignment_run(
             client,
+            tournament_slug=slug,
             previous_run_id=previous_run_id,
             expected_teams=expected_teams,
             task_id=str(job["task_id"]),
@@ -2242,22 +2262,36 @@ class ProductionQa:
         client: httpx.AsyncClient,
         user: dict[str, Any],
         *,
+        tournament_slug: str,
         previous_run_id: str | None,
         expected_teams: int | None,
         task_id: str,
     ) -> dict[str, Any]:
-        deadline = time.monotonic() + max(300.0, self.http_timeout * 12)
+        wait_seconds = (
+            BROWSER_POLLING_AUTO_ASSIGNMENT_TIMEOUT_SECONDS
+            if self.mode == "browser-polling"
+            else max(300.0, self.http_timeout * 12)
+        )
+        deadline = time.monotonic() + wait_seconds
         last_state: dict[str, Any] | None = None
         while time.monotonic() < deadline:
             state = await self.request_as(
                 client,
                 user,
                 "GET",
-                f"/tournaments/{self.tournament_slug}/deadlock/auto-assignment",
+                f"/tournaments/{tournament_slug}/deadlock/auto-assignment",
                 expected=200,
             )
             last_state = state
             latest_run = state.get("latest_run")
+            if isinstance(latest_run, dict) and latest_run.get("status") in {
+                "failed",
+                "cancelled",
+            }:
+                raise QaFailure(
+                    "Auto-assignment worker reported a terminal failure "
+                    f"task_id={task_id} state={latest_run}"
+                )
             if self._auto_assignment_run_matches(
                 latest_run,
                 previous_run_id=previous_run_id,
@@ -2275,21 +2309,35 @@ class ProductionQa:
         self,
         client: httpx.AsyncClient,
         *,
+        tournament_slug: str,
         previous_run_id: str | None,
         expected_teams: int | None,
         task_id: str,
     ) -> dict[str, Any]:
-        deadline = time.monotonic() + max(300.0, self.http_timeout * 12)
+        wait_seconds = (
+            BROWSER_POLLING_AUTO_ASSIGNMENT_TIMEOUT_SECONDS
+            if self.mode == "browser-polling"
+            else max(300.0, self.http_timeout * 12)
+        )
+        deadline = time.monotonic() + wait_seconds
         last_state: dict[str, Any] | None = None
         while time.monotonic() < deadline:
             state = await self.request(
                 client,
                 "GET",
-                f"/tournaments/{self.tournament_slug}/deadlock/auto-assignment",
+                f"/tournaments/{tournament_slug}/deadlock/auto-assignment",
                 expected=200,
             )
             last_state = state
             latest_run = state.get("latest_run")
+            if isinstance(latest_run, dict) and latest_run.get("status") in {
+                "failed",
+                "cancelled",
+            }:
+                raise QaFailure(
+                    "Auto-assignment worker reported a terminal failure "
+                    f"task_id={task_id} state={latest_run}"
+                )
             if self._auto_assignment_run_matches(
                 latest_run,
                 previous_run_id=previous_run_id,
@@ -2630,14 +2678,28 @@ class ProductionQa:
             await db_session.commit()
         self.control_participant_session_token_digest = None
 
-    async def bounded_each(self, items: list[dict[str, Any]], task) -> None:
-        semaphore = asyncio.Semaphore(self.concurrency)
+    async def bounded_each(
+        self,
+        items: list[dict[str, Any]],
+        task,
+        *,
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
+        request_semaphore = semaphore or asyncio.Semaphore(self.concurrency)
 
         async def run_one(item: dict[str, Any]) -> None:
-            async with semaphore:
+            async with request_semaphore:
                 await task(item)
 
         await asyncio.gather(*(run_one(item) for item in items))
+
+    def browser_polling_state_participant_count(
+        self,
+        users: list[dict[str, Any]],
+    ) -> int:
+        organizer_count = max(1, round(len(users) * 0.05))
+        available = max(0, len(users) - organizer_count)
+        return min(self.browser_polling_state_participants, available)
 
     async def bulk_register_scale_users(self) -> list[dict[str, Any]]:
         settings = get_settings()
@@ -3017,6 +3079,7 @@ class ProductionQa:
         *,
         tournament: dict[str, Any],
         participants: list[dict[str, Any]],
+        request_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         slug = str(tournament["slug"])
 
@@ -3030,7 +3093,7 @@ class ProductionQa:
                 json_payload={"entry_type": "solo"},
             )
 
-        await self.bounded_each(participants, join_user)
+        await self.bounded_each(participants, join_user, semaphore=request_semaphore)
 
     async def setup_browser_polling_tournament_state(
         self,
@@ -3039,6 +3102,7 @@ class ProductionQa:
         tournament: dict[str, Any],
         organizer: dict[str, Any],
         participants: list[dict[str, Any]],
+        request_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         category = str(tournament["category"])
         slug = str(tournament["slug"])
@@ -3047,6 +3111,7 @@ class ProductionQa:
                 api_client,
                 tournament=tournament,
                 participants=participants,
+                request_semaphore=request_semaphore,
             )
         if category == "registration_open":
             return
@@ -3089,7 +3154,7 @@ class ProductionQa:
                 json_payload={"choice": "yes"},
             )
 
-        await self.bounded_each(participants, vote_yes)
+        await self.bounded_each(participants, vote_yes, semaphore=request_semaphore)
         await self.request_as(
             api_client,
             organizer,
@@ -3105,16 +3170,12 @@ class ProductionQa:
             expected=201,
             json_payload={"teams_count": BROWSER_POLLING_READY_TEAMS},
         )
-        previous_slug = self.tournament_slug
-        self.tournament_slug = slug
-        try:
-            final_run = await self.wait_for_auto_assignment_run_as(
-                api_client,
-                organizer,
-                expected_teams=BROWSER_POLLING_READY_TEAMS,
-            )
-        finally:
-            self.tournament_slug = previous_slug
+        final_run = await self.wait_for_auto_assignment_run_as(
+            api_client,
+            organizer,
+            tournament_slug=slug,
+            expected_teams=BROWSER_POLLING_READY_TEAMS,
+        )
         run_id = str(final_run["id"])
         await self.request_as(
             api_client,
@@ -3157,7 +3218,7 @@ class ProductionQa:
             slug = str(tournament["slug"])
             category = str(tournament["category"])
             organizer_count = max(1, round(len(users) * 0.05))
-            participant_count = max(1, round(len(users) * 0.35))
+            participant_count = self.browser_polling_state_participant_count(users)
             for user_index, user in enumerate(users):
                 if user_index == 0:
                     role = "organizer"
@@ -3484,18 +3545,33 @@ class ProductionQa:
 
             active_participants = 0
             with self.phase("browser_polling_state_setup"):
-                for tournament, chunk in zip(tournaments, user_chunks):
+                setup_gate = asyncio.Semaphore(BROWSER_POLLING_SETUP_CONCURRENCY)
+                request_gate = asyncio.Semaphore(self.concurrency)
+
+                async def setup_one(
+                    tournament: dict[str, Any],
+                    chunk: list[dict[str, Any]],
+                ) -> None:
                     organizer_count = max(1, round(len(chunk) * 0.05))
-                    participant_count = max(1, round(len(chunk) * 0.35))
+                    participant_count = self.browser_polling_state_participant_count(chunk)
                     participants = chunk[organizer_count : organizer_count + participant_count]
-                    if tournament["category"] != "terminal":
-                        active_participants += len(participants)
-                    await self.setup_browser_polling_tournament_state(
-                        api_client,
-                        tournament=tournament,
-                        organizer=chunk[0],
-                        participants=participants,
-                    )
+                    async with setup_gate:
+                        await self.setup_browser_polling_tournament_state(
+                            api_client,
+                            tournament=tournament,
+                            organizer=chunk[0],
+                            participants=participants,
+                            request_semaphore=request_gate,
+                        )
+
+                active_participants = sum(
+                    self.browser_polling_state_participant_count(chunk)
+                    for tournament, chunk in zip(tournaments, user_chunks)
+                    if tournament["category"] != "terminal"
+                )
+                await asyncio.gather(
+                    *(setup_one(tournament, chunk) for tournament, chunk in zip(tournaments, user_chunks))
+                )
             await self.record_preprod_run(active_participants=active_participants)
 
             tabs = self.build_browser_polling_tabs(
@@ -3511,6 +3587,8 @@ class ProductionQa:
                 "duration_seconds": self.browser_polling_duration,
                 "tournament_plan": dict(BROWSER_POLLING_TOURNAMENT_PLAN),
                 "users_per_tournament": self.browser_polling_users_per_tournament,
+                "state_participants_per_tournament": self.browser_polling_state_participants,
+                "setup_concurrency": BROWSER_POLLING_SETUP_CONCURRENCY,
                 "open_stagger_seconds": self.browser_polling_open_stagger,
                 "tabs_planned": len(tabs),
                 "visible_tabs": sum(1 for tab in tabs if not tab["hidden_after_open"]),
