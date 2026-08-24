@@ -19,7 +19,7 @@ DEFAULT_USERS_PER_TOURNAMENT = 500
 INVITE_MAX_USES = 500
 INVITE_EXTRA_CAPACITY = 64
 INVITE_CLAIM_IP_LIMIT = 60
-INVITE_RATE_LIMIT_HEADROOM = 12
+INVITE_RATE_LIMIT_HEADROOM = 4
 INVITE_MAX_USERS = min(
     INVITE_MAX_USES - INVITE_EXTRA_CAPACITY,
     INVITE_CLAIM_IP_LIMIT - INVITE_RATE_LIMIT_HEADROOM,
@@ -162,8 +162,10 @@ def allocate_user_counts(
 
     # The scale QA flow reserves one invite code for the whole invite-only
     # tournament and keeps 64 uses available for retained/control members.
-    # Keep the synthetic population within the API's max_uses=500 contract;
-    # public tournaments absorb the exact-total remainder.
+    # The organizer joins without claiming, so 56 synthetic users plus the
+    # control participant consume 56 IP-limited claims. That is enough for
+    # eight seven-player teams while retaining four claims of headroom.
+    # Public tournaments absorb the exact-total remainder.
     invite_overflow = 0
     for index in remaining_indexes:
         if plan[index]["visibility"] != "invite_only":

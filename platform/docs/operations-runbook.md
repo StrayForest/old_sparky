@@ -175,7 +175,7 @@ the browser smoke suite and must not target the public production origin. The
 default plan runs 20 sequential retained scale runs with approximately 500
 generated users per tournament (10,000 generated users total; the exact
 assignment-control run uses 383 synthetic players plus the control account),
-11 public and 9 invite-only tournaments, five tournaments each at 8, 16, 32
+18 public and 2 invite-only tournaments, five tournaments each at 8, 16, 32
 and 64 teams, and 600 teams overall. Every generated account exercises
 ordinary profile writes, Deadlock profile writes,
 captain-profile/dream-slot writes, a changed-and-saved revision of each, and a
