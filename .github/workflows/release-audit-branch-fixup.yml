@@ -1,0 +1,90 @@
+name: Release audit branch fixup
+
+on:
+  push:
+    branches:
+      - fix/release-infra-audit-20260824-v2
+    paths:
+      - ".github/workflows/release-audit-branch-fixup.yml"
+      - "platform/tools/platform_release_rollback.sh"
+      - "platform/tools/platform_release_rollback_impl.sh"
+      - "platform/tools/platform_release_restore_runtime.sh"
+      - "platform/tools/platform_safe_env_exec.py"
+      - "platform/tests/test_platform_release_audit_hardening.py"
+
+permissions:
+  contents: write
+
+jobs:
+  fixup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/release-infra-audit-20260824-v2
+          fetch-depth: 1
+
+      - name: Apply deterministic branch patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+          rollback = root / 'platform/tools/platform_release_rollback.sh'
+          rollback_impl = root / 'platform/tools/platform_release_rollback_impl.sh'
+          runtime_restore = root / 'platform/tools/platform_release_restore_runtime.sh'
+          safe_env = root / 'platform/tools/platform_safe_env_exec.py'
+          audit_test = root / 'platform/tests/test_platform_release_audit_hardening.py'
+
+          if rollback_impl.exists():
+              text = rollback_impl.read_text(encoding='utf-8')
+              needle = 'APP_DIR="$(readlink -f "$APP_DIR")"\n'
+              guard = '''APP_DIR="$(readlink -f "$APP_DIR")"\nif [[ "$NO_RESTART_REQUESTED" -eq 1 && "$DRY_RUN" -eq 0 \\\n  && "$APP_DIR" == "/opt/oldsparky/platform" ]]; then\n  echo "Production rollback requires restart, readiness and smoke; --no-restart is refused." >&2\n  exit 2\nfi\n'''
+              if needle not in text:
+                  raise SystemExit('rollback APP_DIR resolution marker missing')
+              text = text.replace(needle, guard, 1)
+              rollback.write_text(text, encoding='utf-8')
+              rollback.chmod(0o755)
+              rollback_impl.unlink()
+
+          text = safe_env.read_text(encoding='utf-8')
+          alias = '\n# Backward-compatible private helper used by metadata regression tests.\n_validate_env_file = _validate_production_env_file\n'
+          if '_validate_env_file = _validate_production_env_file' not in text:
+              marker = '\ndef _read_env_bytes_at(path: Path, *, owners: tuple[int, ...]) -> bytes:\n'
+              if marker not in text:
+                  raise SystemExit('safe env helper insertion marker missing')
+              text = text.replace(marker, alias + marker, 1)
+              safe_env.write_text(text, encoding='utf-8')
+
+          text = runtime_restore.read_text(encoding='utf-8')
+          old = '''  if ! PLATFORM_APP_DIR="$APP_DIR" "$SHARED_VENV/bin/python" \\\n    "$NGINX_TOOL" --apply --reload --json; then\n    # The installer restores its disk snapshots on failure. Validate and reload\n    # that restored disk state before returning failure so active Nginx cannot\n    # remain divergent from the recovery contour.\n    /usr/sbin/nginx -t\n    /usr/bin/systemctl reload nginx.service\n    exit 1\n  fi\n'''
+          new = '''  set +e\n  PLATFORM_APP_DIR="$APP_DIR" "$SHARED_VENV/bin/python" \\\n    "$NGINX_TOOL" --apply --reload --json\n  nginx_status="$?"\n  set -e\n  if [[ "$nginx_status" -ne 0 ]]; then\n    # The installer restores its disk snapshots on failure. Validate and reload\n    # that restored disk state before returning failure so active Nginx cannot\n    # remain divergent from the recovery contour.\n    /usr/sbin/nginx -t\n    /usr/bin/systemctl reload nginx.service\n    exit "$nginx_status"\n  fi\n'''
+          if old in text:
+              runtime_restore.write_text(text.replace(old, new, 1), encoding='utf-8')
+          elif new not in text:
+              raise SystemExit('runtime restore nginx marker missing')
+
+          text = audit_test.read_text(encoding='utf-8')
+          old = '''    def test_operator_rollback_cannot_complete_without_restart_and_smoke(self) -> None:\n        rollback = self.read_tool("platform_release_rollback.sh")\n        self.assertIn("Refusing rollback without restart/readiness/smoke", rollback)\n        self.assertIn("platform_release_rollback_impl.sh", rollback)\n        self.assertTrue((TOOLS_DIR / "platform_release_rollback_impl.sh").is_file())\n'''
+          new = '''    def test_operator_rollback_cannot_complete_without_restart_and_smoke(self) -> None:\n        rollback = self.read_tool("platform_release_rollback.sh")\n        self.assertIn("Production rollback requires restart, readiness and smoke", rollback)\n        self.assertIn('"$APP_DIR" == "/opt/oldsparky/platform"', rollback)\n        self.assertIn("rollback-runtime-pending", rollback)\n        self.assertIn("smoke-passed", rollback)\n'''
+          if old in text:
+              audit_test.write_text(text.replace(old, new, 1), encoding='utf-8')
+          elif new not in text:
+              raise SystemExit('audit rollback assertion marker missing')
+          PY
+
+          if git diff --quiet; then
+            echo "No branch fixup required."
+            exit 0
+          fi
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add platform/tools/platform_release_rollback.sh \
+            platform/tools/platform_release_restore_runtime.sh \
+            platform/tools/platform_safe_env_exec.py \
+            platform/tests/test_platform_release_audit_hardening.py
+          git add -u platform/tools/platform_release_rollback_impl.sh
+          git commit -m "fix(platform): preserve release recovery test boundaries"
+          git push origin HEAD:fix/release-infra-audit-20260824-v2
