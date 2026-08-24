@@ -49,8 +49,8 @@ if _HELPER_SPEC is None or _HELPER_SPEC.loader is None:
 _HELPER_MODULE = importlib.util.module_from_spec(_HELPER_SPEC)
 sys.modules[_HELPER_SPEC.name] = _HELPER_MODULE
 _HELPER_SPEC.loader.exec_module(_HELPER_MODULE)
-_audit_subject_filters = _HELPER_MODULE._audit_subject_filters
 _audit_subject_ids_for_scope = _HELPER_MODULE._audit_subject_ids_for_scope
+_audit_scope_chunks = _HELPER_MODULE._audit_scope_chunks
 _validate_audit_scope = _HELPER_MODULE._validate_audit_scope
 _validate_tournament_graph_boundary = _HELPER_MODULE._validate_tournament_graph_boundary
 
@@ -315,9 +315,21 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             owner_user_ids=user_ids,
             tournament_ids=tournament_ids,
         )
-        audit_filters = [AuditLog.actor_user_id.in_(user_ids)]
-        audit_filters.extend(_audit_subject_filters(audit_subject_ids))
-        audit_result = await db_session.execute(delete(AuditLog).where(or_(*audit_filters)))
+        audit_logs_deleted = 0
+        for user_chunk in _audit_scope_chunks(user_ids):
+            audit_result = await db_session.execute(
+                delete(AuditLog).where(AuditLog.actor_user_id.in_(user_chunk))
+            )
+            audit_logs_deleted += int(audit_result.rowcount or 0)
+        for subject_type, subject_ids in audit_subject_ids.items():
+            for subject_chunk in _audit_scope_chunks(subject_ids):
+                audit_result = await db_session.execute(
+                    delete(AuditLog).where(
+                        AuditLog.subject_type == subject_type,
+                        AuditLog.subject_id.in_(subject_chunk),
+                    )
+                )
+                audit_logs_deleted += int(audit_result.rowcount or 0)
         tournament_result = (
             await db_session.execute(delete(Tournament).where(Tournament.id.in_(tournament_ids)))
             if tournament_ids
@@ -333,7 +345,7 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             "control_account_preserved": control_email,
             "users_deleted": int(user_result.rowcount or 0),
             "tournaments_deleted": int(tournament_result.rowcount or 0) if tournament_result else 0,
-            "audit_logs_deleted": int(audit_result.rowcount or 0),
+            "audit_logs_deleted": audit_logs_deleted,
             "media_metadata_deleted": int(media_deleted),
         }
         for run in runs:
@@ -350,17 +362,30 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             )
             or 0
         )
-        remaining_audit = int(
-            await verify_session.scalar(
-                select(func.count()).select_from(AuditLog).where(
-                    or_(
-                        AuditLog.actor_user_id.in_(user_ids),
-                        AuditLog.subject_id.in_(user_ids | tournament_ids),
+        remaining_audit_ids: set[str] = set()
+        for user_chunk in _audit_scope_chunks(user_ids):
+            remaining_audit_ids.update(
+                str(audit_id)
+                for audit_id in (
+                    await verify_session.scalars(
+                        select(AuditLog.id).where(
+                            AuditLog.actor_user_id.in_(user_chunk)
+                        )
                     )
-                )
+                ).all()
             )
-            or 0
-        )
+        for subject_chunk in _audit_scope_chunks(user_ids | tournament_ids):
+            remaining_audit_ids.update(
+                str(audit_id)
+                for audit_id in (
+                    await verify_session.scalars(
+                        select(AuditLog.id).where(
+                            AuditLog.subject_id.in_(subject_chunk)
+                        )
+                    )
+                ).all()
+            )
+        remaining_audit = len(remaining_audit_ids)
         control_remaining = int(
             await verify_session.scalar(
                 select(func.count()).select_from(User).where(func.lower(User.email) == control_email)

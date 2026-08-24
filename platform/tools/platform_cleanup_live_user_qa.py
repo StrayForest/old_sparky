@@ -44,6 +44,7 @@ MAX_INVENTORY_IDS = {
     "tournament_ids": 8,
     "media_ids": 32,
 }
+AUDIT_SCOPE_CHUNK_SIZE = 256
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,12 @@ def _json_user_filter(column, user_ids: set[str]):
     return or_(
         *(cast(column, Text).contains(f'"{user_id}"') for user_id in user_ids)
     )
+
+
+def _audit_scope_chunks(values: set[str]):
+    ordered_values = tuple(sorted(values))
+    for start in range(0, len(ordered_values), AUDIT_SCOPE_CHUNK_SIZE):
+        yield set(ordered_values[start : start + AUDIT_SCOPE_CHUNK_SIZE])
 
 
 async def _user_linked_tournament_ids(
@@ -287,55 +294,57 @@ async def _validate_audit_scope(
     audit_subject_ids: dict[str, set[str]],
 ) -> None:
     if user_ids:
-        actor_rows = (
-            await db_session.execute(
-                select(AuditLog.subject_type, AuditLog.subject_id).where(
-                    AuditLog.actor_user_id.in_(user_ids)
+        for user_chunk in _audit_scope_chunks(user_ids):
+            actor_rows = (
+                await db_session.execute(
+                    select(AuditLog.subject_type, AuditLog.subject_id).where(
+                        AuditLog.actor_user_id.in_(user_chunk)
+                    )
                 )
-            )
-        ).all()
-        if any(
-            row.subject_id is None
-            or str(row.subject_id)
-            not in audit_subject_ids.get(str(row.subject_type), set())
-            for row in actor_rows
-        ):
-            raise RuntimeError(
-                "Refusing to delete a liveqa actor audit row outside the exact inventory."
-            )
-        payload_rows = (
-            await db_session.execute(
-                select(AuditLog.subject_type, AuditLog.subject_id).where(
-                    _json_user_filter(AuditLog.payload, user_ids)
+            ).all()
+            if any(
+                row.subject_id is None
+                or str(row.subject_id)
+                not in audit_subject_ids.get(str(row.subject_type), set())
+                for row in actor_rows
+            ):
+                raise RuntimeError(
+                    "Refusing to delete a liveqa actor audit row outside the exact inventory."
                 )
-            )
-        ).all()
-        if any(
-            row.subject_id is None
-            or str(row.subject_id)
-            not in audit_subject_ids.get(str(row.subject_type), set())
-            for row in payload_rows
-        ):
-            raise RuntimeError(
-                "Refusing to leave a liveqa user reference in an out-of-scope audit payload."
-            )
+            payload_rows = (
+                await db_session.execute(
+                    select(AuditLog.subject_type, AuditLog.subject_id).where(
+                        _json_user_filter(AuditLog.payload, user_chunk)
+                    )
+                )
+            ).all()
+            if any(
+                row.subject_id is None
+                or str(row.subject_id)
+                not in audit_subject_ids.get(str(row.subject_type), set())
+                for row in payload_rows
+            ):
+                raise RuntimeError(
+                    "Refusing to leave a liveqa user reference in an out-of-scope audit payload."
+                )
 
-    subject_filters = _audit_subject_filters(audit_subject_ids)
-    if not subject_filters:
-        return
-    outside_actor_count = await db_session.scalar(
-        select(func.count())
-        .select_from(AuditLog)
-        .where(
-            or_(*subject_filters),
-            AuditLog.actor_user_id.is_not(None),
-            AuditLog.actor_user_id.notin_(user_ids),
-        )
-    )
-    if outside_actor_count:
-        raise RuntimeError(
-            "Refusing to delete a real actor's audit row for liveqa inventory objects."
-        )
+    for subject_type, subject_ids in audit_subject_ids.items():
+        for subject_chunk in _audit_scope_chunks(subject_ids):
+            outside_actors = (
+                await db_session.scalars(
+                    select(AuditLog.actor_user_id).where(
+                        and_(
+                            AuditLog.subject_type == subject_type,
+                            AuditLog.subject_id.in_(subject_chunk),
+                        ),
+                        AuditLog.actor_user_id.is_not(None),
+                    )
+                )
+            ).all()
+            if any(str(actor_id) not in user_ids for actor_id in outside_actors):
+                raise RuntimeError(
+                    "Refusing to delete a real actor's audit row for liveqa inventory objects."
+                )
 
 
 async def _validate_tournament_graph_boundary(

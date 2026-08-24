@@ -126,6 +126,14 @@ class CleanupLiveUserQaTests(unittest.TestCase):
         self.assertTrue(all("audit_logs.subject_type" in value for value in rendered))
         self.assertTrue(all("audit_logs.subject_id" in value for value in rendered))
 
+    def test_large_audit_scope_is_chunked_for_database_queries(self) -> None:
+        values = {f"00000000-0000-4000-8000-{index:012d}" for index in range(513)}
+
+        chunks = list(MODULE._audit_scope_chunks(values))
+
+        self.assertEqual([len(chunk) for chunk in chunks], [256, 256, 1])
+        self.assertEqual(set().union(*chunks), values)
+
     def test_runtime_target_requires_canonical_production_or_explicit_test(self) -> None:
         with patch.object(MODULE, "validate_platform_settings", return_value=None):
             MODULE._validate_runtime_target(
