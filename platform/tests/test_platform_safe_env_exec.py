@@ -90,6 +90,12 @@ class SafeEnvExecTests(unittest.TestCase):
                 pythonpath=safe_env.TRUSTED_PLATFORM_ROOT,
             )
 
+    def test_retained_browser_recovery_is_an_approved_db_tool(self) -> None:
+        self.assertIn(
+            "platform_recover_retained_browser_report.py",
+            safe_env.TRUSTED_DB_TOOLS,
+        )
+
     @unittest.skipUnless(os.geteuid() == 0, "root-owned dotenv contract")
     def test_openat_reader_reads_an_exact_root_owned_file(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
