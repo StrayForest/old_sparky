@@ -1,0 +1,166 @@
+name: Platform production profile review fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RUN-PRODUCTION-PROFILE-REVIEW to create the retained manual-review tournament"
+        required: true
+        type: string
+      operator_email:
+        description: "Existing account to place into Team 1 as a regular player"
+        required: true
+        default: "aleksei.lisitsin1@gmail.com"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-profile-review-fixture
+  cancel-in-progress: false
+
+jobs:
+  create-fixture:
+    name: Create retained eight-team profile review fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      QA_CONFIRMATION: ${{ inputs.confirmation }}
+      OPERATOR_EMAIL: ${{ inputs.operator_email }}
+      TARGET_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Validate explicit production fixture confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Production fixture must run from the reviewed dev branch." >&2; exit 1; }
+          test "$QA_CONFIRMATION" = "RUN-PRODUCTION-PROFILE-REVIEW" \
+            || { echo "Refusing production fixture without exact confirmation." >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
+          /usr/bin/python3 - "$OPERATOR_EMAIL" <<'PY'
+          import re
+          import sys
+
+          email = sys.argv[1]
+          if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email):
+              raise SystemExit("operator_email is invalid")
+          PY
+
+      - name: Configure production SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-profile-review-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
+          ssh_key_count="$(wc -l < "$ssh_scan" | tr -d ' ')"
+          test "$ssh_key_count" = "1" || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" || {
+            echo "Production SSH host fingerprint mismatch" >&2
+            exit 1
+          }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Create and verify the retained fixture on production
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_log="$RUNNER_TEMP/production-profile-review-fixture.log"
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -i "$SSH_DIR/id_ed25519" \
+          "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$OPERATOR_EMAIL" <<'REMOTE' | tee "$remote_log"
+          set -Eeuo pipefail
+          confirmation="$1"
+          target_sha="$2"
+          operator_email="$3"
+          test "$confirmation" = "RUN-PRODUCTION-PROFILE-REVIEW"
+          runtime=/opt/oldsparky/platform
+          guard="$runtime/current/tools/platform_release_lock_exec.sh"
+          test -x "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          sudo -n -- /bin/bash "$guard" \
+            --app-dir "$runtime" \
+            --expected-sha "$target_sha" \
+            -- /bin/bash -s -- "$target_sha" "$operator_email" <<'MUTATION'
+          set -Eeuo pipefail
+          target_sha="$1"
+          operator_email="$2"
+          runtime=/opt/oldsparky/platform
+          repo=/root/old_sparky
+          test "$(git -C "$repo" rev-parse --verify HEAD)" = "$target_sha" \
+            || { echo "Trusted production checkout does not match target SHA" >&2; exit 1; }
+          cd "$runtime/current"
+          export PLATFORM_APP_DIR="$runtime"
+          export PLATFORM_SHARED_DIR="$runtime/shared"
+          export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
+          export PLATFORM_PYTHON_BIN="$runtime/shared/venv/bin/python"
+          source "$runtime/current/tools/platform_runtime_common.sh"
+          platform_load_env_file
+          export PYTHONPATH="$runtime/current"
+          "$runtime/shared/venv/bin/python" \
+            "$runtime/current/tools/platform_seed_profile_review_tournament.py" \
+            --operator-email "$operator_email"
+          "$runtime/shared/venv/bin/python" \
+            "$runtime/current/tools/platform_seed_profile_review_tournament.py" \
+            --operator-email "$operator_email" \
+            --verify-only
+          MUTATION
+          REMOTE
+
+      - name: Publish fixture result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: platform-production-profile-review-${{ github.run_id }}
+          path: ${{ runner.temp }}/production-profile-review-fixture.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write fixture summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/production-profile-review-fixture.log"
+          {
+            echo "### Production profile review fixture"
+            echo
+            echo "- Target SHA: \`$TARGET_SHA\`"
+            echo "- Operator: \`$OPERATOR_EMAIL\`"
+            echo "- Tournament: [open tournament](https://old-sparky.com/tournaments/old-sparky-profile-cup-8)"
+            echo "- Team: \`Night Wardens\` (regular player slot)"
+            echo
+            if [[ -s "$log" ]]; then
+              echo "#### Server result"
+              echo
+              sed -n '/^{/p' "$log"
+            else
+              echo "The production server returned no fixture result."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
