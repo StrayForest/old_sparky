@@ -211,6 +211,10 @@ quiesce_runtime_writers() {
   if /usr/bin/systemctl is-active --quiet deadlock-cloudflare-ips.timer; then
     CLOUDFLARE_TIMER_WAS_ACTIVE=1
   fi
+  # Mark the runtime as touched before the first stop. If any subsequent stop or
+  # drain step fails before a durable transaction exists, the caller can safely
+  # restore the old runtime instead of leaving a partial maintenance window.
+  WRITERS_QUIESCED=1
   /usr/bin/systemctl stop deadlock-cloudflare-ips.timer
   for attempt in {1..60}; do
     if ! /usr/bin/systemctl is-active --quiet deadlock-cloudflare-ips.service; then
@@ -228,7 +232,6 @@ quiesce_runtime_writers() {
     echo "API/worker writers did not quiesce." >&2
     return 1
   fi
-  WRITERS_QUIESCED=1
   echo "Production API/worker writers quiesced for release staging and migration."
 }
 
