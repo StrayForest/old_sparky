@@ -126,7 +126,8 @@ for required_path in \
   "$CURRENT_TARGET/tools/platform_run_worker.sh" \
   "$CURRENT_TARGET/tools/platform_run_web.sh" \
   "$CURRENT_TARGET/tools/platform_run_alembic.sh" \
-  "$CURRENT_TARGET/tools/platform_safe_env_exec.py"; do
+  "$CURRENT_TARGET/tools/platform_safe_env_exec.py" \
+  "$CURRENT_TARGET/tools/platform_deploy_smoke.py"; do
   [[ -e "$required_path" ]] || fail "Required release file is missing: $required_path"
 done
 pass "Release artifact files present"
@@ -146,6 +147,35 @@ fi
   --verify >/dev/null \
   || fail "Rendered service envs are stale or unsafe."
 pass "Rendered service envs match canonical configuration"
+
+SAFE_ENV_TOOL="$SCRIPT_DIR/platform_safe_env_exec.py"
+if [[ ! -f "$SAFE_ENV_TOOL" ]]; then
+  SAFE_ENV_TOOL="$CURRENT_TARGET/tools/platform_safe_env_exec.py"
+fi
+"$PYTHON_BIN" -I - \
+  "$ENV_FILE" "$SAFE_ENV_TOOL" "$CURRENT_TARGET/tools/platform_deploy_smoke.py" <<'PY' \
+  || fail "Deploy smoke dotenv interpretation diverges from the strict runtime parser."
+import importlib.util
+from pathlib import Path
+import sys
+
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+env_path = Path(sys.argv[1])
+safe = load_module("platform_safe_env_exec_preflight", Path(sys.argv[2]))
+smoke = load_module("platform_deploy_smoke_preflight", Path(sys.argv[3]))
+if safe.load_env_file(env_path) != smoke.load_env(env_path):
+    raise SystemExit("strict and smoke dotenv parsers disagree")
+PY
+pass "Deploy smoke dotenv parser matches strict runtime interpretation"
 
 if [[ "$REQUIRE_EDGE_PARITY" -eq 1 ]]; then
   EDGE_POLICY_TOOL="$SCRIPT_DIR/platform_validate_edge_policy.py"
