@@ -20,13 +20,18 @@ The machine-readable group manifest is `platform/tests/test-suite-manifest.json`
 | `server-smoke` | release owner | `platform-production-deploy.yml` / `deploy` mode | production server over GitHub Actions SSH |
 | `live-public` | production operator | `platform_live_browser_qa.sh public` through `platform-live-launch.yml` | canonical production origin, dedicated server QA UID |
 | `live-user-destructive` | production operator | `platform-live-user-qa.yml` dispatches `platform_live_user_qa.sh` over SSH | production server; marked fixture data and mandatory cleanup |
+| `retained-load-preprod` | performance operator | `platform-retained-load-matrix.yml` dispatches `platform_retained_load_matrix_qa.sh` over SSH | dedicated pre-production server; retained fixture data; explicit operator confirmation |
 
 The ordinary CI workflow runs all deterministic backend, migration, web
 hermetic, documentation, typecheck, lint and build checks. Server-side smoke
 and browser journeys are dispatched through GitHub Actions and execute on the
 production server over the controlled SSH wrappers. Live-user and destructive
 journeys remain explicit operator gates and are never silently hidden by a
-grep exclusion.
+grep exclusion. The retained load matrix is also an explicit operator gate,
+but its target is a dedicated pre-production host and its API origin is
+loopback on that host. It must not run on an ordinary GitHub-hosted runner:
+the runner would measure its own CPU/network limits instead of the platform's
+database, workers and host resources.
 
 ## GitHub execution
 
@@ -51,6 +56,48 @@ Do not substitute a manually run local test for the GitHub workflow. Local
 commands are implementation details for explicit CI-failure diagnosis only;
 the GitHub jobs and their aggregate `platform-security-build` status are the
 release authority.
+
+### Retained pre-production load gate
+
+The retained matrix is `workflow_dispatch` only. It creates approximately
+10,000 retained synthetic users, 20 tournaments and 600 teams, so it has no
+schedule and must not be added to ordinary CI or production deployment. The
+workflow is an orchestrator: the actual API load and performance collection
+run on a dedicated pre-production host through the fixed root supervisor
+`/root/old_sparky/platform/tools/platform_retained_load_matrix_qa.sh`. The
+supervisor verifies the reviewed commit, the active release provenance and a
+non-production environment before it starts.
+
+Configure the protected GitHub `preproduction` environment with these secrets:
+`PREPROD_SSH_HOST`, `PREPROD_SSH_USER`, `PREPROD_SSH_KEY` and
+`PREPROD_SSH_HOST_FINGERPRINT`. The SSH user may use passwordless sudo only for
+the fixed supervisor. The host must have the reviewed `/root/old_sparky`
+checkout, the matching `/opt/oldsparky/platform/current/RELEASE.json`, the
+platform virtualenv and a loopback-accessible pre-production API.
+
+Start it from the reviewed `dev` ref with an existing pre-production control
+account:
+
+```bash
+gh workflow run platform-retained-load-matrix.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev \
+  -f confirmation=RUN-RETAINED-LOAD-MATRIX \
+  -f control_email=<existing-preprod-account-email> \
+  -f concurrency=80
+gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+The job summary shows pass/fail, completed users/tournaments, worst HTTP p95
+and p99, bottleneck classes and the slowest client phases. The workflow
+artifact contains only the compact `matrix-summary.json`, bounded execution
+log and remote wrapper log. Detailed per-tournament reports stay on the
+pre-production host under
+`/opt/oldsparky/platform/shared/preprod-retained-matrix/gha-<run-id>/` and are
+not copied to GitHub Actions, because they can contain invite codes and
+operational identifiers. After manual inspection, use the marked
+pre-production cleanup procedure; do not delete the retained data
+automatically from the workflow.
 
 ## Production browser gate
 

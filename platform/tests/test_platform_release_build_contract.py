@@ -161,6 +161,27 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 workflow = (REPO_ROOT / ".github/workflows" / workflow_name).read_text()
                 self.assertIn("workflow_dispatch:", workflow)
 
+    def test_retained_load_matrix_is_manual_and_preproduction_only(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-retained-load-matrix.yml"
+        ).read_text()
+        supervisor = (
+            REPO_ROOT / "platform/tools/platform_retained_load_matrix_qa.sh"
+        ).read_text()
+
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("schedule:", workflow)
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', workflow)
+        self.assertIn("RUN-RETAINED-LOAD-MATRIX", workflow)
+        self.assertIn("actions/upload-artifact@v6", workflow)
+        self.assertIn("GITHUB_STEP_SUMMARY", workflow)
+        self.assertIn("http://127.0.0.1", supervisor)
+        self.assertIn('[[ "$EUID" -ne 0 ]]', supervisor)
+        self.assertIn('flock -n 9', supervisor)
+        self.assertIn('test "$release_sha" = "$target_sha"', supervisor)
+        self.assertIn("canonical production origin", supervisor)
+        self.assertIn("RETAINED_LOAD_MATRIX_EXPORT=", supervisor)
+
     def test_release_ref_is_rejected_before_any_build_or_network_work(self) -> None:
         unsafe_refs = ("../escape", "bad/ref", 'bad"json', "-leading", "x" * 101)
         with tempfile.TemporaryDirectory() as temp_dir:

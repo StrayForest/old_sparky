@@ -201,6 +201,25 @@ cd /root/old_sparky/platform
   --control-email <existing-account-email>
 ```
 
+The same gate can be launched from GitHub Actions so that the result is
+visible in the workflow summary and downloadable as a short-lived artifact:
+
+```bash
+gh workflow run platform-retained-load-matrix.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev \
+  -f confirmation=RUN-RETAINED-LOAD-MATRIX \
+  -f control_email=<existing-preprod-account-email> \
+  -f concurrency=80
+gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+This route still executes the load on the dedicated pre-production host, not
+on the GitHub-hosted runner. The `preproduction` GitHub environment must have
+the four `PREPROD_SSH_*` secrets described in the test-suite governance. The
+workflow is intentionally manual because the matrix retains a large amount of
+fixture data.
+
 The command retains its marked users and tournaments for inspection and writes
 one report per tournament plus `matrix-summary.json` under
 `/opt/oldsparky/platform/shared/preprod-retained-matrix/<batch-id>/`. Performance
@@ -208,6 +227,9 @@ collection is enabled by default and records client phase latency, route-level
 request/SQL data, CPU/RAM/load, PostgreSQL connections/waits, worker lifecycle
 and a compact per-run and matrix-level bottleneck summary. Use `--skip-performance` or
 `--skip-profile-journey` only for a deliberately reduced diagnostic run.
+
+For a GitHub-dispatched run, the same files are nested under
+`/opt/oldsparky/platform/shared/preprod-retained-matrix/gha-<run-id>/<batch-id>/`.
 
 The matrix is destructive to pre-production data volume and must be followed
 by the marked pre-production cleanup procedure after manual inspection. Never

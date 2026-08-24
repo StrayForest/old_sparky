@@ -50,6 +50,13 @@
       "command": "approved platform_live_user_qa.sh workflow only",
       "environment": "production; marked fixture data and mandatory cleanup",
       "deterministic": false
+    },
+    {
+      "id": "retained-load-preprod",
+      "owner": "performance-operator",
+      "command": "platform-retained-load-matrix.yml dispatches platform_retained_load_matrix_qa.sh through SSH",
+      "environment": "dedicated pre-production server; retained fixture data; GitHub environment preproduction",
+      "deterministic": false
     }
   ]
 }
