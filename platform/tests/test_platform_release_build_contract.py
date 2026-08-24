@@ -220,6 +220,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("control account", cleanup_tool)
         self.assertIn("_validate_tournament_graph_boundary", cleanup_tool)
         self.assertIn("platform_cleanup_retained_matrix.py", load_supervisor + cleanup_supervisor)
+        self.assertIn("async def _main()", cleanup_tool)
+        self.assertNotIn("asyncio.run(dispose_engine())", cleanup_tool)
         self.assertIn("platform_recover_retained_browser_report.py", cleanup_supervisor)
         self.assertIn("timeout --signal=TERM --kill-after=30s", load_supervisor)
 

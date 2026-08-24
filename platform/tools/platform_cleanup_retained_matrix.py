@@ -459,11 +459,15 @@ async def async_main() -> int:
     return 0
 
 
-def main() -> int:
+async def _main() -> int:
     try:
-        return asyncio.run(async_main())
+        return await async_main()
     finally:
-        asyncio.run(dispose_engine())
+        await dispose_engine()
+
+
+def main() -> int:
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

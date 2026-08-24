@@ -312,6 +312,10 @@ its browser report and one-row summary from the matching durable
 ownership and graph-boundary check before deleting anything. A recovered run
 is never considered a passed load measurement.
 
+The cleanup command also disposes its async database engine in the same event
+loop as validation/deletion; cross-loop asyncpg errors in a successful cleanup
+log are treated as a regression and must not be ignored.
+
 The workflow summary includes the worst HTTP p95/p99, bottleneck classes and
 a manual-inspection table with links such as
 `https://old-sparky.com/tournaments/<slug>`. Open those links in a browser,

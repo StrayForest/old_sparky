@@ -128,3 +128,9 @@ an exact run-ID abort workflow, and a fail-closed recovery path that rebuilds
 only the missing browser report from the matching durable `PreprodTestRun`
 row. This recovery is for deletion, not for turning an interrupted run into a
 passing performance result.
+
+The cleanup log also exposed a second-order async resource-lifecycle issue:
+the exact cleanup entrypoint disposed SQLAlchemy's async engine from a second
+event loop after a successful delete. The cleanup entrypoint now owns one
+event loop for both deletion and disposal, so successful cleanup no longer
+emits cross-loop asyncpg errors.
