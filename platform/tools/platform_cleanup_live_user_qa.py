@@ -292,7 +292,9 @@ async def _validate_audit_scope(
     db_session,
     user_ids: set[str],
     audit_subject_ids: dict[str, set[str]],
+    preserved_actor_ids: set[str] | None = None,
 ) -> None:
+    allowed_actor_ids = user_ids | (preserved_actor_ids or set())
     if user_ids:
         for user_chunk in _audit_scope_chunks(user_ids):
             actor_rows = (
@@ -341,7 +343,7 @@ async def _validate_audit_scope(
                     )
                 )
             ).all()
-            if any(str(actor_id) not in user_ids for actor_id in outside_actors):
+            if any(str(actor_id) not in allowed_actor_ids for actor_id in outside_actors):
                 raise RuntimeError(
                     "Refusing to delete a real actor's audit row for liveqa inventory objects."
                 )

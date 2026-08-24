@@ -259,6 +259,7 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         ).all()
         if len(control_rows) != 1 or str(control_rows[0].id) in user_ids:
             raise RuntimeError("control account is missing or overlaps the synthetic fixture")
+        control_user_id = str(control_rows[0].id)
 
         tournament_rows = (
             await db_session.execute(
@@ -308,7 +309,12 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         audit_subject_ids = await _audit_subject_ids_for_scope(
             db_session, user_ids, tournament_ids
         )
-        await _validate_audit_scope(db_session, user_ids, audit_subject_ids)
+        await _validate_audit_scope(
+            db_session,
+            user_ids,
+            audit_subject_ids,
+            preserved_actor_ids={control_user_id},
+        )
 
         media_deleted = await purge_deleted_media_metadata(
             db_session,
@@ -327,6 +333,7 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
                     delete(AuditLog).where(
                         AuditLog.subject_type == subject_type,
                         AuditLog.subject_id.in_(subject_chunk),
+                        AuditLog.actor_user_id.is_(None),
                     )
                 )
                 audit_logs_deleted += int(audit_result.rowcount or 0)
@@ -374,17 +381,20 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
                     )
                 ).all()
             )
-        for subject_chunk in _audit_scope_chunks(user_ids | tournament_ids):
-            remaining_audit_ids.update(
-                str(audit_id)
-                for audit_id in (
-                    await verify_session.scalars(
-                        select(AuditLog.id).where(
-                            AuditLog.subject_id.in_(subject_chunk)
+        for subject_type, subject_ids in audit_subject_ids.items():
+            for subject_chunk in _audit_scope_chunks(subject_ids):
+                remaining_audit_ids.update(
+                    str(audit_id)
+                    for audit_id in (
+                        await verify_session.scalars(
+                            select(AuditLog.id).where(
+                                AuditLog.subject_type == subject_type,
+                                AuditLog.subject_id.in_(subject_chunk),
+                                AuditLog.actor_user_id.is_(None),
+                            )
                         )
-                    )
-                ).all()
-            )
+                    ).all()
+                )
         remaining_audit = len(remaining_audit_ids)
         control_remaining = int(
             await verify_session.scalar(
