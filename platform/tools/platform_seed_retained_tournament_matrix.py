@@ -16,6 +16,9 @@ QA_TOOL = PLATFORM_ROOT / "tools" / "platform_production_qa.py"
 TEAM_SIZES = (8, 16, 32, 64)
 TOURNAMENTS_PER_SIZE = 5
 DEFAULT_USERS_PER_TOURNAMENT = 500
+INVITE_MAX_USES = 500
+INVITE_EXTRA_CAPACITY = 64
+INVITE_MAX_USERS = INVITE_MAX_USES - INVITE_EXTRA_CAPACITY
 
 
 MATRIX_STATES = {
@@ -151,6 +154,29 @@ def allocate_user_counts(
     counts[assigned_index] = assigned_users
     for position, index in enumerate(remaining_indexes):
         counts[index] = base + (1 if position < remainder else 0)
+
+    # The scale QA flow reserves one invite code for the whole invite-only
+    # tournament and keeps 64 uses available for retained/control members.
+    # Keep the synthetic population within the API's max_uses=500 contract;
+    # public tournaments absorb the exact-total remainder.
+    invite_overflow = 0
+    for index in remaining_indexes:
+        if plan[index]["visibility"] != "invite_only":
+            continue
+        if counts[index] > INVITE_MAX_USERS:
+            invite_overflow += counts[index] - INVITE_MAX_USERS
+            counts[index] = INVITE_MAX_USERS
+    public_indexes = [
+        index
+        for index in remaining_indexes
+        if plan[index]["visibility"] == "public"
+    ]
+    if invite_overflow and not public_indexes:
+        raise RuntimeError("Invite-only cap requires at least one public tournament")
+    if public_indexes:
+        public_base, public_remainder = divmod(invite_overflow, len(public_indexes))
+        for position, index in enumerate(public_indexes):
+            counts[index] += public_base + (1 if position < public_remainder else 0)
     return counts
 
 

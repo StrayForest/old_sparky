@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from tools.platform_seed_retained_tournament_matrix import (
+    INVITE_MAX_USERS,
     allocate_user_counts,
     compact_performance,
     matrix_plan,
@@ -24,7 +25,14 @@ class RetainedTournamentMatrixTests(unittest.TestCase):
         self.assertEqual(sum(counts), 10_000)
         self.assertEqual(counts[15], 383)
         self.assertEqual(min(counts), 383)
-        self.assertEqual(max(counts), 507)
+        self.assertEqual(max(counts), 558)
+        self.assertTrue(
+            all(
+                count <= INVITE_MAX_USERS
+                for count, item in zip(counts, plan)
+                if item["visibility"] == "invite_only"
+            )
+        )
         self.assertEqual(sum(item["teams"] for item in plan), 600)
         self.assertEqual(
             sum(item["control_state"] == "assigned" for item in plan),
