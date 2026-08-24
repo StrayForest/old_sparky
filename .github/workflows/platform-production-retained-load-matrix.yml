@@ -202,7 +202,10 @@ jobs:
           print()
           print("#### Bottleneck classes")
           for row in performance.get("bottleneck_classes") or []:
-              print(f"- `{row.get('class')}`: {row.get('runs')} matrix runs")
+              if isinstance(row, dict):
+                  print(f"- `{row.get('class')}`: {row.get('runs')} matrix runs")
+              else:
+                  print(f"- `{row}`")
           print()
           print("#### Manual browser inspection")
           print()

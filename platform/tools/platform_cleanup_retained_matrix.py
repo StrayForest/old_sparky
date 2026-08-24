@@ -166,7 +166,7 @@ def load_matrix_manifest(
         )
         if mode == "scale" and len(row_tournaments) > 1:
             raise ValueError("a matrix row may own at most one tournament")
-        if mode == "browser-polling" and not 1 <= len(row_tournaments) <= MAX_MATRIX_ROWS:
+        if mode == "browser-polling" and not 0 <= len(row_tournaments) <= MAX_MATRIX_ROWS:
             raise ValueError("browser-polling manifest has an invalid tournament count")
         if int(row.get("synthetic_users", len(row_users))) != len(row_users):
             raise ValueError("matrix synthetic user count does not match its report")

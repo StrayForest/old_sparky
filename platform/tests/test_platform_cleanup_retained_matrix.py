@@ -108,6 +108,62 @@ class RetainedMatrixManifestTests(unittest.TestCase):
             self.assertEqual(len(manifest["user_ids"]), 1)
             self.assertEqual(len(manifest["tournament_ids"]), 1)
 
+    def test_browser_polling_manifest_can_finish_before_tournament_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "browser" / "browser-polling.json"
+            report_path.parent.mkdir()
+            marker = "preprod260824120000abcd"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "marker": marker,
+                        "report_path": str(report_path),
+                        "mode": "browser-polling",
+                        "origin": "https://old-sparky.com",
+                        "user_ids": [str(uuid4())],
+                        "tournament_ids": [],
+                        "tournament_visibility": "public",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            summary_path = root / "matrix-summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "browser-polling",
+                        "control_email": "aleksei.lisitsin1@gmail.com",
+                        "completed_tournaments": 0,
+                        "rows": [
+                            {
+                                "synthetic_users": 1,
+                                "report_path": str(report_path),
+                                "result": {
+                                    "marker": marker,
+                                    "report_path": str(report_path),
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def trusted_file(path: Path, *, root: Path) -> Path:
+                resolved = path.resolve()
+                resolved.relative_to(root.resolve())
+                return resolved
+
+            with mock.patch.object(cleanup, "_regular_root_file", side_effect=trusted_file):
+                manifest = cleanup.load_matrix_manifest(
+                    summary_path,
+                    run_root=root,
+                    expected_control_email="aleksei.lisitsin1@gmail.com",
+                )
+            self.assertEqual(manifest["tournament_ids"], set())
+            self.assertEqual(len(manifest["user_ids"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
