@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -51,6 +50,14 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("platform_safe_env_exec.py", runtime_common)
         self.assertIn("export-b64", runtime_common)
 
+    def test_deploy_smoke_uses_strict_parser_and_clears_ambient_platform_env(self) -> None:
+        smoke = self.read_tool("platform_deploy_smoke.py")
+        self.assertIn("platform_safe_env_exec.py", smoke)
+        self.assertIn("_SAFE_ENV.load_env_file", smoke)
+        self.assertIn("_clear_ambient_platform_environment", smoke)
+        self.assertIn('key.startswith(("PLATFORM_", "NEXT_PUBLIC_PLATFORM_"))', smoke)
+        self.assertTrue((TOOLS_DIR / "platform_deploy_smoke_impl.py").is_file())
+
     def test_production_migration_requires_release_transaction_and_quiesces(self) -> None:
         alembic = self.read_tool("platform_run_alembic.sh")
         self.assertIn('"$1" == "upgrade"', alembic)
@@ -62,7 +69,9 @@ class ReleaseHardeningContractTests(unittest.TestCase):
 
     def test_deploy_quiesces_before_stage_and_migration(self) -> None:
         deploy = self.read_tool("platform_release_deploy.sh")
-        quiesce_call = deploy.index("quiesce_runtime_writers", deploy.index('if [[ "$RESUME" -eq 0 ]]'))
+        quiesce_call = deploy.index(
+            "quiesce_runtime_writers", deploy.index('if [[ "$RESUME" -eq 0 ]]')
+        )
         stage = deploy.index('"$INSTALL_TOOL" --stage-only')
         migration = deploy.index("tools/platform_run_alembic.sh upgrade head")
         self.assertLess(quiesce_call, stage)
@@ -70,14 +79,20 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("release_preflight", deploy[stage:migration])
 
     def test_cloudflare_timer_joins_release_lock(self) -> None:
-        unit = (SYSTEMD_DIR / "deadlock-cloudflare-ips.service").read_text(encoding="utf-8")
+        unit = (SYSTEMD_DIR / "deadlock-cloudflare-ips.service").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("platform_release_lock_exec.sh", unit)
         self.assertIn("platform_update_cloudflare_ips.py --apply --reload", unit)
 
     def test_runtime_node_is_exactly_pinned(self) -> None:
-        web_unit = (SYSTEMD_DIR / "deadlock-web.service").read_text(encoding="utf-8")
+        web_unit = (SYSTEMD_DIR / "deadlock-web.service").read_text(
+            encoding="utf-8"
+        )
         node_helper = self.read_tool("platform_node.sh")
-        security_workflow = (WORKFLOW_DIR / "platform-security.yml").read_text(encoding="utf-8")
+        security_workflow = (WORKFLOW_DIR / "platform-security.yml").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("node-v26.3.1/bin/node", web_unit)
         self.assertIn('REQUIRED_NODE_VERSION="26.3.1"', node_helper)
         self.assertIn('node-version: "26.3.1"', security_workflow)
@@ -88,10 +103,16 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn('rm -f -- "$unit_path"', installer)
         self.assertIn("systemctl disable", installer)
 
+    def test_operator_rollback_cannot_complete_without_restart_and_smoke(self) -> None:
+        rollback = self.read_tool("platform_release_rollback.sh")
+        self.assertIn("Refusing rollback without restart/readiness/smoke", rollback)
+        self.assertIn("platform_release_rollback_impl.sh", rollback)
+        self.assertTrue((TOOLS_DIR / "platform_release_rollback_impl.sh").is_file())
+
     def test_mutating_diagnostics_are_manual_or_post_deploy_and_sha_locked(self) -> None:
-        content = (WORKFLOW_DIR / "platform-production-content-diagnostics.yml").read_text(
-            encoding="utf-8"
-        )
+        content = (
+            WORKFLOW_DIR / "platform-production-content-diagnostics.yml"
+        ).read_text(encoding="utf-8")
         diagnostics = (WORKFLOW_DIR / "platform-production-diagnostics.yml").read_text(
             encoding="utf-8"
         )
