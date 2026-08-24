@@ -124,5 +124,39 @@ class ReleaseHardeningContractTests(unittest.TestCase):
             self.assertIn("--expected-sha", workflow)
 
 
+    def test_all_production_ssh_workflows_pin_host_identity(self) -> None:
+        workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-diagnostics.yml')
+        expected_fingerprint = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
+        for name in workflow_names:
+            workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")
+            self.assertIn(expected_fingerprint, workflow, name)
+            self.assertIn("StrictHostKeyChecking yes", workflow, name)
+            self.assertIn("ssh-keygen -lf", workflow, name)
+            self.assertNotIn(
+                'ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts',
+                workflow,
+                name,
+            )
+
+    def test_live_mutations_share_release_lock_and_exact_sha(self) -> None:
+        for name in (
+            "platform-live-launch.yml",
+            "platform-live-user-qa.yml",
+            "platform-patch-translation-qa.yml",
+        ):
+            workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")
+            self.assertIn("platform_release_lock_exec.sh", workflow, name)
+            self.assertIn("--expected-sha", workflow, name)
+
+    def test_translation_workflows_never_source_production_dotenv(self) -> None:
+        for name in (
+            "platform-patch-translation-qa.yml",
+            "platform-production-diagnostics.yml",
+        ):
+            workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")
+            self.assertNotIn('. "$PLATFORM_ENV_FILE"', workflow, name)
+            self.assertIn("platform_load_env_file", workflow, name)
+
+
 if __name__ == "__main__":
     unittest.main()

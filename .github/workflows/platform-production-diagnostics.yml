@@ -28,7 +28,24 @@ jobs:
           install -d -m 700 ~/.ssh
           printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
           chmod 600 ~/.ssh/old_sparky_prod
-          ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts
+          ssh_scan="$(mktemp)"
+          trap 'rm -f -- "$ssh_scan"' EXIT
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
+          ssh_key_count="$(wc -l < "$ssh_scan" | tr -d ' ')"
+          test "$ssh_key_count" = "1" || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" || {
+            echo "Production SSH host fingerprint mismatch" >&2
+            exit 1
+          }
+          install -m 0600 "$ssh_scan" ~/.ssh/known_hosts
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s/.ssh/known_hosts\n' "$HOME"
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
           chmod 600 ~/.ssh/known_hosts
 
       - name: Verify latest patch distribution
@@ -47,7 +64,12 @@ jobs:
           set -euo pipefail
           runtime=/opt/oldsparky/platform
           cd "$runtime/current"
+          export PLATFORM_APP_DIR="$runtime"
+          export PLATFORM_SHARED_DIR="$runtime/shared"
           export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
+          export PLATFORM_PYTHON_BIN="$runtime/shared/venv/bin/python"
+          source "$runtime/current/tools/platform_runtime_common.sh"
+          platform_load_env_file
           export PYTHONPATH="$runtime/current"
 
           "$runtime/shared/venv/bin/python" - <<'PY'
@@ -109,7 +131,12 @@ jobs:
           set -Eeuo pipefail
           runtime=/opt/oldsparky/platform
           cd "$runtime/current"
+          export PLATFORM_APP_DIR="$runtime"
+          export PLATFORM_SHARED_DIR="$runtime/shared"
           export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
+          export PLATFORM_PYTHON_BIN="$runtime/shared/venv/bin/python"
+          source "$runtime/current/tools/platform_runtime_common.sh"
+          platform_load_env_file
           export PYTHONPATH="$runtime/current"
 
           "$runtime/shared/venv/bin/python" - <<'PY'

@@ -46,7 +46,24 @@ jobs:
           install -d -m 700 ~/.ssh
           printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
           chmod 600 ~/.ssh/old_sparky_prod
-          ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts
+          ssh_scan="$(mktemp)"
+          trap 'rm -f -- "$ssh_scan"' EXIT
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
+          ssh_key_count="$(wc -l < "$ssh_scan" | tr -d ' ')"
+          test "$ssh_key_count" = "1" || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" || {
+            echo "Production SSH host fingerprint mismatch" >&2
+            exit 1
+          }
+          install -m 0600 "$ssh_scan" ~/.ssh/known_hosts
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s/.ssh/known_hosts\n' "$HOME"
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
           chmod 600 ~/.ssh/known_hosts
 
       - name: Run live-user QA on the production server
@@ -74,10 +91,16 @@ jobs:
           test "$(git -C "$repo" rev-parse --verify HEAD)" = "$target_sha" \
             || { echo "Trusted QA checkout does not match the dispatched target SHA" >&2; exit 1; }
 
-          export PLATFORM_APP_DIR="$runtime"
-          export PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json
-          export PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com
-          /root/old_sparky/platform/tools/platform_live_user_qa.sh
+          guard="$runtime/current/tools/platform_release_lock_exec.sh"
+          test -x "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          /bin/bash "$guard" \
+            --app-dir "$runtime" \
+            --expected-sha "$target_sha" \
+            -- /usr/bin/env \
+              PLATFORM_APP_DIR="$runtime" \
+              PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
+              PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com \
+              /root/old_sparky/platform/tools/platform_live_user_qa.sh
           echo "LIVE_USER_QA_SUCCESS source_commit=$target_sha"
           REMOTE
 
