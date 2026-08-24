@@ -32,6 +32,7 @@ TRUSTED_SYSTEM_PYTHON = Path("/usr/bin/python3.12")
 TRUSTED_DB_TOOLS = frozenset(
     {
         "platform_cleanup_live_user_qa.py",
+        "platform_cleanup_retained_matrix.py",
         "platform_manual_live_auth_qa.py",
         "platform_provision_live_csp_qa.py",
         "platform_recover_live_user_qa.py",

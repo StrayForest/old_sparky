@@ -57,6 +57,13 @@
       "command": "platform-retained-load-matrix.yml dispatches platform_retained_load_matrix_qa.sh through SSH",
       "environment": "dedicated pre-production server; retained fixture data; GitHub environment preproduction",
       "deterministic": false
+    },
+    {
+      "id": "retained-load-production",
+      "owner": "production-performance-operator",
+      "command": "platform-production-retained-load-matrix.yml and platform-production-retained-load-cleanup.yml through SSH",
+      "environment": "https://old-sparky.com; one production VPS; exact retained fixture cleanup",
+      "deterministic": false
     }
   ]
 }

@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-08-23
+- Last reviewed: 2026-08-24
 
 ## Runtime checks
 
@@ -235,6 +235,54 @@ The matrix is destructive to pre-production data volume and must be followed
 by the marked pre-production cleanup procedure after manual inspection. Never
 put a real account password, session token or live production origin in the
 command or a report.
+
+### Live production retained load
+
+Use this only in a low-traffic maintenance window. It runs on the single live
+VPS through `https://old-sparky.com`, retains its synthetic data for browser
+inspection, and therefore can compete with real traffic for VPS CPU/RAM,
+PostgreSQL, Redis, Celery and disk. A lack of existing user accounts does not
+remove those production risks. Do not start it while a release, migration,
+backup restore, live browser gate or another load/cleanup operation is active.
+
+The `production` GitHub environment reuses the existing production SSH
+secrets. Start the reviewed `dev` workflow manually:
+
+```bash
+gh workflow run platform-production-retained-load-matrix.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
+  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=80
+gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+The workflow summary includes the worst HTTP p95/p99, bottleneck classes and
+a manual-inspection table with links such as
+`https://old-sparky.com/tournaments/<slug>`. Open those links in a browser,
+log in as `aleksei.lisitsin1@gmail.com`, inspect the public and invite-only
+registrations, ready-check states and the assigned team, then perform the
+manual functional checks before cleanup. The report artifact is compact;
+detailed reports stay on the VPS and may contain operational identifiers.
+
+When inspection is complete, clean only the exact load workflow run:
+
+```bash
+gh workflow run platform-production-retained-load-cleanup.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=DELETE-PRODUCTION-RETAINED-LOAD \
+  -f load_run_id=<load-run-id> \
+  -f control_email=aleksei.lisitsin1@gmail.com
+gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+The cleanup supervisor holds the same host lock as the load, validates the
+selected run's summary and every detailed report against production database
+markers, refuses any overlap with the control account or outside tournament,
+deletes the exact fixture graph, verifies zero remaining fixture users,
+tournaments, sessions and audit rows, and only then removes the VPS report
+directory. A failed cleanup keeps the data and report directory in place for
+operator recovery; do not run broad `platform_cleanup_preprod_runs.py` against
+production.
 
 ## Alert thresholds
 

@@ -182,6 +182,41 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("canonical production origin", supervisor)
         self.assertIn("RETAINED_LOAD_MATRIX_EXPORT=", supervisor)
 
+    def test_production_retained_load_has_exact_manual_cleanup_contour(self) -> None:
+        load_workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-matrix.yml"
+        ).read_text()
+        cleanup_workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml"
+        ).read_text()
+        load_supervisor = (
+            REPO_ROOT / "platform/tools/platform_production_retained_load_matrix_qa.sh"
+        ).read_text()
+        cleanup_supervisor = (
+            REPO_ROOT / "platform/tools/platform_production_retained_load_cleanup_qa.sh"
+        ).read_text()
+        cleanup_tool = (
+            REPO_ROOT / "platform/tools/platform_cleanup_retained_matrix.py"
+        ).read_text()
+
+        for workflow in (load_workflow, cleanup_workflow):
+            self.assertIn("workflow_dispatch:", workflow)
+            self.assertNotIn("schedule:", workflow)
+            self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', workflow)
+            self.assertIn("environment: production", workflow)
+            self.assertIn("actions/upload-artifact@v6", workflow)
+        self.assertIn("RUN-PRODUCTION-RETAINED-LOAD-MATRIX", load_workflow)
+        self.assertIn("DELETE-PRODUCTION-RETAINED-LOAD", cleanup_workflow)
+        self.assertIn("https://old-sparky.com", load_supervisor)
+        self.assertIn("https://old-sparky.com", cleanup_supervisor)
+        self.assertIn("flock -n 9", load_supervisor)
+        self.assertIn("flock -n 9", cleanup_supervisor)
+        self.assertIn("PRODUCTION_RETAINED_LOAD_MATRIX_EXPORT=", load_supervisor)
+        self.assertIn("PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1", cleanup_supervisor)
+        self.assertIn("control account", cleanup_tool)
+        self.assertIn("_validate_tournament_graph_boundary", cleanup_tool)
+        self.assertIn("platform_cleanup_retained_matrix.py", load_supervisor + cleanup_supervisor)
+
     def test_release_ref_is_rejected_before_any_build_or_network_work(self) -> None:
         unsafe_refs = ("../escape", "bad/ref", 'bad"json', "-leading", "x" * 101)
         with tempfile.TemporaryDirectory() as temp_dir:

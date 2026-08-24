@@ -1,0 +1,204 @@
+name: Platform production retained load cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type DELETE-PRODUCTION-RETAINED-LOAD to remove one exact retained load run"
+        required: true
+        type: string
+      load_run_id:
+        description: "GitHub run ID of the production retained-load workflow to clean"
+        required: true
+        type: string
+      control_email:
+        description: "The same control account email used by the retained-load run"
+        required: true
+        default: "aleksei.lisitsin1@gmail.com"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-retained-load-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Exact cleanup of one production retained-load run
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      QA_CONFIRMATION: ${{ inputs.confirmation }}
+      LOAD_RUN_ID: ${{ inputs.load_run_id }}
+      CONTROL_EMAIL: ${{ inputs.control_email }}
+      TARGET_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Validate explicit cleanup confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Production cleanup must run from the reviewed dev branch." >&2; exit 1; }
+          test "$QA_CONFIRMATION" = "DELETE-PRODUCTION-RETAINED-LOAD" \
+            || { echo "Refusing cleanup without exact confirmation." >&2; exit 1; }
+          [[ "$LOAD_RUN_ID" =~ ^[0-9]+$ ]] \
+            || { echo "load_run_id must be numeric." >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
+          /usr/bin/python3 - "$CONTROL_EMAIL" <<'PY'
+          import re
+          import sys
+
+          if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", sys.argv[1]):
+              raise SystemExit("control_email is invalid")
+          PY
+
+      - name: Configure production SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-retained-cleanup-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" || {
+            echo "Expected exactly one production ED25519 host key" >&2
+            exit 1
+          }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" || {
+            echo "Production SSH host fingerprint mismatch" >&2
+            exit 1
+          }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Clean the exact retained load run on production
+        id: run-cleanup
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_log="$RUNNER_TEMP/production-retained-cleanup-remote.log"
+          ssh_output_file="$RUNNER_TEMP/production-retained-cleanup-ssh-output"
+          set +e
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" "$CONTROL_EMAIL" "$GITHUB_RUN_ID" \
+            > "$ssh_output_file" 2>&1 <<'REMOTE'
+          set -Eeuo pipefail
+          confirmation="$1"
+          target_sha="$2"
+          load_run_id="$3"
+          control_email="$4"
+          cleanup_run_id="$5"
+          sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_cleanup_qa.sh \
+            "$confirmation" "$target_sha" "$load_run_id" "$control_email" "$cleanup_run_id"
+          REMOTE
+          remote_status=$?
+          set -e
+          cp "$ssh_output_file" "$remote_log"
+          cat "$remote_log"
+          echo "remote_exit_code=$remote_status" >> "$GITHUB_OUTPUT"
+
+          export_dir="$(sed -n 's/^PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=//p' "$remote_log" | tail -n 1)"
+          if [[ -n "$export_dir" ]]; then
+            [[ "$export_dir" =~ ^/tmp/old-sparky-production-retained-cleanup-[0-9]+$ ]] || {
+              echo "Remote cleanup export path failed validation" >&2
+              exit 1
+            }
+            install -d -m 700 "$RUNNER_TEMP/production-retained-cleanup-artifacts"
+            scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/cleanup-summary.json" \
+              "$RUNNER_TEMP/production-retained-cleanup-artifacts/cleanup-summary.json"
+            scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/cleanup.log" \
+              "$RUNNER_TEMP/production-retained-cleanup-artifacts/cleanup.log"
+          fi
+          cp "$remote_log" "$RUNNER_TEMP/production-retained-cleanup-remote.log"
+          exit "$remote_status"
+
+      - name: Publish cleanup artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: platform-production-retained-cleanup-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/production-retained-cleanup-artifacts/cleanup-summary.json
+            ${{ runner.temp }}/production-retained-cleanup-artifacts/cleanup.log
+            ${{ runner.temp }}/production-retained-cleanup-remote.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write cleanup summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          summary="$RUNNER_TEMP/production-retained-cleanup-artifacts/cleanup-summary.json"
+          if [[ ! -s "$summary" ]]; then
+            {
+              echo "### Production retained-load cleanup"
+              echo
+              echo "No cleanup summary was exported from the production server."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          /usr/bin/python3 - "$summary" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print("### Production retained-load cleanup")
+          print()
+          print(f"- Status: **{'passed' if payload.get('ok') else 'failed'}**")
+          print(f"- Markers cleaned: {payload.get('markers', 0)}")
+          print(f"- Synthetic users deleted: {payload.get('users_deleted', 0)}")
+          print(f"- Tournaments deleted: {payload.get('tournaments_deleted', 0)}")
+          print(f"- Control account preserved: `{payload.get('control_account_preserved')}`")
+          PY
+
+      - name: Fail if cleanup was not verified
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.run-cleanup.outputs.remote_exit_code }}" = "0" \
+            || { echo "Production retained-load cleanup failed; retained data was not removed by the supervisor." >&2; exit 1; }
+          grep -q '^PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1$' \
+            "$RUNNER_TEMP/production-retained-cleanup-remote.log"
+          /usr/bin/python3 - "$RUNNER_TEMP/production-retained-cleanup-artifacts/cleanup-summary.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if payload.get("ok") is not True:
+              raise SystemExit("cleanup-summary.json does not report ok=true")
+          PY

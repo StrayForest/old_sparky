@@ -2,7 +2,7 @@
 
 - Status: Active procedure
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-22
+- Last reviewed: 2026-08-24
 
 This document is the executable owner contract for the platform test suite. A
 test must belong to exactly one group and each group must have one documented
@@ -21,6 +21,7 @@ The machine-readable group manifest is `platform/tests/test-suite-manifest.json`
 | `live-public` | production operator | `platform_live_browser_qa.sh public` through `platform-live-launch.yml` | canonical production origin, dedicated server QA UID |
 | `live-user-destructive` | production operator | `platform-live-user-qa.yml` dispatches `platform_live_user_qa.sh` over SSH | production server; marked fixture data and mandatory cleanup |
 | `retained-load-preprod` | performance operator | `platform-retained-load-matrix.yml` dispatches `platform_retained_load_matrix_qa.sh` over SSH | dedicated pre-production server; retained fixture data; explicit operator confirmation |
+| `retained-load-production` | production/performance operator | `platform-production-retained-load-matrix.yml` and `platform-production-retained-load-cleanup.yml` over SSH | canonical live origin; retained fixture data; explicit production confirmation and exact cleanup |
 
 The ordinary CI workflow runs all deterministic backend, migration, web
 hermetic, documentation, typecheck, lint and build checks. Server-side smoke
@@ -32,6 +33,16 @@ but its target is a dedicated pre-production host and its API origin is
 loopback on that host. It must not run on an ordinary GitHub-hosted runner:
 the runner would measure its own CPU/network limits instead of the platform's
 database, workers and host resources.
+
+The production retained-load group is a deliberate exception to the normal
+release gate: it is never scheduled, never part of ordinary CI, and never runs
+on a GitHub-hosted runner. It uses the one production VPS through the canonical
+`https://old-sparky.com` origin, so it measures the live edge, API, worker,
+database and host resources. “There are no existing users” does not make this
+safe to run casually: the test still consumes CPU/RAM/DB/Redis capacity,
+publishes public tournaments, changes caches/metrics/logs and can affect site
+availability while the matrix is active. Use an approved low-traffic window
+and monitor the host during the run.
 
 ## GitHub execution
 
@@ -98,6 +109,54 @@ not copied to GitHub Actions, because they can contain invite codes and
 operational identifiers. After manual inspection, use the marked
 pre-production cleanup procedure; do not delete the retained data
 automatically from the workflow.
+
+### Retained production load and exact cleanup
+
+The live matrix is a manual operator gate. It creates approximately 10,000
+synthetic `@example.com` users, 20 retained tournaments and 600 teams through
+the real API workflow: profile and captain-profile saves, changed saves,
+public registration, invite-code claim plus registration, ready-check,
+captain round, assignment and bracket creation. The existing control account
+is only joined to selected tournaments; its profile and credentials are not
+changed. The workflow summary prints direct browser links for its registered,
+ready-check and assigned-team cases.
+
+Run it only from `dev` after the reviewed commit has been deployed:
+
+```bash
+gh workflow run platform-production-retained-load-matrix.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
+  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=80
+gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+The detailed reports remain on the VPS under
+`/opt/oldsparky/platform/shared/production-retained-matrix/gha-<load-run-id>/`
+until cleanup. The Actions artifact contains only the compact summary and
+bounded logs; it does not expose invite codes.
+
+After opening the summary links and manually checking the site as the control
+account, run the separate exact cleanup workflow with that load workflow's ID:
+
+```bash
+gh workflow run platform-production-retained-load-cleanup.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=DELETE-PRODUCTION-RETAINED-LOAD \
+  -f load_run_id=<load-run-id> \
+  -f control_email=aleksei.lisitsin1@gmail.com
+gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+Cleanup deletes only the selected run's marked synthetic users and their
+tournaments; tournament participants, invites, ready-check/captain/assignment
+rows, brackets, sessions, audit rows and eligible media metadata are removed
+through the exact graph and database cascades. It preserves the control
+account and all unrelated production data. If any identity, marker, report
+path, ownership or cross-run check fails, cleanup stops before deletion.
+The database keeps only the exact `PreprodTestRun` row marked `cleaned` as an
+operator trace; it contains no live account credentials or active fixture
+rows.
 
 ## Production browser gate
 
