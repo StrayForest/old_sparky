@@ -104,7 +104,7 @@ jobs:
           test "$confirmation" = "RUN-PRODUCTION-PROFILE-REVIEW"
           runtime=/opt/oldsparky/platform
           guard="$runtime/current/tools/platform_release_lock_exec.sh"
-          test -x "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          test -f "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
           sudo -n -- /bin/bash "$guard" \
             --app-dir "$runtime" \
             --expected-sha "$target_sha" \
