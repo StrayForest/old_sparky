@@ -105,9 +105,10 @@ class ReleaseHardeningContractTests(unittest.TestCase):
 
     def test_operator_rollback_cannot_complete_without_restart_and_smoke(self) -> None:
         rollback = self.read_tool("platform_release_rollback.sh")
-        self.assertIn("Refusing rollback without restart/readiness/smoke", rollback)
-        self.assertIn("platform_release_rollback_impl.sh", rollback)
-        self.assertTrue((TOOLS_DIR / "platform_release_rollback_impl.sh").is_file())
+        self.assertIn("Production rollback requires restart, readiness and smoke", rollback)
+        self.assertIn('"$APP_DIR" == "/opt/oldsparky/platform"', rollback)
+        self.assertIn("rollback-runtime-pending", rollback)
+        self.assertIn("smoke-passed", rollback)
 
     def test_mutating_diagnostics_are_manual_or_post_deploy_and_sha_locked(self) -> None:
         content = (

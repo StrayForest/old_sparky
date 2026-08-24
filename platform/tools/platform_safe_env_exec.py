@@ -85,6 +85,9 @@ def _validate_production_env_file(metadata: os.stat_result) -> None:
         raise SafeEnvError("production environment file metadata is unsafe")
 
 
+# Backward-compatible private helper used by metadata regression tests.
+_validate_env_file = _validate_production_env_file
+
 def _read_env_bytes_at(path: Path, *, owners: tuple[int, ...]) -> bytes:
     """Open an absolute path one trusted component at a time."""
 
