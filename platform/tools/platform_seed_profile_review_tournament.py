@@ -246,6 +246,39 @@ async def assert_roster_is_available(
         raise RuntimeError(f"Roster contains active commitments: {conflict_summary}")
 
 
+async def release_operator_qa_commitments(
+    db_session,
+    *,
+    operator: User,
+    released_at: datetime,
+) -> int:
+    rows = (
+        await db_session.execute(
+            select(PlayerTournamentCommitment, Tournament)
+            .join(Tournament, Tournament.id == PlayerTournamentCommitment.tournament_id)
+            .where(
+                PlayerTournamentCommitment.user_id == operator.id,
+                PlayerTournamentCommitment.released_at.is_(None),
+            )
+            .with_for_update()
+        )
+    ).all()
+    unexpected = [
+        tournament.slug
+        for _, tournament in rows
+        if not tournament.slug.startswith("qa-")
+    ]
+    if unexpected:
+        raise RuntimeError(
+            "Operator has active commitments outside retained qa-* tournaments: "
+            + ", ".join(sorted(unexpected))
+        )
+    for commitment, _ in rows:
+        commitment.released_at = released_at
+        commitment.release_reason = "profile_review_fixture_reassigned"
+    return len(rows)
+
+
 async def seed(operator_email: str) -> dict[str, object]:
     settings = get_settings()
     if settings.platform_db_schema != "platform":
@@ -260,6 +293,11 @@ async def seed(operator_email: str) -> dict[str, object]:
         if operator is None:
             raise RuntimeError(f"Operator account not found: {operator_email}")
         fake_players = await ensure_fake_players(db_session)
+        released_operator_commitments = await release_operator_qa_commitments(
+            db_session,
+            operator=operator,
+            released_at=now,
+        )
 
         # Keep the operator in the first roster as a regular player, not its captain.
         roster = [*fake_players[:5], operator, *fake_players[5:]]
@@ -457,6 +495,7 @@ async def seed(operator_email: str) -> dict[str, object]:
             "fake_profiles": len(fake_players),
             "operator_email": operator_email,
             "operator_team": TEAM_NAMES[0],
+            "released_operator_commitments": released_operator_commitments,
         }
 
 
