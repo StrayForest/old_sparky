@@ -2,10 +2,6 @@ name: Platform production diagnostics
 
 on:
   workflow_dispatch:
-  push:
-    branches: [dev]
-    paths:
-      - ".github/workflows/platform-production-diagnostics.yml"
 
 permissions:
   contents: read
@@ -23,6 +19,7 @@ jobs:
       PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
       PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
       PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      TARGET_SHA: ${{ github.sha }}
     steps:
       - name: Configure SSH
         shell: bash
@@ -39,7 +36,14 @@ jobs:
         run: |
           set -euo pipefail
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod "$PROD_SSH_USER@$PROD_SSH_HOST" 'bash -s' <<'REMOTE'
+            -i ~/.ssh/old_sparky_prod "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- '$TARGET_SHA'" <<'REMOTE'
+          set -Eeuo pipefail
+          target_sha="$1"
+          runtime=/opt/oldsparky/platform
+          guard="$runtime/current/tools/platform_release_lock_exec.sh"
+          test -f "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          /bin/bash "$guard" --app-dir "$runtime" --expected-sha "$target_sha" -- /bin/bash -s <<'MUTATION'
           set -euo pipefail
           runtime=/opt/oldsparky/platform
           cd "$runtime/current"
@@ -86,6 +90,7 @@ jobs:
 
           curl -fsS --max-time 15 "https://old-sparky.com/api/v1/content/patches/${latest_id}?diag=$(date +%s)" \
             | "$runtime/shared/venv/bin/python" -c 'import json,sys; d=json.load(sys.stdin); s=d.get("sections",[]); h=[x.get("title","") for x in s if x.get("kind")=="hero"]; print("public_api_hero_count="+str(len(h))); print("public_api_heroes="+" | ".join(h)); assert len(h) >= 13 if d.get("id")=="1840944183775204" else True'
+          MUTATION
           REMOTE
 
       - name: Verify ru-v8 four-patch translation regression set
@@ -93,7 +98,14 @@ jobs:
         run: |
           set -euo pipefail
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod "$PROD_SSH_USER@$PROD_SSH_HOST" 'bash -s' <<'REMOTE'
+            -i ~/.ssh/old_sparky_prod "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- '$TARGET_SHA'" <<'REMOTE'
+          set -Eeuo pipefail
+          target_sha="$1"
+          runtime=/opt/oldsparky/platform
+          guard="$runtime/current/tools/platform_release_lock_exec.sh"
+          test -f "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          /bin/bash "$guard" --app-dir "$runtime" --expected-sha "$target_sha" -- /bin/bash -s <<'MUTATION'
           set -Eeuo pipefail
           runtime=/opt/oldsparky/platform
           cd "$runtime/current"
@@ -250,4 +262,5 @@ jobs:
             | grep -E 'patch_translation_(openai_usage|completed|failed)' \
             | tail -n 120 \
             || true
+          MUTATION
           REMOTE
