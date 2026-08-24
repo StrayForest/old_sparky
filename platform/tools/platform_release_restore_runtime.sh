@@ -133,8 +133,15 @@ fi
 
 if [[ "$PREPARE_RUNTIME" -eq 1 ]]; then
   PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"
-  PLATFORM_APP_DIR="$APP_DIR" "$SHARED_VENV/bin/python" \
-    "$NGINX_TOOL" --apply --reload --json
+  if ! PLATFORM_APP_DIR="$APP_DIR" "$SHARED_VENV/bin/python" \
+    "$NGINX_TOOL" --apply --reload --json; then
+    # The installer restores its disk snapshots on failure. Validate and reload
+    # that restored disk state before returning failure so active Nginx cannot
+    # remain divergent from the recovery contour.
+    /usr/sbin/nginx -t
+    /usr/bin/systemctl reload nginx.service
+    exit 1
+  fi
 fi
 
 if [[ "$RUN_RESTART" -eq 1 && "$RESTART_AFTER" -eq 1 ]]; then
