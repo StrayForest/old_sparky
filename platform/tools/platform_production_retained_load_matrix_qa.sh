@@ -149,6 +149,12 @@ else
   browser_root="$run_root/browser-polling"
   install -d -o root -g root -m 0700 "$browser_root"
   browser_report="$browser_root/browser-polling.json"
+  browser_http_connections=$((concurrency * 4))
+  if (( browser_http_connections < 128 )); then
+    browser_http_connections=128
+  elif (( browser_http_connections > 512 )); then
+    browser_http_connections=512
+  fi
   set +e
   timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_production_qa.py" \
@@ -156,7 +162,7 @@ else
     --keep-data \
     --origin "$EXPECTED_ORIGIN" \
     --concurrency "$concurrency" \
-    --http-max-connections 10000 \
+    --http-max-connections "$browser_http_connections" \
     --browser-polling-active-users-only \
     --collect-performance \
     --report-path "$browser_report" \

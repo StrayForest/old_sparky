@@ -200,9 +200,11 @@ browser smoke run.
 The retained matrix is a 10,000-account data-volume test with bounded mutation
 concurrency. The separate browser-polling profile can model 10,000 concurrent
 virtual users with `--browser-polling-users-per-tournament 500`,
-`--browser-polling-active-users-only` and an explicit `--http-max-connections`
-value. This measures virtual-user polling, not 10,000 long-lived SSE sockets;
-the public SSE global/source ceilings remain capacity safeguards.
+`--browser-polling-active-users-only` and a bounded client pool (the production
+workflow uses 128–512 connections depending on requested concurrency). This
+keeps 10,000 virtual tabs without making the same VPS allocate 10,000 load
+generator sockets. It measures virtual-user polling, not 10,000 long-lived SSE
+sockets; the public SSE global/source ceilings remain capacity safeguards.
 
 The control account is passed at runtime and is never modified. The matrix
 places it in registered-only, ready-check and exactly one assignment-control

@@ -124,8 +124,10 @@ against the current web/api/worker identities and units.
   backlog/retry pressure is part of the load evidence.
 - The final 20×500 browser-polling gate keeps fixture state bounded to at most
   32 participants per tournament and uses four setup lanes plus one shared
-  request semaphore. Its five-minute auto-assignment wait is fail-fast; the
-  write-burst profile owns join/ready-vote contention measurements.
+  request semaphore. Its production runner also caps the load-generator HTTP
+  pool at 128–512 connections while retaining 10,000 virtual tabs. Its
+  five-minute auto-assignment wait is fail-fast; the write-burst profile owns
+  join/ready-vote contention measurements.
 - Ready-check votes must be committed only while their round is active and the
   voter remains an eligible active participant. A close or exclusion cannot
   leave a post-close or ineligible vote in persistence.

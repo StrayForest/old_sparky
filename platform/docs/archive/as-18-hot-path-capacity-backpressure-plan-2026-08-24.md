@@ -118,8 +118,9 @@ broad user/table delete.
    than fixture creation: use at most 32 persisted participants per tournament,
    run state setup behind bounded gates, pass tournament slugs explicitly, and
    fail auto-assignment setup after five minutes instead of waiting for the
-   retained-load ceiling. Join/ready-vote contention remains covered by the
-   write-burst profile.
+   retained-load ceiling. Bound the load-generator client pool to 128–512
+   connections while retaining 10,000 virtual tabs. Join/ready-vote contention
+   remains covered by the write-burst profile.
 8. Run documentation and focused checks, then the GitHub security/build gate.
 9. Commit, push/merge to `dev`, observe auto-deploy and production smoke.
 10. Run the approved retained load matrix, clean exact fixtures and archive

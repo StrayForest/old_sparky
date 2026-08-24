@@ -224,6 +224,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn("asyncio.run(dispose_engine())", cleanup_tool)
         self.assertIn("platform_recover_retained_browser_report.py", cleanup_supervisor)
         self.assertIn("timeout --signal=TERM --kill-after=30s", load_supervisor)
+        self.assertIn('browser_http_connections=$((concurrency * 4))', load_supervisor)
+        self.assertIn('browser_http_connections > 512', load_supervisor)
 
     def test_release_ref_is_rejected_before_any_build_or_network_work(self) -> None:
         unsafe_refs = ("../escape", "bad/ref", 'bad"json', "-leading", "x" * 101)
