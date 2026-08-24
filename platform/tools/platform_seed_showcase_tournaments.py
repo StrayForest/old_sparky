@@ -18,6 +18,9 @@ from sqlalchemy import func, select
 from python_packages.platform_domain.deadlock.constants import RANKS
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
+from apps.platform_api.app.services.tournament_participant_capacity import (
+    ensure_participant_slot_claimed,
+)
 from python_packages.platform_infra.models import (
     DeadlockProfile,
     PlayerProfile,
@@ -392,16 +395,26 @@ async def ensure_participants(db_session, tournament: Tournament, users: list[Us
             )
         ).all()
     )
+    participants: list[TournamentParticipant] = []
     for user in selected:
         if user.id in existing_user_ids:
             continue
-        db_session.add(
+        participants.append(
             TournamentParticipant(
                 tournament_id=tournament.id,
                 user_id=user.id,
                 entry_type="solo",
                 status="confirmed" if tournament.status == "in_progress" else "registered",
             )
+        )
+    db_session.add_all(participants)
+    await db_session.flush()
+    for participant in participants:
+        await ensure_participant_slot_claimed(
+            db_session,
+            tournament_id=tournament.id,
+            max_participants=tournament.max_participants,
+            participant_id=participant.id,
         )
 
 

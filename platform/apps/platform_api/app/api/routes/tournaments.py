@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from hashlib import sha256
 import secrets
 import string
 import time
@@ -148,6 +149,12 @@ from apps.platform_api.app.services.tournament_workflow import (
 from apps.platform_api.app.services.tournament_runtime_cache import (
     register_tournament_runtime_cache_invalidator,
 )
+from apps.platform_api.app.services.tournament_participant_capacity import (
+    claim_participant_slot,
+    claim_slot_for_existing_participant,
+    has_free_participant_slot,
+    release_participant_slot,
+)
 from python_packages.platform_domain.deadlock import (
     AutoAssignmentError,
     AutoAssignmentRunFreshness,
@@ -175,7 +182,6 @@ from python_packages.platform_domain.tournaments import (
     can_view_tournament_workspace,
     ensure_solo_entry,
     ensure_supported_tournament_format,
-    ensure_tournament_capacity_allows_join,
     ensure_tournament_rank_allows_join,
     ensure_organizer_can_moderate_participants,
     ensure_participant_restoration_allowed,
@@ -223,7 +229,9 @@ from python_packages.platform_infra.models import (
     TournamentInviteAccess,
     TournamentMatch,
     TournamentParticipant,
+    TournamentParticipantSlot,
     User,
+    new_uuid,
 )
 from python_packages.platform_infra.security import (
     get_authenticated_session,
@@ -291,6 +299,35 @@ def tournament_poll_state_version(
         + int(tournament.bracket_revision or 0) * 1_000_000
         + max(0, int(participant_count))
     )
+
+
+def _representation_etag(*parts: object) -> str:
+    fingerprint = "|".join(str(part) for part in parts)
+    return f'"{sha256(fingerprint.encode("utf-8")).hexdigest()}"'
+
+
+def _conditional_response(
+    request: Request,
+    response: Response,
+    *,
+    etag: str,
+) -> Response | None:
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "private, no-cache"
+    response.headers["Vary"] = "Cookie, Accept-Encoding"
+    raw_header = request.headers.get("if-none-match", "")
+    if raw_header.strip() == "*" or etag in {
+        item.strip() for item in raw_header.split(",") if item.strip()
+    }:
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers={
+                "ETag": etag,
+                "Cache-Control": "private, no-cache",
+                "Vary": "Cookie, Accept-Encoding",
+            },
+        )
+    return None
 
 
 def tournament_summary_poll_delay_ms(tournament: Tournament) -> int:
@@ -378,7 +415,7 @@ class ReadyCheckStateCacheEntry:
 class ParticipantJoinPreflight:
     tournament: Tournament
     has_existing_participant: bool
-    active_participant_count: int
+    has_free_participant_slot: bool
     player_rank: str | None
     has_locked_deadlock_roster: bool
     has_invite_access: bool
@@ -1037,16 +1074,6 @@ async def participant_count_for_tournament(db_session: AsyncSession, tournament_
         or 0
     )
 
-async def active_participant_count_for_tournament(db_session: AsyncSession, tournament_id: str) -> int:
-    count = await db_session.scalar(
-        select(func.count()).select_from(TournamentParticipant).where(
-            TournamentParticipant.tournament_id == tournament_id,
-            TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
-        )
-    )
-    return int(count or 0)
-
-
 async def deadlock_rank_for_user(db_session: AsyncSession, user_id: str) -> str | None:
     return await db_session.scalar(
         select(DeadlockProfile.rank).where(DeadlockProfile.user_id == user_id)
@@ -1136,33 +1163,18 @@ async def ensure_participant_join_limits(
     tournament: Tournament,
     user_id: str,
 ) -> None:
-    active_count_subquery = (
-        select(func.count())
-        .select_from(TournamentParticipant)
-        .where(
-            TournamentParticipant.tournament_id == tournament.id,
-            TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
-        )
-        .scalar_subquery()
+    player_rank = await db_session.scalar(
+        select(DeadlockProfile.rank).where(DeadlockProfile.user_id == user_id)
     )
-    player_rank_subquery = (
-        select(DeadlockProfile.rank)
-        .where(DeadlockProfile.user_id == user_id)
-        .scalar_subquery()
-    )
-    active_count, player_rank = (
-        await db_session.execute(
-            select(
-                active_count_subquery.label("active_participant_count"),
-                player_rank_subquery.label("player_rank"),
-            )
+    if tournament.max_participants is not None and not await has_free_participant_slot(
+        db_session,
+        tournament_id=tournament.id,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Tournament participant limit has been reached.",
         )
-    ).one()
     try:
-        ensure_tournament_capacity_allows_join(
-            max_participants=tournament.max_participants,
-            active_participant_count=int(active_count or 0),
-        )
         ensure_tournament_rank_allows_join(
             allowed_ranks=tournament.allowed_ranks,
             player_rank=player_rank,
@@ -1174,14 +1186,15 @@ async def ensure_participant_join_limits(
 def ensure_participant_join_limits_from_values(
     *,
     tournament: Tournament,
-    active_participant_count: int,
     player_rank: str | None,
+    has_free_participant_slot: bool,
 ) -> None:
+    """Validate rank and capacity using a durable slot snapshot."""
     try:
-        ensure_tournament_capacity_allows_join(
-            max_participants=tournament.max_participants,
-            active_participant_count=active_participant_count,
-        )
+        if tournament.max_participants is not None and not has_free_participant_slot:
+            raise TournamentWorkflowError(
+                "Tournament participant limit has been reached."
+            )
         ensure_tournament_rank_allows_join(
             allowed_ranks=tournament.allowed_ranks,
             player_rank=player_rank,
@@ -1204,14 +1217,14 @@ async def participant_join_preflight(
         )
         .exists()
     )
-    active_count = (
-        select(func.count())
-        .select_from(TournamentParticipant)
+    free_slot = (
+        select(TournamentParticipantSlot.id)
         .where(
-            TournamentParticipant.tournament_id == Tournament.id,
-            TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
+            TournamentParticipantSlot.tournament_id == Tournament.id,
+            TournamentParticipantSlot.participant_id.is_(None),
         )
-        .scalar_subquery()
+        .limit(1)
+        .exists()
     )
     player_rank = (
         select(DeadlockProfile.rank)
@@ -1239,7 +1252,7 @@ async def participant_join_preflight(
             select(
                 Tournament,
                 existing_participant.label("has_existing_participant"),
-                active_count.label("active_participant_count"),
+                free_slot.label("has_free_participant_slot"),
                 player_rank.label("player_rank"),
                 locked_roster.label("has_locked_deadlock_roster"),
                 invite_access.label("has_invite_access"),
@@ -1252,7 +1265,7 @@ async def participant_join_preflight(
     return ParticipantJoinPreflight(
         tournament=row[0],
         has_existing_participant=bool(row.has_existing_participant),
-        active_participant_count=int(row.active_participant_count or 0),
+        has_free_participant_slot=bool(row.has_free_participant_slot),
         player_rank=row.player_rank,
         has_locked_deadlock_roster=bool(row.has_locked_deadlock_roster),
         has_invite_access=bool(row.has_invite_access),
@@ -2377,13 +2390,43 @@ async def create_participant(
     except TournamentWorkflowError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
     participant = TournamentParticipant(
+        id=new_uuid(),
         tournament_id=tournament.id,
         user_id=user.id,
         entry_type=entry_type,
         status="registered",
         team_name=team_name,
     )
-    db_session.add(participant)
+    inserted_id = await db_session.scalar(
+        postgresql.insert(TournamentParticipant)
+        .values(
+            id=participant.id,
+            tournament_id=participant.tournament_id,
+            user_id=participant.user_id,
+            entry_type=participant.entry_type,
+            status=participant.status,
+            team_name=participant.team_name,
+        )
+        .on_conflict_do_nothing(
+            constraint="uq_tournament_participants_tournament_user"
+        )
+        .returning(TournamentParticipant.id)
+    )
+    if inserted_id is None:
+        raise TournamentWorkflowError(
+            "This user is already registered in the tournament."
+        )
+    participant = await db_session.scalar(
+        select(TournamentParticipant).where(TournamentParticipant.id == inserted_id)
+    )
+    if participant is None:
+        raise RuntimeError("Participant disappeared after an idempotent insert.")
+    await claim_participant_slot(
+        db_session,
+        tournament_id=tournament.id,
+        max_participants=tournament.max_participants,
+        participant_id=participant.id,
+    )
     await db_session.flush()
     return participant
 
@@ -3343,13 +3386,16 @@ async def organizer_add_participant(
         tournament=tournament,
         user_id=target_user.id,
     )
-    participant = await create_participant(
-        db_session,
-        tournament=tournament,
-        user=target_user,
-        entry_type=payload.entry_type,
-        team_name=team_name,
-    )
+    try:
+        participant = await create_participant(
+            db_session,
+            tournament=tournament,
+            user=target_user,
+            entry_type=payload.entry_type,
+            team_name=team_name,
+        )
+    except TournamentWorkflowError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await write_audit_log(
         db_session,
         actor_user_id=auth_session.user.id,
@@ -3499,6 +3545,19 @@ async def organizer_moderate_participant(
                     db_session,
                     tournament=tournament,
                 ),
+            )
+        except TournamentWorkflowError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        try:
+            await claim_slot_for_existing_participant(
+                db_session,
+                tournament_id=tournament.id,
+                participant=participant,
+                max_participants=tournament.max_participants,
+                claimed_at=auth_session.now,
             )
         except TournamentWorkflowError as exc:
             raise HTTPException(
@@ -3752,11 +3811,25 @@ async def list_tournament_matches(
 @router.get("/{slug}/bracket", response_model=TournamentBracketResponse)
 async def get_tournament_bracket(
     slug: str,
+    request: Request,
+    response: Response,
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
     teams_view: Literal["full", "summary"] = Query(default="full"),
-) -> TournamentBracketResponse:
+) -> TournamentBracketResponse | Response:
     tournament = await get_tournament_or_404(db_session, slug)
+    etag = _representation_etag(
+        "bracket",
+        tournament.id,
+        tournament.updated_at,
+        tournament.bracket_revision,
+        teams_view,
+        auth_session.user.id if auth_session is not None else "anonymous",
+        tuple(sorted(auth_session.role_slugs)) if auth_session is not None else (),
+    )
+    not_modified = _conditional_response(request, response, etag=etag)
+    if not_modified is not None:
+        return not_modified
     return await build_tournament_bracket_response(
         db_session,
         tournament=tournament,
@@ -4782,17 +4855,16 @@ async def vote_deadlock_ready_check(
             allow_assignment_generation=False,
         )
 
-    tournament = await lock_tournament_for_workflow(db_session, tournament_id)
-    await db_session.refresh(tournament)
+    tournament = route_preflight.tournament
     preflight = await deadlock_ready_vote_preflight(
         db_session,
-        tournament_id=tournament.id,
+        tournament_id=tournament_id,
         user_id=current_user_id,
     )
     if ready_vote_requires_automation(tournament, preflight.active_round, now=auth_session.now):
-        # The scheduling transition commits its own transaction.  Release this
-        # read-only lock, advance under the automation writer lock, then take
-        # the workflow lock again before validating and writing the vote.
+        # Scheduling transitions remain serialized by the tournament row. A
+        # normal vote itself only writes the vote row and its 32-way counter
+        # shard, so it does not join that hot lock.
         await db_session.rollback()
         tournament = await get_tournament_or_404(db_session, slug)
         await advance_deadlock_tournament_automation(
@@ -4801,8 +4873,8 @@ async def vote_deadlock_ready_check(
             now=auth_session.now,
             allow_assignment_generation=False,
         )
-        tournament = await lock_tournament_for_workflow(db_session, tournament_id)
-        await db_session.refresh(tournament)
+        await db_session.rollback()
+        tournament = await get_tournament_or_404(db_session, slug)
         preflight = await deadlock_ready_vote_preflight(
             db_session,
             tournament_id=tournament.id,
@@ -5772,6 +5844,7 @@ async def lock_deadlock_auto_assignment_run(
 async def join_tournament(
     slug: str,
     payload: TournamentParticipantJoinRequest,
+    request: Request,
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentParticipantResponse:
@@ -5782,7 +5855,41 @@ async def join_tournament(
     )
     if preflight is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
-    await lock_tournament_for_workflow(db_session, preflight.tournament.id)
+    idempotency = await reserve_mutation_idempotency(
+        db_session,
+        actor_user_id=auth_session.user.id,
+        scope=f"tournament.join:{preflight.tournament.id}",
+        key=request_idempotency_key(request),
+        request_fingerprint=mutation_payload_fingerprint(
+            {
+                "tournament_id": preflight.tournament.id,
+                "payload": payload.model_dump(mode="json"),
+            }
+        ),
+    )
+    if idempotency is not None and idempotency.replay:
+        resource_id = idempotency.record.resource_id
+        if resource_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The idempotent join request has not completed yet.",
+            )
+        existing_participant = await db_session.scalar(
+            select(TournamentParticipant).where(
+                TournamentParticipant.id == resource_id,
+                TournamentParticipant.tournament_id == preflight.tournament.id,
+                TournamentParticipant.user_id == auth_session.user.id,
+            )
+        )
+        if existing_participant is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The participant created by this Idempotency-Key no longer exists.",
+            )
+        return serialize_participant(
+            existing_participant,
+            auth_session.user.display_name,
+        )
     refreshed_preflight = await participant_join_preflight(
         db_session,
         slug=slug,
@@ -5825,16 +5932,28 @@ async def join_tournament(
     team_name = normalized_team_name(payload.entry_type, payload.team_name)
     ensure_participant_join_limits_from_values(
         tournament=tournament,
-        active_participant_count=preflight.active_participant_count,
         player_rank=preflight.player_rank,
+        has_free_participant_slot=preflight.has_free_participant_slot,
     )
-    participant = await create_participant(
-        db_session,
-        tournament=tournament,
-        user=auth_session.user,
-        entry_type=payload.entry_type,
-        team_name=team_name,
-    )
+    try:
+        async with db_session.begin_nested():
+            participant = await create_participant(
+                db_session,
+                tournament=tournament,
+                user=auth_session.user,
+                entry_type=payload.entry_type,
+                team_name=team_name,
+            )
+    except (IntegrityError, TournamentWorkflowError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                str(exc)
+                if isinstance(exc, TournamentWorkflowError)
+                else "This user is already registered in the tournament."
+            ),
+        ) from exc
+    bind_mutation_idempotency_resource(idempotency, participant.id)
     await db_session.commit()
     _invalidate_participant_page_cache(tournament.id)
     return serialize_participant(participant, auth_session.user.display_name)
@@ -5909,6 +6028,10 @@ async def leave_tournament(
 
     await db_session.execute(
         select(User.id).where(User.id == participant.user_id).with_for_update()
+    )
+    await release_participant_slot(
+        db_session,
+        participant_id=participant.id,
     )
     if is_solo_tournament_format(tournament.format_slug):
         await prune_participant_from_active_ready_round(
@@ -6098,6 +6221,8 @@ async def get_tournament_scoped_profile(
 @router.get("/{slug}/workspace", response_model=TournamentWorkspaceResponse)
 async def get_tournament_workspace(
     slug: str,
+    request: Request,
+    response: Response,
     participants_limit: int = Query(
         default=25,
         ge=0,
@@ -6108,7 +6233,7 @@ async def get_tournament_workspace(
     include_current_user: bool = Query(default=True),
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
-) -> TournamentWorkspaceResponse:
+) -> TournamentWorkspaceResponse | Response:
     row = (
         await db_session.execute(
             tournament_with_counts_stmt().where(Tournament.slug == slug)
@@ -6174,7 +6299,7 @@ async def get_tournament_workspace(
         current_user_has_invite_access=invite_access is not None,
     )
     if not workspace_visible:
-        return TournamentWorkspaceResponse(
+        workspace_response = TournamentWorkspaceResponse(
             tournament=tournament_response,
             current_user=current_user,
             current_user_active_commitment=active_commitment,
@@ -6190,6 +6315,18 @@ async def get_tournament_workspace(
             next_poll_after_ms=tournament_summary_poll_delay_ms(tournament),
             state_version=tournament_response.state_version,
         )
+        etag = _representation_etag(
+            "workspace",
+            tournament.id,
+            tournament_response.state_version,
+            workspace_view,
+            participants_limit,
+            participants_offset,
+            include_current_user,
+            auth_session.user.id if auth_session is not None else "anonymous",
+        )
+        not_modified = _conditional_response(request, response, etag=etag)
+        return not_modified or workspace_response
 
     if participants_limit > 0:
         participants, participants_total, participants_has_more = await tournament_participant_page(
@@ -6279,7 +6416,7 @@ async def get_tournament_workspace(
             assignment_runs_loaded=assignment_runs_loaded,
         )
 
-    return TournamentWorkspaceResponse(
+    workspace_response = TournamentWorkspaceResponse(
         tournament=tournament_response,
         current_user=current_user,
         current_user_active_commitment=active_commitment,
@@ -6299,6 +6436,35 @@ async def get_tournament_workspace(
         ),
         state_version=tournament_response.state_version,
     )
+    etag = _representation_etag(
+        "workspace",
+        tournament.id,
+        tournament_response.state_version,
+        workspace_view,
+        participants_limit,
+        participants_offset,
+        include_current_user,
+        auth_session.user.id if auth_session is not None else "anonymous",
+        workspace_response.bracket.revision if workspace_response.bracket is not None else None,
+        (
+            workspace_response.ready_check.state_version
+            if workspace_response.ready_check is not None
+            else None
+        ),
+        (
+            workspace_response.ready_check.active_round.id
+            if workspace_response.ready_check is not None
+            and workspace_response.ready_check.active_round is not None
+            else (
+                workspace_response.ready_check.latest_round.id
+                if workspace_response.ready_check is not None
+                and workspace_response.ready_check.latest_round is not None
+                else None
+            )
+        ),
+    )
+    not_modified = _conditional_response(request, response, etag=etag)
+    return not_modified or workspace_response
 
 
 @router.get("/{slug}", response_model=TournamentResponse)

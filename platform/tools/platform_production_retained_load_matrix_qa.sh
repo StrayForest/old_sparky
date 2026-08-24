@@ -27,8 +27,8 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# != 5 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id>" >&2
+if (( $# != 5 && $# != 6 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling]" >&2
   exit 2
 fi
 
@@ -37,6 +37,15 @@ target_sha="$2"
 control_email="$3"
 concurrency="$4"
 run_id="$5"
+profile="${6:-matrix}"
+
+case "$profile" in
+  matrix|browser-polling) ;;
+  *)
+    echo "Profile must be matrix or browser-polling." >&2
+    exit 1
+    ;;
+esac
 
 [[ "$confirmation" == "$CONFIRMATION" ]]
 [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || {
@@ -119,19 +128,102 @@ rm -rf -- "$export_dir"
 install -d -o "$export_uid" -g "$export_gid" -m 0700 "$export_dir"
 log_path="$run_root/matrix.log"
 
-set +e
-"$QA_PYTHON" "$TOOLS_DIR/platform_seed_retained_tournament_matrix.py" \
-  --origin "$EXPECTED_ORIGIN" \
-  --control-email "$control_email" \
-  --concurrency "$concurrency" \
-  --output-root "$run_root" \
-  2>&1 | tee "$log_path"
-pipeline_status=("${PIPESTATUS[@]}")
-qa_status="${pipeline_status[0]}"
-tee_status="${pipeline_status[1]}"
-set -e
-if [[ "$tee_status" != "0" ]]; then
-  qa_status=1
+if [[ "$profile" == "matrix" ]]; then
+  set +e
+  "$QA_PYTHON" "$TOOLS_DIR/platform_seed_retained_tournament_matrix.py" \
+    --origin "$EXPECTED_ORIGIN" \
+    --control-email "$control_email" \
+    --concurrency "$concurrency" \
+    --output-root "$run_root" \
+    2>&1 | tee "$log_path"
+  pipeline_status=("${PIPESTATUS[@]}")
+  qa_status="${pipeline_status[0]}"
+  tee_status="${pipeline_status[1]}"
+  set -e
+  if [[ "$tee_status" != "0" ]]; then
+    qa_status=1
+  fi
+else
+  browser_root="$run_root/browser-polling"
+  install -d -o root -g root -m 0700 "$browser_root"
+  browser_report="$browser_root/browser-polling.json"
+  set +e
+  "$QA_PYTHON" "$TOOLS_DIR/platform_production_qa.py" \
+    --mode browser-polling \
+    --keep-data \
+    --origin "$EXPECTED_ORIGIN" \
+    --concurrency "$concurrency" \
+    --http-max-connections 10000 \
+    --browser-polling-active-users-only \
+    --collect-performance \
+    --report-path "$browser_report" \
+    2>&1 | tee "$log_path"
+  pipeline_status=("${PIPESTATUS[@]}")
+  qa_status="${pipeline_status[0]}"
+  tee_status="${pipeline_status[1]}"
+  set -e
+  if [[ "$tee_status" != "0" ]]; then
+    qa_status=1
+  fi
+  "$SYSTEM_PYTHON" -I - "$browser_report" "$browser_root/matrix-summary.json" "$target_sha" "$run_id" "$control_email" "$qa_status" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+report_path, summary_path, target_sha, run_id, control_email, status = sys.argv[1:]
+try:
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    report = {}
+marker = str(report.get("marker") or "")
+user_ids = report.get("user_ids") if isinstance(report.get("user_ids"), list) else []
+tournament_ids = report.get("tournament_ids") if isinstance(report.get("tournament_ids"), list) else []
+passed = int(status) == 0 and report.get("passed") is True
+performance = report.get("performance") if isinstance(report.get("performance"), dict) else {}
+http_client = performance.get("http_client") if isinstance(performance.get("http_client"), dict) else {}
+http_overall = http_client.get("overall") if isinstance(http_client.get("overall"), dict) else {}
+bottleneck = performance.get("bottleneck_summary") if isinstance(performance.get("bottleneck_summary"), dict) else {}
+polling = report.get("polling") if isinstance(report.get("polling"), dict) else {}
+summary = {
+    "mode": "browser-polling",
+    "target_sha": target_sha,
+    "github_run_id": int(run_id),
+    "control_email": control_email.strip().lower(),
+    "planned_tournaments": 20,
+    "completed_tournaments": len(tournament_ids),
+    "planned_users": 10000,
+    "completed_users": len(user_ids),
+    "passed": passed,
+    "polling": {
+        "profile": polling.get("profile"),
+        "tabs_planned": polling.get("tabs_planned"),
+        "visible_tabs": polling.get("visible_tabs"),
+        "hidden_tabs": polling.get("hidden_tabs"),
+        "executed": polling.get("executed"),
+        "not_modified": polling.get("not_modified"),
+        "deduped": polling.get("deduped"),
+    },
+    "performance_summary": {
+        "worst_http_p95_ms": http_overall.get("p95_ms"),
+        "worst_http_p99_ms": http_overall.get("p99_ms"),
+        "bottleneck_classes": bottleneck.get("likely_bottleneck_classes", []),
+        "resource_flags": bottleneck.get("resource_flags", {}),
+    },
+    "rows": [{
+        "synthetic_users": len(user_ids),
+        "report_path": report_path,
+        "result": {
+            "passed": passed,
+            "marker": marker,
+            "report_path": report_path,
+        },
+    }],
+}
+Path(summary_path).write_text(
+    json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+    encoding="utf-8",
+)
+PY
 fi
 
 shopt -s nullglob

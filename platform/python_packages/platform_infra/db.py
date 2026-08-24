@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from hashlib import sha256
 import logging
+import os
+from time import perf_counter
 
 from sqlalchemy import MetaData, event, text
 from sqlalchemy.ext.asyncio import (
@@ -18,7 +20,10 @@ from python_packages.platform_infra.config import (
     get_settings,
     validate_platform_settings,
 )
-from python_packages.platform_infra.performance import install_sqlalchemy_query_metrics
+from python_packages.platform_infra.performance import (
+    install_sqlalchemy_query_metrics,
+    record_pool_checkout_wait,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +81,35 @@ def engine() -> AsyncEngine:
     if _engine is None:
         settings = get_settings()
         validate_platform_settings(settings)
+        is_worker = os.environ.get("PLATFORM_RUNTIME_SERVICE", "").strip().lower() == "worker"
+        pool_size = (
+            settings.platform_worker_db_pool_size
+            if is_worker
+            else settings.platform_db_pool_size
+        )
+        max_overflow = (
+            settings.platform_worker_db_max_overflow
+            if is_worker
+            else settings.platform_db_max_overflow
+        )
+        pool_timeout = (
+            settings.platform_worker_db_pool_timeout_seconds
+            if is_worker
+            else settings.platform_db_pool_timeout_seconds
+        )
+        pool_recycle = (
+            settings.platform_worker_db_pool_recycle_seconds
+            if is_worker
+            else settings.platform_db_pool_recycle_seconds
+        )
         _engine = create_async_engine(
             settings.platform_database_url,
             future=True,
             pool_pre_ping=True,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
+            pool_recycle=pool_recycle,
         )
         install_sqlalchemy_query_metrics(_engine.sync_engine)
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
@@ -110,4 +140,7 @@ async def dispose_engine() -> None:
 
 async def get_db_session() -> AsyncIterator[AsyncSession]:
     async with session_factory()() as db_session:
+        checkout_started = perf_counter()
+        await db_session.connection()
+        record_pool_checkout_wait(perf_counter() - checkout_started)
         yield db_session

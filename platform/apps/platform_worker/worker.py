@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 from celery import Celery
 from celery.signals import worker_process_shutdown
 from fastapi import HTTPException
+from kombu import Exchange, Queue
 from sqlalchemy import select
 
 from apps.platform_api.app.services.deadlock_automation import (
@@ -68,6 +69,10 @@ return 0
 """
 AUTO_ASSIGNMENT_LOCK_PREFIX = "platform:deadlock-auto-assignment:run-lock:"
 AUTO_ASSIGNMENT_LOCK_TTL_SECONDS = 900
+HIGH_PRIORITY_QUEUE = "deadlock-platform-high"
+DEFAULT_PRIORITY_QUEUE = "deadlock-platform-default"
+LOW_PRIORITY_QUEUE = "deadlock-platform-low"
+PLATFORM_EXCHANGE = Exchange("deadlock-platform", type="direct", durable=True)
 
 celery_app = Celery(
     "deadlock_platform",
@@ -79,7 +84,54 @@ celery_app.conf.update(
     result_serializer="json",
     accept_content=["json"],
     timezone="UTC",
-    task_default_queue="deadlock-platform",
+    task_default_queue=DEFAULT_PRIORITY_QUEUE,
+    task_default_priority=5,
+    task_queue_max_priority=10,
+    task_queues=(
+        Queue(HIGH_PRIORITY_QUEUE, exchange=PLATFORM_EXCHANGE, routing_key=HIGH_PRIORITY_QUEUE),
+        Queue(DEFAULT_PRIORITY_QUEUE, exchange=PLATFORM_EXCHANGE, routing_key=DEFAULT_PRIORITY_QUEUE),
+        Queue(LOW_PRIORITY_QUEUE, exchange=PLATFORM_EXCHANGE, routing_key=LOW_PRIORITY_QUEUE),
+    ),
+    task_routes={
+        "platform.deadlock_automation_tick": {
+            "queue": HIGH_PRIORITY_QUEUE,
+            "priority": 9,
+        },
+        "platform.deadlock_auto_assignment_run": {
+            "queue": DEFAULT_PRIORITY_QUEUE,
+            "priority": 6,
+        },
+        "platform.player_commitment_reconciliation": {
+            "queue": LOW_PRIORITY_QUEUE,
+            "priority": 2,
+        },
+        "platform.home_content_refresh": {
+            "queue": LOW_PRIORITY_QUEUE,
+            "priority": 1,
+        },
+        "platform.auth_lifecycle_cleanup": {
+            "queue": LOW_PRIORITY_QUEUE,
+            "priority": 1,
+        },
+        "platform.media_reconciliation": {
+            "queue": LOW_PRIORITY_QUEUE,
+            "priority": 1,
+        },
+        "platform.media_process_asset": {
+            "queue": LOW_PRIORITY_QUEUE,
+            "priority": 1,
+        },
+        PATCH_TRANSLATION_TASK_NAME: {
+            "queue": LOW_PRIORITY_QUEUE,
+            "priority": 1,
+        },
+    },
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    task_publish_retry=True,
+    broker_connection_retry_on_startup=True,
+    broker_transport_options={"visibility_timeout": 900},
+    task_send_sent_event=True,
     task_track_started=True,
     worker_prefetch_multiplier=1,
     beat_schedule={

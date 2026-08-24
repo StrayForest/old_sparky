@@ -163,9 +163,10 @@ Targets under normal non-saturated load:
 - browser INP at or below 200 ms;
 - public/detail LCP at or below 2.5 s.
 
-Measure one user step before tuning. Capture response bytes, p50/p95/p99,
-SQL/request, DB and compute time, CPU/RAM/load, connections, locks, cache state,
-queue wait and worker lifecycle. Use
+Measure one user step before tuning. Capture response bytes, status/304 ratio,
+p50/p95/p99, SQL/request, DB and compute time, pool checkout wait,
+CPU/RAM/load, connections, locks, cache state, Celery queue backlog/retries and
+worker lifecycle. Use
 `tools/platform_production_qa.py --collect-performance` and
 `tools/platform_performance_audit.py`; detailed JSON stays under shared storage.
 
@@ -265,9 +266,30 @@ secrets. Start the reviewed `dev` workflow manually:
 gh workflow run platform-production-retained-load-matrix.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
-  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=80
+  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=80 \
+  -f profile=matrix
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
+
+After the workflow is deployed and the ordinary retained matrix has been
+reviewed, run the final virtual-user gate with the same confirmation and
+control account, changing only the profile:
+
+```bash
+gh workflow run platform-production-retained-load-matrix.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
+  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=80 \
+  -f profile=browser-polling
+gh run watch <browser-load-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+The `browser-polling` profile creates 20 marked tournaments and 10,000
+synthetic users, opens 10,000 active virtual tabs, sends conditional revision
+reads and reports `304 Not Modified`, deduplication, response latency, pool
+wait, database/lock pressure and Celery backlog. It is a polling test, not a
+request to raise the 10,000-user SSE ceiling. Clean the exact browser load run
+with the same cleanup workflow before starting another production load.
 
 The workflow summary includes the worst HTTP p95/p99, bottleneck classes and
 a manual-inspection table with links such as

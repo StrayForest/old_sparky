@@ -67,8 +67,8 @@ The migration scenario is destructive to its disposable database. It must not
 be pointed at `platformdb` or a production connection. The scenario creates a
 legacy `private` tournament and an intentionally duplicated active workflow
 row, confirms the first upgrade fails without applying the revision, repairs
-the duplicate, retries the upgrade, and verifies normalized visibility and the
-final constraints.
+the duplicate, retries the upgrade through `20260824_0043`, and verifies
+normalized visibility, participant-capacity slots and the final constraints.
 
 Do not substitute a manually run local test for the GitHub workflow. Local
 commands are implementation details for explicit CI-failure diagnosis only;
@@ -137,6 +137,12 @@ gh workflow run platform-production-retained-load-matrix.yml \
   -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=80
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
+
+The same workflow has `profile=browser-polling`. That explicit final gate uses
+20 tournaments × 500 users, 10,000 active virtual polling tabs, conditional
+revision reads and the same exact-marker cleanup path. Run it only after the
+ordinary retained matrix and use its own workflow run ID for cleanup; it does
+not mean 10,000 persistent SSE connections.
 
 The detailed reports remain on the VPS under
 `/opt/oldsparky/platform/shared/production-retained-matrix/gha-<load-run-id>/`

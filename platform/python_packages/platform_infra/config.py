@@ -190,6 +190,19 @@ class PlatformSettings(BaseSettings):
     platform_perf_sql_count_threshold: int = Field(default=25, ge=0)
     platform_perf_log_mutations: bool = True
     platform_api_workers: int = Field(default=2, gt=0)
+    # Keep PostgreSQL connection count bounded per process. API and Celery
+    # processes use separate budgets so background bursts cannot consume the
+    # entire database capacity reserved for user requests.
+    platform_db_pool_size: int = Field(default=3, gt=0)
+    platform_db_max_overflow: int = Field(default=1, ge=0)
+    platform_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
+    platform_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
+    platform_worker_db_pool_size: int = Field(default=2, gt=0)
+    platform_worker_db_max_overflow: int = Field(default=0, ge=0)
+    platform_worker_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
+    platform_worker_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
+    platform_worker_concurrency: int = Field(default=2, gt=0)
+    platform_db_connection_budget: int = Field(default=12, gt=0)
 
 
 @lru_cache(maxsize=1)
@@ -278,6 +291,17 @@ def validate_platform_settings(
         parse_load_test_source_ips(settings.platform_load_test_source_ips)
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
+    api_connection_budget = settings.platform_api_workers * (
+        settings.platform_db_pool_size + settings.platform_db_max_overflow
+    )
+    worker_connection_budget = settings.platform_worker_concurrency * (
+        settings.platform_worker_db_pool_size
+        + settings.platform_worker_db_max_overflow
+    )
+    if api_connection_budget + worker_connection_budget > settings.platform_db_connection_budget:
+        raise RuntimeError(
+            "Configured API and worker PostgreSQL pools exceed PLATFORM_DB_CONNECTION_BUDGET."
+        )
     if environment == "test":
         redis_url = urlsplit(settings.platform_redis_url)
         if redis_url.scheme not in {"redis", "rediss"} or redis_url.path != "/15":

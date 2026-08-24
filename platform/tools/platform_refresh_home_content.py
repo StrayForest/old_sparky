@@ -49,7 +49,7 @@ def _enqueue_patch_translations(payload: dict[str, Any]) -> int:
                 producer.send_task(
                     PATCH_TRANSLATION_TASK_NAME,
                     args=[patch_id],
-                    queue="deadlock-platform",
+                    queue="deadlock-platform-low",
                     expires=1800,
                 )
                 enqueued += 1

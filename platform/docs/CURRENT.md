@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-23
+- Last reviewed: 2026-08-24
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -28,10 +28,25 @@ Read this file for the current production baseline and next engineering priority
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
 - Password-login guessing protection uses independent source-IP and account-wide Redis state. Account identifiers are represented by HMAC fingerprints, shared failures drive adaptive Turnstile and a bounded cooldown, and successful login clears account failure/cooldown state.
-- Alembic head: `20260822_0040`.
-- Production contains the verified operator account and no test tournaments.
+- Production Alembic head before this release is `20260822_0040`; the reviewed
+  branch target adds `20260824_0042` participant slots and `20260824_0043`
+  ready-vote lifecycle guards.
+- On 2026-08-24 production was reset only after a restore-verified backup
+  (`platformdb-20260824T173357Z.dump`, SHA-256
+  `3ee0e6616b4af7964578a02d1df9cbef2855b0559bec8a395d3435cd15c0379d`). The
+  account `aleksei.lisitsin1@gmail.com`, its configured profile/media/access
+  graph and roles were retained; all tournament links, tournaments and other
+  application data were removed. Post-reset verification found one user,
+  zero tournaments and zero participant/workflow/audit rows.
 
 ## Current engineering priority
+
+AS-18 — Hot-path capacity and backpressure implementation is in progress. The scope and
+execution checklist are maintained in
+[`archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md`](archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md).
+The protected-account/database reset gate is resolved for the supplied
+production identity. Migration, exact-SHA CI, deploy smoke and retained-load
+evidence remain release gates.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.
@@ -77,14 +92,29 @@ against the current web/api/worker identities and units.
 - Profile-level Deadlock dream slots are the source of truth.
 - Invite-only workspace reads require active participant membership or explicit organizer/admin authority; historical inactive participant rows are not authorization grants, including for an already-open private bracket SSE stream.
 - Organizer exclusion must retain the tournament participant row as `disqualified`; self-rejoin and same-tournament invite redemption remain blocked until the organizer deliberately restores an active status. This is tournament-scoped and must not become a platform-wide ban.
-- Invite use and active-participant capacity are transaction-scoped PostgreSQL invariants: invite claim/revoke locks the stable tournament and invite rows in tournament-to-invite order; active-roster mutations serialize on the tournament row and capacity is rechecked before an inactive retained participant becomes active. Authentication last-seen touches use an isolated database transaction and must never commit or release locks owned by a mutation request.
+- Invite use and participant capacity are transaction-scoped PostgreSQL invariants: invite claim/revoke locks the stable tournament and invite rows in tournament-to-invite order; ordinary joins claim durable free slots without locking the tournament row, while lifecycle/restore mutations retain the tournament-row boundary and recheck capacity. Authentication last-seen touches use an isolated database transaction and must never commit or release locks owned by a mutation request.
 - Resource-creating API retries use durable actor/scope `Idempotency-Key` records. A repeated key with the same payload resolves to the originally created tournament/invite; reusing a key with a different payload is rejected.
 - Player-commitment reconciliation is a tournament workflow writer: it locks every affected Tournament row in deterministic id order before reading lifecycle state or releasing commitments. Automation failure-state persistence reacquires the same Tournament lock after any rollback.
-- Every Deadlock ready-check, captain, assignment generation, roster publish
-  and roster-lock write path — API, automation and worker alike — locks its
-  tournament row before checking lifecycle state. It re-reads terminal/staging
-  status under that lock and locks secondary rows in one documented order.
-  Redis may coalesce work but never replaces this durable transaction boundary.
+- Every Deadlock ready-check start/close, captain, assignment generation,
+  roster publish and roster-lock write path — API, automation and worker alike
+  — locks its tournament row before checking lifecycle state. Ordinary ready
+  votes are the deliberate exception: they upsert the unique vote row and its
+  32-way counter shard without taking the tournament-row lock; a deferred
+  database guard rejects votes after round closure or without active
+  participation. Redis may coalesce work but never replaces this durable
+  transaction boundary.
+- Participant capacity is represented by durable per-tournament slots. Join
+  claims a free slot with `FOR UPDATE SKIP LOCKED`; inactive retained rows and
+  deletes release capacity, while the unique `(tournament_id, user_id)` index
+  and idempotency record guard retries.
+- Bracket/workspace reads expose revision-derived private ETags and accept
+  `If-None-Match`; unchanged reads return `304`. Active browser views poll at
+  the existing short interval, hidden/passive/terminal views back off or stop,
+  and SSE remains admission-limited.
+- API and worker SQLAlchemy pools are explicit and bounded: the reviewed
+  baseline is API `2 x (3 + 1)` plus worker `2 x (2 + 0)` within a 12-connection
+  budget. Celery uses high/default/low queues, prefetch one and late acks;
+  backlog/retry pressure is part of the load evidence.
 - Ready-check votes must be committed only while their round is active and the
   voter remains an eligible active participant. A close or exclusion cannot
   leave a post-close or ineligible vote in persistence.

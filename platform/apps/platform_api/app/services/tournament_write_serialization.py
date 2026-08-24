@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 from fastapi import Depends, HTTPException, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from python_packages.platform_domain.tournaments import (
-    TournamentWorkflowError,
-    can_organizer_moderate_participants,
-    ensure_tournament_capacity_allows_join,
-)
+from python_packages.platform_domain.tournaments import can_organizer_moderate_participants
 from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
 from python_packages.platform_infra.models import (
@@ -17,6 +13,9 @@ from python_packages.platform_infra.models import (
     TournamentInviteAccess,
     TournamentParticipant,
     User,
+)
+from apps.platform_api.app.services.tournament_participant_capacity import (
+    has_free_participant_slot,
 )
 from python_packages.platform_infra.security import get_optional_authenticated_session
 
@@ -53,6 +52,13 @@ def _is_organizer_participant_add_request(request: Request) -> bool:
     return (
         request.method.upper() == "POST"
         and _matched_route_path(request).endswith("/{slug}/participants/manage")
+    )
+
+
+def _is_self_join_request(request: Request) -> bool:
+    return (
+        request.method.upper() == "POST"
+        and _matched_route_path(request).endswith("/{slug}/join")
     )
 
 
@@ -245,27 +251,14 @@ async def _enforce_restore_capacity(
     if current_status not in INACTIVE_PARTICIPANT_STATUSES:
         return
 
-    active_participant_count = int(
-        await db_session.scalar(
-            select(func.count())
-            .select_from(TournamentParticipant)
-            .where(
-                TournamentParticipant.tournament_id == tournament_id,
-                TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
-            )
-        )
-        or 0
-    )
-    try:
-        ensure_tournament_capacity_allows_join(
-            max_participants=max_participants,
-            active_participant_count=active_participant_count,
-        )
-    except TournamentWorkflowError as exc:
+    if max_participants is not None and not await has_free_participant_slot(
+        db_session,
+        tournament_id=tournament_id,
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(exc),
-        ) from exc
+            detail="Tournament participant limit has been reached.",
+        )
 
 
 async def _lock_participant_mutation(
@@ -280,8 +273,13 @@ async def _lock_participant_mutation(
         return
 
     if mutation_kind == "self":
+        if _is_self_join_request(request):
+            return
         locked = await _lock_tournament(db_session, slug=slug)
     else:
+        # Organizer moderation and removals retain the tournament-row lock so
+        # lifecycle/workflow state and secondary rows keep their established
+        # lock order.
         owner_snapshot = await _tournament_owner_snapshot(db_session, slug=slug)
         if owner_snapshot is None:
             return
@@ -314,7 +312,7 @@ async def serialize_tournament_write_invariants(
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> None:
-    """Serialize invite and participant-count mutations on stable PostgreSQL rows.
+    """Serialize lifecycle/invite mutations while joins claim independent slots.
 
     Locks are acquired in tournament -> invite order and remain owned by the
     request's shared database transaction until the route commits, rolls back,

@@ -10,7 +10,12 @@
 - Secrets, TLS, staging, runtimes, backups and reports live under `/opt/oldsparky/platform/shared`, outside immutable releases.
 - Nginx is the only public origin listener. Application/data services bind loopback.
 - PostgreSQL is authoritative for durable state; Redis owns bounded ephemeral state, locks, cache and Celery transport; R2 is not a database.
-- Tournament invite-use and active participant-capacity decisions are serialized in PostgreSQL: invite claim/revoke locks the tournament row and then the invite row, while participant-count mutations serialize on the tournament row and inactive restoration rechecks capacity before reactivation.
+- Tournament invite-use and participant-capacity decisions are serialized in
+  PostgreSQL: invite claim/revoke locks the tournament row and then the invite
+  row, ordinary joins claim durable per-tournament slots with
+  `FOR UPDATE SKIP LOCKED`, and inactive restoration retains the lifecycle
+  lock before reactivation. The unique participant key and slot table remain
+  authoritative; Redis is not the capacity store.
 - Public bracket SSE uses layered admission protection: Redis-backed application leases bound global, source and authenticated-user concurrency, while Nginx retains an independent coarse source/global connection ceiling.
 - Public media rendering is one-way `R2 -> CDN -> browser`; the API does not proxy media object bytes or fall back to local-disk reads.
 
@@ -31,7 +36,10 @@ Browser
 Browser -> cdn.old-sparky.com -> Cloudflare cache -> public R2 variants
 ```
 
-The platform connects directly to PostgreSQL. Add a database pooler only from measured scaling evidence.
+The platform connects directly to PostgreSQL with explicit API and worker pool
+limits: the reviewed baseline reserves `2 x (3 + 1)` API connections and
+`2 x (2 + 0)` worker connections within a 12-connection budget. Add a database
+pooler only from measured scaling evidence.
 
 ## Component ownership
 
@@ -39,7 +47,10 @@ The platform connects directly to PostgreSQL. Add a database pooler only from me
 - FastAPI owns HTTP schemas, authentication context and adapter orchestration.
 - Domain/services own permissions, workflow invariants and concurrency rules.
 - SQLAlchemy/Alembic own persistence and expand/contract schema evolution.
-- Celery owns image processing, assignment compute, reconciliation and external refresh work that must not block HTTP.
+- Celery owns image processing, assignment compute, reconciliation and
+  external refresh work that must not block HTTP. Existing Redis transport is
+  split into high/default/low queues with prefetch-one and late acknowledgements
+  so workflow work has priority over cleanup/refresh backlog.
 - Nginx owns origin TLS, proxy limits, cache headers and browser-hardening headers for HTML, API, static, SSE and error responses.
 - Cloudflare owns public DNS/edge TLS/HSTS/cache/WAF/Access. Edge controls never grant an application role.
 

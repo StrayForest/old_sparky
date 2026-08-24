@@ -18,6 +18,9 @@ from python_packages.platform_domain.deadlock.constants import RANKS
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.media.hard_delete import purge_deleted_media_metadata
+from apps.platform_api.app.services.tournament_participant_capacity import (
+    ensure_participant_slot_claimed,
+)
 from python_packages.platform_infra.models import (
     DeadlockDreamSlot,
     DeadlockProfile,
@@ -349,14 +352,23 @@ async def seed(operator_email: str) -> dict[str, object]:
         db_session.add(tournament)
         await db_session.flush()
 
-        for user in roster:
-            db_session.add(
-                TournamentParticipant(
-                    tournament_id=tournament.id,
-                    user_id=user.id,
-                    entry_type="solo",
-                    status="confirmed",
-                )
+        participants = [
+            TournamentParticipant(
+                tournament_id=tournament.id,
+                user_id=user.id,
+                entry_type="solo",
+                status="confirmed",
+            )
+            for user in roster
+        ]
+        db_session.add_all(participants)
+        await db_session.flush()
+        for participant in participants:
+            await ensure_participant_slot_claimed(
+                db_session,
+                tournament_id=tournament.id,
+                max_participants=tournament.max_participants,
+                participant_id=participant.id,
             )
 
         ready_round = TournamentDeadlockReadyRound(

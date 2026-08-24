@@ -11,6 +11,7 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockCaptainRound,
     TournamentDeadlockReadyRound,
     TournamentInvite,
+    TournamentParticipantSlot,
 )
 
 
@@ -106,6 +107,47 @@ class DeadlockPersistenceModelTests(unittest.TestCase):
             public_name_migration.read_text(encoding="utf-8"),
         )
         self.assertIn("pg_index.indisvalid", public_name_migration.read_text(encoding="utf-8"))
+
+    def test_participant_capacity_slots_are_bounded_and_released_by_status_trigger(self) -> None:
+        constraints = {
+            str(constraint.name)
+            for constraint in TournamentParticipantSlot.__table__.constraints
+        }
+        self.assertIn(
+            "uq_tournament_participant_slots_tournament_slot",
+            constraints,
+        )
+        self.assertIn(
+            "uq_tournament_participant_slots_tournament_participant",
+            constraints,
+        )
+        free_index = next(
+            index
+            for index in TournamentParticipantSlot.__table__.indexes
+            if index.name == "ix_tournament_participant_slots_free"
+        )
+        self.assertEqual(str(free_index.dialect_options["postgresql"]["where"]), "participant_id IS NULL")
+
+        migration_root = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+        capacity_migration = (migration_root / "20260824_0042_participant_capacity_slots.py").read_text(
+            encoding="utf-8"
+        )
+        ready_vote_migration = (migration_root / "20260824_0043_ready_vote_open_round_guard.py").read_text(
+            encoding="utf-8"
+        )
+        capacity_service = (
+            Path(__file__).resolve().parents[1]
+            / "apps"
+            / "platform_api"
+            / "app"
+            / "services"
+            / "tournament_participant_capacity.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("skip_locked=True", capacity_service)
+        self.assertIn("trg_release_inactive_tournament_participant_slot", capacity_migration)
+        self.assertIn("AFTER INSERT OR UPDATE OF max_participants", capacity_migration)
+        self.assertIn("ON CONFLICT (tournament_id, slot_number) DO NOTHING", capacity_migration)
+        self.assertIn("trg_tournament_deadlock_ready_votes_open_round", ready_vote_migration)
 
 
 if __name__ == "__main__":

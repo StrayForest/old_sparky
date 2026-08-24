@@ -123,6 +123,11 @@ def load_matrix_manifest(
     control_email = str(payload.get("control_email") or "").strip().lower()
     if control_email != expected_control_email.strip().lower():
         raise ValueError("matrix control email does not match the cleanup input")
+    mode = str(payload.get("mode") or "scale")
+    if mode not in {"scale", "browser-polling"}:
+        raise ValueError("matrix mode is not supported")
+    if mode == "browser-polling" and len(rows) != 1:
+        raise ValueError("browser-polling manifest must contain exactly one row")
 
     markers: set[str] = set()
     user_ids: set[str] = set()
@@ -149,8 +154,8 @@ def load_matrix_manifest(
             raise ValueError("matrix detail report must be a JSON object")
         if report.get("marker") != marker or report.get("report_path") != str(report_path):
             raise ValueError("matrix report identity does not match its summary row")
-        if report.get("mode") != "scale" or report.get("origin") != EXPECTED_ORIGIN:
-            raise ValueError("matrix report is not a canonical production scale report")
+        if report.get("mode") != mode or report.get("origin") != EXPECTED_ORIGIN:
+            raise ValueError("matrix report is not a canonical production retained-load report")
         row_users = _uuid_list(
             report.get("user_ids"), field=f"{marker}.user_ids", allow_empty=True
         )
@@ -159,8 +164,10 @@ def load_matrix_manifest(
             field=f"{marker}.tournament_ids",
             allow_empty=True,
         )
-        if len(row_tournaments) > 1:
+        if mode == "scale" and len(row_tournaments) > 1:
             raise ValueError("a matrix row may own at most one tournament")
+        if mode == "browser-polling" and not 1 <= len(row_tournaments) <= MAX_MATRIX_ROWS:
+            raise ValueError("browser-polling manifest has an invalid tournament count")
         if int(row.get("synthetic_users", len(row_users))) != len(row_users):
             raise ValueError("matrix synthetic user count does not match its report")
         if markers.intersection({marker}) or user_ids.intersection(row_users) or tournament_ids.intersection(row_tournaments):
@@ -179,10 +186,14 @@ def load_matrix_manifest(
         )
     if not user_ids:
         raise ValueError("matrix manifest contains no synthetic users")
-    if payload.get("completed_tournaments") != len(rows):
+    expected_completed_tournaments = (
+        len(rows) if mode == "scale" else sum(len(row["tournament_ids"]) for row in manifests)
+    )
+    if payload.get("completed_tournaments") != expected_completed_tournaments:
         raise ValueError("matrix completed tournament count does not match its rows")
     return {
         "control_email": control_email,
+        "mode": mode,
         "markers": markers,
         "user_ids": user_ids,
         "tournament_ids": tournament_ids,
@@ -272,17 +283,20 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("some matrix tournaments are missing or outside the manifest")
         expected_tournament_ids: set[str] = set()
         for row in manifest["rows"]:
-            if not row["tournament_ids"]:
-                continue
-            tournament_id = row["tournament_ids"][0]
-            tournament = next(item for item in tournament_rows if str(item.id) == tournament_id)
-            expected_description = f"Large preprod QA tournament {row['marker']}."
-            if (
-                tournament.description != expected_description
-                or str(tournament.organizer_user_id) not in set(row["user_ids"])
-            ):
-                raise RuntimeError("matrix tournament ownership or marker does not match")
-            expected_tournament_ids.add(tournament_id)
+            for tournament_id in row["tournament_ids"]:
+                tournament = next(item for item in tournament_rows if str(item.id) == tournament_id)
+                if manifest["mode"] == "scale":
+                    description_ok = tournament.description == f"Large preprod QA tournament {row['marker']}."
+                else:
+                    description_ok = str(tournament.description or "").startswith(
+                        f"Browser polling profile {row['marker']} "
+                    )
+                if (
+                    not description_ok
+                    or str(tournament.organizer_user_id) not in set(row["user_ids"])
+                ):
+                    raise RuntimeError("matrix tournament ownership or marker does not match")
+                expected_tournament_ids.add(tournament_id)
         if expected_tournament_ids != tournament_ids:
             raise RuntimeError("matrix tournament manifest is not one-to-one with reports")
 

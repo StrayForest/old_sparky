@@ -29,6 +29,7 @@ class RequestPerformanceMetrics:
     compute_blocks: int = 0
     compute_time_seconds: float = 0.0
     response_bytes: int = 0
+    pool_checkout_wait_seconds: float = 0.0
     qa_phase: str | None = None
     cf_ray: str | None = None
     client_fingerprint: str | None = None
@@ -136,6 +137,12 @@ def current_request_metrics() -> RequestPerformanceMetrics | None:
     return _current_metrics.get()
 
 
+def record_pool_checkout_wait(elapsed_seconds: float) -> None:
+    metrics = _current_metrics.get()
+    if metrics is not None:
+        metrics.pool_checkout_wait_seconds += max(0.0, elapsed_seconds)
+
+
 def reset_request_metrics(token: Token[RequestPerformanceMetrics | None]) -> None:
     _current_metrics.reset(token)
 
@@ -212,6 +219,7 @@ class RequestPerformanceMiddleware:
             total_ms >= settings.platform_perf_slow_request_ms
             or sql_ms >= settings.platform_perf_slow_db_ms
             or metrics.sql_query_count >= settings.platform_perf_sql_count_threshold
+            or metrics.pool_checkout_wait_seconds >= 0.1
         )
         if not should_log:
             return
@@ -222,7 +230,7 @@ class RequestPerformanceMiddleware:
             "request_perf request_id=%s method=%s path=%s route=%s status=%s "
             "total_ms=%.2f sql_ms=%.2f sql_count=%s max_sql_ms=%.2f "
             "compute_ms=%.2f compute_blocks=%s response_bytes=%s qa_phase=%s "
-            "cf_ray=%s client=%s",
+            "pool_wait_ms=%.2f cf_ray=%s client=%s",
             metrics.request_id,
             metrics.method,
             metrics.path,
@@ -236,6 +244,7 @@ class RequestPerformanceMiddleware:
             metrics.compute_blocks,
             metrics.response_bytes,
             metrics.qa_phase or "-",
+            metrics.pool_checkout_wait_seconds * 1000,
             metrics.cf_ray or "-",
             metrics.client_fingerprint or "-",
         )

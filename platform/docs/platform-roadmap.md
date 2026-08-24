@@ -2,11 +2,22 @@
 
 - Status: Active backlog and priority map
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-23
+- Last reviewed: 2026-08-24
 
 For the production baseline and immediate engineering target, read [`CURRENT.md`](CURRENT.md). This file deliberately omits release diaries and detailed audit evidence.
 
 ## P1 — security and correctness
+
+### AS-18 — Hot-path capacity and backpressure
+
+**In progress.** Participant slots, idempotent join, non-locking ordinary
+ready votes, conditional ETag reads, bounded pools and priority queues are
+implemented in the reviewed branch. The implementation plan and destructive-data reset gate are
+recorded in [`archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md`](archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md).
+The package covers join capacity slots, compact conditional workflow reads,
+bounded API/worker pools, Celery priority/backpressure and retained load
+evidence. Existing 32-shard ready votes, PostgreSQL workflow authority and
+SSE admission limits remain in force.
 
 ### AS-17 — End-to-end release transaction and recovery
 

@@ -31,6 +31,19 @@ class PlatformWorkerRuntimeTests(unittest.TestCase):
     def test_automation_task_does_not_store_unused_results(self) -> None:
         self.assertTrue(worker.deadlock_automation_tick.ignore_result)
 
+    def test_background_work_is_routed_to_bounded_priority_queues(self) -> None:
+        routes = worker.celery_app.conf.task_routes
+        self.assertEqual(
+            routes["platform.deadlock_automation_tick"]["queue"],
+            worker.HIGH_PRIORITY_QUEUE,
+        )
+        self.assertEqual(
+            routes["platform.player_commitment_reconciliation"]["queue"],
+            worker.LOW_PRIORITY_QUEUE,
+        )
+        self.assertEqual(worker.celery_app.conf.worker_prefetch_multiplier, 1)
+        self.assertTrue(worker.celery_app.conf.task_acks_late)
+
     def test_automation_beat_entry_expires_at_the_next_cadence(self) -> None:
         self.assertEqual(
             worker.celery_app.conf.beat_schedule["deadlock-automation-tick"],

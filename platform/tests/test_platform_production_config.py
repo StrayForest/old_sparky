@@ -60,6 +60,19 @@ class PlatformProductionConfigTests(unittest.TestCase):
     def test_complete_production_configuration_passes(self) -> None:
         validate_platform_settings(self.production_settings())
 
+    def test_database_connection_budget_rejects_unbounded_combination(self) -> None:
+        settings = self.production_settings(
+            platform_api_workers=2,
+            platform_db_pool_size=5,
+            platform_db_max_overflow=2,
+            platform_worker_concurrency=2,
+            platform_worker_db_pool_size=3,
+            platform_worker_db_max_overflow=1,
+            platform_db_connection_budget=10,
+        )
+        with self.assertRaisesRegex(RuntimeError, "CONNECTION_BUDGET"):
+            validate_platform_settings(settings)
+
     def test_load_test_source_allowlist_accepts_exact_ipv4_and_ipv6_only(self) -> None:
         self.assertEqual(
             parse_load_test_source_ips("192.0.2.10, 2001:db8::10"),

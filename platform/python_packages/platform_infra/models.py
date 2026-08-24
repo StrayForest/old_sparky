@@ -635,6 +635,52 @@ class TournamentParticipant(TimestampMixin, Base):
     )
 
 
+class TournamentParticipantSlot(TimestampMixin, Base):
+    """Durable bounded capacity for an individual tournament.
+
+    A slot is claimed only by an active participant. Retained inactive
+    participant rows stay available for audit/history without consuming
+    registration capacity.
+    """
+
+    __tablename__ = "tournament_participant_slots"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id",
+            "slot_number",
+            name="uq_tournament_participant_slots_tournament_slot",
+        ),
+        UniqueConstraint(
+            "tournament_id",
+            "participant_id",
+            name="uq_tournament_participant_slots_tournament_participant",
+        ),
+        CheckConstraint("slot_number > 0", name="slot_number_positive"),
+        Index(
+            "ix_tournament_participant_slots_free",
+            "tournament_id",
+            postgresql_where=text("participant_id IS NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tournament_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("platform.tournaments.id", ondelete="CASCADE"),
+        index=True,
+    )
+    slot_number: Mapped[int] = mapped_column(Integer)
+    participant_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("platform.tournament_participants.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class TournamentMatch(TimestampMixin, Base):
     __tablename__ = "tournament_matches"
     __table_args__ = (

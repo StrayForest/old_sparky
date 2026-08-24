@@ -16,6 +16,16 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
             platform_database_url="postgresql+asyncpg://platform_user@127.0.0.1/platformdb",
             platform_environment="development",
             platform_db_schema="platform",
+            platform_load_test_source_ips="",
+            platform_api_workers=2,
+            platform_db_pool_size=3,
+            platform_db_max_overflow=1,
+            platform_db_pool_timeout_seconds=5,
+            platform_db_pool_recycle_seconds=1800,
+            platform_worker_concurrency=2,
+            platform_worker_db_pool_size=2,
+            platform_worker_db_max_overflow=0,
+            platform_db_connection_budget=12,
         )
         engine = Mock()
         engine.sync_engine = sentinel.sync_engine
@@ -33,6 +43,10 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
                 settings.platform_database_url,
                 future=True,
                 pool_pre_ping=True,
+                pool_size=3,
+                max_overflow=1,
+                pool_timeout=5,
+                pool_recycle=1800,
             )
             install_query_metrics.assert_called_once_with(sentinel.sync_engine)
             create_session_factory.assert_called_once_with(

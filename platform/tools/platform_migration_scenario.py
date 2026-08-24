@@ -1,4 +1,4 @@
-"""Exercise the 0040 migration against populated legacy data."""
+"""Exercise the current persistence migrations against populated legacy data."""
 
 from __future__ import annotations
 
@@ -20,12 +20,13 @@ from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     Tournament,
     TournamentDeadlockReadyRound,
+    TournamentParticipantSlot,
     User,
 )
 
 
 TARGET_REVISION = "20260821_0039"
-HEAD_REVISION = "20260822_0040"
+HEAD_REVISION = "20260824_0043"
 
 
 def _run_alembic(
@@ -119,6 +120,17 @@ async def _assert_repaired_state(tournament_id: str) -> None:
         )
         if len(active_rounds) != 1:
             raise RuntimeError(f"expected one active ready round, found {len(active_rounds)}")
+        slot_count = len(
+            list(
+                await db_session.scalars(
+                    select(TournamentParticipantSlot).where(
+                        TournamentParticipantSlot.tournament_id == tournament_id
+                    )
+                )
+            )
+        )
+        if slot_count != 16:
+            raise RuntimeError(f"expected 16 participant capacity slots, found {slot_count}")
 
 
 async def _main() -> None:

@@ -102,6 +102,20 @@ class ProductionQaPollingProfileTests(unittest.TestCase):
         self.assertEqual(qa.http_max_connections, 10_000)
         self.assertTrue(qa.browser_polling_active_users_only)
 
+    def test_browser_polling_defaults_to_10000_virtual_users(self) -> None:
+        qa = ProductionQa(
+            origin="http://127.0.0.1",
+            report_path=Path("/tmp/platform-production-qa-default-10k-test.json"),
+            browser_gate_dir=None,
+            browser_gate_timeout=1.0,
+            http_timeout=1.0,
+            keep_data=False,
+            mode="browser-polling",
+        )
+
+        self.assertEqual(qa.scale_users, 10_000)
+        self.assertEqual(qa.browser_polling_users_per_tournament, 500)
+
     def test_polling_metrics_group_events(self) -> None:
         recorder = PollingMetricsRecorder()
         recorder.mark(
@@ -130,11 +144,18 @@ class ProductionQaPollingProfileTests(unittest.TestCase):
             tournament_status="terminal",
             terminal_known=True,
         )
+        recorder.mark(
+            "not_modified",
+            route="GET /tournaments/{slug}/workspace",
+            role="participant",
+            tournament_status="ready_check_active",
+        )
 
         summary = recorder.summary()
 
         self.assertEqual(summary["total_scheduled"], 1)
         self.assertEqual(summary["executed"], 2)
+        self.assertEqual(summary["not_modified"], 1)
         self.assertEqual(summary["skipped_hidden"], 1)
         self.assertEqual(
             summary["by_route"]["GET /tournaments/{slug}/workspace"]["executed"],

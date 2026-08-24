@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from redis.asyncio import Redis, from_url
 from sqlalchemy import delete, func, or_, select, text
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +56,9 @@ from python_packages.platform_infra.models import (
     UserSession,
 )
 from python_packages.platform_infra.security import hash_password, new_session_token, session_token_digest
+from apps.platform_api.app.services.tournament_participant_capacity import (
+    ensure_participant_slot_claimed,
+)
 
 
 VALID_RANKS = list(RANKS[:-1])
@@ -77,14 +81,14 @@ UUID_RE = re.compile(
 NUMERIC_PATH_RE = re.compile(r"/\d+(?=/|$)")
 REQUEST_PERF_RE = re.compile(r"\brequest_perf\b(?P<body>.*)$")
 PROCESS_CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-BROWSER_POLLING_PROFILE_NAME = "browser-polling-20x50"
+BROWSER_POLLING_PROFILE_NAME = "browser-polling-20x500"
 BROWSER_POLLING_TOURNAMENT_PLAN = (
     ("registration_open", 10),
     ("ready_check_active", 5),
     ("bracket_active", 3),
     ("terminal", 2),
 )
-BROWSER_POLLING_USERS_PER_TOURNAMENT = 50
+BROWSER_POLLING_USERS_PER_TOURNAMENT = 500
 BROWSER_POLLING_DURATION_SECONDS = 300.0
 BROWSER_POLLING_OPEN_STAGGER_SECONDS = 30.0
 BROWSER_POLLING_FIXED_INTERVAL_MS = 10_000
@@ -493,6 +497,7 @@ class PollingMetricsRecorder:
             "skipped_terminal": int(counter.get("skipped_terminal", 0)),
             "deduped": int(counter.get("deduped", 0)),
             "aborted": int(counter.get("aborted", 0)),
+            "not_modified": int(counter.get("not_modified", 0)),
             "sse_reconnect": int(counter.get("sse_reconnect", 0)),
         }
 
@@ -999,6 +1004,27 @@ class SystemSampler:
         self._previous_postgres_ticks: int | None = None
         self._previous_process_groups: dict[str, dict[str, Any]] | None = None
         self._previous_monotonic: float | None = None
+        self._celery_redis: Redis = from_url(
+            get_settings().platform_celery_broker_url,
+            decode_responses=True,
+        )
+
+    async def celery_backlog(self) -> dict[str, int] | dict[str, str]:
+        try:
+            queue_names = (
+                "deadlock-platform-high",
+                "deadlock-platform-default",
+                "deadlock-platform-low",
+            )
+            lengths = await asyncio.gather(
+                *(self._celery_redis.llen(queue) for queue in queue_names)
+            )
+            return {
+                queue: int(length or 0)
+                for queue, length in zip(queue_names, lengths, strict=True)
+            }
+        except Exception as exc:
+            return {"error": type(exc).__name__}
 
     async def start(self) -> None:
         if self._task is None:
@@ -1006,10 +1032,12 @@ class SystemSampler:
 
     async def stop(self) -> None:
         if self._task is None:
+            await self._celery_redis.aclose()
             return
         self._task.cancel()
         await asyncio.gather(self._task, return_exceptions=True)
         self._task = None
+        await self._celery_redis.aclose()
 
     async def _run(self) -> None:
         while True:
@@ -1098,6 +1126,7 @@ class SystemSampler:
                 "postgres_cpu_percent": round(postgres_cpu_percent, 2),
                 "processes": process_metrics,
                 "postgres_waits": await sample_postgres_waits(),
+                "celery_backlog": await self.celery_backlog(),
             }
         )
 
@@ -1156,6 +1185,24 @@ class SystemSampler:
             float(row.get("max_lock_waiting_query_ms") or 0)
             for row in postgres_wait_rows
         ]
+        backlog_rows = [
+            sample.get("celery_backlog", {})
+            for sample in samples
+            if isinstance(sample.get("celery_backlog"), dict)
+            and "error" not in sample.get("celery_backlog", {})
+        ]
+        backlog_by_queue = {
+            queue: {
+                "max": max(int(row.get(queue) or 0) for row in backlog_rows),
+                "last": int(backlog_rows[-1].get(queue) or 0),
+            }
+            for queue in (
+                "deadlock-platform-high",
+                "deadlock-platform-default",
+                "deadlock-platform-low",
+            )
+            if backlog_rows
+        }
         worker_counts = [int(sample["gunicorn"]["workers"]) for sample in samples]
         return {
             "samples": len(samples),
@@ -1272,6 +1319,10 @@ class SystemSampler:
                     3,
                 ),
             },
+            "celery_backlog": {
+                "samples": len(backlog_rows),
+                "by_queue": backlog_by_queue,
+            },
         }
 
 
@@ -1294,6 +1345,7 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
         "compute_ms": float,
         "compute_blocks": int,
         "response_bytes": int,
+        "pool_wait_ms": float,
     }
     for key, caster in numeric_keys.items():
         if key not in values:
@@ -1342,6 +1394,7 @@ def summarize_request_perf_logs(
     compute_times = [float(row["compute_ms"]) for row in rows if isinstance(row.get("compute_ms"), (int, float))]
     max_sql_times = [float(row["max_sql_ms"]) for row in rows if isinstance(row.get("max_sql_ms"), (int, float))]
     response_bytes = [float(row["response_bytes"]) for row in rows if isinstance(row.get("response_bytes"), (int, float))]
+    pool_wait_times = [float(row["pool_wait_ms"]) for row in rows if isinstance(row.get("pool_wait_ms"), (int, float))]
     non_sql_times = [
         max(
             0.0,
@@ -1391,6 +1444,7 @@ def summarize_request_perf_logs(
             "response_bytes": byte_stats(
                 [int(row["response_bytes"]) for row in row_values if isinstance(row.get("response_bytes"), (int, float))]
             ),
+            "pool_checkout_wait_ms": row_metric_stats("pool_wait_ms", row_values),
         }
 
     return {
@@ -1402,6 +1456,7 @@ def summarize_request_perf_logs(
         "non_sql_time": metric_stats(non_sql_times),
         "max_sql_time_ms": round(max(max_sql_times), 3) if max_sql_times else None,
         "response_bytes": byte_stats([int(value) for value in response_bytes]),
+        "pool_checkout_wait_ms": metric_stats(pool_wait_times),
         "by_route": {
             route: summarize_route_rows(row_values)
             for route, row_values in sorted(
@@ -2011,8 +2066,10 @@ class ProductionQa:
         method: str,
         path: str,
         *,
-        expected: int,
+        expected: int | tuple[int, ...],
         json_payload: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+        return_response_meta: bool = False,
     ) -> Any:
         token = self.session_tokens_by_user_id[str(user["id"])]
         csrf_token = None
@@ -2023,31 +2080,39 @@ class ProductionQa:
         ok = False
         response_bytes = 0
         try:
+            request_headers = {
+                "Origin": self.origin,
+                "Cookie": "; ".join(
+                    filter(
+                        None,
+                        (
+                            f"{self.session_cookie_name}={token}",
+                            f"{self.csrf_cookie_name}={csrf_token}" if csrf_token else None,
+                        ),
+                    )
+                ),
+                **({"X-CSRF-Token": csrf_token} if csrf_token else {}),
+                **(
+                    {"X-Platform-QA-Phase": self.current_phase}
+                    if self.collect_performance
+                    else {}
+                ),
+            }
+            if extra_headers:
+                request_headers.update(extra_headers)
             response = await client.request(
                 method,
                 path,
-                headers={
-                    "Origin": self.origin,
-                    "Cookie": "; ".join(
-                        filter(
-                            None,
-                            (
-                                f"{self.session_cookie_name}={token}",
-                                f"{self.csrf_cookie_name}={csrf_token}" if csrf_token else None,
-                            ),
-                        )
-                    ),
-                    **({"X-CSRF-Token": csrf_token} if csrf_token else {}),
-                    **(
-                        {"X-Platform-QA-Phase": self.current_phase}
-                        if self.collect_performance
-                        else {}
-                    ),
-                },
+                headers=request_headers,
                 json=json_payload,
             )
             status_code = response.status_code
-            ok = response.status_code == expected
+            expected_statuses = (
+                {expected}
+                if isinstance(expected, int)
+                else set(expected)
+            )
+            ok = response.status_code in expected_statuses
             response_bytes = len(response.content or b"")
         finally:
             if self.collect_performance:
@@ -2063,14 +2128,20 @@ class ProductionQa:
                     finished_at=finished_at,
                     response_bytes=response_bytes,
                 )
-        if response.status_code != expected:
+        expected_statuses = (
+            {expected}
+            if isinstance(expected, int)
+            else set(expected)
+        )
+        if response.status_code not in expected_statuses:
             raise QaFailure(
-                f"{method} {path} as {user['label']}: expected {expected}, got "
+                f"{method} {path} as {user['label']}: expected {sorted(expected_statuses)}, got "
                 f"{response.status_code}: {response.text[:1000]}"
             )
-        if not response.content:
-            return None
-        return response.json()
+        payload = response.json() if response.content else None
+        if return_response_meta:
+            return payload, response.status_code, dict(response.headers)
+        return payload
 
     async def csrf_token_for_user(
         self,
@@ -2304,6 +2375,19 @@ class ProductionQa:
             else:
                 participant.entry_type = "solo"
                 participant.status = "registered"
+            await db_session.flush()
+            await ensure_participant_slot_claimed(
+                db_session,
+                tournament_id=self.tournament_id,
+                max_participants=(
+                    await db_session.scalar(
+                        select(Tournament.max_participants).where(
+                            Tournament.id == self.tournament_id
+                        )
+                    )
+                ),
+                participant_id=participant.id,
+            )
 
             ready_round_id: int | None = None
             if self.retained_participant_state == "ready-unassigned":
@@ -2421,6 +2505,19 @@ class ProductionQa:
             else:
                 participant.entry_type = "solo"
                 participant.status = "registered"
+            await db_session.flush()
+            await ensure_participant_slot_claimed(
+                db_session,
+                tournament_id=self.tournament_id,
+                max_participants=(
+                    await db_session.scalar(
+                        select(Tournament.max_participants).where(
+                            Tournament.id == self.tournament_id
+                        )
+                    )
+                ),
+                participant_id=participant.id,
+            )
 
             token = new_session_token()
             token_digest = session_token_digest(token)
@@ -3167,13 +3264,34 @@ class ProductionQa:
                 hidden=bool(tab.get("hidden")),
                 terminal_known=bool(tab.get("terminal_known")),
             )
-            return await self.request_as(
+            request_result = await self.request_as(
                 api_client,
                 tab["user"],
                 "GET",
                 str(tab["route"]),
-                expected=200,
+                expected=(200, 304),
+                extra_headers=(
+                    {"If-None-Match": str(tab["etag"])}
+                    if tab.get("etag")
+                    else None
+                ),
+                return_response_meta=True,
             )
+            payload, status_code, response_headers = request_result
+            if status_code == 304:
+                self.polling_metrics.mark(
+                    "not_modified",
+                    route=route_label,
+                    role=str(tab["role"]),
+                    tournament_status=str(tab["tournament_status"]),
+                    hidden=bool(tab.get("hidden")),
+                    terminal_known=bool(tab.get("terminal_known")),
+                )
+                return tab.get("last_payload")
+            if response_headers.get("etag"):
+                tab["etag"] = response_headers["etag"]
+            tab["last_payload"] = payload
+            return payload
         finally:
             inflight.discard(inflight_key)
 
@@ -3440,6 +3558,16 @@ class ProductionQa:
                 "browser_polling_bracket_deduped",
                 polling_summary["deduped"] > 0,
                 {"deduped": polling_summary["deduped"]},
+            )
+            self.scenario(
+                "browser_polling_conditional_reads_observed",
+                polling_summary["not_modified"] > 0
+                if self.browser_polling_duration >= 30
+                else True,
+                {
+                    "not_modified": polling_summary["not_modified"],
+                    "skipped_short_duration": self.browser_polling_duration < 30,
+                },
             )
             long_enough_for_polling_tick = (
                 self.browser_polling_duration

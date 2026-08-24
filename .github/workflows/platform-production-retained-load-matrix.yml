@@ -17,6 +17,14 @@ on:
         required: true
         default: "80"
         type: string
+      profile:
+        description: "Load profile; browser-polling is the final 10,000 virtual-user gate"
+        required: true
+        default: "matrix"
+        type: choice
+        options:
+          - matrix
+          - browser-polling
 
 permissions:
   contents: read
@@ -38,6 +46,7 @@ jobs:
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       CONTROL_EMAIL: ${{ inputs.control_email }}
       QA_CONCURRENCY: ${{ inputs.concurrency }}
+      QA_PROFILE: ${{ inputs.profile }}
       TARGET_SHA: ${{ github.sha }}
 
     steps:
@@ -49,6 +58,8 @@ jobs:
             || { echo "Production retained load must run from the reviewed dev branch." >&2; exit 1; }
           test "$QA_CONFIRMATION" = "RUN-PRODUCTION-RETAINED-LOAD-MATRIX" \
             || { echo "Refusing production load without exact confirmation." >&2; exit 1; }
+          test "$QA_PROFILE" = "matrix" || test "$QA_PROFILE" = "browser-polling" \
+            || { echo "Unsupported production load profile" >&2; exit 1; }
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
@@ -108,7 +119,7 @@ jobs:
             -o ServerAliveCountMax=3 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$CONTROL_EMAIL" "$QA_CONCURRENCY" "$GITHUB_RUN_ID" \
+            bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$CONTROL_EMAIL" "$QA_CONCURRENCY" "$GITHUB_RUN_ID" "$QA_PROFILE" \
             > "$ssh_output_file" 2>&1 <<'REMOTE'
           set -Eeuo pipefail
           confirmation="$1"
@@ -116,8 +127,9 @@ jobs:
           control_email="$3"
           concurrency="$4"
           run_id="$5"
+          profile="$6"
           sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_matrix_qa.sh \
-            "$confirmation" "$target_sha" "$control_email" "$concurrency" "$run_id"
+            "$confirmation" "$target_sha" "$control_email" "$concurrency" "$run_id" "$profile"
           REMOTE
           remote_status=$?
           set -e
@@ -175,14 +187,18 @@ jobs:
 
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           performance = payload.get("performance_summary") or {}
+          polling = payload.get("polling") or {}
           print("### Production retained 10k-user load matrix")
           print()
+          print(f"- Profile: **{payload.get('mode', 'scale')}**")
           print(f"- Status: **{'passed' if payload.get('passed') else 'failed'}**")
           print(f"- Tournaments: {payload.get('completed_tournaments', 0)}/{payload.get('planned_tournaments', 0)}")
           print(f"- Generated users: {payload.get('completed_users', 0)}/{payload.get('planned_users', 0)}")
           print(f"- Planned teams: {payload.get('planned_teams', 0)}")
           print(f"- Worst HTTP p95: {performance.get('worst_http_p95_ms')} ms")
           print(f"- Worst HTTP p99: {performance.get('worst_http_p99_ms')} ms")
+          if polling:
+              print(f"- Polling tabs: {polling.get('tabs_planned')}; executed: {polling.get('executed')}; 304/not-modified: {polling.get('not_modified')}; deduped: {polling.get('deduped')}")
           print()
           print("#### Bottleneck classes")
           for row in performance.get("bottleneck_classes") or []:
