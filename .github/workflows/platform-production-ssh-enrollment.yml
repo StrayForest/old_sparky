@@ -1,9 +1,8 @@
 name: Platform production SSH host-key enrollment
 
 on:
-  push:
-    branches:
-      - fix/release-infra-audit-20260824-v2
+  pull_request:
+    branches: [dev]
     paths:
       - ".github/workflows/platform-production-ssh-enrollment.yml"
 
