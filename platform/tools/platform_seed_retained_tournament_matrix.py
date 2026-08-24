@@ -31,7 +31,7 @@ MATRIX_STATES = {
         ("public", "registered"),
         ("invite_only", "ready"),
         ("public", None),
-        ("invite_only", "registered"),
+        ("public", "registered"),
         ("public", None),
     ),
     16: (
@@ -131,7 +131,7 @@ def validate_matrix_plan(plan: list[dict[str, Any]]) -> None:
     if len(assigned_items) != 1 or int(assigned_items[0]["teams"]) != 64:
         raise RuntimeError("The assigned control state must be on the 64-team run")
     if Counter(str(item["visibility"]) for item in plan) != Counter(
-        {"public": 18, "invite_only": 2}
+        {"public": 19, "invite_only": 1}
     ):
         raise RuntimeError("Invalid tournament visibility matrix")
 

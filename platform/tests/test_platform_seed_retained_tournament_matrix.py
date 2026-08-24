@@ -44,7 +44,7 @@ class RetainedTournamentMatrixTests(unittest.TestCase):
         )
         self.assertEqual(
             sum(item["visibility"] == "invite_only" for item in plan),
-            2,
+            1,
         )
         self.assertEqual(
             [(item["teams"], item["control_state"]) for item in plan if item["control_state"] == "assigned"],
