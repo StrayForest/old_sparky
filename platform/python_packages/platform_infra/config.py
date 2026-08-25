@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 PLATFORM_SCHEMA = "platform"
+PLATFORM_SSE_DB_POOL_SIZE = 2
 PLATFORM_ROOT = Path(__file__).resolve().parents[2]
 DEVELOPMENT_SECRET_KEY = "development-only-secret-key-change-before-production"
 
@@ -193,7 +194,7 @@ class PlatformSettings(BaseSettings):
     # Keep PostgreSQL connection count bounded per process. API and Celery
     # processes use separate budgets so background bursts cannot consume the
     # entire database capacity reserved for user requests.
-    platform_db_pool_size: int = Field(default=12, gt=0)
+    platform_db_pool_size: int = Field(default=16, gt=0)
     platform_db_max_overflow: int = Field(default=0, ge=0)
     platform_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
     platform_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
@@ -202,7 +203,7 @@ class PlatformSettings(BaseSettings):
     platform_worker_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
     platform_worker_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
     platform_worker_concurrency: int = Field(default=2, gt=0)
-    platform_db_connection_budget: int = Field(default=32, gt=0)
+    platform_db_connection_budget: int = Field(default=40, gt=0)
 
 
 @lru_cache(maxsize=1)
@@ -298,7 +299,11 @@ def validate_platform_settings(
         settings.platform_worker_db_pool_size
         + settings.platform_worker_db_max_overflow
     )
-    if api_connection_budget + worker_connection_budget > settings.platform_db_connection_budget:
+    stream_connection_budget = settings.platform_api_workers * PLATFORM_SSE_DB_POOL_SIZE
+    if (
+        api_connection_budget + worker_connection_budget + stream_connection_budget
+        > settings.platform_db_connection_budget
+    ):
         raise RuntimeError(
             "Configured API and worker PostgreSQL pools exceed PLATFORM_DB_CONNECTION_BUDGET."
         )

@@ -77,12 +77,12 @@ class PlatformProductionConfigTests(unittest.TestCase):
         validate_platform_settings(
             self.production_settings(
                 platform_api_workers=2,
-                platform_db_pool_size=12,
+                platform_db_pool_size=16,
                 platform_db_max_overflow=0,
                 platform_worker_concurrency=2,
                 platform_worker_db_pool_size=2,
                 platform_worker_db_max_overflow=0,
-                platform_db_connection_budget=32,
+                platform_db_connection_budget=40,
             )
         )
 

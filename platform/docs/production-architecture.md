@@ -39,11 +39,12 @@ Browser
 Browser -> cdn.old-sparky.com -> Cloudflare cache -> public R2 variants
 ```
 
-The platform connects directly to PostgreSQL with explicit API and worker pool
-limits: the measured 10k browser-polling baseline reserves `2 x (12 + 0)` API
-connections and `2 x (2 + 0)` worker connections within a 32-connection
-budget. This is a bounded increase, not unlimited overflow; add a database
-pooler only from new measured scaling evidence.
+The platform connects directly to PostgreSQL with explicit API, worker and SSE
+pool limits: the measured 10k browser-polling baseline reserves `2 x (16 + 0)`
+API connections, `2 x (2 + 0)` worker connections and `2 x 2` separate SSE
+authorization-pool connections within a 40-connection budget. This is a
+bounded increase, not unlimited overflow; add a database pooler only from new
+measured scaling evidence.
 
 ## Component ownership
 

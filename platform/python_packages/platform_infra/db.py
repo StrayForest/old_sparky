@@ -19,6 +19,7 @@ from sqlalchemy.orm import DeclarativeBase, Session
 
 from python_packages.platform_infra.config import (
     PLATFORM_SCHEMA,
+    PLATFORM_SSE_DB_POOL_SIZE,
     get_settings,
     validate_platform_settings,
 )
@@ -36,7 +37,7 @@ PUBLIC_AUTOMATION_FAILURE_MESSAGE = "Tournament automation failed. A retry is sc
 # thousands of EventSource opens must not occupy the ordinary API pool. Keep a
 # separate explicit two-connection budget for stream admission/revalidation.
 SSE_STREAM_DB_CONCURRENCY = 2
-SSE_STREAM_DB_POOL_SIZE = 2
+SSE_STREAM_DB_POOL_SIZE = PLATFORM_SSE_DB_POOL_SIZE
 
 naming_convention = {
     "ix": "ix_%(column_0_label)s",
