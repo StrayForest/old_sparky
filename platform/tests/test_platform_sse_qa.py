@@ -210,6 +210,8 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertIn("all_attempts_done", sse_source)
         self.assertIn("sse_event_delivery_complete", sse_source)
         self.assertIn("expected_events", sse_source)
+        self.assertIn("fatal_traceback", sse_source)
+        self.assertIn("performance_collection_error", sse_source)
         self.assertIn('RLIMIT_NOFILE', sse_source)
         self.assertIn("platform_recover_retained_browser_report.py", cleanup)
         self.assertIn('--mode "$recovery_profile"', cleanup)

@@ -258,6 +258,15 @@ jobs:
             if ssh -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
               -i "$SSH_DIR/id_ed25519" \
               "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              "test -s '$export_dir/qa-command.log'"; then
+              scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+                -i "$SSH_DIR/id_ed25519" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/qa-command.log" \
+                "$RUNNER_TEMP/production-retained-load-artifacts/qa-command.log"
+            fi
+            if ssh -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST" \
               "test -s '$export_dir/server-observability.log'"; then
               scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
                 -i "$SSH_DIR/id_ed25519" \
@@ -275,6 +284,7 @@ jobs:
           path: |
             ${{ runner.temp }}/production-retained-load-artifacts/matrix-summary.json
             ${{ runner.temp }}/production-retained-load-artifacts/matrix.log
+            ${{ runner.temp }}/production-retained-load-artifacts/qa-command.log
             ${{ runner.temp }}/production-retained-load-artifacts/server-observability.log
             ${{ runner.temp }}/production-retained-load-remote.log
           if-no-files-found: warn

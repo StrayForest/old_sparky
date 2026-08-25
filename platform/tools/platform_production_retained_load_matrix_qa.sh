@@ -410,6 +410,10 @@ find "$run_root" -xdev -type f -exec chmod 0600 -- {} +
 
 install -o "$export_uid" -g "$export_gid" -m 0600 "$summary_path" "$export_dir/matrix-summary.json"
 install -o "$export_uid" -g "$export_gid" -m 0600 "$log_path" "$export_dir/matrix.log"
+if [[ -s "$run_root/qa-command.log" ]]; then
+  install -o "$export_uid" -g "$export_gid" -m 0600 \
+    "$run_root/qa-command.log" "$export_dir/qa-command.log"
+fi
 if [[ -s "$server_observability_log" ]]; then
   install -o "$export_uid" -g "$export_gid" -m 0600 \
     "$server_observability_log" "$export_dir/server-observability.log"

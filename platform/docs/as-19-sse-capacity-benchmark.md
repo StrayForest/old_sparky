@@ -544,3 +544,12 @@ stores only the measured conclusion and run identifiers.
   abort workflow now exports partial matrix/QA/server logs and an exact process
   snapshot before cleanup. The observer samples every five seconds and bounds
   journalctl to 4,000 records to avoid an unbounded post-run collection phase.
+- The first complete observer-enabled 1,000-SSE diagnostic (`32879752207`) did
+  not reach a production admission limit: the load generator exited with
+  `IndexError: list index out of range` before producing a valid matrix summary.
+  VPS snapshots showed the generator around 80--90% CPU, unchanged Redis
+  `rejected_connections` during the run and no sampled PostgreSQL lock wait.
+  The runner now preserves the full traceback, separates performance-summary
+  failures from the primary error and exports raw `qa-command.log`. Exact
+  cleanup `32880184859` removed the fixture and preserved the control account;
+  this run is invalid and is not included in the SSE staircase.

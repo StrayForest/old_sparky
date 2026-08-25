@@ -220,6 +220,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("PRODUCTION_RETAINED_LOAD_MATRIX_EXPORT=", load_supervisor)
         self.assertIn("server-observability.log", load_supervisor)
         self.assertIn("server-observability.log", load_workflow)
+        self.assertIn("qa-command.log", load_supervisor)
+        self.assertIn("qa-command.log", load_workflow)
         self.assertIn("PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1", cleanup_supervisor)
         self.assertIn("control account", cleanup_tool)
         self.assertIn("_validate_tournament_graph_boundary", cleanup_tool)

@@ -160,6 +160,14 @@ abort path now also exports partial matrix/QA/server logs and an exact process
 snapshot before cleanup; the observer samples every five seconds and bounds
 journalctl to 4,000 records so diagnostics cannot create an unbounded
 post-run wait.
+The first complete observer-enabled 1,000-SSE diagnostic (`32879752207`) did
+not hit a production admission limit: the load generator exited with
+`IndexError: list index out of range` before writing a valid matrix summary.
+Its server snapshots showed the generator at roughly 80--90% CPU, Redis
+`rejected_connections` unchanged during the run, and no sampled PostgreSQL lock
+wait. The runner is being hardened to preserve the full traceback, isolate
+performance-summary failures and export the raw `qa-command.log`; cleanup
+`32880184859` removed the exact fixture and preserved the control account.
 
 To reduce repeated CI/CD runs, AS-19 is explicitly local-first: classify origin
 versus Nginx/edge closes, compare Redis TCP connections with active SSE, and

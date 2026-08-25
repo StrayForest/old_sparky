@@ -15,6 +15,7 @@ import resource
 import secrets
 import sys
 import time
+import traceback
 from typing import Any
 
 import httpx
@@ -728,11 +729,25 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         )
     except Exception as exc:
         qa.report["fatal_error"] = f"{type(exc).__name__}: {exc}"
+        qa.report["fatal_traceback"] = traceback.format_exc(limit=40)
         with suppress(Exception):
             await qa.record_preprod_run(status="failed", finished_at=datetime.now(UTC))
         raise
     finally:
-        await qa.stop_performance_collection()
+        try:
+            await qa.stop_performance_collection()
+        except Exception as exc:
+            qa.report["performance_collection_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            qa.report["performance_collection_traceback"] = traceback.format_exc(limit=40)
+            qa.scenarios.append(
+                {
+                    "name": "performance_collection",
+                    "ok": False,
+                    "detail": qa.report["performance_collection_error"],
+                }
+            )
         for client in qa.clients:
             with suppress(Exception):
                 await client.aclose()
@@ -823,11 +838,32 @@ async def async_main() -> int:
     try:
         report = await run_profile(args)
     except Exception as exc:
-        print(json.dumps({"passed": False, "fatal_error": f"{type(exc).__name__}: {exc}"}))
+        print(
+            json.dumps(
+                {
+                    "passed": False,
+                    "fatal_error": f"{type(exc).__name__}: {exc}",
+                    "fatal_traceback": traceback.format_exc(limit=40),
+                }
+            )
+        )
         return 1
     finally:
         await dispose_engine()
-    print(json.dumps(summary(report), ensure_ascii=False))
+    try:
+        compact_summary = summary(report)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "passed": False,
+                    "fatal_error": f"{type(exc).__name__}: {exc}",
+                    "fatal_traceback": traceback.format_exc(limit=40),
+                }
+            )
+        )
+        return 1
+    print(json.dumps(compact_summary, ensure_ascii=False))
     return 0 if report.get("passed") else 1
 
 
