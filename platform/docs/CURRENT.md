@@ -212,9 +212,10 @@ and use revision polling during a cooldown. Its public 5k run produced
 and all 3,000 events; successful-stream connect p95 was still 61.8s.
 The public mixed 10k profile then exposed a separate revalidation burst:
 `pool_wait_ms` reached about 4.4s and workspace/SSE requests returned 500s.
-The next code candidate bounds private-stream revalidation to six checks per
-API worker, leaving DB pool capacity for ordinary API traffic while keeping
-the authorization check and fail-closed behavior unchanged.
+The next code candidate bounds both stream admission DB sessions and private
+stream revalidation to six per API worker, and omits only the non-authoritative
+last-seen write during stream auth; ordinary API traffic retains DB capacity,
+while authorization and fail-closed behavior remain unchanged.
 
 To reduce repeated CI/CD runs, AS-19 uses one origin-local control only to
 separate origin from Nginx/edge closes, then treats public Cloudflare runs as

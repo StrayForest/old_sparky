@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from hashlib import sha256
 import logging
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 # Tournament.automation_last_error is part of the public TournamentResponse contract.
 # Never persist arbitrary worker/domain exception text into that field.
 PUBLIC_AUTOMATION_FAILURE_MESSAGE = "Tournament automation failed. A retry is scheduled."
+# A stream admission request needs a short DB transaction, but a burst of
+# thousands of EventSource opens must not occupy the entire per-worker pool.
+# Keep half of the default API pool available for ordinary requests.
+SSE_STREAM_DB_CONCURRENCY = 6
 
 naming_convention = {
     "ix": "ix_%(column_0_label)s",
@@ -73,6 +78,7 @@ def _sanitize_public_error_fields(
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+_stream_db_concurrency = asyncio.Semaphore(SSE_STREAM_DB_CONCURRENCY)
 
 
 def engine() -> AsyncEngine:
@@ -144,3 +150,14 @@ async def get_db_session() -> AsyncIterator[AsyncSession]:
         await db_session.connection()
         record_pool_checkout_wait(perf_counter() - checkout_started)
         yield db_session
+
+
+async def get_stream_db_session() -> AsyncIterator[AsyncSession]:
+    """Open one bounded short-lived DB session for SSE admission."""
+
+    async with _stream_db_concurrency:
+        async with session_factory()() as db_session:
+            checkout_started = perf_counter()
+            await db_session.connection()
+            record_pool_checkout_wait(perf_counter() - checkout_started)
+            yield db_session

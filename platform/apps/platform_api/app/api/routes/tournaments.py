@@ -213,7 +213,7 @@ from python_packages.platform_domain.tournaments import (
     transition_match_status,
 )
 from python_packages.platform_infra.audit import write_audit_log
-from python_packages.platform_infra.db import get_db_session
+from python_packages.platform_infra.db import get_db_session, get_stream_db_session
 from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
 from python_packages.platform_infra.media.errors import MediaError
 from python_packages.platform_infra.media.source_store import StagedSource
@@ -3870,7 +3870,7 @@ async def get_tournament_bracket(
 async def get_tournament_bracket_events(
     slug: str,
     auth_session=Depends(get_optional_authenticated_session_for_stream),
-    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+    db_session: AsyncSession = Depends(get_stream_db_session, scope="function"),
 ) -> StreamingResponse:
     access_context = current_tournament_stream_access_context()
     if (

@@ -596,4 +596,4 @@ stores only the measured conclusion and run identifiers.
   remain the acceptance gate.
 - Public ramp A/B `open_concurrency=16` (`32888021777`) still failed through Cloudflare: 3,466/5,000 HTTP 200, 1,533 Error 1200, one 502 and zero app 429s; slower opening did not solve the edge queue.
 - Public candidate `1d0f56d5` produced 3,000 HTTP 200 SSE plus 2,000 fast app 429s for 5,000 attempts, zero Cloudflare 1200/503/errors and all 3,000 events; connect p95 remained 61.8s.
-- The interrupted public mixed 10k profile exposed a separate revalidation burst: API `pool_wait_ms` reached ~4.4s and workspace/SSE requests returned 500; next candidate bounds private-stream revalidation to six checks per API worker while preserving fail-closed authorization.
+- The public mixed 10k A/B still returned pool-timeout 500s during initial stream admission; the next candidate bounds both stream admission sessions and private revalidation to six per API worker, omitting only stream-auth last-seen writes while preserving fail-closed authorization.

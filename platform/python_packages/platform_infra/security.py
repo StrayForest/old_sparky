@@ -21,7 +21,7 @@ from python_packages.platform_infra.auth_lifecycle import (
 )
 from python_packages.platform_infra.config import PlatformSettings, get_settings
 from python_packages.platform_infra.csrf import clear_csrf_cookie
-from python_packages.platform_infra.db import get_db_session, session_factory
+from python_packages.platform_infra.db import get_db_session, get_stream_db_session, session_factory
 from python_packages.platform_infra.models import Role, User, UserRole, UserSession
 from python_packages.platform_infra.turnstile import (
     normalized_turnstile_mode,
@@ -528,9 +528,11 @@ async def get_authenticated_session(
     return auth_session
 
 
-async def get_optional_authenticated_session(
+async def _resolve_optional_authenticated_session(
     request: Request,
-    db_session: AsyncSession = Depends(get_db_session),
+    db_session: AsyncSession,
+    *,
+    touch_session: bool,
 ) -> AuthenticatedSession | None:
     settings = get_settings()
     token = request.cookies.get(settings.platform_session_cookie_name)
@@ -594,15 +596,36 @@ async def get_optional_authenticated_session(
 
     roles = frozenset(str(role_slug) for _, _, role_slug in rows if role_slug)
     auth_session = AuthenticatedSession(user=user, session=user_session, role_slugs=roles, now=now)
-    await _touch_authenticated_session(auth_session)
+    if touch_session:
+        await _touch_authenticated_session(auth_session)
     remember_authenticated_session(token_digest, auth_session)
     return auth_session
 
 
+async def get_optional_authenticated_session(
+    request: Request,
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AuthenticatedSession | None:
+    return await _resolve_optional_authenticated_session(
+        request,
+        db_session,
+        touch_session=True,
+    )
+
+
 async def get_optional_authenticated_session_for_stream(
     request: Request,
-    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+    db_session: AsyncSession = Depends(get_stream_db_session, scope="function"),
 ) -> AuthenticatedSession | None:
-    """Resolve stream auth with a DB session scoped to the endpoint call."""
+    """Resolve stream auth in a bounded short-lived DB session.
 
-    return await get_optional_authenticated_session(request, db_session)
+    Session last-seen metadata is deliberately not touched on stream connect:
+    it is not an authorization decision, and doing so would require a second
+    DB connection while the stream admission session is still checked out.
+    """
+
+    return await _resolve_optional_authenticated_session(
+        request,
+        db_session,
+        touch_session=False,
+    )

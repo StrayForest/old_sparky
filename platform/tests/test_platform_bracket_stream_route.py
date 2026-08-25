@@ -10,7 +10,7 @@ from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.tournament_workspace_access import (
     TournamentStreamAccessContext,
 )
-from python_packages.platform_infra.db import get_db_session
+from python_packages.platform_infra.db import get_db_session, get_stream_db_session
 
 
 class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
@@ -25,11 +25,11 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @staticmethod
-    def _db_dependencies(route_context):
+    def _db_dependencies(route_context, dependency):
         db_dependencies = []
 
         def collect(dependant) -> None:
-            if dependant.call is get_db_session:
+            if dependant.call is dependency:
                 db_dependencies.append(dependant)
             for child in dependant.dependencies:
                 collect(child)
@@ -43,14 +43,14 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
             app,
             "/api/v1/tournaments/{slug}/bracket/events",
         )
-        db_dependencies = self._db_dependencies(route_context)
+        db_dependencies = self._db_dependencies(route_context, get_stream_db_session)
         self.assertGreaterEqual(len(db_dependencies), 1)
         self.assertTrue(all(item.scope == "function" for item in db_dependencies))
 
     def test_regular_tournament_routes_keep_request_scoped_db_sessions(self) -> None:
         app = create_app()
         route_context = self._route_context(app, "/api/v1/tournaments")
-        db_dependencies = self._db_dependencies(route_context)
+        db_dependencies = self._db_dependencies(route_context, get_db_session)
         self.assertGreaterEqual(len(db_dependencies), 1)
         self.assertTrue(any(item.scope is None for item in db_dependencies))
 
@@ -59,6 +59,7 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
             tournaments.get_tournament_bracket_events
         ).parameters["db_session"]
         self.assertEqual(parameter.default.scope, "function")
+        self.assertIs(parameter.default.dependency, get_stream_db_session)
 
     async def test_sse_endpoint_reuses_stream_access_participant_snapshot(self) -> None:
         tournament = SimpleNamespace(id="tournament-1")
