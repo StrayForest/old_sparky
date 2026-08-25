@@ -44,7 +44,10 @@ pool limits: the measured 10k browser-polling baseline reserves `2 x (16 + 0)`
 API connections, `2 x (2 + 0)` worker connections and `2 x 2` separate SSE
 authorization-pool connections within a 40-connection budget. This is a
 bounded increase, not unlimited overflow; add a database pooler only from new
-measured scaling evidence.
+measured scaling evidence. High-volume optional-authenticated reads validate
+the session in their request transaction but do not perform a second
+`last_seen_at` write transaction; that metadata is not an authorization
+decision and must not double the connection demand of a read burst.
 
 ## Component ownership
 

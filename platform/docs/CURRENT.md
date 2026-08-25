@@ -392,8 +392,12 @@ against the current web/api/worker identities and units.
   separate SSE authorization pool `2 x 2` within a 40-connection budget.
   Celery uses high/default/low queues, prefetch one and late acks;
   backlog/retry pressure is part of the load evidence. This is the next
-  retained-load candidate after the live 10k mixed run exhausted the 12-slot
-  API pool with five-second checkout timeouts.
+  retained-load candidate after release `2ca7a8df` still exhausted the
+  16-slot API pool during the live 10k mixed run with five-second checkout
+  timeouts. VPS logs show optional read authentication opening a second
+  `last_seen_at` transaction while the primary read session is checked out;
+  the next public A/B removes that non-authoritative write from optional read
+  auth while retaining mutation touches and SSE revalidation.
 - The final 20×500 browser-polling gate keeps fixture state bounded to at most
   32 participants per tournament and uses four setup lanes plus one shared
   request semaphore. Its production runner retains 10,000 virtual tabs but

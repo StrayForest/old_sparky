@@ -606,10 +606,15 @@ async def get_optional_authenticated_session(
     request: Request,
     db_session: AsyncSession = Depends(get_db_session),
 ) -> AuthenticatedSession | None:
+    # Optional authentication is used by the high-volume read path.  The
+    # session lookup is authoritative, but last_seen_at is telemetry rather
+    # than an authorization decision.  Do not open a second transaction from
+    # inside the request while the primary read session is checked out.  This
+    # keeps a first authenticated GET at one DB connection instead of two.
     return await _resolve_optional_authenticated_session(
         request,
         db_session,
-        touch_session=True,
+        touch_session=False,
     )
 
 

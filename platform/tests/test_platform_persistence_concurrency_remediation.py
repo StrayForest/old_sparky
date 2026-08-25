@@ -32,6 +32,24 @@ class _AsyncContext:
 
 
 class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_optional_read_auth_does_not_open_last_seen_transaction(self) -> None:
+        request = Mock()
+        db_session = Mock()
+        resolved = SimpleNamespace()
+        with patch.object(
+            security,
+            "_resolve_optional_authenticated_session",
+            AsyncMock(return_value=resolved),
+        ) as resolve:
+            result = await security.get_optional_authenticated_session(request, db_session)
+
+        self.assertIs(result, resolved)
+        resolve.assert_awaited_once_with(
+            request,
+            db_session,
+            touch_session=False,
+        )
+
     async def test_auth_touch_uses_isolated_session_transaction(self) -> None:
         touch_session = Mock()
         touch_session.execute = AsyncMock(return_value=SimpleNamespace(rowcount=1))
