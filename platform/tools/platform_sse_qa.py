@@ -135,6 +135,7 @@ class SseMetrics:
         return {
             "connection_attempts": attempts,
             "connected": connected,
+            "initial_connected": self.counters["initial_connected"],
             "max_active_connections": self.counters["max_active_connections"],
             "active_connections": self.counters["active_connections"],
             "completed": self.counters["completed"],
@@ -322,6 +323,9 @@ async def consume_sse_connection(
     duration_seconds: float,
     reconnect_cycles: int,
     open_gate: asyncio.Semaphore,
+    all_attempts_done: asyncio.Event,
+    mark_attempt_finished,
+    hold_deadline_after_barrier,
 ) -> None:
     token = qa.session_tokens_by_user_id[str(user["id"])]
     headers = {
@@ -332,12 +336,13 @@ async def consume_sse_connection(
         "X-Platform-QA-Phase": qa.current_phase,
         SSE_LOAD_TEST_BYPASS_HEADER: sse_load_test_bypass_token(get_settings()),
     }
-    deadline = time.monotonic() + duration_seconds
+    deadline: float | None = None
     cycles = max(0, reconnect_cycles)
     per_cycle_hold = duration_seconds / (cycles + 1) if cycles else duration_seconds
+    initial_attempt_marked = False
 
     for cycle in range(cycles + 1):
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             break
         metrics.mark("connection_attempts")
         attempt_started = time.monotonic()
@@ -359,6 +364,9 @@ async def consume_sse_connection(
             async with open_gate:
                 response = await stream_context.__aenter__()
             metrics.response_status(response.status_code)
+            if cycle == 0 and not initial_attempt_marked:
+                initial_attempt_marked = True
+                await mark_attempt_finished()
             if response.status_code != 200:
                 if response.status_code == 429:
                     metrics.mark("rejected_429")
@@ -378,8 +386,15 @@ async def consume_sse_connection(
                 continue
 
             metrics.connection_opened()
+            if cycle == 0:
+                metrics.mark("initial_connected")
             connected_this_attempt = True
             metrics.connect_latencies.append((time.monotonic() - attempt_started) * 1000)
+            if cycle == 0:
+                deadline = await hold_deadline_after_barrier(
+                    all_attempts_done,
+                    duration_seconds,
+                )
             cycle_deadline = min(deadline, time.monotonic() + per_cycle_hold)
             current_event = False
             try:
@@ -442,6 +457,9 @@ async def consume_sse_connection(
                 },
             )
         finally:
+            if cycle == 0 and not initial_attempt_marked:
+                initial_attempt_marked = True
+                await mark_attempt_finished()
             if stream_context is not None:
                 with suppress(Exception):
                     await stream_context.__aexit__(None, None, None)
@@ -474,6 +492,30 @@ async def run_connections(
     )
     qa.clients.append(sse_client)
     open_gate = asyncio.Semaphore(max(1, open_concurrency))
+    attempts_finished = 0
+    attempts_lock = asyncio.Lock()
+    all_attempts_done = asyncio.Event()
+    hold_deadline = 0.0
+    hold_deadline_lock = asyncio.Lock()
+
+    async def mark_attempt_finished() -> None:
+        nonlocal attempts_finished
+        async with attempts_lock:
+            attempts_finished += 1
+            if attempts_finished >= connection_count:
+                all_attempts_done.set()
+
+    async def hold_deadline_after_barrier(
+        barrier: asyncio.Event,
+        hold_seconds: float,
+    ) -> float:
+        nonlocal hold_deadline
+        await barrier.wait()
+        async with hold_deadline_lock:
+            if hold_deadline <= 0:
+                hold_deadline = time.monotonic() + hold_seconds
+            return hold_deadline
+
     connections = [
         (
             users[index % len(users)],
@@ -492,10 +534,14 @@ async def run_connections(
                 duration_seconds=duration_seconds,
                 reconnect_cycles=reconnect_cycles,
                 open_gate=open_gate,
+                all_attempts_done=all_attempts_done,
+                mark_attempt_finished=mark_attempt_finished,
+                hold_deadline_after_barrier=hold_deadline_after_barrier,
             )
         )
         for user, tournament in connections
     ]
+    await all_attempts_done.wait()
     await asyncio.sleep(min(2.0, max(0.1, duration_seconds / 4)))
     publisher = asyncio.create_task(
         publish_probe_events(
@@ -514,6 +560,7 @@ async def run_connections(
         "reconnect_cycles": reconnect_cycles,
         "probe_event_count": event_count,
         "probe_event_interval_seconds": event_interval,
+        "expected_events": metrics.counters["initial_connected"] * max(0, event_count),
         "application_global_admission_limit": SSE_GLOBAL_LIMIT,
         "load_generator_resources": load_generator_resource_limits(),
         "metrics": metrics.summary(),
@@ -587,6 +634,15 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 or metrics["rejected_429"] > 0,
                 metrics,
             )
+            qa.scenario(
+                "sse_event_delivery_complete",
+                metrics["events"] >= sse_report["expected_events"],
+                {
+                    "events": metrics["events"],
+                    "expected_events": sse_report["expected_events"],
+                },
+                fatal=False,
+            )
         else:
             tabs = qa.build_browser_polling_tabs(
                 tournaments=tournaments,
@@ -650,6 +706,15 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 sse_report["metrics"]["errors"] == 0
                 and sse_report["metrics"]["rejected_other"] == 0,
                 sse_report["metrics"],
+                fatal=False,
+            )
+            qa.scenario(
+                "combined_sse_event_delivery_complete",
+                sse_report["metrics"]["events"] >= sse_report["expected_events"],
+                {
+                    "events": sse_report["metrics"]["events"],
+                    "expected_events": sse_report["expected_events"],
+                },
                 fatal=False,
             )
 
@@ -724,6 +789,7 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
             "errors": metrics.get("errors"),
             "error_samples": metrics.get("error_samples", []),
             "events": metrics.get("events"),
+            "expected_events": sse.get("expected_events"),
             "reconnects": metrics.get("reconnects"),
             "response_statuses": metrics.get("response_statuses", {}),
             "response_error_samples": metrics.get("response_error_samples", []),

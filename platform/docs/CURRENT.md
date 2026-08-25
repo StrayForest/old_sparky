@@ -120,14 +120,20 @@ security/build `32865611322`, automatic deploy `32866234695` and production
 deploy/live smoke `32866244193` all passed. The first guarded live 10k SSE
 diagnostic (`32866749952`) stopped before SSE at the fixture setup boundary:
 the first authenticated CSRF request returned a Cloudflare 504 after about
-30.2s. It is not a live SSE result. Exact cleanup (`32866955426`) deleted
-10,000 synthetic users, left zero fixture users/tournaments/sessions/audit
-rows and preserved `aleksei.lisitsin1@gmail.com`. The evidence points to
-setup write amplification: the runner was persisting a growing 10k identity
-JSON into `PreprodTestRun` after every 500-user batch. Progress checkpoints are
-being compacted, with exact marker-scoped recovery retained for interrupted
-runs, before the next live attempt; the fix is ready for the next exact-SHA
-release gate.
+30.2s. Exact cleanup (`32866955426`) deleted 10,000 synthetic users, left zero
+fixture users/tournaments/sessions/audit rows and preserved
+`aleksei.lisitsin1@gmail.com`. After compacting progress checkpoints and
+redeploying as `3ed9d4a3`, repeat live run `32869459781` reached 10,000/10,000
+HTTP 200 SSE responses with zero 429/503/other responses and zero client
+errors. Connect p50/p95/p99 were 113.8s/202.0s/210.4s, with API CPU the
+dominant signal (73.9% average, 136.2% peak) and no PostgreSQL lock
+contention. The runner published before the final connection barrier and
+delivered only 9 events, so this proves opening capacity only, not complete
+fan-out. The next runner change adds an all-attempts barrier and strict event
+delivery accounting before another live 10k fan-out run.
+The opening-capacity repeat was cleaned by `32870304826`: 10,000 synthetic
+users and 20 tournaments deleted, zero remaining users/tournaments/sessions/
+audit rows, control account preserved.
 
 To reduce repeated CI/CD runs, AS-19 is explicitly local-first: classify origin
 versus Nginx/edge closes, compare Redis TCP connections with active SSE, and

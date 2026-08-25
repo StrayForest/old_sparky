@@ -486,6 +486,14 @@ stores only the measured conclusion and run identifiers.
   sampling showed PostgreSQL peak CPU but no sustained API CPU, Redis rejection
   or PostgreSQL connection/lock flag; the setup path is therefore a separate
   measured bottleneck, not evidence that the relay failed.
+- After compacting progress checkpoints and redeploying as `3ed9d4a3`, the
+  repeat live run `32869459781` reached `10,000/10,000` HTTP 200 streams with
+  zero 429/503/other responses and zero client errors. Its connect p50/p95/p99
+  were `113.8s/202.0s/210.4s`; API CPU was the dominant resource signal
+  (average `73.9%`, peak `136.2%`), while no PostgreSQL lock contention was
+  observed. However, the pre-barrier runner published too early and recorded
+  only `9` events, so this is an opening-capacity pass, not an event-fan-out
+  pass. Cleanup is still required before the next strict rerun.
 - The live failure exposed write amplification in the fixture runner: user
   creation persisted a growing JSON identity list to `PreprodTestRun` after
   every 500-user batch, immediately before API setup. The runner now stores a
@@ -493,10 +501,17 @@ stores only the measured conclusion and run identifiers.
   inventory for the final report; interrupted-run recovery reconstructs the
   exact marker-scoped user set from synthetic email identities. This keeps
   cleanup fail-closed while removing setup-report serialization from the SSE
-  measurement. The change must pass local verification and a new exact-SHA
-  deploy before another live 10k attempt.
+  measurement. The runner is now being tightened further with an all-attempts
+  barrier and an explicit `events >= connected × event_count` gate; that change
+  must pass local verification and a new exact-SHA deploy before another live
+  10k fan-out attempt.
 - Exact cleanup of the failed live run deleted 10,000 synthetic users and
   verified zero remaining fixture users, tournaments, sessions or audit rows;
   `aleksei.lisitsin1@gmail.com` was preserved. The combined polling+SSE live
   contour, reconnects, slow-consumer behavior and delta-response savings are
   still open gates.
+- The opening-capacity repeat was cleaned by `32870304826`: 10,000 synthetic
+  users and 20 tournaments were deleted, with zero remaining users,
+  tournaments, sessions or audit rows and the control account preserved. The
+  next strict run must use the barrier/event-delivery runner before any claim
+  is made about complete 10k fan-out.
