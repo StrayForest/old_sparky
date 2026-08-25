@@ -69,6 +69,9 @@ The repeat production run (`32800341184`) completed all 20 tournaments and
 58.5s/p99 98.5s; its exact cleanup (`32800905099`) removed 10,000 users and
 20 tournaments. The production wrapper is now switched to the measured
 active/passive browser mix for the next gate.
+The mixed run's zero 304 result is consistent with Cloudflare rewriting strong
+ETags as weak validators; the API now uses RFC-compatible weak comparison and
+has regression coverage. A post-fix production gate remains to be measured.
 The load work also requires a ten-run controlled A/B matrix followed by five
 follow-up variants around the winning configuration; the winner is selected
 by zero errors/cleanup first, then latency, CPU and pool wait, not by raw

@@ -125,6 +125,13 @@ rows while preserving the control account. The production wrapper therefore
 switches from all-active tabs to the default active/passive browser mix; this
 is an evidence-driven backpressure change, not an error suppression.
 
+The production zero-304 result also isolated an edge compatibility hypothesis:
+Cloudflare can rewrite a strong origin ETag as a weak validator during
+compression, while the API previously compared validator strings literally.
+The API now applies weak comparison for `If-None-Match` on safe reads and has
+coverage for `W/"..."` validators; the post-fix production gate remains
+pending measurement.
+
 The selected release settings are API pool `12+0` per worker, worker pool
 `2+0` with concurrency two, total connection budget `32`, load-generator HTTP
 pool `40`, tab opening stagger `300s`, and a `30s` polling window. The

@@ -307,6 +307,13 @@ def _representation_etag(*parts: object) -> str:
     return f'"{sha256(fingerprint.encode("utf-8")).hexdigest()}"'
 
 
+def _etag_weak_value(value: str) -> str:
+    normalized = value.strip()
+    if normalized.startswith("W/"):
+        return normalized[2:].strip()
+    return normalized
+
+
 def _conditional_response(
     request: Request,
     response: Response,
@@ -317,8 +324,8 @@ def _conditional_response(
     response.headers["Cache-Control"] = "private, no-cache"
     response.headers["Vary"] = "Cookie, Accept-Encoding"
     raw_header = request.headers.get("if-none-match", "")
-    if raw_header.strip() == "*" or etag in {
-        item.strip() for item in raw_header.split(",") if item.strip()
+    if raw_header.strip() == "*" or _etag_weak_value(etag) in {
+        _etag_weak_value(item) for item in raw_header.split(",") if item.strip()
     }:
         return Response(
             status_code=status.HTTP_304_NOT_MODIFIED,
