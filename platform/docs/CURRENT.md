@@ -212,10 +212,14 @@ and use revision polling during a cooldown. Its public 5k run produced
 and all 3,000 events; successful-stream connect p95 was still 61.8s.
 The public mixed 10k profile then exposed a separate revalidation burst:
 `pool_wait_ms` reached about 4.4s and workspace/SSE requests returned 500s.
-The next code candidate bounds both stream admission DB sessions and private
-stream revalidation to six per API worker, and omits only the non-authoritative
-last-seen write during stream auth; ordinary API traffic retains DB capacity,
-while authorization and fail-closed behavior remain unchanged.
+Candidate `c7da9230` passed a public 1k mixed control through Cloudflare:
+1,000 users, 300/300 SSE 200, 300/300 events and 1,783 polling requests with
+zero errors; SSE connect p95 was 5.8s and event p95 322ms. Its public mixed
+10k run still produced API `QueuePool` 500s while SSE stayed 200: one worker's
+pool was exhausted by six stream-admission DB sessions plus polling. The next
+candidate reduces stream admission and revalidation to two per worker and
+coalesces public revalidation by tournament/slug; private viewer-specific
+authorization remains unchanged and fail-closed.
 
 To reduce repeated CI/CD runs, AS-19 uses one origin-local control only to
 separate origin from Nginx/edge closes, then treats public Cloudflare runs as

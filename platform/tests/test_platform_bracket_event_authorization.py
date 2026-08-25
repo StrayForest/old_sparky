@@ -5,6 +5,9 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from apps.platform_api.app.services import bracket_events
+from apps.platform_api.app.services.tournament_workspace_access import (
+    TournamentStreamAccessContext,
+)
 
 
 class _FakePubSub:
@@ -126,6 +129,61 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pubsub.unsubscribed, ["platform:bracket:tournament-3"])
         self.assertTrue(pubsub.closed)
         self.assertTrue(client.closed)
+
+    async def test_public_streams_share_revalidation_key_across_viewers(self) -> None:
+        contexts = iter(
+            (
+                TournamentStreamAccessContext(
+                    decision="public",
+                    slug="public-tournament",
+                    user_id="user-1",
+                    session_id="session-1",
+                ),
+                TournamentStreamAccessContext(
+                    decision="public",
+                    slug="public-tournament",
+                    user_id="user-2",
+                    session_id="session-2",
+                ),
+            )
+        )
+        with patch.object(
+            bracket_events,
+            "current_tournament_stream_access_context",
+            side_effect=lambda: next(contexts),
+        ):
+            first = bracket_events._access_check_cache_key("tournament-1")
+            second = bracket_events._access_check_cache_key("tournament-1")
+
+        self.assertEqual(first, second)
+        self.assertEqual(first, "tournament-1:public:public-tournament")
+
+    async def test_private_streams_keep_viewer_specific_revalidation_key(self) -> None:
+        contexts = iter(
+            (
+                TournamentStreamAccessContext(
+                    decision="active_participant",
+                    slug="private-tournament",
+                    user_id="user-1",
+                    session_id="session-1",
+                ),
+                TournamentStreamAccessContext(
+                    decision="active_participant",
+                    slug="private-tournament",
+                    user_id="user-2",
+                    session_id="session-2",
+                ),
+            )
+        )
+        with patch.object(
+            bracket_events,
+            "current_tournament_stream_access_context",
+            side_effect=lambda: next(contexts),
+        ):
+            first = bracket_events._access_check_cache_key("tournament-1")
+            second = bracket_events._access_check_cache_key("tournament-1")
+
+        self.assertNotEqual(first, second)
 
     async def test_stream_recycles_after_bounded_lifetime(self) -> None:
         pubsub = _FakePubSub([])

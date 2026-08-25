@@ -25,10 +25,10 @@ logger = logging.getLogger(__name__)
 
 SSE_ACCESS_REVALIDATION_SECONDS = 30.0
 SSE_ACCESS_CHECK_COALESCE_SECONDS = 0.5
-# Keep a reserve of each API worker's DB pool for ordinary user requests. A
-# bracket event can wake thousands of private streams at once; allowing every
-# stream to revalidate concurrently turns that fan-out into a DB pool outage.
-SSE_ACCESS_REVALIDATION_CONCURRENCY = 6
+# Keep most of each API worker's DB pool for ordinary user requests. A bracket
+# event can wake thousands of private streams at once; allowing every stream
+# to revalidate concurrently turns that fan-out into a DB pool outage.
+SSE_ACCESS_REVALIDATION_CONCURRENCY = 2
 SSE_RELAY_QUEUE_MAXSIZE = 32
 
 _access_check_registry_lock = asyncio.Lock()
@@ -163,6 +163,11 @@ def _access_check_cache_key(tournament_id: str) -> str:
     context = current_tournament_stream_access_context()
     if context is None:
         return f"{tournament_id}:anonymous"
+    if context.decision == "public":
+        # Public visibility does not depend on the viewer's session. Sharing
+        # this short-lived check across viewers turns one tournament event
+        # into one DB read instead of one read per connected public stream.
+        return ":".join((tournament_id, context.decision, context.slug))
     return ":".join(
         (
             tournament_id,

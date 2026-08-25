@@ -32,9 +32,9 @@ logger = logging.getLogger(__name__)
 # Never persist arbitrary worker/domain exception text into that field.
 PUBLIC_AUTOMATION_FAILURE_MESSAGE = "Tournament automation failed. A retry is scheduled."
 # A stream admission request needs a short DB transaction, but a burst of
-# thousands of EventSource opens must not occupy the entire per-worker pool.
-# Keep half of the default API pool available for ordinary requests.
-SSE_STREAM_DB_CONCURRENCY = 6
+# thousands of EventSource opens must not occupy the per-worker pool. Keep ten
+# of the default twelve connections available for ordinary requests.
+SSE_STREAM_DB_CONCURRENCY = 2
 
 naming_convention = {
     "ix": "ix_%(column_0_label)s",
