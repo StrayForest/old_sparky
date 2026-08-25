@@ -192,5 +192,12 @@ stores only the measured conclusion and run identifiers.
   is rejected. The corrected implementation keeps ordinary API dependencies
   request-scoped and puts the SSE route in a dedicated router with a
   function-scoped auth/policy/serialization graph. Stream revalidation still
-  uses short-lived sessions. It is not ranked until its own CI/deploy/load/
-  cleanup cycle.
+  uses short-lived sessions. Its first production H1 run `32832475533` was
+  cleaned by `32832797705`: `200=620`, `500=380`, `429=0`,
+  `max_active=422`, event count 38, connect p95 21.49s. PostgreSQL peaked at
+  195.0% CPU, API at 134.7%, bracket SSE server p95 was 57.9s, and no
+  PostgreSQL connection-peak or lock-wait flag was raised. This is a failed
+  capacity point, but it confirms that the original one-connection-per-SSE
+  signature is no longer the only bottleneck. The runner now records bounded
+  status-body diagnostics for non-200 responses; the result is not ranked
+  until the diagnostic rerun and staircase continue.

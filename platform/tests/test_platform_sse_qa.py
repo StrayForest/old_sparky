@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from uuid import uuid4
 
+import httpx
+
 from tools.platform_cleanup_retained_matrix import load_matrix_manifest
 from tools.platform_sse_qa import SSE_EVENT_TYPE, SseMetrics, summary
 
@@ -37,10 +39,31 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(result["active_connections"], 1)
         self.assertEqual(result["rejected_429"], 2)
         self.assertEqual(result["response_statuses"], {"429": 2})
+        self.assertEqual(result["response_error_samples"], [])
         self.assertEqual(result["events"], 3)
         self.assertEqual(result["connected_percent"], 50.0)
         self.assertEqual(result["connect_latency_ms"]["p95"], 1.95)
         self.assertAlmostEqual(result["event_delivery_latency_ms"]["p99"], 6.96)
+
+    def test_metrics_keep_bounded_non_200_response_diagnostics(self) -> None:
+        metrics = SseMetrics()
+        headers = httpx.Headers(
+            {
+                "content-type": "application/json",
+                "server": "nginx",
+            }
+        )
+        for _ in range(30):
+            metrics.record_response_error(
+                status_code=500,
+                body=b'{"detail":"pool timeout"}',
+                headers=headers,
+            )
+
+        samples = metrics.summary()["response_error_samples"]
+        self.assertEqual(len(samples), 25)
+        self.assertEqual(samples[0]["status"], 500)
+        self.assertEqual(samples[0]["body"], '{"detail":"pool timeout"}')
 
     def test_summary_is_an_exact_cleanup_manifest(self) -> None:
         marker = "preprod260825120000abcd"

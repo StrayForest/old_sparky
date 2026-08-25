@@ -110,7 +110,12 @@ an ordinary invite-claim path showed an `idle in transaction` session and a
 transactionid lock wait. The corrected design keeps ordinary API dependencies
 request-scoped and isolates function-scoped auth/policy/serialization in a
 dedicated SSE router, with revalidation kept in short-lived sessions. The
-10+5 ranking remains pending.
+first H1 on that corrected deployment (`32832475533`, cleaned by
+`32832797705`) reached `200=620`/`500=380`, `max_active=422`, and connect p95
+21.49s. PostgreSQL peaked at 195.0% CPU and the SSE server route p95 was
+57.9s, with no PostgreSQL connection-peak or lock-wait flag. The runner now
+records bounded non-200 response-body diagnostics. This is not a capacity
+pass; the 10+5 ranking remains pending.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.

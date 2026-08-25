@@ -49,6 +49,7 @@ class SseMetrics:
         self.connect_latencies: list[float] = []
         self.event_latencies: list[float] = []
         self.error_samples: list[dict[str, str]] = []
+        self.response_error_samples: list[dict[str, Any]] = []
         self.max_error_samples = 25
 
     def mark(self, name: str, amount: int = 1) -> None:
@@ -76,6 +77,24 @@ class SseMetrics:
             self.error_samples.append(
                 {"type": type(error).__name__, "message": str(error)[:300]}
             )
+
+    def record_response_error(
+        self,
+        *,
+        status_code: int,
+        body: bytes,
+        headers: httpx.Headers,
+    ) -> None:
+        if len(self.response_error_samples) >= self.max_error_samples:
+            return
+        self.response_error_samples.append(
+            {
+                "status": status_code,
+                "content_type": headers.get("content-type", ""),
+                "server": headers.get("server", ""),
+                "body": body[:500].decode("utf-8", errors="replace"),
+            }
+        )
 
     def summary(self) -> dict[str, Any]:
         attempts = self.counters["connection_attempts"]
@@ -109,6 +128,7 @@ class SseMetrics:
                 "p99": percentile(self.event_latencies, 99),
             },
             "error_samples": list(self.error_samples),
+            "response_error_samples": list(self.response_error_samples),
             "response_statuses": dict(sorted(self.response_statuses.items())),
         }
 
@@ -307,6 +327,12 @@ async def consume_sse_connection(
                     metrics.mark("rejected_503")
                 else:
                     metrics.mark("rejected_other")
+                with suppress(Exception):
+                    metrics.record_response_error(
+                        status_code=response.status_code,
+                        body=await response.aread(),
+                        headers=response.headers,
+                    )
                 await stream_context.__aexit__(None, None, None)
                 stream_context = None
                 continue
