@@ -67,15 +67,25 @@ control account. A production polling pass is therefore not claimed yet.
 The repeat production run (`32800341184`) completed all 20 tournaments and
 12,283 polling GETs, but observed zero `304 Not Modified` responses with p95
 58.5s/p99 98.5s; its exact cleanup (`32800905099`) removed 10,000 users and
-20 tournaments. The production wrapper is now switched to the measured
-active/passive browser mix for the next gate.
+20 tournaments. The production wrapper was then switched to the measured
+active/passive browser mix.
 The mixed run's zero 304 result is consistent with Cloudflare rewriting strong
 ETags as weak validators; the API now uses RFC-compatible weak comparison and
-has regression coverage. A post-fix production gate remains to be measured.
-The load work also requires a ten-run controlled A/B matrix followed by five
-follow-up variants around the winning configuration; the winner is selected
-by zero errors/cleanup first, then latency, CPU and pool wait, not by raw
-throughput alone.
+has regression coverage. The post-fix release at `ca2960bd` passed security/build
+(`32802478200`), automatic deploy (`32802841513`) and production smoke
+(`32802847059`). Its retained 10,000-user production gate (`32803100629`)
+completed all 20 tournaments and 11,659 polling GETs, including 1,201
+conditional `304` responses, with p95 433ms/p99 700ms and no sustained CPU,
+connection or lock saturation. Exact cleanup (`32803657743`) deleted 10,000
+users and 20 tournaments, left zero fixture users/tournaments/sessions/audit
+rows and preserved the control account. The required ten A/B experiments and
+five follow-up variants are now complete; the selected profile is the bounded
+active/passive mix with HTTP40, 300s opening stagger, 30s polling window and
+API pool 12+0.
+The load work required a ten-run controlled A/B matrix followed by five
+follow-up variants around the winning configuration; that matrix is complete.
+The winner was selected by zero errors/cleanup first, then latency, CPU and
+pool wait, not by raw throughput alone.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.

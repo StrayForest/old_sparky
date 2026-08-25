@@ -1,6 +1,6 @@
 # AS-18 — Hot-path capacity and backpressure plan
 
-- Status: Implementation and local capacity verification complete; production browser setup gate remains open after a cleanly verified 504/cleanup cycle
+- Status: Implementation, 10+5 hypothesis experiments, local staircase and production browser gate complete; continuous 10-second polling for all 10,000 tabs remains outside the two-core ceiling
 - Owner: Platform maintainers
 - Date: 2026-08-24
 
@@ -129,8 +129,16 @@ The production zero-304 result also isolated an edge compatibility hypothesis:
 Cloudflare can rewrite a strong origin ETag as a weak validator during
 compression, while the API previously compared validator strings literally.
 The API now applies weak comparison for `If-None-Match` on safe reads and has
-coverage for `W/"..."` validators; the post-fix production gate remains
-pending measurement.
+coverage for `W/"..."` validators. The post-fix release `ca2960bd` passed
+security/build `32802478200`, automatic deploy `32802841513` and production
+deploy/live smoke `32802847059`. The retained production browser gate
+`32803100629` completed all 20 tournaments and all 10,000 synthetic users,
+executed 11,659 polling GETs, returned 1,201 conditional `304` responses and
+reported worst p95/p99 of 433/700ms. It had a DB-time hotspot and a peak-CPU
+flag, but no sustained CPU saturation, high PostgreSQL connection peak or lock
+contention. Exact cleanup `32803657743` removed 10,000 users and 20
+tournaments, verified zero remaining fixture users/tournaments/sessions/audit
+rows and preserved `aleksei.lisitsin1@gmail.com`.
 
 The selected release settings are API pool `12+0` per worker, worker pool
 `2+0` with concurrency two, total connection budget `32`, load-generator HTTP
@@ -273,12 +281,23 @@ broad user/table delete.
    security/build gate `32798830524`.
 9. **Completed:** commit `4345db24`, push to `dev`, observe auto-deploy
    `32799208823` and production smoke `32799216186`.
-10. **Completed with production gate open:** run `32798245204` created 10,000
+10. **Completed:** run `32798245204` created 10,000
     users but received a Cloudflare 504 during the first tournament POST, so
     polling did not start and the run is not a passing benchmark. Exact cleanup
     `32799479496` removed 10,000 users and 1 partial tournament, verified zero
     remaining fixture users/tournaments/sessions/audit rows and preserved the
     control account.
+11. **Completed:** the repeat production run `32800341184` completed all 20
+    tournaments and 12,283 polling GETs but failed the conditional-read gate
+    with zero 304 responses. Exact cleanup `32800905099` removed its 10,000
+    users and 20 tournaments. The evidence selected the active/passive mix and
+    exposed weak-validator handling at the Cloudflare boundary.
+12. **Completed:** weak `If-None-Match` comparison and regression coverage were
+    released at `ca2960bd`; the retained production gate `32803100629` passed
+    with 10,000 users, 20 tournaments, 11,659 GETs, 1,201 304 responses and
+    433/700ms worst p95/p99. Exact cleanup `32803657743` verified zero fixture
+    rows and preserved the control account. The 10 A/B + 5 follow-up matrix is
+    complete and the bounded active/passive profile is the selected winner.
 
 Operational finding from the first live browser-polling attempt (2026-08-24):
 the browser harness reached a long async-assignment wait and the GitHub
