@@ -288,9 +288,20 @@ stores only the measured conclusion and run identifiers.
   files` or `All connection attempts failed`; there were no HTTP error
   responses and no 429/503 admission response. The run therefore does not
   measure an origin failure and cannot establish 1000 capacity.
-- The next A/B fixes this measurement confounder in the retained-load runner:
-  the SSE child process raises its soft `RLIMIT_NOFILE` to 32768 when the hard
-  limit permits it, logs the effective soft/hard values and includes them in
-  the report. This changes only the load generator process, not Nginx,
-  PostgreSQL or the API service. The 1000/open32 shape must be repeated after
-  that fix before selecting an application optimization winner.
+- The runner confounder was fixed in `d5cd6f93`: the SSE child process raises
+  its soft `RLIMIT_NOFILE` to 32768 when the hard limit permits it and logs the
+  effective soft/hard values. This changes only the load generator process,
+  not Nginx, PostgreSQL or the API service. The valid repeat at 1000/open32,
+  load `32845174078` with exact cleanup `32845451618`, confirmed
+  `nofile soft=32768 hard=32768` and reached `998/1,000` HTTP 200 streams,
+  `2` Cloudflare 500 responses, `5` incomplete-chunk client errors,
+  `max_active=994`, 410 events and connect p95 20.14s. No 429/503, sustained
+  CPU/load-average, PostgreSQL connection or lock saturation was observed.
+  The classified hotspot remained database time. Stream admission work fell
+  to 5.26 average SQL queries and 161.7ms average DB time; this supports the
+  participant-snapshot optimization, but the strict 1000 gate still fails.
+  Compact JSON artifacts now retain the effective load-generator `nofile`
+  limits and bounded connection/response error samples for the next repeat.
+- Repeat the same 1000/open32 shape once more before changing opening
+  concurrency or application semantics. The repeat determines whether the
+  two edge 500s are stable origin pressure or near-boundary variance.

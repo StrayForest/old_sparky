@@ -78,7 +78,18 @@ class PlatformSseQaTests(unittest.TestCase):
             "user_ids": [user_id],
             "tournament_ids": [tournament_id],
             "requested_users": 1,
-            "sse": {"target_connections": 1, "metrics": {"connected": 1}},
+            "sse": {
+                "target_connections": 1,
+                "load_generator_resources": {
+                    "nofile_soft": 32768,
+                    "nofile_hard": 32768,
+                },
+                "metrics": {
+                    "connected": 1,
+                    "error_samples": [],
+                    "response_error_samples": [],
+                },
+            },
             "polling": {"tabs_planned": 1, "executed": 1},
             "performance": {},
             "passed": True,
@@ -91,6 +102,8 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(compact["completed_tournaments"], 1)
         self.assertEqual(compact["rows"][0]["synthetic_users"], 1)
         self.assertEqual(compact["rows"][0]["result"]["marker"], marker)
+        self.assertEqual(compact["sse"]["load_generator_resources"]["nofile_soft"], 32768)
+        self.assertEqual(compact["sse"]["error_samples"], [])
 
     def test_sse_manifest_is_accepted_by_exact_cleanup_validator(self) -> None:
         marker = "preprod260825120000abcd"
