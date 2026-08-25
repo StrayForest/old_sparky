@@ -27,14 +27,14 @@ staircase, combined run and resource evidence pass.
 
 ## Ordered protocol
 
-1. Deploy the reviewed runner and limit candidate through the normal `dev`
-   security/build and automatic production deployment chain. If a diagnostic
-   identifies a measurement-blocking implementation issue, record it as a
-   separate A/B hypothesis, deploy only that focused correction, and repeat
-   the affected staircase point before ranking the ten variants. If the core
-   matrix passes, run a separate reviewed overload extension above 10,000 to
-   measure headroom and deliberate admission, without treating a deliberate
-   `429` as a successful 10,000-user result.
+1. Run the isolated loopback origin staircase first. Do not spend CI/CD or
+   production time on a candidate that fails at the application origin. Only
+   after a local winner passes the strict transport and event-delivery gate
+   promote that focused change through the normal `dev` security/build and
+   automatic production deployment chain. If the core matrix passes, run a
+   separate reviewed overload extension above 10,000 to measure headroom and
+   deliberate admission, without treating a deliberate `429` as a successful
+   10,000-user result.
 2. Run the ten hypotheses below one at a time. Clean each run before starting
    the next one; a failed or canceled run is still cleaned.
 3. Select the best hypothesis by zero unexpected errors/503s first, then
@@ -55,8 +55,11 @@ staircase, combined run and resource evidence pass.
 The runner records connection attempts, connected streams, `429`/`503`/other
 responses, connection latency, keepalives, reconnects, bytes, event delivery
 latency, polling status/304 counters, HTTP p50/p95/p99, request-performance
-logs, CPU/RAM/load, PostgreSQL connections and lock waits, and worker/backlog
-signals where available.
+logs, CPU/RAM/load, Nginx/API/PostgreSQL/Redis TCP connections, PostgreSQL
+connections and lock waits, and worker/backlog signals where available. Redis
+TCP connections are sampled without issuing extra Redis commands; this was
+important for the per-stream baseline and remains useful for detecting relay
+or limiter regressions.
 
 The Redis messages are explicitly transport/fan-out probes with type
 `qa_sse_probe`; they do not mutate authoritative tournament state. A successful
@@ -71,47 +74,146 @@ requiring diagnosis. A `429` is only acceptable when the tested variant is
 deliberately above a configured ceiling; it is not a successful 10,000-user
 result.
 
+## Research conclusions and local-first gate
+
+The current production evidence does not support raising admission limits as
+the next change. The reliable contour is still below the configured ceilings,
+and the failed 1,000-stream runs show edge `500` responses and incomplete
+chunked bodies rather than deliberate `429` admission. The next measurements
+must first classify where a stream ends and whether Redis fan-out scales with
+one connection per stream.
+
+The design constraints are based on the following primary documentation and
+published engineering reports:
+
+- [FastAPI advanced dependencies](https://fastapi.tiangolo.com/advanced/advanced-dependencies/)
+  documents `Depends(..., scope="function")`, which closes a yielded database
+  resource before a `StreamingResponse` starts. The SSE route uses this
+  isolated dependency graph while periodic authorization opens short-lived
+  sessions; security revalidation is not removed.
+- [NGINX proxy module documentation](https://nginx.org/en/docs/http/ngx_http_proxy_module.html)
+  defines `proxy_read_timeout` as an idle interval between upstream reads, not
+  a total response lifetime. The 660-second experiment was therefore rejected
+  after it worsened the measured result; keepalives and stream lifecycle must
+  be tested independently from the timeout.
+- [Cloudflare Error 524 guidance](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/)
+  and [Cloudflare Error 520 guidance](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-520/)
+  require correlation of edge identifiers, origin response status and response
+  timing before classifying an edge `500` as an application or proxy failure.
+- [Gunicorn's design guidance](https://docs.gunicorn.org/en/stable/design.html)
+  recommends asynchronous workers for streaming and long polling. Worker count
+  is a process-concurrency choice, not a one-worker-per-client setting.
+- [SQLAlchemy pooling](https://docs.sqlalchemy.org/en/20/core/pooling.html)
+  requires an explicit pool/overflow/timeout budget. Increasing the pool to
+  hide a stream-held connection is not an accepted experiment.
+- [Redis Pub/Sub](https://redis.io/docs/latest/develop/pubsub/) is at-most-once
+  transport. Shared subscribers or relay-like fan-out therefore require an
+  explicit reconnect, ordering and missed-event/snapshot policy before they
+  can replace the current per-stream subscription.
+- [Slack's realtime architecture](https://slack.engineering/real-time-messaging/)
+  separates channel routing from gateway-held connections, while
+  [Discord's million-user report](https://discord.com/blog/maxjourney-pushing-discords-limits-with-a-million-plus-online-users-in-a-single-server)
+  describes passive connections, relays and bounded fan-out. These are
+  architectural hypotheses for local testing, not a reason to copy a relay
+  into the authoritative workflow path without measurements.
+
+The local-first execution gate is:
+
+1. **L0 — application origin.** Use the isolated `test` environment,
+   `platformdb_test` and Redis DB 15. Run 1,000, 5,000 and 10,000 synthetic
+   stream attempts against the loopback API with short holds (5/15/60s), then
+   repeat only the best two contours. Capture HTTP status, complete-body
+   errors, event delivery, Redis TCP connections and PostgreSQL connections.
+2. **L1 — local Nginx.** Repeat the winning L0 shapes through a disposable
+   local Nginx configuration with the production 60-second idle timeout and
+   15-second keepalives. Compare origin and proxy `upstream_status`,
+   `request_completion`, `connection_requests` and request IDs.
+3. **L2 — fan-out variants.** Compare the baseline one-Pub/Sub-client-per-stream
+   implementation with the narrowly scoped shared-subscriber/relay candidate for
+   one tournament. The prototype must preserve authorization before every
+   private event, explicit revision/snapshot recovery and disconnect cleanup.
+4. **L3 — selected candidate only.** Promote one local winner to the normal
+   exact-SHA CI/deploy chain, then run one production diagnostic contour before
+   spending time on the full 10+5 matrix. A local pass is not production
+   authorization, but a local failure is sufficient to reject a candidate.
+
+The local gate is strict: no unexpected `5xx`, malformed/incomplete stream
+body or client error; `429` is counted as deliberate admission only when the
+test is intentionally above a configured cap. A valid candidate must also
+show that active SSE count does not pin PostgreSQL connections for the stream's
+whole lifetime. The local load generator itself must report its `RLIMIT_NOFILE`
+and have enough descriptors, otherwise the result is a generator failure rather
+than a server-capacity result.
+
+## Engineering hypothesis register
+
+These are the ten technical hypotheses behind the workload variants below.
+They are deliberately separated from the 1k/5k/10k staircase so a failed
+opening shape is not mistaken for a failed architectural change.
+
+| ID | Hypothesis | Current evidence/status |
+| --- | --- | --- |
+| E1 | A request-scoped DB session was held for the whole SSE stream. | Accepted and fixed with the dedicated SSE router and function-scoped dependency. |
+| E2 | Duplicate stream authorization/snapshot queries amplify setup CPU and DB time. | Accepted; participant snapshot/query reuse materially reduced stream DB work. |
+| E3 | Revalidating idle streams every keepalive is unnecessary work. | Accepted; 30-second checkpoints removed sustained API CPU saturation in the local 1,000-stream contour while retaining event and idle revalidation. |
+| E4 | Opening backpressure is more valuable than raising worker count. | Accepted; bounded `open_concurrency=64` reached the local 10,000-stream target, while faster/unbounded shapes were slower or failed at the boundary. |
+| E5 | The load generator's file-descriptor ceiling distorted the 1,000-stream result. | Confirmed confounder and fixed; subsequent runs use/report `32768` descriptors. |
+| E6 | The 60-second Nginx read timeout caused the incomplete streams. | Rejected by the isolated 660-second experiment; the longer timeout regressed CPU/load and errors. |
+| E7 | Cloudflare/origin closes are being misclassified because edge and Nginx completion fields are missing. | Accepted as an observability requirement; the loopback probe isolates origin behavior and the runner now retains request/edge/Nginx correlation fields. |
+| E8 | One Redis Pub/Sub connection per stream becomes the next hard limit. | Accepted and rejected as the production shape: the local per-stream baseline reached 9,982/10,000 but produced 18 limiter `503`s and Redis peaked at 10,000 clients. |
+| E9 | One subscriber/relay per tournament can reduce fan-out without moving authoritative state out of PostgreSQL. | Accepted for the local transport candidate: one relay per API worker/tournament reached 10,000/10,000 with 10,000/10,000 events and Redis peak 146. Private authorization remains in the stream path. |
+| E10 | Compact revision/delta events reduce CPU and bytes enough to move the boundary. | Partially accepted: the event contract is already a compact revision/match delta trigger; full delta-response savings still need a payload benchmark. |
+
+E1–E6 retain the earlier production evidence. E7–E9 now have isolated local
+evidence; E10 is partially implemented but its full delta-response savings
+remain unmeasured because the 10k transport winner was selected without
+changing the authoritative bracket payload. The local result is not a
+production authorization: the exact-SHA CI/deploy gate and one guarded live
+diagnostic remain required.
+
 ## Ten hypotheses
 
-These are executed against the same retained fixture and public route. The
-first three establish the staircase; the remaining variants isolate opening
-burst, hold time, fan-out and mixed polling effects.
+The following ten A/B hypotheses were tested locally against the isolated
+origin. They compare one causal change at a time and include the earlier
+production evidence where that was the only safe place to test the edge or
+proxy contour.
 
-| ID | Variant | SSE target | Hold | Open concurrency | Probe |
-| --- | --- | ---: | ---: | ---: | --- |
-| H1 | 1k staircase baseline | 1,000 | 60s | 256 | 3 events / 1s |
-| H2 | 5k staircase baseline | 5,000 | 60s | 512 | 3 events / 1s |
-| H3 | 10k gradual baseline | 10,000 | 60s | 512 | 3 events / 1s |
-| H4 | 10k faster opening | 10,000 | 60s | 1,024 | 3 events / 1s |
-| H5 | 10k bounded opening | 10,000 | 60s | 256 | 3 events / 1s |
-| H6 | 10k long hold | 10,000 | 180s | 512 | 3 events / 1s |
-| H7 | 10k fan-out burst | 10,000 | 60s | 512 | 20 events / 0.25s |
-| H8 | 10k high fan-out opening | 10,000 | 60s | 1,024 | 20 events / 0.25s |
-| H9 | 10k reconnect pressure | 10,000 | 60s | 512 | 1 reconnect, 3 events / 1s |
-| H10 | 10k combined workload | 10,000 | 60s | 512 | 3 events / 1s + polling |
+| ID | Hypothesis / comparison | Result |
+| --- | --- | --- |
+| H1 | Stream-held DB session vs function-scoped session | Function scope removed the 1:1 PostgreSQL lease; the original 1k failure moved from pool exhaustion to edge/origin pressure. |
+| H2 | Duplicate stream authorization/snapshot query vs reused access context | Reduced SQL work, but was not sufficient alone for the 1k strict gate. |
+| H3 | Revalidation every keepalive vs 30-second checkpoint | The 30-second checkpoint retained private-event checks and removed sustained API CPU saturation in the 1k contour. |
+| H4 | Load-generator `RLIMIT_NOFILE=1024` vs `32768` | `1024` produced `Errno 24` and was invalid; `32768` made the 1k test a server measurement. |
+| H5 | Nginx `proxy_read_timeout=60s` vs `660s` | `660s` regressed CPU/load/errors; `60s` retained. |
+| H6 | `open_concurrency=16/32/64` | Open32 was the strict 512 contour; open64 was the best local 1k/5k/10k opening shape. |
+| H7 | One Redis Pub/Sub client per stream vs worker/tournament relay | Per-stream failed at 10k with 18 limiter `503`s and Redis peak 10,000; relay passed 10k with Redis peak 146. |
+| H8 | Per-request/non-blocking limiter pool vs shared blocking pool `64/20s` | Pool32 caused limiter-unavailable `503`s; blocking64/20s produced zero `503`s at 10k. |
+| H9 | Ramp-only stream test vs barrier-held persistent streams | The barrier makes all attempts reach terminal status before the hold and event probe; it prevents early clients disappearing before the target is open. |
+| H10 | 10-second event hold vs 30-second hold with 5-second settle | `167/10,000` events at the short hold was a measurement-tail failure; the selected hold delivered `10,000/10,000`. |
 
-H10 uses `profile=combined`, a 30-second polling window and the established
-300-second opening stagger. The other rows use `profile=sse`. H1/H2 are
-diagnostic staircase points, not evidence that the server is limited to those
-sizes.
+H1–H10 are local engineering A/Bs, not a production capacity claim. The
+combined 10,000-user polling+SSE profile remains a separate release gate.
 
 ## Five follow-up hypotheses
 
 After selecting `Hn`, run five nearby variants rather than changing several
 dimensions at once:
 
-| ID | Follow-up change around `Hn` |
-| --- | --- |
-| F1 | halve the SSE opening concurrency |
-| F2 | double the SSE opening concurrency, capped at 2,048 |
-| F3 | double the hold duration |
-| F4 | double probe event rate while keeping the opening shape |
-| F5 | repeat the winner with one forced reconnect cycle |
+| ID | Follow-up around the relay winner | Result |
+| --- | --- | --- |
+| F1 | Open 1k streams with `open_concurrency=32` | Pass: 1,000/1,000 HTTP 200 and events, p95 7.8s, Redis peak 147, load-1m peak 0.66. |
+| F2 | Open 1k streams with `open_concurrency=128` | Pass: 1,000/1,000 HTTP 200 and events, p95 6.8s, Redis peak 149, load-1m peak 0.94; not promoted to 10k without a 10k confirmation. |
+| F3 | Hold 1k streams for 20s instead of 10s | Pass: 1,000/1,000 HTTP 200 and events, p95 7.3s, Redis peak 149, load-1m peak 0.99. |
+| F4 | Five events at 0.2s instead of one event | Pass: 5,000/5,000 events, p95 7.4s, Redis peak 150, load-1m peak 0.85. |
+| F5 | Increase post-open settle from 5s to 10s | Pass: 1,000/1,000 HTTP 200 and events, p95 6.9s, Redis peak 149, load-1m peak 1.22. |
 
-The final winner is the highest-capacity variant with zero unexpected errors
-and measurable headroom. If two variants tie, prefer the one with lower p95,
-lower CPU and fewer Redis/DB waits. No value is accepted only because it
-allows the client generator to create more tasks.
+The final 10k local winner is relay + coalesced authorization + blocking
+limiter pool `64/20s` + bounded `open_concurrency=64` + barrier/settle/hold
+profile. The five 1k follow-ups all passed; `open_concurrency=128` was fastest
+at 1k, but `64` is the only opening shape confirmed at 10k. The winner has
+zero unexpected errors, full event delivery and large PostgreSQL headroom. It
+is still not production-approved until CI/CD and the guarded live diagnostic
+pass.
 
 ## Operator commands
 
@@ -158,9 +260,35 @@ stores only the measured conclusion and run identifiers.
   `da1435c`. Signed QA-bypass and failed-run summary fix: exact CI
   `32826238833`, auto-deploy `32826794523`, production deploy/live smoke
   `32826801617`, all passed for `39499dfc`.
-- Ten-hypothesis matrix: pending.
-- Follow-up matrix: pending.
+- Local ten-hypothesis A/B classification: complete for the origin transport
+  contour; production/CI matrix remains pending by design.
+- Local five follow-up variants around the relay winner: complete for the
+  transport contour; slow-consumer/reconnect correctness and production matrix
+  remain pending.
 - Combined 10,000-user SSE + polling gate: pending.
+- The local origin probe is `platform/tools/platform_sse_origin_probe.py` and
+  runs only with `PLATFORM_ENVIRONMENT=test`, `platformdb_test`, Redis DB 15
+  and a loopback origin. It clears only its exact test admission key and
+  deletes its exact tournament/user fixture in `finally`.
+- Local staircase evidence, using a barrier so all attempts reached terminal
+  status before the event probe:
+
+  | Profile | Result | Connect p95 | Redis peak | PostgreSQL peak |
+  | --- | --- | ---: | ---: | ---: |
+  | 1k, per-stream Pub/Sub | 1,000/1,000 HTTP 200; 3,000/3,000 events | 14.8s | 1,017 | 31 |
+  | 5k, per-stream Pub/Sub | 5,000/5,000 HTTP 200; 15,000/15,000 events | 126.2s | 5,017 | 31 |
+  | 10k, per-stream Pub/Sub | 9,982/10,000 HTTP 200; 18 limiter `503`s | 402.3s | 10,000 | 31 |
+  | 1k, worker/tournament relay | 1,000/1,000 HTTP 200; 3,000/3,000 events | 10.9s | 83 | 31 |
+  | 5k, worker/tournament relay | 5,000/5,000 HTTP 200; 15,000/15,000 events | 99.3s | 4,602 | 31 |
+  | 10k, relay + blocking limiter pool | 10,000/10,000 HTTP 200; 10,000/10,000 events | 309.4s | 146 | 31 |
+
+  The final 10k local run held the streams for 30 seconds after a 5-second
+  settle period, took 425.2 seconds end to end, had zero probe errors, API
+  peak 10,000, load-1m peak 1.72 and Redis `rejected_connections` delta 0.
+  PostgreSQL connections stayed at 31 rather than growing with active SSE.
+  The 10-second hold variant delivered only 167 events before its readers
+  drained; it was rejected as a measurement shape and repeated with the
+  settle/hold profile before selecting the winner.
 - Diagnostic H1 attempt `32823477661` did not reach a valid SSE result: the
   setup completed, but the application source bucket held at 32 (`connected=171`,
   `max_active=32`, `rejected_other=829`, `errors=149`, no events). It was

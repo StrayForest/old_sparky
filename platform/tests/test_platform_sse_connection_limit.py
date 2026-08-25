@@ -18,6 +18,7 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         await self._clear_limit_keys()
+        await sse.dispose_sse_connection_limiter()
 
     async def _clear_limit_keys(self) -> None:
         cache = redis_client()
@@ -227,6 +228,9 @@ class PlatformSseNginxGuardTests(unittest.TestCase):
         self.assertIn("limit_conn platform_sse_global 10240;", nginx)
         self.assertIn("limit_conn_status 429;", nginx)
         self.assertIn('"limit_conn_status":"$limit_conn_status"', nginx)
+        self.assertIn('"upstream_status":"$upstream_status"', nginx)
+        self.assertIn('"request_completion":"$request_completion"', nginx)
+        self.assertIn('"connection_requests":$connection_requests', nginx)
         self.assertIn("proxy_read_timeout 60s;", nginx)
 
 

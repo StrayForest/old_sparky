@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -42,6 +43,10 @@ class _FakeRedisClient:
 
 
 class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self) -> None:
+        bracket_events._access_check_cache.clear()
+        bracket_events._access_check_locks.clear()
+
     async def test_stream_stops_before_next_private_event_after_access_is_revoked(self) -> None:
         pubsub = _FakePubSub([{"data": '{"revision":2}'}])
         client = _FakeRedisClient(pubsub)
@@ -126,6 +131,15 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         pubsub = _FakePubSub([])
         client = _FakeRedisClient(pubsub)
         access_check = AsyncMock(return_value=True)
+        monotonic_values = iter(
+            (10.0, 10.0 + bracket_events.SSE_STREAM_MAX_LIFETIME_SECONDS)
+        )
+
+        def fake_monotonic() -> float:
+            return next(
+                monotonic_values,
+                10.0 + bracket_events.SSE_STREAM_MAX_LIFETIME_SECONDS,
+            )
 
         with (
             patch.object(bracket_events, "redis_client", MagicMock(return_value=client)),
@@ -136,9 +150,9 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(bracket_events.secrets, "randbelow", return_value=0),
             patch.object(
-                bracket_events.time,
+                bracket_events,
                 "monotonic",
-                side_effect=(10.0, 10.0 + bracket_events.SSE_STREAM_MAX_LIFETIME_SECONDS),
+                side_effect=fake_monotonic,
             ),
         ):
             stream = bracket_events.stream_bracket_events("tournament-4")
@@ -158,6 +172,10 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         pubsub = _FakePubSub([None])
         client = _FakeRedisClient(pubsub)
         access_check = AsyncMock(return_value=False)
+        monotonic_values = iter((10.0, 10.0, 40.0))
+
+        def fake_monotonic() -> float:
+            return next(monotonic_values, 40.0)
 
         with (
             patch.object(bracket_events, "redis_client", MagicMock(return_value=client)),
@@ -167,9 +185,9 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 access_check,
             ),
             patch.object(
-                bracket_events.time,
+                bracket_events,
                 "monotonic",
-                side_effect=(10.0, 10.0, 40.0),
+                side_effect=fake_monotonic,
             ),
         ):
             stream = bracket_events.stream_bracket_events(
@@ -182,6 +200,65 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         access_check.assert_awaited_once_with("tournament-5")
         self.assertTrue(client.closed)
+
+    async def test_identical_streams_coalesce_authorization_revalidation(self) -> None:
+        clients = [
+            _FakeRedisClient(_FakePubSub([{"data": '{"revision":2}'}])),
+            _FakeRedisClient(_FakePubSub([{"data": '{"revision":2}'}])),
+        ]
+        access_check = AsyncMock(return_value=True)
+
+        with (
+            patch.object(bracket_events, "redis_client", side_effect=clients),
+            patch.object(
+                bracket_events,
+                "current_tournament_stream_access_is_valid",
+                access_check,
+            ),
+        ):
+            streams = [
+                bracket_events.stream_bracket_events(
+                    "same-tournament",
+                    admission_verified=True,
+                )
+                for _ in clients
+            ]
+            await asyncio.gather(*(anext(stream) for stream in streams))
+            await asyncio.gather(*(anext(stream) for stream in streams))
+            await asyncio.gather(*(stream.aclose() for stream in streams))
+
+        access_check.assert_awaited_once_with("same-tournament")
+
+    async def test_identical_streams_share_one_redis_subscription(self) -> None:
+        pubsub = _FakePubSub([{"data": '{"revision":4}'}])
+        client = _FakeRedisClient(pubsub)
+        redis_factory = MagicMock(return_value=client)
+
+        with (
+            patch.object(bracket_events, "redis_client", redis_factory),
+            patch.object(
+                bracket_events,
+                "current_tournament_stream_access_is_valid",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            streams = [
+                bracket_events.stream_bracket_events(
+                    "shared-tournament",
+                    admission_verified=True,
+                )
+                for _ in range(2)
+            ]
+            await asyncio.gather(*(anext(stream) for stream in streams))
+            events = await asyncio.gather(*(anext(stream) for stream in streams))
+            await asyncio.gather(*(stream.aclose() for stream in streams))
+
+        self.assertEqual(events, [
+            'event: bracket\ndata: {"revision":4}\n\n',
+            'event: bracket\ndata: {"revision":4}\n\n',
+        ])
+        redis_factory.assert_called_once_with()
+        self.assertEqual(pubsub.subscribed, ["platform:bracket:shared-tournament"])
 
 
 if __name__ == "__main__":

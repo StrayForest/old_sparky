@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from python_packages.platform_infra.models import MediaAsset
@@ -14,6 +14,14 @@ class MediaCleanupRequired(RuntimeError):
         self.status_counts = dict(sorted(status_counts.items()))
         count = sum(self.status_counts.values())
         super().__init__(f"{count} media asset(s) must finish durable cleanup before hard delete")
+
+
+MEDIA_QUERY_CHUNK_SIZE = 10_000
+
+
+def _chunks(values: tuple[str, ...]) -> Iterable[tuple[str, ...]]:
+    for start in range(0, len(values), MEDIA_QUERY_CHUNK_SIZE):
+        yield values[start : start + MEDIA_QUERY_CHUNK_SIZE]
 
 
 async def purge_deleted_media_metadata(
@@ -33,27 +41,39 @@ async def purge_deleted_media_metadata(
     scoped_tournament_ids = tuple(
         dict.fromkeys(str(value) for value in tournament_ids if value)
     )
-    filters = []
-    if user_ids:
-        filters.append(MediaAsset.owner_user_id.in_(user_ids))
-    if scoped_tournament_ids:
-        filters.append(MediaAsset.tournament_id.in_(scoped_tournament_ids))
-    if not filters:
+    if not user_ids and not scoped_tournament_ids:
         return 0
 
-    rows = (
-        await db_session.execute(
-            select(MediaAsset.id, MediaAsset.status)
-            .where(or_(*filters))
-            .with_for_update()
-        )
-    ).all()
-    blockers = Counter(str(row.status) for row in rows if row.status != "deleted")
+    # Keep every statement comfortably below asyncpg's 32,767 bind-parameter
+    # limit. Querying the two scopes separately preserves the OR semantics and
+    # avoids a cartesian product when both collections are large. A media row
+    # matching both scopes is deduplicated by its primary key.
+    rows_by_id: dict[str, str] = {}
+    for column, values in (
+        (MediaAsset.owner_user_id, user_ids),
+        (MediaAsset.tournament_id, scoped_tournament_ids),
+    ):
+        for chunk in _chunks(values):
+            rows = (
+                await db_session.execute(
+                    select(MediaAsset.id, MediaAsset.status)
+                    .where(column.in_(chunk))
+                    .with_for_update()
+                )
+            ).all()
+            for row in rows:
+                rows_by_id.setdefault(str(row.id), str(row.status))
+
+    blockers = Counter(status for status in rows_by_id.values() if status != "deleted")
     if blockers:
         raise MediaCleanupRequired(dict(blockers))
-    asset_ids = [str(row.id) for row in rows]
+    asset_ids = list(rows_by_id)
     if not asset_ids:
         return 0
-    result = await db_session.execute(delete(MediaAsset).where(MediaAsset.id.in_(asset_ids)))
+
+    deleted = 0
+    for chunk in _chunks(tuple(asset_ids)):
+        result = await db_session.execute(delete(MediaAsset).where(MediaAsset.id.in_(chunk)))
+        deleted += int(result.rowcount or 0)
     await db_session.flush()
-    return int(result.rowcount or 0)
+    return deleted

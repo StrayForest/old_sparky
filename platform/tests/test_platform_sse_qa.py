@@ -51,6 +51,8 @@ class PlatformSseQaTests(unittest.TestCase):
             {
                 "content-type": "application/json",
                 "server": "nginx",
+                "cf-ray": "abc123-SIN",
+                "cf-cache-status": "DYNAMIC",
             }
         )
         for _ in range(30):
@@ -64,6 +66,27 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(len(samples), 25)
         self.assertEqual(samples[0]["status"], 500)
         self.assertEqual(samples[0]["body"], '{"detail":"pool timeout"}')
+        self.assertEqual(samples[0]["cf_ray"], "abc123-SIN")
+        self.assertEqual(samples[0]["cf_cache_status"], "DYNAMIC")
+
+    def test_error_samples_keep_bounded_stream_correlation(self) -> None:
+        metrics = SseMetrics()
+        metrics.record_error(
+            httpx.RemoteProtocolError("incomplete chunked read"),
+            details={
+                "request_id": "sseqa-test",
+                "elapsed_ms": 60012.3,
+                "bytes_received": 128,
+                "events": 3,
+                "keepalives": 4,
+                "cf_ray": "ray-test",
+            },
+        )
+
+        sample = metrics.summary()["error_samples"][0]
+        self.assertEqual(sample["request_id"], "sseqa-test")
+        self.assertEqual(sample["elapsed_ms"], 60012.3)
+        self.assertEqual(sample["cf_ray"], "ray-test")
 
     def test_summary_is_an_exact_cleanup_manifest(self) -> None:
         marker = "preprod260825120000abcd"

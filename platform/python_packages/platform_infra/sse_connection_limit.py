@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Callable
 
+from redis.asyncio import BlockingConnectionPool, Redis
 from redis.exceptions import RedisError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -25,7 +26,6 @@ from python_packages.platform_infra.config import (
 )
 from python_packages.platform_infra.db import session_factory
 from python_packages.platform_infra.models import User, UserSession
-from python_packages.platform_infra.redis import redis_client
 from python_packages.platform_infra.security import session_token_digest
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,10 @@ SSE_LEASE_SECONDS = SSE_STREAM_MAX_LIFETIME_SECONDS + SSE_LEASE_GRACE_SECONDS
 SSE_KEY_PREFIX = "platform:sse-limit:v1"
 SSE_LOAD_TEST_BYPASS_HEADER = "x-platform-qa-sse-bypass"
 SSE_LOAD_TEST_BYPASS_CONTEXT = b"platform-sse-load-test-v1"
+SSE_LIMITER_REDIS_POOL_MAX_CONNECTIONS = 64
+SSE_LIMITER_REDIS_POOL_TIMEOUT_SECONDS = 20.0
+
+_limiter_redis_client: Redis | None = None
 
 _ACQUIRE_SCRIPT = """
 local now = tonumber(ARGV[1])
@@ -130,6 +134,28 @@ def _user_key(settings: PlatformSettings, user_id: str) -> str:
     return f"{SSE_KEY_PREFIX}:user:{_fingerprint(settings, f'user:{user_id}')}"
 
 
+def _limiter_client() -> Redis:
+    global _limiter_redis_client
+    if _limiter_redis_client is None:
+        settings = get_settings()
+        pool = BlockingConnectionPool.from_url(
+            settings.platform_redis_url,
+            decode_responses=True,
+            max_connections=SSE_LIMITER_REDIS_POOL_MAX_CONNECTIONS,
+            timeout=SSE_LIMITER_REDIS_POOL_TIMEOUT_SECONDS,
+        )
+        _limiter_redis_client = Redis(connection_pool=pool)
+    return _limiter_redis_client
+
+
+async def dispose_sse_connection_limiter() -> None:
+    global _limiter_redis_client
+    client = _limiter_redis_client
+    _limiter_redis_client = None
+    if client is not None:
+        await client.aclose()
+
+
 async def _reserve_keys(
     keys: list[str],
     limits: list[int],
@@ -146,7 +172,7 @@ async def _reserve_keys(
 
     lease_expires_at = now_epoch + lease_seconds
     key_expires_at = lease_expires_at + SSE_KEY_EXPIRY_GRACE_SECONDS
-    cache = redis_client()
+    cache = _limiter_client()
     try:
         rejected_index = int(
             await cache.eval(
@@ -164,9 +190,6 @@ async def _reserve_keys(
         raise SseConnectionLimiterUnavailable(
             "SSE connection protection is temporarily unavailable."
         ) from exc
-    finally:
-        await cache.aclose()
-
     if rejected_index:
         raise SseConnectionLimitExceeded(scopes[rejected_index - 1])
 
@@ -174,11 +197,8 @@ async def _reserve_keys(
 async def _release_keys(keys: list[str], *, member: str) -> None:
     if not keys:
         return
-    cache = redis_client()
-    try:
-        await cache.eval(_RELEASE_SCRIPT, len(keys), *keys, member)
-    finally:
-        await cache.aclose()
+    cache = _limiter_client()
+    await cache.eval(_RELEASE_SCRIPT, len(keys), *keys, member)
 
 
 @dataclass(slots=True)

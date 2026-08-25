@@ -18,6 +18,7 @@ ExecStart=/opt/oldsparky/platform/current/tools/platform_run_api.sh
 Restart=on-failure
 RestartSec=5
 UMask=0007
+LimitNOFILE=65535
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true

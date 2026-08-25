@@ -56,8 +56,9 @@ create-before-response boundary: the exact cleanup path now recovers only a
 marker-matching tournament owned by that run's synthetic organizer set before
 deletion, while malformed or foreign matches remain fail-closed.
 
-The measured local staircase reached 1,000 → 5,000 → 10,000 virtual users on
-the selected bounded profile. Production remains commit- and exact-SHA-gated;
+The measured local browser-polling staircase reached 1,000 → 5,000 → 10,000
+virtual users on the selected bounded profile. Production remains commit- and
+exact-SHA-gated;
 a canceled, recovered or setup-failed run is not a successful benchmark. The
 first production browser run (`32798245204`) created its 10,000 users but hit a
 Cloudflare 504 while creating the first tournament, before polling began. Its
@@ -97,9 +98,28 @@ the runner now carries a signed QA-only bypass for that bucket while retaining
 global, per-user, Redis and Nginx admission. Failed runs also export compact
 metrics for diagnosis. The required ten hypotheses followed by five variants
 around the winner are specified in the protocol and acceptance rules maintained
-in [`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md). No
-10,000-persistent-SSE claim is made until the 1k/5k/10k staircase, any
-above-10k overload extension and combined run are measured through CI/CD.
+in [`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md).
+
+The local loopback origin staircase now passes the selected transport contour:
+the worker/tournament relay plus coalesced authorization and a shared blocking
+SSE limiter pool reached 1,000, 5,000 and 10,000 persistent streams with zero
+HTTP errors and complete event delivery in the final 10k run. The final run
+had 10,000/10,000 HTTP 200, 10,000/10,000 events, Redis peak 146, PostgreSQL
+peak 31, no Redis rejection increase and no PostgreSQL connection growth with
+active SSE. Its p95 connection-open latency was 309.4s, so handshake speed and
+the combined polling+SSE profile remain release gates. This local result does
+not authorize production or a 10,000-persistent-SSE claim: the exact-SHA
+CI/deploy gate, one guarded live diagnostic, the five follow-up correctness
+checks and the combined run are still required. The prior per-stream Redis
+shape is rejected at 10k because it produced 18 limiter `503`s and Redis peak
+10,000.
+
+To reduce repeated CI/CD runs, AS-19 is explicitly local-first: classify origin
+versus Nginx/edge closes, compare Redis TCP connections with active SSE, and
+reject failed candidates locally before promoting one exact-SHA diagnostic run.
+The benchmark document records the completed ten local A/B classifications and
+five transport follow-ups; full delta-response measurement and
+slow-consumer/reconnect correctness remain open before live promotion.
 The first valid 1k run reached the application but failed with 500s while
 long-lived responses held request-scoped PostgreSQL connections; removing a
 duplicate QA-only session lookup was not sufficient. The next focused A/B

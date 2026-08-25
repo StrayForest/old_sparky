@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import resource
+import secrets
 import sys
 import time
 from typing import Any
@@ -57,7 +58,7 @@ class SseMetrics:
         self.response_statuses: Counter[str] = Counter()
         self.connect_latencies: list[float] = []
         self.event_latencies: list[float] = []
-        self.error_samples: list[dict[str, str]] = []
+        self.error_samples: list[dict[str, Any]] = []
         self.response_error_samples: list[dict[str, Any]] = []
         self.max_error_samples = 25
 
@@ -80,12 +81,21 @@ class SseMetrics:
             self.mark("active_connections", -1)
         self.mark("disconnects")
 
-    def record_error(self, error: BaseException) -> None:
+    def record_error(
+        self,
+        error: BaseException,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         self.mark("errors")
         if len(self.error_samples) < self.max_error_samples:
-            self.error_samples.append(
-                {"type": type(error).__name__, "message": str(error)[:300]}
-            )
+            sample: dict[str, Any] = {
+                "type": type(error).__name__,
+                "message": str(error)[:300],
+            }
+            if details:
+                sample.update(details)
+            self.error_samples.append(sample)
 
     def record_response_error(
         self,
@@ -93,17 +103,31 @@ class SseMetrics:
         status_code: int,
         body: bytes,
         headers: httpx.Headers,
+        request_id: str | None = None,
     ) -> None:
         if len(self.response_error_samples) >= self.max_error_samples:
             return
-        self.response_error_samples.append(
-            {
-                "status": status_code,
-                "content_type": headers.get("content-type", ""),
-                "server": headers.get("server", ""),
-                "body": body[:500].decode("utf-8", errors="replace"),
-            }
-        )
+        sample: dict[str, Any] = {
+            "status": status_code,
+            "content_type": headers.get("content-type", ""),
+            "server": headers.get("server", ""),
+            "body": body[:500].decode("utf-8", errors="replace"),
+        }
+        if request_id:
+            sample["request_id"] = request_id
+        for header_name in (
+            "cf-ray",
+            "cf-cache-status",
+            "cf-error-type",
+            "date",
+            "retry-after",
+            "transfer-encoding",
+            "x-request-id",
+        ):
+            value = headers.get(header_name)
+            if value:
+                sample[header_name.replace("-", "_")] = value[:200]
+        self.response_error_samples.append(sample)
 
     def summary(self) -> dict[str, Any]:
         attempts = self.counters["connection_attempts"]
@@ -301,7 +325,7 @@ async def consume_sse_connection(
 ) -> None:
     token = qa.session_tokens_by_user_id[str(user["id"])]
     headers = {
-        "Accept": "text/event-stream",
+        "Accept": "text/event-stream, application/problem+json",
         "Cache-Control": "no-cache",
         "Origin": qa.origin,
         "Cookie": f"{qa.session_cookie_name}={token}",
@@ -317,6 +341,12 @@ async def consume_sse_connection(
             break
         metrics.mark("connection_attempts")
         attempt_started = time.monotonic()
+        request_id = f"sseqa-{secrets.token_hex(8)}"
+        headers["X-Request-ID"] = request_id
+        counters_before = {
+            name: metrics.counters[name]
+            for name in ("bytes_received", "events", "keepalives")
+        }
         stream_context = None
         response = None
         connected_this_attempt = False
@@ -341,6 +371,7 @@ async def consume_sse_connection(
                         status_code=response.status_code,
                         body=await response.aread(),
                         headers=response.headers,
+                        request_id=request_id,
                     )
                 await stream_context.__aexit__(None, None, None)
                 stream_context = None
@@ -381,9 +412,35 @@ async def consume_sse_connection(
                 metrics.mark("reconnects")
                 await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
-            metrics.record_error(exc)
+            details: dict[str, Any] = {
+                "request_id": request_id,
+                "elapsed_ms": round((time.monotonic() - attempt_started) * 1000, 2),
+                "bytes_received": metrics.counters["bytes_received"]
+                - counters_before["bytes_received"],
+                "events": metrics.counters["events"] - counters_before["events"],
+                "keepalives": metrics.counters["keepalives"]
+                - counters_before["keepalives"],
+            }
+            if response is not None:
+                details["status"] = response.status_code
+                for header_name in ("cf-ray", "server", "x-request-id"):
+                    value = response.headers.get(header_name)
+                    if value:
+                        details[header_name.replace("-", "_")] = value[:200]
+            metrics.record_error(exc, details=details)
         except Exception as exc:  # pragma: no cover - defensive load-harness boundary
-            metrics.record_error(exc)
+            metrics.record_error(
+                exc,
+                details={
+                    "request_id": request_id,
+                    "elapsed_ms": round((time.monotonic() - attempt_started) * 1000, 2),
+                    "bytes_received": metrics.counters["bytes_received"]
+                    - counters_before["bytes_received"],
+                    "events": metrics.counters["events"] - counters_before["events"],
+                    "keepalives": metrics.counters["keepalives"]
+                    - counters_before["keepalives"],
+                },
+            )
         finally:
             if stream_context is not None:
                 with suppress(Exception):

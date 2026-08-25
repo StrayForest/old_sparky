@@ -1040,6 +1040,7 @@ class SystemSampler:
         self._previous_postgres_ticks: int | None = None
         self._previous_process_groups: dict[str, dict[str, Any]] | None = None
         self._previous_monotonic: float | None = None
+        self._api_port = int(get_settings().platform_api_port)
         self._celery_redis: Redis = from_url(
             get_settings().platform_celery_broker_url,
             decode_responses=True,
@@ -1156,8 +1157,14 @@ class SystemSampler:
                     "15m": float(load_columns[2]),
                 },
                 "nginx_connections": read_tcp_connection_counts(80),
-                "api_connections": read_tcp_connection_counts(8010),
+                "api_connections": read_tcp_connection_counts(self._api_port),
                 "postgres_connections": read_tcp_connection_counts(5432),
+                # Keep this beside the existing socket counters so a load run
+                # can distinguish Redis fan-out/limiter pressure from
+                # PostgreSQL pool pressure without issuing extra Redis commands
+                # per sample. The baseline owns one Pub/Sub client per stream;
+                # the relay candidate intentionally does not.
+                "redis_connections": read_tcp_connection_counts(6379),
                 "gunicorn": gunicorn_counts(processes),
                 "postgres_cpu_percent": round(postgres_cpu_percent, 2),
                 "processes": process_metrics,
@@ -1182,6 +1189,9 @@ class SystemSampler:
         ]
         postgres_connections = [
             int(sample["postgres_connections"]["established"]) for sample in samples
+        ]
+        redis_connections = [
+            int(sample["redis_connections"]["established"]) for sample in samples
         ]
         postgres_cpu = [
             float(sample["postgres_cpu_percent"]) for sample in samples[1:]
@@ -1278,6 +1288,10 @@ class SystemSampler:
             "postgres_established_connections": {
                 "avg": round(sum(postgres_connections) / len(postgres_connections), 2),
                 "max": max(postgres_connections),
+            },
+            "redis_established_connections": {
+                "avg": round(sum(redis_connections) / len(redis_connections), 2),
+                "max": max(redis_connections),
             },
             "gunicorn_workers": {
                 "min": min(worker_counts),
