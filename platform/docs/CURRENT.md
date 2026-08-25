@@ -205,9 +205,16 @@ the edge: 3,466/5,000 streams returned HTTP 200, 1,533 returned Cloudflare
 Connect latency was p50/p95/p99 38.0/93.0/143.1 seconds. VPS evidence again
 showed no sustained CPU, PostgreSQL connection/lock or backend-wait pressure.
 The exact cleanup removed 10,000 users and 20 tournaments and preserved the
-control account. The next candidate lowers application SSE admission to
-3,000 and makes the browser close failed EventSource connections and use
-revision polling during a cooldown.
+control account. Deployed candidate `1d0f56d5` lowered application SSE
+admission to 3,000 and makes the browser close failed EventSource connections
+and use revision polling during a cooldown. Its public 5k run produced
+3,000 HTTP 200 SSE plus 2,000 fast app 429s, zero Cloudflare 1200/503/errors
+and all 3,000 events; successful-stream connect p95 was still 61.8s.
+The public mixed 10k profile then exposed a separate revalidation burst:
+`pool_wait_ms` reached about 4.4s and workspace/SSE requests returned 500s.
+The next code candidate bounds private-stream revalidation to six checks per
+API worker, leaving DB pool capacity for ordinary API traffic while keeping
+the authorization check and fail-closed behavior unchanged.
 
 To reduce repeated CI/CD runs, AS-19 uses one origin-local control only to
 separate origin from Nginx/edge closes, then treats public Cloudflare runs as

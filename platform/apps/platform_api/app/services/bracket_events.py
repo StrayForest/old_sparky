@@ -25,11 +25,16 @@ logger = logging.getLogger(__name__)
 
 SSE_ACCESS_REVALIDATION_SECONDS = 30.0
 SSE_ACCESS_CHECK_COALESCE_SECONDS = 0.5
+# Keep a reserve of each API worker's DB pool for ordinary user requests. A
+# bracket event can wake thousands of private streams at once; allowing every
+# stream to revalidate concurrently turns that fan-out into a DB pool outage.
+SSE_ACCESS_REVALIDATION_CONCURRENCY = 6
 SSE_RELAY_QUEUE_MAXSIZE = 32
 
 _access_check_registry_lock = asyncio.Lock()
 _access_check_cache: dict[str, tuple[float, bool]] = {}
 _access_check_locks: dict[str, asyncio.Lock] = {}
+_access_check_concurrency = asyncio.Semaphore(SSE_ACCESS_REVALIDATION_CONCURRENCY)
 _relay_registry_lock = asyncio.Lock()
 _relays: dict[str, "_BracketEventRelay"] = {}
 _RELAY_CLOSED = object()
@@ -189,7 +194,8 @@ async def _coalesced_stream_access_check(tournament_id: str) -> bool:
                 and monotonic() - cached[0] < SSE_ACCESS_CHECK_COALESCE_SECONDS
             ):
                 return cached[1]
-        allowed = await current_tournament_stream_access_is_valid(tournament_id)
+        async with _access_check_concurrency:
+            allowed = await current_tournament_stream_access_is_valid(tournament_id)
         async with _access_check_registry_lock:
             _access_check_cache[key] = (monotonic(), allowed)
             if len(_access_check_cache) > 4096:

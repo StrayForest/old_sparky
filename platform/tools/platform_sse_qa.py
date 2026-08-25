@@ -701,7 +701,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 "combined_polling_requests_without_errors",
                 qa.report["polling"]["errors"] == 0,
                 qa.report["polling"],
-                fatal=False,
+                fatal=True,
             )
             qa.scenario(
                 "combined_sse_admission_cap_respected",
@@ -711,9 +711,10 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             qa.scenario(
                 "combined_sse_no_unexpected_errors",
                 sse_report["metrics"]["errors"] == 0
-                and sse_report["metrics"]["rejected_other"] == 0,
+                and sse_report["metrics"]["rejected_other"] == 0
+                and sse_report["metrics"]["rejected_503"] == 0,
                 sse_report["metrics"],
-                fatal=False,
+                fatal=True,
             )
             qa.scenario(
                 "combined_sse_event_delivery_complete",
@@ -722,7 +723,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     "events": sse_report["metrics"]["events"],
                     "expected_events": sse_report["expected_events"],
                 },
-                fatal=False,
+                fatal=True,
             )
 
         qa.report["duration_seconds"] = round(time.monotonic() - started, 4)

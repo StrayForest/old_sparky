@@ -229,6 +229,40 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         access_check.assert_awaited_once_with("same-tournament")
 
+    async def test_revalidation_concurrency_leaves_capacity_for_normal_api_requests(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        access_check = AsyncMock()
+
+        async def delayed_check(tournament_id: str) -> bool:
+            if tournament_id == "first-tournament":
+                started.set()
+                await release.wait()
+            return True
+
+        access_check.side_effect = delayed_check
+        with (
+            patch.object(bracket_events, "current_tournament_stream_access_is_valid", access_check),
+            patch.object(
+                bracket_events,
+                "_access_check_concurrency",
+                asyncio.Semaphore(1),
+            ),
+        ):
+            first = asyncio.create_task(
+                bracket_events._coalesced_stream_access_check("first-tournament")
+            )
+            await started.wait()
+            second = asyncio.create_task(
+                bracket_events._coalesced_stream_access_check("second-tournament")
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(access_check.await_count, 1)
+            release.set()
+            self.assertEqual(await asyncio.gather(first, second), [True, True])
+
+        self.assertEqual(access_check.await_count, 2)
+
     async def test_identical_streams_share_one_redis_subscription(self) -> None:
         pubsub = _FakePubSub([{"data": '{"revision":4}'}])
         client = _FakeRedisClient(pubsub)

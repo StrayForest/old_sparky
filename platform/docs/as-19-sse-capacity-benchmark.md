@@ -594,6 +594,6 @@ stores only the measured conclusion and run identifiers.
   validator accepts its loopback origin only for `mode=sse` when
   `request_origin` is still the canonical public origin. Public-origin runs
   remain the acceptance gate.
-- Public ramp A/B `open_concurrency=16` (`32888021777`) still failed through
-  Cloudflare: 3,466/5,000 HTTP 200, 1,533 Error 1200, one 502 and zero app
-  429s. Connect latency was p50/p95/p99 38.0/93.0/143.1 seconds; the VPS showed no sustained CPU/PG/lock/backend pressure, so the slower ramp did not solve the edge queue. Exact cleanup removed 10,000 users and 20 tournaments; next is application admission ceiling 3,000 plus browser polling fallback.
+- Public ramp A/B `open_concurrency=16` (`32888021777`) still failed through Cloudflare: 3,466/5,000 HTTP 200, 1,533 Error 1200, one 502 and zero app 429s; slower opening did not solve the edge queue.
+- Public candidate `1d0f56d5` produced 3,000 HTTP 200 SSE plus 2,000 fast app 429s for 5,000 attempts, zero Cloudflare 1200/503/errors and all 3,000 events; connect p95 remained 61.8s.
+- The interrupted public mixed 10k profile exposed a separate revalidation burst: API `pool_wait_ms` reached ~4.4s and workspace/SSE requests returned 500; next candidate bounds private-stream revalidation to six checks per API worker while preserving fail-closed authorization.
