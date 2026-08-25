@@ -120,9 +120,32 @@ by `32834698357`: 256/256, zero errors), while 512 failed (`32834773835`,
 cleaned by `32835036424`: 415/512, 97 Cloudflare 500s, max_active 348). The
 current reliable contour is 256. A 512/open128 backpressure A/B improved to
 468/512 with 44 Cloudflare 500s (`32835148133`, cleaned by `32835407140`), but
-still failed. The next implementation removes one duplicate SSE admission
-query by reusing the authorized tournament snapshot; the 10+5 ranking
-remains pending.
+still failed. Query reuse then improved the same contour to 486/512 with 26
+Cloudflare 500s, 41 client errors, `max_active=445` and connect p95 10.83s in
+`32837162933`; exact cleanup `32837600679` verified zero retained fixture
+data and preserved `aleksei.lisitsin1@gmail.com`. This is the best measured
+512/open128 contour, but it still fails the zero-unexpected-errors criterion;
+the 10+5 ranking and staircase remain pending.
+The first 5,000-SSE staircase (`32837747171`, exact cleanup `32838201646`)
+was substantially worse at `open_concurrency=512`: `200=1,856/5,000`,
+`500=3,143`, `errors=308`, `max_active=338`, zero events and connect p95
+221.6s. No 429/503 admission response occurred; failures were sampled as
+Cloudflare 500s. This confirms that the nominal Nginx/Redis ceilings are not
+the current capacity and that opening pressure/origin work must be reduced
+before 5k/10k targets are meaningful.
+At 512 connections, a more gradual `open_concurrency=64` contour
+(`32838425845`, cleanup `32838635589`) reached 512/512 HTTP 200 responses,
+max_active 504 and 234 events with p95 opening 11.72s, but recorded 8 client
+errors. It was near the boundary, not yet a strict pass; the subsequent
+open32 run established the higher strict contour described below.
+Reducing opening concurrency to 32 produced the first strict 512-SSE pass in
+`32838825035` (cleanup `32839036740`): 512/512 HTTP 200, zero errors, 284
+events and connect p95 12.30s, with no sustained CPU, PostgreSQL connection or
+lock saturation. The same open32 shape at 1,000 SSE (`32839100405`, cleanup
+`32839300689`) reached 990/1,000 with 17 errors and sustained `deadlock-api`
+CPU saturation, so the current strict staircase point is 512. A focused code
+A/B now removes only the duplicate pre-subscription authorization query while
+retaining first-event and periodic revalidation checks.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.

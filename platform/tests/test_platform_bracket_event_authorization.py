@@ -92,7 +92,7 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_emits_event_when_access_remains_current(self) -> None:
         pubsub = _FakePubSub([{"data": '{"revision":3}'}])
         client = _FakeRedisClient(pubsub)
-        access_check = AsyncMock(side_effect=(True, True))
+        access_check = AsyncMock(return_value=True)
 
         with (
             patch.object(bracket_events, "redis_client", MagicMock(return_value=client)),
@@ -103,7 +103,10 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(bracket_events.secrets, "randbelow", return_value=250),
         ):
-            stream = bracket_events.stream_bracket_events("tournament-3")
+            stream = bracket_events.stream_bracket_events(
+                "tournament-3",
+                admission_verified=True,
+            )
             self.assertEqual(
                 await anext(stream),
                 "retry: 5250\nevent: connected\ndata: {}\n\n",
@@ -114,7 +117,7 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             )
             await stream.aclose()
 
-        self.assertEqual(access_check.await_count, 2)
+        self.assertEqual(access_check.await_count, 1)
         self.assertEqual(pubsub.unsubscribed, ["platform:bracket:tournament-3"])
         self.assertTrue(pubsub.closed)
         self.assertTrue(client.closed)

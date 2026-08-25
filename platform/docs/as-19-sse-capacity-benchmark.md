@@ -214,8 +214,48 @@ stores only the measured conclusion and run identifiers.
   `200=468/512`, `500=44`, `errors=70`, `max_active=398`, events 89 and
   connect p95 11.66s, but still failed the no-unexpected-errors criterion.
   Lower opening concurrency helps, but does not make 512 reliable.
-- The next focused implementation reuses the full tournament snapshot loaded
-  by the stream authorization dependency for the endpoint's visibility check,
-  removing one duplicate SSE admission query while preserving the same
-  authorization and periodic revalidation semantics. It is not ranked until
-  its exact CI/deploy/load/cleanup cycle.
+- Query-reuse A/B on the deployed dedicated stream router reused the full
+  tournament snapshot loaded by the stream authorization dependency for the
+  endpoint visibility check. It preserved the same authorization and
+  periodic revalidation semantics and removed one duplicate admission query.
+  Load `32837162933`, after CI/deploy `32836308720` / `32836811526` /
+  `32836818533`, reached `200=486/512`, `500=26`, `errors=41`,
+  `max_active=445`, events 91 and connect p95 10.83s; no `429` or `503` was
+  observed, and sampled failures were Cloudflare `500 Internal Server Error`
+  responses. Exact cleanup `32837600679` verified 1,000 fixture users and 20
+  tournaments deleted, zero remaining fixture users/tournaments/sessions/audit
+  rows, and preservation of `aleksei.lisitsin1@gmail.com`. This is the best
+  measured 512/open128 contour so far, but it still fails the zero-unexpected-
+  errors criterion; the reliable contour remains 256.
+- H2 staircase (`5,000` SSE, `open_concurrency=512`, 60s hold) failed much
+  earlier than the nominal admission ceilings: load `32837747171` reached
+  `200=1,856/5,000`, `500=3,143`, `errors=308`, `max_active=338`, zero
+  delivered events and connect p95 221.6s. No `429` or `503` was returned;
+  sampled failures were Cloudflare `500 Internal Server Error` responses.
+  Exact cleanup `32838201646` deleted 5,000 fixture users and 20 tournaments
+  and verified zero remaining fixture users/tournaments/sessions/audit rows
+  while preserving the control account. This confirms that raising admission
+  limits alone cannot produce the 5k step; opening pressure must be reduced or
+  the origin request path must be made cheaper before higher targets are useful.
+- A 512-connection opening-backpressure contour with `open_concurrency=64`
+  (`32838425845`, exact cleanup `32838635589`) reached all `512/512` HTTP
+  200 responses, `max_active=504`, 234 events and connect p95 11.72s, with no
+  429/503 or non-200 response. It still recorded 8 client-side stream errors,
+  so it is near the boundary but not a strict pass. This is currently the
+  strongest 512 contour and supports opening backpressure as a useful
+  hypothesis; before testing open32, the reliable zero-error contour remained
+  256.
+- Reducing the opening burst to `open_concurrency=32` produced the first
+  strict pass at 512: load `32838825035`, exact cleanup `32839036740`,
+  `200=512/512`, `errors=0`, `max_active=512`, 284 events, no `429/503` and
+  connect p95 12.30s. Resource sampling showed no sustained CPU, PostgreSQL
+  connection or lock saturation; the remaining classification was the same
+  SSE DB-time hotspot. This is the current reliable 512 contour.
+- A 1,000-connection staircase at the same `open_concurrency=32` in load
+  `32839100405` (cleanup `32839300689`) reached `200=990/1,000`,
+  `errors=17`, `max_active=988` and 315 events, but failed the strict gate.
+  It showed sustained and peak `deadlock-api` CPU saturation without
+  PostgreSQL connection/lock saturation. The current strict staircase point
+  is therefore 512; the next code A/B removes only the duplicate
+  pre-subscription authorization query while retaining the first-event and
+  periodic revalidation checks.

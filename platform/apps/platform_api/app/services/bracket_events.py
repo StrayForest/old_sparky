@@ -44,8 +44,22 @@ async def publish_bracket_event(
         await client.aclose()
 
 
-async def stream_bracket_events(tournament_id: str) -> AsyncIterator[str]:
-    if not await current_tournament_stream_access_is_valid(tournament_id):
+async def stream_bracket_events(
+    tournament_id: str,
+    *,
+    admission_verified: bool = False,
+) -> AsyncIterator[str]:
+    """Stream bracket events after endpoint admission and on every checkpoint.
+
+    The HTTP endpoint has already completed the authoritative admission check
+    before creating the stream. Skipping that duplicate check avoids a second
+    database round trip before Redis subscription; the first event/keepalive
+    checkpoint and every later checkpoint still revalidate access.
+    """
+
+    if not admission_verified and not await current_tournament_stream_access_is_valid(
+        tournament_id
+    ):
         return
 
     client = redis_client()

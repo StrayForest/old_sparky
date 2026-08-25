@@ -3897,7 +3897,7 @@ async def get_tournament_bracket_events(
     )
 
     return StreamingResponse(
-        stream_bracket_events(tournament.id),
+        stream_bracket_events(tournament.id, admission_verified=True),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
