@@ -17,7 +17,10 @@ from python_packages.platform_infra.models import (
 from apps.platform_api.app.services.tournament_participant_capacity import (
     has_free_participant_slot,
 )
-from python_packages.platform_infra.security import get_optional_authenticated_session
+from python_packages.platform_infra.security import (
+    get_optional_authenticated_session,
+    get_optional_authenticated_session_for_stream,
+)
 
 
 ACTIVE_PARTICIPANT_STATUSES = ("registered", "confirmed", "checked_in")
@@ -310,7 +313,7 @@ async def _lock_participant_mutation(
 async def serialize_tournament_write_invariants(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session),
-    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+    db_session: AsyncSession = Depends(get_db_session),
 ) -> None:
     """Serialize lifecycle/invite mutations while joins claim independent slots.
 
@@ -351,3 +354,13 @@ async def serialize_tournament_write_invariants(
             mutation_kind=mutation_kind,
             db_session=db_session,
         )
+
+
+async def serialize_tournament_write_invariants_for_stream(
+    request: Request,
+    auth_session=Depends(get_optional_authenticated_session_for_stream),
+    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+) -> None:
+    """Keep the shared tournament dependency graph short-lived for SSE."""
+
+    await serialize_tournament_write_invariants(request, auth_session, db_session)

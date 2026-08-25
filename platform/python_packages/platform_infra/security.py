@@ -485,7 +485,7 @@ async def _touch_authenticated_session(
 
 async def get_authenticated_session(
     request: Request,
-    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+    db_session: AsyncSession = Depends(get_db_session),
 ) -> AuthenticatedSession:
     settings = get_settings()
     token = request.cookies.get(settings.platform_session_cookie_name)
@@ -530,7 +530,7 @@ async def get_authenticated_session(
 
 async def get_optional_authenticated_session(
     request: Request,
-    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+    db_session: AsyncSession = Depends(get_db_session),
 ) -> AuthenticatedSession | None:
     settings = get_settings()
     token = request.cookies.get(settings.platform_session_cookie_name)
@@ -597,3 +597,12 @@ async def get_optional_authenticated_session(
     await _touch_authenticated_session(auth_session)
     remember_authenticated_session(token_digest, auth_session)
     return auth_session
+
+
+async def get_optional_authenticated_session_for_stream(
+    request: Request,
+    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+) -> AuthenticatedSession | None:
+    """Resolve stream auth with a DB session scoped to the endpoint call."""
+
+    return await get_optional_authenticated_session(request, db_session)

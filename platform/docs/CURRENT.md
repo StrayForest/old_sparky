@@ -104,10 +104,13 @@ The first valid 1k run reached the application but failed with 500s while
 long-lived responses held request-scoped PostgreSQL connections; removing a
 duplicate QA-only session lookup was not sufficient. The next focused A/B
 explicitly closed the endpoint session and materially improved the result, but
-router/auth dependencies still retained request-scoped sessions. The current
-follow-up applies `scope="function"` across the complete SSE dependency graph,
-with revalidation kept in short-lived sessions. The 10+5 ranking remains
-pending.
+router/auth dependencies still retained request-scoped sessions. A first
+global `scope="function"` attempt was canceled at CI run `32829249835` after
+an ordinary invite-claim path showed an `idle in transaction` session and a
+transactionid lock wait. The corrected design keeps ordinary API dependencies
+request-scoped and isolates function-scoped auth/policy/serialization in a
+dedicated SSE router, with revalidation kept in short-lived sessions. The
+10+5 ranking remains pending.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.

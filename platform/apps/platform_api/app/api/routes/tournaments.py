@@ -237,6 +237,7 @@ from python_packages.platform_infra.models import (
 from python_packages.platform_infra.security import (
     get_authenticated_session,
     get_optional_authenticated_session,
+    get_optional_authenticated_session_for_stream,
 )
 from python_packages.platform_infra.tournament_names import (
     lock_tournament_name,
@@ -245,6 +246,7 @@ from python_packages.platform_infra.tournament_names import (
 from python_packages.platform_infra.slugs import unique_slug_from_name
 
 router = APIRouter()
+stream_router = APIRouter()
 
 INVITE_CODE_ALPHABET = string.ascii_uppercase + string.digits
 INACTIVE_PARTICIPANT_STATUSES = ("withdrawn", "disqualified")
@@ -3861,10 +3863,10 @@ async def get_tournament_bracket(
     )
 
 
-@router.get("/{slug}/bracket/events")
+@stream_router.get("/{slug}/bracket/events")
 async def get_tournament_bracket_events(
     slug: str,
-    auth_session=Depends(get_optional_authenticated_session),
+    auth_session=Depends(get_optional_authenticated_session_for_stream),
     db_session: AsyncSession = Depends(get_db_session, scope="function"),
 ) -> StreamingResponse:
     tournament = await get_tournament_or_404(db_session, slug)

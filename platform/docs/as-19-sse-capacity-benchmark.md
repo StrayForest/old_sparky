@@ -183,7 +183,14 @@ stores only the measured conclusion and run identifiers.
   `971ms` and PostgreSQL peaked at `94.6%` CPU. This materially improved the
   result but did not remove all failures, showing that router/auth dependencies
   still retained request-scoped sessions.
-- The next focused A/B applies FastAPI's documented `scope="function"` to the
-  complete SSE dependency graph (auth, tournament policies, serialization and
-  endpoint DB dependencies), while keeping short-lived DB sessions for stream
-  revalidation. It is not ranked until its own CI/deploy/load/cleanup cycle.
+- The first implementation of the next focused A/B applied
+  `scope="function"` globally to shared authentication and tournament
+  dependencies. Its CI run `32829249835` was canceled after the backend job
+  exceeded the historical runtime by roughly 5x; local `pg_stat_activity`
+  showed an ordinary invite-claim request holding an `idle in transaction`
+  session while another request waited on a transactionid lock. That variant
+  is rejected. The corrected implementation keeps ordinary API dependencies
+  request-scoped and puts the SSE route in a dedicated router with a
+  function-scoped auth/policy/serialization graph. Stream revalidation still
+  uses short-lived sessions. It is not ranked until its own CI/deploy/load/
+  cleanup cycle.

@@ -6,7 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.models import TournamentInvite, TournamentParticipant
-from python_packages.platform_infra.security import get_optional_authenticated_session
+from python_packages.platform_infra.security import (
+    get_optional_authenticated_session,
+    get_optional_authenticated_session_for_stream,
+)
 
 
 def _matched_route_path(request: Request) -> str:
@@ -63,7 +66,7 @@ async def _reject_disqualified_invite_claim(
 async def enforce_tournament_participant_policy(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session),
-    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+    db_session: AsyncSession = Depends(get_db_session),
 ) -> None:
     """Reject invite redemption for retained tournament disqualifications."""
 
@@ -75,3 +78,13 @@ async def enforce_tournament_participant_policy(
         user_id=auth_session.user.id,
         db_session=db_session,
     )
+
+
+async def enforce_tournament_participant_policy_for_stream(
+    request: Request,
+    auth_session=Depends(get_optional_authenticated_session_for_stream),
+    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+) -> None:
+    """Apply the participant policy without extending a DB session into SSE."""
+
+    await enforce_tournament_participant_policy(request, auth_session, db_session)

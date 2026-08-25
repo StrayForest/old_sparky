@@ -18,7 +18,10 @@ from python_packages.platform_infra.models import (
     UserRole,
     UserSession,
 )
-from python_packages.platform_infra.security import get_optional_authenticated_session
+from python_packages.platform_infra.security import (
+    get_optional_authenticated_session,
+    get_optional_authenticated_session_for_stream,
+)
 
 ACTIVE_PARTICIPANT_STATUSES = frozenset({"registered", "confirmed", "checked_in"})
 ADMIN_ROLE_SLUGS = ("admin", "superadmin")
@@ -211,7 +214,7 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
 async def ensure_private_tournament_read_membership_is_active(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session),
-    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+    db_session: AsyncSession = Depends(get_db_session),
 ) -> None:
     """Prevent retained participant rows from acting as private-read membership.
 
@@ -316,4 +319,18 @@ async def ensure_private_tournament_read_membership_is_active(
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Inactive tournament participants cannot access private tournament workspace data.",
+    )
+
+
+async def ensure_private_tournament_read_membership_is_active_for_stream(
+    request: Request,
+    auth_session=Depends(get_optional_authenticated_session_for_stream),
+    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+) -> None:
+    """Apply private-read authorization with endpoint-scoped DB access."""
+
+    await ensure_private_tournament_read_membership_is_active(
+        request,
+        auth_session,
+        db_session,
     )
