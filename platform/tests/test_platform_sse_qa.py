@@ -19,7 +19,8 @@ class PlatformSseQaTests(unittest.TestCase):
         for _ in range(4):
             metrics.mark("connection_attempts")
         for _ in range(2):
-            metrics.mark("connected")
+            metrics.connection_opened()
+        metrics.connection_closed()
         metrics.mark("rejected_429")
         metrics.mark("rejected_429")
         metrics.mark("events", 3)
@@ -30,6 +31,8 @@ class PlatformSseQaTests(unittest.TestCase):
 
         self.assertEqual(result["connection_attempts"], 4)
         self.assertEqual(result["connected"], 2)
+        self.assertEqual(result["max_active_connections"], 2)
+        self.assertEqual(result["active_connections"], 1)
         self.assertEqual(result["rejected_429"], 2)
         self.assertEqual(result["events"], 3)
         self.assertEqual(result["connected_percent"], 50.0)

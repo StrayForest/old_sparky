@@ -49,6 +49,19 @@ class SseMetrics:
     def mark(self, name: str, amount: int = 1) -> None:
         self.counters[name] += amount
 
+    def connection_opened(self) -> None:
+        self.mark("connected")
+        self.mark("active_connections")
+        self.counters["max_active_connections"] = max(
+            self.counters["max_active_connections"],
+            self.counters["active_connections"],
+        )
+
+    def connection_closed(self) -> None:
+        if self.counters["active_connections"] > 0:
+            self.mark("active_connections", -1)
+        self.mark("disconnects")
+
     def record_error(self, error: BaseException) -> None:
         self.mark("errors")
         if len(self.error_samples) < self.max_error_samples:
@@ -62,6 +75,8 @@ class SseMetrics:
         return {
             "connection_attempts": attempts,
             "connected": connected,
+            "max_active_connections": self.counters["max_active_connections"],
+            "active_connections": self.counters["active_connections"],
             "completed": self.counters["completed"],
             "reconnects": self.counters["reconnects"],
             "disconnects": self.counters["disconnects"],
@@ -265,6 +280,7 @@ async def consume_sse_connection(
         attempt_started = time.monotonic()
         stream_context = None
         response = None
+        connected_this_attempt = False
         try:
             stream_context = client.stream(
                 "GET",
@@ -284,7 +300,8 @@ async def consume_sse_connection(
                 stream_context = None
                 continue
 
-            metrics.mark("connected")
+            metrics.connection_opened()
+            connected_this_attempt = True
             metrics.connect_latencies.append((time.monotonic() - attempt_started) * 1000)
             cycle_deadline = min(deadline, time.monotonic() + per_cycle_hold)
             current_event = False
@@ -325,8 +342,8 @@ async def consume_sse_connection(
             if stream_context is not None:
                 with suppress(Exception):
                     await stream_context.__aexit__(None, None, None)
-            if response is not None and time.monotonic() < deadline:
-                metrics.mark("disconnects")
+            if connected_this_attempt:
+                metrics.connection_closed()
 
 
 async def run_connections(
@@ -457,7 +474,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             )
             qa.scenario(
                 "sse_admission_cap_respected",
-                metrics["connected"] <= SSE_GLOBAL_LIMIT,
+                metrics["max_active_connections"] <= SSE_GLOBAL_LIMIT,
                 metrics,
             )
             qa.scenario(
@@ -521,7 +538,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             )
             qa.scenario(
                 "combined_sse_admission_cap_respected",
-                sse_report["metrics"]["connected"] <= SSE_GLOBAL_LIMIT,
+                sse_report["metrics"]["max_active_connections"] <= SSE_GLOBAL_LIMIT,
                 sse_report["metrics"],
             )
             qa.scenario(
@@ -591,10 +608,11 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
         "planned_users": report.get("requested_users"),
         "tournament_ids": report.get("tournament_ids", []),
         "completed_tournaments": len(report.get("tournament_ids", [])),
-        "planned_tournaments": len(BROWSER_POLLING_TOURNAMENT_PLAN),
+        "planned_tournaments": sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN),
         "sse": {
             "target_connections": sse.get("target_connections"),
             "connected": metrics.get("connected"),
+            "max_active_connections": metrics.get("max_active_connections"),
             "rejected_429": metrics.get("rejected_429"),
             "rejected_503": metrics.get("rejected_503"),
             "errors": metrics.get("errors"),
