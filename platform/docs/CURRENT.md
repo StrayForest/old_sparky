@@ -156,9 +156,14 @@ saturation (`32841823646`, cleanup `32842030758`), but did not meet the strict
 gate. Reducing opening concurrency further to 16 returned sustained API CPU
 and produced 13 errors (`32842094082`, cleanup `32842288384`). The current
 strict contour is 512 with open32/open64; 1000 persistent SSE remains
-unproven. The next A/B removes a duplicate participant lookup already
-represented by the stream access context; authorization and revocation
-semantics remain unchanged.
+unproven. The participant-snapshot A/B is now deployed in `7105dde8` and
+retained the same authorization and revocation semantics. Its 1000/open32
+run (`32843777739`, cleanup `32844061492`) reached 989/1000 HTTP 200 streams,
+with 11 client errors and connect p95 18.68s; all error samples were load
+generator `Errno 24: Too many open files`/connection-attempt failures, with no
+HTTP 429/500/503. This run is therefore invalid for declaring an origin
+capacity result. The next runner A/B raises the SSE child-process `nofile`
+limit and records it in the report before repeating the same shape.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.

@@ -280,5 +280,17 @@ stores only the measured conclusion and run identifiers.
   participant status into its access context; the endpoint can derive the
   visibility flag from that context and avoid a second read. This does not
   change session validity, role checks, private-event revalidation or the
-  fallback path when the context is unavailable. Its production result is
-  pending.
+  fallback path when the context is unavailable. It was deployed in
+  `7105dde8` and measured at 1000/open32 in load `32843777739`, with exact
+  cleanup `32844061492`: `989/1,000` HTTP 200 streams, `errors=11`,
+  `max_active=989`, 452 events and connect p95 18.68s. Crucially, every
+  sampled error was client-side `ConnectError: [Errno 24] Too many open
+  files` or `All connection attempts failed`; there were no HTTP error
+  responses and no 429/503 admission response. The run therefore does not
+  measure an origin failure and cannot establish 1000 capacity.
+- The next A/B fixes this measurement confounder in the retained-load runner:
+  the SSE child process raises its soft `RLIMIT_NOFILE` to 32768 when the hard
+  limit permits it, logs the effective soft/hard values and includes them in
+  the report. This changes only the load generator process, not Nginx,
+  PostgreSQL or the API service. The 1000/open32 shape must be repeated after
+  that fix before selecting an application optimization winner.

@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import resource
 import sys
 import time
 from typing import Any
@@ -40,6 +41,14 @@ from tools.platform_production_qa import (
 DEFAULT_REPORT_PATH = Path("/tmp/platform-sse-qa-report.json")
 DEFAULT_ORIGIN = "http://127.0.0.1"
 SSE_EVENT_TYPE = "qa_sse_probe"
+
+
+def load_generator_resource_limits() -> dict[str, int]:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    return {
+        "nofile_soft": int(soft),
+        "nofile_hard": int(hard),
+    }
 
 
 class SseMetrics:
@@ -449,6 +458,7 @@ async def run_connections(
         "probe_event_count": event_count,
         "probe_event_interval_seconds": event_interval,
         "application_global_admission_limit": SSE_GLOBAL_LIMIT,
+        "load_generator_resources": load_generator_resource_limits(),
         "metrics": metrics.summary(),
     }
 

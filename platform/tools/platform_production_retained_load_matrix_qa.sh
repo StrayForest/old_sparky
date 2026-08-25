@@ -283,6 +283,23 @@ Path(summary_path).write_text(
 )
 PY
 else
+  # A persistent SSE probe needs one client-side descriptor per live stream
+  # plus setup/API/Redis descriptors.  The default shell soft limit on some
+  # production images is 1024, which makes a 1k probe fail inside the load
+  # generator with Errno 24 before the origin has a chance to respond.
+  # Raise only the QA child-process limit and never change the server units.
+  nofile_soft="$(ulimit -Sn)"
+  nofile_hard="$(ulimit -Hn)"
+  if [[ "$nofile_soft" =~ ^[0-9]+$ ]]; then
+    nofile_target=32768
+    if [[ "$nofile_hard" =~ ^[0-9]+$ ]] && (( nofile_hard < nofile_target )); then
+      nofile_target="$nofile_hard"
+    fi
+    if (( nofile_soft < nofile_target )); then
+      ulimit -n "$nofile_target"
+    fi
+  fi
+  echo "SSE load-generator nofile soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
   sse_root="$run_root/$profile"
   install -d -o root -g root -m 0700 "$sse_root"
   sse_report="$sse_root/$profile.json"
