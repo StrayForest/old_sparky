@@ -128,10 +128,10 @@ def load_matrix_manifest(
     if control_email != expected_control_email.strip().lower():
         raise ValueError("matrix control email does not match the cleanup input")
     mode = str(payload.get("mode") or "scale")
-    if mode not in {"scale", "browser-polling"}:
+    if mode not in {"scale", "browser-polling", "sse", "combined"}:
         raise ValueError("matrix mode is not supported")
-    if mode == "browser-polling" and len(rows) != 1:
-        raise ValueError("browser-polling manifest must contain exactly one row")
+    if mode in {"browser-polling", "sse", "combined"} and len(rows) != 1:
+        raise ValueError(f"{mode} manifest must contain exactly one row")
 
     markers: set[str] = set()
     user_ids: set[str] = set()
@@ -170,8 +170,8 @@ def load_matrix_manifest(
         )
         if mode == "scale" and len(row_tournaments) > 1:
             raise ValueError("a matrix row may own at most one tournament")
-        if mode == "browser-polling" and not 0 <= len(row_tournaments) <= MAX_MATRIX_ROWS:
-            raise ValueError("browser-polling manifest has an invalid tournament count")
+        if mode in {"browser-polling", "sse", "combined"} and not 0 <= len(row_tournaments) <= MAX_MATRIX_ROWS:
+            raise ValueError(f"{mode} manifest has an invalid tournament count")
         if int(row.get("synthetic_users", len(row_users))) != len(row_users):
             raise ValueError("matrix synthetic user count does not match its report")
         if markers.intersection({marker}) or user_ids.intersection(row_users) or tournament_ids.intersection(row_tournaments):
@@ -261,7 +261,7 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     control_email = str(manifest["control_email"])
     async with session_factory()() as db_session:
         recovered_tournament_ids: dict[str, set[str]] = {}
-        if manifest["mode"] == "browser-polling":
+        if manifest["mode"] in {"browser-polling", "sse", "combined"}:
             for row in manifest["rows"]:
                 marker_prefix = f"Browser polling profile {row['marker']} "
                 candidates = list(

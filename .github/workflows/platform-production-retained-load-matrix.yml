@@ -18,13 +18,60 @@ on:
         default: "80"
         type: string
       profile:
-        description: "Load profile; browser-polling is the final 10,000 virtual-user gate"
+        description: "Load profile; SSE profiles measure admission/fan-out and combined polling"
         required: true
         default: "matrix"
         type: choice
         options:
           - matrix
           - browser-polling
+          - sse
+          - combined
+      sse_connections:
+        description: "SSE connection attempts (1-10000; current app admission is 128)"
+        required: true
+        default: "128"
+        type: string
+      sse_duration:
+        description: "SSE hold duration in seconds (1-600)"
+        required: true
+        default: "60"
+        type: string
+      sse_open_concurrency:
+        description: "Concurrent SSE opens (1-10000)"
+        required: true
+        default: "256"
+        type: string
+      sse_reconnect_cycles:
+        description: "Forced reconnect cycles per SSE client (0-10)"
+        required: true
+        default: "0"
+        type: string
+      sse_users_per_tournament:
+        description: "Synthetic users per tournament: 50/250/500 for 1k/5k/10k"
+        required: true
+        default: "500"
+        type: string
+      sse_event_count:
+        description: "Synthetic Redis fan-out probe events (0-100)"
+        required: true
+        default: "3"
+        type: string
+      sse_event_interval:
+        description: "Seconds between fan-out probe events (0-60)"
+        required: true
+        default: "1"
+        type: string
+      combined_polling_duration:
+        description: "Combined polling window in seconds (1-300)"
+        required: true
+        default: "30"
+        type: string
+      combined_polling_open_stagger:
+        description: "Combined polling opening stagger in seconds (0-600)"
+        required: true
+        default: "300"
+        type: string
 
 permissions:
   contents: read
@@ -47,6 +94,15 @@ jobs:
       CONTROL_EMAIL: ${{ inputs.control_email }}
       QA_CONCURRENCY: ${{ inputs.concurrency }}
       QA_PROFILE: ${{ inputs.profile }}
+      QA_SSE_CONNECTIONS: ${{ inputs.sse_connections }}
+      QA_SSE_DURATION: ${{ inputs.sse_duration }}
+      QA_SSE_OPEN_CONCURRENCY: ${{ inputs.sse_open_concurrency }}
+      QA_SSE_RECONNECT_CYCLES: ${{ inputs.sse_reconnect_cycles }}
+      QA_SSE_USERS_PER_TOURNAMENT: ${{ inputs.sse_users_per_tournament }}
+      QA_SSE_EVENT_COUNT: ${{ inputs.sse_event_count }}
+      QA_SSE_EVENT_INTERVAL: ${{ inputs.sse_event_interval }}
+      QA_COMBINED_POLLING_DURATION: ${{ inputs.combined_polling_duration }}
+      QA_COMBINED_POLLING_OPEN_STAGGER: ${{ inputs.combined_polling_open_stagger }}
       TARGET_SHA: ${{ github.sha }}
 
     steps:
@@ -58,20 +114,63 @@ jobs:
             || { echo "Production retained load must run from the reviewed dev branch." >&2; exit 1; }
           test "$QA_CONFIRMATION" = "RUN-PRODUCTION-RETAINED-LOAD-MATRIX" \
             || { echo "Refusing production load without exact confirmation." >&2; exit 1; }
-          test "$QA_PROFILE" = "matrix" || test "$QA_PROFILE" = "browser-polling" \
+          test "$QA_PROFILE" = "matrix" || test "$QA_PROFILE" = "browser-polling" || \
+            test "$QA_PROFILE" = "sse" || test "$QA_PROFILE" = "combined" \
             || { echo "Unsupported production load profile" >&2; exit 1; }
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
-          /usr/bin/python3 - "$CONTROL_EMAIL" "$QA_CONCURRENCY" <<'PY'
+          /usr/bin/python3 - \
+            "$CONTROL_EMAIL" "$QA_CONCURRENCY" "$QA_PROFILE" \
+            "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" \
+            "$QA_SSE_RECONNECT_CYCLES" "$QA_SSE_USERS_PER_TOURNAMENT" \
+            "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
+            "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" <<'PY'
           import re
           import sys
 
-          email, concurrency = sys.argv[1:]
+          (
+              email,
+              concurrency,
+              profile,
+              sse_connections,
+              sse_duration,
+              sse_open_concurrency,
+              sse_reconnect_cycles,
+              sse_users_per_tournament,
+              sse_event_count,
+              sse_event_interval,
+              combined_polling_duration,
+              combined_polling_open_stagger,
+          ) = sys.argv[1:]
           if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email):
               raise SystemExit("control_email is invalid")
           if not re.fullmatch(r"[1-9][0-9]{0,2}", concurrency) or not 1 <= int(concurrency) <= 256:
               raise SystemExit("concurrency must be an integer from 1 to 256")
+          if profile in {"sse", "combined"}:
+              integer_ranges = {
+                  "sse_connections": (sse_connections, 1, 10000),
+                  "sse_open_concurrency": (sse_open_concurrency, 1, 10000),
+                  "sse_reconnect_cycles": (sse_reconnect_cycles, 0, 10),
+                  "sse_users_per_tournament": (sse_users_per_tournament, 10, 500),
+                  "sse_event_count": (sse_event_count, 0, 100),
+              }
+              for name, (value, lower, upper) in integer_ranges.items():
+                  if not re.fullmatch(r"[0-9]+", value) or not lower <= int(value) <= upper:
+                      raise SystemExit(f"{name} must be between {lower} and {upper}")
+              decimal_ranges = {
+                  "sse_duration": (sse_duration, 1, 600),
+                  "sse_event_interval": (sse_event_interval, 0, 60),
+                  "combined_polling_duration": (combined_polling_duration, 1, 300),
+                  "combined_polling_open_stagger": (combined_polling_open_stagger, 0, 600),
+              }
+              for name, (value, lower, upper) in decimal_ranges.items():
+                  try:
+                      parsed = float(value)
+                  except ValueError:
+                      raise SystemExit(f"{name} must be numeric") from None
+                  if not lower <= parsed <= upper:
+                      raise SystemExit(f"{name} must be between {lower} and {upper}")
           PY
 
       - name: Configure production SSH
@@ -120,6 +219,9 @@ jobs:
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$CONTROL_EMAIL" "$QA_CONCURRENCY" "$GITHUB_RUN_ID" "$QA_PROFILE" \
+              "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" "$QA_SSE_RECONNECT_CYCLES" \
+              "$QA_SSE_USERS_PER_TOURNAMENT" "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
+              "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" \
             > "$ssh_output_file" 2>&1 <<'REMOTE'
           set -Eeuo pipefail
           confirmation="$1"
@@ -128,8 +230,9 @@ jobs:
           concurrency="$4"
           run_id="$5"
           profile="$6"
+          shift 6
           sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_matrix_qa.sh \
-            "$confirmation" "$target_sha" "$control_email" "$concurrency" "$run_id" "$profile"
+            "$confirmation" "$target_sha" "$control_email" "$concurrency" "$run_id" "$profile" "$@"
           REMOTE
           remote_status=$?
           set -e
@@ -199,6 +302,10 @@ jobs:
           print(f"- Worst HTTP p99: {performance.get('worst_http_p99_ms')} ms")
           if polling:
               print(f"- Polling tabs: {polling.get('tabs_planned')}; executed: {polling.get('executed')}; 304/not-modified: {polling.get('not_modified')}; deduped: {polling.get('deduped')}")
+          sse = payload.get("sse") or {}
+          if sse:
+              connect_latency = sse.get("connect_latency_ms") or {}
+              print(f"- SSE connections: {sse.get('connected')}/{sse.get('target_connections')}; 429 admissions: {sse.get('rejected_429')}; events: {sse.get('events')}; connect p95: {connect_latency.get('p95')} ms")
           print()
           print("#### Bottleneck classes")
           for row in performance.get("bottleneck_classes") or []:

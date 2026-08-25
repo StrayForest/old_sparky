@@ -28,8 +28,8 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# != 5 && $# != 6 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling]" >&2
+if (( $# < 5 || $# > 15 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger]" >&2
   exit 2
 fi
 
@@ -42,8 +42,55 @@ profile="${6:-matrix}"
 
 case "$profile" in
   matrix|browser-polling) ;;
+  sse|combined)
+    sse_connections="${7:-128}"
+    sse_duration="${8:-60}"
+    sse_open_concurrency="${9:-256}"
+    sse_reconnect_cycles="${10:-0}"
+    sse_users_per_tournament="${11:-500}"
+    sse_event_count="${12:-3}"
+    sse_event_interval="${13:-1}"
+    combined_polling_duration="${14:-30}"
+    combined_polling_open_stagger="${15:-300}"
+    [[ "$sse_connections" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_connections <= 10000 )) || {
+      echo "SSE connections must be an integer from 1 to 10000." >&2
+      exit 1
+    }
+    [[ "$sse_duration" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_duration >= 1 && $sse_duration <= 600)}") == 1 )) || {
+      echo "SSE duration must be between 1 and 600 seconds." >&2
+      exit 1
+    }
+    [[ "$sse_open_concurrency" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_open_concurrency <= 10000 )) || {
+      echo "SSE open concurrency must be an integer from 1 to 10000." >&2
+      exit 1
+    }
+    [[ "$sse_reconnect_cycles" =~ ^[0-9]{1,2}$ ]] && (( sse_reconnect_cycles <= 10 )) || {
+      echo "SSE reconnect cycles must be an integer from 0 to 10." >&2
+      exit 1
+    }
+    [[ "$sse_users_per_tournament" =~ ^[1-9][0-9]{0,2}$ ]] && (( sse_users_per_tournament >= 10 && sse_users_per_tournament <= 500 )) || {
+      echo "SSE users per tournament must be between 10 and 500." >&2
+      exit 1
+    }
+    [[ "$sse_event_count" =~ ^[0-9]{1,3}$ ]] && (( sse_event_count <= 100 )) || {
+      echo "SSE event count must be an integer from 0 to 100." >&2
+      exit 1
+    }
+    [[ "$sse_event_interval" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_event_interval >= 0 && $sse_event_interval <= 60)}") == 1 )) || {
+      echo "SSE event interval must be between 0 and 60 seconds." >&2
+      exit 1
+    }
+    [[ "$combined_polling_duration" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($combined_polling_duration >= 1 && $combined_polling_duration <= 300)}") == 1 )) || {
+      echo "Combined polling duration must be between 1 and 300 seconds." >&2
+      exit 1
+    }
+    [[ "$combined_polling_open_stagger" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($combined_polling_open_stagger >= 0 && $combined_polling_open_stagger <= 600)}") == 1 )) || {
+      echo "Combined polling open stagger must be between 0 and 600 seconds." >&2
+      exit 1
+    }
+    ;;
   *)
-    echo "Profile must be matrix or browser-polling." >&2
+    echo "Profile must be matrix, browser-polling, sse or combined." >&2
     exit 1
     ;;
 esac
@@ -146,7 +193,7 @@ if [[ "$profile" == "matrix" ]]; then
   if [[ "$tee_status" != "0" ]]; then
     qa_status=1
   fi
-else
+elif [[ "$profile" == "browser-polling" ]]; then
   browser_root="$run_root/browser-polling"
   install -d -o root -g root -m 0700 "$browser_root"
   browser_report="$browser_root/browser-polling.json"
@@ -235,6 +282,42 @@ Path(summary_path).write_text(
     encoding="utf-8",
 )
 PY
+else
+  sse_root="$run_root/$profile"
+  install -d -o root -g root -m 0700 "$sse_root"
+  sse_report="$sse_root/$profile.json"
+  sse_summary="$sse_root/matrix-summary.json"
+  set +e
+  timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
+  "$QA_PYTHON" "$TOOLS_DIR/platform_sse_qa.py" \
+    --env-file "$RUNTIME_ROOT/shared/.env.platform" \
+    --origin "$EXPECTED_ORIGIN" \
+    --mode "$profile" \
+    --control-email "$control_email" \
+    --target-sha "$target_sha" \
+    --github-run-id "$run_id" \
+    --users-per-tournament "$sse_users_per_tournament" \
+    --sse-connections "$sse_connections" \
+    --sse-duration "$sse_duration" \
+    --sse-open-concurrency "$sse_open_concurrency" \
+    --sse-reconnect-cycles "$sse_reconnect_cycles" \
+    --sse-event-count "$sse_event_count" \
+    --sse-event-interval "$sse_event_interval" \
+    --combined-polling-duration "$combined_polling_duration" \
+    --combined-polling-open-stagger "$combined_polling_open_stagger" \
+    --concurrency "$concurrency" \
+    --http-max-connections 40 \
+    --report-path "$sse_report" \
+    --summary-path "$sse_summary" \
+    --keep-data \
+    2>&1 | tee "$log_path"
+  pipeline_status=("${PIPESTATUS[@]}")
+  qa_status="${pipeline_status[0]}"
+  tee_status="${pipeline_status[1]}"
+  set -e
+  if [[ "$tee_status" != "0" ]]; then
+    qa_status=1
+  fi
 fi
 
 shopt -s nullglob

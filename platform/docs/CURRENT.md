@@ -87,6 +87,14 @@ follow-up variants around the winning configuration; that matrix is complete.
 The winner was selected by zero errors/cleanup first, then latency, CPU and
 pool wait, not by raw throughput alone.
 
+AS-19 — SSE capacity and combined-load measurement is in progress. The
+reviewed runner adds separate SSE-only and polling+SSE profiles to the existing
+production retained-load workflow, with exact cleanup/recovery/abort support.
+The protocol and acceptance rules are maintained in
+[`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md). No
+10,000-persistent-SSE claim is made until the 1k/5k/10k staircase and combined
+run are measured through CI/CD.
+
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.
 The audit remediation is tracked in [`test-suite-governance.md`](test-suite-governance.md):

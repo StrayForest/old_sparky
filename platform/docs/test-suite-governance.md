@@ -38,9 +38,10 @@ The retained matrix's 10,000 users are persisted scale-fixture accounts, not
 10,000 simultaneous request workers. The `browser-polling` profile is the
 concurrent virtual-user gate; use 20 tournaments × 500 users, the default
 active/passive browser mix, HTTP40, a 300-second opening stagger and a
-30-second polling window when that profile is the target. It does not represent 10,000 persistent SSE
-connections or continuous 10-second polling by every tab, which remain beyond
-the measured two-core capacity contour.
+30-second polling window when that profile is the target. The separate `sse`
+and `combined` profiles measure SSE admission, fan-out and interaction with
+polling; they do not turn a rejected 10,000-stream target into a supported
+capacity claim.
 
 The production retained-load group is a deliberate exception to the normal
 release gate: it is never scheduled, never part of ordinary CI, and never runs
@@ -139,12 +140,18 @@ gh workflow run platform-production-retained-load-matrix.yml \
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The same workflow has `profile=browser-polling`. That explicit final gate uses
+The same workflow has `profile=browser-polling`, `profile=sse` and
+`profile=combined`. The browser profile uses
 20 tournaments × 500 users, 10,000 virtual tabs with the default active/passive
 browser mix opened over a 300-second ramp, a 30-second polling window, HTTP40
 and conditional revision reads with the same exact-marker cleanup path. Run it only after the ordinary
 retained matrix and use its own workflow run ID for cleanup; it does not mean
 10,000 persistent SSE connections.
+
+The SSE staircase uses 1,000, 5,000 and 10,000 connection attempts with
+50/250/500 users per tournament. The combined profile runs the selected polling
+mix and SSE targets concurrently. Both profiles remain manual,
+workflow-dispatch-only production measurements with exact cleanup.
 
 The detailed reports remain on the VPS under
 `/opt/oldsparky/platform/shared/production-retained-matrix/gha-<load-run-id>/`

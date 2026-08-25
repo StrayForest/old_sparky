@@ -295,6 +295,14 @@ bounded polling test, not a request to raise the 10,000-user SSE ceiling.
 Clean the exact browser load run with the same cleanup workflow before starting
 another production load.
 
+The same workflow also exposes `profile=sse` and `profile=combined`. The SSE
+staircase uses 1,000, 5,000 and 10,000 connection attempts with 50/250/500
+users per tournament. Above the application global limit, connected streams at
+or below the cap plus explicit `429` admissions are expected; `503`, other
+unexpected responses, client errors or resource saturation are not. The
+combined profile runs the selected polling mix and SSE target together. Follow
+the ordered protocol in [`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md).
+
 The measured pool baseline is a reviewed runtime configuration, not a load-test
 CLI override. During the planned production configuration window, apply only
 the three changed connection keys to the root-only canonical env and let the renderer
@@ -318,7 +326,7 @@ Cancellation is a two-step operator action. Canceling the GitHub job stops the
 runner-side SSH client, but a detached remote process may continue until its
 server-side 180-minute ceiling. For an immediate, exact stop use the reviewed
 abort workflow with the canceled load workflow ID; it matches only that
-browser-polling supervisor's process tree, checks the current release SHA and
+retained-load supervisor's process tree, checks the current release SHA and
 verifies that the shared load lock is free:
 
 ```bash
@@ -330,7 +338,7 @@ gh run watch <abort-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
 If the canceled run has no final report, the exact cleanup supervisor rebuilds
-its browser report and one-row summary from the matching durable
+its retained report and one-row summary from the matching durable
 `PreprodTestRun.report`. It still performs every marker, email, tournament
 ownership and graph-boundary check before deleting anything. A recovered run
 is never considered a passed load measurement.

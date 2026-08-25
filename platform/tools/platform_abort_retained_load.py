@@ -48,7 +48,7 @@ def exact_roots(run_id: str) -> set[int]:
     roots: set[int] = set()
     for pid in all_process_ids():
         args = cmdline(pid)
-        if SCRIPT_PATH in args and run_id in args and "browser-polling" in args:
+        if SCRIPT_PATH in args and run_id in args:
             roots.add(pid)
     return roots
 
@@ -132,7 +132,7 @@ def main() -> int:
 
     roots = exact_roots(args.load_run_id)
     if not roots:
-        print(f"No exact browser-polling supervisor found for load run {args.load_run_id}.")
+        print(f"No exact retained-load supervisor found for load run {args.load_run_id}.")
         return 0
     tree = process_tree(roots)
     print(f"Exact supervisor roots: {sorted(roots)}")

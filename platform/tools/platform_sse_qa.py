@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+"""Measure retained SSE connection admission, fan-out and reconnect behavior."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+from collections import Counter
+from contextlib import suppress
+from datetime import UTC, datetime
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+import httpx
+from redis.asyncio import Redis, from_url
+
+PLATFORM_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PLATFORM_ROOT))
+
+from apps.platform_api.app.services.bracket_events import bracket_channel
+from python_packages.platform_infra.config import get_settings
+from python_packages.platform_infra.db import dispose_engine
+from python_packages.platform_infra.sse_connection_limit import SSE_GLOBAL_LIMIT
+from tools.platform_production_qa import (
+    BROWSER_POLLING_TOURNAMENT_PLAN,
+    BROWSER_POLLING_SETUP_CONCURRENCY,
+    ProductionQa,
+    load_env_file,
+    percentile,
+)
+
+DEFAULT_REPORT_PATH = Path("/tmp/platform-sse-qa-report.json")
+DEFAULT_ORIGIN = "http://127.0.0.1"
+SSE_EVENT_TYPE = "qa_sse_probe"
+
+
+class SseMetrics:
+    def __init__(self) -> None:
+        self.counters: Counter[str] = Counter()
+        self.connect_latencies: list[float] = []
+        self.event_latencies: list[float] = []
+        self.error_samples: list[dict[str, str]] = []
+        self.max_error_samples = 25
+
+    def mark(self, name: str, amount: int = 1) -> None:
+        self.counters[name] += amount
+
+    def record_error(self, error: BaseException) -> None:
+        self.mark("errors")
+        if len(self.error_samples) < self.max_error_samples:
+            self.error_samples.append(
+                {"type": type(error).__name__, "message": str(error)[:300]}
+            )
+
+    def summary(self) -> dict[str, Any]:
+        attempts = self.counters["connection_attempts"]
+        connected = self.counters["connected"]
+        return {
+            "connection_attempts": attempts,
+            "connected": connected,
+            "completed": self.counters["completed"],
+            "reconnects": self.counters["reconnects"],
+            "disconnects": self.counters["disconnects"],
+            "rejected_429": self.counters["rejected_429"],
+            "rejected_503": self.counters["rejected_503"],
+            "rejected_other": self.counters["rejected_other"],
+            "errors": self.counters["errors"],
+            "keepalives": self.counters["keepalives"],
+            "events": self.counters["events"],
+            "bytes_received": self.counters["bytes_received"],
+            "connected_percent": round(connected / attempts * 100, 3) if attempts else 0.0,
+            "connect_latency_ms": {
+                "count": len(self.connect_latencies),
+                "p50": percentile(self.connect_latencies, 50),
+                "p95": percentile(self.connect_latencies, 95),
+                "p99": percentile(self.connect_latencies, 99),
+            },
+            "event_delivery_latency_ms": {
+                "count": len(self.event_latencies),
+                "p50": percentile(self.event_latencies, 50),
+                "p95": percentile(self.event_latencies, 95),
+                "p99": percentile(self.event_latencies, 99),
+            },
+            "error_samples": list(self.error_samples),
+        }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run retained SSE-only or polling+SSE production QA."
+    )
+    parser.add_argument("--origin", default=DEFAULT_ORIGIN)
+    parser.add_argument("--env-file", type=Path, default=None)
+    parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
+    parser.add_argument("--summary-path", type=Path, default=None)
+    parser.add_argument("--control-email", required=True)
+    parser.add_argument("--target-sha", default=None)
+    parser.add_argument("--github-run-id", type=int, default=None)
+    parser.add_argument("--mode", choices=("sse", "combined"), required=True)
+    parser.add_argument("--users-per-tournament", type=int, default=500)
+    parser.add_argument("--sse-connections", type=int, default=128)
+    parser.add_argument("--sse-duration", type=float, default=60.0)
+    parser.add_argument("--sse-open-concurrency", type=int, default=256)
+    parser.add_argument("--sse-reconnect-cycles", type=int, default=0)
+    parser.add_argument("--sse-event-count", type=int, default=3)
+    parser.add_argument("--sse-event-interval", type=float, default=1.0)
+    parser.add_argument("--combined-polling-duration", type=float, default=30.0)
+    parser.add_argument("--combined-polling-open-stagger", type=float, default=300.0)
+    parser.add_argument("--concurrency", type=int, default=20)
+    parser.add_argument("--http-max-connections", type=int, default=40)
+    parser.add_argument("--http-timeout", type=float, default=180.0)
+    parser.add_argument("--system-sample-interval", type=float, default=1.0)
+    parser.add_argument("--keep-data", action="store_true")
+    return parser.parse_args()
+
+
+async def prepare_fixture(
+    qa: ProductionQa,
+    api_client: httpx.AsyncClient,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[list[dict[str, Any]]]]:
+    with qa.phase("sse_seed_users"):
+        users = await qa.bulk_register_scale_users()
+    qa.scenario(
+        "sse_users_created",
+        len(users) == qa.scale_users,
+        {"users": len(users), "requested": qa.scale_users},
+    )
+
+    tournament_count = sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN)
+    chunk_size = qa.browser_polling_users_per_tournament
+    user_chunks = [
+        users[index * chunk_size : (index + 1) * chunk_size]
+        for index in range(tournament_count)
+    ]
+    organizers = [chunk[0] for chunk in user_chunks if chunk]
+    admins = [chunk[1] for chunk in user_chunks if len(chunk) > 1]
+    await qa.grant_browser_polling_permissions(organizers, admins)
+
+    tournament_categories = [
+        category
+        for category, count in BROWSER_POLLING_TOURNAMENT_PLAN
+        for _ in range(count)
+    ]
+    tournaments: list[dict[str, Any]] = []
+    with qa.phase("sse_tournament_setup"):
+        for index, (category, chunk) in enumerate(
+            zip(tournament_categories, user_chunks),
+            start=1,
+        ):
+            tournaments.append(
+                await qa.create_browser_polling_tournament(
+                    api_client,
+                    organizer=chunk[0],
+                    category=category,
+                    index=index,
+                )
+            )
+        await qa.record_preprod_run(tournaments_created=len(tournaments))
+    qa.scenario(
+        "sse_tournaments_created",
+        len(tournaments) == tournament_count,
+        {"tournaments": len(tournaments), "plan": dict(BROWSER_POLLING_TOURNAMENT_PLAN)},
+    )
+
+    active_participants = 0
+    with qa.phase("sse_tournament_state_setup"):
+        setup_gate = asyncio.Semaphore(BROWSER_POLLING_SETUP_CONCURRENCY)
+        request_gate = asyncio.Semaphore(qa.concurrency)
+
+        async def setup_one(
+            tournament: dict[str, Any],
+            chunk: list[dict[str, Any]],
+        ) -> None:
+            organizer_count = max(1, round(len(chunk) * 0.05))
+            participant_count = qa.browser_polling_state_participant_count(chunk)
+            participants = chunk[organizer_count : organizer_count + participant_count]
+            async with setup_gate:
+                await qa.setup_browser_polling_tournament_state(
+                    api_client,
+                    tournament=tournament,
+                    organizer=chunk[0],
+                    participants=participants,
+                    request_semaphore=request_gate,
+                )
+
+        active_participants = sum(
+            qa.browser_polling_state_participant_count(chunk)
+            for tournament, chunk in zip(tournaments, user_chunks)
+            if tournament["category"] != "terminal"
+        )
+        await asyncio.gather(
+            *(
+                setup_one(tournament, chunk)
+                for tournament, chunk in zip(tournaments, user_chunks)
+            )
+        )
+    await qa.record_preprod_run(active_participants=active_participants)
+    return users, tournaments, user_chunks
+
+
+async def publish_probe_events(
+    tournament_ids: list[str],
+    *,
+    count: int,
+    interval_seconds: float,
+) -> None:
+    if count <= 0 or not tournament_ids:
+        return
+    settings = get_settings()
+    client: Redis = from_url(settings.platform_redis_url, decode_responses=True)
+    try:
+        for event_index in range(count):
+            published_at_ms = int(time.time() * 1000)
+            payload = json.dumps(
+                {
+                    "type": SSE_EVENT_TYPE,
+                    "revision": event_index + 1,
+                    "qa_published_at_ms": published_at_ms,
+                },
+                separators=(",", ":"),
+            )
+            await asyncio.gather(
+                *(
+                    client.publish(bracket_channel(tournament_id), payload)
+                    for tournament_id in tournament_ids
+                )
+            )
+            if event_index + 1 < count:
+                await asyncio.sleep(max(0.0, interval_seconds))
+    finally:
+        await client.aclose()
+
+
+async def consume_sse_connection(
+    qa: ProductionQa,
+    client: httpx.AsyncClient,
+    metrics: SseMetrics,
+    *,
+    user: dict[str, Any],
+    tournament_slug: str,
+    duration_seconds: float,
+    reconnect_cycles: int,
+    open_gate: asyncio.Semaphore,
+) -> None:
+    token = qa.session_tokens_by_user_id[str(user["id"])]
+    headers = {
+        "Accept": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Origin": qa.origin,
+        "Cookie": f"{qa.session_cookie_name}={token}",
+        "X-Platform-QA-Phase": qa.current_phase,
+    }
+    deadline = time.monotonic() + duration_seconds
+    cycles = max(0, reconnect_cycles)
+    per_cycle_hold = duration_seconds / (cycles + 1) if cycles else duration_seconds
+
+    for cycle in range(cycles + 1):
+        if time.monotonic() >= deadline:
+            break
+        metrics.mark("connection_attempts")
+        attempt_started = time.monotonic()
+        stream_context = None
+        response = None
+        try:
+            stream_context = client.stream(
+                "GET",
+                f"/tournaments/{tournament_slug}/bracket/events",
+                headers=headers,
+            )
+            async with open_gate:
+                response = await stream_context.__aenter__()
+            if response.status_code != 200:
+                if response.status_code == 429:
+                    metrics.mark("rejected_429")
+                elif response.status_code == 503:
+                    metrics.mark("rejected_503")
+                else:
+                    metrics.mark("rejected_other")
+                await stream_context.__aexit__(None, None, None)
+                stream_context = None
+                continue
+
+            metrics.mark("connected")
+            metrics.connect_latencies.append((time.monotonic() - attempt_started) * 1000)
+            cycle_deadline = min(deadline, time.monotonic() + per_cycle_hold)
+            current_event = False
+            try:
+                async with asyncio.timeout(max(0.1, cycle_deadline - time.monotonic())):
+                    async for line in response.aiter_lines():
+                        metrics.mark("bytes_received", len(line.encode("utf-8")) + 1)
+                        if line.startswith(": keepalive"):
+                            metrics.mark("keepalives")
+                        elif line == "event: connected":
+                            current_event = False
+                        elif line == "event: bracket":
+                            current_event = True
+                        elif current_event and line.startswith("data: "):
+                            metrics.mark("events")
+                            current_event = False
+                            with suppress(TypeError, ValueError):
+                                payload = json.loads(line[6:])
+                                published_at_ms = int(payload.get("qa_published_at_ms", 0))
+                                if published_at_ms:
+                                    metrics.event_latencies.append(
+                                        max(0.0, time.time() * 1000 - published_at_ms)
+                                    )
+                        if time.monotonic() >= cycle_deadline:
+                            break
+            except TimeoutError:
+                metrics.mark("completed")
+            else:
+                metrics.mark("completed")
+            if cycle < cycles and time.monotonic() < deadline:
+                metrics.mark("reconnects")
+                await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
+            metrics.record_error(exc)
+        except Exception as exc:  # pragma: no cover - defensive load-harness boundary
+            metrics.record_error(exc)
+        finally:
+            if stream_context is not None:
+                with suppress(Exception):
+                    await stream_context.__aexit__(None, None, None)
+            if response is not None and time.monotonic() < deadline:
+                metrics.mark("disconnects")
+
+
+async def run_connections(
+    qa: ProductionQa,
+    users: list[dict[str, Any]],
+    tournaments: list[dict[str, Any]],
+    *,
+    connection_count: int,
+    duration_seconds: float,
+    open_concurrency: int,
+    reconnect_cycles: int,
+    event_count: int,
+    event_interval: float,
+    http_max_connections: int,
+) -> dict[str, Any]:
+    metrics = SseMetrics()
+    sse_client = httpx.AsyncClient(
+        base_url=qa.api_origin,
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0),
+        limits=httpx.Limits(
+            max_connections=max(1, http_max_connections),
+            max_keepalive_connections=max(1, http_max_connections),
+        ),
+    )
+    qa.clients.append(sse_client)
+    open_gate = asyncio.Semaphore(max(1, open_concurrency))
+    connections = [
+        (
+            users[index % len(users)],
+            tournaments[index % len(tournaments)],
+        )
+        for index in range(connection_count)
+    ]
+    tasks = [
+        asyncio.create_task(
+            consume_sse_connection(
+                qa,
+                sse_client,
+                metrics,
+                user=user,
+                tournament_slug=str(tournament["slug"]),
+                duration_seconds=duration_seconds,
+                reconnect_cycles=reconnect_cycles,
+                open_gate=open_gate,
+            )
+        )
+        for user, tournament in connections
+    ]
+    await asyncio.sleep(min(2.0, max(0.1, duration_seconds / 4)))
+    publisher = asyncio.create_task(
+        publish_probe_events(
+            [str(tournament["id"]) for tournament in tournaments],
+            count=event_count,
+            interval_seconds=event_interval,
+        )
+    )
+    await asyncio.gather(*tasks)
+    await publisher
+    return {
+        "profile": "sse-only",
+        "target_connections": connection_count,
+        "duration_seconds": duration_seconds,
+        "open_concurrency": open_concurrency,
+        "reconnect_cycles": reconnect_cycles,
+        "probe_event_count": event_count,
+        "probe_event_interval_seconds": event_interval,
+        "application_global_admission_limit": SSE_GLOBAL_LIMIT,
+        "metrics": metrics.summary(),
+    }
+
+
+async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
+    env_file = args.env_file
+    if env_file is None:
+        configured_env = os.environ.get("PLATFORM_ENV_FILE", "").strip()
+        env_file = Path(configured_env) if configured_env else PLATFORM_ROOT / ".env.platform"
+    load_env_file(env_file)
+
+    qa = ProductionQa(
+        origin=args.origin,
+        report_path=args.report_path,
+        keep_data=args.keep_data,
+        browser_gate_dir=None,
+        browser_gate_timeout=120.0,
+        http_timeout=args.http_timeout,
+        mode="browser-polling",
+        concurrency=args.concurrency,
+        http_max_connections=args.http_max_connections,
+        collect_performance=True,
+        system_sample_interval=args.system_sample_interval,
+        browser_polling_duration=args.combined_polling_duration,
+        browser_polling_open_stagger=args.combined_polling_open_stagger,
+        browser_polling_users_per_tournament=args.users_per_tournament,
+    )
+    qa.report["mode"] = args.mode
+    qa.report["control_email"] = args.control_email.strip().lower()
+    qa.report["target_sha"] = args.target_sha
+    qa.report["github_run_id"] = args.github_run_id
+    qa.report["sse"] = {}
+    started = time.monotonic()
+    api_client = await qa.new_client()
+    try:
+        await qa.record_preprod_run(status="running", requested_users=qa.scale_users)
+        await qa.start_performance_collection()
+        users, tournaments, user_chunks = await prepare_fixture(qa, api_client)
+        if args.mode == "sse":
+            with qa.phase("sse_only_run"):
+                sse_report = await run_connections(
+                    qa,
+                    users,
+                    tournaments,
+                    connection_count=args.sse_connections,
+                    duration_seconds=args.sse_duration,
+                    open_concurrency=args.sse_open_concurrency,
+                    reconnect_cycles=args.sse_reconnect_cycles,
+                    event_count=args.sse_event_count,
+                    event_interval=args.sse_event_interval,
+                    http_max_connections=max(args.http_max_connections, args.sse_connections),
+                )
+            qa.report["sse"] = sse_report
+            metrics = sse_report["metrics"]
+            qa.scenario(
+                "sse_no_unexpected_errors",
+                metrics["errors"] == 0 and metrics["rejected_other"] == 0,
+                metrics,
+                fatal=False,
+            )
+            qa.scenario(
+                "sse_admission_cap_respected",
+                metrics["connected"] <= SSE_GLOBAL_LIMIT,
+                metrics,
+            )
+            qa.scenario(
+                "sse_capacity_or_explicit_admission_observed",
+                metrics["connected"] == args.sse_connections
+                or metrics["rejected_429"] > 0,
+                metrics,
+            )
+        else:
+            tabs = qa.build_browser_polling_tabs(
+                tournaments=tournaments,
+                user_chunks=user_chunks,
+            )
+            qa.report["polling"] = {
+                "profile": "combined-polling-with-sse",
+                "duration_seconds": args.combined_polling_duration,
+                "open_stagger_seconds": args.combined_polling_open_stagger,
+                "tabs_planned": len(tabs),
+                "visible_tabs": sum(1 for tab in tabs if not tab["hidden_after_open"]),
+                "hidden_tabs": sum(1 for tab in tabs if tab["hidden_after_open"]),
+                "load_generator_local": qa.origin.startswith("http://127.0.0.1"),
+            }
+            with qa.phase("combined_sse_and_polling"):
+                inflight: set[str] = set()
+                async def run_polling() -> None:
+                    await asyncio.gather(
+                        *(
+                            qa.run_browser_polling_tab(
+                                api_client,
+                                tab,
+                                profile_duration=args.combined_polling_duration,
+                                inflight=inflight,
+                            )
+                            for tab in tabs
+                        )
+                    )
+
+                polling_task = asyncio.create_task(run_polling())
+                sse_task = asyncio.create_task(
+                    run_connections(
+                        qa,
+                        users,
+                        tournaments,
+                        connection_count=args.sse_connections,
+                        duration_seconds=args.sse_duration,
+                        open_concurrency=args.sse_open_concurrency,
+                        reconnect_cycles=args.sse_reconnect_cycles,
+                        event_count=args.sse_event_count,
+                        event_interval=args.sse_event_interval,
+                        http_max_connections=max(args.http_max_connections, args.sse_connections),
+                    )
+                )
+                _, sse_report = await asyncio.gather(polling_task, sse_task)
+            qa.report["polling"].update(qa.polling_metrics.summary())
+            qa.report["sse"] = sse_report
+            qa.scenario(
+                "combined_polling_requests_without_errors",
+                qa.report["polling"]["errors"] == 0,
+                qa.report["polling"],
+                fatal=False,
+            )
+            qa.scenario(
+                "combined_sse_admission_cap_respected",
+                sse_report["metrics"]["connected"] <= SSE_GLOBAL_LIMIT,
+                sse_report["metrics"],
+            )
+            qa.scenario(
+                "combined_sse_no_unexpected_errors",
+                sse_report["metrics"]["errors"] == 0
+                and sse_report["metrics"]["rejected_other"] == 0,
+                sse_report["metrics"],
+                fatal=False,
+            )
+
+        qa.report["duration_seconds"] = round(time.monotonic() - started, 4)
+        qa.scenario("sse_profile_complete", True)
+        await qa.record_preprod_run(
+            status="passed",
+            created_users=len(users),
+            tournaments_created=len(tournaments),
+            finished_at=datetime.now(UTC),
+        )
+    except Exception:
+        with suppress(Exception):
+            await qa.record_preprod_run(status="failed", finished_at=datetime.now(UTC))
+        raise
+    finally:
+        await qa.stop_performance_collection()
+        for client in qa.clients:
+            with suppress(Exception):
+                await client.aclose()
+        if not qa.keep_data:
+            cleanup = await qa.cleanup_targeted()
+            qa.report["cleanup"] = cleanup
+            qa.scenarios.append(
+                {"name": "sse_cleanup", "ok": cleanup.get("ok", False), "detail": cleanup}
+            )
+        else:
+            qa.report["cleanup"] = {"ok": False, "kept": True}
+        qa.report["finished_at"] = datetime.now(UTC).isoformat()
+        qa.report["passed"] = all(item["ok"] for item in qa.scenarios)
+        qa.report_path.parent.mkdir(parents=True, exist_ok=True)
+        qa.report_path.write_text(
+            json.dumps(qa.report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        with suppress(Exception):
+            await qa.record_preprod_run(report_path=str(qa.report_path))
+    if args.summary_path is not None:
+        args.summary_path.parent.mkdir(parents=True, exist_ok=True)
+        args.summary_path.write_text(
+            json.dumps(summary(qa.report), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    return qa.report
+
+
+def summary(report: dict[str, Any]) -> dict[str, Any]:
+    sse = report.get("sse") if isinstance(report.get("sse"), dict) else {}
+    metrics = sse.get("metrics") if isinstance(sse.get("metrics"), dict) else {}
+    polling = report.get("polling") if isinstance(report.get("polling"), dict) else {}
+    return {
+        "marker": report.get("marker"),
+        "mode": report.get("mode"),
+        "target_sha": report.get("target_sha"),
+        "github_run_id": report.get("github_run_id"),
+        "control_email": report.get("control_email"),
+        "passed": report.get("passed"),
+        "report_path": report.get("report_path"),
+        "created_users": report.get("created_users"),
+        "planned_users": report.get("requested_users"),
+        "tournament_ids": report.get("tournament_ids", []),
+        "completed_tournaments": len(report.get("tournament_ids", [])),
+        "planned_tournaments": len(BROWSER_POLLING_TOURNAMENT_PLAN),
+        "sse": {
+            "target_connections": sse.get("target_connections"),
+            "connected": metrics.get("connected"),
+            "rejected_429": metrics.get("rejected_429"),
+            "rejected_503": metrics.get("rejected_503"),
+            "errors": metrics.get("errors"),
+            "events": metrics.get("events"),
+            "reconnects": metrics.get("reconnects"),
+            "connect_latency_ms": metrics.get("connect_latency_ms"),
+            "event_delivery_latency_ms": metrics.get("event_delivery_latency_ms"),
+        },
+        "polling": {
+            "tabs_planned": polling.get("tabs_planned"),
+            "executed": polling.get("executed"),
+            "errors": polling.get("errors"),
+            "not_modified": polling.get("not_modified"),
+        }
+        if polling
+        else None,
+        "performance": report.get("performance", {}).get("bottleneck_summary", {}),
+        "rows": [{
+            "synthetic_users": len(report.get("user_ids", [])),
+            "report_path": report.get("report_path"),
+            "result": {
+                "passed": report.get("passed"),
+                "marker": report.get("marker"),
+                "report_path": report.get("report_path"),
+            },
+        }],
+    }
+
+
+async def async_main() -> int:
+    args = parse_args()
+    try:
+        report = await run_profile(args)
+    except Exception as exc:
+        print(json.dumps({"passed": False, "fatal_error": f"{type(exc).__name__}: {exc}"}))
+        return 1
+    finally:
+        await dispose_engine()
+    print(json.dumps(summary(report), ensure_ascii=False))
+    return 0 if report.get("passed") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(async_main()))

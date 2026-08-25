@@ -24,6 +24,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |
 | Services, storage, media and performance | [Operations runbook](operations-runbook.md) |
+| SSE capacity benchmark | [AS-19 benchmark plan](as-19-sse-capacity-benchmark.md) |
 | Security operations / CSP policy | [Security runbook](security-runbook.md) |
 | Cloudflare dashboard work | [Cloudflare checklist](cloudflare-production-checklist.md) |
 | Incident handling | [Incident response](incident-response.md) |

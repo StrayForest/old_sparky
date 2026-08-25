@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recover an interrupted browser-polling report from its durable QA row.
+"""Recover an interrupted retained-load report from its durable QA row.
 
 The production retained-load supervisor updates ``PreprodTestRun.report`` after
 each material setup phase.  If the GitHub SSH client is canceled, the final
@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--load-run-id", required=True)
     parser.add_argument("--control-email", required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("browser-polling", "sse", "combined"),
+        default="browser-polling",
+    )
     return parser.parse_args()
 
 
@@ -113,8 +118,11 @@ def build_recovered_summary(
     http_client = performance.get("http_client") if isinstance(performance.get("http_client"), dict) else {}
     http_overall = http_client.get("overall") if isinstance(http_client.get("overall"), dict) else {}
     bottleneck = performance.get("bottleneck_summary") if isinstance(performance.get("bottleneck_summary"), dict) else {}
+    mode = str(report.get("mode") or "browser-polling")
+    sse = report.get("sse") if isinstance(report.get("sse"), dict) else {}
+    sse_metrics = sse.get("metrics") if isinstance(sse.get("metrics"), dict) else {}
     return {
-        "mode": "browser-polling",
+        "mode": mode,
         "target_sha": "recovered-from-durable-run",
         "github_run_id": int(load_run_id),
         "control_email": control_email,
@@ -132,7 +140,15 @@ def build_recovered_summary(
             "executed": polling.get("executed"),
             "not_modified": polling.get("not_modified"),
             "deduped": polling.get("deduped"),
-        },
+        } if polling else None,
+        "sse": {
+            "target_connections": sse.get("target_connections"),
+            "connected": sse_metrics.get("connected"),
+            "rejected_429": sse_metrics.get("rejected_429"),
+            "rejected_503": sse_metrics.get("rejected_503"),
+            "errors": sse_metrics.get("errors"),
+            "events": sse_metrics.get("events"),
+        } if sse else None,
         "performance_summary": {
             "worst_http_p95_ms": http_overall.get("p95_ms"),
             "worst_http_p99_ms": http_overall.get("p99_ms"),
@@ -168,13 +184,13 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
     settings = get_settings()
     validate_platform_settings(settings)
     if settings.platform_environment.strip().lower() != "production":
-        raise RuntimeError("browser report recovery is forbidden outside production")
+        raise RuntimeError("retained report recovery is forbidden outside production")
     if settings.platform_web_origin.rstrip("/") != EXPECTED_ORIGIN:
         raise RuntimeError("browser report recovery requires the canonical origin")
 
-    browser_root = run_root / "browser-polling"
-    report_path = browser_root / "browser-polling.json"
-    summary_path = browser_root / "matrix-summary.json"
+    profile_root = run_root / args.mode
+    report_path = profile_root / f"{args.mode}.json"
+    summary_path = profile_root / "matrix-summary.json"
     generic_summary_path = run_root / "matrix-summary.json"
 
     async with session_factory()() as db_session:
@@ -189,7 +205,7 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
         )
         if len(rows) != 1:
             raise RuntimeError(
-                "database must contain exactly one PreprodTestRun for the exact browser report path"
+                "database must contain exactly one PreprodTestRun for the exact retained report path"
             )
         run = rows[0]
         stored = dict(run.report or {})
@@ -199,8 +215,8 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("durable QA marker is not a canonical retained-load marker")
     if run.origin != EXPECTED_ORIGIN or stored.get("origin") != EXPECTED_ORIGIN:
         raise RuntimeError("durable QA provenance is not the canonical production origin")
-    if stored.get("mode") != "browser-polling":
-        raise RuntimeError("durable QA row is not a browser-polling run")
+    if stored.get("mode") != args.mode:
+        raise RuntimeError("durable QA row mode does not match the selected retained profile")
     user_ids = _uuid_list(stored.get("user_ids"), field="user_ids")
     tournament_ids = _uuid_list(stored.get("tournament_ids"), field="tournament_ids")
     if not user_ids:
@@ -212,9 +228,9 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
         try:
             existing = json.loads(report_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("existing browser report is not valid JSON") from exc
+            raise RuntimeError("existing retained report is not valid JSON") from exc
         if not isinstance(existing, dict):
-            raise RuntimeError("existing browser report must be a JSON object")
+            raise RuntimeError("existing retained report must be a JSON object")
         if (
             existing.get("marker") != marker
             or existing.get("report_path") != str(report_path)
@@ -223,13 +239,13 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
             or set(_uuid_list(existing.get("tournament_ids"), field="existing tournament_ids"))
             != set(tournament_ids)
         ):
-            raise RuntimeError("existing browser report does not match durable QA identity")
+            raise RuntimeError("existing retained report does not match durable QA identity")
         report = existing
     else:
         report = stored
         report["marker"] = marker
         report["origin"] = EXPECTED_ORIGIN
-        report["mode"] = "browser-polling"
+        report["mode"] = args.mode
         report["report_path"] = str(report_path)
         report["user_ids"] = user_ids
         report["tournament_ids"] = tournament_ids
@@ -242,9 +258,9 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
         try:
             existing_summary = json.loads(summary_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("existing browser summary is not valid JSON") from exc
+            raise RuntimeError("existing retained summary is not valid JSON") from exc
         if not isinstance(existing_summary, dict) or not existing_summary.get("rows"):
-            raise RuntimeError("existing browser summary is not an exact cleanup manifest")
+            raise RuntimeError("existing retained summary is not an exact cleanup manifest")
     else:
         summary = build_recovered_summary(
             report,
@@ -268,8 +284,8 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("refusing to remove a non-generic root summary")
         generic_summary_path.unlink()
 
-    print(f"RECOVERED_BROWSER_REPORT={report_path}")
-    print(f"RECOVERED_BROWSER_SUMMARY={summary_path}")
+    print(f"RECOVERED_RETAINED_REPORT={report_path}")
+    print(f"RECOVERED_RETAINED_SUMMARY={summary_path}")
     print(f"RECOVERED_MARKER={marker}")
     print(f"RECOVERED_USERS={len(user_ids)}")
     print(f"RECOVERED_TOURNAMENTS={len(tournament_ids)}")

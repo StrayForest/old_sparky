@@ -112,5 +112,5 @@ jobs:
             echo "### Production retained-load abort"
             echo
             echo "- Target load run: **$LOAD_RUN_ID**"
-            echo "- The abort helper matched only the exact browser-polling supervisor tree for this run ID."
+            echo "- The abort helper matched only the exact retained-load supervisor tree for this run ID."
           } >> "$GITHUB_STEP_SUMMARY"
