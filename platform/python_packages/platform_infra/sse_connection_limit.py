@@ -333,14 +333,23 @@ class SseConnectionLimitMiddleware:
         settings = self.settings_factory()
         source_address = _source_address(scope)
         source_fingerprint = _fingerprint(settings, f"source:{source_address}")
+        bypass_source_limit = _has_sse_load_test_bypass(scope, settings)
         lease: SseConnectionLease | None = None
         try:
             lease = await reserve_sse_connection(
                 source_address,
                 settings=settings,
-                bypass_source_limit=_has_sse_load_test_bypass(scope, settings),
+                bypass_source_limit=bypass_source_limit,
             )
-            user_id = await _authenticated_user_id(scope, settings)
+            # The signed QA probe uses one distinct session per virtual user and
+            # is already admitted through the route's normal auth dependency.
+            # Avoid a second session lookup in middleware for that probe only;
+            # real clients retain the authenticated-user cap and its lookup.
+            user_id = (
+                None
+                if bypass_source_limit
+                else await _authenticated_user_id(scope, settings)
+            )
             if user_id is not None:
                 await lease.add_user_scope(user_id)
         except SseConnectionLimitExceeded as exc:
