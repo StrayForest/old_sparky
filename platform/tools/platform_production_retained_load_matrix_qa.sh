@@ -287,6 +287,10 @@ else
   install -d -o root -g root -m 0700 "$sse_root"
   sse_report="$sse_root/$profile.json"
   sse_summary="$sse_root/matrix-summary.json"
+  # Fixture creation performs authenticated CSRF/session reads. Keep that
+  # setup below the API pool budget; SSE opening pressure is controlled
+  # independently by --sse-open-concurrency below.
+  sse_setup_concurrency=20
   set +e
   timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_sse_qa.py" \
@@ -305,7 +309,7 @@ else
     --sse-event-interval "$sse_event_interval" \
     --combined-polling-duration "$combined_polling_duration" \
     --combined-polling-open-stagger "$combined_polling_open_stagger" \
-    --concurrency "$concurrency" \
+    --concurrency "$sse_setup_concurrency" \
     --http-max-connections 40 \
     --report-path "$sse_report" \
     --summary-path "$sse_summary" \

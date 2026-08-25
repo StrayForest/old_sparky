@@ -139,6 +139,8 @@ class PlatformSseQaTests(unittest.TestCase):
             self.assertIn(profile, supervisor)
             self.assertIn(profile, workflow)
         self.assertIn("platform_sse_qa.py", supervisor)
+        self.assertIn('sse_setup_concurrency=20', supervisor)
+        self.assertIn('--concurrency "$sse_setup_concurrency"', supervisor)
         self.assertIn('--control-email "$control_email"', supervisor)
         self.assertIn("platform_recover_retained_browser_report.py", cleanup)
         self.assertIn('--mode "$recovery_profile"', cleanup)

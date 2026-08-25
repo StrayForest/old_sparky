@@ -2228,9 +2228,11 @@ class ProductionQa:
                     response_bytes=response_bytes,
                 )
         if response.status_code != 200:
+            request_id = response.headers.get("x-request-id") or response.headers.get("cf-ray")
             raise QaFailure(
                 f"GET /auth/csrf as {user['label']}: expected 200, got "
-                f"{response.status_code}: {response.text[:1000]}"
+                f"{response.status_code}: {response.text[:1000]} "
+                f"request_id={request_id or 'missing'}"
             )
         try:
             csrf_token = str(response.json()["csrf_token"])
