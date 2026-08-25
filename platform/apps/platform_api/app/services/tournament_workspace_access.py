@@ -331,7 +331,6 @@ async def ensure_private_tournament_read_membership_is_active(
         return
 
     user_id = auth_session.user.id
-    session_id = _auth_session_id(auth_session)
     row = (
         await db_session.execute(
             select(
