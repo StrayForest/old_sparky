@@ -227,7 +227,7 @@ class PlatformSseNginxGuardTests(unittest.TestCase):
         self.assertIn("limit_conn platform_sse_global 10240;", nginx)
         self.assertIn("limit_conn_status 429;", nginx)
         self.assertIn('"limit_conn_status":"$limit_conn_status"', nginx)
-        self.assertIn("proxy_read_timeout 660s;", nginx)
+        self.assertIn("proxy_read_timeout 60s;", nginx)
 
 
 if __name__ == "__main__":

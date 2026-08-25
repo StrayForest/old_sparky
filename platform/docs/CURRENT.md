@@ -184,10 +184,11 @@ incomplete-chunk errors. Open64 (`32847283128`, cleanup `32847524729`) reached
 Both retained nofile 32768/32768 and showed no 429/503, PostgreSQL connection
 or lock saturation; neither is a strict pass. Investigation found the SSE
 Nginx location's `proxy_read_timeout=60s` exactly matched the 60s benchmark
-hold. The candidate change raises only this route timeout to `660s`, above
-the supported 600s stream lifetime, while retaining application leases,
-admission limits, keepalives and authorization. It is pending CI/deploy and
-will be tested at open64 first.
+hold. The isolated `660s` candidate was deployed as `c3e5752f` and tested at
+open64 in `32848671574` (cleanup `32848969483`): it regressed to 999/1000
+HTTP 200, one Cloudflare 500 and 13 incomplete-chunk errors, with high load
+average and PostgreSQL CPU. It is rejected and the SSE timeout is restored to
+60s; no admission limit was changed.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.

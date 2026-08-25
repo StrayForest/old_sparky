@@ -339,3 +339,9 @@ stores only the measured conclusion and run identifiers.
   `660s` (above the supported 600s stream lifetime); application leases,
   per-user/global admission, keepalives and authorization are unchanged.
   This is a timeout-lifecycle experiment, not an admission-limit increase.
+- The `660s` timeout candidate was deployed as `c3e5752f` and tested at
+  open64 in load `32848671574`, with exact cleanup `32848969483`. It regressed
+  to `999/1,000` HTTP 200, one Cloudflare 500 and 13 incomplete-chunk errors;
+  the run also raised the load-average flag and PostgreSQL CPU hotspot. The
+  candidate is rejected and the SSE timeout is restored to `60s`; this
+  experiment does not justify increasing proxy lifetime or admission limits.
