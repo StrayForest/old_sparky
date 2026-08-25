@@ -198,17 +198,17 @@ start_server_observer() {
       timeout 5s sudo -n -u postgres psql -X -qAt -d platformdb -F '|' -c \
         "SELECT pid,state,COALESCE(wait_event_type,''),COALESCE(wait_event,''),round(EXTRACT(EPOCH FROM now()-query_start)*1000,1),left(regexp_replace(query,E'\\s+',' ','g'),240) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND state<>'idle' ORDER BY query_start NULLS LAST LIMIT 16" \
         2>&1 || true
-      sleep 2
+      sleep 5
     done
     echo "=== post-run logs $(date --iso-8601=seconds) ==="
     echo "--- api/worker journal ---"
-    journalctl -u deadlock-api -u deadlock-worker --since "$started_at" --no-pager -o short-iso 2>&1 | tail -n 4000
+    journalctl -u deadlock-api -u deadlock-worker --since "$started_at" --no-pager -o short-iso -n 4000 2>&1
     echo "--- nginx access ---"
     tail -n 4000 /var/log/nginx/platform-access.log 2>&1 || true
     echo "--- nginx error ---"
     tail -n 2000 /var/log/nginx/platform-error.log 2>&1 || true
   ) > "$server_observability_log" 2>&1 &
-  echo "$!"
+  SERVER_OBSERVER_PID="$!"
 }
 
 run_monitored() {
@@ -218,7 +218,8 @@ run_monitored() {
   timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" "$@" > "$raw_log" 2>&1 &
   local qa_pid="$!"
   local observer_pid
-  observer_pid="$(start_server_observer "$qa_pid")"
+  start_server_observer "$qa_pid"
+  observer_pid="$SERVER_OBSERVER_PID"
   local qa_status=0
   wait "$qa_pid" || qa_status="$?"
   wait "$observer_pid" 2>/dev/null || true

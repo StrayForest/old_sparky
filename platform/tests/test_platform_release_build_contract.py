@@ -211,6 +211,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("RUN-PRODUCTION-RETAINED-LOAD-MATRIX", load_workflow)
         self.assertIn("DELETE-PRODUCTION-RETAINED-LOAD", cleanup_workflow)
         self.assertIn("ABORT-PRODUCTION-RETAINED-LOAD", abort_workflow)
+        self.assertIn("ABORT_EVIDENCE_EXPORT=", abort_workflow)
+        self.assertIn("server-observability.log", abort_workflow)
         self.assertIn("https://old-sparky.com", load_supervisor)
         self.assertIn("https://old-sparky.com", cleanup_supervisor)
         self.assertIn("flock -n 9", load_supervisor)

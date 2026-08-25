@@ -530,8 +530,17 @@ stores only the measured conclusion and run identifiers.
   diagnostic, not a change to API/DB/SSE admission limits.
 - The retained-load supervisor now observes the VPS directly during the remote
   command: bounded `ps`, socket, Redis client/rejection and PostgreSQL activity
-  snapshots are written every two seconds, followed by bounded API/worker
+  snapshots are written every five seconds, followed by bounded API/worker
   `journalctl` and Nginx access/error tails. The read-only evidence is exported
   as `server-observability.log` beside the compact matrix summary, so a future
   setup stall can be classified while it is occurring instead of inferred only
   from the final CI status.
+- The ANALYZE diagnostic run `32874380384` exceeded the ten-minute observation
+  window and was stopped by exact abort `32875410391`; the first observer-enabled
+  rerun `32877021919` behaved the same and was stopped by `32878007693`. Neither
+  produced a completed matrix summary, so neither is a capacity measurement.
+  Exact cleanups `32875508695` and `32878057962` removed their
+  10,000-user/20-tournament fixtures and preserved the control account. The
+  abort workflow now exports partial matrix/QA/server logs and an exact process
+  snapshot before cleanup. The observer samples every five seconds and bounds
+  journalctl to 4,000 records to avoid an unbounded post-run collection phase.

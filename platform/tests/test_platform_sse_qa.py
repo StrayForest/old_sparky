@@ -214,3 +214,5 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertIn("platform_recover_retained_browser_report.py", cleanup)
         self.assertIn('--mode "$recovery_profile"', cleanup)
         self.assertIn("if SCRIPT_PATH in args and run_id in args:", abort)
+        self.assertIn("ABORT_EVIDENCE_EXPORT=", abort)
+        self.assertIn("server-observability.log", abort)

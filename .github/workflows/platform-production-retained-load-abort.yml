@@ -81,7 +81,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          install -d -m 700 "$RUNNER_TEMP/production-retained-abort-artifacts"
+          artifact_dir="$RUNNER_TEMP/production-retained-abort-artifacts"
+          install -d -m 700 "$artifact_dir"
+          ssh_output_file="$artifact_dir/abort.log"
+          set +e
           ssh \
             -F "$SSH_DIR/config" \
             -o BatchMode=yes \
@@ -93,14 +96,49 @@ jobs:
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             sudo -n -- /root/old_sparky/platform/tools/platform_abort_retained_load.py \
               "$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" \
-            2>&1 | tee "$RUNNER_TEMP/production-retained-abort-artifacts/abort.log"
+            > "$ssh_output_file" 2>&1
+          remote_status=$?
+          set -e
+          cat "$ssh_output_file"
+
+          export_dir="$(sed -n 's/^ABORT_EVIDENCE_EXPORT=//p' "$ssh_output_file" | tail -n 1)"
+          if [[ -n "$export_dir" ]]; then
+            [[ "$export_dir" =~ ^/tmp/old-sparky-production-retained-abort-[0-9]+$ ]] || {
+              echo "Abort evidence export path failed validation" >&2
+              exit 1
+            }
+            copy_if_present() {
+              local name="$1"
+              if ssh -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+                -i "$SSH_DIR/id_ed25519" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST" \
+                "test -s '$export_dir/$name'"; then
+                scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+                  -i "$SSH_DIR/id_ed25519" \
+                  "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/$name" \
+                  "$artifact_dir/$name"
+              fi
+            }
+            copy_if_present abort-process-tree.txt
+            copy_if_present matrix.log
+            copy_if_present qa-command.log
+            copy_if_present server-observability.log
+            copy_if_present matrix-summary.json
+          fi
+          exit "$remote_status"
 
       - name: Publish abort evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
           name: platform-production-retained-abort-${{ github.run_id }}
-          path: ${{ runner.temp }}/production-retained-abort-artifacts/abort.log
+          path: |
+            ${{ runner.temp }}/production-retained-abort-artifacts/abort.log
+            ${{ runner.temp }}/production-retained-abort-artifacts/abort-process-tree.txt
+            ${{ runner.temp }}/production-retained-abort-artifacts/matrix.log
+            ${{ runner.temp }}/production-retained-abort-artifacts/qa-command.log
+            ${{ runner.temp }}/production-retained-abort-artifacts/server-observability.log
+            ${{ runner.temp }}/production-retained-abort-artifacts/matrix-summary.json
           if-no-files-found: warn
           retention-days: 14
 
