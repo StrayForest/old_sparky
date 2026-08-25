@@ -33,6 +33,7 @@ class TournamentStreamAccessContext:
     slug: str
     user_id: str | None = None
     session_id: str | None = None
+    tournament: Tournament | None = None
 
 
 _tournament_stream_access_context: ContextVar[TournamentStreamAccessContext | None] = ContextVar(
@@ -211,6 +212,89 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
     return True
 
 
+def _apply_stream_access_context(
+    *,
+    slug: str,
+    auth_session,
+    tournament_visibility: str,
+    organizer_user_id: str | None,
+    participant_status: str | None,
+    tournament: Tournament | None = None,
+) -> None:
+    if auth_session_has_admin_role(auth_session):
+        _tournament_stream_access_context.set(
+            TournamentStreamAccessContext(
+                decision="admin",
+                slug=slug,
+                user_id=auth_session.user.id,
+                session_id=_auth_session_id(auth_session),
+                tournament=tournament,
+            )
+        )
+        return
+    if auth_session is None:
+        return
+
+    user_id = auth_session.user.id
+    session_id = _auth_session_id(auth_session)
+    if tournament_visibility != "invite_only":
+        _tournament_stream_access_context.set(
+            TournamentStreamAccessContext(
+                decision="public",
+                slug=slug,
+                tournament=tournament,
+            )
+        )
+        return
+    if organizer_user_id == user_id:
+        _tournament_stream_access_context.set(
+            TournamentStreamAccessContext(
+                decision="organizer",
+                slug=slug,
+                user_id=user_id,
+                session_id=session_id,
+                tournament=tournament,
+            )
+        )
+        return
+    if participant_status is None:
+        _tournament_stream_access_context.set(
+            TournamentStreamAccessContext(
+                decision="deny",
+                slug=slug,
+                user_id=user_id,
+                session_id=session_id,
+                tournament=tournament,
+            )
+        )
+        return
+    if participant_status in ACTIVE_PARTICIPANT_STATUSES:
+        _tournament_stream_access_context.set(
+            TournamentStreamAccessContext(
+                decision="active_participant",
+                slug=slug,
+                user_id=user_id,
+                session_id=session_id,
+                tournament=tournament,
+            )
+        )
+        return
+
+    _tournament_stream_access_context.set(
+        TournamentStreamAccessContext(
+            decision="deny",
+            slug=slug,
+            user_id=user_id,
+            session_id=session_id,
+            tournament=tournament,
+        )
+    )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Inactive tournament participants cannot access private tournament workspace data.",
+    )
+
+
 async def ensure_private_tournament_read_membership_is_active(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session),
@@ -269,56 +353,12 @@ async def ensure_private_tournament_read_membership_is_active(
         )
         return
 
-    tournament_visibility = row[0]
-    organizer_user_id = row[1]
-    participant_status = row[2]
-    if tournament_visibility != "invite_only":
-        _tournament_stream_access_context.set(
-            TournamentStreamAccessContext(decision="public", slug=slug)
-        )
-        return
-    if organizer_user_id == user_id:
-        _tournament_stream_access_context.set(
-            TournamentStreamAccessContext(
-                decision="organizer",
-                slug=slug,
-                user_id=user_id,
-                session_id=session_id,
-            )
-        )
-        return
-    if participant_status is None:
-        _tournament_stream_access_context.set(
-            TournamentStreamAccessContext(
-                decision="deny",
-                slug=slug,
-                user_id=user_id,
-                session_id=session_id,
-            )
-        )
-        return
-    if participant_status in ACTIVE_PARTICIPANT_STATUSES:
-        _tournament_stream_access_context.set(
-            TournamentStreamAccessContext(
-                decision="active_participant",
-                slug=slug,
-                user_id=user_id,
-                session_id=session_id,
-            )
-        )
-        return
-
-    _tournament_stream_access_context.set(
-        TournamentStreamAccessContext(
-            decision="deny",
-            slug=slug,
-            user_id=user_id,
-            session_id=session_id,
-        )
-    )
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Inactive tournament participants cannot access private tournament workspace data.",
+    _apply_stream_access_context(
+        slug=slug,
+        auth_session=auth_session,
+        tournament_visibility=row[0],
+        organizer_user_id=row[1],
+        participant_status=row[2],
     )
 
 
@@ -329,8 +369,34 @@ async def ensure_private_tournament_read_membership_is_active_for_stream(
 ) -> None:
     """Apply private-read authorization with endpoint-scoped DB access."""
 
-    await ensure_private_tournament_read_membership_is_active(
-        request,
-        auth_session,
-        db_session,
+    _tournament_stream_access_context.set(None)
+    slug = private_tournament_child_slug_from_request(request)
+    if slug is None or auth_session is None:
+        return
+
+    row = (
+        await db_session.execute(
+            select(Tournament, TournamentParticipant.status)
+            .outerjoin(
+                TournamentParticipant,
+                (TournamentParticipant.tournament_id == Tournament.id)
+                & (TournamentParticipant.user_id == auth_session.user.id),
+            )
+            .where(Tournament.slug == slug)
+        )
+    ).first()
+    if row is None:
+        _tournament_stream_access_context.set(
+            TournamentStreamAccessContext(decision="deny", slug=slug)
+        )
+        return
+
+    tournament = row[0]
+    _apply_stream_access_context(
+        slug=slug,
+        auth_session=auth_session,
+        tournament_visibility=tournament.visibility,
+        organizer_user_id=tournament.organizer_user_id,
+        participant_status=row[1],
+        tournament=tournament,
     )

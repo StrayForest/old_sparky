@@ -201,3 +201,21 @@ stores only the measured conclusion and run identifiers.
   signature is no longer the only bottleneck. The runner now records bounded
   status-body diagnostics for non-200 responses; the result is not ranked
   until the diagnostic rerun and staircase continue.
+- Intermediate contour on the same deployment: `256` SSE passed in load run
+  `32834441834` and was cleaned by `32834698357` (`200=256/256`, `errors=0`,
+  `max_active=256`, events 87, connect p95 5.19s). The next `512` step failed
+  in load run `32834773835` and is pending cleanup result: `200=415/512`,
+  `500=97`, `errors=77`, `max_active=348`, connect p95 10.94s; all sampled
+  500s were Cloudflare plain `Internal Server Error` responses. It was cleaned
+  by `32835036424`. The current reliable contour is therefore 256, with the
+  failure boundary between 256 and 512 under this opening shape.
+- A backpressure A/B at `512` connections with opening concurrency `128`
+  (`32835148133`, cleaned by `32835407140`) improved the result to
+  `200=468/512`, `500=44`, `errors=70`, `max_active=398`, events 89 and
+  connect p95 11.66s, but still failed the no-unexpected-errors criterion.
+  Lower opening concurrency helps, but does not make 512 reliable.
+- The next focused implementation reuses the full tournament snapshot loaded
+  by the stream authorization dependency for the endpoint's visibility check,
+  removing one duplicate SSE admission query while preserving the same
+  authorization and periodic revalidation semantics. It is not ranked until
+  its exact CI/deploy/load/cleanup cycle.

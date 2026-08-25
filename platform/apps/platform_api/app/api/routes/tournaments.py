@@ -149,6 +149,9 @@ from apps.platform_api.app.services.tournament_workflow import (
 from apps.platform_api.app.services.tournament_runtime_cache import (
     register_tournament_runtime_cache_invalidator,
 )
+from apps.platform_api.app.services.tournament_workspace_access import (
+    current_tournament_stream_access_context,
+)
 from apps.platform_api.app.services.tournament_participant_capacity import (
     PARTICIPANT_SLOT_MATERIALIZATION_LIMIT,
     claim_participant_slot,
@@ -3869,7 +3872,15 @@ async def get_tournament_bracket_events(
     auth_session=Depends(get_optional_authenticated_session_for_stream),
     db_session: AsyncSession = Depends(get_db_session, scope="function"),
 ) -> StreamingResponse:
-    tournament = await get_tournament_or_404(db_session, slug)
+    access_context = current_tournament_stream_access_context()
+    if (
+        access_context is not None
+        and access_context.slug == slug
+        and access_context.tournament is not None
+    ):
+        tournament = access_context.tournament
+    else:
+        tournament = await get_tournament_or_404(db_session, slug)
     has_participant_record = False
     if auth_session is not None:
         has_participant_record = (

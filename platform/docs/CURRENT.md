@@ -115,7 +115,14 @@ first H1 on that corrected deployment (`32832475533`, cleaned by
 21.49s. PostgreSQL peaked at 195.0% CPU and the SSE server route p95 was
 57.9s, with no PostgreSQL connection-peak or lock-wait flag. The runner now
 records bounded non-200 response-body diagnostics. This is not a capacity
-pass; the 10+5 ranking remains pending.
+pass. A same-shape intermediate contour passed at 256 (`32834441834`, cleaned
+by `32834698357`: 256/256, zero errors), while 512 failed (`32834773835`,
+cleaned by `32835036424`: 415/512, 97 Cloudflare 500s, max_active 348). The
+current reliable contour is 256. A 512/open128 backpressure A/B improved to
+468/512 with 44 Cloudflare 500s (`32835148133`, cleaned by `32835407140`), but
+still failed. The next implementation removes one duplicate SSE admission
+query by reusing the authorized tournament snapshot; the 10+5 ranking
+remains pending.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.
