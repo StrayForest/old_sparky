@@ -146,6 +146,10 @@ and is not evidence against the relay or SSE fan-out. Exact cleanup
 tournaments, sessions and audit rows while preserving the control account.
 The next setup hypothesis refreshes PostgreSQL statistics after direct fixture
 inserts and records bounded active PostgreSQL query samples during the run.
+The retained-load supervisor now also records bounded live VPS snapshots
+(`ps`, sockets, Redis client/rejection counters and PostgreSQL activity) plus
+post-run API/worker journal and Nginx access/error tails; these are exported as
+`server-observability.log` alongside the compact matrix artifact.
 
 To reduce repeated CI/CD runs, AS-19 is explicitly local-first: classify origin
 versus Nginx/edge closes, compare Redis TCP connections with active SSE, and

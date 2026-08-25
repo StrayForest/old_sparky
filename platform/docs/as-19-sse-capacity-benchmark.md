@@ -528,3 +528,10 @@ stores only the measured conclusion and run identifiers.
   `users`, `sessions` and `user_roles` after direct fixture inserts and records
   bounded active-query samples from `pg_stat_activity`; this is a setup
   diagnostic, not a change to API/DB/SSE admission limits.
+- The retained-load supervisor now observes the VPS directly during the remote
+  command: bounded `ps`, socket, Redis client/rejection and PostgreSQL activity
+  snapshots are written every two seconds, followed by bounded API/worker
+  `journalctl` and Nginx access/error tails. The read-only evidence is exported
+  as `server-observability.log` beside the compact matrix summary, so a future
+  setup stall can be classified while it is occurring instead of inferred only
+  from the final CI status.

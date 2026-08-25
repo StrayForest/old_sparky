@@ -175,24 +175,68 @@ install -d -o root -g root -m 0700 "$run_root"
 rm -rf -- "$export_dir"
 install -d -o "$export_uid" -g "$export_gid" -m 0700 "$export_dir"
 log_path="$run_root/matrix.log"
+server_observability_log="$run_root/server-observability.log"
+
+start_server_observer() {
+  local target_pid="$1"
+  local started_at
+  started_at="$(date --iso-8601=seconds)"
+  (
+    set +e
+    echo "observer_started_at=$started_at"
+    echo "observer_target_pid=$target_pid"
+    while kill -0 "$target_pid" 2>/dev/null; do
+      echo "=== snapshot $(date --iso-8601=seconds) ==="
+      echo "--- process ---"
+      ps -eo pid=,ppid=,stat=,pcpu=,pmem=,rss=,comm=,args= --sort=-pcpu | head -n 32
+      echo "--- sockets ---"
+      ss -Htan 2>/dev/null | awk '{print $1, $4, $5}' | sort | uniq -c | sort -nr | head -n 80
+      echo "--- redis ---"
+      redis-cli -h 127.0.0.1 -p 6379 info clients 2>&1 | grep -E '^(connected_clients|blocked_clients|tracking_clients|rejected_connections):' || true
+      redis-cli -h 127.0.0.1 -p 6379 info stats 2>&1 | grep -E '^(total_connections_received|rejected_connections|instantaneous_ops_per_sec):' || true
+      echo "--- postgres activity ---"
+      timeout 5s sudo -n -u postgres psql -X -qAt -d platformdb -F '|' -c \
+        "SELECT pid,state,COALESCE(wait_event_type,''),COALESCE(wait_event,''),round(EXTRACT(EPOCH FROM now()-query_start)*1000,1),left(regexp_replace(query,E'\\s+',' ','g'),240) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND state<>'idle' ORDER BY query_start NULLS LAST LIMIT 16" \
+        2>&1 || true
+      sleep 2
+    done
+    echo "=== post-run logs $(date --iso-8601=seconds) ==="
+    echo "--- api/worker journal ---"
+    journalctl -u deadlock-api -u deadlock-worker --since "$started_at" --no-pager -o short-iso 2>&1 | tail -n 4000
+    echo "--- nginx access ---"
+    tail -n 4000 /var/log/nginx/platform-access.log 2>&1 || true
+    echo "--- nginx error ---"
+    tail -n 2000 /var/log/nginx/platform-error.log 2>&1 || true
+  ) > "$server_observability_log" 2>&1 &
+  echo "$!"
+}
+
+run_monitored() {
+  local output_log="$1"
+  shift
+  local raw_log="$run_root/qa-command.log"
+  timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" "$@" > "$raw_log" 2>&1 &
+  local qa_pid="$!"
+  local observer_pid
+  observer_pid="$(start_server_observer "$qa_pid")"
+  local qa_status=0
+  wait "$qa_pid" || qa_status="$?"
+  wait "$observer_pid" 2>/dev/null || true
+  cat "$raw_log" | tee "$output_log"
+  return "$qa_status"
+}
 
 if [[ "$profile" == "matrix" ]]; then
   set +e
-  timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
+  run_monitored "$log_path" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_seed_retained_tournament_matrix.py" \
     --env-file "$RUNTIME_ROOT/shared/.env.platform" \
     --origin "$EXPECTED_ORIGIN" \
     --control-email "$control_email" \
     --concurrency "$concurrency" \
     --output-root "$run_root" \
-    2>&1 | tee "$log_path"
-  pipeline_status=("${PIPESTATUS[@]}")
-  qa_status="${pipeline_status[0]}"
-  tee_status="${pipeline_status[1]}"
+  qa_status="$?"
   set -e
-  if [[ "$tee_status" != "0" ]]; then
-    qa_status=1
-  fi
 elif [[ "$profile" == "browser-polling" ]]; then
   browser_root="$run_root/browser-polling"
   install -d -o root -g root -m 0700 "$browser_root"
@@ -203,7 +247,7 @@ elif [[ "$profile" == "browser-polling" ]]; then
   browser_http_connections=40
   browser_setup_concurrency=20
   set +e
-  timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
+  run_monitored "$log_path" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_production_qa.py" \
     --env-file "$RUNTIME_ROOT/shared/.env.platform" \
     --mode browser-polling \
@@ -214,15 +258,9 @@ elif [[ "$profile" == "browser-polling" ]]; then
     --browser-polling-duration 30 \
     --browser-polling-open-stagger 300 \
     --collect-performance \
-    --report-path "$browser_report" \
-    2>&1 | tee "$log_path"
-  pipeline_status=("${PIPESTATUS[@]}")
-  qa_status="${pipeline_status[0]}"
-  tee_status="${pipeline_status[1]}"
+    --report-path "$browser_report"
+  qa_status="$?"
   set -e
-  if [[ "$tee_status" != "0" ]]; then
-    qa_status=1
-  fi
   "$SYSTEM_PYTHON" -I - "$browser_report" "$browser_root/matrix-summary.json" "$target_sha" "$run_id" "$control_email" "$qa_status" <<'PY'
 import json
 from pathlib import Path
@@ -309,7 +347,7 @@ else
   # independently by --sse-open-concurrency below.
   sse_setup_concurrency=20
   set +e
-  timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
+  run_monitored "$log_path" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_sse_qa.py" \
     --env-file "$RUNTIME_ROOT/shared/.env.platform" \
     --origin "$EXPECTED_ORIGIN" \
@@ -330,15 +368,9 @@ else
     --http-max-connections 40 \
     --report-path "$sse_report" \
     --summary-path "$sse_summary" \
-    --keep-data \
-    2>&1 | tee "$log_path"
-  pipeline_status=("${PIPESTATUS[@]}")
-  qa_status="${pipeline_status[0]}"
-  tee_status="${pipeline_status[1]}"
+    --keep-data
+  qa_status="$?"
   set -e
-  if [[ "$tee_status" != "0" ]]; then
-    qa_status=1
-  fi
 fi
 
 shopt -s nullglob
@@ -377,6 +409,10 @@ find "$run_root" -xdev -type f -exec chmod 0600 -- {} +
 
 install -o "$export_uid" -g "$export_gid" -m 0600 "$summary_path" "$export_dir/matrix-summary.json"
 install -o "$export_uid" -g "$export_gid" -m 0600 "$log_path" "$export_dir/matrix.log"
+if [[ -s "$server_observability_log" ]]; then
+  install -o "$export_uid" -g "$export_gid" -m 0600 \
+    "$server_observability_log" "$export_dir/server-observability.log"
+fi
 printf 'PRODUCTION_RETAINED_LOAD_MATRIX_EXPORT=%s\n' "$export_dir"
 printf 'PRODUCTION_RETAINED_LOAD_MATRIX_SUMMARY=%s\n' "$export_dir/matrix-summary.json"
 printf 'PRODUCTION_RETAINED_LOAD_MATRIX_RUN_ROOT=%s\n' "$run_root"
