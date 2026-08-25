@@ -167,8 +167,27 @@ with two Cloudflare 500s, five incomplete-chunk client errors and connect p95
 PostgreSQL connection/lock saturation. Stream DB work fell to 5.26 average
 queries and 161.7ms DB time. Compact load artifacts now include the effective
 `nofile` limits and bounded error/response samples. This is a material
-improvement, but not a strict 1000 pass; one same-shape repeat is required to
-separate near-boundary variance from a stable origin failure.
+improvement, but not a strict 1000 pass. The same-shape repeat
+(`32846652953`, exact cleanup `32846866673`) reproduced the boundary failure
+at 995/1000 HTTP 200 streams: five Cloudflare 500s, four incomplete-chunk
+client errors, max_active 995, 401 events and connect p95 18.64s. The load
+generator reported nofile 32768/32768; there were still no 429/503 responses,
+sustained CPU/load-average flags or PostgreSQL connection/lock saturation.
+This keeps the strict contour at 512. Cleanup verified 1,000 synthetic users
+and 20 tournaments removed, zero fixture users, tournaments, sessions and
+audit rows remaining, and preservation of `aleksei.lisitsin1@gmail.com`. The
+next controlled comparison changes only opening concurrency (16 versus 64)
+before any admission-limit change. Open16 (`32847009440`, cleanup
+`32847218607`) reached 999/1000 HTTP 200 with one Cloudflare 500 and eight
+incomplete-chunk errors. Open64 (`32847283128`, cleanup `32847524729`) reached
+1000/1000 HTTP 200 with zero HTTP errors but eight incomplete-chunk errors.
+Both retained nofile 32768/32768 and showed no 429/503, PostgreSQL connection
+or lock saturation; neither is a strict pass. Investigation found the SSE
+Nginx location's `proxy_read_timeout=60s` exactly matched the 60s benchmark
+hold. The candidate change raises only this route timeout to `660s`, above
+the supported 600s stream lifetime, while retaining application leases,
+admission limits, keepalives and authorization. It is pending CI/deploy and
+will be tested at open64 first.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.

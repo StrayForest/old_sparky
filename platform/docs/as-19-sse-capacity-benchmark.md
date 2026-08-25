@@ -305,3 +305,37 @@ stores only the measured conclusion and run identifiers.
 - Repeat the same 1000/open32 shape once more before changing opening
   concurrency or application semantics. The repeat determines whether the
   two edge 500s are stable origin pressure or near-boundary variance.
+- The same-shape repeat on the runner-fixed deployment was load
+  `32846652953`, with exact cleanup `32846866673`. It confirmed the failure is
+  reproducible at the boundary: `995/1,000` HTTP 200 streams, `5` Cloudflare
+  500 responses, `4` incomplete-chunk client errors, `max_active=995`, 401
+  events and connect p95 18.64s. The runner reported
+  `nofile soft=32768 hard=32768`; there were still no 429/503 responses,
+  sustained CPU/load-average saturation, PostgreSQL connection-peak or lock
+  contention flags. The remaining classification is a DB-time hotspot during
+  mixed setup work plus a small origin/edge failure rate at this opening
+  shape, so 1000/open32 is not a strict pass. Cleanup verified deletion of
+  1,000 synthetic users and 20 tournaments, zero remaining fixture users,
+  tournaments, sessions or audit rows, and preservation of
+  `aleksei.lisitsin1@gmail.com`.
+- Because the same-shape result failed in the same way twice, the next
+  experiment may change one variable: compare a gentler `open_concurrency=16`
+  and a faster `open_concurrency=64` at 1000, while retaining the fixed runner
+  and exact cleanup. No Nginx/Redis admission ceiling will be raised blindly;
+  both runs must show whether the current limit is opening pressure or a
+  deeper stream/origin boundary.
+- The opening-shape comparison on the same deployment produced: open16 load
+  `32847009440` / cleanup `32847218607` with `999/1,000` HTTP 200, one
+  Cloudflare 500 and eight incomplete-chunk errors; open64 load `32847283128`
+  / cleanup `32847524729` with `1,000/1,000` HTTP 200, zero HTTP errors and
+  eight incomplete-chunk errors. Both retained `nofile=32768/32768`, had no
+  429/503 or PostgreSQL connection/lock saturation, and remained classified
+  as DB-time hotspots. Open64 is the best handshake result, but neither is a
+  strict pass because the stream body did not complete cleanly for eight
+  clients.
+- The next candidate targets a concrete boundary found in the deployed
+  configuration: the SSE Nginx location used `proxy_read_timeout=60s`, equal
+  to the benchmark hold. The candidate raises only that route timeout to
+  `660s` (above the supported 600s stream lifetime); application leases,
+  per-user/global admission, keepalives and authorization are unchanged.
+  This is a timeout-lifecycle experiment, not an admission-limit increase.
