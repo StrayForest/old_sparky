@@ -821,6 +821,13 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
         if polling
         else None,
         "performance": report.get("performance", {}).get("bottleneck_summary", {}),
+        "fatal_error": report.get("fatal_error"),
+        "fatal_traceback": report.get("fatal_traceback"),
+        "performance_collection_error": report.get("performance_collection_error"),
+        "performance_collection_traceback": report.get(
+            "performance_collection_traceback"
+        ),
+        "scenarios": report.get("scenarios", []),
         "rows": [{
             "synthetic_users": len(report.get("user_ids", [])),
             "report_path": report.get("report_path"),

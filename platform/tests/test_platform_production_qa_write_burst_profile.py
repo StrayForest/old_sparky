@@ -3,6 +3,7 @@ import unittest
 from tools.platform_production_qa import (
     HttpMetricsRecorder,
     HttpSample,
+    SystemSampler,
     burst_offsets,
     follow_up_read_counts,
     evaluate_write_burst_profiles,
@@ -13,6 +14,56 @@ from tools.platform_production_qa import (
 
 
 class ProductionQaWriteBurstProfileTests(unittest.TestCase):
+    def test_system_summary_keeps_sample_window_when_postgres_has_active_queries(self) -> None:
+        sampler = SystemSampler.__new__(SystemSampler)
+        sampler.interval_seconds = 1.0
+        sampler.samples = [
+            {
+                "cpu_per_core_percent": {"cpu0": 10.0},
+                "memory_used_bytes": 100,
+                "memory_total_bytes": 200,
+                "swap_used_bytes": 0,
+                "swap_total_bytes": 0,
+                "load_average": {"1m": 0.1, "5m": 0.1, "15m": 0.1},
+                "nginx_connections": {"established": 1},
+                "postgres_connections": {"established": 2},
+                "redis_connections": {"established": 3},
+                "gunicorn": {"workers": 2},
+                "postgres_cpu_percent": 4.0,
+                "processes": {
+                    "api": {
+                        "process_count": 2,
+                        "cpu_percent": 10.0,
+                        "rss_bytes": 100,
+                        "read_bytes_per_second": 0,
+                        "write_bytes_per_second": 0,
+                    }
+                },
+                "postgres_waits": {
+                    "lock_waiters": 0,
+                    "waiting_backends": 0,
+                    "ungranted_locks": 0,
+                    "max_waiting_query_ms": 10,
+                    "max_lock_waiting_query_ms": 0,
+                    "active_query_samples": [{"query_age_ms": 10}],
+                },
+                "celery_backlog": {
+                    "deadlock-platform-high": 0,
+                    "deadlock-platform-default": 0,
+                    "deadlock-platform-low": 0,
+                },
+            }
+        ]
+
+        result = sampler.summary()
+
+        self.assertEqual(result["samples"], 1)
+        self.assertEqual(result["gunicorn_workers"]["last"], 2)
+        self.assertEqual(
+            result["postgres_waits"]["active_query_samples"][0]["query_age_ms"],
+            10,
+        )
+
     def test_burst_offsets_are_even_and_do_not_exceed_window(self) -> None:
         offsets = burst_offsets(count=5, spread_seconds=10)
 

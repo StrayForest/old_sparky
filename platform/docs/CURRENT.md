@@ -169,6 +169,18 @@ wait. The runner is being hardened to preserve the full traceback, isolate
 performance-summary failures and export the raw `qa-command.log`; cleanup
 `32880184859` removed the exact fixture and preserved the control account.
 
+The next observer-enabled 1,000-SSE run (`32881488410`) reached the application
+cleanly: 1,000/1,000 connections returned HTTP 200, there were no errors,
+429s or 503s, and all 1,000 expected events were delivered. Connect latency
+was p50/p95/p99 8.72/17.77/18.00 seconds; event delivery latency was
+395.5/574.2/584.7 ms. The run was still marked failed because the performance
+collector crashed while summarizing PostgreSQL active-query samples. The
+collector was fixed to keep its system-sample window separate from those
+rows, with a regression test; exact cleanup `32882110537` removed the fixture
+and preserved the control account. This is a valid 1k SSE transport result,
+but not yet the final staircase gate until the repaired collector produces
+complete telemetry.
+
 To reduce repeated CI/CD runs, AS-19 is explicitly local-first: classify origin
 versus Nginx/edge closes, compare Redis TCP connections with active SSE, and
 reject failed candidates locally before promoting one exact-SHA diagnostic run.

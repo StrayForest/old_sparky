@@ -553,3 +553,14 @@ stores only the measured conclusion and run identifiers.
   failures from the primary error and exports raw `qa-command.log`. Exact
   cleanup `32880184859` removed the fixture and preserved the control account;
   this run is invalid and is not included in the SSE staircase.
+- The next observer-enabled 1,000-SSE run (`32881488410`) reached the
+  application cleanly: 1,000/1,000 connections returned HTTP 200, with zero
+  errors, 429s or 503s, and all 1,000 expected events delivered. Connect
+  latency was p50/p95/p99 8.72/17.77/18.00 seconds; event delivery latency was
+  395.5/574.2/584.7 ms. The overall workflow was nevertheless red because
+  the performance collector crashed while summarizing PostgreSQL active-query
+  samples. The collector now keeps that row list separate from the system
+  sample window and has a regression test. Exact cleanup `32882110537`
+  removed the fixture and preserved the control account. Treat this as a
+  valid 1k SSE transport result, but rerun the repaired collector before using
+  it as the staircase gate.

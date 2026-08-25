@@ -1269,11 +1269,11 @@ class SystemSampler:
         ]
         active_query_samples: list[dict[str, Any]] = []
         for row in postgres_wait_rows:
-            samples = row.get("active_query_samples")
-            if not isinstance(samples, list):
+            active_rows = row.get("active_query_samples")
+            if not isinstance(active_rows, list):
                 continue
             active_query_samples.extend(
-                sample for sample in samples if isinstance(sample, dict)
+                sample for sample in active_rows if isinstance(sample, dict)
             )
         active_query_samples.sort(
             key=lambda sample: float(sample.get("query_age_ms") or 0),
