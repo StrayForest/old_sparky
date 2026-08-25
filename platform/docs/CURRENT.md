@@ -23,7 +23,7 @@ Read this file for the current production baseline and next engineering priority
 - Tournament invite claims/revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Last invite use and last participant slot cannot be consumed twice, and restoring a retained inactive participant rechecks capacity before making the row active again.
 - Anonymous public profile contracts omit account/contact email and Steam authentication identity. Public tournament participant/workspace contracts omit moderation note, moderator identity and moderation timestamps; organizer management uses a separate response DTO that retains those fields.
 - Public tournament automation errors are persistence-sanitized before commit: `automation_last_error` can contain only the stable generic retry message, while restricted logs retain only tournament/failure metadata and a one-way error fingerprint. Migration `20260821_0039` rewrites historical non-null values to the same safe message.
-- Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. The AS-19 capacity candidate raises the global ceilings to application `10,240`, Nginx `10,240` and Nginx `worker_connections=32,768`; the existing deployed contour remains the release baseline until that candidate passes CI, deploy smoke and the controlled 10+5 experiment.
+- Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. The deployed AS-19 candidate uses application/Nginx global ceilings of `10,240` and Nginx `worker_connections=32,768`; relay fan-out, short-lived DB access checks and bounded Redis limiter pooling are enabled. A guarded live 10k SSE result is still required before treating those ceilings as proven capacity.
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
@@ -108,11 +108,26 @@ had 10,000/10,000 HTTP 200, 10,000/10,000 events, Redis peak 146, PostgreSQL
 peak 31, no Redis rejection increase and no PostgreSQL connection growth with
 active SSE. Its p95 connection-open latency was 309.4s, so handshake speed and
 the combined polling+SSE profile remain release gates. This local result does
-not authorize production or a 10,000-persistent-SSE claim: the exact-SHA
-CI/deploy gate, one guarded live diagnostic, the five follow-up correctness
-checks and the combined run are still required. The prior per-stream Redis
+not authorize a 10,000-persistent-SSE claim: the exact-SHA CI/deploy gate and
+live smoke passed, but the first guarded live diagnostic stopped during
+authenticated fixture setup before any SSE opened. The five follow-up
+correctness checks and the combined run are still required. The prior per-stream Redis
 shape is rejected at 10k because it produced 18 limiter `503`s and Redis peak
 10,000.
+
+The relay winner is deployed in `4f4b5863207e37cc2c9993be8d03f0cb72d10a66`;
+security/build `32865611322`, automatic deploy `32866234695` and production
+deploy/live smoke `32866244193` all passed. The first guarded live 10k SSE
+diagnostic (`32866749952`) stopped before SSE at the fixture setup boundary:
+the first authenticated CSRF request returned a Cloudflare 504 after about
+30.2s. It is not a live SSE result. Exact cleanup (`32866955426`) deleted
+10,000 synthetic users, left zero fixture users/tournaments/sessions/audit
+rows and preserved `aleksei.lisitsin1@gmail.com`. The evidence points to
+setup write amplification: the runner was persisting a growing 10k identity
+JSON into `PreprodTestRun` after every 500-user batch. Progress checkpoints are
+being compacted, with exact marker-scoped recovery retained for interrupted
+runs, before the next live attempt; the fix is ready for the next exact-SHA
+release gate.
 
 To reduce repeated CI/CD runs, AS-19 is explicitly local-first: classify origin
 versus Nginx/edge closes, compare Redis TCP connections with active SSE, and

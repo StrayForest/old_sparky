@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from uuid import uuid4
 
 from tools.platform_production_qa import (
     PollingMetricsRecorder,
@@ -133,6 +134,29 @@ class ProductionQaPollingProfileTests(unittest.TestCase):
 
         self.assertEqual(qa.scale_users, 10_000)
         self.assertEqual(qa.browser_polling_users_per_tournament, 500)
+
+    def test_preprod_progress_snapshot_bounds_large_identity_lists(self) -> None:
+        qa = ProductionQa(
+            origin="http://127.0.0.1",
+            report_path=Path("/tmp/platform-production-qa-progress-test.json"),
+            browser_gate_dir=None,
+            browser_gate_timeout=1.0,
+            http_timeout=1.0,
+            keep_data=True,
+            mode="browser-polling",
+        )
+        user_ids = [str(uuid4()) for _ in range(100)]
+        qa.user_ids.extend(user_ids)
+        qa.report["user_ids"] = qa.user_ids
+
+        progress = qa._preprod_report_snapshot(progress=True)
+        final = qa._preprod_report_snapshot(progress=False)
+
+        self.assertEqual(progress["user_ids"]["count"], 100)
+        self.assertEqual(progress["user_ids"]["first"], user_ids[:4])
+        self.assertEqual(progress["user_ids"]["last"], user_ids[-4:])
+        self.assertTrue(progress["fixture_progress"]["exact_identity_report_deferred_until_phase_completion"])
+        self.assertEqual(final["user_ids"], user_ids)
 
     def test_polling_metrics_group_events(self) -> None:
         recorder = PollingMetricsRecorder()

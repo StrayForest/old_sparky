@@ -29,11 +29,14 @@ sys.path.insert(0, str(PLATFORM_ROOT))
 
 from python_packages.platform_infra.config import get_settings, validate_platform_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
-from python_packages.platform_infra.models import PreprodTestRun
+from python_packages.platform_infra.models import PreprodTestRun, User
 
 
 EXPECTED_ORIGIN = "https://old-sparky.com"
 MARKER_PATTERN = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
+SYNTHETIC_EMAIL_PATTERN = re.compile(
+    r"^(?P<marker>preprod[0-9]{12}[0-9a-f]{4})-[a-z0-9-]+@example\.com$"
+)
 RUN_ROOT_PATTERN = re.compile(
     r"^/opt/oldsparky/platform/shared/production-retained-matrix/gha-(?P<run_id>[0-9]+)$"
 )
@@ -86,6 +89,53 @@ def _uuid_list(value: Any, *, field: str) -> list[str]:
     if len(result) != len(set(result)):
         raise RuntimeError(f"{field} must not contain duplicate UUIDs")
     return result
+
+
+async def _recover_progress_user_ids(
+    db_session: Any,
+    *,
+    stored_report: dict[str, Any],
+    marker: str,
+) -> list[str]:
+    """Rebuild an exact user inventory after an interrupted progress checkpoint.
+
+    Progress checkpoints intentionally retain only a bounded ID sample. The
+    marker-scoped email query is the recovery path when a process is killed
+    before its final full report is written; it never broadens cleanup beyond
+    the canonical synthetic fixture namespace.
+    """
+
+    raw_ids = stored_report.get("user_ids")
+    if isinstance(raw_ids, list):
+        return _uuid_list(raw_ids, field="user_ids")
+    if not isinstance(raw_ids, dict):
+        raise RuntimeError("durable QA row contains no recoverable user inventory")
+    progress = stored_report.get("fixture_progress")
+    if not isinstance(progress, dict) or progress.get("marker") != marker:
+        raise RuntimeError("durable QA progress identity does not match its marker")
+    expected_count = int(raw_ids.get("count") or progress.get("synthetic_user_count") or 0)
+    if expected_count <= 0:
+        raise RuntimeError("durable QA progress contains no synthetic user count")
+
+    rows = list(
+        (
+            await db_session.execute(
+                select(User.id, User.email).where(
+                    User.email.like(f"{marker}-%@example.com")
+                )
+            )
+        ).all()
+    )
+    user_ids: list[str] = []
+    for row in rows:
+        email = str(row.email or "").lower()
+        match = SYNTHETIC_EMAIL_PATTERN.fullmatch(email)
+        if match is None or match.group("marker") != marker:
+            raise RuntimeError("durable QA recovery found an invalid synthetic email")
+        user_ids.append(str(row.id))
+    if len(user_ids) != expected_count or len(user_ids) != len(set(user_ids)):
+        raise RuntimeError("durable QA recovery user count does not match its progress checkpoint")
+    return _uuid_list(sorted(user_ids), field="user_ids")
 
 
 def _write_root_json(path: Path, payload: dict[str, Any]) -> None:
@@ -209,16 +259,19 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
             )
         run = rows[0]
         stored = dict(run.report or {})
-
-    marker = str(stored.get("marker") or run.marker or "")
-    if not MARKER_PATTERN.fullmatch(marker) or run.marker != marker:
-        raise RuntimeError("durable QA marker is not a canonical retained-load marker")
-    if run.origin != EXPECTED_ORIGIN or stored.get("origin") != EXPECTED_ORIGIN:
-        raise RuntimeError("durable QA provenance is not the canonical production origin")
-    if stored.get("mode") != args.mode:
-        raise RuntimeError("durable QA row mode does not match the selected retained profile")
-    user_ids = _uuid_list(stored.get("user_ids"), field="user_ids")
-    tournament_ids = _uuid_list(stored.get("tournament_ids"), field="tournament_ids")
+        marker = str(stored.get("marker") or run.marker or "")
+        if not MARKER_PATTERN.fullmatch(marker) or run.marker != marker:
+            raise RuntimeError("durable QA marker is not a canonical retained-load marker")
+        if run.origin != EXPECTED_ORIGIN or stored.get("origin") != EXPECTED_ORIGIN:
+            raise RuntimeError("durable QA provenance is not the canonical production origin")
+        if stored.get("mode") != args.mode:
+            raise RuntimeError("durable QA row mode does not match the selected retained profile")
+        user_ids = await _recover_progress_user_ids(
+            db_session,
+            stored_report=stored,
+            marker=marker,
+        )
+        tournament_ids = _uuid_list(stored.get("tournament_ids"), field="tournament_ids")
     if not user_ids:
         raise RuntimeError("durable QA row contains no synthetic users to recover")
     if str(stored.get("report_path") or run.report_path) != str(report_path):

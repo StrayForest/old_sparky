@@ -94,6 +94,10 @@ BROWSER_POLLING_OPEN_STAGGER_SECONDS = 30.0
 BROWSER_POLLING_FIXED_INTERVAL_MS = 10_000
 BROWSER_POLLING_DEFAULT_INTERVAL_MS = 15_000
 BROWSER_POLLING_JITTER_MS = 3_000
+# Progress checkpoints are written while a retained fixture is being built.
+# Do not serialize the complete 10k-user identity inventory on every batch;
+# the final report still contains the exact inventory used by cleanup.
+PREPROD_PROGRESS_ID_SAMPLE_SIZE = 4
 BROWSER_POLLING_READY_TEAMS = 2
 # The browser profile measures read fan-out, conditional responses and tab
 # lifecycle.  A small but valid roster keeps fixture creation from becoming a
@@ -2419,7 +2423,29 @@ class ProductionQa:
             return False
         return True
 
-    async def record_preprod_run(self, **updates: Any) -> None:
+    def _preprod_report_snapshot(self, *, progress: bool) -> dict[str, Any]:
+        snapshot = dict(self.report)
+        if not progress:
+            return snapshot
+
+        for key in ("user_ids", "tournament_ids", "tournament_slugs"):
+            value = snapshot.get(key)
+            if not isinstance(value, list) or len(value) <= PREPROD_PROGRESS_ID_SAMPLE_SIZE * 2:
+                continue
+            snapshot[key] = {
+                "count": len(value),
+                "first": value[:PREPROD_PROGRESS_ID_SAMPLE_SIZE],
+                "last": value[-PREPROD_PROGRESS_ID_SAMPLE_SIZE:],
+                "complete_inventory_in_final_report": True,
+            }
+        snapshot["fixture_progress"] = {
+            "marker": self.marker,
+            "synthetic_user_count": len(self.user_ids),
+            "exact_identity_report_deferred_until_phase_completion": True,
+        }
+        return snapshot
+
+    async def record_preprod_run(self, *, progress: bool = False, **updates: Any) -> None:
         async with session_factory()() as db_session:
             run = await db_session.scalar(select(PreprodTestRun).where(PreprodTestRun.marker == self.marker))
             if run is None:
@@ -2434,13 +2460,13 @@ class ProductionQa:
                     ),
                     report_path=str(self.report_path),
                     started_at=datetime.now(UTC),
-                    report=dict(self.report),
+                    report=self._preprod_report_snapshot(progress=progress),
                 )
                 db_session.add(run)
             for key, value in updates.items():
                 if hasattr(run, key):
                     setattr(run, key, value)
-            run.report = dict(self.report)
+            run.report = self._preprod_report_snapshot(progress=progress)
             await db_session.commit()
 
     async def add_retained_participant(self) -> dict[str, Any] | None:
@@ -2847,7 +2873,7 @@ class ProductionQa:
                         db_session.add(UserRole(user_id=user.id, role_id=role.id))
                 await db_session.commit()
                 self.report["created_users"] = len(users)
-                await self.record_preprod_run(created_users=len(users))
+                await self.record_preprod_run(progress=True, created_users=len(users))
 
         self.users_by_id.update({user["id"]: user for user in users})
         return users

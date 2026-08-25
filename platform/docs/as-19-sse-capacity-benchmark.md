@@ -473,3 +473,30 @@ stores only the measured conclusion and run identifiers.
   the run also raised the load-average flag and PostgreSQL CPU hotspot. The
   candidate is rejected and the SSE timeout is restored to `60s`; this
   experiment does not justify increasing proxy lifetime or admission limits.
+- The relay winner was then packaged as `4f4b5863` and passed the exact-SHA
+  security/build gate `32865611322`, automatic deploy `32866234695` and
+  production deploy/live smoke `32866244193`. The local 10k strict result is
+  therefore deployed, but that release gate does not itself prove 10k public
+  SSE capacity.
+- The first guarded live 10k SSE diagnostic on that release was load
+  `32866749952`, cleanup `32866955426`. It did not reach SSE: after creating
+  10,000 synthetic users, the first authenticated `GET /auth/csrf` used for
+  tournament setup returned a Cloudflare `504` after about 30.2s. No SSE
+  connection, event or admission result is inferred from this run. Production
+  sampling showed PostgreSQL peak CPU but no sustained API CPU, Redis rejection
+  or PostgreSQL connection/lock flag; the setup path is therefore a separate
+  measured bottleneck, not evidence that the relay failed.
+- The live failure exposed write amplification in the fixture runner: user
+  creation persisted a growing JSON identity list to `PreprodTestRun` after
+  every 500-user batch, immediately before API setup. The runner now stores a
+  bounded progress sample during that phase and keeps the complete identity
+  inventory for the final report; interrupted-run recovery reconstructs the
+  exact marker-scoped user set from synthetic email identities. This keeps
+  cleanup fail-closed while removing setup-report serialization from the SSE
+  measurement. The change must pass local verification and a new exact-SHA
+  deploy before another live 10k attempt.
+- Exact cleanup of the failed live run deleted 10,000 synthetic users and
+  verified zero remaining fixture users, tournaments, sessions or audit rows;
+  `aleksei.lisitsin1@gmail.com` was preserved. The combined polling+SSE live
+  contour, reconnects, slow-consumer behavior and delta-response savings are
+  still open gates.
