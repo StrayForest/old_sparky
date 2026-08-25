@@ -42,8 +42,8 @@ class PlatformSseSessionRevocationTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(
                     access,
-                    "session_factory",
-                    MagicMock(return_value=lambda: _FakeSession(("invite_only", "organizer-1", None))),
+                    "stream_db_session",
+                    MagicMock(return_value=_FakeSession(("invite_only", "organizer-1", None))),
                 ),
                 patch.object(
                     access,
@@ -77,8 +77,8 @@ class PlatformSseSessionRevocationTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(
                     access,
-                    "session_factory",
-                    MagicMock(return_value=lambda: _FakeSession(("invite_only", "organizer-1", None))),
+                    "stream_db_session",
+                    MagicMock(return_value=_FakeSession(("invite_only", "organizer-1", None))),
                 ),
                 patch.object(
                     access,
@@ -111,8 +111,8 @@ class PlatformSseSessionRevocationTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(
                     access,
-                    "session_factory",
-                    MagicMock(return_value=lambda: _FakeSession(("invite_only", "organizer-1", "registered"))),
+                    "stream_db_session",
+                    MagicMock(return_value=_FakeSession(("invite_only", "organizer-1", "registered"))),
                 ),
                 patch.object(
                     access,
