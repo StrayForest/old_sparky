@@ -1016,6 +1016,37 @@ async def sample_postgres_waits() -> dict[str, Any]:
                                 WHERE db.datname = current_database()
                                   AND NOT locks.granted
                             ) AS ungranted_locks
+                            ,(
+                                SELECT COALESCE(
+                                    json_agg(
+                                        json_build_object(
+                                            'state', activity.state,
+                                            'wait_event_type', activity.wait_event_type,
+                                            'wait_event', activity.wait_event,
+                                            'query_age_ms', round(
+                                                extract(epoch FROM now() - activity.query_start) * 1000,
+                                                3
+                                            ),
+                                            'query', left(
+                                                regexp_replace(activity.query, E'\\s+', ' ', 'g'),
+                                                240
+                                            )
+                                        )
+                                        ORDER BY activity.query_start
+                                    ),
+                                    '[]'::json
+                                )
+                                FROM (
+                                    SELECT state, wait_event_type, wait_event, query_start, query
+                                    FROM pg_stat_activity
+                                    WHERE datname = current_database()
+                                      AND pid <> pg_backend_pid()
+                                      AND state = 'active'
+                                      AND query_start IS NOT NULL
+                                    ORDER BY query_start
+                                    LIMIT 8
+                                ) AS activity
+                            ) AS active_query_samples
                         """
                     )
                 )
@@ -1030,6 +1061,7 @@ async def sample_postgres_waits() -> dict[str, Any]:
                     3,
                 ),
                 "ungranted_locks": int(row["ungranted_locks"] or 0),
+                "active_query_samples": row["active_query_samples"] or [],
             }
     except Exception as exc:
         return {"error": type(exc).__name__}
@@ -1235,6 +1267,18 @@ class SystemSampler:
             float(row.get("max_lock_waiting_query_ms") or 0)
             for row in postgres_wait_rows
         ]
+        active_query_samples: list[dict[str, Any]] = []
+        for row in postgres_wait_rows:
+            samples = row.get("active_query_samples")
+            if not isinstance(samples, list):
+                continue
+            active_query_samples.extend(
+                sample for sample in samples if isinstance(sample, dict)
+            )
+        active_query_samples.sort(
+            key=lambda sample: float(sample.get("query_age_ms") or 0),
+            reverse=True,
+        )
         backlog_rows = [
             sample.get("celery_backlog", {})
             for sample in samples
@@ -1372,6 +1416,7 @@ class SystemSampler:
                     max(postgres_lock_waiting_query_ms or [0]),
                     3,
                 ),
+                "active_query_samples": active_query_samples[:16],
             },
             "celery_backlog": {
                 "samples": len(backlog_rows),
@@ -2874,6 +2919,24 @@ class ProductionQa:
                 await db_session.commit()
                 self.report["created_users"] = len(users)
                 await self.record_preprod_run(progress=True, created_users=len(users))
+
+            # The fixture is inserted directly for deterministic scale setup.
+            # Refresh planner statistics before the first authenticated API
+            # request so a large synthetic session set cannot be measured with
+            # stale estimates from the previous cleanup state.
+            await db_session.execute(
+                text(
+                    "ANALYZE platform.users, platform.sessions, platform.user_roles"
+                )
+            )
+            await db_session.commit()
+            self.report["fixture_statistics"] = {
+                "analyzed": [
+                    "platform.users",
+                    "platform.sessions",
+                    "platform.user_roles",
+                ]
+            }
 
         self.users_by_id.update({user["id"]: user for user in users})
         return users

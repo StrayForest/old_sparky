@@ -246,6 +246,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             'live_env = Path("/opt/oldsparky/platform/shared/.env.platform")',
             qa_source,
         )
+        self.assertIn(
+            "ANALYZE platform.users, platform.sessions, platform.user_roles",
+            qa_source,
+        )
+        self.assertIn("active_query_samples", qa_source)
 
     def test_release_ref_is_rejected_before_any_build_or_network_work(self) -> None:
         unsafe_refs = ("../escape", "bad/ref", 'bad"json', "-leading", "x" * 101)

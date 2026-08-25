@@ -515,3 +515,16 @@ stores only the measured conclusion and run identifiers.
   tournaments, sessions or audit rows and the control account preserved. The
   next strict run must use the barrier/event-delivery runner before any claim
   is made about complete 10k fan-out.
+- The strict barrier/event-delivery runner was deployed as
+  `da203bd1f78dd52658b9a05f3964218266de094d` after security/build
+  `32871147286`, automatic deploy `32871730205` and production deploy/live
+  smoke `32871738322`. Its guarded run `32872200332` again stopped before SSE:
+  after 10,000 users were inserted, the first authenticated `GET /auth/csrf`
+  returned Cloudflare `504` after about 30.2s. The runner's strict fan-out gate
+  was therefore never reached and no SSE capacity conclusion is inferred.
+  Exact cleanup `32872451869` deleted 10,000 users and verified zero remaining
+  fixture users, tournaments, sessions or audit rows while preserving the
+  control account. The next setup A/B refreshes PostgreSQL statistics for
+  `users`, `sessions` and `user_roles` after direct fixture inserts and records
+  bounded active-query samples from `pg_stat_activity`; this is a setup
+  diagnostic, not a change to API/DB/SSE admission limits.

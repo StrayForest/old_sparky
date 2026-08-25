@@ -135,6 +135,18 @@ The opening-capacity repeat was cleaned by `32870304826`: 10,000 synthetic
 users and 20 tournaments deleted, zero remaining users/tournaments/sessions/
 audit rows, control account preserved.
 
+The strict barrier/event-delivery runner was deployed as
+`da203bd1f78dd52658b9a05f3964218266de094d` after security/build
+`32871147286`, automatic deploy `32871730205` and production deploy/live smoke
+`32871738322` passed. Its guarded 10k run `32872200332` did not reach SSE:
+the same authenticated fixture-setup `GET /auth/csrf` returned Cloudflare 504
+after about 30.2s, before tournament creation. This repeats the setup boundary
+and is not evidence against the relay or SSE fan-out. Exact cleanup
+`32872451869` deleted 10,000 users and verified zero remaining fixture users,
+tournaments, sessions and audit rows while preserving the control account.
+The next setup hypothesis refreshes PostgreSQL statistics after direct fixture
+inserts and records bounded active PostgreSQL query samples during the run.
+
 To reduce repeated CI/CD runs, AS-19 is explicitly local-first: classify origin
 versus Nginx/edge closes, compare Redis TCP connections with active SSE, and
 reject failed candidates locally before promoting one exact-SHA diagnostic run.
