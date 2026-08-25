@@ -62,6 +62,14 @@ on:
         required: true
         default: "1"
         type: string
+      sse_origin_mode:
+        description: "SSE transport target; public includes Cloudflare, origin-local measures the VPS origin"
+        required: true
+        default: "public"
+        type: choice
+        options:
+          - public
+          - origin-local
       combined_polling_duration:
         description: "Combined polling window in seconds (1-300)"
         required: true
@@ -101,6 +109,7 @@ jobs:
       QA_SSE_USERS_PER_TOURNAMENT: ${{ inputs.sse_users_per_tournament }}
       QA_SSE_EVENT_COUNT: ${{ inputs.sse_event_count }}
       QA_SSE_EVENT_INTERVAL: ${{ inputs.sse_event_interval }}
+      QA_SSE_ORIGIN_MODE: ${{ inputs.sse_origin_mode }}
       QA_COMBINED_POLLING_DURATION: ${{ inputs.combined_polling_duration }}
       QA_COMBINED_POLLING_OPEN_STAGGER: ${{ inputs.combined_polling_open_stagger }}
       TARGET_SHA: ${{ github.sha }}
@@ -125,7 +134,8 @@ jobs:
             "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" \
             "$QA_SSE_RECONNECT_CYCLES" "$QA_SSE_USERS_PER_TOURNAMENT" \
             "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
-            "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" <<'PY'
+            "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" \
+            "$QA_SSE_ORIGIN_MODE" <<'PY'
           import re
           import sys
 
@@ -142,11 +152,16 @@ jobs:
               sse_event_interval,
               combined_polling_duration,
               combined_polling_open_stagger,
+              sse_origin_mode,
           ) = sys.argv[1:]
           if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email):
               raise SystemExit("control_email is invalid")
           if not re.fullmatch(r"[1-9][0-9]{0,2}", concurrency) or not 1 <= int(concurrency) <= 256:
               raise SystemExit("concurrency must be an integer from 1 to 256")
+          if sse_origin_mode not in {"public", "origin-local"}:
+              raise SystemExit("sse_origin_mode must be public or origin-local")
+          if sse_origin_mode == "origin-local" and profile != "sse":
+              raise SystemExit("origin-local is only supported for the SSE profile")
           if profile in {"sse", "combined"}:
               integer_ranges = {
                   "sse_connections": (sse_connections, 1, 10000),
@@ -221,7 +236,7 @@ jobs:
             bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$CONTROL_EMAIL" "$QA_CONCURRENCY" "$GITHUB_RUN_ID" "$QA_PROFILE" \
               "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" "$QA_SSE_RECONNECT_CYCLES" \
               "$QA_SSE_USERS_PER_TOURNAMENT" "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
-              "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" \
+              "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" "$QA_SSE_ORIGIN_MODE" \
             > "$ssh_output_file" 2>&1 <<'REMOTE'
           set -Eeuo pipefail
           confirmation="$1"

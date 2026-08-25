@@ -28,8 +28,8 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# < 5 || $# > 15 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger]" >&2
+if (( $# < 5 || $# > 16 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local]]" >&2
   exit 2
 fi
 
@@ -52,6 +52,15 @@ case "$profile" in
     sse_event_interval="${13:-1}"
     combined_polling_duration="${14:-30}"
     combined_polling_open_stagger="${15:-300}"
+    sse_origin_mode="${16:-public}"
+    [[ "$sse_origin_mode" == "public" || "$sse_origin_mode" == "origin-local" ]] || {
+      echo "SSE origin mode must be public or origin-local." >&2
+      exit 1
+    }
+    if [[ "$sse_origin_mode" == "origin-local" && "$profile" != "sse" ]]; then
+      echo "origin-local is only supported for the SSE-only profile." >&2
+      exit 1
+    fi
     [[ "$sse_connections" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_connections <= 10000 )) || {
       echo "SSE connections must be an integer from 1 to 10000." >&2
       exit 1
@@ -343,6 +352,10 @@ else
   install -d -o root -g root -m 0700 "$sse_root"
   sse_report="$sse_root/$profile.json"
   sse_summary="$sse_root/matrix-summary.json"
+  sse_origin="$EXPECTED_ORIGIN"
+  if [[ "$sse_origin_mode" == "origin-local" ]]; then
+    sse_origin="http://127.0.0.1:8010"
+  fi
   # Fixture creation performs authenticated CSRF/session reads. Keep that
   # setup below the API pool budget; SSE opening pressure is controlled
   # independently by --sse-open-concurrency below.
@@ -351,7 +364,8 @@ else
   run_monitored "$log_path" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_sse_qa.py" \
     --env-file "$RUNTIME_ROOT/shared/.env.platform" \
-    --origin "$EXPECTED_ORIGIN" \
+    --origin "$sse_origin" \
+    --request-origin "$EXPECTED_ORIGIN" \
     --mode "$profile" \
     --control-email "$control_email" \
     --target-sha "$target_sha" \

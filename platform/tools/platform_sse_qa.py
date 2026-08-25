@@ -173,6 +173,11 @@ def parse_args() -> argparse.Namespace:
         description="Run retained SSE-only or polling+SSE production QA."
     )
     parser.add_argument("--origin", default=DEFAULT_ORIGIN)
+    parser.add_argument(
+        "--request-origin",
+        default=None,
+        help="Origin header to send when --origin points at a direct origin address.",
+    )
     parser.add_argument("--env-file", type=Path, default=None)
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
     parser.add_argument("--summary-path", type=Path, default=None)
@@ -332,7 +337,7 @@ async def consume_sse_connection(
     headers = {
         "Accept": "text/event-stream, application/problem+json",
         "Cache-Control": "no-cache",
-        "Origin": qa.origin,
+        "Origin": qa.request_origin,
         "Cookie": f"{qa.session_cookie_name}={token}",
         "X-Platform-QA-Phase": qa.current_phase,
         SSE_LOAD_TEST_BYPASS_HEADER: sse_load_test_bypass_token(get_settings()),
@@ -577,6 +582,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
 
     qa = ProductionQa(
         origin=args.origin,
+        request_origin=args.request_origin,
         report_path=args.report_path,
         keep_data=args.keep_data,
         browser_gate_dir=None,

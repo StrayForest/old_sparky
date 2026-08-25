@@ -209,6 +209,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertIn("environment: production", workflow)
             self.assertIn("actions/upload-artifact@v6", workflow)
         self.assertIn("RUN-PRODUCTION-RETAINED-LOAD-MATRIX", load_workflow)
+        self.assertIn("sse_origin_mode", load_workflow)
+        self.assertIn("origin-local", load_workflow)
         self.assertIn("DELETE-PRODUCTION-RETAINED-LOAD", cleanup_workflow)
         self.assertIn("ABORT-PRODUCTION-RETAINED-LOAD", abort_workflow)
         self.assertIn("ABORT_EVIDENCE_EXPORT=", abort_workflow)

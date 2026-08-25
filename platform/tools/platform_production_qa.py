@@ -1821,6 +1821,7 @@ class ProductionQa:
         self,
         *,
         origin: str,
+        request_origin: str | None = None,
         report_path: Path,
         keep_data: bool,
         browser_gate_dir: Path | None,
@@ -1858,6 +1859,7 @@ class ProductionQa:
         self.marker = f"{prefix}{timestamp}{secrets.token_hex(2)}"
         self.origin = origin.rstrip("/")
         self.api_origin = f"{self.origin}/api/v1"
+        self.request_origin = (request_origin or self.origin).rstrip("/")
         self.report_path = report_path
         self.keep_data = keep_data
         requested_tournament_name = (tournament_name or "").strip()
@@ -1980,6 +1982,7 @@ class ProductionQa:
             "marker": self.marker,
             "started_at": datetime.now(UTC).isoformat(),
             "origin": self.origin,
+            "request_origin": self.request_origin,
             "mode": mode,
             "report_path": str(report_path),
             "requested_users": self.scale_users if mode in {"scale", "browser-polling", "write-burst"} else None,
@@ -2131,11 +2134,11 @@ class ProductionQa:
         try:
             headers = (
                 {
-                    "Origin": self.origin,
+                    "Origin": self.request_origin,
                     "X-Platform-QA-Phase": self.current_phase,
                 }
                 if self.collect_performance
-                else {"Origin": self.origin}
+                else {"Origin": self.request_origin}
             )
             response = await client.request(
                 method,
@@ -2191,7 +2194,7 @@ class ProductionQa:
         response_bytes = 0
         try:
             request_headers = {
-                "Origin": self.origin,
+                "Origin": self.request_origin,
                 "Cookie": "; ".join(
                     filter(
                         None,
@@ -2271,7 +2274,7 @@ class ProductionQa:
             response = await client.get(
                 "/auth/csrf",
                 headers={
-                    "Origin": self.origin,
+                    "Origin": self.request_origin,
                     "Cookie": f"{self.session_cookie_name}={session_token}",
                 },
             )

@@ -181,6 +181,17 @@ and preserved the control account. This is a valid 1k SSE transport result,
 but not yet the final staircase gate until the repaired collector produces
 complete telemetry.
 
+The first 5,000-SSE public-origin run (`32883773066`) reached the VPS only
+partially: 3,535 connections returned HTTP 200 and 1,465 returned Cloudflare
+503 Error 1200 (`cache_connection_limit`, `Retry-After: 60`). Application
+429s were zero, PostgreSQL lock contention was not observed, and sustained CPU
+saturation was false; the red result is therefore an edge-capacity result,
+not an origin-capacity result. Exact cleanup `32884651890` removed the 10k
+fixture set and preserved the control account. The retained-load harness now
+supports an explicit `origin-local` SSE mode (`127.0.0.1:8010` with the
+canonical production Origin header) to measure the VPS origin without
+Cloudflare; public mode remains the separate edge acceptance test.
+
 To reduce repeated CI/CD runs, AS-19 is explicitly local-first: classify origin
 versus Nginx/edge closes, compare Redis TCP connections with active SSE, and
 reject failed candidates locally before promoting one exact-SHA diagnostic run.

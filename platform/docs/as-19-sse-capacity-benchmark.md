@@ -564,3 +564,14 @@ stores only the measured conclusion and run identifiers.
   removed the fixture and preserved the control account. Treat this as a
   valid 1k SSE transport result, but rerun the repaired collector before using
   it as the staircase gate.
+- The first 5,000-SSE public-origin run (`32883773066`) reached the VPS only
+  partially: 3,535 connections returned HTTP 200 and 1,465 returned Cloudflare
+  503 Error 1200 (`cache_connection_limit`, with `Retry-After: 60`). The
+  application emitted zero 429s; PostgreSQL lock contention was not observed
+  and sustained CPU saturation was false. This is an edge-capacity result,
+  not an origin-capacity result. Exact cleanup `32884651890` removed the
+  10k-user/20-tournament fixtures and preserved the control account. The
+  retained-load harness now has an explicit `origin-local` SSE mode using
+  `127.0.0.1:8010` with the canonical production `Origin` header, so the
+  remaining 5k/10k staircase can separate Cloudflare edge capacity from VPS
+  origin capacity.
