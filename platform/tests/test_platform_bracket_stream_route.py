@@ -1,40 +1,41 @@
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+import inspect
 
 from apps.platform_api.app.api.routes import tournaments
+from apps.platform_api.app.main import create_app
+from python_packages.platform_infra.db import get_db_session
 
 
 class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
-    async def test_sse_route_closes_request_db_session_before_streaming(self) -> None:
-        db_session = AsyncMock()
-        tournament = SimpleNamespace(id="tournament-1", visibility="public")
+    def test_sse_dependency_graph_uses_function_scoped_db_sessions(self) -> None:
+        app = create_app()
+        route_context = next(
+            context
+            for included_router in app.router.routes
+            if type(included_router).__name__ == "_IncludedRouter"
+            for context in included_router.effective_route_contexts()
+            if context.path == "/api/v1/tournaments/{slug}/bracket/events"
+        )
 
-        with (
-            patch.object(
-                tournaments,
-                "get_tournament_or_404",
-                new=AsyncMock(return_value=tournament),
-            ),
-            patch.object(
-                tournaments,
-                "ensure_tournament_workspace_visible",
-            ),
-            patch.object(
-                tournaments,
-                "stream_bracket_events",
-            ),
-        ):
-            response = await tournaments.get_tournament_bracket_events(
-                "cup-1",
-                auth_session=None,
-                db_session=db_session,
-            )
+        db_dependencies = []
 
-        self.assertEqual(response.media_type, "text/event-stream")
-        db_session.close.assert_awaited_once()
+        def collect(dependant) -> None:
+            if dependant.call is get_db_session:
+                db_dependencies.append(dependant)
+            for child in dependant.dependencies:
+                collect(child)
+
+        collect(route_context.dependant)
+        self.assertGreaterEqual(len(db_dependencies), 1)
+        self.assertTrue(all(item.scope == "function" for item in db_dependencies))
+
+    def test_sse_endpoint_uses_function_scoped_db_dependency(self) -> None:
+        parameter = inspect.signature(
+            tournaments.get_tournament_bracket_events
+        ).parameters["db_session"]
+        self.assertEqual(parameter.default.scope, "function")
 
 
 if __name__ == "__main__":

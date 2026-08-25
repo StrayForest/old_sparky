@@ -211,7 +211,7 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
 async def ensure_private_tournament_read_membership_is_active(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session),
-    db_session: AsyncSession = Depends(get_db_session),
+    db_session: AsyncSession = Depends(get_db_session, scope="function"),
 ) -> None:
     """Prevent retained participant rows from acting as private-read membership.
 

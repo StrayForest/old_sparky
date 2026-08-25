@@ -63,7 +63,7 @@ async def _reject_disqualified_invite_claim(
 async def enforce_tournament_participant_policy(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session),
-    db_session: AsyncSession = Depends(get_db_session),
+    db_session: AsyncSession = Depends(get_db_session, scope="function"),
 ) -> None:
     """Reject invite redemption for retained tournament disqualifications."""
 

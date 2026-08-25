@@ -485,7 +485,7 @@ async def _touch_authenticated_session(
 
 async def get_authenticated_session(
     request: Request,
-    db_session: AsyncSession = Depends(get_db_session),
+    db_session: AsyncSession = Depends(get_db_session, scope="function"),
 ) -> AuthenticatedSession:
     settings = get_settings()
     token = request.cookies.get(settings.platform_session_cookie_name)
@@ -530,7 +530,7 @@ async def get_authenticated_session(
 
 async def get_optional_authenticated_session(
     request: Request,
-    db_session: AsyncSession = Depends(get_db_session),
+    db_session: AsyncSession = Depends(get_db_session, scope="function"),
 ) -> AuthenticatedSession | None:
     settings = get_settings()
     token = request.cookies.get(settings.platform_session_cookie_name)

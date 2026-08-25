@@ -176,5 +176,14 @@ stores only the measured conclusion and run identifiers.
   signed QA streams. Load `32827142929`, cleanup `32827388111`: `200=80`,
   `500=920`, `max_active=35`, no `429/503`, no events. The result did not
   improve the bottleneck; it isolated that the long-lived response still held
-  request-scoped DB connections. The next focused A/B closes that session before
-  returning `StreamingResponse`, while preserving stream access revalidation.
+  request-scoped DB connections.
+- Focused A/B `b742b136` explicitly closed the endpoint DB session before
+  `StreamingResponse`. Load `32828905208`, cleanup `32829138910`: `200=694`,
+  `500=306`, `max_active=396`, `events=25`, no `429/503`; `/csrf` p95 was
+  `971ms` and PostgreSQL peaked at `94.6%` CPU. This materially improved the
+  result but did not remove all failures, showing that router/auth dependencies
+  still retained request-scoped sessions.
+- The next focused A/B applies FastAPI's documented `scope="function"` to the
+  complete SSE dependency graph (auth, tournament policies, serialization and
+  endpoint DB dependencies), while keeping short-lived DB sessions for stream
+  revalidation. It is not ranked until its own CI/deploy/load/cleanup cycle.

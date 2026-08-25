@@ -310,7 +310,7 @@ async def _lock_participant_mutation(
 async def serialize_tournament_write_invariants(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session),
-    db_session: AsyncSession = Depends(get_db_session),
+    db_session: AsyncSession = Depends(get_db_session, scope="function"),
 ) -> None:
     """Serialize lifecycle/invite mutations while joins claim independent slots.
 

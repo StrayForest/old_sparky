@@ -3865,7 +3865,7 @@ async def get_tournament_bracket(
 async def get_tournament_bracket_events(
     slug: str,
     auth_session=Depends(get_optional_authenticated_session),
-    db_session: AsyncSession = Depends(get_db_session),
+    db_session: AsyncSession = Depends(get_db_session, scope="function"),
 ) -> StreamingResponse:
     tournament = await get_tournament_or_404(db_session, slug)
     has_participant_record = False
@@ -3883,11 +3883,6 @@ async def get_tournament_bracket_events(
         has_participant_record=has_participant_record,
     )
 
-    # A StreamingResponse can outlive the endpoint function by minutes.  Do
-    # not keep the request-scoped SQLAlchemy session (and its checked-out
-    # PostgreSQL connection) attached to the response body for that lifetime.
-    # The stream performs its own short-lived access revalidation sessions.
-    await db_session.close()
     return StreamingResponse(
         stream_bracket_events(tournament.id),
         media_type="text/event-stream",
