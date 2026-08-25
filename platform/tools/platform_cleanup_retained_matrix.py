@@ -57,6 +57,7 @@ _validate_tournament_graph_boundary = _HELPER_MODULE._validate_tournament_graph_
 
 CONFIRMATION = "DELETE-PRODUCTION-RETAINED-LOAD"
 EXPECTED_ORIGIN = "https://old-sparky.com"
+EXPECTED_ORIGIN_LOCAL = "http://127.0.0.1:8010"
 MAX_MATRIX_ROWS = 20
 MARKER_PATTERN = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
 EMAIL_PATTERN = re.compile(
@@ -106,6 +107,18 @@ def _uuid_list(value: object, *, field: str, allow_empty: bool = True) -> list[s
     if len(result) != len(set(result)):
         raise ValueError(f"{field} must not contain duplicate IDs")
     return result
+
+
+def _is_canonical_matrix_origin(report: dict[str, Any], *, mode: str) -> bool:
+    """Accept the public origin or the explicit local SSE control path only."""
+    origin = str(report.get("origin") or "").rstrip("/")
+    if origin == EXPECTED_ORIGIN:
+        return True
+    return (
+        mode == "sse"
+        and origin == EXPECTED_ORIGIN_LOCAL
+        and str(report.get("request_origin") or "").rstrip("/") == EXPECTED_ORIGIN
+    )
 
 
 def load_matrix_manifest(
@@ -158,7 +171,7 @@ def load_matrix_manifest(
             raise ValueError("matrix detail report must be a JSON object")
         if report.get("marker") != marker or report.get("report_path") != str(report_path):
             raise ValueError("matrix report identity does not match its summary row")
-        if report.get("mode") != mode or report.get("origin") != EXPECTED_ORIGIN:
+        if report.get("mode") != mode or not _is_canonical_matrix_origin(report, mode=mode):
             raise ValueError("matrix report is not a canonical production retained-load report")
         row_users = _uuid_list(
             report.get("user_ids"), field=f"{marker}.user_ids", allow_empty=True
@@ -186,6 +199,7 @@ def load_matrix_manifest(
                 "user_ids": row_users,
                 "tournament_ids": row_tournaments,
                 "visibility": report.get("tournament_visibility"),
+                "request_origin": str(report.get("request_origin") or "").rstrip("/"),
             }
         )
     if not user_ids:
@@ -301,7 +315,15 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         report_by_marker = {row["marker"]: row for row in manifest["rows"]}
         for run in runs:
             row = report_by_marker[run.marker]
-            if run.origin != EXPECTED_ORIGIN or run.report_path != row["report_path"]:
+            report_is_local_control = (
+                run.origin == EXPECTED_ORIGIN_LOCAL
+                and manifest["mode"] == "sse"
+                and row.get("request_origin") == EXPECTED_ORIGIN
+            )
+            if (
+                (run.origin != EXPECTED_ORIGIN and not report_is_local_control)
+                or run.report_path != row["report_path"]
+            ):
                 raise RuntimeError("database run provenance does not match the matrix report")
             stored_report = dict(run.report or {})
             stored_tournament_ids = set(stored_report.get("tournament_ids") or [])

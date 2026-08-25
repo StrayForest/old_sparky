@@ -575,3 +575,13 @@ stores only the measured conclusion and run identifiers.
   `127.0.0.1:8010` with the canonical production `Origin` header, so the
   remaining 5k/10k staircase can separate Cloudflare edge capacity from VPS
   origin capacity.
+- The one permitted origin-local control run (`32886113934`) accepted all
+  5,000 connections and delivered all 5,000 events with zero errors, 429s or
+  503s. Its connect latency was p50/p95/p99 29.4/89.3/95.7 seconds. This is
+  not a customer-facing success: the direct-origin result shows that the VPS
+  eventually holds the streams, while the long admission time gives
+  Cloudflare enough queue pressure to emit Error 1200 on the public path.
+  The control run must be cleaned with the exact manifest; the cleanup
+  validator accepts its loopback origin only for `mode=sse` when
+  `request_origin` is still the canonical public origin. Public-origin runs
+  remain the acceptance gate.

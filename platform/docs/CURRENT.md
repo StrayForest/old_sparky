@@ -191,6 +191,14 @@ fixture set and preserved the control account. The retained-load harness now
 supports an explicit `origin-local` SSE mode (`127.0.0.1:8010` with the
 canonical production Origin header) to measure the VPS origin without
 Cloudflare; public mode remains the separate edge acceptance test.
+The first controlled 5,000-SSE origin-local run (`32886113934`) accepted
+5,000/5,000 connections and delivered 5,000/5,000 events with no errors;
+connect latency was p50/p95/p99 29.4/89.3/95.7 seconds. This proves only that
+the application can eventually hold the connections, not that the public
+site can accept them fast enough. Its cleanup initially hit a harness
+provenance guard because the report correctly recorded `127.0.0.1`; the
+cleanup contract is being narrowed to allow only this SSE control mode when
+the request Origin remains canonical.
 
 To reduce repeated CI/CD runs, AS-19 is explicitly local-first: classify origin
 versus Nginx/edge closes, compare Redis TCP connections with active SSE, and

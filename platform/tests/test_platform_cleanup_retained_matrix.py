@@ -221,6 +221,78 @@ class RetainedMatrixManifestTests(unittest.TestCase):
             self.assertEqual(manifest["tournament_ids"], set())
             self.assertEqual(len(manifest["user_ids"]), 1)
 
+    def test_origin_local_sse_manifest_requires_canonical_request_origin(self) -> None:
+        marker = "preprod260825120000abcd"
+        user_id = str(uuid4())
+        tournament_id = str(uuid4())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "sse" / "sse.json"
+            report_path.parent.mkdir()
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "marker": marker,
+                        "report_path": str(report_path),
+                        "mode": "sse",
+                        "origin": "http://127.0.0.1:8010",
+                        "request_origin": "https://old-sparky.com",
+                        "user_ids": [user_id],
+                        "tournament_ids": [tournament_id],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            summary_path = root / "matrix-summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "sse",
+                        "control_email": "aleksei.lisitsin1@gmail.com",
+                        "completed_tournaments": 1,
+                        "rows": [
+                            {
+                                "synthetic_users": 1,
+                                "report_path": str(report_path),
+                                "result": {"marker": marker, "report_path": str(report_path)},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report_path.chmod(0o600)
+            summary_path.chmod(0o600)
+
+            def trusted_file(path: Path, *, root: Path) -> Path:
+                resolved = path.resolve()
+                resolved.relative_to(root.resolve())
+                return resolved
+
+            with mock.patch.object(cleanup, "_regular_root_file", side_effect=trusted_file):
+                manifest = cleanup.load_matrix_manifest(
+                    summary_path,
+                    run_root=root,
+                    expected_control_email="aleksei.lisitsin1@gmail.com",
+                )
+
+            self.assertEqual(manifest["mode"], "sse")
+            self.assertEqual(manifest["user_ids"], {user_id})
+
+            report_path.write_text(
+                report_path.read_text(encoding="utf-8").replace(
+                    "https://old-sparky.com", "https://attacker.invalid"
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(cleanup, "_regular_root_file", side_effect=trusted_file):
+                with self.assertRaisesRegex(ValueError, "canonical production retained-load report"):
+                    cleanup.load_matrix_manifest(
+                        summary_path,
+                        run_root=root,
+                        expected_control_email="aleksei.lisitsin1@gmail.com",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
