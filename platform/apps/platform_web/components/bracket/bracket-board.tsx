@@ -27,6 +27,7 @@ const BRACKET_POLL_BASE_MS = 10_000;
 const BRACKET_POLL_JITTER_MS = 3000;
 const BRACKET_POLL_MIN_MS = 3_000;
 const BRACKET_POLL_MAX_MS = 60_000;
+const SSE_RETRY_COOLDOWN_MS = 60_000;
 const PANNING_IGNORE_SELECTOR = "button,input,select,textarea,a,[role='button']";
 
 type LayoutMatch = {
@@ -258,31 +259,77 @@ export function BracketBoard({
         pollingTimer = null;
       }
     };
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        void refreshIfVisible();
-      } else {
-        abortRefresh();
+    let source: EventSource | null = null;
+    let sseRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    let sseRetryNotBefore = 0;
+
+    const closeSource = () => {
+      if (source !== null) {
+        source.close();
+        source = null;
       }
     };
 
-    const source = new EventSource(
-      platformApiUrl(`/tournaments/${slug}/bracket/events`),
-      { withCredentials: true },
-    );
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    source.onopen = () => {
-      stopPolling();
-    };
-    source.addEventListener("bracket", () => {
-      scheduleEventRefresh();
-    });
-    source.onerror = () => {
-      startPolling();
+    const scheduleSseRetry = () => {
+      if (sseRetryTimer !== null) {
+        clearTimeout(sseRetryTimer);
+      }
+      const delayMs = Math.max(0, sseRetryNotBefore - Date.now());
+      sseRetryTimer = setTimeout(() => {
+        sseRetryTimer = null;
+        if (document.visibilityState === "visible") {
+          openSse();
+        }
+      }, delayMs);
     };
 
+    const openSse = () => {
+      if (
+        source !== null
+        || document.visibilityState !== "visible"
+        || Date.now() < sseRetryNotBefore
+      ) {
+        return;
+      }
+      source = new EventSource(
+        platformApiUrl(`/tournaments/${slug}/bracket/events`),
+        { withCredentials: true },
+      );
+      source.onopen = () => {
+        stopPolling();
+      };
+      source.addEventListener("bracket", () => {
+        scheduleEventRefresh();
+      });
+      source.onerror = () => {
+        // EventSource retries automatically, which would keep hammering a
+        // saturated edge. Close it and use revision polling during cooldown.
+        closeSource();
+        sseRetryNotBefore = Date.now() + SSE_RETRY_COOLDOWN_MS;
+        startPolling();
+        scheduleSseRetry();
+      };
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refreshIfVisible();
+        openSse();
+      } else {
+        abortRefresh();
+        closeSource();
+        stopPolling();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    openSse();
+
     return () => {
-      source.close();
+      closeSource();
+      if (sseRetryTimer !== null) {
+        clearTimeout(sseRetryTimer);
+      }
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       clearEventRefresh();
       stopPolling();

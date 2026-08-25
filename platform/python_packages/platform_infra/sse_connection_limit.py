@@ -31,7 +31,11 @@ from python_packages.platform_infra.security import session_token_digest
 logger = logging.getLogger(__name__)
 
 SSE_PATH_RE = re.compile(r"^/api/v1/tournaments/[^/]+/bracket/events$")
-SSE_GLOBAL_LIMIT = 10_240
+# Cloudflare's public edge starts returning Error 1200 while the origin is
+# still below its own CPU/DB ceilings. Keep a deliberate local headroom so
+# excess viewers receive an immediate, controlled 429 and can fall back to
+# revision polling instead of waiting in the edge queue.
+SSE_GLOBAL_LIMIT = 3_000
 SSE_SOURCE_LIMIT = 32
 SSE_USER_LIMIT = 4
 SSE_STREAM_MAX_LIFETIME_SECONDS = 600

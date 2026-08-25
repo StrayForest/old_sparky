@@ -10,6 +10,9 @@ from python_packages.platform_infra import sse_connection_limit as sse
 
 
 class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
+    def test_global_cap_leaves_headroom_below_observed_edge_queue(self) -> None:
+        self.assertEqual(sse.SSE_GLOBAL_LIMIT, 3_000)
+
     async def asyncSetUp(self) -> None:
         self.settings = get_settings()
         if self.settings.platform_environment.strip().lower() != "test":

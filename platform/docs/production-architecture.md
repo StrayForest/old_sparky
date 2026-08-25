@@ -99,6 +99,6 @@ Daily maintenance restore-verifies DB backups before pruning known artifacts. Of
 
 ## Capacity boundary
 
-The current VPS has two CPU cores and about 3.7 GiB RAM. Image concurrency starts at one. Public bracket SSE application admission is capped at 128 streams globally, 6 per source address and 4 per authenticated user; Nginx retains coarser hard ceilings of 160 globally and 8 per source address. Individual streams are bounded to 600 seconds, send keepalive opportunities every 15 seconds and advertise reconnect delay with 5–12 second jitter. These values are capacity safeguards, not product entitlements; change them only from retained load/resource evidence.
+The current VPS has two CPU cores and about 3.7 GiB RAM. Image concurrency starts at one. Public bracket SSE application admission is capped at 3,000 streams globally, 32 per source address and 4 per authenticated user; Nginx retains coarser 10,240 source/global ceilings. Individual streams are bounded to 600 seconds, send keepalive opportunities every 15 seconds and advertise reconnect delay with 5–12 second jitter. Visible bracket tabs use SSE, while hidden tabs and admission failures fall back to revision polling. These values are capacity safeguards, not product entitlements; change them only from retained load/resource evidence.
 
 Additional workers, exporters, transforms, poolers or nodes require retained CPU/RSS/queue/DB evidence against the operations targets.

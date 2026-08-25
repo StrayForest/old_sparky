@@ -15,26 +15,31 @@ synthetic data behind.
 The previous deployed contour was application global `128`, Nginx
 `8/source + 160/global`, and Nginx `worker_connections=768`. That contour
 rejected the 1,000- and 5,000-attempt probes before they tested application
-capacity. The reviewed capacity candidate raises the global ceilings to
-application `10,240` global / `32/source`, Nginx `10,240/source + 10,240/global`, and
-`worker_connections=32,768`, while retaining a per-user cap of `4` and
-fail-closed Redis admission. The production load runner uses a signed,
+capacity. The reviewed capacity candidate initially raised the global ceilings
+to application `10,240` global / `32/source`, Nginx `10,240/source + 10,240/global`,
+and `worker_connections=32,768`, while retaining a per-user cap of `4` and
+fail-closed Redis admission. Public runs then showed Cloudflare Error 1200 at
+about 3,500 concurrent streams while the VPS still had no sustained CPU,
+PostgreSQL or lock saturation. The selected next hypothesis lowers only the
+application global ceiling to `3,000`, leaving Nginx at `10,240`, so excess
+viewers receive a fast application `429` and can use polling rather than wait
+in the Cloudflare edge queue. The production load runner uses a signed,
 secret-derived QA header to bypass only the application per-source bucket;
 global, per-user, Redis fail-closed and Nginx limits remain active. Ordinary
 clients never receive this bypass. These are capacity ceilings, not a claim
-that a single VPS can sustain 10,000 streams; the claim is made only after the
-staircase, combined run and resource evidence pass.
+that a single VPS can sustain 10,000 persistent streams; 10,000 virtual users
+must be measured as a mixed active-SSE/passive-polling workload.
 
 ## Ordered protocol
 
-1. Run the isolated loopback origin staircase first. Do not spend CI/CD or
-   production time on a candidate that fails at the application origin. Only
-   after a local winner passes the strict transport and event-delivery gate
-   promote that focused change through the normal `dev` security/build and
-   automatic production deployment chain. If the core matrix passes, run a
-   separate reviewed overload extension above 10,000 to measure headroom and
-   deliberate admission, without treating a deliberate `429` as a successful
-   10,000-user result.
+1. Run the public Cloudflare path as the acceptance contour. A single
+   origin-local run is allowed only as a diagnostic control; it must never be
+   used to claim customer capacity or replace a public result. If a candidate
+   changes runtime behavior, promote it through the normal `dev`
+   security/build and automatic production deployment chain before measuring
+   it. A deliberate application `429` is acceptable only when it is returned
+   quickly and the client falls back to polling; Cloudflare `1200`, origin
+   `5xx`, unexpected disconnect or client error is a failure.
 2. Run the ten hypotheses below one at a time. Clean each run before starting
    the next one; a failed or canceled run is still cleaned.
 3. Select the best hypothesis by zero unexpected errors/503s first, then
@@ -207,17 +212,18 @@ dimensions at once:
 | F4 | Five events at 0.2s instead of one event | Pass: 5,000/5,000 events, p95 7.4s, Redis peak 150, load-1m peak 0.85. |
 | F5 | Increase post-open settle from 5s to 10s | Pass: 1,000/1,000 HTTP 200 and events, p95 6.9s, Redis peak 149, load-1m peak 1.22. |
 
-The final 10k local winner is relay + coalesced authorization + blocking
-limiter pool `64/20s` + bounded `open_concurrency=64` + barrier/settle/hold
-profile. The five 1k follow-ups all passed; `open_concurrency=128` was fastest
-at 1k, but `64` is the only opening shape confirmed at 10k. The winner has
-zero unexpected errors, full event delivery and large PostgreSQL headroom. It
-is still not production-approved until CI/CD and the guarded live diagnostic
-pass.
+The final 10k origin transport winner is relay + coalesced authorization +
+blocking limiter pool `64/20s` + bounded `open_concurrency=64` +
+barrier/settle/hold profile. It has zero unexpected origin errors, full event
+delivery and PostgreSQL headroom, but is not a public capacity claim: the live
+Cloudflare contour fails around 3,500 concurrent streams. Public acceptance
+now requires fast application admission plus active-SSE/passive-polling
+fallback; origin-local success cannot promote a candidate by itself.
 
 ## Operator commands
 
-Run from the reviewed `dev` branch in a low-traffic window:
+Run from the reviewed `dev` branch in a low-traffic window. Production public
+mode is the acceptance path; `origin-local` is allowed only once as a control:
 
 ```bash
 gh workflow run platform-production-retained-load-matrix.yml \
@@ -248,7 +254,10 @@ gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 If the load workflow is canceled while the SSH step is active, use the exact
 abort workflow first. The cleanup/recovery path accepts `sse` and `combined`
 manifests and still validates marker, report path, synthetic ownership,
-tournament graph and control-account preservation before deletion.
+tournament graph and control-account preservation before deletion. When the
+Actions API is unavailable, run the same fixed production cleanup supervisor
+on the VPS with the exact SHA, load run ID and control email; never issue a
+broad database delete.
 
 ## Results
 
@@ -585,3 +594,6 @@ stores only the measured conclusion and run identifiers.
   validator accepts its loopback origin only for `mode=sse` when
   `request_origin` is still the canonical public origin. Public-origin runs
   remain the acceptance gate.
+- Public ramp A/B `open_concurrency=16` (`32888021777`) still failed through
+  Cloudflare: 3,466/5,000 HTTP 200, 1,533 Error 1200, one 502 and zero app
+  429s. Connect latency was p50/p95/p99 38.0/93.0/143.1 seconds; the VPS showed no sustained CPU/PG/lock/backend pressure, so the slower ramp did not solve the edge queue. Exact cleanup removed 10,000 users and 20 tournaments; next is application admission ceiling 3,000 plus browser polling fallback.

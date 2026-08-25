@@ -23,7 +23,7 @@ Read this file for the current production baseline and next engineering priority
 - Tournament invite claims/revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Last invite use and last participant slot cannot be consumed twice, and restoring a retained inactive participant rechecks capacity before making the row active again.
 - Anonymous public profile contracts omit account/contact email and Steam authentication identity. Public tournament participant/workspace contracts omit moderation note, moderator identity and moderation timestamps; organizer management uses a separate response DTO that retains those fields.
 - Public tournament automation errors are persistence-sanitized before commit: `automation_last_error` can contain only the stable generic retry message, while restricted logs retain only tournament/failure metadata and a one-way error fingerprint. Migration `20260821_0039` rewrites historical non-null values to the same safe message.
-- Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. The deployed AS-19 candidate uses application/Nginx global ceilings of `10,240` and Nginx `worker_connections=32,768`; relay fan-out, short-lived DB access checks and bounded Redis limiter pooling are enabled. A guarded live 10k SSE result is still required before treating those ceilings as proven capacity.
+- Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. The AS-19 candidate now uses an application global ceiling of `3,000` with `32/source` and `4/user`, while Nginx retains `10,240` source/global ceilings and `worker_connections=32,768`; relay fan-out, short-lived DB access checks and bounded Redis limiter pooling are enabled. The lower application ceiling is a controlled-degradation guard against the observed Cloudflare Error 1200 edge queue, not a claim that 3,000 is final capacity.
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
@@ -197,12 +197,22 @@ connect latency was p50/p95/p99 29.4/89.3/95.7 seconds. This proves only that
 the application can eventually hold the connections, not that the public
 site can accept them fast enough. Its cleanup initially hit a harness
 provenance guard because the report correctly recorded `127.0.0.1`; the
-cleanup contract is being narrowed to allow only this SSE control mode when
-the request Origin remains canonical.
+cleanup contract now allows only this SSE control mode when the request Origin
+remains canonical.
+The public ramp A/B with `open_concurrency=16` (`32888021777`) still failed at
+the edge: 3,466/5,000 streams returned HTTP 200, 1,533 returned Cloudflare
+1200 and one returned Cloudflare 502; the application returned zero 429s.
+Connect latency was p50/p95/p99 38.0/93.0/143.1 seconds. VPS evidence again
+showed no sustained CPU, PostgreSQL connection/lock or backend-wait pressure.
+The exact cleanup removed 10,000 users and 20 tournaments and preserved the
+control account. The next candidate lowers application SSE admission to
+3,000 and makes the browser close failed EventSource connections and use
+revision polling during a cooldown.
 
-To reduce repeated CI/CD runs, AS-19 is explicitly local-first: classify origin
-versus Nginx/edge closes, compare Redis TCP connections with active SSE, and
-reject failed candidates locally before promoting one exact-SHA diagnostic run.
+To reduce repeated CI/CD runs, AS-19 uses one origin-local control only to
+separate origin from Nginx/edge closes, then treats public Cloudflare runs as
+the acceptance contour. Compare Redis TCP connections with active SSE and
+reject candidates that produce edge 1200s before promoting them.
 The benchmark document records the completed ten local A/B classifications and
 five transport follow-ups; full delta-response measurement and
 slow-consumer/reconnect correctness remain open before live promotion.
