@@ -24,7 +24,11 @@ sys.path.insert(0, str(PLATFORM_ROOT))
 from apps.platform_api.app.services.bracket_events import bracket_channel
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import dispose_engine
-from python_packages.platform_infra.sse_connection_limit import SSE_GLOBAL_LIMIT
+from python_packages.platform_infra.sse_connection_limit import (
+    SSE_GLOBAL_LIMIT,
+    SSE_LOAD_TEST_BYPASS_HEADER,
+    sse_load_test_bypass_token,
+)
 from tools.platform_production_qa import (
     BROWSER_POLLING_TOURNAMENT_PLAN,
     BROWSER_POLLING_SETUP_CONCURRENCY,
@@ -41,6 +45,7 @@ SSE_EVENT_TYPE = "qa_sse_probe"
 class SseMetrics:
     def __init__(self) -> None:
         self.counters: Counter[str] = Counter()
+        self.response_statuses: Counter[str] = Counter()
         self.connect_latencies: list[float] = []
         self.event_latencies: list[float] = []
         self.error_samples: list[dict[str, str]] = []
@@ -56,6 +61,9 @@ class SseMetrics:
             self.counters["max_active_connections"],
             self.counters["active_connections"],
         )
+
+    def response_status(self, status_code: int) -> None:
+        self.response_statuses[str(status_code)] += 1
 
     def connection_closed(self) -> None:
         if self.counters["active_connections"] > 0:
@@ -101,6 +109,7 @@ class SseMetrics:
                 "p99": percentile(self.event_latencies, 99),
             },
             "error_samples": list(self.error_samples),
+            "response_statuses": dict(sorted(self.response_statuses.items())),
         }
 
 
@@ -268,6 +277,7 @@ async def consume_sse_connection(
         "Origin": qa.origin,
         "Cookie": f"{qa.session_cookie_name}={token}",
         "X-Platform-QA-Phase": qa.current_phase,
+        SSE_LOAD_TEST_BYPASS_HEADER: sse_load_test_bypass_token(get_settings()),
     }
     deadline = time.monotonic() + duration_seconds
     cycles = max(0, reconnect_cycles)
@@ -289,6 +299,7 @@ async def consume_sse_connection(
             )
             async with open_gate:
                 response = await stream_context.__aenter__()
+            metrics.response_status(response.status_code)
             if response.status_code != 200:
                 if response.status_code == 429:
                     metrics.mark("rejected_429")
@@ -557,7 +568,8 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             tournaments_created=len(tournaments),
             finished_at=datetime.now(UTC),
         )
-    except Exception:
+    except Exception as exc:
+        qa.report["fatal_error"] = f"{type(exc).__name__}: {exc}"
         with suppress(Exception):
             await qa.record_preprod_run(status="failed", finished_at=datetime.now(UTC))
         raise
@@ -583,12 +595,12 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         )
         with suppress(Exception):
             await qa.record_preprod_run(report_path=str(qa.report_path))
-    if args.summary_path is not None:
-        args.summary_path.parent.mkdir(parents=True, exist_ok=True)
-        args.summary_path.write_text(
-            json.dumps(summary(qa.report), indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        if args.summary_path is not None:
+            args.summary_path.parent.mkdir(parents=True, exist_ok=True)
+            args.summary_path.write_text(
+                json.dumps(summary(qa.report), indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
     return qa.report
 
 
@@ -615,9 +627,11 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
             "max_active_connections": metrics.get("max_active_connections"),
             "rejected_429": metrics.get("rejected_429"),
             "rejected_503": metrics.get("rejected_503"),
+            "rejected_other": metrics.get("rejected_other"),
             "errors": metrics.get("errors"),
             "events": metrics.get("events"),
             "reconnects": metrics.get("reconnects"),
+            "response_statuses": metrics.get("response_statuses", {}),
             "connect_latency_ms": metrics.get("connect_latency_ms"),
             "event_delivery_latency_ms": metrics.get("event_delivery_latency_ms"),
         },

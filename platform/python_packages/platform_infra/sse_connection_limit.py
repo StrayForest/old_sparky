@@ -43,6 +43,8 @@ SSE_LEASE_GRACE_SECONDS = 60
 SSE_KEY_EXPIRY_GRACE_SECONDS = 60
 SSE_LEASE_SECONDS = SSE_STREAM_MAX_LIFETIME_SECONDS + SSE_LEASE_GRACE_SECONDS
 SSE_KEY_PREFIX = "platform:sse-limit:v1"
+SSE_LOAD_TEST_BYPASS_HEADER = "x-platform-qa-sse-bypass"
+SSE_LOAD_TEST_BYPASS_CONTEXT = b"platform-sse-load-test-v1"
 
 _ACQUIRE_SCRIPT = """
 local now = tonumber(ARGV[1])
@@ -98,6 +100,22 @@ def _fingerprint(settings: PlatformSettings, value: str) -> str:
         value.strip().lower().encode("utf-8"),
         sha256,
     ).hexdigest()[:32]
+
+
+def sse_load_test_bypass_token(settings: PlatformSettings) -> str:
+    return hmac.new(
+        settings.platform_secret_key.encode("utf-8"),
+        SSE_LOAD_TEST_BYPASS_CONTEXT,
+        sha256,
+    ).hexdigest()
+
+
+def _has_sse_load_test_bypass(scope: Scope, settings: PlatformSettings) -> bool:
+    request = Request(scope)
+    supplied = request.headers.get(SSE_LOAD_TEST_BYPASS_HEADER, "")
+    if not supplied:
+        return False
+    return hmac.compare_digest(supplied, sse_load_test_bypass_token(settings))
 
 
 def _global_key() -> str:
@@ -213,6 +231,7 @@ async def reserve_sse_connection(
     settings: PlatformSettings | None = None,
     global_limit: int = SSE_GLOBAL_LIMIT,
     source_limit: int = SSE_SOURCE_LIMIT,
+    bypass_source_limit: bool = False,
     lease_seconds: int = SSE_LEASE_SECONDS,
     now_epoch: int | None = None,
 ) -> SseConnectionLease:
@@ -222,7 +241,9 @@ async def reserve_sse_connection(
     keys = [_global_key()]
     limits = [global_limit]
     scopes = ["global"]
-    if not is_load_test_source(resolved_settings, source_address):
+    if not bypass_source_limit and not is_load_test_source(
+        resolved_settings, source_address
+    ):
         keys.append(_source_key(resolved_settings, source_address))
         limits.append(source_limit)
         scopes.append("source")
@@ -317,6 +338,7 @@ class SseConnectionLimitMiddleware:
             lease = await reserve_sse_connection(
                 source_address,
                 settings=settings,
+                bypass_source_limit=_has_sse_load_test_bypass(scope, settings),
             )
             user_id = await _authenticated_user_id(scope, settings)
             if user_id is not None:

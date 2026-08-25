@@ -109,6 +109,42 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await asyncio.gather(*(lease.release() for lease in leases))
 
+    async def test_signed_qa_bypass_skips_source_cap_but_not_global_cap(self) -> None:
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/tournaments/test/bracket/events",
+            "headers": [
+                (
+                    sse.SSE_LOAD_TEST_BYPASS_HEADER.encode("ascii"),
+                    sse.sse_load_test_bypass_token(self.settings).encode("ascii"),
+                )
+            ],
+        }
+        self.assertTrue(sse._has_sse_load_test_bypass(scope, self.settings))
+        leases = [
+            await sse.reserve_sse_connection(
+                "127.0.0.1",
+                settings=self.settings,
+                global_limit=2,
+                source_limit=1,
+                bypass_source_limit=True,
+            )
+            for _ in range(2)
+        ]
+        try:
+            with self.assertRaises(sse.SseConnectionLimitExceeded) as context:
+                await sse.reserve_sse_connection(
+                    "127.0.0.1",
+                    settings=self.settings,
+                    global_limit=2,
+                    source_limit=1,
+                    bypass_source_limit=True,
+                )
+            self.assertEqual(context.exception.scope, "global")
+        finally:
+            await asyncio.gather(*(lease.release() for lease in leases))
+
     async def test_user_limit_spans_distinct_source_addresses(self) -> None:
         leases = [
             await sse.reserve_sse_connection(

@@ -18,14 +18,20 @@ rejected the 1,000- and 5,000-attempt probes before they tested application
 capacity. The reviewed capacity candidate raises the global ceilings to
 application `10,240` global / `32/source`, Nginx `10,240/source + 10,240/global`, and
 `worker_connections=32,768`, while retaining a per-user cap of `4` and
-fail-closed Redis admission. These are capacity ceilings, not a claim that a
-single VPS can sustain 10,000 streams; the claim is made only after the
+fail-closed Redis admission. The production load runner uses a signed,
+secret-derived QA header to bypass only the application per-source bucket;
+global, per-user, Redis fail-closed and Nginx limits remain active. Ordinary
+clients never receive this bypass. These are capacity ceilings, not a claim
+that a single VPS can sustain 10,000 streams; the claim is made only after the
 staircase, combined run and resource evidence pass.
 
 ## Ordered protocol
 
 1. Deploy the reviewed runner and limit candidate through the normal `dev`
-   security/build and automatic production deployment chain.
+   security/build and automatic production deployment chain. If the core
+   matrix passes, run a separate reviewed overload extension above 10,000 to
+   measure headroom and deliberate admission, without treating a deliberate
+   `429` as a successful 10,000-user result.
 2. Run the ten hypotheses below one at a time. Clean each run before starting
    the next one; a failed or canceled run is still cleaned.
 3. Select the best hypothesis by zero unexpected errors/503s first, then
@@ -145,7 +151,15 @@ Results are added after the CI/deploy gate and each production run. Detailed
 JSON and bounded logs remain in the GitHub artifacts/VPS run root; this document
 stores only the measured conclusion and run identifiers.
 
-- Limit candidate CI/deploy: pending.
+- Limit candidate CI/deploy: `32819954714` / production `32820833942` passed for
+  `da1435c`; the signed QA-bypass and failed-run summary fix are pending their
+  own CI/deploy gate.
 - Ten-hypothesis matrix: pending.
 - Follow-up matrix: pending.
 - Combined 10,000-user SSE + polling gate: pending.
+- Diagnostic H1 attempt `32823477661` did not reach a valid SSE result: the
+  setup completed, but the application source bucket held at 32 (`connected=171`,
+  `max_active=32`, `rejected_other=829`, `errors=149`, no events). It was
+  cleaned by `32823765006`: 1,000 users and 20 tournaments deleted, zero fixture
+  users/tournaments/sessions/audit rows remained, and the control account was
+  preserved. This run is excluded from hypothesis ranking.

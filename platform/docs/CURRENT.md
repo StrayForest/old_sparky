@@ -91,12 +91,15 @@ AS-19 — SSE capacity and combined-load measurement is in progress. The
 reviewed runner adds separate SSE-only and polling+SSE profiles to the existing
 production retained-load workflow, with exact cleanup/recovery/abort support.
 The limit candidate raises the previously observed Nginx/app admission
-ceilings and manages the Nginx main worker connection capacity. The required
-ten hypotheses followed by five variants around the winner are specified in
-the protocol and acceptance rules maintained in
-[`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md). No
-10,000-persistent-SSE claim is made until the 1k/5k/10k staircase and combined
-run are measured through CI/CD.
+ceilings and manages the Nginx main worker connection capacity. The first
+post-deploy diagnostic stopped at the application per-source bucket of 32, so
+the runner now carries a signed QA-only bypass for that bucket while retaining
+global, per-user, Redis and Nginx admission. Failed runs also export compact
+metrics for diagnosis. The required ten hypotheses followed by five variants
+around the winner are specified in the protocol and acceptance rules maintained
+in [`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md). No
+10,000-persistent-SSE claim is made until the 1k/5k/10k staircase, any
+above-10k overload extension and combined run are measured through CI/CD.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.
