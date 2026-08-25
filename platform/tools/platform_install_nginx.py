@@ -431,8 +431,8 @@ def validate_main_config(source: Path) -> None:
     text = source.read_text(encoding="utf-8")
     if "worker_rlimit_nofile 65535;" not in text:
         raise ValueError("Nginx main config must raise worker_rlimit_nofile to 65535.")
-    if "worker_connections 16384;" not in text:
-        raise ValueError("Nginx main config must provide 16384 worker connections.")
+    if "worker_connections 32768;" not in text:
+        raise ValueError("Nginx main config must provide 32768 worker connections.")
     if "include /etc/nginx/sites-enabled/*;" not in text:
         raise ValueError("Nginx main config must include managed virtual hosts.")
 
