@@ -115,13 +115,24 @@ load generator consumed about 84% of both cores. Ten thousand tabs with a
 the accepted no-VPS-increase target. Continuous 10-second polling for all
 10,000 tabs is beyond this two-core contour and is not claimed as supported.
 
+The first complete production browser attempt (`32800341184`) reached all 20
+tournaments and executed 12,283 polling GETs, so fixture setup and edge POST
+timeout were no longer the blocker. It still failed the conditional-read gate:
+zero `304 Not Modified` responses, p95 58.5s and p99 98.5s, with a DB-time
+hotspot and peak CPU flag. Exact cleanup `32800905099` removed 10,000 users and
+20 tournaments and verified zero remaining users/tournaments/sessions/audit
+rows while preserving the control account. The production wrapper therefore
+switches from all-active tabs to the default active/passive browser mix; this
+is an evidence-driven backpressure change, not an error suppression.
+
 The selected release settings are API pool `12+0` per worker, worker pool
 `2+0` with concurrency two, total connection budget `32`, load-generator HTTP
-pool `40`, active-tab opening stagger `300s`, and a `30s` polling window. The
-production wrapper passes these bounded values explicitly; its generic
-`concurrency` input is retained for the ordinary matrix, while the browser
-profile uses measured setup concurrency `20` and no longer expands the browser
-HTTP pool.
+pool `40`, tab opening stagger `300s`, and a `30s` polling window. The
+production wrapper passes these bounded values explicitly and uses the default
+active/passive browser mix after the all-active production attempt exceeded
+latency budgets; its generic `concurrency` input is retained for the ordinary
+matrix, while the browser profile uses measured setup concurrency `20` and no
+longer expands the browser HTTP pool.
 
 The final local staircase on that selected runtime was repeated after the
 tooling/docs changes:
@@ -248,8 +259,8 @@ broad user/table delete.
    run state setup behind bounded gates, pass tournament slugs explicitly, and
    fail auto-assignment setup after five minutes instead of waiting for the
    retained-load ceiling. Bound the load-generator client pool to 40
-   connections, open tabs over 300 seconds and use a 30-second active polling
-   window while retaining 10,000 virtual tabs. Join/ready-vote contention
+   connections, open tabs over 300 seconds and use a 30-second mixed
+   active/passive polling window while retaining 10,000 virtual tabs. Join/ready-vote contention
    remains covered by the write-burst profile.
 8. **Completed:** run documentation and focused checks, then the GitHub
    security/build gate `32798830524`.

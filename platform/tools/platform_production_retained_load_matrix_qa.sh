@@ -166,7 +166,6 @@ else
     --http-max-connections "$browser_http_connections" \
     --browser-polling-duration 30 \
     --browser-polling-open-stagger 300 \
-    --browser-polling-active-users-only \
     --collect-performance \
     --report-path "$browser_report" \
     2>&1 | tee "$log_path"

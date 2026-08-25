@@ -229,6 +229,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('--concurrency "$browser_setup_concurrency"', load_supervisor)
         self.assertIn('--browser-polling-duration 30', load_supervisor)
         self.assertIn('--browser-polling-open-stagger 300', load_supervisor)
+        self.assertNotIn('--browser-polling-active-users-only', load_supervisor)
 
     def test_browser_qa_does_not_silently_fallback_to_production_env(self) -> None:
         qa_source = (REPO_ROOT / "platform/tools/platform_production_qa.py").read_text()

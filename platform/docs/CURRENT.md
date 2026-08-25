@@ -64,6 +64,11 @@ Cloudflare 504 while creating the first tournament, before polling began. Its
 exact cleanup (`32799479496`) deleted 10,000 users and 1 partial tournament,
 verified zero fixture users/tournaments/sessions/audit rows and preserved the
 control account. A production polling pass is therefore not claimed yet.
+The repeat production run (`32800341184`) completed all 20 tournaments and
+12,283 polling GETs, but observed zero `304 Not Modified` responses with p95
+58.5s/p99 98.5s; its exact cleanup (`32800905099`) removed 10,000 users and
+20 tournaments. The production wrapper is now switched to the measured
+active/passive browser mix for the next gate.
 The load work also requires a ten-run controlled A/B matrix followed by five
 follow-up variants around the winning configuration; the winner is selected
 by zero errors/cleanup first, then latency, CPU and pool wait, not by raw
@@ -141,9 +146,10 @@ against the current web/api/worker identities and units.
 - The final 20×500 browser-polling gate keeps fixture state bounded to at most
   32 participants per tournament and uses four setup lanes plus one shared
   request semaphore. Its production runner retains 10,000 virtual tabs but
-  uses HTTP40, a 300-second opening stagger and a 30-second active polling
-  window. Its five-minute auto-assignment wait is fail-fast; the write-burst
-  profile owns join/ready-vote contention measurements.
+  uses HTTP40, a 300-second opening stagger and a 30-second mixed
+  active/passive polling window. Its five-minute auto-assignment wait is
+  fail-fast; the write-burst profile owns join/ready-vote contention
+  measurements.
 - Ready-check votes must be committed only while their round is active and the
   voter remains an eligible active participant. A close or exclusion cannot
   leave a post-close or ineligible vote in persistence.
