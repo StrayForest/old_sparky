@@ -28,7 +28,10 @@ staircase, combined run and resource evidence pass.
 ## Ordered protocol
 
 1. Deploy the reviewed runner and limit candidate through the normal `dev`
-   security/build and automatic production deployment chain. If the core
+   security/build and automatic production deployment chain. If a diagnostic
+   identifies a measurement-blocking implementation issue, record it as a
+   separate A/B hypothesis, deploy only that focused correction, and repeat
+   the affected staircase point before ranking the ten variants. If the core
    matrix passes, run a separate reviewed overload extension above 10,000 to
    measure headroom and deliberate admission, without treating a deliberate
    `429` as a successful 10,000-user result.
@@ -152,8 +155,9 @@ JSON and bounded logs remain in the GitHub artifacts/VPS run root; this document
 stores only the measured conclusion and run identifiers.
 
 - Limit candidate CI/deploy: `32819954714` / production `32820833942` passed for
-  `da1435c`; the signed QA-bypass and failed-run summary fix are pending their
-  own CI/deploy gate.
+  `da1435c`. Signed QA-bypass and failed-run summary fix: exact CI
+  `32826238833`, auto-deploy `32826794523`, production deploy/live smoke
+  `32826801617`, all passed for `39499dfc`.
 - Ten-hypothesis matrix: pending.
 - Follow-up matrix: pending.
 - Combined 10,000-user SSE + polling gate: pending.
@@ -163,3 +167,14 @@ stores only the measured conclusion and run identifiers.
   cleaned by `32823765006`: 1,000 users and 20 tournaments deleted, zero fixture
   users/tournaments/sessions/audit rows remained, and the control account was
   preserved. This run is excluded from hypothesis ranking.
+- Valid H1 baseline after signed QA source-bucket bypass: load
+  `32825319293`, cleanup `32825654336`. It reached the application rather than
+  Nginx admission, but returned `200=136`, `500=864`, `max_active=30`, no
+  events; PostgreSQL peaked at 196% CPU and the bracket-events route had p95
+  about 6.2s. It is retained as a failed baseline, not a capacity result.
+- A/B diagnostic `39499dfc` removed the duplicate middleware session lookup for
+  signed QA streams. Load `32827142929`, cleanup `32827388111`: `200=80`,
+  `500=920`, `max_active=35`, no `429/503`, no events. The result did not
+  improve the bottleneck; it isolated that the long-lived response still held
+  request-scoped DB connections. The next focused A/B closes that session before
+  returning `StreamingResponse`, while preserving stream access revalidation.

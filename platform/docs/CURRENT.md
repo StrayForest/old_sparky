@@ -100,6 +100,11 @@ around the winner are specified in the protocol and acceptance rules maintained
 in [`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md). No
 10,000-persistent-SSE claim is made until the 1k/5k/10k staircase, any
 above-10k overload extension and combined run are measured through CI/CD.
+The first valid 1k run reached the application but failed with 500s while
+long-lived responses held request-scoped PostgreSQL connections; removing a
+duplicate QA-only session lookup was not sufficient. The next focused A/B
+closes that request session before `StreamingResponse`, with revalidation kept
+in short-lived sessions. The 10+5 ranking remains pending.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.
