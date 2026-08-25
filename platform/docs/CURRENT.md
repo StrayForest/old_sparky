@@ -219,7 +219,11 @@ zero errors; SSE connect p95 was 5.8s and event p95 322ms. Its public mixed
 pool was exhausted by six stream-admission DB sessions plus polling. The next
 candidate reduces stream admission and revalidation to two per worker and
 coalesces public revalidation by tournament/slug; private viewer-specific
-authorization remains unchanged and fail-closed.
+authorization remains unchanged and fail-closed. Candidate `a3908a45` reduced
+early pool waits but its public 10k mixed run still hit 500s after 1,691 SSE;
+VPS snapshots showed ordinary and stream work sharing the API pool. The next
+candidate moves admission and revalidation to a bounded SSE-only pool of two
+connections per API worker, leaving the API pool isolated for polling.
 
 To reduce repeated CI/CD runs, AS-19 uses one origin-local control only to
 separate origin from Nginx/edge closes, then treats public Cloudflare runs as

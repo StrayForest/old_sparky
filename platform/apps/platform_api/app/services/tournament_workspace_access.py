@@ -9,7 +9,10 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from python_packages.platform_infra.db import get_db_session, session_factory
+from python_packages.platform_infra.db import (
+    get_db_session,
+    stream_db_session,
+)
 from python_packages.platform_infra.models import (
     Role,
     Tournament,
@@ -142,7 +145,7 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
         if access_context.decision == "deny":
             return False
 
-        async with session_factory()() as db_session:
+        async with stream_db_session() as db_session:
             row = (
                 await db_session.execute(
                     select(
@@ -195,7 +198,7 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
                 return participant_status in ACTIVE_PARTICIPANT_STATUSES
             return False
 
-    async with session_factory()() as db_session:
+    async with stream_db_session() as db_session:
         row = (
             await db_session.execute(
                 select(Tournament.slug, Tournament.visibility).where(
