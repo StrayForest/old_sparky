@@ -16,7 +16,7 @@ The previous deployed contour was application global `128`, Nginx
 `8/source + 160/global`, and Nginx `worker_connections=768`. That contour
 rejected the 1,000- and 5,000-attempt probes before they tested application
 capacity. The reviewed capacity candidate raises the global ceilings to
-application `10,240`, Nginx `32/source + 10,240/global`, and
+application `10,240` global / `32/source`, Nginx `10,240/source + 10,240/global`, and
 `worker_connections=16,384`, while retaining a per-user cap of `4` and
 fail-closed Redis admission. These are capacity ceilings, not a claim that a
 single VPS can sustain 10,000 streams; the claim is made only after the
