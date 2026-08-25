@@ -20,6 +20,8 @@ from python_packages.platform_infra.sse_connection_limit import (
 
 logger = logging.getLogger(__name__)
 
+SSE_ACCESS_REVALIDATION_SECONDS = 30.0
+
 
 def bracket_channel(tournament_id: str) -> str:
     return f"platform:bracket:{tournament_id}"
@@ -53,8 +55,8 @@ async def stream_bracket_events(
 
     The HTTP endpoint has already completed the authoritative admission check
     before creating the stream. Skipping that duplicate check avoids a second
-    database round trip before Redis subscription; the first event/keepalive
-    checkpoint and every later checkpoint still revalidate access.
+    database round trip before Redis subscription; every bracket event and the
+    periodic idle checkpoint still revalidate access.
     """
 
     if not admission_verified and not await current_tournament_stream_access_is_valid(
@@ -67,6 +69,7 @@ async def stream_bracket_events(
     channel = bracket_channel(tournament_id)
     await pubsub.subscribe(channel)
     started_at = time.monotonic()
+    last_access_check_at = started_at
     retry_ms = SSE_RECONNECT_MIN_MS + secrets.randbelow(SSE_RECONNECT_JITTER_MS + 1)
     try:
         yield f"retry: {retry_ms}\nevent: connected\ndata: {{}}\n\n"
@@ -80,8 +83,13 @@ async def stream_bracket_events(
                 ignore_subscribe_messages=True,
                 timeout=min(float(SSE_KEEPALIVE_SECONDS), remaining_seconds),
             )
-            if not await current_tournament_stream_access_is_valid(tournament_id):
-                break
+            now = time.monotonic()
+            if message is not None or (
+                now - last_access_check_at >= SSE_ACCESS_REVALIDATION_SECONDS
+            ):
+                if not await current_tournament_stream_access_is_valid(tournament_id):
+                    break
+                last_access_check_at = now
             if message is None:
                 yield ": keepalive\n\n"
                 continue

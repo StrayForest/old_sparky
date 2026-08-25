@@ -131,9 +131,10 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
 
     Public streams remain public-only. Every authenticated private stream
     revalidates the exact server-side session plus the authority that admitted
-    it (organizer, platform admin, or active participant) before every event or
-    keepalive. Session logout/revocation and role removal therefore take effect
-    without waiting for the bounded SSE lifetime to expire.
+    it (organizer, platform admin, or active participant) before every event
+    and at periodic idle checkpoints. Session logout/revocation and role
+    removal therefore take effect before any later private event, without
+    waiting for the bounded SSE lifetime to expire.
     """
 
     access_context = current_tournament_stream_access_context()

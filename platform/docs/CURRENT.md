@@ -143,9 +143,12 @@ Reducing opening concurrency to 32 produced the first strict 512-SSE pass in
 events and connect p95 12.30s, with no sustained CPU, PostgreSQL connection or
 lock saturation. The same open32 shape at 1,000 SSE (`32839100405`, cleanup
 `32839300689`) reached 990/1,000 with 17 errors and sustained `deadlock-api`
-CPU saturation, so the current strict staircase point is 512. A focused code
-A/B now removes only the duplicate pre-subscription authorization query while
-retaining first-event and periodic revalidation checks.
+CPU saturation, so the current strict staircase point is 512. The follow-up
+lifecycle A/B removes the duplicate pre-subscription authorization query and
+changes idle checkpoints from every keepalive to a 30s cadence while retaining
+mandatory revalidation before each private event; focused route,
+authorization, revocation and QA tests pass locally, with production
+measurement pending.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.

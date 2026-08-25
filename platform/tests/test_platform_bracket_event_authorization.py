@@ -154,6 +154,35 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pubsub.closed)
         self.assertTrue(client.closed)
 
+    async def test_idle_stream_revalidates_at_periodic_checkpoint(self) -> None:
+        pubsub = _FakePubSub([None])
+        client = _FakeRedisClient(pubsub)
+        access_check = AsyncMock(return_value=False)
+
+        with (
+            patch.object(bracket_events, "redis_client", MagicMock(return_value=client)),
+            patch.object(
+                bracket_events,
+                "current_tournament_stream_access_is_valid",
+                access_check,
+            ),
+            patch.object(
+                bracket_events.time,
+                "monotonic",
+                side_effect=(10.0, 10.0, 40.0),
+            ),
+        ):
+            stream = bracket_events.stream_bracket_events(
+                "tournament-5",
+                admission_verified=True,
+            )
+            self.assertIn("event: connected", await anext(stream))
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+
+        access_check.assert_awaited_once_with("tournament-5")
+        self.assertTrue(client.closed)
+
 
 if __name__ == "__main__":
     unittest.main()

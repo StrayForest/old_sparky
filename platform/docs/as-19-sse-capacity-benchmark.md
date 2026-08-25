@@ -256,6 +256,8 @@ stores only the measured conclusion and run identifiers.
   `errors=17`, `max_active=988` and 315 events, but failed the strict gate.
   It showed sustained and peak `deadlock-api` CPU saturation without
   PostgreSQL connection/lock saturation. The current strict staircase point
-  is therefore 512; the next code A/B removes only the duplicate
-  pre-subscription authorization query while retaining the first-event and
-  periodic revalidation checks.
+  is therefore 512. The follow-up lifecycle A/B removes the duplicate
+  pre-subscription authorization query and changes idle checkpoints from every
+  keepalive to a 30s cadence, while retaining mandatory revalidation before
+  each private event. Focused route, authorization, revocation and QA tests
+  pass locally; its production result is pending.
