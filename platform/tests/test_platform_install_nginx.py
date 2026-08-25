@@ -57,6 +57,9 @@ class PlatformInstallNginxTests(unittest.TestCase):
         snippet_text = MODULE.DEFAULT_SNIPPET_SOURCE.read_text(encoding="utf-8")
         self.assertNotIn("Content-Security-Policy", snippet_text)
 
+    def test_main_config_has_sse_connection_capacity(self) -> None:
+        MODULE.validate_main_config(MODULE.DEFAULT_MAIN_SOURCE)
+
     def test_vhost_rejects_nginx_owned_csp_in_both_modes(self) -> None:
         original = MODULE.DEFAULT_SOURCE.read_text(encoding="utf-8")
         include_line = f"    include {MODULE.DEFAULT_SNIPPET_DESTINATION};"

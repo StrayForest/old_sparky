@@ -31,8 +31,8 @@ from python_packages.platform_infra.security import session_token_digest
 logger = logging.getLogger(__name__)
 
 SSE_PATH_RE = re.compile(r"^/api/v1/tournaments/[^/]+/bracket/events$")
-SSE_GLOBAL_LIMIT = 128
-SSE_SOURCE_LIMIT = 6
+SSE_GLOBAL_LIMIT = 10_240
+SSE_SOURCE_LIMIT = 32
 SSE_USER_LIMIT = 4
 SSE_STREAM_MAX_LIFETIME_SECONDS = 600
 SSE_KEEPALIVE_SECONDS = 15

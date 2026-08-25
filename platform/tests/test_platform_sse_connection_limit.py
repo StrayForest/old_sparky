@@ -187,8 +187,8 @@ class PlatformSseNginxGuardTests(unittest.TestCase):
             "limit_conn_zone $server_name zone=platform_sse_global:1m;",
             nginx,
         )
-        self.assertIn("limit_conn platform_sse_ip 8;", nginx)
-        self.assertIn("limit_conn platform_sse_global 160;", nginx)
+        self.assertIn("limit_conn platform_sse_ip 32;", nginx)
+        self.assertIn("limit_conn platform_sse_global 10240;", nginx)
         self.assertIn("limit_conn_status 429;", nginx)
         self.assertIn('"limit_conn_status":"$limit_conn_status"', nginx)
         self.assertIn("proxy_read_timeout 60s;", nginx)

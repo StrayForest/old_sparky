@@ -23,7 +23,9 @@ Runtime layout:
 Build/install tools create immutable artifacts; the release deploy wrapper
 retains a durable transaction through migration, restart/readiness, Nginx and
 smoke before committing `current`/`previous`. Nginx installation validates and
-updates the vhost plus shared security-header snippet as one rollback unit.
+updates the managed main config, vhost plus shared security-header snippet as
+one rollback unit. The main config carries the SSE worker capacity settings;
+the vhost carries the SSE source/global admission contour.
 The systemd installer installs all API/web/worker, health, Cloudflare,
 maintenance and off-site-backup units; only the reviewed recurring timers are
 enabled automatically. Do not edit live files without the documented state

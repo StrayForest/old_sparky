@@ -17,6 +17,8 @@ import tempfile
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = PLATFORM_ROOT / "deploy/nginx/deadlock-platform.conf"
+DEFAULT_MAIN_SOURCE = PLATFORM_ROOT / "deploy/nginx/nginx.conf"
+DEFAULT_MAIN_DESTINATION = Path("/etc/nginx/nginx.conf")
 DEFAULT_SNIPPET_SOURCE = (
     PLATFORM_ROOT / "deploy/nginx/snippets/deadlock-platform-security-headers.conf"
 )
@@ -90,6 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--reload", action="store_true")
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    parser.add_argument("--main-source", type=Path, default=DEFAULT_MAIN_SOURCE)
+    parser.add_argument(
+        "--main-destination", type=Path, default=DEFAULT_MAIN_DESTINATION
+    )
     parser.add_argument("--snippet-source", type=Path, default=DEFAULT_SNIPPET_SOURCE)
     parser.add_argument("--available", type=Path, default=DEFAULT_AVAILABLE)
     parser.add_argument("--enabled", type=Path, default=DEFAULT_ENABLED)
@@ -419,6 +425,18 @@ def validate_candidate(
         run_checked([nginx_bin, "-t", "-c", str(main_config)])
 
 
+def validate_main_config(source: Path) -> None:
+    if not source.is_file():
+        raise FileNotFoundError(f"Nginx main candidate is missing: {source}.")
+    text = source.read_text(encoding="utf-8")
+    if "worker_rlimit_nofile 65535;" not in text:
+        raise ValueError("Nginx main config must raise worker_rlimit_nofile to 65535.")
+    if "worker_connections 16384;" not in text:
+        raise ValueError("Nginx main config must provide 16384 worker connections.")
+    if "include /etc/nginx/sites-enabled/*;" not in text:
+        raise ValueError("Nginx main config must include managed virtual hosts.")
+
+
 def atomic_copy(source: Path, destination: Path) -> None:
     atomic_write(source.read_bytes(), destination, mode=0o644)
 
@@ -495,16 +513,25 @@ def install(
     *,
     snippet_source: Path = DEFAULT_SNIPPET_SOURCE,
     snippet_destination: Path = DEFAULT_SNIPPET_DESTINATION,
+    main_source: Path | None = None,
+    main_destination: Path | None = None,
 ) -> bool:
     if os.geteuid() != 0:
         raise PermissionError("--apply requires root.")
-    destination_paths = (available, enabled, snippet_destination)
+    if (main_source is None) != (main_destination is None):
+        raise ValueError("Nginx main source and destination must be provided together.")
+    destination_paths = (available, enabled, snippet_destination) + (
+        (main_destination,) if main_destination is not None else ()
+    )
     if len(set(destination_paths)) != len(destination_paths):
         raise ValueError("Nginx vhost, enabled link and snippet destinations must be distinct.")
 
     previous_available = snapshot_path(available)
     previous_enabled = snapshot_path(enabled)
     previous_snippet = snapshot_path(snippet_destination)
+    previous_main = (
+        snapshot_path(main_destination) if main_destination is not None else None
+    )
     moved_default = False
     old_default_enabled = DEFAULT_OLD_ENABLED.exists() or DEFAULT_OLD_ENABLED.is_symlink()
     changed = (
@@ -516,6 +543,16 @@ def install(
         or previous_snippet.kind != "file"
         or previous_snippet.data != snippet_source.read_bytes()
         or previous_snippet.mode != 0o644
+        or (
+            main_source is not None
+            and main_destination is not None
+            and (
+                previous_main is None
+                or previous_main.kind != "file"
+                or previous_main.data != main_source.read_bytes()
+                or previous_main.mode != 0o644
+            )
+        )
         or old_default_enabled
     )
     if not changed:
@@ -533,6 +570,8 @@ def install(
             moved_default = True
         atomic_copy(source, available)
         atomic_copy(snippet_source, snippet_destination)
+        if main_source is not None and main_destination is not None:
+            atomic_copy(main_source, main_destination)
         atomic_symlink(str(available), enabled)
         run_checked([nginx_bin, "-t"])
         if reload_nginx:
@@ -549,6 +588,11 @@ def install(
                 restore_path(path, snapshot)
             except Exception as exc:  # pragma: no cover - catastrophic filesystem failure
                 rollback_errors.append(f"{path}: {exc}")
+        if main_destination is not None and previous_main is not None:
+            try:
+                restore_path(main_destination, previous_main)
+            except Exception as exc:  # pragma: no cover - catastrophic filesystem failure
+                rollback_errors.append(f"{main_destination}: {exc}")
         try:
             if moved_default and (
                 DEFAULT_OLD_DISABLED.exists() or DEFAULT_OLD_DISABLED.is_symlink()
@@ -575,6 +619,7 @@ def main() -> int:
         snippet_source=args.snippet_source,
         snippet_destination=args.snippet_destination,
     )
+    validate_main_config(args.main_source)
     changed = False
     if args.apply:
         changed = install(
@@ -585,15 +630,19 @@ def main() -> int:
             args.reload,
             snippet_source=args.snippet_source,
             snippet_destination=args.snippet_destination,
+            main_source=args.main_source,
+            main_destination=args.main_destination,
         )
     result = {
         "ok": True,
         "mode": "apply" if args.apply else "dry-run",
         "candidate": str(args.source),
+        "main_candidate": str(args.main_source),
         "snippet_candidate": str(args.snippet_source),
         "available": str(args.available),
         "enabled": str(args.enabled),
         "snippet_destination": str(args.snippet_destination),
+        "main_destination": str(args.main_destination),
         "changed": changed,
         "reload_requested": bool(args.reload),
         "prerequisites": prerequisites,
