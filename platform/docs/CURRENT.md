@@ -146,9 +146,19 @@ lock saturation. The same open32 shape at 1,000 SSE (`32839100405`, cleanup
 CPU saturation, so the current strict staircase point is 512. The follow-up
 lifecycle A/B removes the duplicate pre-subscription authorization query and
 changes idle checkpoints from every keepalive to a 30s cadence while retaining
-mandatory revalidation before each private event; focused route,
-authorization, revocation and QA tests pass locally, with production
-measurement pending.
+mandatory revalidation before each private event. On the deployed
+duplicate-check variant, 512/open64 became a strict pass (`32840244186`,
+cleanup `32840480141`: 512/512, zero errors, 393 events, p95 10.86s);
+1000/open32 still reached only 990/1000 with 16 errors and sustained API CPU
+(`32840531009`, cleanup `32840726728`). The idle-checkpoint variant then
+improved 1000/open32 to 989/1000 with 12 errors and removed sustained CPU
+saturation (`32841823646`, cleanup `32842030758`), but did not meet the strict
+gate. Reducing opening concurrency further to 16 returned sustained API CPU
+and produced 13 errors (`32842094082`, cleanup `32842288384`). The current
+strict contour is 512 with open32/open64; 1000 persistent SSE remains
+unproven. The next A/B removes a duplicate participant lookup already
+represented by the stream access context; authorization and revocation
+semantics remain unchanged.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.

@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import inspect
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from apps.platform_api.app.api.routes import tournaments
 from apps.platform_api.app.main import create_app
+from apps.platform_api.app.services.tournament_workspace_access import (
+    TournamentStreamAccessContext,
+)
 from python_packages.platform_infra.db import get_db_session
 
 
@@ -54,6 +59,59 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
             tournaments.get_tournament_bracket_events
         ).parameters["db_session"]
         self.assertEqual(parameter.default.scope, "function")
+
+    async def test_sse_endpoint_reuses_stream_access_participant_snapshot(self) -> None:
+        tournament = SimpleNamespace(id="tournament-1")
+        auth_session = SimpleNamespace(
+            user=SimpleNamespace(id="user-1"),
+            role_slugs=frozenset(),
+        )
+        access_context = TournamentStreamAccessContext(
+            decision="active_participant",
+            slug="test-tournament",
+            user_id="user-1",
+            session_id="session-1",
+            tournament=tournament,
+        )
+
+        async def empty_stream():
+            if False:
+                yield ""
+
+        with (
+            patch.object(
+                tournaments,
+                "current_tournament_stream_access_context",
+                return_value=access_context,
+            ),
+            patch.object(
+                tournaments,
+                "ensure_tournament_workspace_visible",
+            ) as ensure_visible,
+            patch.object(
+                tournaments,
+                "participant_for_user",
+                new_callable=AsyncMock,
+            ) as participant_for_user,
+            patch.object(
+                tournaments,
+                "stream_bracket_events",
+                return_value=empty_stream(),
+            ),
+        ):
+            response = await tournaments.get_tournament_bracket_events(
+                "test-tournament",
+                auth_session,
+                MagicMock(),
+            )
+
+        self.assertEqual(response.media_type, "text/event-stream")
+        participant_for_user.assert_not_awaited()
+        ensure_visible.assert_called_once_with(
+            tournament,
+            auth_session=auth_session,
+            has_participant_record=True,
+        )
 
 
 if __name__ == "__main__":

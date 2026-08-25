@@ -256,8 +256,29 @@ stores only the measured conclusion and run identifiers.
   `errors=17`, `max_active=988` and 315 events, but failed the strict gate.
   It showed sustained and peak `deadlock-api` CPU saturation without
   PostgreSQL connection/lock saturation. The current strict staircase point
-  is therefore 512. The follow-up lifecycle A/B removes the duplicate
-  pre-subscription authorization query and changes idle checkpoints from every
-  keepalive to a 30s cadence, while retaining mandatory revalidation before
-  each private event. Focused route, authorization, revocation and QA tests
-  pass locally; its production result is pending.
+  is therefore 512.
+- The duplicate pre-subscription authorization A/B deployed in `bd02dbe9`
+  retained the same access checks and removed one query before Redis
+  subscription. At 512/open64, load `32840244186` with exact cleanup
+  `32840480141` was a strict pass: `200=512/512`, zero errors, 393 events and
+  connect p95 10.86s. It still showed CPU peak/load-average flags but no
+  sustained API CPU, PostgreSQL connection or lock saturation. At
+  1000/open32, load `32840531009` with cleanup `32840726728` reached
+  `990/1,000`, `errors=16`, `max_active=985` and 398 events, with sustained
+  API CPU; it therefore failed the strict gate.
+- The idle-revalidation A/B deployed in `79b023f0` keeps mandatory access
+  validation before every private event but checks idle streams every 30s
+  instead of every keepalive. At 1000/open32, load `32841823646` with exact
+  cleanup `32842030758` reached `989/1,000`, `errors=12`, `max_active=988`
+  and 469 events. Sustained CPU and load-average flags disappeared; the
+  remaining classified hotspot was database time, but the zero-error gate
+  still failed. A 1000/open16 contour (`32842094082`, cleanup
+  `32842288384`) reached `989/1,000` with 13 errors, 423 events and p95
+  20.06s; sustained API CPU returned, so open16 is worse than open32.
+- The next focused A/B removes the endpoint's duplicate participant lookup.
+  The stream access dependency has already loaded the tournament and
+  participant status into its access context; the endpoint can derive the
+  visibility flag from that context and avoid a second read. This does not
+  change session validity, role checks, private-event revalidation or the
+  fallback path when the context is unavailable. Its production result is
+  pending.

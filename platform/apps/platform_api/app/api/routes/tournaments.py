@@ -3881,8 +3881,22 @@ async def get_tournament_bracket_events(
         tournament = access_context.tournament
     else:
         tournament = await get_tournament_or_404(db_session, slug)
-    has_participant_record = False
-    if auth_session is not None:
+    has_participant_record = (
+        access_context is not None
+        and access_context.slug == slug
+        and access_context.tournament is not None
+        and access_context.tournament.id == tournament.id
+        and access_context.decision == "active_participant"
+    )
+    if (
+        auth_session is not None
+        and (
+            access_context is None
+            or access_context.slug != slug
+            or access_context.tournament is None
+            or access_context.tournament.id != tournament.id
+        )
+    ):
         has_participant_record = (
             await participant_for_user(
                 db_session,
