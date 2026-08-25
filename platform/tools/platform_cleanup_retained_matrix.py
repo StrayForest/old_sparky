@@ -62,6 +62,10 @@ MARKER_PATTERN = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
 EMAIL_PATTERN = re.compile(
     r"^(?P<marker>preprod[0-9]{12}[0-9a-f]{4})-[a-z0-9-]+@example\.com$"
 )
+BROWSER_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
+    r"^Browser polling profile (?P<marker>preprod[0-9]{12}[0-9a-f]{4}) "
+    r"(?P<category>registration_open|ready_check_active|bracket_active|terminal)\.$"
+)
 
 
 def _regular_root_file(path: Path, *, root: Path) -> Path:
@@ -213,6 +217,36 @@ async def _count_ids(db_session, model: Any, ids: set[str]) -> int:
     )
 
 
+def _merge_recovered_browser_tournaments(
+    row: dict[str, Any],
+    candidate_rows: list[Any],
+    *,
+    user_ids: set[str],
+) -> set[str]:
+    """Recover a create-before-timeout tournament without widening cleanup scope.
+
+    A gateway timeout can arrive after the API has committed the tournament but
+    before the load generator receives its response. In that case the durable
+    report has no tournament ID. Only the exact marker description and a
+    synthetic organizer from the same manifest may recover that identity.
+    """
+    marker = str(row["marker"])
+    declared_ids = set(row["tournament_ids"])
+    recovered_ids: set[str] = set()
+    for candidate in candidate_rows:
+        description = str(candidate.description or "")
+        match = BROWSER_TOURNAMENT_DESCRIPTION_PATTERN.fullmatch(description)
+        if match is None or match.group("marker") != marker:
+            raise RuntimeError("browser cleanup found an invalid marker-owned tournament")
+        if str(candidate.organizer_user_id) not in user_ids:
+            raise RuntimeError("browser cleanup found a tournament owned outside the exact inventory")
+        recovered_ids.add(str(candidate.id))
+    if len(recovered_ids) > MAX_MATRIX_ROWS:
+        raise RuntimeError("browser cleanup found too many marker-owned tournaments")
+    row["tournament_ids"] = sorted(declared_ids | recovered_ids)
+    return recovered_ids - declared_ids
+
+
 async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     settings = get_settings()
     validate_platform_settings(settings)
@@ -226,6 +260,33 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     tournament_ids = set(manifest["tournament_ids"])
     control_email = str(manifest["control_email"])
     async with session_factory()() as db_session:
+        recovered_tournament_ids: dict[str, set[str]] = {}
+        if manifest["mode"] == "browser-polling":
+            for row in manifest["rows"]:
+                marker_prefix = f"Browser polling profile {row['marker']} "
+                candidates = list(
+                    (
+                        await db_session.execute(
+                            select(
+                                Tournament.id,
+                                Tournament.description,
+                                Tournament.organizer_user_id,
+                            ).where(Tournament.description.like(f"{marker_prefix}%"))
+                        )
+                    ).all()
+                )
+                recovered = _merge_recovered_browser_tournaments(
+                    row,
+                    candidates,
+                    user_ids=set(row["user_ids"]),
+                )
+                if recovered:
+                    recovered_tournament_ids[row["marker"]] = recovered
+            tournament_ids = {
+                tournament_id
+                for row in manifest["rows"]
+                for tournament_id in row["tournament_ids"]
+            }
         runs = list(
             (
                 await db_session.scalars(
@@ -243,10 +304,18 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             if run.origin != EXPECTED_ORIGIN or run.report_path != row["report_path"]:
                 raise RuntimeError("database run provenance does not match the matrix report")
             stored_report = dict(run.report or {})
+            stored_tournament_ids = set(stored_report.get("tournament_ids") or [])
+            manifest_tournament_ids = set(row["tournament_ids"])
             if (
                 stored_report.get("marker") != run.marker
                 or set(stored_report.get("user_ids") or []) != set(row["user_ids"])
-                or set(stored_report.get("tournament_ids") or []) != set(row["tournament_ids"])
+                or (
+                    stored_tournament_ids != manifest_tournament_ids
+                    and not (
+                        run.marker in recovered_tournament_ids
+                        and stored_tournament_ids <= manifest_tournament_ids
+                    )
+                )
             ):
                 raise RuntimeError("database run report identity does not match the matrix report")
 

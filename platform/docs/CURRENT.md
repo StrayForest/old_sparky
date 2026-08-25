@@ -51,7 +51,10 @@ also exposed an operator-contour bug: canceling the GitHub SSH step did not
 propagate to the remote supervisor. The reviewed abort workflow, remote
 180-minute ceiling and durable-report recovery are now part of the retained
 load procedure; a canceled run remains a failed measurement and must be
-cleaned exactly.
+cleaned exactly. A production browser setup timeout also exposed the
+create-before-response boundary: the exact cleanup path now recovers only a
+marker-matching tournament owned by that run's synthetic organizer set before
+deletion, while malformed or foreign matches remain fail-closed.
 
 The remaining AS-18 load work uses an uncommitted-source staircase only in an
 isolated local/pre-production runtime: 1,000 → 5,000 → 10,000 virtual users.

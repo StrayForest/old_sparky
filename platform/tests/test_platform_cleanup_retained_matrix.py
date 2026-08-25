@@ -19,6 +19,63 @@ SPEC.loader.exec_module(cleanup)
 
 
 class RetainedMatrixManifestTests(unittest.TestCase):
+    def test_browser_timeout_recovery_requires_exact_marker_and_synthetic_owner(self) -> None:
+        marker = "preprod260824120000abcd"
+        user_id = str(uuid4())
+        row = {"marker": marker, "tournament_ids": []}
+
+        candidate = type(
+            "Candidate",
+            (),
+            {
+                "id": str(uuid4()),
+                "description": f"Browser polling profile {marker} registration_open.",
+                "organizer_user_id": user_id,
+            },
+        )()
+        recovered = cleanup._merge_recovered_browser_tournaments(
+            row,
+            [candidate],
+            user_ids={user_id},
+        )
+
+        self.assertEqual(recovered, {candidate.id})
+        self.assertEqual(row["tournament_ids"], [candidate.id])
+
+        outsider = type(
+            "Candidate",
+            (),
+            {
+                "id": str(uuid4()),
+                "description": f"Browser polling profile {marker} bracket_active.",
+                "organizer_user_id": str(uuid4()),
+            },
+        )()
+        with self.assertRaisesRegex(RuntimeError, "outside the exact inventory"):
+            cleanup._merge_recovered_browser_tournaments(
+                {"marker": marker, "tournament_ids": []},
+                [outsider],
+                user_ids={user_id},
+            )
+
+    def test_browser_timeout_recovery_rejects_wrong_marker_description(self) -> None:
+        marker = "preprod260824120000abcd"
+        candidate = type(
+            "Candidate",
+            (),
+            {
+                "id": str(uuid4()),
+                "description": f"Browser polling profile {marker} unexpected.",
+                "organizer_user_id": str(uuid4()),
+            },
+        )()
+        with self.assertRaisesRegex(RuntimeError, "invalid marker-owned tournament"):
+            cleanup._merge_recovered_browser_tournaments(
+                {"marker": marker, "tournament_ids": []},
+                [candidate],
+                user_ids={candidate.organizer_user_id},
+            )
+
     def _write_manifest(self, root: Path, report_path: Path) -> Path:
         marker = "preprod260824120000abcd"
         user_id = str(uuid4())

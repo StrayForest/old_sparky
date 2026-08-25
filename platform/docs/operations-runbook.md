@@ -335,6 +335,14 @@ its browser report and one-row summary from the matching durable
 ownership and graph-boundary check before deleting anything. A recovered run
 is never considered a passed load measurement.
 
+If a browser tournament was committed before its POST timed out at the edge,
+the durable report may contain the synthetic users but no tournament ID. The
+cleanup validator then recovers only exact `Browser polling profile <marker>
+<category>.` descriptions whose organizer is one of that run's synthetic
+users. Any malformed marker match or organizer outside the manifest remains a
+fail-closed cleanup error; this recovery never broadens deletion to a generic
+historical search.
+
 The cleanup command also disposes its async database engine in the same event
 loop as validation/deletion; cross-loop asyncpg errors in a successful cleanup
 log are treated as a regression and must not be ignored.
@@ -361,7 +369,8 @@ gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 The cleanup supervisor holds the same host lock as the load, validates the
 selected run's summary and every detailed report against production database
 markers, refuses any overlap with the control account or outside tournament,
-deletes the exact fixture graph, verifies zero remaining fixture users,
+recovers only a create-before-timeout browser tournament under the exact
+marker/organizer rule above, deletes the exact fixture graph, verifies zero remaining fixture users,
 tournaments, sessions and audit rows, and only then removes the VPS report
 directory. A failed cleanup keeps the data and report directory in place for
 operator recovery; do not run broad `platform_cleanup_preprod_runs.py` against
