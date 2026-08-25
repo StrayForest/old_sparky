@@ -133,6 +133,7 @@ if [[ "$profile" == "matrix" ]]; then
   set +e
   timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_seed_retained_tournament_matrix.py" \
+    --env-file "$RUNTIME_ROOT/shared/.env.platform" \
     --origin "$EXPECTED_ORIGIN" \
     --control-email "$control_email" \
     --concurrency "$concurrency" \
@@ -149,20 +150,22 @@ else
   browser_root="$run_root/browser-polling"
   install -d -o root -g root -m 0700 "$browser_root"
   browser_report="$browser_root/browser-polling.json"
-  browser_http_connections=$((concurrency * 4))
-  if (( browser_http_connections < 128 )); then
-    browser_http_connections=128
-  elif (( browser_http_connections > 512 )); then
-    browser_http_connections=512
-  fi
+  # The measured 10k profile uses a bounded client pool.  The previous
+  # concurrency*4 rule opened 320 connections for the normal concurrency=80
+  # dispatch and exhausted the API database pool before the VPS CPU was busy.
+  browser_http_connections=40
+  browser_setup_concurrency=20
   set +e
   timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_production_qa.py" \
+    --env-file "$RUNTIME_ROOT/shared/.env.platform" \
     --mode browser-polling \
     --keep-data \
     --origin "$EXPECTED_ORIGIN" \
-    --concurrency "$concurrency" \
+    --concurrency "$browser_setup_concurrency" \
     --http-max-connections "$browser_http_connections" \
+    --browser-polling-duration 30 \
+    --browser-polling-open-stagger 300 \
     --browser-polling-active-users-only \
     --collect-performance \
     --report-path "$browser_report" \

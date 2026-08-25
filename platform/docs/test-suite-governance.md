@@ -37,9 +37,10 @@ database, workers and host resources.
 The retained matrix's 10,000 users are persisted scale-fixture accounts, not
 10,000 simultaneous request workers. The `browser-polling` profile is the
 concurrent virtual-user gate; use 20 tournaments × 500 users, active-users-only
-mode and an explicitly sized HTTP connection pool when that profile is the
-target. It does not represent 10,000 persistent SSE connections, which remain
-bounded by the application and Nginx capacity policy.
+mode, HTTP40, a 300-second opening stagger and a 30-second polling window when
+that profile is the target. It does not represent 10,000 persistent SSE
+connections or continuous 10-second polling by every tab, which remain beyond
+the measured two-core capacity contour.
 
 The production retained-load group is a deliberate exception to the normal
 release gate: it is never scheduled, never part of ordinary CI, and never runs
@@ -139,10 +140,11 @@ gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
 The same workflow has `profile=browser-polling`. That explicit final gate uses
-20 tournaments × 500 users, 10,000 active virtual polling tabs, conditional
-revision reads and the same exact-marker cleanup path. Run it only after the
-ordinary retained matrix and use its own workflow run ID for cleanup; it does
-not mean 10,000 persistent SSE connections.
+20 tournaments × 500 users, 10,000 active virtual polling tabs opened over a
+300-second ramp, a 30-second polling window, HTTP40 and conditional revision
+reads with the same exact-marker cleanup path. Run it only after the ordinary
+retained matrix and use its own workflow run ID for cleanup; it does not mean
+10,000 persistent SSE connections.
 
 The detailed reports remain on the VPS under
 `/opt/oldsparky/platform/shared/production-retained-matrix/gha-<load-run-id>/`

@@ -471,6 +471,7 @@ class PollingMetricsRecorder:
         self.by_tournament_status: dict[str, Counter[str]] = defaultdict(Counter)
         self.route_executed_by_hidden: Counter[str] = Counter()
         self.route_executed_by_terminal: Counter[str] = Counter()
+        self.error_samples: list[dict[str, str]] = []
 
     def mark(
         self,
@@ -494,6 +495,33 @@ class PollingMetricsRecorder:
         if tournament_status:
             self.by_tournament_status[tournament_status][event] += 1
 
+    def record_error(
+        self,
+        *,
+        route: str,
+        role: str,
+        tournament_status: str,
+        error: BaseException,
+    ) -> None:
+        self.mark(
+            "errors",
+            route=route,
+            role=role,
+            tournament_status=tournament_status,
+        )
+        if len(self.error_samples) >= 25:
+            return
+        message = str(error).strip()
+        self.error_samples.append(
+            {
+                "type": type(error).__name__,
+                "route": route,
+                "role": role,
+                "tournament_status": tournament_status,
+                "message": message[:300],
+            }
+        )
+
     @staticmethod
     def _counter_row(counter: Counter[str]) -> dict[str, int]:
         return {
@@ -505,6 +533,7 @@ class PollingMetricsRecorder:
             "aborted": int(counter.get("aborted", 0)),
             "not_modified": int(counter.get("not_modified", 0)),
             "sse_reconnect": int(counter.get("sse_reconnect", 0)),
+            "errors": int(counter.get("errors", 0)),
         }
 
     def summary(self) -> dict[str, Any]:
@@ -524,6 +553,7 @@ class PollingMetricsRecorder:
             },
             "executed_while_hidden": dict(sorted(self.route_executed_by_hidden.items())),
             "executed_after_terminal": dict(sorted(self.route_executed_by_terminal.items())),
+            "error_samples": list(self.error_samples),
         }
 
 
@@ -1912,9 +1942,16 @@ class ProductionQa:
             "control_participant": None,
         }
 
-    def scenario(self, name: str, ok: bool, detail: Any = None) -> None:
+    def scenario(
+        self,
+        name: str,
+        ok: bool,
+        detail: Any = None,
+        *,
+        fatal: bool = True,
+    ) -> None:
         self.scenarios.append({"name": name, "ok": ok, "detail": detail})
-        if not ok:
+        if not ok and fatal:
             raise QaFailure(f"{name}: {detail}")
 
     @contextmanager
@@ -3325,19 +3362,28 @@ class ProductionQa:
                 hidden=bool(tab.get("hidden")),
                 terminal_known=bool(tab.get("terminal_known")),
             )
-            request_result = await self.request_as(
-                api_client,
-                tab["user"],
-                "GET",
-                str(tab["route"]),
-                expected=(200, 304),
-                extra_headers=(
-                    {"If-None-Match": str(tab["etag"])}
-                    if tab.get("etag")
-                    else None
-                ),
-                return_response_meta=True,
-            )
+            try:
+                request_result = await self.request_as(
+                    api_client,
+                    tab["user"],
+                    "GET",
+                    str(tab["route"]),
+                    expected=(200, 304),
+                    extra_headers=(
+                        {"If-None-Match": str(tab["etag"])}
+                        if tab.get("etag")
+                        else None
+                    ),
+                    return_response_meta=True,
+                )
+            except Exception as exc:
+                self.polling_metrics.record_error(
+                    route=route_label,
+                    role=str(tab["role"]),
+                    tournament_status=str(tab["tournament_status"]),
+                    error=exc,
+                )
+                return None
             payload, status_code, response_headers = request_result
             if status_code == 304:
                 self.polling_metrics.mark(
@@ -3658,6 +3704,15 @@ class ProductionQa:
                     "aborted": polling_summary["aborted"],
                     "skipped_short_duration": not long_enough_for_polling_tick,
                 },
+            )
+            self.scenario(
+                "browser_polling_requests_without_errors",
+                polling_summary["errors"] == 0,
+                {
+                    "errors": polling_summary["errors"],
+                    "error_samples": polling_summary["error_samples"],
+                },
+                fatal=False,
             )
             self.scenario(
                 "browser_polling_repeated_gets_below_fixed_polling",
@@ -5965,8 +6020,8 @@ async def async_main() -> int:
     args = parse_args()
     env_file = args.env_file
     if env_file is None:
-        live_env = Path("/opt/oldsparky/platform/shared/.env.platform")
-        env_file = live_env if live_env.exists() else PLATFORM_ROOT / ".env.platform"
+        configured_env = os.environ.get("PLATFORM_ENV_FILE", "").strip()
+        env_file = Path(configured_env) if configured_env else PLATFORM_ROOT / ".env.platform"
     load_env_file(env_file)
 
     qa = ProductionQa(
@@ -6013,7 +6068,7 @@ async def async_main() -> int:
         else:
             report = await qa.run()
     except Exception as exc:
-        qa.report["fatal_error"] = str(exc)
+        qa.report["fatal_error"] = f"{type(exc).__name__}: {exc!r}"
         qa.report["finished_at"] = datetime.now(UTC).isoformat()
         qa.report["passed"] = False
         qa.report["report_path"] = str(args.report_path)

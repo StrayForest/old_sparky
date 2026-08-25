@@ -192,6 +192,22 @@ class ProductionQaPollingProfileTests(unittest.TestCase):
             {"GET /tournaments/{slug}": 1},
         )
 
+    def test_polling_metrics_keep_bounded_error_samples(self) -> None:
+        recorder = PollingMetricsRecorder()
+        for _ in range(30):
+            recorder.record_error(
+                route="GET /tournaments/{slug}/workspace",
+                role="viewer",
+                tournament_status="registration_open",
+                error=RuntimeError("transport failed"),
+            )
+
+        summary = recorder.summary()
+
+        self.assertEqual(summary["errors"], 30)
+        self.assertEqual(len(summary["error_samples"]), 25)
+        self.assertEqual(summary["error_samples"][0]["type"], "RuntimeError")
+
     def test_fixed_polling_expectation_uses_route_labels(self) -> None:
         tabs = [
             {

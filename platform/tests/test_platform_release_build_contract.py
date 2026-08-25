@@ -224,8 +224,27 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn("asyncio.run(dispose_engine())", cleanup_tool)
         self.assertIn("platform_recover_retained_browser_report.py", cleanup_supervisor)
         self.assertIn("timeout --signal=TERM --kill-after=30s", load_supervisor)
-        self.assertIn('browser_http_connections=$((concurrency * 4))', load_supervisor)
-        self.assertIn('browser_http_connections > 512', load_supervisor)
+        self.assertIn('browser_http_connections=40', load_supervisor)
+        self.assertIn('browser_setup_concurrency=20', load_supervisor)
+        self.assertIn('--concurrency "$browser_setup_concurrency"', load_supervisor)
+        self.assertIn('--browser-polling-duration 30', load_supervisor)
+        self.assertIn('--browser-polling-open-stagger 300', load_supervisor)
+
+    def test_browser_qa_does_not_silently_fallback_to_production_env(self) -> None:
+        qa_source = (REPO_ROOT / "platform/tools/platform_production_qa.py").read_text()
+
+        self.assertIn(
+            'configured_env = os.environ.get("PLATFORM_ENV_FILE", "").strip()',
+            qa_source,
+        )
+        self.assertIn(
+            'env_file = Path(configured_env) if configured_env else PLATFORM_ROOT / ".env.platform"',
+            qa_source,
+        )
+        self.assertNotIn(
+            'live_env = Path("/opt/oldsparky/platform/shared/.env.platform")',
+            qa_source,
+        )
 
     def test_release_ref_is_rejected_before_any_build_or_network_work(self) -> None:
         unsafe_refs = ("../escape", "bad/ref", 'bad"json', "-leading", "x" * 101)

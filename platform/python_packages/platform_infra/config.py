@@ -193,8 +193,8 @@ class PlatformSettings(BaseSettings):
     # Keep PostgreSQL connection count bounded per process. API and Celery
     # processes use separate budgets so background bursts cannot consume the
     # entire database capacity reserved for user requests.
-    platform_db_pool_size: int = Field(default=3, gt=0)
-    platform_db_max_overflow: int = Field(default=1, ge=0)
+    platform_db_pool_size: int = Field(default=12, gt=0)
+    platform_db_max_overflow: int = Field(default=0, ge=0)
     platform_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
     platform_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
     platform_worker_db_pool_size: int = Field(default=2, gt=0)
@@ -202,7 +202,7 @@ class PlatformSettings(BaseSettings):
     platform_worker_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
     platform_worker_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
     platform_worker_concurrency: int = Field(default=2, gt=0)
-    platform_db_connection_budget: int = Field(default=12, gt=0)
+    platform_db_connection_budget: int = Field(default=32, gt=0)
 
 
 @lru_cache(maxsize=1)

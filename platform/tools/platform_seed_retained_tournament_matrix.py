@@ -73,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         help="Existing account used for manual control states; its profile is never changed.",
     )
     parser.add_argument("--origin", default="http://127.0.0.1")
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Explicit runtime env file passed to each retained QA child.",
+    )
     parser.add_argument("--concurrency", type=int, default=80)
     parser.add_argument(
         "--users-per-tournament",
@@ -336,6 +342,7 @@ def run() -> int:
             "--mode",
             "scale",
             "--keep-data",
+            *(["--env-file", str(args.env_file)] if args.env_file is not None else []),
             "--origin",
             args.origin,
             "--scale-users",

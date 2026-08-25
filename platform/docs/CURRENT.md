@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-24
+- Last reviewed: 2026-08-25
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -52,6 +52,17 @@ propagate to the remote supervisor. The reviewed abort workflow, remote
 180-minute ceiling and durable-report recovery are now part of the retained
 load procedure; a canceled run remains a failed measurement and must be
 cleaned exactly.
+
+The remaining AS-18 load work uses an uncommitted-source staircase only in an
+isolated local/pre-production runtime: 1,000 → 5,000 → 10,000 virtual users.
+Each step must retain a durable report and compare client, SQL, pool, lock,
+CPU/RAM/load, Nginx, Redis and Celery evidence before the next hypothesis is
+changed. Production remains commit- and exact-SHA-gated; a canceled or
+recovered run is not a successful benchmark.
+The load work also requires a ten-run controlled A/B matrix followed by five
+follow-up variants around the winning configuration; the winner is selected
+by zero errors/cleanup first, then latency, CPU and pool wait, not by raw
+throughput alone.
 
 **AS-16 — Test-suite audit and executable CI/live ownership** is resolved and
 live-validated in production.
@@ -118,16 +129,16 @@ against the current web/api/worker identities and units.
   `If-None-Match`; unchanged reads return `304`. Active browser views poll at
   the existing short interval, hidden/passive/terminal views back off or stop,
   and SSE remains admission-limited.
-- API and worker SQLAlchemy pools are explicit and bounded: the reviewed
-  baseline is API `2 x (3 + 1)` plus worker `2 x (2 + 0)` within a 12-connection
-  budget. Celery uses high/default/low queues, prefetch one and late acks;
-  backlog/retry pressure is part of the load evidence.
+- API and worker SQLAlchemy pools are explicit and bounded: the measured
+  10k-polling baseline is API `2 x (12 + 0)` plus worker `2 x (2 + 0)` within a
+  32-connection budget. Celery uses high/default/low queues, prefetch one and
+  late acks; backlog/retry pressure is part of the load evidence.
 - The final 20×500 browser-polling gate keeps fixture state bounded to at most
   32 participants per tournament and uses four setup lanes plus one shared
-  request semaphore. Its production runner also caps the load-generator HTTP
-  pool at 128–512 connections while retaining 10,000 virtual tabs. Its
-  five-minute auto-assignment wait is fail-fast; the write-burst profile owns
-  join/ready-vote contention measurements.
+  request semaphore. Its production runner retains 10,000 virtual tabs but
+  uses HTTP40, a 300-second opening stagger and a 30-second active polling
+  window. Its five-minute auto-assignment wait is fail-fast; the write-burst
+  profile owns join/ready-vote contention measurements.
 - Ready-check votes must be committed only while their round is active and the
   voter remains an eligible active participant. A close or exclusion cannot
   leave a post-close or ineligible vote in persistence.

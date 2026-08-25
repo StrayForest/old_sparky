@@ -198,13 +198,14 @@ matrix itself is started manually by an operator and is a load test, not a
 browser smoke run.
 
 The retained matrix is a 10,000-account data-volume test with bounded mutation
-concurrency. The separate browser-polling profile can model 10,000 concurrent
-virtual users with `--browser-polling-users-per-tournament 500`,
-`--browser-polling-active-users-only` and a bounded client pool (the production
-workflow uses 128–512 connections depending on requested concurrency). This
-keeps 10,000 virtual tabs without making the same VPS allocate 10,000 load
-generator sockets. It measures virtual-user polling, not 10,000 long-lived SSE
-sockets; the public SSE global/source ceilings remain capacity safeguards.
+concurrency. The separate browser-polling profile models 10,000 virtual tabs
+with `--browser-polling-users-per-tournament 500`,
+`--browser-polling-active-users-only`, HTTP40, a 300-second opening stagger and
+a 30-second polling window. This keeps the virtual-user count without making
+the same VPS allocate 10,000 load-generator sockets. It measures bounded
+virtual-user polling, not 10,000 long-lived SSE sockets or continuous 10-second
+polling by every tab; the public SSE global/source ceilings remain capacity
+safeguards.
 
 The control account is passed at runtime and is never modified. The matrix
 places it in registered-only, ready-check and exactly one assignment-control
@@ -287,11 +288,31 @@ gh run watch <browser-load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
 The `browser-polling` profile creates 20 marked tournaments and 10,000
-synthetic users, opens 10,000 active virtual tabs, sends conditional revision
-reads and reports `304 Not Modified`, deduplication, response latency, pool
-wait, database/lock pressure and Celery backlog. It is a polling test, not a
-request to raise the 10,000-user SSE ceiling. Clean the exact browser load run
-with the same cleanup workflow before starting another production load.
+synthetic users, opens 10,000 active virtual tabs over the bounded ramp, sends
+conditional revision reads and reports `304 Not Modified`, deduplication,
+response latency, pool wait, database/lock pressure and Celery backlog. It is a
+bounded polling test, not a request to raise the 10,000-user SSE ceiling.
+Clean the exact browser load run with the same cleanup workflow before starting
+another production load.
+
+The measured pool baseline is a reviewed runtime configuration, not a load-test
+CLI override. During the planned production configuration window, apply only
+the three changed connection keys to the root-only canonical env and let the renderer
+refresh scoped service envs:
+
+```bash
+cd /opt/oldsparky/platform/current
+python3 tools/platform_configure_shared_env.py --apply \
+  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+  --only PLATFORM_DB_POOL_SIZE \
+  --only PLATFORM_DB_MAX_OVERFLOW \
+  --only PLATFORM_DB_CONNECTION_BUDGET
+```
+
+Verify the rendered env and service restart through the normal release
+preflight/deploy chain; do not edit `.env.platform` by hand or use unlimited
+overflow. The load gate must not start until the active API/worker processes
+report the reviewed pool values.
 
 Cancellation is a two-step operator action. Canceling the GitHub job stops the
 runner-side SSH client, but a detached remote process may continue until its

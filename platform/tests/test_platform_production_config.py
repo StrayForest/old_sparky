@@ -73,6 +73,19 @@ class PlatformProductionConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "CONNECTION_BUDGET"):
             validate_platform_settings(settings)
 
+    def test_measured_10k_pool_shape_fits_connection_budget(self) -> None:
+        validate_platform_settings(
+            self.production_settings(
+                platform_api_workers=2,
+                platform_db_pool_size=12,
+                platform_db_max_overflow=0,
+                platform_worker_concurrency=2,
+                platform_worker_db_pool_size=2,
+                platform_worker_db_max_overflow=0,
+                platform_db_connection_budget=32,
+            )
+        )
+
     def test_load_test_source_allowlist_accepts_exact_ipv4_and_ipv6_only(self) -> None:
         self.assertEqual(
             parse_load_test_source_ips("192.0.2.10, 2001:db8::10"),
