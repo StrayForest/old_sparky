@@ -41,8 +41,8 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-AS-18 — Hot-path capacity and backpressure implementation is in progress. The scope and
-execution checklist are maintained in
+AS-18 — Hot-path capacity and backpressure implementation and local capacity
+verification are complete. The scope and execution checklist are maintained in
 [`archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md`](archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md).
 The protected-account/database reset gate is resolved for the supplied
 production identity. Migration, exact-SHA CI, deploy smoke and retained-load
@@ -56,12 +56,14 @@ create-before-response boundary: the exact cleanup path now recovers only a
 marker-matching tournament owned by that run's synthetic organizer set before
 deletion, while malformed or foreign matches remain fail-closed.
 
-The remaining AS-18 load work uses an uncommitted-source staircase only in an
-isolated local/pre-production runtime: 1,000 → 5,000 → 10,000 virtual users.
-Each step must retain a durable report and compare client, SQL, pool, lock,
-CPU/RAM/load, Nginx, Redis and Celery evidence before the next hypothesis is
-changed. Production remains commit- and exact-SHA-gated; a canceled or
-recovered run is not a successful benchmark.
+The measured local staircase reached 1,000 → 5,000 → 10,000 virtual users on
+the selected bounded profile. Production remains commit- and exact-SHA-gated;
+a canceled, recovered or setup-failed run is not a successful benchmark. The
+first production browser run (`32798245204`) created its 10,000 users but hit a
+Cloudflare 504 while creating the first tournament, before polling began. Its
+exact cleanup (`32799479496`) deleted 10,000 users and 1 partial tournament,
+verified zero fixture users/tournaments/sessions/audit rows and preserved the
+control account. A production polling pass is therefore not claimed yet.
 The load work also requires a ten-run controlled A/B matrix followed by five
 follow-up variants around the winning configuration; the winner is selected
 by zero errors/cleanup first, then latency, CPU and pool wait, not by raw
