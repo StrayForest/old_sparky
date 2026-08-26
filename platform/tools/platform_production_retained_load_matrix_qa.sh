@@ -85,8 +85,12 @@ case "$profile" in
       echo "SSE open concurrency must be an integer from 1 to 10000." >&2
       exit 1
     }
-    [[ "$sse_open_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_open_timeout >= 0.5 && $sse_open_timeout <= 30)}") == 1 )) || {
-      echo "SSE open timeout must be between 0.5 and 30 seconds." >&2
+    sse_open_timeout_max=30
+    if [[ "$sse_origin_mode" == "origin-local" ]]; then
+      sse_open_timeout_max=60
+    fi
+    [[ "$sse_open_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_open_timeout >= 0.5 && $sse_open_timeout <= $sse_open_timeout_max)}") == 1 )) || {
+      echo "SSE open timeout must be between 0.5 and $sse_open_timeout_max seconds for this origin mode." >&2
       exit 1
     }
     [[ "$sse_reconnect_cycles" =~ ^[0-9]{1,2}$ ]] && (( sse_reconnect_cycles <= 10 )) || {

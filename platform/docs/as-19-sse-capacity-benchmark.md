@@ -584,9 +584,9 @@ The exact release chain for the final code was security/build
 
 All valid retained runs were followed by exact cleanup, with zero synthetic
 users, tournaments, sessions and audit rows remaining and the control account
-preserved. A requested 3,000-open, 60-second run was rejected by QA input
-validation before fixture setup because the supported timeout maximum is 30
-seconds; it contributes no capacity result.
+preserved. The earlier 3,000-open, 60-second request was rejected by QA input
+validation before the origin-local diagnostic ceiling was extended; it
+contributes no capacity result. Public timeout policy remains capped at 30s.
 
 The final stopping verdict is: safe origin handshake improvements are
 complete. The ticket path removes PostgreSQL from normal opening, the Redis

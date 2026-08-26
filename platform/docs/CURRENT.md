@@ -445,8 +445,9 @@ attempts as polling fallback without errors: Cloudflare/transport handshake
 queueing, not origin admission failure, remains the customer-facing
 bottleneck. Origin-local `3,000` with the allowed 30-second QA ceiling reached
 `2,650/3,000` streams and delivered `7,950/7,950` events, again without
-errors or rejected requests; a requested 60-second run was rejected by QA
-validation before fixture setup and is not a measurement. These results do
+errors or rejected requests; the earlier 60-second request was rejected by QA
+before the origin-local diagnostic ceiling was extended and is not a
+measurement. These results do
 not claim `10,000` persistent public SSE connections or a full 180% CPU
 target. They show that the low-risk origin admission fixes are exhausted:
 the remaining optimization is edge/transport handshake architecture or

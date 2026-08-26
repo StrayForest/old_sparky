@@ -43,7 +43,7 @@ on:
         default: "256"
         type: string
       sse_open_timeout:
-        description: "Client-side SSE handshake timeout before polling fallback (0.5-30 seconds)"
+        description: "Client-side SSE handshake timeout (public 0.5-30s; origin-local diagnostic 0.5-60s)"
         required: true
         default: "5"
         type: string
@@ -194,9 +194,10 @@ jobs:
               for name, (value, lower, upper) in integer_ranges.items():
                   if not re.fullmatch(r"[0-9]+", value) or not lower <= int(value) <= upper:
                       raise SystemExit(f"{name} must be between {lower} and {upper}")
+              sse_open_timeout_max = 60 if sse_origin_mode == "origin-local" else 30
               decimal_ranges = {
                   "sse_duration": (sse_duration, 1, 600),
-                  "sse_open_timeout": (sse_open_timeout, 0.5, 30),
+                  "sse_open_timeout": (sse_open_timeout, 0.5, sse_open_timeout_max),
                   "sse_event_interval": (sse_event_interval, 0, 60),
                   "combined_polling_duration": (combined_polling_duration, 1, 300),
                   "combined_polling_open_stagger": (combined_polling_open_stagger, 0, 600),

@@ -15,6 +15,7 @@ from tools.platform_sse_qa import (
     SseMetrics,
     _close_sse_stream_context,
     combined_profile_timeout_seconds,
+    max_sse_open_timeout_seconds,
     summary,
 )
 
@@ -86,6 +87,11 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(result["open_timeouts"], 1)
         self.assertEqual(result["fallback_polling_eligible"], 1)
         self.assertEqual(result["errors"], 0)
+
+    def test_origin_local_timeout_ceiling_is_diagnostic_only(self) -> None:
+        self.assertEqual(max_sse_open_timeout_seconds("http://127.0.0.1:8010"), 60.0)
+        self.assertEqual(max_sse_open_timeout_seconds("http://localhost:8010"), 60.0)
+        self.assertEqual(max_sse_open_timeout_seconds("https://old-sparky.com"), 30.0)
 
 
 class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):

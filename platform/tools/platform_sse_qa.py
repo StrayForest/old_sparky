@@ -46,6 +46,8 @@ SSE_EVENT_TYPE = "qa_sse_probe"
 COMBINED_TIMEOUT_GRACE_SECONDS = 15.0
 SSE_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
 SSE_FIXTURE_TIMEOUT_SECONDS = 90.0
+SSE_OPEN_TIMEOUT_MAX_PUBLIC_SECONDS = 30.0
+SSE_OPEN_TIMEOUT_MAX_ORIGIN_LOCAL_SECONDS = 60.0
 
 
 async def _close_sse_stream_context(stream_context: Any | None) -> None:
@@ -66,6 +68,15 @@ def load_generator_resource_limits() -> dict[str, int]:
         "nofile_soft": int(soft),
         "nofile_hard": int(hard),
     }
+
+
+def max_sse_open_timeout_seconds(origin: str) -> float:
+    """Return the QA handshake ceiling for the selected transport target."""
+
+    hostname = urlsplit(str(origin)).hostname
+    if hostname in {"127.0.0.1", "localhost", "::1"}:
+        return SSE_OPEN_TIMEOUT_MAX_ORIGIN_LOCAL_SECONDS
+    return SSE_OPEN_TIMEOUT_MAX_PUBLIC_SECONDS
 
 
 class SseMetrics:
@@ -234,8 +245,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--system-sample-interval", type=float, default=1.0)
     parser.add_argument("--keep-data", action="store_true")
     args = parser.parse_args()
-    if not 0.5 <= args.sse_open_timeout <= 30.0:
-        parser.error("--sse-open-timeout must be between 0.5 and 30 seconds")
+    max_open_timeout = max_sse_open_timeout_seconds(args.origin)
+    if not 0.5 <= args.sse_open_timeout <= max_open_timeout:
+        parser.error(
+            "--sse-open-timeout must be between 0.5 and "
+            f"{max_open_timeout:g} seconds for this origin"
+        )
     return args
 
 

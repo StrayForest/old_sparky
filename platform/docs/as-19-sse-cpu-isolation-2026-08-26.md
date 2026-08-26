@@ -412,8 +412,9 @@ Final retained-load evidence:
 Every valid retained run had an immediate exact cleanup. Cleanup reports for
 all final runs verified zero synthetic users, tournaments, sessions and audit
 rows while preserving the control account. The attempted 3,000-open,
-60-second run was rejected by the harness validation (`max=30s`) before
-fixture creation and is excluded from the matrix.
+60-second run was rejected by the harness validation before the origin-local
+diagnostic ceiling was extended; it was before fixture creation and is
+excluded from the matrix. Public timeout policy remains capped at 30 seconds.
 
 The final conclusion is intentionally bounded: the ticketed origin path and
 Redis limiter starvation are fixed, the protected combined 10k-user site
