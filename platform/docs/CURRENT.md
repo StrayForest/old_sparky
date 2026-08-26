@@ -218,7 +218,8 @@ The corrected 10k public A/B with HTTP pool512 (`1787699600`, cleaned by
 `1787699601`) removed generator queueing but averaged ~91% API CPU. The selected
 lean-contour F2 (`1787700610`, cleaned by `1787700611`) passed 10,000 users with
 11,659 polling requests, p95/p99 262/388ms, ~49.6% API CPU, 1,201 304s and
-zero errors; F1 also passed. F3 pool256 failed with 9 pool-timeout 500s, F4
+zero errors; F1 also passed. Final deployed gate `1787701010` repeated the
+pass with p95/p99 277/420ms, 1,200 304s and zero errors. F3 pool256 failed with 9 pool-timeout 500s, F4
 viewer `bracket_summary` passed but was slower (365/647ms, ~86.4% CPU), and
 F5 server early workspace `304` failed with 20 errors. The F5 live patch was
 removed, baseline hash restored and health returned 200. A local integration

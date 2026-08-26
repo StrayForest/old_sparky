@@ -38,10 +38,10 @@ pool wait ~1.9s. The selected contour is the frontend-aligned lean workspace
 contract (`include_current_user=false`) with client pool512; F1 `1787700510`
 (stagger 450s) and F2 `1787700610` (600s) passed. F2 was best: p95/p99
 262/388ms, CPU ~49.6%, zero errors, 1,201 conditional 304s, 32/32 SSE events.
-These runs open only 32 SSE, not 10,000 persistent SSE. Local DB integration
-remains blocked by the developer `platformdb_test` password and is a CI item.
+The post-release exact-SHA gate `1787701010` also passed: p95/p99 277/420ms, 1,200 304s, 32/32 SSE events, zero errors; these runs open only 32 SSE, not 10,000 persistent SSE.
+Local DB integration remains blocked by the developer `platformdb_test` password and is a CI item.
 
-Workspace follow-up results are recorded here before any commit or CI release:
+Workspace follow-up results, including the final post-deploy gate:
 
 | Run | Variant | Result | Key evidence |
 | --- | --- | --- | --- |
@@ -50,12 +50,13 @@ Workspace follow-up results are recorded here before any commit or CI release:
 | `1787700710` | lean, pool256, stagger300s | FAIL | 9 workspace 500s from pool16 timeout |
 | `1787700810` | viewer `bracket_summary` | PASS, not best | p95/p99 365/647ms; CPU 86.4% |
 | `1787700910` | server early workspace `304` | FAIL | 20 errors; 18 workspace 500s from pool16 timeout |
+| `1787701010` | deployed final lean gate, pool512, stagger600s | PASS | p95/p99 277/420ms; 1,200 304s; 0 errors |
 
 Every run used the public domain without a bypass and was cleaned immediately;
-each removed 10,000 users and 20 tournaments, left zero fixture rows and
-preserved the control account. The early-304 live patch was restored byte-for-byte
-to baseline and health returned 200; it is rejected because first reads still
-need the pool and extra preflight work did not prevent timeouts.
+each removed 10,000 users and 20 tournaments, left zero fixture rows, preserved
+the control account. The early-304 live patch was restored byte-for-byte to
+baseline and health returned 200; it is rejected because first reads still need
+the pool and extra preflight work did not prevent timeouts.
 
 ## Ordered protocol
 
