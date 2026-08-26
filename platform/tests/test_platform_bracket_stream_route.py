@@ -111,10 +111,6 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sse_endpoint_reuses_stream_access_participant_snapshot(self) -> None:
         tournament = SimpleNamespace(id="tournament-1")
-        auth_session = SimpleNamespace(
-            user=SimpleNamespace(id="user-1"),
-            role_slugs=frozenset(),
-        )
         access_context = TournamentStreamAccessContext(
             decision="active_participant",
             slug="test-tournament",
