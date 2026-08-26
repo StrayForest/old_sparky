@@ -28,7 +28,7 @@ on:
           - sse
           - combined
       sse_connections:
-        description: "SSE connection attempts (1-10000; current app admission is 128)"
+        description: "SSE connection attempts (1-10000; admission and fallback are measured separately)"
         required: true
         default: "128"
         type: string
@@ -41,6 +41,11 @@ on:
         description: "Concurrent SSE opens (1-10000)"
         required: true
         default: "256"
+        type: string
+      sse_open_timeout:
+        description: "Client-side SSE handshake timeout before polling fallback (0.5-30 seconds)"
+        required: true
+        default: "5"
         type: string
       sse_reconnect_cycles:
         description: "Forced reconnect cycles per SSE client (0-10)"
@@ -105,6 +110,7 @@ jobs:
       QA_SSE_CONNECTIONS: ${{ inputs.sse_connections }}
       QA_SSE_DURATION: ${{ inputs.sse_duration }}
       QA_SSE_OPEN_CONCURRENCY: ${{ inputs.sse_open_concurrency }}
+      QA_SSE_OPEN_TIMEOUT: ${{ inputs.sse_open_timeout }}
       QA_SSE_RECONNECT_CYCLES: ${{ inputs.sse_reconnect_cycles }}
       QA_SSE_USERS_PER_TOURNAMENT: ${{ inputs.sse_users_per_tournament }}
       QA_SSE_EVENT_COUNT: ${{ inputs.sse_event_count }}
@@ -132,7 +138,7 @@ jobs:
           /usr/bin/python3 - \
             "$CONTROL_EMAIL" "$QA_CONCURRENCY" "$QA_PROFILE" \
             "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" \
-            "$QA_SSE_RECONNECT_CYCLES" "$QA_SSE_USERS_PER_TOURNAMENT" \
+            "$QA_SSE_OPEN_TIMEOUT" "$QA_SSE_RECONNECT_CYCLES" "$QA_SSE_USERS_PER_TOURNAMENT" \
             "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
             "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" \
             "$QA_SSE_ORIGIN_MODE" <<'PY'
@@ -146,6 +152,7 @@ jobs:
               sse_connections,
               sse_duration,
               sse_open_concurrency,
+              sse_open_timeout,
               sse_reconnect_cycles,
               sse_users_per_tournament,
               sse_event_count,
@@ -175,6 +182,7 @@ jobs:
                       raise SystemExit(f"{name} must be between {lower} and {upper}")
               decimal_ranges = {
                   "sse_duration": (sse_duration, 1, 600),
+                  "sse_open_timeout": (sse_open_timeout, 0.5, 30),
                   "sse_event_interval": (sse_event_interval, 0, 60),
                   "combined_polling_duration": (combined_polling_duration, 1, 300),
                   "combined_polling_open_stagger": (combined_polling_open_stagger, 0, 600),
@@ -234,7 +242,7 @@ jobs:
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$CONTROL_EMAIL" "$QA_CONCURRENCY" "$GITHUB_RUN_ID" "$QA_PROFILE" \
-              "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" "$QA_SSE_RECONNECT_CYCLES" \
+              "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" "$QA_SSE_OPEN_TIMEOUT" "$QA_SSE_RECONNECT_CYCLES" \
               "$QA_SSE_USERS_PER_TOURNAMENT" "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
               "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" "$QA_SSE_ORIGIN_MODE" \
             > "$ssh_output_file" 2>&1 <<'REMOTE'

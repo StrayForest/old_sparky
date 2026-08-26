@@ -1124,10 +1124,19 @@ export async function queueTournamentAutoAssignmentRun(
 export async function getTournamentBracket(
   slug: string,
   requestHeaders: HeadersInit = {},
-  options: { teamsView?: "summary" | "full"; signal?: AbortSignal } = {}
+  options: {
+    teamsView?: "summary" | "full";
+    signal?: AbortSignal;
+    ifNoneMatch?: string | null;
+    cachedBracket?: Bracket | null;
+    onResponse?: (response: Response) => void;
+  } = {}
 ): Promise<Bracket | null> {
   const headers = new Headers(requestHeaders);
   headers.set("accept", "application/json");
+  if (options.ifNoneMatch) {
+    headers.set("if-none-match", options.ifNoneMatch);
+  }
   try {
     const params = new URLSearchParams({
       teams_view: options.teamsView ?? "summary"
@@ -1138,6 +1147,10 @@ export async function getTournamentBracket(
       cache: "no-store",
       signal: options.signal
     });
+    options.onResponse?.(response);
+    if (response.status === 304) {
+      return options.cachedBracket ?? null;
+    }
     if (!response.ok) {
       return null;
     }

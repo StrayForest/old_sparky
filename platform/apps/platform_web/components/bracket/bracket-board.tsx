@@ -27,6 +27,12 @@ const BRACKET_POLL_BASE_MS = 10_000;
 const BRACKET_POLL_JITTER_MS = 3000;
 const BRACKET_POLL_MIN_MS = 3_000;
 const BRACKET_POLL_MAX_MS = 60_000;
+const configuredSseOpenTimeoutMs = Number(
+  process.env.NEXT_PUBLIC_PLATFORM_SSE_OPEN_TIMEOUT_MS ?? "",
+);
+const SSE_OPEN_TIMEOUT_MS = Number.isFinite(configuredSseOpenTimeoutMs)
+  ? Math.min(30_000, Math.max(500, Math.round(configuredSseOpenTimeoutMs)))
+  : 5_000;
 const SSE_RETRY_COOLDOWN_MS = 60_000;
 const PANNING_IGNORE_SELECTOR = "button,input,select,textarea,a,[role='button']";
 
@@ -109,6 +115,7 @@ export function BracketBoard({
   const activeRefreshController = useRef<AbortController | null>(null);
   const refreshInFlight = useRef<Promise<Bracket | null> | null>(null);
   const refreshGeneration = useRef(0);
+  const bracketEtag = useRef<string | null>(null);
 
   useEffect(() => {
     bracketRef.current = bracket;
@@ -131,6 +138,14 @@ export function BracketBoard({
     const request = getTournamentBracket(slug, {}, {
       teamsView: "summary",
       signal: controller.signal,
+      ifNoneMatch: bracketEtag.current,
+      cachedBracket: bracketRef.current,
+      onResponse: (response) => {
+        const etag = response.headers.get("etag");
+        if (etag) {
+          bracketEtag.current = etag;
+        }
+      },
     })
       .then((next) => {
         if (controller.signal.aborted || requestGeneration !== refreshGeneration.current) {
@@ -167,6 +182,10 @@ export function BracketBoard({
     refreshInFlight.current = request;
     return request;
   }, [slug, t]);
+
+  useEffect(() => {
+    bracketEtag.current = null;
+  }, [slug]);
 
   useEffect(() => {
     const shouldLoadBracketMatches = !bracket || (
@@ -260,14 +279,30 @@ export function BracketBoard({
       }
     };
     let source: EventSource | null = null;
+    let sseOpenTimer: ReturnType<typeof setTimeout> | null = null;
     let sseRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let sseRetryNotBefore = 0;
 
+    const clearSseOpenTimer = () => {
+      if (sseOpenTimer !== null) {
+        clearTimeout(sseOpenTimer);
+        sseOpenTimer = null;
+      }
+    };
+
     const closeSource = () => {
+      clearSseOpenTimer();
       if (source !== null) {
         source.close();
         source = null;
       }
+    };
+
+    const fallBackToPolling = () => {
+      closeSource();
+      sseRetryNotBefore = Date.now() + SSE_RETRY_COOLDOWN_MS;
+      startPolling();
+      scheduleSseRetry();
     };
 
     const scheduleSseRetry = () => {
@@ -295,7 +330,16 @@ export function BracketBoard({
         platformApiUrl(`/tournaments/${slug}/bracket/events`),
         { withCredentials: true },
       );
+      sseOpenTimer = setTimeout(() => {
+        // A slow edge handshake is not useful to a visitor. Abort it before
+        // an upstream queue can turn a normal fallback into a multi-minute
+        // wait, then retry only after the cooldown.
+        if (source !== null) {
+          fallBackToPolling();
+        }
+      }, SSE_OPEN_TIMEOUT_MS);
       source.onopen = () => {
+        clearSseOpenTimer();
         stopPolling();
       };
       source.addEventListener("bracket", () => {
@@ -304,10 +348,7 @@ export function BracketBoard({
       source.onerror = () => {
         // EventSource retries automatically, which would keep hammering a
         // saturated edge. Close it and use revision polling during cooldown.
-        closeSource();
-        sseRetryNotBefore = Date.now() + SSE_RETRY_COOLDOWN_MS;
-        startPolling();
-        scheduleSseRetry();
+        fallBackToPolling();
       };
     };
 

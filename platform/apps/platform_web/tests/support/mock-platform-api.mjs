@@ -305,7 +305,9 @@ function bracketPayload(slug, canManage = false, includeTeams = true) {
         && (tournamentStatus === "registration_closed" || tournamentStatus === "in_progress")
     },
     teams: includeTeams ? teams : [],
-    matches
+    matches,
+    next_poll_after_ms: 3_000,
+    state_version: 0
   };
 }
 
@@ -595,6 +597,17 @@ const server = createServer((request, response) => {
   const bracketMatch = path.match(/^\/api\/v1\/tournaments\/([^/]+)\/bracket$/);
   if (bracketMatch && request.method === "GET") {
     const slug = bracketMatch[1];
+    const etag = '"mock-bracket-revision-0"';
+    const requestEtag = request.headers["if-none-match"] ?? "";
+    if (requestEtag === etag || requestEtag === `W/${etag}`) {
+      response.writeHead(304, {
+        etag,
+        "cache-control": "private, no-cache",
+        vary: "Cookie, Accept-Encoding"
+      });
+      response.end();
+      return;
+    }
     json(
       response,
       200,
@@ -602,7 +615,12 @@ const server = createServer((request, response) => {
         slug,
         slug === bracketManagerTournament.slug
           || (request.headers.cookie ?? "").includes("bracket-manager-smoke=1")
-      )
+      ),
+      {
+        etag,
+        "cache-control": "private, no-cache",
+        vary: "Cookie, Accept-Encoding"
+      }
     );
     return;
   }

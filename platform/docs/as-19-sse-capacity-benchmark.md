@@ -246,8 +246,8 @@ barrier/settle/hold profile. It has zero unexpected origin errors, full event
 delivery and PostgreSQL headroom, but is not a public capacity claim: the live
 Cloudflare contour fails around 3,500 concurrent streams. Public acceptance
 now requires fast application admission plus active-SSE/passive-polling
-fallback; origin-local success cannot promote a candidate by itself.
-
+fallback; origin-local success cannot promote a candidate by itself. See the
+[`CPU-isolation matrix`](as-19-sse-cpu-isolation-2026-08-26.md); public contour is authoritative and a load-generator or probe Redis failure is invalid.
 ## Operator commands
 
 Run from the reviewed `dev` branch in a low-traffic window. Production public
@@ -266,8 +266,9 @@ gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 Use `sse_connections=5000` with `sse_users_per_tournament=250`, then
 `sse_connections=10000` with `sse_users_per_tournament=500`. Set
 `sse_open_concurrency`, `sse_duration`, `sse_event_count`,
-`sse_event_interval` and `sse_reconnect_cycles` per the hypothesis table. For
-the combined run use `profile=combined`, `sse_users_per_tournament=500`, and
+`sse_event_interval`, `sse_reconnect_cycles` and `sse_open_timeout` per the
+hypothesis table. For the combined run use `profile=combined`,
+`sse_users_per_tournament=500`, and
 the reviewed polling/SSE durations. Always run:
 
 ```bash

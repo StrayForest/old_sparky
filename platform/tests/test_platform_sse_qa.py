@@ -69,6 +69,17 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(samples[0]["cf_ray"], "abc123-SIN")
         self.assertEqual(samples[0]["cf_cache_status"], "DYNAMIC")
 
+    def test_open_timeout_is_reported_as_polling_fallback_signal(self) -> None:
+        metrics = SseMetrics()
+        metrics.mark("open_timeouts")
+        metrics.mark("fallback_polling_eligible")
+
+        result = metrics.summary()
+
+        self.assertEqual(result["open_timeouts"], 1)
+        self.assertEqual(result["fallback_polling_eligible"], 1)
+        self.assertEqual(result["errors"], 0)
+
     def test_error_samples_keep_bounded_stream_correlation(self) -> None:
         metrics = SseMetrics()
         metrics.record_error(
@@ -204,6 +215,7 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertIn('sse_setup_concurrency=20', supervisor)
         self.assertIn('--concurrency "$sse_setup_concurrency"', supervisor)
         self.assertIn('--request-origin "$EXPECTED_ORIGIN"', supervisor)
+        self.assertIn('--sse-open-timeout "$sse_open_timeout"', supervisor)
         self.assertIn('sse_origin="http://127.0.0.1:8010"', supervisor)
         self.assertIn('--control-email "$control_email"', supervisor)
         self.assertIn('ulimit -n "$nofile_target"', supervisor)
@@ -212,6 +224,7 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertIn("all_attempts_done", sse_source)
         self.assertIn("sse_event_delivery_complete", sse_source)
         self.assertIn("expected_events", sse_source)
+        self.assertIn("fallback_polling_eligible", sse_source)
         self.assertIn("fatal_traceback", sse_source)
         self.assertIn("performance_collection_error", sse_source)
         self.assertIn("--request-origin", sse_source)

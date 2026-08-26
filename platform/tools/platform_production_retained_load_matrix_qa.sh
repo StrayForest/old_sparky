@@ -34,8 +34,8 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# < 5 || $# > 16 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local]]" >&2
+if (( $# < 5 || $# > 17 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local]]" >&2
   exit 2
 fi
 
@@ -52,13 +52,14 @@ case "$profile" in
     sse_connections="${7:-128}"
     sse_duration="${8:-60}"
     sse_open_concurrency="${9:-256}"
-    sse_reconnect_cycles="${10:-0}"
-    sse_users_per_tournament="${11:-500}"
-    sse_event_count="${12:-3}"
-    sse_event_interval="${13:-1}"
-    combined_polling_duration="${14:-30}"
-    combined_polling_open_stagger="${15:-300}"
-    sse_origin_mode="${16:-public}"
+    sse_open_timeout="${10:-5}"
+    sse_reconnect_cycles="${11:-0}"
+    sse_users_per_tournament="${12:-500}"
+    sse_event_count="${13:-3}"
+    sse_event_interval="${14:-1}"
+    combined_polling_duration="${15:-30}"
+    combined_polling_open_stagger="${16:-300}"
+    sse_origin_mode="${17:-public}"
     [[ "$sse_origin_mode" == "public" || "$sse_origin_mode" == "origin-local" ]] || {
       echo "SSE origin mode must be public or origin-local." >&2
       exit 1
@@ -77,6 +78,10 @@ case "$profile" in
     }
     [[ "$sse_open_concurrency" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_open_concurrency <= 10000 )) || {
       echo "SSE open concurrency must be an integer from 1 to 10000." >&2
+      exit 1
+    }
+    [[ "$sse_open_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_open_timeout >= 0.5 && $sse_open_timeout <= 30)}") == 1 )) || {
+      echo "SSE open timeout must be between 0.5 and 30 seconds." >&2
       exit 1
     }
     [[ "$sse_reconnect_cycles" =~ ^[0-9]{1,2}$ ]] && (( sse_reconnect_cycles <= 10 )) || {
@@ -385,6 +390,7 @@ else
     --sse-connections "$sse_connections" \
     --sse-duration "$sse_duration" \
     --sse-open-concurrency "$sse_open_concurrency" \
+    --sse-open-timeout "$sse_open_timeout" \
     --sse-reconnect-cycles "$sse_reconnect_cycles" \
     --sse-event-count "$sse_event_count" \
     --sse-event-interval "$sse_event_interval" \

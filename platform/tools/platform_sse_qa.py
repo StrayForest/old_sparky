@@ -143,6 +143,8 @@ class SseMetrics:
             "rejected_429": self.counters["rejected_429"],
             "rejected_503": self.counters["rejected_503"],
             "rejected_other": self.counters["rejected_other"],
+            "open_timeouts": self.counters["open_timeouts"],
+            "fallback_polling_eligible": self.counters["fallback_polling_eligible"],
             "errors": self.counters["errors"],
             "keepalives": self.counters["keepalives"],
             "events": self.counters["events"],
@@ -187,6 +189,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sse-connections", type=int, default=128)
     parser.add_argument("--sse-duration", type=float, default=60.0)
     parser.add_argument("--sse-open-concurrency", type=int, default=256)
+    parser.add_argument(
+        "--sse-open-timeout",
+        type=float,
+        default=5.0,
+        help="Abort an SSE handshake after this many seconds and count it as polling fallback eligible.",
+    )
     parser.add_argument("--sse-reconnect-cycles", type=int, default=0)
     parser.add_argument("--sse-event-count", type=int, default=3)
     parser.add_argument("--sse-event-interval", type=float, default=1.0)
@@ -197,7 +205,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--http-timeout", type=float, default=180.0)
     parser.add_argument("--system-sample-interval", type=float, default=1.0)
     parser.add_argument("--keep-data", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0.5 <= args.sse_open_timeout <= 30.0:
+        parser.error("--sse-open-timeout must be between 0.5 and 30 seconds")
+    return args
 
 
 async def prepare_fixture(
@@ -327,6 +338,7 @@ async def consume_sse_connection(
     duration_seconds: float,
     reconnect_cycles: int,
     open_gate: asyncio.Semaphore,
+    open_timeout_seconds: float,
     all_attempts_done: asyncio.Event,
     mark_attempt_finished,
     hold_deadline_after_barrier,
@@ -364,13 +376,20 @@ async def consume_sse_connection(
                 f"/tournaments/{tournament_slug}/bracket/events",
                 headers=headers,
             )
-            async with open_gate:
-                response = await stream_context.__aenter__()
+            try:
+                async with asyncio.timeout(max(0.1, open_timeout_seconds)):
+                    async with open_gate:
+                        response = await stream_context.__aenter__()
+            except TimeoutError:
+                metrics.mark("open_timeouts")
+                metrics.mark("fallback_polling_eligible")
+                continue
             metrics.response_status(response.status_code)
             if cycle == 0 and not initial_attempt_marked:
                 initial_attempt_marked = True
                 await mark_attempt_finished()
             if response.status_code != 200:
+                metrics.mark("fallback_polling_eligible")
                 if response.status_code == 429:
                     metrics.mark("rejected_429")
                 elif response.status_code == 503:
@@ -478,6 +497,7 @@ async def run_connections(
     connection_count: int,
     duration_seconds: float,
     open_concurrency: int,
+    open_timeout_seconds: float,
     reconnect_cycles: int,
     event_count: int,
     event_interval: float,
@@ -487,7 +507,12 @@ async def run_connections(
     sse_client = httpx.AsyncClient(
         base_url=qa.api_origin,
         follow_redirects=True,
-        timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0),
+        timeout=httpx.Timeout(
+            connect=max(10.0, open_timeout_seconds + 5.0),
+            read=None,
+            write=10.0,
+            pool=10.0,
+        ),
         limits=httpx.Limits(
             max_connections=max(1, http_max_connections),
             max_keepalive_connections=max(1, http_max_connections),
@@ -537,6 +562,7 @@ async def run_connections(
                 duration_seconds=duration_seconds,
                 reconnect_cycles=reconnect_cycles,
                 open_gate=open_gate,
+                open_timeout_seconds=open_timeout_seconds,
                 all_attempts_done=all_attempts_done,
                 mark_attempt_finished=mark_attempt_finished,
                 hold_deadline_after_barrier=hold_deadline_after_barrier,
@@ -560,6 +586,7 @@ async def run_connections(
         "target_connections": connection_count,
         "duration_seconds": duration_seconds,
         "open_concurrency": open_concurrency,
+        "open_timeout_seconds": open_timeout_seconds,
         "reconnect_cycles": reconnect_cycles,
         "probe_event_count": event_count,
         "probe_event_interval_seconds": event_interval,
@@ -614,6 +641,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     connection_count=args.sse_connections,
                     duration_seconds=args.sse_duration,
                     open_concurrency=args.sse_open_concurrency,
+                    open_timeout_seconds=args.sse_open_timeout,
                     reconnect_cycles=args.sse_reconnect_cycles,
                     event_count=args.sse_event_count,
                     event_interval=args.sse_event_interval,
@@ -635,7 +663,8 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             qa.scenario(
                 "sse_capacity_or_explicit_admission_observed",
                 metrics["connected"] == args.sse_connections
-                or metrics["rejected_429"] > 0,
+                or metrics["rejected_429"] > 0
+                or metrics["open_timeouts"] > 0,
                 metrics,
             )
             qa.scenario(
@@ -685,6 +714,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                         connection_count=args.sse_connections,
                         duration_seconds=args.sse_duration,
                         open_concurrency=args.sse_open_concurrency,
+                        open_timeout_seconds=args.sse_open_timeout,
                         reconnect_cycles=args.sse_reconnect_cycles,
                         event_count=args.sse_event_count,
                         event_interval=args.sse_event_interval,
