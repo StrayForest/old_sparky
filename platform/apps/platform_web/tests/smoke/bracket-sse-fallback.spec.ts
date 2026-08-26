@@ -5,6 +5,14 @@ test("abandons a stalled SSE handshake and starts bracket polling", async ({ pag
   const fallbackTimeoutMs = Number.isFinite(configuredTimeoutMs)
     ? Math.min(30_000, Math.max(500, Math.round(configuredTimeoutMs)))
     : 1_000;
+  // Page routes do not intercept a SharedWorker's EventSource. Keep this
+  // fallback test focused on the direct browser connection it controls.
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "SharedWorker", {
+      configurable: true,
+      value: undefined,
+    });
+  });
   await page.context().addCookies([
     {
       name: "deadlock_platform_session",
