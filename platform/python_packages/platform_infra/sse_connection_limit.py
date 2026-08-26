@@ -46,8 +46,12 @@ SSE_LEASE_SECONDS = SSE_STREAM_MAX_LIFETIME_SECONDS + SSE_LEASE_GRACE_SECONDS
 SSE_KEY_PREFIX = "platform:sse-limit:v1"
 SSE_LOAD_TEST_BYPASS_HEADER = "x-platform-qa-sse-bypass"
 SSE_LOAD_TEST_BYPASS_CONTEXT = b"platform-sse-load-test-v1"
-SSE_LIMITER_REDIS_POOL_MAX_CONNECTIONS = 64
-SSE_LIMITER_REDIS_POOL_TIMEOUT_SECONDS = 0.5
+# A burst of signed-ticket opens still performs one atomic global lease in
+# Redis. Keep this pool large enough to absorb the bounded 3,000-connection
+# application ceiling without turning pool checkout into a false 503, while
+# retaining a finite wait so Redis failure remains fail-closed.
+SSE_LIMITER_REDIS_POOL_MAX_CONNECTIONS = 512
+SSE_LIMITER_REDIS_POOL_TIMEOUT_SECONDS = 2.0
 SSE_CONNECTION_LEASE_SCOPE = "platform.sse_connection_lease"
 
 _limiter_redis_client: Redis | None = None
