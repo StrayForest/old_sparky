@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from python_packages.platform_infra.db import (
+    SseStreamDbAdmissionUnavailable,
     get_db_session,
     stream_db_session,
 )
@@ -140,80 +141,86 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
     waiting for the bounded SSE lifetime to expire.
     """
 
-    access_context = current_tournament_stream_access_context()
-    if access_context is not None:
-        if access_context.decision == "deny":
-            return False
+    try:
+        access_context = current_tournament_stream_access_context()
+        if access_context is not None:
+            if access_context.decision == "deny":
+                return False
+
+            async with stream_db_session() as db_session:
+                row = (
+                    await db_session.execute(
+                        select(
+                            Tournament.visibility,
+                            Tournament.organizer_user_id,
+                            TournamentParticipant.status,
+                        )
+                        .outerjoin(
+                            TournamentParticipant,
+                            (TournamentParticipant.tournament_id == Tournament.id)
+                            & (
+                                TournamentParticipant.user_id
+                                == (access_context.user_id or "")
+                            ),
+                        )
+                        .where(
+                            Tournament.id == tournament_id,
+                            Tournament.slug == access_context.slug,
+                        )
+                    )
+                ).first()
+                if row is None:
+                    return False
+
+                tournament_visibility = str(row[0])
+                organizer_user_id = str(row[1])
+                participant_status = row[2]
+
+                if access_context.decision == "public":
+                    return tournament_visibility == "public"
+                if tournament_visibility != "invite_only":
+                    return True
+                if not access_context.user_id or not access_context.session_id:
+                    return False
+                if not await _authenticated_stream_session_is_current(
+                    db_session,
+                    user_id=access_context.user_id,
+                    session_id=access_context.session_id,
+                ):
+                    return False
+
+                if access_context.decision == "admin":
+                    return await _user_still_has_admin_role(
+                        db_session,
+                        user_id=access_context.user_id,
+                    )
+                if access_context.decision == "organizer":
+                    return organizer_user_id == access_context.user_id
+                if access_context.decision == "active_participant":
+                    return participant_status in ACTIVE_PARTICIPANT_STATUSES
+                return False
 
         async with stream_db_session() as db_session:
             row = (
                 await db_session.execute(
-                    select(
-                        Tournament.visibility,
-                        Tournament.organizer_user_id,
-                        TournamentParticipant.status,
-                    )
-                    .outerjoin(
-                        TournamentParticipant,
-                        (TournamentParticipant.tournament_id == Tournament.id)
-                        & (
-                            TournamentParticipant.user_id
-                            == (access_context.user_id or "")
-                        ),
-                    )
-                    .where(
-                        Tournament.id == tournament_id,
-                        Tournament.slug == access_context.slug,
+                    select(Tournament.slug, Tournament.visibility).where(
+                        Tournament.id == tournament_id
                     )
                 )
             ).first()
-            if row is None:
-                return False
-
-            tournament_visibility = str(row[0])
-            organizer_user_id = str(row[1])
-            participant_status = row[2]
-
-            if access_context.decision == "public":
-                return tournament_visibility == "public"
-            if tournament_visibility != "invite_only":
-                return True
-            if not access_context.user_id or not access_context.session_id:
-                return False
-            if not await _authenticated_stream_session_is_current(
-                db_session,
-                user_id=access_context.user_id,
-                session_id=access_context.session_id,
-            ):
-                return False
-
-            if access_context.decision == "admin":
-                return await _user_still_has_admin_role(
-                    db_session,
-                    user_id=access_context.user_id,
-                )
-            if access_context.decision == "organizer":
-                return organizer_user_id == access_context.user_id
-            if access_context.decision == "active_participant":
-                return participant_status in ACTIVE_PARTICIPANT_STATUSES
+        if row is None:
+            return True
+        if row[1] != "public":
             return False
-
-    async with stream_db_session() as db_session:
-        row = (
-            await db_session.execute(
-                select(Tournament.slug, Tournament.visibility).where(
-                    Tournament.id == tournament_id
-                )
-            )
-        ).first()
-    if row is None:
+        _tournament_stream_access_context.set(
+            TournamentStreamAccessContext(decision="public", slug=str(row[0]))
+        )
         return True
-    if row[1] != "public":
+    except SseStreamDbAdmissionUnavailable:
+        # Revalidation runs after the response has started.  A 503 cannot be
+        # sent safely there; closing the stream makes the client use polling
+        # or reconnect with the normal backoff instead.
         return False
-    _tournament_stream_access_context.set(
-        TournamentStreamAccessContext(decision="public", slug=str(row[0]))
-    )
-    return True
 
 
 def _apply_stream_access_context(

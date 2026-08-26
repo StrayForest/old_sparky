@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from unittest.mock import Mock, patch, sentinel
+
+from starlette.exceptions import HTTPException
 
 from python_packages.platform_infra import db
 
@@ -96,7 +99,7 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
                 pool_pre_ping=True,
                 pool_size=db.SSE_STREAM_DB_POOL_SIZE,
                 max_overflow=0,
-                pool_timeout=5,
+                pool_timeout=db.SSE_STREAM_DB_ACQUIRE_TIMEOUT_SECONDS,
                 pool_recycle=1800,
             )
             install_query_metrics.assert_called_once_with(sentinel.stream_sync_engine)
@@ -108,3 +111,21 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
         finally:
             db._stream_engine = previous_engine
             db._stream_session_factory = previous_session_factory
+
+
+class PlatformStreamDbAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_saturated_stream_admission_fails_fast_and_maps_to_503(self) -> None:
+        previous_semaphore = db._stream_db_concurrency
+        db._stream_db_concurrency = asyncio.Semaphore(0)
+        try:
+            with patch.object(db, "SSE_STREAM_DB_ACQUIRE_TIMEOUT_SECONDS", 0.001):
+                stream = db.get_stream_db_session()
+                with self.assertRaises(HTTPException) as context:
+                    await stream.__anext__()
+
+            self.assertEqual(context.exception.status_code, 503)
+            self.assertEqual(context.exception.headers["Retry-After"], "1")
+            self.assertEqual(context.exception.headers["Cache-Control"], "no-store")
+            self.assertIn("Use polling", str(context.exception.detail))
+        finally:
+            db._stream_db_concurrency = previous_semaphore

@@ -180,3 +180,26 @@ rate, edge errors and API CPU at each timeout.
   ran and 153 failed during database setup. This is an environment failure,
   not evidence against the candidate.
 - No commit, CI run or production deployment has been made for this candidate.
+
+## Bounded admission follow-up
+
+The public 1,000-SSE staircase exposed a second queue after the
+function-scoped DB lifetime fix. The stream DB semaphore had two slots but an
+unbounded wait; the limiter Redis pool allowed a 20-second wait; and the
+middleware's per-user lookup could wait on the ordinary API pool. The 5-second
+public run reached server route p95 `19.2s` while API CPU was not sustained at
+100%, so this was an admission queue, not proof of a CPU ceiling.
+
+The next candidate bounds each admission wait to `0.5s`. Saturated initial
+admission returns `503` with `Retry-After` and `Cache-Control: no-store`, so
+the browser uses conditional revision polling. Saturated revalidation closes
+the already-open stream safely because an HTTP status cannot be sent after
+streaming has begun. Session and tournament permission checks remain
+authoritative and fail closed; no Cloudflare, Nginx or application cap is
+raised.
+
+Local focused DB, stream authorization, limiter and load-harness tests pass,
+including the 503 mapping. The public A/B gate for this candidate is response
+time to either SSE 200 or deliberate 503, zero unexpected 5xx/1200, normal
+polling fallback, and a decreasing server route p95. Only after that gate will
+the staircase continue to 5k and 10k public virtual users.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import re
@@ -50,7 +51,8 @@ SSE_KEY_PREFIX = "platform:sse-limit:v1"
 SSE_LOAD_TEST_BYPASS_HEADER = "x-platform-qa-sse-bypass"
 SSE_LOAD_TEST_BYPASS_CONTEXT = b"platform-sse-load-test-v1"
 SSE_LIMITER_REDIS_POOL_MAX_CONNECTIONS = 64
-SSE_LIMITER_REDIS_POOL_TIMEOUT_SECONDS = 20.0
+SSE_LIMITER_REDIS_POOL_TIMEOUT_SECONDS = 0.5
+SSE_LIMITER_DB_LOOKUP_TIMEOUT_SECONDS = 0.5
 
 _limiter_redis_client: Redis | None = None
 
@@ -310,23 +312,26 @@ async def _authenticated_user_id(
         )
 
     try:
-        async with session_factory()() as db_session:
-            user_id = await db_session.scalar(
-                select(UserSession.user_id)
-                .join(User, User.id == UserSession.user_id)
-                .where(
-                    UserSession.token_digest == session_token_digest(token),
-                    UserSession.invalidated_at.is_(None),
-                    UserSession.expires_at > now,
-                    *predicates,
+        async with asyncio.timeout(SSE_LIMITER_DB_LOOKUP_TIMEOUT_SECONDS):
+            async with session_factory()() as db_session:
+                user_id = await db_session.scalar(
+                    select(UserSession.user_id)
+                    .join(User, User.id == UserSession.user_id)
+                    .where(
+                        UserSession.token_digest == session_token_digest(token),
+                        UserSession.invalidated_at.is_(None),
+                        UserSession.expires_at > now,
+                        *predicates,
+                    )
                 )
-            )
-    except SQLAlchemyError:
-        logger.warning(
-            "Could not resolve authenticated SSE user for connection limiting.",
-            exc_info=True,
+    except (SQLAlchemyError, TimeoutError) as exc:
+        logger.info(
+            "SSE limiter user lookup failed closed; returning controlled admission response.",
+            exc_info=logger.isEnabledFor(logging.DEBUG),
         )
-        return None
+        raise SseConnectionLimiterUnavailable(
+            "SSE connection protection could not verify the session promptly."
+        ) from exc
 
     return str(user_id) if user_id is not None else None
 

@@ -15,7 +15,9 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import DeclarativeBase, Session
+from starlette.exceptions import HTTPException
 
 from python_packages.platform_infra.config import (
     PLATFORM_SCHEMA,
@@ -38,6 +40,15 @@ PUBLIC_AUTOMATION_FAILURE_MESSAGE = "Tournament automation failed. A retry is sc
 # separate explicit two-connection budget for stream admission/revalidation.
 SSE_STREAM_DB_CONCURRENCY = 2
 SSE_STREAM_DB_POOL_SIZE = PLATFORM_SSE_DB_POOL_SIZE
+# This is admission work, not a queue.  Once the two short-lived stream DB
+# slots are busy, the client must switch to revision polling instead of
+# waiting behind a burst of EventSource handshakes.
+SSE_STREAM_DB_ACQUIRE_TIMEOUT_SECONDS = 0.5
+SSE_STREAM_DB_ADMISSION_RETRY_AFTER_SECONDS = 1
+
+
+class SseStreamDbAdmissionUnavailable(RuntimeError):
+    """The short SSE admission DB budget is temporarily saturated."""
 
 naming_convention = {
     "ix": "ix_%(column_0_label)s",
@@ -146,7 +157,7 @@ def stream_engine() -> AsyncEngine:
             pool_pre_ping=True,
             pool_size=SSE_STREAM_DB_POOL_SIZE,
             max_overflow=0,
-            pool_timeout=settings.platform_db_pool_timeout_seconds,
+            pool_timeout=SSE_STREAM_DB_ACQUIRE_TIMEOUT_SECONDS,
             pool_recycle=settings.platform_db_pool_recycle_seconds,
         )
         install_sqlalchemy_query_metrics(_stream_engine.sync_engine)
@@ -196,17 +207,45 @@ async def get_db_session() -> AsyncIterator[AsyncSession]:
 async def get_stream_db_session() -> AsyncIterator[AsyncSession]:
     """Open one bounded short-lived DB session for SSE admission."""
 
-    async with stream_db_session() as db_session:
-        yield db_session
+    try:
+        async with stream_db_session() as db_session:
+            yield db_session
+    except SseStreamDbAdmissionUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Live-update admission is temporarily full. Use polling.",
+            headers={
+                "Retry-After": str(SSE_STREAM_DB_ADMISSION_RETRY_AFTER_SECONDS),
+                "Cache-Control": "no-store",
+            },
+        ) from exc
 
 
 @asynccontextmanager
 async def stream_db_session() -> AsyncIterator[AsyncSession]:
     """Use the bounded SSE-only pool for admission and revalidation."""
 
-    async with _stream_db_concurrency:
+    try:
+        await asyncio.wait_for(
+            _stream_db_concurrency.acquire(),
+            timeout=SSE_STREAM_DB_ACQUIRE_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        raise SseStreamDbAdmissionUnavailable(
+            "SSE stream admission DB concurrency is temporarily saturated."
+        ) from exc
+
+    try:
         async with stream_session_factory()() as db_session:
             checkout_started = perf_counter()
-            await db_session.connection()
+            try:
+                async with asyncio.timeout(SSE_STREAM_DB_ACQUIRE_TIMEOUT_SECONDS):
+                    await db_session.connection()
+            except (SQLAlchemyTimeoutError, TimeoutError) as exc:
+                raise SseStreamDbAdmissionUnavailable(
+                    "SSE stream admission DB checkout is temporarily saturated."
+                ) from exc
             record_pool_checkout_wait(perf_counter() - checkout_started)
             yield db_session
+    finally:
+        _stream_db_concurrency.release()
