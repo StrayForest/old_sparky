@@ -559,46 +559,6 @@ release candidate is verified.
   as `server-observability.log` beside the compact matrix summary, so a future
   setup stall can be classified while it is occurring instead of inferred only
   from the final CI status.
-- Two observer-enabled setup attempts were aborted after exact cleanup because
-  no valid matrix summary was produced. The supervisor now retains bounded VPS
-  snapshots, raw QA traceback and partial reports; neither attempt is a
-  capacity measurement.
-- The next observer-enabled 1,000-SSE run (`32881488410`) reached the
-  application cleanly: 1,000/1,000 connections returned HTTP 200, with zero
-  errors, 429s or 503s, and all 1,000 expected events delivered. Connect
-  latency was p50/p95/p99 8.72/17.77/18.00 seconds; event delivery latency was
-  395.5/574.2/584.7 ms. The overall workflow was nevertheless red because
-  the performance collector crashed while summarizing PostgreSQL active-query
-  samples. The collector now keeps that row list separate from the system
-  sample window and has a regression test. Exact cleanup `32882110537`
-  removed the fixture and preserved the control account. Treat this as a
-  valid 1k SSE transport result, but rerun the repaired collector before using
-  it as the staircase gate.
-- The first 5,000-SSE public-origin run (`32883773066`) reached the VPS only
-  partially: 3,535 connections returned HTTP 200 and 1,465 returned Cloudflare
-  503 Error 1200 (`cache_connection_limit`, with `Retry-After: 60`). The
-  application emitted zero 429s; PostgreSQL lock contention was not observed
-  and sustained CPU saturation was false. This is an edge-capacity result,
-  not an origin-capacity result. Exact cleanup `32884651890` removed the
-  10k-user/20-tournament fixtures and preserved the control account. The
-  retained-load harness now has an explicit `origin-local` SSE mode using
-  `127.0.0.1:8010` with the canonical production `Origin` header, so the
-  remaining 5k/10k staircase can separate Cloudflare edge capacity from VPS
-  origin capacity.
-- The one permitted origin-local control run (`32886113934`) accepted all
-  5,000 connections and delivered all 5,000 events with zero errors, 429s or
-  503s. Its connect latency was p50/p95/p99 29.4/89.3/95.7 seconds. This is
-  not a customer-facing success: the direct-origin result shows that the VPS
-  eventually holds the streams, while the long admission time gives
-  Cloudflare enough queue pressure to emit Error 1200 on the public path.
-  The control run must be cleaned with the exact manifest; the cleanup
-  validator accepts its loopback origin only for `mode=sse` when
-  `request_origin` is still the canonical public origin. Public-origin runs
-  remain the acceptance gate.
-- Public ramp A/B `open_concurrency=16` (`32888021777`) still failed through Cloudflare: 3,466/5,000 HTTP 200, 1,533 Error 1200, one 502 and zero app 429s; slower opening did not solve the edge queue. The current bounded-admission candidate `c7874f3b` instead makes overload fail fast and keeps Cloudflare/Nginx limits unchanged.
-- On the repaired public 5k run `32959670815` (exact cleanup `32959892162`), all 5,000 attempts became fallback-eligible within 1s with zero client errors/429/503/1200, but zero HTTP 200 streams; API CPU averaged 68.7% and no locks were observed. This is a valid UX fallback result, not an SSE-capacity pass.
-- The 1k low-burst A/B `32960050840` (exact cleanup `32960232187`) reached 13 HTTP 200 streams and 987 fallbacks; connect p95 was 4.90s. Candidate `e772bd76` is now deployed with a 1s browser timeout, up to 500ms SSE jitter and prompt conditional polling; public 10k run `32961754619` (cleanup `32962201314`) produced 10,000 fast fallbacks and no persistent SSE 200s.
-
 ## Final unified SSE package — 2026-08-27
 
 The historical staircase above is superseded for the current production
