@@ -10,6 +10,12 @@ from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.tournament_workspace_access import (
     TournamentStreamAccessContext,
 )
+from apps.platform_api.app.services.tournament_participant_policy import (
+    enforce_tournament_participant_policy,
+)
+from apps.platform_api.app.services.tournament_write_serialization import (
+    serialize_tournament_write_invariants,
+)
 from python_packages.platform_infra.db import get_db_session, get_stream_db_session
 from python_packages.platform_infra.sse_connection_limit import admit_sse_authenticated_user
 
@@ -79,6 +85,21 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
             "/api/v1/tournaments/{slug}/bracket/events",
         )
         self.assertEqual(self._db_dependencies(route_context, get_db_session), [])
+
+    def test_sse_router_does_not_include_write_only_policy_dependencies(self) -> None:
+        app = create_app()
+        route_context = self._route_context(
+            app,
+            "/api/v1/tournaments/{slug}/bracket/events",
+        )
+        self.assertEqual(
+            self._db_dependencies(route_context, serialize_tournament_write_invariants),
+            [],
+        )
+        self.assertEqual(
+            self._db_dependencies(route_context, enforce_tournament_participant_policy),
+            [],
+        )
 
     def test_sse_router_admits_authenticated_user_after_route_auth(self) -> None:
         app = create_app()

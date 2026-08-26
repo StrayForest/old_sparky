@@ -20,7 +20,6 @@ from apps.platform_api.app.api.routes import (
 )
 from apps.platform_api.app.services.tournament_participant_policy import (
     enforce_tournament_participant_policy,
-    enforce_tournament_participant_policy_for_stream,
 )
 from python_packages.platform_infra.sse_connection_limit import admit_sse_authenticated_user
 from apps.platform_api.app.services.tournament_workspace_access import (
@@ -29,7 +28,6 @@ from apps.platform_api.app.services.tournament_workspace_access import (
 )
 from apps.platform_api.app.services.tournament_write_serialization import (
     serialize_tournament_write_invariants,
-    serialize_tournament_write_invariants_for_stream,
 )
 
 api_router = APIRouter()
@@ -52,8 +50,6 @@ tournament_dependencies = [
 stream_tournament_dependencies = [
     Depends(ensure_private_tournament_read_membership_is_active_for_stream),
     Depends(admit_sse_authenticated_user),
-    Depends(serialize_tournament_write_invariants_for_stream),
-    Depends(enforce_tournament_participant_policy_for_stream),
 ]
 api_router.include_router(
     tournaments.stream_router,

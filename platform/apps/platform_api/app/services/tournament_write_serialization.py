@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from python_packages.platform_domain.tournaments import can_organizer_moderate_participants
-from python_packages.platform_infra.db import get_db_session, get_stream_db_session
+from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
 from python_packages.platform_infra.models import (
     Tournament,
@@ -354,13 +354,3 @@ async def serialize_tournament_write_invariants(
             mutation_kind=mutation_kind,
             db_session=db_session,
         )
-
-
-async def serialize_tournament_write_invariants_for_stream(
-    request: Request,
-    auth_session=Depends(get_optional_authenticated_session_for_stream),
-    db_session: AsyncSession = Depends(get_stream_db_session, scope="function"),
-) -> None:
-    """Keep the SSE dependency graph on the isolated stream DB pool."""
-
-    await serialize_tournament_write_invariants(request, auth_session, db_session)
