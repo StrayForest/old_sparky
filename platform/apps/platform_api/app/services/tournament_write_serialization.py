@@ -19,7 +19,6 @@ from apps.platform_api.app.services.tournament_participant_capacity import (
 )
 from python_packages.platform_infra.security import (
     get_optional_authenticated_session,
-    get_optional_authenticated_session_for_stream,
 )
 
 

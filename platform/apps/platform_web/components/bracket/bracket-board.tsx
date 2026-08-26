@@ -270,7 +270,7 @@ export function BracketBoard({
           return;
         }
         schedulePollingTick(next ?? bracketRef.current);
-      }, Math.floor(Math.random() * BRACKET_POLL_JITTER_MS));
+      }, delayMs);
     };
     const stopPolling = () => {
       pollingActive = false;
@@ -284,6 +284,8 @@ export function BracketBoard({
       }
     };
     let source: EventSource | null = null;
+    let sharedPort: MessagePort | null = null;
+    let sseActive = false;
     let sseOpenDelayTimer: ReturnType<typeof setTimeout> | null = null;
     let sseOpenTimer: ReturnType<typeof setTimeout> | null = null;
     let sseRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -302,10 +304,17 @@ export function BracketBoard({
         sseOpenDelayTimer = null;
       }
       clearSseOpenTimer();
+      if (sharedPort !== null) {
+        sharedPort.postMessage({ type: "unsubscribe", key: slug });
+        sharedPort.onmessage = null;
+        sharedPort.close();
+        sharedPort = null;
+      }
       if (source !== null) {
         source.close();
         source = null;
       }
+      sseActive = false;
     };
 
     const fallBackToPolling = () => {
@@ -323,14 +332,14 @@ export function BracketBoard({
       sseRetryTimer = setTimeout(() => {
         sseRetryTimer = null;
         if (document.visibilityState === "visible") {
-          openSse();
+          void refreshIfVisible().finally(openSse);
         }
       }, delayMs);
     };
 
     const openSse = () => {
       if (
-        source !== null
+        sseActive
         || document.visibilityState !== "visible"
         || Date.now() < sseRetryNotBefore
       ) {
@@ -341,34 +350,67 @@ export function BracketBoard({
         if (
           document.visibilityState !== "visible"
           || Date.now() < sseRetryNotBefore
-          || source !== null
+          || sseActive
         ) {
           return;
         }
-        source = new EventSource(
-          platformApiUrl(`/tournaments/${slug}/bracket/events`),
-          { withCredentials: true },
-        );
+        const ticket = bracketRef.current?.sseAdmissionTicket;
+        const streamUrl = platformApiUrl(`/tournaments/${slug}/bracket/events`);
+        const url = ticket
+          ? `${streamUrl}?ticket=${encodeURIComponent(ticket)}`
+          : streamUrl;
+        sseActive = true;
+        const onOpen = () => {
+          clearSseOpenTimer();
+          stopPolling();
+        };
+        const onBracket = () => {
+          scheduleEventRefresh();
+        };
+        const onError = () => {
+          // Close the source and use revision polling during cooldown. This
+          // also stops a shared worker from reconnecting every browser tab.
+          fallBackToPolling();
+        };
         sseOpenTimer = setTimeout(() => {
           // A slow edge handshake is not useful to a visitor. Abort it before
           // an upstream queue can turn a normal fallback into a multi-minute
           // wait, then retry only after the cooldown.
-          if (source !== null) {
+          if (sseActive) {
             fallBackToPolling();
           }
         }, SSE_OPEN_TIMEOUT_MS);
-        source.onopen = () => {
-          clearSseOpenTimer();
-          stopPolling();
-        };
-        source.addEventListener("bracket", () => {
-          scheduleEventRefresh();
-        });
-        source.onerror = () => {
-          // EventSource retries automatically, which would keep hammering a
-          // saturated edge. Close it and use revision polling during cooldown.
-          fallBackToPolling();
-        };
+        try {
+          if (typeof SharedWorker !== "undefined") {
+            const worker = new SharedWorker("/sse-shared-worker.js");
+            worker.onerror = onError;
+            sharedPort = worker.port;
+            sharedPort.onmessage = (event: MessageEvent<{
+              key?: string;
+              type?: string;
+            }>) => {
+              if (event.data.key !== slug) {
+                return;
+              }
+              if (event.data.type === "open") {
+                onOpen();
+              } else if (event.data.type === "bracket") {
+                onBracket();
+              } else if (event.data.type === "error") {
+                onError();
+              }
+            };
+            sharedPort.start();
+            sharedPort.postMessage({ type: "subscribe", key: slug, url });
+          } else {
+            source = new EventSource(url, { withCredentials: true });
+            source.onopen = onOpen;
+            source.addEventListener("bracket", onBracket);
+            source.onerror = onError;
+          }
+        } catch {
+          onError();
+        }
       }, Math.floor(Math.random() * SSE_OPEN_JITTER_MS));
     };
 

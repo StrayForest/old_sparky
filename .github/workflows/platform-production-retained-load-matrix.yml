@@ -75,6 +75,14 @@ on:
         options:
           - public
           - origin-local
+      sse_admission_mode:
+        description: "SSE admission path; signed ticket removes PostgreSQL from opening, legacy is the control"
+        required: true
+        default: "ticket"
+        type: choice
+        options:
+          - ticket
+          - legacy
       combined_polling_duration:
         description: "Combined polling window in seconds (1-300)"
         required: true
@@ -118,6 +126,7 @@ jobs:
       QA_SSE_EVENT_COUNT: ${{ inputs.sse_event_count }}
       QA_SSE_EVENT_INTERVAL: ${{ inputs.sse_event_interval }}
       QA_SSE_ORIGIN_MODE: ${{ inputs.sse_origin_mode }}
+      QA_SSE_ADMISSION_MODE: ${{ inputs.sse_admission_mode }}
       QA_COMBINED_POLLING_DURATION: ${{ inputs.combined_polling_duration }}
       QA_COMBINED_POLLING_OPEN_STAGGER: ${{ inputs.combined_polling_open_stagger }}
       TARGET_SHA: ${{ github.sha }}
@@ -143,7 +152,7 @@ jobs:
             "$QA_SSE_OPEN_TIMEOUT" "$QA_SSE_RECONNECT_CYCLES" "$QA_SSE_USERS_PER_TOURNAMENT" \
             "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
             "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" \
-            "$QA_SSE_ORIGIN_MODE" <<'PY'
+            "$QA_SSE_ORIGIN_MODE" "$QA_SSE_ADMISSION_MODE" <<'PY'
           import re
           import sys
 
@@ -162,6 +171,7 @@ jobs:
               combined_polling_duration,
               combined_polling_open_stagger,
               sse_origin_mode,
+              sse_admission_mode,
           ) = sys.argv[1:]
           if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email):
               raise SystemExit("control_email is invalid")
@@ -169,6 +179,8 @@ jobs:
               raise SystemExit("concurrency must be an integer from 1 to 256")
           if sse_origin_mode not in {"public", "origin-local"}:
               raise SystemExit("sse_origin_mode must be public or origin-local")
+          if sse_admission_mode not in {"ticket", "legacy"}:
+              raise SystemExit("sse_admission_mode must be ticket or legacy")
           if sse_origin_mode == "origin-local" and profile != "sse":
               raise SystemExit("origin-local is only supported for the SSE profile")
           if profile in {"sse", "combined"}:
@@ -247,6 +259,7 @@ jobs:
               "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" "$QA_SSE_OPEN_TIMEOUT" "$QA_SSE_RECONNECT_CYCLES" \
               "$QA_SSE_USERS_PER_TOURNAMENT" "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
               "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" "$QA_SSE_ORIGIN_MODE" \
+              "$QA_SSE_ADMISSION_MODE" \
             > "$ssh_output_file" 2>&1 <<'REMOTE'
           set -Eeuo pipefail
           confirmation="$1"

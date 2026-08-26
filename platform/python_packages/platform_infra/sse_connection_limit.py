@@ -397,17 +397,20 @@ async def admit_sse_authenticated_user(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session_for_stream),
 ) -> None:
-    """Attach the authenticated-user lease after the route auth check.
-
-    The middleware intentionally reserves only global/source capacity. The
-    route dependency already performs the authoritative session and visibility
-    checks using the bounded stream DB session; re-querying the same cookie in
-    middleware creates avoidable DB pressure during a handshake burst.
-    """
+    """Attach the authenticated-user lease after the route auth check."""
 
     if auth_session is None:
         return
     lease = request.scope.get(SSE_CONNECTION_LEASE_SCOPE)
     if not isinstance(lease, SseConnectionLease):
         raise RuntimeError("SSE connection lease is missing from the request scope.")
-    await lease.add_user_scope(str(auth_session.user.id))
+    await add_sse_authenticated_user_scope(request, str(auth_session.user.id))
+
+
+async def add_sse_authenticated_user_scope(request: Request, user_id: str) -> None:
+    """Add the authenticated-user lease after stream authorization."""
+
+    lease = request.scope.get(SSE_CONNECTION_LEASE_SCOPE)
+    if not isinstance(lease, SseConnectionLease):
+        raise RuntimeError("SSE connection lease is missing from the request scope.")
+    await lease.add_user_scope(user_id)

@@ -3,21 +3,21 @@ from __future__ import annotations
 import inspect
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 from apps.platform_api.app.api.routes import tournaments
 from apps.platform_api.app.main import create_app
-from apps.platform_api.app.services.tournament_workspace_access import (
-    TournamentStreamAccessContext,
-)
 from apps.platform_api.app.services.tournament_participant_policy import (
     enforce_tournament_participant_policy,
+)
+from apps.platform_api.app.services.tournament_workspace_access import (
+    TournamentStreamAccessContext,
+    admit_tournament_bracket_stream,
 )
 from apps.platform_api.app.services.tournament_write_serialization import (
     serialize_tournament_write_invariants,
 )
-from python_packages.platform_infra.db import get_db_session, get_stream_db_session
-from python_packages.platform_infra.sse_connection_limit import admit_sse_authenticated_user
+from python_packages.platform_infra.db import get_db_session
 
 
 class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
@@ -44,15 +44,26 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
         collect(route_context.dependant)
         return db_dependencies
 
-    def test_sse_dependency_graph_uses_function_scoped_db_sessions(self) -> None:
+    def test_sse_route_has_one_conditional_admission_dependency(self) -> None:
         app = create_app()
         route_context = self._route_context(
             app,
             "/api/v1/tournaments/{slug}/bracket/events",
         )
-        db_dependencies = self._db_dependencies(route_context, get_stream_db_session)
-        self.assertGreaterEqual(len(db_dependencies), 1)
-        self.assertTrue(all(item.scope == "function" for item in db_dependencies))
+        self.assertEqual(
+            len(self._db_dependencies(route_context, get_db_session)),
+            0,
+        )
+        admission_dependencies = []
+
+        def collect(dependant) -> None:
+            if dependant.call is admit_tournament_bracket_stream:
+                admission_dependencies.append(dependant)
+            for child in dependant.dependencies:
+                collect(child)
+
+        collect(route_context.dependant)
+        self.assertEqual(len(admission_dependencies), 1)
 
     def test_regular_tournament_routes_keep_request_scoped_db_sessions(self) -> None:
         app = create_app()
@@ -61,30 +72,10 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(db_dependencies), 1)
         self.assertTrue(any(item.scope is None for item in db_dependencies))
 
-    def test_sse_endpoint_uses_function_scoped_db_dependency(self) -> None:
-        parameter = inspect.signature(
+    def test_sse_endpoint_has_no_database_dependency(self) -> None:
+        self.assertNotIn("db_session", inspect.signature(
             tournaments.get_tournament_bracket_events
-        ).parameters["db_session"]
-        self.assertEqual(parameter.default.scope, "function")
-        self.assertIs(parameter.default.dependency, get_stream_db_session)
-
-    def test_sse_router_auth_and_access_share_stream_db_dependency(self) -> None:
-        app = create_app()
-        route_context = self._route_context(
-            app,
-            "/api/v1/tournaments/{slug}/bracket/events",
-        )
-        db_dependencies = self._db_dependencies(route_context, get_stream_db_session)
-        self.assertGreaterEqual(len(db_dependencies), 2)
-        self.assertTrue(all(item.scope == "function" for item in db_dependencies))
-
-    def test_sse_router_does_not_reserve_the_ordinary_api_db_pool(self) -> None:
-        app = create_app()
-        route_context = self._route_context(
-            app,
-            "/api/v1/tournaments/{slug}/bracket/events",
-        )
-        self.assertEqual(self._db_dependencies(route_context, get_db_session), [])
+        ).parameters)
 
     def test_sse_router_does_not_include_write_only_policy_dependencies(self) -> None:
         app = create_app()
@@ -101,7 +92,7 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
             [],
         )
 
-    def test_sse_router_admits_authenticated_user_after_route_auth(self) -> None:
+    def test_sse_router_uses_conditional_admission_dependency(self) -> None:
         app = create_app()
         route_context = self._route_context(
             app,
@@ -110,17 +101,13 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
         dependencies = []
 
         def collect(dependant) -> None:
-            if dependant.call is admit_sse_authenticated_user:
+            if dependant.call is admit_tournament_bracket_stream:
                 dependencies.append(dependant)
             for child in dependant.dependencies:
                 collect(child)
 
         collect(route_context.dependant)
         self.assertEqual(len(dependencies), 1)
-        self.assertEqual(
-            dependencies[0].dependencies[0].call.__name__,
-            "get_optional_authenticated_session_for_stream",
-        )
 
     async def test_sse_endpoint_reuses_stream_access_participant_snapshot(self) -> None:
         tournament = SimpleNamespace(id="tournament-1")
@@ -148,32 +135,13 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 tournaments,
-                "ensure_tournament_workspace_visible",
-            ) as ensure_visible,
-            patch.object(
-                tournaments,
-                "participant_for_user",
-                new_callable=AsyncMock,
-            ) as participant_for_user,
-            patch.object(
-                tournaments,
                 "stream_bracket_events",
                 return_value=empty_stream(),
             ),
         ):
-            response = await tournaments.get_tournament_bracket_events(
-                "test-tournament",
-                auth_session,
-                MagicMock(),
-            )
+            response = await tournaments.get_tournament_bracket_events("test-tournament")
 
         self.assertEqual(response.media_type, "text/event-stream")
-        participant_for_user.assert_not_awaited()
-        ensure_visible.assert_called_once_with(
-            tournament,
-            auth_session=auth_session,
-            has_participant_record=True,
-        )
 
 
 if __name__ == "__main__":

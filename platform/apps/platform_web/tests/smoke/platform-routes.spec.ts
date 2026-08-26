@@ -107,6 +107,7 @@ test("document CSP uses one fresh nonce and leaves static responses unscoped", a
   expect(secondNonce).not.toBe(firstNonce);
   expect(firstPolicy).toContain("script-src-attr 'none'");
   expect(firstPolicy).toContain("style-src-attr 'none'");
+  expect(firstPolicy).toContain("worker-src 'self'");
   expect(firstPolicy).toContain("https://i2.ytimg.com https://i3.ytimg.com");
   expect(firstPolicy).not.toMatch(/'unsafe-|strict-dynamic|\*|\bdata:/);
   expect(first.headers()["reporting-endpoints"]).toBe(

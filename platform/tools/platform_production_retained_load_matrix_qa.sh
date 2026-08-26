@@ -34,8 +34,8 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# < 5 || $# > 17 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local]]" >&2
+if (( $# < 5 || $# > 18 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local] [ticket|legacy]]" >&2
   exit 2
 fi
 
@@ -60,6 +60,11 @@ case "$profile" in
     combined_polling_duration="${15:-30}"
     combined_polling_open_stagger="${16:-300}"
     sse_origin_mode="${17:-public}"
+    sse_admission_mode="${18:-ticket}"
+    [[ "$sse_admission_mode" == "ticket" || "$sse_admission_mode" == "legacy" ]] || {
+      echo "SSE admission mode must be ticket or legacy." >&2
+      exit 1
+    }
     [[ "$sse_origin_mode" == "public" || "$sse_origin_mode" == "origin-local" ]] || {
       echo "SSE origin mode must be public or origin-local." >&2
       exit 1
@@ -397,6 +402,7 @@ else
     --sse-event-interval "$sse_event_interval" \
     --combined-polling-duration "$combined_polling_duration" \
     --combined-polling-open-stagger "$combined_polling_open_stagger" \
+    --sse-admission-mode "$sse_admission_mode" \
     --concurrency "$sse_setup_concurrency" \
     --http-max-connections "$HTTP_MAX_CONNECTIONS" \
     --http-timeout 10 \

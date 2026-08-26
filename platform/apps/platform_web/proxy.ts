@@ -25,7 +25,7 @@ function contentSecurityPolicy(nonce: string): string {
     "font-src 'self'",
     "manifest-src 'self'",
     "media-src 'none'",
-    "worker-src 'none'",
+    "worker-src 'self'",
     "report-uri /api/v1/security/csp-report",
     "report-to csp-endpoint",
   ].join("; ");

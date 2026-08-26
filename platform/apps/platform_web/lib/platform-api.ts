@@ -159,6 +159,7 @@ type ApiBracket = {
   matches?: ApiMatch[] | null;
   next_poll_after_ms?: number | null;
   state_version?: number | null;
+  sse_admission_ticket?: string | null;
 };
 
 type ApiBracketCapabilities = {
@@ -1542,7 +1543,8 @@ function mapBracket(item: ApiBracket): Bracket {
     teams: (item.teams ?? []).map(mapTeam),
     matches: (item.matches ?? []).map(mapMatch),
     nextPollAfterMs: item.next_poll_after_ms ?? null,
-    stateVersion: item.state_version ?? null
+    stateVersion: item.state_version ?? null,
+    sseAdmissionTicket: item.sse_admission_ticket ?? null,
   };
 }
 
@@ -1561,7 +1563,8 @@ function emptyBracket(tournamentId: string, tournamentStatus: TournamentStatus):
     teams: [],
     matches: [],
     nextPollAfterMs: null,
-    stateVersion: null
+    stateVersion: null,
+    sseAdmissionTicket: null,
   };
 }
 

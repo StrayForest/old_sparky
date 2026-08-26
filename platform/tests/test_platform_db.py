@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import unittest
-from unittest.mock import Mock, patch, sentinel
+from unittest.mock import AsyncMock, MagicMock, Mock, patch, sentinel
 
 from starlette.exceptions import HTTPException
 
@@ -115,11 +114,15 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
 
 class PlatformStreamDbAdmissionTests(unittest.IsolatedAsyncioTestCase):
     async def test_saturated_stream_admission_fails_fast_and_maps_to_503(self) -> None:
-        previous_semaphore = db._stream_db_concurrency
-        db._stream_db_concurrency = asyncio.Semaphore(0)
+        session = Mock()
+        session.connection = AsyncMock(side_effect=TimeoutError)
+        session_context = MagicMock()
+        session_context.__aenter__ = AsyncMock(return_value=session)
+        session_context.__aexit__ = AsyncMock(return_value=None)
+        session_factory = MagicMock(return_value=session_context)
+        stream = db.get_stream_db_session()
         try:
-            with patch.object(db, "SSE_STREAM_DB_ACQUIRE_TIMEOUT_SECONDS", 0.001):
-                stream = db.get_stream_db_session()
+            with patch.object(db, "stream_session_factory", return_value=session_factory):
                 with self.assertRaises(HTTPException) as context:
                     await stream.__anext__()
 
@@ -128,4 +131,4 @@ class PlatformStreamDbAdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(context.exception.headers["Cache-Control"], "no-store")
             self.assertIn("Use polling", str(context.exception.detail))
         finally:
-            db._stream_db_concurrency = previous_semaphore
+            await stream.aclose()

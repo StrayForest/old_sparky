@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import (
     SseStreamDbAdmissionUnavailable,
     get_db_session,
@@ -27,6 +28,13 @@ from python_packages.platform_infra.security import (
     get_optional_authenticated_session,
     get_optional_authenticated_session_for_stream,
 )
+from python_packages.platform_infra.sse_admission import (
+    SseAdmissionTicketInvalid,
+    verify_sse_admission_ticket,
+)
+from python_packages.platform_infra.sse_connection_limit import (
+    add_sse_authenticated_user_scope,
+)
 
 ACTIVE_PARTICIPANT_STATUSES = frozenset({"registered", "confirmed", "checked_in"})
 ADMIN_ROLE_SLUGS = ("admin", "superadmin")
@@ -39,6 +47,7 @@ class TournamentStreamAccessContext:
     user_id: str | None = None
     session_id: str | None = None
     tournament: Tournament | None = None
+    tournament_id: str | None = None
 
 
 _tournament_stream_access_context: ContextVar[TournamentStreamAccessContext | None] = ContextVar(
@@ -178,6 +187,13 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
                 participant_status = row[2]
 
                 if access_context.decision == "public":
+                    if access_context.user_id and access_context.session_id:
+                        if not await _authenticated_stream_session_is_current(
+                            db_session,
+                            user_id=access_context.user_id,
+                            session_id=access_context.session_id,
+                        ):
+                            return False
                     return tournament_visibility == "public"
                 if tournament_visibility != "invite_only":
                     return True
@@ -411,3 +427,119 @@ async def ensure_private_tournament_read_membership_is_active_for_stream(
         participant_status=row[1],
         tournament=tournament,
     )
+
+
+def _stream_db_unavailable_http_exception() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="Live-update admission is temporarily full. Use polling.",
+        headers={
+            "Retry-After": "1",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+async def admit_tournament_bracket_stream(
+    request: Request,
+    slug: str,
+    ticket: str | None = Query(default=None, alias="ticket"),
+) -> None:
+    """Admit an SSE stream with a ticket fast path and DB fallback.
+
+    A ticket is issued only after the normal workspace authorization path has
+    proved visibility. Private tickets remain bound to the same session
+    cookie and are revalidated against PostgreSQL while the stream is open.
+    Unticketed clients retain the authoritative bounded-DB admission path.
+    """
+
+    _tournament_stream_access_context.set(None)
+    if ticket is not None:
+        settings = get_settings()
+        session_token = request.cookies.get(settings.platform_session_cookie_name)
+        try:
+            admitted = verify_sse_admission_ticket(
+                ticket,
+                expected_slug=slug,
+                session_token=session_token,
+            )
+        except SseAdmissionTicketInvalid as exc:
+            raise HTTPException(
+                status_code=401,
+                detail="SSE admission ticket is invalid or expired.",
+                headers={"Cache-Control": "no-store"},
+            ) from exc
+        _tournament_stream_access_context.set(
+            TournamentStreamAccessContext(
+                decision=admitted.access,
+                slug=admitted.slug,
+                user_id=admitted.user_id,
+                session_id=admitted.session_id,
+                tournament_id=admitted.tournament_id,
+            )
+        )
+        if admitted.user_id is not None:
+            await add_sse_authenticated_user_scope(request, admitted.user_id)
+        return
+
+    try:
+        async with stream_db_session() as db_session:
+            auth_session = await get_optional_authenticated_session_for_stream(
+                request,
+                db_session,
+            )
+            await ensure_private_tournament_read_membership_is_active_for_stream(
+                request,
+                auth_session,
+                db_session,
+            )
+            context = current_tournament_stream_access_context()
+            if context is not None and context.decision == "deny" and auth_session is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        "Tournament roster and bracket data are visible only to joined "
+                        "participants, the organizer, or platform admins."
+                    ),
+                )
+            if context is None or context.decision == "deny":
+                tournament = await db_session.scalar(
+                    select(Tournament).where(Tournament.slug == slug)
+                )
+                if tournament is None:
+                    raise HTTPException(status_code=404, detail="Tournament not found.")
+                if tournament.visibility == "invite_only":
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Authentication required to view invite-only tournament bracket data.",
+                    )
+                context = TournamentStreamAccessContext(
+                    decision="public",
+                    slug=slug,
+                    tournament=tournament,
+                    tournament_id=tournament.id,
+                )
+                _tournament_stream_access_context.set(context)
+            elif context.tournament is None:
+                tournament = await db_session.scalar(
+                    select(Tournament).where(Tournament.slug == slug)
+                )
+                if tournament is None:
+                    raise HTTPException(status_code=404, detail="Tournament not found.")
+                _tournament_stream_access_context.set(
+                    TournamentStreamAccessContext(
+                        decision=context.decision,
+                        slug=context.slug,
+                        user_id=context.user_id,
+                        session_id=context.session_id,
+                        tournament=tournament,
+                        tournament_id=tournament.id,
+                    )
+                )
+            if auth_session is not None:
+                await add_sse_authenticated_user_scope(
+                    request,
+                    str(auth_session.user.id),
+                )
+    except SseStreamDbAdmissionUnavailable as exc:
+        raise _stream_db_unavailable_http_exception() from exc

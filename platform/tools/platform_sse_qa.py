@@ -17,6 +17,7 @@ import sys
 import time
 import traceback
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from redis.asyncio import Redis, from_url
@@ -210,6 +211,12 @@ def parse_args() -> argparse.Namespace:
         help="Abort an SSE handshake after this many seconds and count it as polling fallback eligible.",
     )
     parser.add_argument("--sse-reconnect-cycles", type=int, default=0)
+    parser.add_argument(
+        "--sse-admission-mode",
+        choices=("ticket", "legacy"),
+        default="ticket",
+        help="Use a signed workspace-issued ticket or the legacy DB-backed SSE admission path.",
+    )
     parser.add_argument("--sse-event-count", type=int, default=3)
     parser.add_argument("--sse-event-interval", type=float, default=1.0)
     parser.add_argument("--combined-polling-duration", type=float, default=30.0)
@@ -283,6 +290,35 @@ async def prepare_fixture(
     return users, tournaments, [users]
 
 
+async def issue_public_sse_admission_ticket(
+    qa: ProductionQa,
+    client: httpx.AsyncClient,
+    tournament_slug: str,
+) -> str:
+    """Fetch one public bracket descriptor and retain its signed SSE proof."""
+
+    response = await client.get(
+        f"/tournaments/{quote(tournament_slug, safe='')}/bracket?teams_view=summary",
+        headers={
+            "Accept": "application/json",
+            "Origin": qa.request_origin,
+            "X-Platform-QA-Phase": qa.current_phase,
+        },
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Public SSE admission ticket request failed with "
+            f"HTTP {response.status_code}."
+        )
+    try:
+        ticket = response.json().get("sse_admission_ticket")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Public SSE admission ticket response was not JSON.") from exc
+    if not isinstance(ticket, str) or not ticket:
+        raise RuntimeError("Public SSE admission ticket was missing from the bracket response.")
+    return ticket
+
+
 async def publish_probe_events(
     tournament_ids: list[str],
     *,
@@ -330,6 +366,7 @@ async def consume_sse_connection(
     *,
     user: dict[str, Any],
     tournament_slug: str,
+    sse_ticket: str | None,
     duration_seconds: float,
     reconnect_cycles: int,
     open_gate: asyncio.Semaphore,
@@ -369,7 +406,12 @@ async def consume_sse_connection(
         try:
             stream_context = client.stream(
                 "GET",
-                f"/tournaments/{tournament_slug}/bracket/events",
+                (
+                    f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
+                    f"?ticket={quote(sse_ticket, safe='')}"
+                    if sse_ticket
+                    else f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
+                ),
                 headers=headers,
             )
             try:
@@ -502,6 +544,7 @@ async def run_connections(
     duration_seconds: float,
     open_concurrency: int,
     open_timeout_seconds: float,
+    sse_ticket: str | None,
     reconnect_cycles: int,
     event_count: int,
     event_interval: float,
@@ -563,6 +606,7 @@ async def run_connections(
                 metrics,
                 user=user,
                 tournament_slug=str(tournament["slug"]),
+                sse_ticket=sse_ticket,
                 duration_seconds=duration_seconds,
                 reconnect_cycles=reconnect_cycles,
                 open_gate=open_gate,
@@ -593,6 +637,7 @@ async def run_connections(
             "duration_seconds": duration_seconds,
             "open_concurrency": open_concurrency,
             "open_timeout_seconds": open_timeout_seconds,
+            "admission_mode": "ticket" if sse_ticket else "legacy",
             "reconnect_cycles": reconnect_cycles,
             "probe_event_count": event_count,
             "probe_event_interval_seconds": event_interval,
@@ -669,6 +714,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     qa.report["target_sha"] = args.target_sha
     qa.report["github_run_id"] = args.github_run_id
     qa.report["sse"] = {}
+    qa.report["sse_admission"] = {"mode": args.sse_admission_mode, "issued": False}
     started = time.monotonic()
     api_client = await qa.new_client()
     try:
@@ -685,6 +731,19 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 "SSE fixture setup exceeded its bounded budget of "
                 f"{SSE_FIXTURE_TIMEOUT_SECONDS:.1f}s"
             ) from exc
+        sse_ticket: str | None = None
+        if args.sse_admission_mode == "ticket":
+            with qa.phase("sse_admission_ticket"):
+                sse_ticket = await issue_public_sse_admission_ticket(
+                    qa,
+                    api_client,
+                    str(tournaments[0]["slug"]),
+                )
+            qa.report["sse_admission"] = {
+                "mode": "ticket",
+                "issued": True,
+                "scope": "anonymous-public",
+            }
         if args.mode == "sse":
             with qa.phase("sse_only_run"):
                 sse_report = await run_connections(
@@ -695,6 +754,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     duration_seconds=args.sse_duration,
                     open_concurrency=args.sse_open_concurrency,
                     open_timeout_seconds=args.sse_open_timeout,
+                    sse_ticket=sse_ticket,
                     reconnect_cycles=args.sse_reconnect_cycles,
                     event_count=args.sse_event_count,
                     event_interval=args.sse_event_interval,
@@ -772,6 +832,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                         duration_seconds=args.sse_duration,
                         open_concurrency=args.sse_open_concurrency,
                         open_timeout_seconds=args.sse_open_timeout,
+                        sse_ticket=sse_ticket,
                         reconnect_cycles=args.sse_reconnect_cycles,
                         event_count=args.sse_event_count,
                         event_interval=args.sse_event_interval,
@@ -917,6 +978,9 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
             sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN),
         ),
         "sse": {
+            "admission_mode": sse.get("admission_mode") or (
+                report.get("sse_admission") or {}
+            ).get("mode"),
             "target_connections": sse.get("target_connections"),
             "connected": metrics.get("connected"),
             "max_active_connections": metrics.get("max_active_connections"),

@@ -213,7 +213,8 @@ from python_packages.platform_domain.tournaments import (
     transition_match_status,
 )
 from python_packages.platform_infra.audit import write_audit_log
-from python_packages.platform_infra.db import get_db_session, get_stream_db_session
+from python_packages.platform_infra.config import get_settings
+from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
 from python_packages.platform_infra.media.errors import MediaError
 from python_packages.platform_infra.media.source_store import StagedSource
@@ -240,8 +241,8 @@ from python_packages.platform_infra.models import (
 from python_packages.platform_infra.security import (
     get_authenticated_session,
     get_optional_authenticated_session,
-    get_optional_authenticated_session_for_stream,
 )
+from python_packages.platform_infra.sse_admission import issue_sse_admission_ticket
 from python_packages.platform_infra.tournament_names import (
     lock_tournament_name,
     public_tournament_name_exists,
@@ -275,6 +276,66 @@ BRACKET_IDLE_POLL_MS = 30_000
 READY_CHECK_ACTIVE_PARTICIPANT_POLL_MS = 5_000
 READY_CHECK_ACTIVE_VIEWER_POLL_MS = 15_000
 TERMINAL_TOURNAMENT_STATUSES = frozenset(("completed", "cancelled"))
+
+
+def _issue_tournament_sse_admission_ticket(
+    request: Request,
+    *,
+    tournament: Tournament,
+    auth_session,
+    has_participant_record: bool,
+) -> str | None:
+    if tournament.visibility == "invite_only":
+        if auth_session is None:
+            return None
+        if auth_session_has_admin_role(auth_session):
+            access = "admin"
+        elif tournament.organizer_user_id == auth_session.user.id:
+            access = "organizer"
+        elif has_participant_record:
+            access = "active_participant"
+        else:
+            return None
+    else:
+        access = "public"
+
+    session_token = None
+    session_id = None
+    user_id = None
+    if auth_session is not None:
+        session_token = request.cookies.get(get_settings().platform_session_cookie_name)
+        session_id = str(getattr(auth_session.session, "id", "") or "")
+        user_id = str(getattr(auth_session.user, "id", "") or "")
+        if not session_token or not session_id or not user_id:
+            return None
+    return issue_sse_admission_ticket(
+        tournament_id=str(tournament.id),
+        slug=tournament.slug,
+        access=access,
+        user_id=user_id,
+        session_id=session_id,
+        session_token=session_token,
+    )
+
+
+def _with_tournament_sse_ticket(
+    request: Request,
+    bracket: TournamentBracketResponse,
+    *,
+    tournament: Tournament,
+    auth_session,
+    has_participant_record: bool,
+) -> TournamentBracketResponse:
+    return bracket.model_copy(
+        update={
+            "sse_admission_ticket": _issue_tournament_sse_admission_ticket(
+                request,
+                tournament=tournament,
+                auth_session=auth_session,
+                has_participant_record=has_participant_record,
+            )
+        }
+    )
 
 
 def bracket_capabilities(
@@ -3956,60 +4017,50 @@ async def get_tournament_bracket(
     not_modified = _conditional_response(request, response, etag=etag)
     if not_modified is not None:
         return not_modified
-    return await build_tournament_bracket_response(
+    has_participant_record = False
+    has_active_participant_record = False
+    if auth_session is not None and tournament.visibility == "invite_only":
+        participant_record = await participant_for_user(
+            db_session,
+            tournament_id=tournament.id,
+            user_id=auth_session.user.id,
+        )
+        has_participant_record = participant_record is not None
+        has_active_participant_record = bool(
+            participant_record is not None
+            and not participant_status_is_inactive(participant_record.status)
+        )
+    bracket = await build_tournament_bracket_response(
         db_session,
         tournament=tournament,
         auth_session=auth_session,
+        has_participant_record=has_participant_record,
         include_team_members=teams_view == "full",
+    )
+    return _with_tournament_sse_ticket(
+        request,
+        bracket,
+        tournament=tournament,
+        auth_session=auth_session,
+        has_participant_record=has_active_participant_record,
     )
 
 
 @stream_router.get("/{slug}/bracket/events")
 async def get_tournament_bracket_events(
     slug: str,
-    auth_session=Depends(get_optional_authenticated_session_for_stream),
-    db_session: AsyncSession = Depends(get_stream_db_session, scope="function"),
 ) -> StreamingResponse:
     access_context = current_tournament_stream_access_context()
-    if (
-        access_context is not None
-        and access_context.slug == slug
-        and access_context.tournament is not None
-    ):
-        tournament = access_context.tournament
-    else:
-        tournament = await get_tournament_or_404(db_session, slug)
-    has_participant_record = (
-        access_context is not None
-        and access_context.slug == slug
-        and access_context.tournament is not None
-        and access_context.tournament.id == tournament.id
-        and access_context.decision == "active_participant"
-    )
-    if (
-        auth_session is not None
-        and (
-            access_context is None
-            or access_context.slug != slug
-            or access_context.tournament is None
-            or access_context.tournament.id != tournament.id
-        )
-    ):
-        has_participant_record = (
-            await participant_for_user(
-                db_session,
-                tournament_id=tournament.id,
-                user_id=auth_session.user.id,
-            )
-        ) is not None
-    ensure_tournament_workspace_visible(
-        tournament,
-        auth_session=auth_session,
-        has_participant_record=has_participant_record,
-    )
-
+    if access_context is None or access_context.slug != slug or access_context.decision == "deny":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+    tournament = access_context.tournament
+    tournament_id = access_context.tournament_id
+    if tournament is not None:
+        tournament_id = str(tournament.id)
+    if not tournament_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
     return StreamingResponse(
-        stream_bracket_events(tournament.id, admission_verified=True),
+        stream_bracket_events(tournament_id, admission_verified=True),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -6440,6 +6491,19 @@ async def get_tournament_workspace(
                                 "current_user_active_commitment": active_commitment,
                             }
                         )
+                        workspace_response = workspace_response.model_copy(
+                            update={
+                                "bracket": _with_tournament_sse_ticket(
+                                    request,
+                                    workspace_response.bracket,
+                                    tournament=current_tournament,
+                                    auth_session=auth_session,
+                                    has_participant_record=False,
+                                )
+                                if workspace_response.bracket is not None
+                                else None,
+                            }
+                        )
                         etag = _workspace_response_etag(
                             workspace_response,
                             workspace_view=workspace_view,
@@ -6606,6 +6670,16 @@ async def get_tournament_workspace(
             visible_assignment_run=visible_assignment_run,
             assignment_run_loaded=assignment_runs_loaded,
         )
+    bracket = _with_tournament_sse_ticket(
+        request,
+        bracket,
+        tournament=tournament,
+        auth_session=auth_session,
+        has_participant_record=bool(
+            participant_record is not None
+            and not participant_status_is_inactive(participant_record.status)
+        ),
+    )
 
     ready_check: TournamentDeadlockReadyCheckStateResponse | None = None
     auto_assignment: TournamentDeadlockAutoAssignmentStateResponse | None = None
@@ -6677,6 +6751,13 @@ async def get_tournament_workspace(
                     ),
                     "current_user": None,
                     "current_user_active_commitment": None,
+                    "bracket": (
+                        workspace_response.bracket.model_copy(
+                            update={"sse_admission_ticket": None}
+                        )
+                        if workspace_response.bracket is not None
+                        else None
+                    ),
                 }
             ),
         )

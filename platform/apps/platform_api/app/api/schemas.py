@@ -1084,6 +1084,9 @@ class TournamentBracketResponse(BaseModel):
     matches: list[TournamentBracketMatchResponse] = Field(default_factory=list)
     next_poll_after_ms: int | None = None
     state_version: int | None = None
+    # A short-lived proof issued only after the surrounding workspace access
+    # check. It removes PostgreSQL from the subsequent SSE handshake.
+    sse_admission_ticket: str | None = None
 
 
 class AuditLogResponse(BaseModel):

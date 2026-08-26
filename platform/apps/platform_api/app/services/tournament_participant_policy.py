@@ -8,7 +8,6 @@ from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.models import TournamentInvite, TournamentParticipant
 from python_packages.platform_infra.security import (
     get_optional_authenticated_session,
-    get_optional_authenticated_session_for_stream,
 )
 
 

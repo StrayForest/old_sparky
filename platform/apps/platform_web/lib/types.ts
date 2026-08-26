@@ -160,6 +160,7 @@ export type Bracket = {
   matches: Match[];
   nextPollAfterMs?: number | null;
   stateVersion?: number | null;
+  sseAdmissionTicket?: string | null;
 };
 
 export type ActiveTournamentCommitment = {
