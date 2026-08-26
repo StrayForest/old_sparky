@@ -194,7 +194,9 @@ jobs:
               for name, (value, lower, upper) in integer_ranges.items():
                   if not re.fullmatch(r"[0-9]+", value) or not lower <= int(value) <= upper:
                       raise SystemExit(f"{name} must be between {lower} and {upper}")
-              sse_open_timeout_max = 60 if sse_origin_mode == "origin-local" else 30
+              # This is a retained-load diagnostic ceiling only. The browser
+              # fallback/cooldown policy is independent and remains unchanged.
+              sse_open_timeout_max = 60
               decimal_ranges = {
                   "sse_duration": (sse_duration, 1, 600),
                   "sse_open_timeout": (sse_open_timeout, 0.5, sse_open_timeout_max),
