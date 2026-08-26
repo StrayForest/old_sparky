@@ -144,6 +144,14 @@ already validated Pydantic payload through `model_dump_json()` with the same
 ETag, avoiding a second response-model validation/JSON encoding pass. It is
 accepted only with unchanged status/body/ETag contracts and lower API CPU and
 workspace p95 on the same mixed contour.
+The H3 live run `32981400437` (cleanup `32981700615`) reached the bounded
+diagnostic budget with workspace p50/p95/p99 `383/996/2,070ms`, API CPU
+`106.6%` average and `144.6%` peak, PostgreSQL `17.1%`, Redis `0.27%`, and no
+lock/backend-wait contention. It did not beat H2 and is not the selected
+winner. The next local H4 adds a 128-entry/2-second public registration-open
+workspace snapshot for the lean detail polling contract, with fresh
+permission checks and mutation invalidation; it is not yet deployed or
+counted as a production result.
 
 AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact

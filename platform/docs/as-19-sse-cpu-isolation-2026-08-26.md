@@ -336,3 +336,25 @@ status, ETag and conditional `304` behavior while avoiding FastAPI's second
 response-model validation/encoding pass. The live gate compares API CPU,
 workspace p95/p99, payload bytes, conditional responses and error counts with
 the same mixed contour.
+
+The H3 public run `32981400437` reached the same bounded diagnostic budget and
+was therefore a measured FAIL, not a hang. It recorded workspace p50/p95/p99
+`383/996/2,070ms`, average DB time `198ms` at 5 SQL queries/request, API CPU
+`106.6%` average (`144.6%` peak), PostgreSQL `17.1%`, Redis `0.27%`, and no
+lock/backend-wait contention. This is not a clear improvement over H2, so H3
+is not selected as the final winner. Exact cleanup `32981700615` succeeded.
+
+### CPU follow-up H4: public registration-open workspace snapshot
+
+H4 keeps the H2 registration-open query reduction and adds a small per-process
+TTL snapshot only for the anonymous/public-shaped detail contract used by the
+mass polling contour: `participants_limit=0`, offset `0` and
+`include_current_user=false`. A cache hit still performs a cheap tournament
+identity/status/visibility read; authenticated requests independently recheck
+participant, invite and organizer/admin access before using the generic DTO.
+Private/participant/manager responses never enter this cache. The snapshot is
+bounded to 128 entries and 2 seconds, is invalidated after tournament status and
+participant mutations, and remains an optimization of public representation
+data rather than authoritative state. H4 must be rejected if the mixed contour
+shows stale permission-sensitive fields, incorrect ETags/304s, unexpected
+errors, or no measurable reduction in API CPU/route latency.

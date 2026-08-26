@@ -263,6 +263,8 @@ READY_CHECK_STATE_CACHE_TTL_SECONDS = 30.0
 READY_CHECK_STATE_CACHE_MAX_ENTRIES = 128
 PARTICIPANT_PAGE_CACHE_TTL_SECONDS = 30.0
 PARTICIPANT_PAGE_CACHE_MAX_ENTRIES = 512
+PUBLIC_WORKSPACE_SNAPSHOT_CACHE_TTL_SECONDS = 2.0
+PUBLIC_WORKSPACE_SNAPSHOT_CACHE_MAX_ENTRIES = 128
 POLLING_DISABLED_MS = 0
 PUBLIC_SUMMARY_POLL_MS = 45_000
 WORKSPACE_VIEWER_POLL_MS = 45_000
@@ -319,6 +321,35 @@ def _serialized_model_response(payload: Any, *, etag: str) -> Response:
     )
     response.headers["ETag"] = etag
     return response
+
+
+def _workspace_response_etag(
+    workspace_response: TournamentWorkspaceResponse,
+    *,
+    workspace_view: str,
+    participants_limit: int,
+    participants_offset: int,
+    include_current_user: bool,
+    user_id: str,
+) -> str:
+    ready_check = workspace_response.ready_check
+    ready_round_id = None
+    if ready_check is not None:
+        active_round = ready_check.active_round or ready_check.latest_round
+        ready_round_id = active_round.id if active_round is not None else None
+    return _representation_etag(
+        "workspace",
+        workspace_response.tournament.id,
+        workspace_response.tournament.state_version,
+        workspace_view,
+        participants_limit,
+        participants_offset,
+        include_current_user,
+        user_id,
+        workspace_response.bracket.revision if workspace_response.bracket is not None else None,
+        ready_check.state_version if ready_check is not None else None,
+        ready_round_id,
+    )
 
 
 def _etag_weak_value(value: str) -> str:
@@ -451,6 +482,14 @@ class ParticipantPageCacheEntry:
     has_more: bool
 
 
+@dataclass(frozen=True, slots=True)
+class PublicWorkspaceSnapshotCacheEntry:
+    expires_at: float
+    tournament_id: str
+    tournament_updated_at: datetime | None
+    response: TournamentWorkspaceResponse
+
+
 
 
 
@@ -467,6 +506,7 @@ _participant_page_cache: dict[
     tuple[str, str, int, int],
     ParticipantPageCacheEntry,
 ] = {}
+_public_workspace_snapshot_cache: dict[str, PublicWorkspaceSnapshotCacheEntry] = {}
 
 
 def _prune_expired_cache_entries(cache: dict[Any, Any], *, now: float) -> None:
@@ -581,6 +621,40 @@ def _set_participant_page_cache(
     )
 
 
+def _get_public_workspace_snapshot_cache(
+    slug: str,
+) -> PublicWorkspaceSnapshotCacheEntry | None:
+    now = time.monotonic()
+    entry = _public_workspace_snapshot_cache.get(slug)
+    if entry is None:
+        return None
+    if entry.expires_at <= now:
+        _public_workspace_snapshot_cache.pop(slug, None)
+        return None
+    return entry
+
+
+def _set_public_workspace_snapshot_cache(
+    slug: str,
+    *,
+    tournament_id: str,
+    tournament_updated_at: datetime | None,
+    response: TournamentWorkspaceResponse,
+) -> None:
+    now = time.monotonic()
+    _trim_cache(
+        _public_workspace_snapshot_cache,
+        max_entries=PUBLIC_WORKSPACE_SNAPSHOT_CACHE_MAX_ENTRIES,
+        now=now,
+    )
+    _public_workspace_snapshot_cache[slug] = PublicWorkspaceSnapshotCacheEntry(
+        expires_at=now + PUBLIC_WORKSPACE_SNAPSHOT_CACHE_TTL_SECONDS,
+        tournament_id=tournament_id,
+        tournament_updated_at=tournament_updated_at,
+        response=response,
+    )
+
+
 def _invalidate_participant_page_cache(tournament_id: str) -> None:
     keys = [
         key
@@ -603,11 +677,21 @@ def _invalidate_ready_check_state_cache(tournament_id: str) -> None:
 
 
 def invalidate_tournament_runtime_caches(tournament_id: str) -> None:
-    bracket_keys = [key for key in _bracket_response_cache if key[0] == tournament_id]
+    normalized_tournament_id = str(tournament_id)
+    bracket_keys = [
+        key for key in _bracket_response_cache if key[0] == normalized_tournament_id
+    ]
     for key in bracket_keys:
         _bracket_response_cache.pop(key, None)
     _invalidate_participant_page_cache(tournament_id)
     _invalidate_ready_check_state_cache(tournament_id)
+    snapshot_keys = [
+        slug
+        for slug, entry in _public_workspace_snapshot_cache.items()
+        if entry.tournament_id == normalized_tournament_id
+    ]
+    for slug in snapshot_keys:
+        _public_workspace_snapshot_cache.pop(slug, None)
 
 
 register_tournament_runtime_cache_invalidator(invalidate_tournament_runtime_caches)
@@ -3321,6 +3405,7 @@ async def update_tournament_status(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     tournament = transition.tournament
     await db_session.commit()
+    invalidate_tournament_runtime_caches(tournament.id)
     await db_session.refresh(tournament)
     cover_media, organizer_avatar_media = await tournament_media_descriptors(
         db_session,
@@ -3451,7 +3536,7 @@ async def organizer_add_participant(
         },
     )
     await db_session.commit()
-    _invalidate_participant_page_cache(tournament.id)
+    invalidate_tournament_runtime_caches(tournament.id)
     await db_session.refresh(participant)
     return serialize_participant(participant, target_user.display_name)
 
@@ -6028,7 +6113,7 @@ async def join_tournament(
         ) from exc
     bind_mutation_idempotency_resource(idempotency, participant.id)
     await db_session.commit()
-    _invalidate_participant_page_cache(tournament.id)
+    invalidate_tournament_runtime_caches(tournament.id)
     return serialize_participant(participant, auth_session.user.display_name)
 
 
@@ -6307,6 +6392,72 @@ async def get_tournament_workspace(
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentWorkspaceResponse | Response:
+    public_snapshot_candidate = bool(
+        workspace_view == "detail"
+        and participants_limit == 0
+        and participants_offset == 0
+        and not include_current_user
+    )
+    if public_snapshot_candidate:
+        snapshot = _get_public_workspace_snapshot_cache(slug)
+        if snapshot is not None:
+            current_tournament = await db_session.scalar(
+                select(Tournament).where(Tournament.slug == slug)
+            )
+            if current_tournament is not None:
+                ensure_tournament_summary_visible(current_tournament, auth_session)
+                if (
+                    str(current_tournament.id) == snapshot.tournament_id
+                    and current_tournament.visibility == "public"
+                    and current_tournament.status == "registration_open"
+                    and current_tournament.updated_at == snapshot.tournament_updated_at
+                ):
+                    participant_record: TournamentParticipant | None = None
+                    invite_access: TournamentInviteAccess | None = None
+                    active_commitment: PlayerTournamentCommitmentResponse | None = None
+                    if auth_session is not None:
+                        participant_record, invite_access, active_commitment = await workspace_access_for_user(
+                            db_session,
+                            tournament_id=current_tournament.id,
+                            user_id=auth_session.user.id,
+                        )
+                    current_user_is_organizer = bool(
+                        auth_session is not None
+                        and current_tournament.organizer_user_id == auth_session.user.id
+                    )
+                    if (
+                        participant_record is None
+                        and not current_user_is_organizer
+                        and not auth_session_has_admin_role(auth_session)
+                    ):
+                        workspace_response = snapshot.response.model_copy(
+                            update={
+                                "tournament": snapshot.response.tournament.model_copy(
+                                    update={
+                                        "current_user_has_invite_access": invite_access is not None,
+                                    }
+                                ),
+                                "current_user_active_commitment": active_commitment,
+                            }
+                        )
+                        etag = _workspace_response_etag(
+                            workspace_response,
+                            workspace_view=workspace_view,
+                            participants_limit=participants_limit,
+                            participants_offset=participants_offset,
+                            include_current_user=include_current_user,
+                            user_id=(
+                                auth_session.user.id
+                                if auth_session is not None
+                                else "anonymous"
+                            ),
+                        )
+                        not_modified = _conditional_response(request, response, etag=etag)
+                        return not_modified or _serialized_model_response(
+                            workspace_response,
+                            etag=etag,
+                        )
+
     row = (
         await db_session.execute(
             tournament_with_counts_stmt().where(Tournament.slug == slug)
@@ -6388,15 +6539,13 @@ async def get_tournament_workspace(
             next_poll_after_ms=tournament_summary_poll_delay_ms(tournament),
             state_version=tournament_response.state_version,
         )
-        etag = _representation_etag(
-            "workspace",
-            tournament.id,
-            tournament_response.state_version,
-            workspace_view,
-            participants_limit,
-            participants_offset,
-            include_current_user,
-            auth_session.user.id if auth_session is not None else "anonymous",
+        etag = _workspace_response_etag(
+            workspace_response,
+            workspace_view=workspace_view,
+            participants_limit=participants_limit,
+            participants_offset=participants_offset,
+            include_current_user=include_current_user,
+            user_id=auth_session.user.id if auth_session is not None else "anonymous",
         )
         not_modified = _conditional_response(request, response, etag=etag)
         return not_modified or _serialized_model_response(workspace_response, etag=etag)
@@ -6509,32 +6658,35 @@ async def get_tournament_workspace(
         ),
         state_version=tournament_response.state_version,
     )
-    etag = _representation_etag(
-        "workspace",
-        tournament.id,
-        tournament_response.state_version,
-        workspace_view,
-        participants_limit,
-        participants_offset,
-        include_current_user,
-        auth_session.user.id if auth_session is not None else "anonymous",
-        workspace_response.bracket.revision if workspace_response.bracket is not None else None,
-        (
-            workspace_response.ready_check.state_version
-            if workspace_response.ready_check is not None
-            else None
-        ),
-        (
-            workspace_response.ready_check.active_round.id
-            if workspace_response.ready_check is not None
-            and workspace_response.ready_check.active_round is not None
-            else (
-                workspace_response.ready_check.latest_round.id
-                if workspace_response.ready_check is not None
-                and workspace_response.ready_check.latest_round is not None
-                else None
-            )
-        ),
+    if (
+        public_snapshot_candidate
+        and tournament.visibility == "public"
+        and tournament.status == "registration_open"
+        and participant_record is None
+        and not current_user_is_organizer
+        and not auth_session_has_admin_role(auth_session)
+    ):
+        _set_public_workspace_snapshot_cache(
+            tournament.slug,
+            tournament_id=str(tournament.id),
+            tournament_updated_at=tournament.updated_at,
+            response=workspace_response.model_copy(
+                update={
+                    "tournament": tournament_response.model_copy(
+                        update={"current_user_has_invite_access": False}
+                    ),
+                    "current_user": None,
+                    "current_user_active_commitment": None,
+                }
+            ),
+        )
+    etag = _workspace_response_etag(
+        workspace_response,
+        workspace_view=workspace_view,
+        participants_limit=participants_limit,
+        participants_offset=participants_offset,
+        include_current_user=include_current_user,
+        user_id=auth_session.user.id if auth_session is not None else "anonymous",
     )
     not_modified = _conditional_response(request, response, etag=etag)
     return not_modified or _serialized_model_response(workspace_response, etag=etag)

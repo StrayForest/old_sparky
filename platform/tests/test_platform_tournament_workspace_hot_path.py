@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+from datetime import datetime, timezone
+import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from pydantic import BaseModel
+from starlette.requests import Request
+from starlette.responses import Response
 
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
 
 
 class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self) -> None:
+        tournament_routes._public_workspace_snapshot_cache.clear()
+
     def test_serialized_model_response_uses_json_payload_and_etag(self) -> None:
         class Payload(BaseModel):
             value: int
@@ -48,6 +55,83 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, "pending")
         self.assertEqual(response.teams, [])
         self.assertEqual(response.matches, [])
+
+    async def test_public_workspace_snapshot_serves_without_rebuilding_workspace(self) -> None:
+        created_at = datetime.now(timezone.utc)
+        tournament_response = tournament_routes.TournamentResponse(
+            id="tournament-1",
+            slug="public-cup",
+            name="Public Cup",
+            description=None,
+            visibility="public",
+            status="registration_open",
+            format_slug="solo",
+            organizer_user_id="organizer-1",
+            created_at=created_at,
+        )
+        snapshot_response = tournament_routes.TournamentWorkspaceResponse(
+            tournament=tournament_response,
+        )
+        tournament_routes._set_public_workspace_snapshot_cache(
+            "public-cup",
+            tournament_id="tournament-1",
+            tournament_updated_at=created_at,
+            response=snapshot_response,
+        )
+        current_tournament = SimpleNamespace(
+            id="tournament-1",
+            slug="public-cup",
+            visibility="public",
+            status="registration_open",
+            organizer_user_id="organizer-1",
+            updated_at=created_at,
+        )
+        db_session = AsyncMock()
+        db_session.scalar = AsyncMock(return_value=current_tournament)
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/tournaments/public-cup/workspace",
+                "headers": [],
+                "query_string": b"",
+                "scheme": "http",
+                "server": ("testserver", 80),
+                "client": ("testclient", 1),
+            }
+        )
+
+        response = await tournament_routes.get_tournament_workspace(
+            "public-cup",
+            request,
+            Response(),
+            participants_limit=0,
+            participants_offset=0,
+            workspace_view="detail",
+            include_current_user=False,
+            auth_session=None,
+            db_session=db_session,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body)["tournament"]["participant_count"], 0)
+        db_session.scalar.assert_awaited_once()
+        db_session.execute.assert_not_awaited()
+
+    def test_runtime_invalidation_removes_public_snapshot(self) -> None:
+        snapshot_response = tournament_routes.TournamentWorkspaceResponse.model_construct()
+        tournament_routes._set_public_workspace_snapshot_cache(
+            "public-cup",
+            tournament_id="tournament-1",
+            tournament_updated_at=None,
+            response=snapshot_response,
+        )
+
+        tournament_routes.invalidate_tournament_runtime_caches("tournament-1")
+
+        self.assertIsNone(
+            tournament_routes._get_public_workspace_snapshot_cache("public-cup")
+        )
 
 
 if __name__ == "__main__":
