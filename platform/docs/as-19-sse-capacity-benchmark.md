@@ -246,8 +246,7 @@ barrier/settle/hold profile. It has zero unexpected origin errors, full event
 delivery and PostgreSQL headroom, but is not a public capacity claim: the live
 Cloudflare contour fails around 3,500 concurrent streams. Public acceptance
 now requires fast application admission plus active-SSE/passive-polling
-fallback; origin-local success cannot promote a candidate by itself. See the
-[`CPU-isolation matrix`](as-19-sse-cpu-isolation-2026-08-26.md); public contour is authoritative and a load-generator or probe Redis failure is invalid.
+fallback; origin-local success cannot promote a candidate by itself. See the [`CPU-isolation matrix`](as-19-sse-cpu-isolation-2026-08-26.md); public contour is authoritative and a load-generator or probe Redis failure is invalid.
 ## Operator commands
 
 Run from the reviewed `dev` branch in a low-traffic window. Production public
