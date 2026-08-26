@@ -1855,7 +1855,7 @@ class ProductionQa:
         control_participant_state: str | None = None,
     ) -> None:
         timestamp = datetime.now(UTC).strftime("%y%m%d%H%M%S")
-        prefix = "preprod" if mode in {"scale", "browser-polling", "write-burst"} else "qa"
+        prefix = "preprod" if mode in {"scale", "browser-polling", "write-burst", "sse"} else "qa"
         self.marker = f"{prefix}{timestamp}{secrets.token_hex(2)}"
         self.origin = origin.rstrip("/")
         self.api_origin = f"{self.origin}/api/v1"
@@ -1985,7 +1985,7 @@ class ProductionQa:
             "request_origin": self.request_origin,
             "mode": mode,
             "report_path": str(report_path),
-            "requested_users": self.scale_users if mode in {"scale", "browser-polling", "write-burst"} else None,
+            "requested_users": self.scale_users if mode in {"scale", "browser-polling", "write-burst", "sse"} else None,
             "http_timeout_seconds": self.http_timeout,
             "profile_journey": self.profile_journey,
             "scenarios": self.scenarios,
@@ -2503,7 +2503,7 @@ class ProductionQa:
                     origin=self.origin,
                     requested_users=(
                         self.scale_users
-                        if self.mode in {"scale", "browser-polling", "write-burst"}
+                        if self.mode in {"scale", "browser-polling", "write-burst", "sse"}
                         else len(self.user_ids)
                     ),
                     report_path=str(self.report_path),

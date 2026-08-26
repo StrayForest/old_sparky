@@ -85,6 +85,14 @@ users and 20 tournaments, left zero fixture users/tournaments/sessions/audit
   opening stagger; F2 was selected by zero errors first, then p95/p99, CPU and
   pool wait rather than raw throughput.
 
+The current SSE harness follow-up isolates transport from fixture workflow
+latency. SSE and combined profiles use the requested synthetic-user count and
+one public tournament on a single Redis hot key; they do not run the full
+ready-check/assignment fixture first. Setup is bounded at 90 seconds. The
+full 20-tournament stateful fixture remains owned by the browser-polling
+profile, so a slow background workflow cannot be mistaken for SSE admission
+latency.
+
 AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact
 cleanup/recovery support. Public tests send no source-bucket bypass: Cloudflare,

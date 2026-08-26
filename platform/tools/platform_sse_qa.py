@@ -32,7 +32,6 @@ from python_packages.platform_infra.sse_connection_limit import (
 )
 from tools.platform_production_qa import (
     BROWSER_POLLING_TOURNAMENT_PLAN,
-    BROWSER_POLLING_SETUP_CONCURRENCY,
     ProductionQa,
     load_env_file,
     percentile,
@@ -43,6 +42,7 @@ DEFAULT_ORIGIN = "http://127.0.0.1"
 SSE_EVENT_TYPE = "qa_sse_probe"
 COMBINED_TIMEOUT_GRACE_SECONDS = 15.0
 SSE_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
+SSE_FIXTURE_TIMEOUT_SECONDS = 90.0
 
 
 async def _close_sse_stream_context(stream_context: Any | None) -> None:
@@ -234,6 +234,16 @@ async def prepare_fixture(
     qa: ProductionQa,
     api_client: httpx.AsyncClient,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[list[dict[str, Any]]]]:
+    """Build the smallest valid hot-key fixture for SSE admission tests.
+
+    The browser-polling profile deliberately builds several tournament states,
+    including background assignment workflows.  That is useful for polling
+    coverage but makes it a poor prerequisite for an SSE capacity test: a
+    delayed worker would be measured as SSE connect latency.  SSE authorization
+    only needs a public tournament and authenticated sessions, so keep this
+    fixture focused on the single Redis/channel hot key that the test measures.
+    """
+
     with qa.phase("sse_seed_users"):
         users = await qa.bulk_register_scale_users()
     qa.scenario(
@@ -242,76 +252,35 @@ async def prepare_fixture(
         {"users": len(users), "requested": qa.scale_users},
     )
 
-    tournament_count = sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN)
-    chunk_size = qa.browser_polling_users_per_tournament
-    user_chunks = [
-        users[index * chunk_size : (index + 1) * chunk_size]
-        for index in range(tournament_count)
-    ]
-    organizers = [chunk[0] for chunk in user_chunks if chunk]
-    admins = [chunk[1] for chunk in user_chunks if len(chunk) > 1]
-    await qa.grant_browser_polling_permissions(organizers, admins)
+    if not users:
+        raise RuntimeError("SSE fixture requires at least one synthetic user")
+    organizer = users[0]
+    await qa.grant_browser_polling_permissions([organizer], [])
 
-    tournament_categories = [
-        category
-        for category, count in BROWSER_POLLING_TOURNAMENT_PLAN
-        for _ in range(count)
-    ]
     tournaments: list[dict[str, Any]] = []
     with qa.phase("sse_tournament_setup"):
-        for index, (category, chunk) in enumerate(
-            zip(tournament_categories, user_chunks),
-            start=1,
-        ):
-            tournaments.append(
-                await qa.create_browser_polling_tournament(
-                    api_client,
-                    organizer=chunk[0],
-                    category=category,
-                    index=index,
-                )
+        tournaments.append(
+            await qa.create_browser_polling_tournament(
+                api_client,
+                organizer=organizer,
+                category="registration_open",
+                index=1,
             )
-        await qa.record_preprod_run(tournaments_created=len(tournaments))
+        )
+        await qa.record_preprod_run(tournaments_created=1)
     qa.scenario(
         "sse_tournaments_created",
-        len(tournaments) == tournament_count,
-        {"tournaments": len(tournaments), "plan": dict(BROWSER_POLLING_TOURNAMENT_PLAN)},
+        len(tournaments) == 1,
+        {"tournaments": len(tournaments), "fixture": "hot-public-single-tournament"},
     )
-
-    active_participants = 0
-    with qa.phase("sse_tournament_state_setup"):
-        setup_gate = asyncio.Semaphore(BROWSER_POLLING_SETUP_CONCURRENCY)
-        request_gate = asyncio.Semaphore(qa.concurrency)
-
-        async def setup_one(
-            tournament: dict[str, Any],
-            chunk: list[dict[str, Any]],
-        ) -> None:
-            organizer_count = max(1, round(len(chunk) * 0.05))
-            participant_count = qa.browser_polling_state_participant_count(chunk)
-            participants = chunk[organizer_count : organizer_count + participant_count]
-            async with setup_gate:
-                await qa.setup_browser_polling_tournament_state(
-                    api_client,
-                    tournament=tournament,
-                    organizer=chunk[0],
-                    participants=participants,
-                    request_semaphore=request_gate,
-                )
-
-        active_participants = sum(
-            qa.browser_polling_state_participant_count(chunk)
-            for tournament, chunk in zip(tournaments, user_chunks)
-            if tournament["category"] != "terminal"
-        )
-        await asyncio.gather(
-            *(
-                setup_one(tournament, chunk)
-                for tournament, chunk in zip(tournaments, user_chunks)
-            )
-        )
-    await qa.record_preprod_run(active_participants=active_participants)
-    return users, tournaments, user_chunks
+    qa.report["sse_fixture"] = {
+        "profile": "hot-public-single-tournament",
+        "background_workflows": False,
+        "users": len(users),
+        "tournaments": len(tournaments),
+    }
+    qa.report["planned_tournaments"] = 1
+    return users, tournaments, [users]
 
 
 async def publish_probe_events(
@@ -664,6 +633,11 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         env_file = Path(configured_env) if configured_env else PLATFORM_ROOT / ".env.platform"
     load_env_file(env_file)
 
+    combined_users = sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN) * args.users_per_tournament
+    requested_users = max(
+        args.sse_connections,
+        combined_users if args.mode == "combined" else 14,
+    )
     qa = ProductionQa(
         origin=args.origin,
         request_origin=args.request_origin,
@@ -672,7 +646,8 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         browser_gate_dir=None,
         browser_gate_timeout=120.0,
         http_timeout=args.http_timeout,
-        mode="browser-polling",
+        mode="sse",
+        scale_users=requested_users,
         concurrency=args.concurrency,
         http_max_connections=args.http_max_connections,
         collect_performance=True,
@@ -691,7 +666,17 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     try:
         await qa.record_preprod_run(status="running", requested_users=qa.scale_users)
         await qa.start_performance_collection()
-        users, tournaments, user_chunks = await prepare_fixture(qa, api_client)
+        try:
+            users, tournaments, user_chunks = await asyncio.wait_for(
+                prepare_fixture(qa, api_client),
+                timeout=SSE_FIXTURE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            qa.report["sse_fixture_timeout_seconds"] = SSE_FIXTURE_TIMEOUT_SECONDS
+            raise RuntimeError(
+                "SSE fixture setup exceeded its bounded budget of "
+                f"{SSE_FIXTURE_TIMEOUT_SECONDS:.1f}s"
+            ) from exc
         if args.mode == "sse":
             with qa.phase("sse_only_run"):
                 sse_report = await run_connections(
@@ -902,7 +887,10 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
         "planned_users": report.get("requested_users"),
         "tournament_ids": report.get("tournament_ids", []),
         "completed_tournaments": len(report.get("tournament_ids", [])),
-        "planned_tournaments": sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN),
+        "planned_tournaments": report.get(
+            "planned_tournaments",
+            sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN),
+        ),
         "sse": {
             "target_connections": sse.get("target_connections"),
             "connected": metrics.get("connected"),

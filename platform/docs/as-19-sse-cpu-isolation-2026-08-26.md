@@ -264,3 +264,12 @@ closes SSE tasks and clients on cancellation, and bounds combined execution to
 previous parameters). A timeout is recorded as a diagnostic FAIL and still
 emits the exact cleanup manifest; it cannot occupy the VPS for the 180-minute
 supervisor limit. The focused SSE QA/unittest and shell syntax checks pass.
+
+The next harness candidate removes a separate measurement contaminant exposed
+by the canceled combined run. SSE/combined fixture setup now creates only the
+requested number of synthetic users and one public tournament on the single
+Redis hot key; it does not run the browser profile's ready-check or assignment
+workflow first. A 90-second fixture budget fails fast and leaves the durable
+marker for exact cleanup. The full 20-tournament stateful fixture remains in
+the browser-polling profile, where those workflow transitions are part of the
+test rather than an SSE prerequisite.
