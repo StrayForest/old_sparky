@@ -39,7 +39,7 @@ EXPECTED_CSP_POLICY_TEMPLATE = (
     "https://assets-bucket.deadlock-api.com https://i2.ytimg.com https://i3.ytimg.com; "
     "connect-src 'self'; "
     "frame-src https://challenges.cloudflare.com; font-src 'self'; manifest-src 'self'; "
-    "media-src 'none'; worker-src 'none'; report-uri /api/v1/security/csp-report; "
+    "media-src 'none'; worker-src 'self'; report-uri /api/v1/security/csp-report; "
     "report-to csp-endpoint"
 )
 EXPECTED_REPORTING_ENDPOINTS = 'csp-endpoint="/api/v1/security/csp-report"'
