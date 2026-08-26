@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from python_packages.platform_infra.db import (
     SseStreamDbAdmissionUnavailable,
     get_db_session,
+    get_stream_db_session,
     stream_db_session,
 )
 from python_packages.platform_infra.models import (

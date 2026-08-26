@@ -232,7 +232,10 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
             "add_user_scope",
             new_callable=AsyncMock,
         ) as add_user_scope:
-            await sse.admit_sse_authenticated_user(scope=Request(scope), auth_session=auth_session)
+            await sse.admit_sse_authenticated_user(
+                request=Request(scope),
+                auth_session=auth_session,
+            )
 
         add_user_scope.assert_awaited_once_with("user-1")
 
