@@ -120,20 +120,20 @@ opened without a shared request gate. Abort `32974261688` and cleanup
 combined polling requests by the configured concurrency and cancels/drains
 both workload tasks on timeout before the next mixed acceptance run.
 
-The first bounded mixed rerun `32975890344` completed its diagnostic budget
-instead of hanging, but correctly failed because the 10,000-tab polling phase
-did not finish within 85 seconds. It is still useful bottleneck evidence:
-`deadlock-api` averaged 104.1% CPU (peak 152.8%), workspace origin p95 was
-879.9ms and p99 2.09s, PostgreSQL averaged 17.3%, Redis 0.3%, and no lock or
-backend-wait contention was observed. The load generator was no longer the
-dominant process. Exact cleanup `32976226545` removed 10,000 users and one
-tournament and preserved the control account.
+The bounded mixed rerun on baseline `c4bcf3c9` (`32975890344`) reached the
+VPS and stopped at its 85-second diagnostic budget with an explicit FAIL. It
+recorded `deadlock-api` at 104.1% average CPU (152.8% peak), workspace origin
+p95 879.9ms/p99 2.09s, PostgreSQL 17.3%, Redis 0.3%, and no lock or backend
+wait contention. Its exact cleanup `32976226545` removed 10,000 users and one
+tournament. The first single-tournament count-plan candidate (`99e465a3`,
+run `32978141716`, cleanup `32978444085`) did not win this contour: API CPU
+remained 104.0%, workspace server p95 was 1.09s and DB time rose slightly.
+It was reverted from the follow-up candidate.
 
-The next CPU follow-up uses a single-tournament count query for direct
-`/{slug}` and `/{slug}/workspace` reads. It avoids grouping participant counts
-for every tournament when the route already selects one slug, while collection
-list queries retain their grouped plan. This is an A/B candidate; it does not
-alter visibility, per-user access checks, ETags or SSE admission.
+The next candidate skips the published-assignment lookup only for
+`registration_open` detail workspaces. The domain guard makes assignment
+staging unavailable before `registration_closed`; all access checks,
+participant state, ETags, response fields and SSE admission remain unchanged.
 
 AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact
