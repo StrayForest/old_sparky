@@ -263,6 +263,8 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('SSE_FIXTURE_TIMEOUT_SECONDS = 90.0', sse_source)
         self.assertIn('mode="sse"', sse_source)
         self.assertIn('scale_users=requested_users', sse_source)
+        self.assertIn('"max_subscribers_reported"', sse_source)
+        self.assertIn('"publisher": sse.get("publisher")', sse_source)
         self.assertIn("all_attempts_done", sse_source)
         self.assertIn("sse_event_delivery_complete", sse_source)
         self.assertIn("expected_events", sse_source)

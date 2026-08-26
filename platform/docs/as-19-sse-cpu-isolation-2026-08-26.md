@@ -273,3 +273,9 @@ workflow first. A 90-second fixture budget fails fast and leaves the durable
 marker for exact cleanup. The full 20-tournament stateful fixture remains in
 the browser-polling profile, where those workflow transitions are part of the
 test rather than an SSE prerequisite.
+
+The next diagnostic revision also records Redis `PUBLISH` subscriber counts,
+stream disconnects, keepalives and bytes in the compact summary. This makes a
+mass fan-out failure distinguishable as a Redis/relay subscription miss, an
+edge-side stream close, or a client parser/lifecycle issue before any limit is
+raised.

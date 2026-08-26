@@ -93,6 +93,11 @@ full 20-tournament stateful fixture remains owned by the browser-polling
 profile, so a slow background workflow cannot be mistaken for SSE admission
 latency.
 
+The next diagnostic revision records Redis publisher subscriber counts and
+stream close/keepalive/byte counters in the compact artifact. This separates
+"Redis published to no relay", "origin relay received but edge closed", and
+"client parser missed the event" before changing production limits.
+
 AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact
 cleanup/recovery support. Public tests send no source-bucket bypass: Cloudflare,

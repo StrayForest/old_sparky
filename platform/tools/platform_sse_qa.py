@@ -288,11 +288,12 @@ async def publish_probe_events(
     *,
     count: int,
     interval_seconds: float,
-) -> None:
+) -> dict[str, Any]:
     if count <= 0 or not tournament_ids:
-        return
+        return {"published_events": 0, "subscriber_counts": []}
     settings = get_settings()
     client: Redis = from_url(settings.platform_redis_url, decode_responses=True)
+    subscriber_counts: list[int] = []
     try:
         for event_index in range(count):
             published_at_ms = int(time.time() * 1000)
@@ -304,16 +305,22 @@ async def publish_probe_events(
                 },
                 separators=(",", ":"),
             )
-            await asyncio.gather(
+            deliveries = await asyncio.gather(
                 *(
                     client.publish(bracket_channel(tournament_id), payload)
                     for tournament_id in tournament_ids
                 )
             )
+            subscriber_counts.append(sum(int(delivery) for delivery in deliveries))
             if event_index + 1 < count:
                 await asyncio.sleep(max(0.0, interval_seconds))
     finally:
         await client.aclose()
+    return {
+        "published_events": len(subscriber_counts),
+        "subscriber_counts": subscriber_counts,
+        "max_subscribers_reported": max(subscriber_counts, default=0),
+    }
 
 
 async def consume_sse_connection(
@@ -567,7 +574,7 @@ async def run_connections(
         )
         for user, tournament in connections
     ]
-    publisher: asyncio.Task[None] | None = None
+    publisher: asyncio.Task[dict[str, Any]] | None = None
     try:
         await all_attempts_done.wait()
         await asyncio.sleep(min(2.0, max(0.1, duration_seconds / 4)))
@@ -579,7 +586,7 @@ async def run_connections(
             )
         )
         await asyncio.gather(*tasks)
-        await publisher
+        publisher_report = await publisher
         return {
             "profile": "sse-only",
             "target_connections": connection_count,
@@ -590,6 +597,7 @@ async def run_connections(
             "probe_event_count": event_count,
             "probe_event_interval_seconds": event_interval,
             "expected_events": metrics.counters["initial_connected"] * max(0, event_count),
+            "publisher": publisher_report,
             "application_global_admission_limit": SSE_GLOBAL_LIMIT,
             "load_generator_resources": load_generator_resource_limits(),
             "metrics": metrics.summary(),
@@ -895,13 +903,20 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
             "target_connections": sse.get("target_connections"),
             "connected": metrics.get("connected"),
             "max_active_connections": metrics.get("max_active_connections"),
+            "completed": metrics.get("completed"),
+            "disconnects": metrics.get("disconnects"),
             "rejected_429": metrics.get("rejected_429"),
             "rejected_503": metrics.get("rejected_503"),
             "rejected_other": metrics.get("rejected_other"),
+            "open_timeouts": metrics.get("open_timeouts"),
+            "fallback_polling_eligible": metrics.get("fallback_polling_eligible"),
             "errors": metrics.get("errors"),
+            "keepalives": metrics.get("keepalives"),
+            "bytes_received": metrics.get("bytes_received"),
             "error_samples": metrics.get("error_samples", []),
             "events": metrics.get("events"),
             "expected_events": sse.get("expected_events"),
+            "publisher": sse.get("publisher"),
             "reconnects": metrics.get("reconnects"),
             "response_statuses": metrics.get("response_statuses", {}),
             "response_error_samples": metrics.get("response_error_samples", []),
