@@ -150,8 +150,12 @@ diagnostic budget with workspace p50/p95/p99 `383/996/2,070ms`, API CPU
 lock/backend-wait contention. It did not beat H2 and is not the selected
 winner. The next local H4 adds a 128-entry/2-second public registration-open
 workspace snapshot for the lean detail polling contract, with fresh
-permission checks and mutation invalidation; it is not yet deployed or
-counted as a production result.
+permission checks and mutation invalidation. H4 is deployed from
+`706dd0ab` after security/build `32982759177`, automatic deploy `32983323484`
+and production deploy/live smoke `32983333250`; it is not yet counted as a
+production performance result because the public mixed A/B
+`32985062916` is still waiting for a GitHub Actions runner and has not reached
+the VPS. No retained-load fixture was created by that queued run.
 
 AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact
