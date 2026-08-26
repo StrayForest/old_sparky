@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from starlette.requests import Request
+
 from apps.platform_api.app.api.routes import tournaments
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.tournament_participant_policy import (
@@ -18,6 +20,10 @@ from apps.platform_api.app.services.tournament_write_serialization import (
     serialize_tournament_write_invariants,
 )
 from python_packages.platform_infra.db import get_db_session
+from python_packages.platform_infra.sse_connection_limit import (
+    SSE_CONNECTION_LEASE_SCOPE,
+    SseConnectionLease,
+)
 
 
 class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
@@ -135,7 +141,23 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
                 return_value=empty_stream(),
             ),
         ):
-            response = await tournaments.get_tournament_bracket_events("test-tournament")
+            request_scope = {
+                "type": "http",
+                "method": "GET",
+                "path": "/api/v1/tournaments/test-tournament/bracket/events",
+                "headers": [],
+                "client": ("127.0.0.1", 1000),
+            }
+            request_scope[SSE_CONNECTION_LEASE_SCOPE] = SseConnectionLease(
+                member="test-member",
+                settings=tournaments.get_settings(),
+            )
+            response = await tournaments.get_tournament_bracket_events(
+                "test-tournament",
+                Request(request_scope),
+            )
+
+        self.assertIsNotNone(response)
 
         self.assertEqual(response.media_type, "text/event-stream")
 

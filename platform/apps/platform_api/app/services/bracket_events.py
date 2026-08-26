@@ -18,7 +18,8 @@ from python_packages.platform_infra.sse_connection_limit import (
     SSE_KEEPALIVE_SECONDS,
     SSE_RECONNECT_JITTER_MS,
     SSE_RECONNECT_MIN_MS,
-    SSE_STREAM_MAX_LIFETIME_SECONDS,
+    SseConnectionLease,
+    SseConnectionLeaseRenewalFailed,
 )
 
 logger = logging.getLogger(__name__)
@@ -240,6 +241,7 @@ async def stream_bracket_events(
     tournament_id: str,
     *,
     admission_verified: bool = False,
+    connection_lease: SseConnectionLease | None = None,
 ) -> AsyncIterator[str]:
     """Stream bracket events after endpoint admission and on every checkpoint.
 
@@ -258,25 +260,33 @@ async def stream_bracket_events(
     relay, event_queue = await _subscribe_to_bracket_relay(channel)
     started_at = monotonic()
     last_access_check_at = started_at
+    last_lease_renewal_at = started_at
     retry_ms = SSE_RECONNECT_MIN_MS + secrets.randbelow(SSE_RECONNECT_JITTER_MS + 1)
     try:
         yield f"retry: {retry_ms}\nevent: connected\ndata: {{}}\n\n"
         while True:
-            remaining_seconds = (
-                SSE_STREAM_MAX_LIFETIME_SECONDS - (monotonic() - started_at)
-            )
-            if remaining_seconds <= 0:
-                break
             try:
                 message = await asyncio.wait_for(
                     event_queue.get(),
-                    timeout=min(float(SSE_KEEPALIVE_SECONDS), remaining_seconds),
+                    timeout=float(SSE_KEEPALIVE_SECONDS),
                 )
             except TimeoutError:
                 message = None
             if message is _RELAY_CLOSED:
                 break
             now = monotonic()
+            if (
+                connection_lease is not None
+                and now - last_lease_renewal_at >= 15.0
+            ):
+                try:
+                    await connection_lease.renew()
+                except SseConnectionLeaseRenewalFailed:
+                    logger.error(
+                        "Closing SSE stream because its connection lease could not be renewed."
+                    )
+                    break
+                last_lease_renewal_at = now
             if message is not None or (
                 now - last_access_check_at >= SSE_ACCESS_REVALIDATION_SECONDS
             ):

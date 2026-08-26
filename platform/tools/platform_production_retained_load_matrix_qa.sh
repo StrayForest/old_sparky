@@ -34,8 +34,8 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# < 5 || $# > 18 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local] [ticket|legacy]]" >&2
+if (( $# < 5 || $# > 20 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-open-rate sse-capacity-limit sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local] [ticket|legacy]]" >&2
   exit 2
 fi
 
@@ -45,6 +45,19 @@ control_email="$3"
 concurrency="$4"
 run_id="$5"
 profile="${6:-matrix}"
+# Keep optional SSE controls initialized even when a release-side supervisor
+# receives an older positional invocation.  The script runs with nounset and
+# must still export a truthful summary rather than fail after the workload.
+sse_open_rate=0
+sse_capacity_limit=0
+sse_reconnect_cycles=0
+sse_users_per_tournament=500
+sse_event_count=3
+sse_event_interval=1
+combined_polling_duration=30
+combined_polling_open_stagger=300
+sse_origin_mode=public
+sse_admission_mode=ticket
 
 case "$profile" in
   matrix|browser-polling) ;;
@@ -53,14 +66,16 @@ case "$profile" in
     sse_duration="${8:-60}"
     sse_open_concurrency="${9:-256}"
     sse_open_timeout="${10:-5}"
-    sse_reconnect_cycles="${11:-0}"
-    sse_users_per_tournament="${12:-500}"
-    sse_event_count="${13:-3}"
-    sse_event_interval="${14:-1}"
-    combined_polling_duration="${15:-30}"
-    combined_polling_open_stagger="${16:-300}"
-    sse_origin_mode="${17:-public}"
-    sse_admission_mode="${18:-ticket}"
+    sse_open_rate="${11:-0}"
+    sse_capacity_limit="${12:-0}"
+    sse_reconnect_cycles="${13:-0}"
+    sse_users_per_tournament="${14:-500}"
+    sse_event_count="${15:-3}"
+    sse_event_interval="${16:-1}"
+    combined_polling_duration="${17:-30}"
+    combined_polling_open_stagger="${18:-300}"
+    sse_origin_mode="${19:-public}"
+    sse_admission_mode="${20:-ticket}"
     [[ "$sse_admission_mode" == "ticket" || "$sse_admission_mode" == "legacy" ]] || {
       echo "SSE admission mode must be ticket or legacy." >&2
       exit 1
@@ -73,16 +88,16 @@ case "$profile" in
       echo "origin-local is only supported for the SSE-only profile." >&2
       exit 1
     fi
-    [[ "$sse_connections" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_connections <= 10000 )) || {
-      echo "SSE connections must be an integer from 1 to 10000." >&2
+    [[ "$sse_connections" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_connections <= 30000 )) || {
+      echo "SSE connections must be an integer from 1 to 30000." >&2
       exit 1
     }
     [[ "$sse_duration" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_duration >= 1 && $sse_duration <= 600)}") == 1 )) || {
       echo "SSE duration must be between 1 and 600 seconds." >&2
       exit 1
     }
-    [[ "$sse_open_concurrency" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_open_concurrency <= 10000 )) || {
-      echo "SSE open concurrency must be an integer from 1 to 10000." >&2
+    [[ "$sse_open_concurrency" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_open_concurrency <= 30000 )) || {
+      echo "SSE open concurrency must be an integer from 1 to 30000." >&2
       exit 1
     }
     # Public 60s is a diagnostic ceiling only; the browser's own fallback
@@ -92,6 +107,20 @@ case "$profile" in
       echo "SSE open timeout must be between 0.5 and $sse_open_timeout_max seconds for this origin mode." >&2
       exit 1
     }
+    [[ "$sse_open_rate" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_open_rate >= 0 && $sse_open_rate <= 1000)}") == 1 )) || {
+      echo "SSE open rate must be between 0 and 1000 new SSE/sec." >&2
+      exit 1
+    }
+    [[ "$sse_capacity_limit" =~ ^[0-9]+$ ]] && (( sse_capacity_limit <= 30000 )) || {
+      echo "SSE capacity limit must be an integer from 0 to 30000." >&2
+      exit 1
+    }
+    if (( sse_capacity_limit > 3000 )) && {
+      [[ "$profile" != "sse" || "$sse_origin_mode" != "origin-local" || "$sse_admission_mode" != "ticket" ]]
+    }; then
+      echo "High SSE capacity mode requires the ticketed SSE-only loopback origin." >&2
+      exit 1
+    fi
     [[ "$sse_reconnect_cycles" =~ ^[0-9]{1,2}$ ]] && (( sse_reconnect_cycles <= 10 )) || {
       echo "SSE reconnect cycles must be an integer from 0 to 10." >&2
       exit 1
@@ -211,20 +240,86 @@ start_server_observer() {
   started_at="$(date --iso-8601=seconds)"
   (
     set +e
+    service_main_pid() {
+      systemctl show --property=MainPID --value "$1" 2>/dev/null
+    }
+
+    service_control_group() {
+      systemctl show --property=ControlGroup --value "$1" 2>/dev/null
+    }
+
+    print_process_resource() {
+      local label="$1"
+      local pid="$2"
+      [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+      [[ -d "/proc/$pid" ]] || return 0
+      local rss_kb fd_count vm_rss vm_peak threads
+      rss_kb="$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print $1}')"
+      fd_count="$(find "/proc/$pid/fd" -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l)"
+      vm_rss="$(awk '/^VmRSS:/ {print $2 " " $3}' "/proc/$pid/status" 2>/dev/null)"
+      vm_peak="$(awk '/^VmPeak:/ {print $2 " " $3}' "/proc/$pid/status" 2>/dev/null)"
+      threads="$(awk '/^Threads:/ {print $2}' "/proc/$pid/status" 2>/dev/null)"
+      echo "$label pid=$pid rss_kb=${rss_kb:-0} fd_count=${fd_count:-0} vm_rss=${vm_rss:-unknown} vm_peak=${vm_peak:-unknown} threads=${threads:-0}"
+      ps -p "$pid" -o pid=,ppid=,stat=,pcpu=,pmem=,rss=,etime=,comm=,args= 2>/dev/null || true
+    }
+
+    print_cgroup_resource() {
+      local unit="$1"
+      local group_path
+      group_path="$(service_control_group "$unit")"
+      [[ "$group_path" == /* ]] || return 0
+      echo "cgroup unit=$unit path=$group_path"
+      for metric in memory.current memory.max memory.peak memory.events pids.current pids.max; do
+        if [[ -r "/sys/fs/cgroup$group_path/$metric" ]]; then
+          echo "cgroup_metric unit=$unit metric=$metric value=$(tr '\n' ';' < "/sys/fs/cgroup$group_path/$metric")"
+        fi
+      done
+    }
+
     echo "observer_started_at=$started_at"
     echo "observer_target_pid=$target_pid"
     while kill -0 "$target_pid" 2>/dev/null; do
       echo "=== snapshot $(date --iso-8601=seconds) ==="
       echo "--- process ---"
       ps -eo pid=,ppid=,stat=,pcpu=,pmem=,rss=,comm=,args= --sort=-pcpu | head -n 32
+      echo "--- process resources ---"
+      print_process_resource "load_generator" "$target_pid"
+      api_pid="$(service_main_pid deadlock-api)"
+      worker_pid="$(service_main_pid deadlock-worker)"
+      nginx_pid="$(service_main_pid nginx)"
+      print_process_resource "deadlock_api_main" "$api_pid"
+      print_process_resource "deadlock_worker_main" "$worker_pid"
+      print_process_resource "nginx_main" "$nginx_pid"
+      for child_pid in $(pgrep -P "$api_pid" 2>/dev/null); do
+        print_process_resource "deadlock_api_child" "$child_pid"
+      done
+      for child_pid in $(pgrep -P "$nginx_pid" 2>/dev/null); do
+        print_process_resource "nginx_child" "$child_pid"
+      done
+      print_cgroup_resource deadlock-api
+      print_cgroup_resource deadlock-worker
+      print_cgroup_resource nginx
       echo "--- sockets ---"
+      ss -s 2>&1 || true
       ss -Htan 2>/dev/null | awk '{print $1, $4, $5}' | sort | uniq -c | sort -nr | head -n 80
+      echo "--- listening queues ---"
+      ss -ltn 2>&1 || true
+      echo "--- kernel socket counters ---"
+      for kernel_stat in /proc/net/sockstat /proc/net/sockstat6 /proc/net/netstat /proc/net/snmp; do
+        if [[ -r "$kernel_stat" ]]; then
+          echo "kernel_stat=$kernel_stat"
+          cat "$kernel_stat"
+        fi
+      done
       echo "--- redis ---"
-      redis-cli -h 127.0.0.1 -p 6379 info clients 2>&1 | grep -E '^(connected_clients|blocked_clients|tracking_clients|rejected_connections):' || true
-      redis-cli -h 127.0.0.1 -p 6379 info stats 2>&1 | grep -E '^(total_connections_received|rejected_connections|instantaneous_ops_per_sec):' || true
+      redis-cli -h 127.0.0.1 -p 6379 info memory clients stats commandstats 2>&1 | grep -E '^(used_memory_human|maxmemory_human|used_memory_peak_human|mem_fragmentation_ratio|connected_clients|blocked_clients|tracking_clients|rejected_connections|total_connections_received|instantaneous_ops_per_sec|latest_fork_usec|cmdstat_|latency_percentiles_usec)' || true
+      redis-cli -h 127.0.0.1 -p 6379 info latency 2>&1 | head -n 80 || true
       echo "--- postgres activity ---"
       timeout 5s sudo -n -u postgres psql -X -qAt -d platformdb -F '|' -c \
         "SELECT pid,state,COALESCE(wait_event_type,''),COALESCE(wait_event,''),round(EXTRACT(EPOCH FROM now()-query_start)*1000,1),left(regexp_replace(query,E'\\s+',' ','g'),240) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND state<>'idle' ORDER BY query_start NULLS LAST LIMIT 16" \
+        2>&1 || true
+      timeout 5s sudo -n -u postgres psql -X -qAt -d platformdb -F '|' -c \
+        "SELECT state,COALESCE(wait_event_type,''),COALESCE(wait_event,''),count(*) FROM pg_stat_activity WHERE datname=current_database() GROUP BY state,wait_event_type,wait_event ORDER BY count(*) DESC" \
         2>&1 || true
       sleep 5
     done
@@ -359,7 +454,7 @@ else
   nofile_soft="$(ulimit -Sn)"
   nofile_hard="$(ulimit -Hn)"
   if [[ "$nofile_soft" =~ ^[0-9]+$ ]]; then
-    nofile_target=32768
+    nofile_target=65535
     if [[ "$nofile_hard" =~ ^[0-9]+$ ]] && (( nofile_hard < nofile_target )); then
       nofile_target="$nofile_hard"
     fi
@@ -400,6 +495,8 @@ else
     --sse-duration "$sse_duration" \
     --sse-open-concurrency "$sse_open_concurrency" \
     --sse-open-timeout "$sse_open_timeout" \
+    --sse-open-rate "$sse_open_rate" \
+    --sse-capacity-limit "$sse_capacity_limit" \
     --sse-reconnect-cycles "$sse_reconnect_cycles" \
     --sse-event-count "$sse_event_count" \
     --sse-event-interval "$sse_event_interval" \

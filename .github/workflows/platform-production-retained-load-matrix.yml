@@ -28,7 +28,7 @@ on:
           - sse
           - combined
       sse_connections:
-        description: "SSE connection attempts (1-10000; admission and fallback are measured separately)"
+        description: "SSE connection attempts (1-30000; admission and fallback are measured separately)"
         required: true
         default: "128"
         type: string
@@ -38,7 +38,7 @@ on:
         default: "60"
         type: string
       sse_open_concurrency:
-        description: "Concurrent SSE opens (1-10000)"
+        description: "Concurrent SSE opens (1-30000)"
         required: true
         default: "256"
         type: string
@@ -46,6 +46,16 @@ on:
         description: "Diagnostic SSE handshake timeout (public/origin-local 0.5-60s; browser fallback policy is unchanged)"
         required: true
         default: "5"
+        type: string
+      sse_open_rate:
+        description: "Gradual-fill opening rate in new SSE/sec (0 = burst; 1-1000 = paced)"
+        required: true
+        default: "0"
+        type: string
+      sse_capacity_limit:
+        description: "QA-only signed global SSE cap (0 = production cap; max 30000; high cap requires origin-local)"
+        required: true
+        default: "0"
         type: string
       sse_reconnect_cycles:
         description: "Forced reconnect cycles per SSE client (0-10)"
@@ -121,6 +131,8 @@ jobs:
       QA_SSE_DURATION: ${{ inputs.sse_duration }}
       QA_SSE_OPEN_CONCURRENCY: ${{ inputs.sse_open_concurrency }}
       QA_SSE_OPEN_TIMEOUT: ${{ inputs.sse_open_timeout }}
+      QA_SSE_OPEN_RATE: ${{ inputs.sse_open_rate }}
+      QA_SSE_CAPACITY_LIMIT: ${{ inputs.sse_capacity_limit }}
       QA_SSE_RECONNECT_CYCLES: ${{ inputs.sse_reconnect_cycles }}
       QA_SSE_USERS_PER_TOURNAMENT: ${{ inputs.sse_users_per_tournament }}
       QA_SSE_EVENT_COUNT: ${{ inputs.sse_event_count }}
@@ -149,7 +161,8 @@ jobs:
           /usr/bin/python3 - \
             "$CONTROL_EMAIL" "$QA_CONCURRENCY" "$QA_PROFILE" \
             "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" \
-            "$QA_SSE_OPEN_TIMEOUT" "$QA_SSE_RECONNECT_CYCLES" "$QA_SSE_USERS_PER_TOURNAMENT" \
+            "$QA_SSE_OPEN_TIMEOUT" "$QA_SSE_OPEN_RATE" "$QA_SSE_CAPACITY_LIMIT" \
+            "$QA_SSE_RECONNECT_CYCLES" "$QA_SSE_USERS_PER_TOURNAMENT" \
             "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
             "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" \
             "$QA_SSE_ORIGIN_MODE" "$QA_SSE_ADMISSION_MODE" <<'PY'
@@ -164,6 +177,8 @@ jobs:
               sse_duration,
               sse_open_concurrency,
               sse_open_timeout,
+              sse_open_rate,
+              sse_capacity_limit,
               sse_reconnect_cycles,
               sse_users_per_tournament,
               sse_event_count,
@@ -185,8 +200,8 @@ jobs:
               raise SystemExit("origin-local is only supported for the SSE profile")
           if profile in {"sse", "combined"}:
               integer_ranges = {
-                  "sse_connections": (sse_connections, 1, 10000),
-                  "sse_open_concurrency": (sse_open_concurrency, 1, 10000),
+                  "sse_connections": (sse_connections, 1, 30000),
+                  "sse_open_concurrency": (sse_open_concurrency, 1, 30000),
                   "sse_reconnect_cycles": (sse_reconnect_cycles, 0, 10),
                   "sse_users_per_tournament": (sse_users_per_tournament, 10, 500),
                   "sse_event_count": (sse_event_count, 0, 100),
@@ -194,12 +209,17 @@ jobs:
               for name, (value, lower, upper) in integer_ranges.items():
                   if not re.fullmatch(r"[0-9]+", value) or not lower <= int(value) <= upper:
                       raise SystemExit(f"{name} must be between {lower} and {upper}")
+              if not re.fullmatch(r"[0-9]+", sse_capacity_limit) or not 0 <= int(sse_capacity_limit) <= 30000:
+                  raise SystemExit("sse_capacity_limit must be between 0 and 30000")
+              if int(sse_capacity_limit) > 3000 and (profile != "sse" or sse_origin_mode != "origin-local" or sse_admission_mode != "ticket"):
+                  raise SystemExit("high SSE capacity mode requires the ticketed SSE-only loopback origin")
               # This is a retained-load diagnostic ceiling only. The browser
               # fallback/cooldown policy is independent and remains unchanged.
               sse_open_timeout_max = 60
               decimal_ranges = {
                   "sse_duration": (sse_duration, 1, 600),
                   "sse_open_timeout": (sse_open_timeout, 0.5, sse_open_timeout_max),
+                  "sse_open_rate": (sse_open_rate, 0, 1000),
                   "sse_event_interval": (sse_event_interval, 0, 60),
                   "combined_polling_duration": (combined_polling_duration, 1, 300),
                   "combined_polling_open_stagger": (combined_polling_open_stagger, 0, 600),
@@ -259,7 +279,8 @@ jobs:
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
             bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$CONTROL_EMAIL" "$QA_CONCURRENCY" "$GITHUB_RUN_ID" "$QA_PROFILE" \
-              "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" "$QA_SSE_OPEN_TIMEOUT" "$QA_SSE_RECONNECT_CYCLES" \
+              "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" "$QA_SSE_OPEN_TIMEOUT" \
+              "$QA_SSE_OPEN_RATE" "$QA_SSE_CAPACITY_LIMIT" "$QA_SSE_RECONNECT_CYCLES" \
               "$QA_SSE_USERS_PER_TOURNAMENT" "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
               "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" "$QA_SSE_ORIGIN_MODE" \
               "$QA_SSE_ADMISSION_MODE" \

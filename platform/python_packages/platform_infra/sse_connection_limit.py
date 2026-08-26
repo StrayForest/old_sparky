@@ -33,19 +33,25 @@ SSE_PATH_RE = re.compile(r"^/api/v1/tournaments/[^/]+/bracket/events$")
 # excess viewers receive an immediate, controlled 429 and can fall back to
 # revision polling instead of waiting in the edge queue.
 SSE_GLOBAL_LIMIT = 3_000
+SSE_QA_GLOBAL_LIMIT_MAX = 30_000
 SSE_SOURCE_LIMIT = 32
 SSE_USER_LIMIT = 4
-SSE_STREAM_MAX_LIFETIME_SECONDS = 600
 SSE_KEEPALIVE_SECONDS = 15
 SSE_RECONNECT_MIN_MS = 5_000
 SSE_RECONNECT_JITTER_MS = 7_000
 SSE_RETRY_AFTER_SECONDS = 15
-SSE_LEASE_GRACE_SECONDS = 60
+SSE_LEASE_SECONDS = 120
+SSE_LEASE_RENEW_INTERVAL_SECONDS = 30
 SSE_KEY_EXPIRY_GRACE_SECONDS = 60
-SSE_LEASE_SECONDS = SSE_STREAM_MAX_LIFETIME_SECONDS + SSE_LEASE_GRACE_SECONDS
 SSE_KEY_PREFIX = "platform:sse-limit:v1"
 SSE_LOAD_TEST_BYPASS_HEADER = "x-platform-qa-sse-bypass"
 SSE_LOAD_TEST_BYPASS_CONTEXT = b"platform-sse-load-test-v1"
+SSE_LOAD_TEST_CAPACITY_HEADER = "x-platform-qa-sse-capacity"
+SSE_LOAD_TEST_CAPACITY_CONTEXT = b"platform-sse-capacity-v1"
+# A paced 30,000-stream diagnostic at 25 opens/sec takes about 20 minutes.
+# Keep the proof short-lived while leaving enough time for the deliberately
+# bounded QA window to finish opening; it is never used by browser clients.
+SSE_LOAD_TEST_CAPACITY_TTL_SECONDS = 1_800
 # A burst of signed-ticket opens still performs one atomic global lease in
 # Redis. Keep this pool large enough to absorb the bounded 3,000-connection
 # application ceiling without turning pool checkout into a false 503, while
@@ -89,6 +95,23 @@ end
 return 0
 """
 
+_RENEW_SCRIPT = """
+local lease_expires_at = tonumber(ARGV[2])
+local key_expires_at = tonumber(ARGV[3])
+local member = ARGV[1]
+local renewed = 0
+
+for i = 1, #KEYS do
+  if redis.call('ZSCORE', KEYS[i], member) then
+    redis.call('ZADD', KEYS[i], lease_expires_at, member)
+    redis.call('EXPIREAT', KEYS[i], key_expires_at)
+    renewed = renewed + 1
+  end
+end
+
+return renewed
+"""
+
 
 class SseConnectionLimitError(RuntimeError):
     pass
@@ -101,6 +124,10 @@ class SseConnectionLimitExceeded(SseConnectionLimitError):
 
 
 class SseConnectionLimiterUnavailable(SseConnectionLimitError):
+    pass
+
+
+class SseConnectionLeaseRenewalFailed(SseConnectionLimitError):
     pass
 
 
@@ -120,12 +147,58 @@ def sse_load_test_bypass_token(settings: PlatformSettings) -> str:
     ).hexdigest()
 
 
+def _capacity_signature(settings: PlatformSettings, payload: str) -> str:
+    return hmac.new(
+        settings.platform_secret_key.encode("utf-8"),
+        b".".join((SSE_LOAD_TEST_CAPACITY_CONTEXT, payload.encode("ascii"))),
+        sha256,
+    ).hexdigest()
+
+
+def sse_load_test_capacity_token(
+    settings: PlatformSettings,
+    global_limit: int,
+    *,
+    now_epoch: int | None = None,
+) -> str:
+    """Issue a short-lived signed global-cap proof for an approved QA run."""
+
+    if not 1 <= global_limit <= SSE_QA_GLOBAL_LIMIT_MAX:
+        raise ValueError(
+            f"QA SSE global limit must be between 1 and {SSE_QA_GLOBAL_LIMIT_MAX}."
+        )
+    now = int(time.time()) if now_epoch is None else now_epoch
+    payload = f"{global_limit}:{now + SSE_LOAD_TEST_CAPACITY_TTL_SECONDS}"
+    return f"{payload}:{_capacity_signature(settings, payload)}"
+
+
 def _has_sse_load_test_bypass(scope: Scope, settings: PlatformSettings) -> bool:
     request = Request(scope)
     supplied = request.headers.get(SSE_LOAD_TEST_BYPASS_HEADER, "")
     if not supplied:
         return False
     return hmac.compare_digest(supplied, sse_load_test_bypass_token(settings))
+
+
+def _qa_global_limit(scope: Scope, settings: PlatformSettings) -> int | None:
+    request = Request(scope)
+    parts = request.headers.get(SSE_LOAD_TEST_CAPACITY_HEADER, "").split(":")
+    if len(parts) != 3:
+        return None
+    raw_limit, raw_expires_at, supplied_signature = parts
+    if not raw_limit.isdecimal() or not raw_expires_at.isdecimal():
+        return None
+    global_limit = int(raw_limit)
+    expires_at = int(raw_expires_at)
+    if not 1 <= global_limit <= SSE_QA_GLOBAL_LIMIT_MAX:
+        return None
+    now = int(time.time())
+    if expires_at <= now or expires_at > now + SSE_LOAD_TEST_CAPACITY_TTL_SECONDS:
+        return None
+    payload = f"{global_limit}:{expires_at}"
+    if not hmac.compare_digest(supplied_signature, _capacity_signature(settings, payload)):
+        return None
+    return global_limit
 
 
 def _global_key() -> str:
@@ -207,11 +280,46 @@ async def _release_keys(keys: list[str], *, member: str) -> None:
     await cache.eval(_RELEASE_SCRIPT, len(keys), *keys, member)
 
 
+async def _renew_keys(
+    keys: list[str],
+    *,
+    member: str,
+    lease_seconds: int,
+    now_epoch: int,
+) -> None:
+    if not keys:
+        return
+    lease_expires_at = now_epoch + lease_seconds
+    key_expires_at = lease_expires_at + SSE_KEY_EXPIRY_GRACE_SECONDS
+    cache = _limiter_client()
+    try:
+        renewed = int(
+            await cache.eval(
+                _RENEW_SCRIPT,
+                len(keys),
+                *keys,
+                member,
+                lease_expires_at,
+                key_expires_at,
+            )
+        )
+    except RedisError as exc:
+        raise SseConnectionLeaseRenewalFailed(
+            "SSE connection protection renewal is temporarily unavailable."
+        ) from exc
+    if renewed != len(keys):
+        raise SseConnectionLeaseRenewalFailed(
+            "SSE connection protection lease is no longer active."
+        )
+
+
 @dataclass(slots=True)
 class SseConnectionLease:
     member: str
     settings: PlatformSettings
     keys: list[str] = field(default_factory=list)
+    lease_seconds: int = SSE_LEASE_SECONDS
+    last_renewed_epoch: int = 0
     released: bool = False
 
     async def add_user_scope(
@@ -219,7 +327,7 @@ class SseConnectionLease:
         user_id: str,
         *,
         user_limit: int = SSE_USER_LIMIT,
-        lease_seconds: int = SSE_LEASE_SECONDS,
+        lease_seconds: int | None = None,
         now_epoch: int | None = None,
     ) -> None:
         if self.released:
@@ -233,10 +341,24 @@ class SseConnectionLease:
             [user_limit],
             ["user"],
             member=self.member,
-            lease_seconds=lease_seconds,
+            lease_seconds=self.lease_seconds if lease_seconds is None else lease_seconds,
             now_epoch=now,
         )
         self.keys.append(key)
+
+    async def renew(self, *, now_epoch: int | None = None) -> None:
+        if self.released or not self.keys:
+            return
+        now = int(time.time()) if now_epoch is None else now_epoch
+        if now - self.last_renewed_epoch < SSE_LEASE_RENEW_INTERVAL_SECONDS:
+            return
+        await _renew_keys(
+            self.keys,
+            member=self.member,
+            lease_seconds=self.lease_seconds,
+            now_epoch=now,
+        )
+        self.last_renewed_epoch = now
 
     async def release(self) -> None:
         if self.released:
@@ -285,6 +407,8 @@ async def reserve_sse_connection(
         member=member,
         settings=resolved_settings,
         keys=keys,
+        lease_seconds=lease_seconds,
+        last_renewed_epoch=now,
     )
 
 
@@ -322,11 +446,13 @@ class SseConnectionLimitMiddleware:
         source_address = _source_address(scope)
         source_fingerprint = _fingerprint(settings, f"source:{source_address}")
         bypass_source_limit = _has_sse_load_test_bypass(scope, settings)
+        global_limit = _qa_global_limit(scope, settings) or SSE_GLOBAL_LIMIT
         lease: SseConnectionLease | None = None
         try:
             lease = await reserve_sse_connection(
                 source_address,
                 settings=settings,
+                global_limit=global_limit,
                 bypass_source_limit=bypass_source_limit,
             )
         except SseConnectionLimitExceeded as exc:

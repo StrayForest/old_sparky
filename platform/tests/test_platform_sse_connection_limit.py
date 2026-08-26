@@ -153,6 +153,48 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await asyncio.gather(*(lease.release() for lease in leases))
 
+    def test_signed_qa_capacity_proof_is_bounded_and_tamper_evident(self) -> None:
+        now = 1_700_000_000
+        token = sse.sse_load_test_capacity_token(
+            self.settings,
+            15_000,
+            now_epoch=now,
+        )
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/tournaments/test/bracket/events",
+            "headers": [
+                (
+                    sse.SSE_LOAD_TEST_CAPACITY_HEADER.encode("ascii"),
+                    token.encode("ascii"),
+                )
+            ],
+        }
+
+        with patch.object(sse.time, "time", return_value=now):
+            self.assertEqual(sse._qa_global_limit(scope, self.settings), 15_000)
+
+        with patch.object(sse.time, "time", return_value=now + sse.SSE_LOAD_TEST_CAPACITY_TTL_SECONDS):
+            self.assertIsNone(sse._qa_global_limit(scope, self.settings))
+
+        tampered = token.replace("15000:", "30000:", 1)
+        scope["headers"] = [
+            (
+                sse.SSE_LOAD_TEST_CAPACITY_HEADER.encode("ascii"),
+                tampered.encode("ascii"),
+            )
+        ]
+        with patch.object(sse.time, "time", return_value=now):
+            self.assertIsNone(sse._qa_global_limit(scope, self.settings))
+
+        with self.assertRaises(ValueError):
+            sse.sse_load_test_capacity_token(
+                self.settings,
+                sse.SSE_QA_GLOBAL_LIMIT_MAX + 1,
+                now_epoch=now,
+            )
+
     async def test_user_limit_spans_distinct_source_addresses(self) -> None:
         leases = [
             await sse.reserve_sse_connection(
@@ -214,6 +256,27 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         )
         await stale.release()
         await replacement.release()
+
+    async def test_lease_renewal_extends_all_scopes_after_interval(self) -> None:
+        lease = sse.SseConnectionLease(
+            member="member",
+            settings=self.settings,
+            keys=["global", "source", "user"],
+            lease_seconds=120,
+            last_renewed_epoch=100,
+        )
+        with patch.object(sse, "_renew_keys", new=AsyncMock()) as renew_keys:
+            await lease.renew(now_epoch=120)
+            renew_keys.assert_not_awaited()
+            await lease.renew(now_epoch=130)
+
+        renew_keys.assert_awaited_once_with(
+            lease.keys,
+            member="member",
+            lease_seconds=120,
+            now_epoch=130,
+        )
+        self.assertEqual(lease.last_renewed_epoch, 130)
 
     async def test_authenticated_user_scope_uses_route_auth_result(self) -> None:
         scope = {
@@ -277,6 +340,56 @@ class PlatformSseConnectionMiddlewareTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sent_messages[0]["type"], "http.response.start")
         self.assertEqual(sent_messages[0]["status"], 429)
+        lease.release.assert_awaited_once_with()
+
+    async def test_signed_qa_capacity_limit_is_passed_without_bypassing_global_admission(self) -> None:
+        settings = get_settings()
+        lease = MagicMock(spec=sse.SseConnectionLease)
+        lease.release = AsyncMock()
+
+        async def app(_scope, _receive, _send):
+            return None
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            return None
+
+        now = 1_700_000_000
+        token = sse.sse_load_test_capacity_token(settings, 15_000, now_epoch=now)
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/tournaments/test/bracket/events",
+            "headers": [
+                (
+                    sse.SSE_LOAD_TEST_CAPACITY_HEADER.encode("ascii"),
+                    token.encode("ascii"),
+                )
+            ],
+            "client": ("127.0.0.1", 443),
+        }
+        middleware = sse.SseConnectionLimitMiddleware(
+            app,
+            settings_factory=lambda: settings,
+        )
+        with (
+            patch.object(sse.time, "time", return_value=now),
+            patch.object(
+                sse,
+                "reserve_sse_connection",
+                new=AsyncMock(return_value=lease),
+            ) as reserve,
+        ):
+            await middleware(scope, receive, send)
+
+        reserve.assert_awaited_once_with(
+            "127.0.0.1",
+            settings=settings,
+            global_limit=15_000,
+            bypass_source_limit=False,
+        )
         lease.release.assert_awaited_once_with()
 
 

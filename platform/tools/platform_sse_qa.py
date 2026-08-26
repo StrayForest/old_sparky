@@ -30,7 +30,10 @@ from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import dispose_engine
 from python_packages.platform_infra.sse_connection_limit import (
     SSE_GLOBAL_LIMIT,
+    SSE_LOAD_TEST_CAPACITY_HEADER,
     SSE_LOAD_TEST_BYPASS_HEADER,
+    SSE_QA_GLOBAL_LIMIT_MAX,
+    sse_load_test_capacity_token,
     sse_load_test_bypass_token,
 )
 from tools.platform_production_qa import (
@@ -221,6 +224,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sse-duration", type=float, default=60.0)
     parser.add_argument("--sse-open-concurrency", type=int, default=256)
     parser.add_argument(
+        "--sse-open-rate",
+        type=float,
+        default=0.0,
+        help="Gradual-fill opening rate in new SSE/sec; zero keeps bounded burst behavior.",
+    )
+    parser.add_argument(
+        "--sse-capacity-limit",
+        type=int,
+        default=0,
+        help="Explicit QA-only global cap; high-cap runs are restricted to the loopback origin.",
+    )
+    parser.add_argument(
         "--sse-open-timeout",
         type=float,
         default=5.0,
@@ -253,6 +268,20 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--sse-open-timeout must be between 0.5 and "
             f"{max_open_timeout:g} seconds for this origin"
+        )
+    if not 0.0 <= args.sse_open_rate <= 1000.0:
+        parser.error("--sse-open-rate must be between 0 and 1000 new SSE/sec")
+    if not 1 <= args.sse_connections <= SSE_QA_GLOBAL_LIMIT_MAX:
+        parser.error(
+            f"--sse-connections must be between 1 and {SSE_QA_GLOBAL_LIMIT_MAX}"
+        )
+    if not 1 <= args.sse_open_concurrency <= SSE_QA_GLOBAL_LIMIT_MAX:
+        parser.error(
+            f"--sse-open-concurrency must be between 1 and {SSE_QA_GLOBAL_LIMIT_MAX}"
+        )
+    if not 0 <= args.sse_capacity_limit <= SSE_QA_GLOBAL_LIMIT_MAX:
+        parser.error(
+            f"--sse-capacity-limit must be between 0 and {SSE_QA_GLOBAL_LIMIT_MAX}"
         )
     return args
 
@@ -391,6 +420,8 @@ async def consume_sse_connection(
     reconnect_cycles: int,
     open_gate: asyncio.Semaphore,
     open_timeout_seconds: float,
+    open_delay_seconds: float,
+    sse_capacity_token: str | None,
     all_attempts_done: asyncio.Event,
     mark_attempt_finished,
     hold_deadline_after_barrier,
@@ -412,10 +443,15 @@ async def consume_sse_connection(
         headers[SSE_LOAD_TEST_BYPASS_HEADER] = sse_load_test_bypass_token(
             get_settings()
         )
+    if sse_capacity_token is not None:
+        headers[SSE_LOAD_TEST_CAPACITY_HEADER] = sse_capacity_token
     deadline: float | None = None
     cycles = max(0, reconnect_cycles)
     per_cycle_hold = duration_seconds / (cycles + 1) if cycles else duration_seconds
     initial_attempt_marked = False
+
+    if open_delay_seconds > 0:
+        await asyncio.sleep(open_delay_seconds)
 
     for cycle in range(cycles + 1):
         if deadline is not None and time.monotonic() >= deadline:
@@ -577,6 +613,10 @@ async def run_connections(
     reconnect_cycles: int,
     event_count: int,
     event_interval: float,
+    open_rate_per_second: float,
+    sse_capacity_token: str | None,
+    global_admission_limit: int,
+    plateau_probe_connections: int,
     http_max_connections: int,
 ) -> dict[str, Any]:
     metrics = SseMetrics()
@@ -609,6 +649,17 @@ async def run_connections(
             if attempts_finished >= connection_count:
                 all_attempts_done.set()
 
+    probe_attempts_finished = 0
+    probe_attempts_done = asyncio.Event()
+    probe_attempts_lock = asyncio.Lock()
+
+    async def mark_probe_attempt_finished() -> None:
+        nonlocal probe_attempts_finished
+        async with probe_attempts_lock:
+            probe_attempts_finished += 1
+            if probe_attempts_finished >= plateau_probe_connections:
+                probe_attempts_done.set()
+
     async def hold_deadline_after_barrier(
         barrier: asyncio.Event,
         hold_seconds: float,
@@ -620,36 +671,87 @@ async def run_connections(
                 hold_deadline = time.monotonic() + hold_seconds
             return hold_deadline
 
-    connections = [
-        (
-            users[index % len(users)],
-            tournaments[index % len(tournaments)],
-        )
-        for index in range(connection_count)
-    ]
-    tasks = [
-        asyncio.create_task(
-            consume_sse_connection(
-                qa,
-                sse_client,
-                metrics,
-                user=user,
-                tournament_slug=str(tournament["slug"]),
-                sse_ticket=sse_ticket,
-                duration_seconds=duration_seconds,
-                reconnect_cycles=reconnect_cycles,
-                open_gate=open_gate,
-                open_timeout_seconds=open_timeout_seconds,
-                all_attempts_done=all_attempts_done,
-                mark_attempt_finished=mark_attempt_finished,
-                hold_deadline_after_barrier=hold_deadline_after_barrier,
+    def create_connection_tasks(
+        count: int,
+        *,
+        index_offset: int,
+        attempt_finished,
+    ) -> list[asyncio.Task[None]]:
+        connections = [
+            (
+                users[(index_offset + index) % len(users)],
+                tournaments[(index_offset + index) % len(tournaments)],
             )
-        )
-        for user, tournament in connections
-    ]
+            for index in range(count)
+        ]
+        return [
+            asyncio.create_task(
+                consume_sse_connection(
+                    qa,
+                    sse_client,
+                    metrics,
+                    user=user,
+                    tournament_slug=str(tournament["slug"]),
+                    sse_ticket=sse_ticket,
+                    duration_seconds=duration_seconds,
+                    reconnect_cycles=reconnect_cycles,
+                    open_gate=open_gate,
+                    open_timeout_seconds=open_timeout_seconds,
+                    open_delay_seconds=(
+                        index / open_rate_per_second if open_rate_per_second > 0 else 0
+                    ),
+                    sse_capacity_token=sse_capacity_token,
+                    all_attempts_done=all_attempts_done,
+                    mark_attempt_finished=attempt_finished,
+                    hold_deadline_after_barrier=hold_deadline_after_barrier,
+                )
+            )
+            for index, (user, tournament) in enumerate(connections)
+        ]
+
+    tasks = create_connection_tasks(
+        connection_count,
+        index_offset=0,
+        attempt_finished=mark_attempt_finished,
+    )
+    probe_tasks: list[asyncio.Task[None]] = []
+    plateau_report = {
+        "requested_connections": max(0, plateau_probe_connections),
+        "base_connected": 0,
+        "probe_connected": 0,
+        "probe_rejected_429": 0,
+        "probe_rejected_503": 0,
+        "probe_open_timeouts": 0,
+        "executed": False,
+    }
     publisher: asyncio.Task[dict[str, Any]] | None = None
     try:
         await all_attempts_done.wait()
+        plateau_report["base_connected"] = metrics.counters["initial_connected"]
+        if (
+            plateau_probe_connections > 0
+            and sse_capacity_token is not None
+            and plateau_report["base_connected"] >= connection_count
+        ):
+            plateau_report["executed"] = True
+            before_connected = metrics.counters["connected"]
+            before_rejected_429 = metrics.counters["rejected_429"]
+            before_rejected_503 = metrics.counters["rejected_503"]
+            before_open_timeouts = metrics.counters["open_timeouts"]
+            probe_tasks = create_connection_tasks(
+                plateau_probe_connections,
+                index_offset=connection_count,
+                attempt_finished=mark_probe_attempt_finished,
+            )
+            await probe_attempts_done.wait()
+            plateau_report.update(
+                {
+                    "probe_connected": metrics.counters["connected"] - before_connected,
+                    "probe_rejected_429": metrics.counters["rejected_429"] - before_rejected_429,
+                    "probe_rejected_503": metrics.counters["rejected_503"] - before_rejected_503,
+                    "probe_open_timeouts": metrics.counters["open_timeouts"] - before_open_timeouts,
+                }
+            )
         await asyncio.sleep(min(2.0, max(0.1, duration_seconds / 4)))
         publisher = asyncio.create_task(
             publish_probe_events(
@@ -658,7 +760,7 @@ async def run_connections(
                 interval_seconds=event_interval,
             )
         )
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks, *probe_tasks)
         publisher_report = await publisher
         return {
             "profile": "sse-only",
@@ -666,13 +768,16 @@ async def run_connections(
             "duration_seconds": duration_seconds,
             "open_concurrency": open_concurrency,
             "open_timeout_seconds": open_timeout_seconds,
+            "open_rate_per_second": open_rate_per_second,
+            "capacity_mode": sse_capacity_token is not None,
             "admission_mode": "ticket" if sse_ticket else "legacy",
             "reconnect_cycles": reconnect_cycles,
             "probe_event_count": event_count,
             "probe_event_interval_seconds": event_interval,
             "expected_events": metrics.counters["initial_connected"] * max(0, event_count),
             "publisher": publisher_report,
-            "application_global_admission_limit": SSE_GLOBAL_LIMIT,
+            "application_global_admission_limit": global_admission_limit,
+            "plateau_probe": plateau_report,
             "load_generator_resources": load_generator_resource_limits(),
             "metrics": metrics.summary(),
         }
@@ -682,7 +787,7 @@ async def run_connections(
         if publisher is not None:
             with suppress(asyncio.CancelledError, Exception):
                 await publisher
-        pending_tasks = [task for task in tasks if not task.done()]
+        pending_tasks = [task for task in (*tasks, *probe_tasks) if not task.done()]
         for task in pending_tasks:
             task.cancel()
         if pending_tasks:
@@ -714,6 +819,30 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         configured_env = os.environ.get("PLATFORM_ENV_FILE", "").strip()
         env_file = Path(configured_env) if configured_env else PLATFORM_ROOT / ".env.platform"
     load_env_file(env_file)
+
+    settings = get_settings()
+    if args.sse_capacity_limit:
+        if args.sse_capacity_limit > SSE_GLOBAL_LIMIT and (
+            args.mode != "sse"
+            or urlsplit(str(args.origin)).hostname
+            not in {"127.0.0.1", "localhost", "::1"}
+            or args.sse_admission_mode != "ticket"
+        ):
+            raise RuntimeError(
+                "QA SSE capacity mode above the production cap requires the ticketed SSE-only loopback origin."
+            )
+        sse_capacity_token = sse_load_test_capacity_token(
+            settings,
+            args.sse_capacity_limit,
+        )
+    else:
+        sse_capacity_token = None
+    plateau_probe_connections = (
+        10
+        if args.sse_capacity_limit > SSE_GLOBAL_LIMIT
+        and args.sse_connections == args.sse_capacity_limit
+        else 0
+    )
 
     combined_users = sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN) * args.users_per_tournament
     requested_users = max(
@@ -783,6 +912,10 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     duration_seconds=args.sse_duration,
                     open_concurrency=args.sse_open_concurrency,
                     open_timeout_seconds=args.sse_open_timeout,
+                    open_rate_per_second=args.sse_open_rate,
+                    sse_capacity_token=sse_capacity_token,
+                    global_admission_limit=args.sse_capacity_limit or SSE_GLOBAL_LIMIT,
+                    plateau_probe_connections=plateau_probe_connections,
                     sse_ticket=sse_ticket,
                     reconnect_cycles=args.sse_reconnect_cycles,
                     event_count=args.sse_event_count,
@@ -799,7 +932,8 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             )
             qa.scenario(
                 "sse_admission_cap_respected",
-                metrics["max_active_connections"] <= SSE_GLOBAL_LIMIT,
+                metrics["max_active_connections"]
+                <= (args.sse_capacity_limit or SSE_GLOBAL_LIMIT),
                 metrics,
             )
             qa.scenario(
@@ -861,6 +995,10 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                         duration_seconds=args.sse_duration,
                         open_concurrency=args.sse_open_concurrency,
                         open_timeout_seconds=args.sse_open_timeout,
+                        open_rate_per_second=args.sse_open_rate,
+                        sse_capacity_token=sse_capacity_token,
+                        global_admission_limit=args.sse_capacity_limit or SSE_GLOBAL_LIMIT,
+                        plateau_probe_connections=plateau_probe_connections,
                         sse_ticket=sse_ticket,
                         reconnect_cycles=args.sse_reconnect_cycles,
                         event_count=args.sse_event_count,
@@ -907,7 +1045,8 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             )
             qa.scenario(
                 "combined_sse_admission_cap_respected",
-                sse_report["metrics"]["max_active_connections"] <= SSE_GLOBAL_LIMIT,
+                sse_report["metrics"]["max_active_connections"]
+                <= (args.sse_capacity_limit or SSE_GLOBAL_LIMIT),
                 sse_report["metrics"],
             )
             qa.scenario(
@@ -1011,6 +1150,12 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
                 report.get("sse_admission") or {}
             ).get("mode"),
             "target_connections": sse.get("target_connections"),
+            "open_rate_per_second": sse.get("open_rate_per_second"),
+            "capacity_mode": sse.get("capacity_mode"),
+            "application_global_admission_limit": sse.get(
+                "application_global_admission_limit"
+            ),
+            "plateau_probe": sse.get("plateau_probe"),
             "connected": metrics.get("connected"),
             "max_active_connections": metrics.get("max_active_connections"),
             "completed": metrics.get("completed"),

@@ -248,6 +248,10 @@ from python_packages.platform_infra.tournament_names import (
     public_tournament_name_exists,
 )
 from python_packages.platform_infra.slugs import unique_slug_from_name
+from python_packages.platform_infra.sse_connection_limit import (
+    SSE_CONNECTION_LEASE_SCOPE,
+    SseConnectionLease,
+)
 
 router = APIRouter()
 stream_router = APIRouter()
@@ -4049,6 +4053,7 @@ async def get_tournament_bracket(
 @stream_router.get("/{slug}/bracket/events")
 async def get_tournament_bracket_events(
     slug: str,
+    request: Request,
 ) -> StreamingResponse:
     access_context = current_tournament_stream_access_context()
     if access_context is None or access_context.slug != slug or access_context.decision == "deny":
@@ -4059,8 +4064,18 @@ async def get_tournament_bracket_events(
         tournament_id = str(tournament.id)
     if not tournament_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+    connection_lease = request.scope.get(SSE_CONNECTION_LEASE_SCOPE)
+    if not isinstance(connection_lease, SseConnectionLease):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Live-update connection protection is temporarily unavailable.",
+        )
     return StreamingResponse(
-        stream_bracket_events(tournament_id, admission_verified=True),
+        stream_bracket_events(
+            tournament_id,
+            admission_verified=True,
+            connection_lease=connection_lease,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

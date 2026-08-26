@@ -130,6 +130,36 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pubsub.closed)
         self.assertTrue(client.closed)
 
+    async def test_stream_closes_when_connection_lease_cannot_be_renewed(self) -> None:
+        pubsub = _FakePubSub([{"data": '{"revision":5}'}])
+        client = _FakeRedisClient(pubsub)
+        connection_lease = MagicMock()
+        connection_lease.renew = AsyncMock(
+            side_effect=bracket_events.SseConnectionLeaseRenewalFailed("expired")
+        )
+        monotonic_values = iter((10.0, 30.0))
+
+        with (
+            patch.object(bracket_events, "redis_client", MagicMock(return_value=client)),
+            patch.object(bracket_events, "monotonic", side_effect=monotonic_values),
+            patch.object(bracket_events.secrets, "randbelow", return_value=0),
+        ):
+            stream = bracket_events.stream_bracket_events(
+                "tournament-lease",
+                admission_verified=True,
+                connection_lease=connection_lease,
+            )
+            self.assertEqual(
+                await anext(stream),
+                "retry: 5000\nevent: connected\ndata: {}\n\n",
+            )
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+
+        connection_lease.renew.assert_awaited_once_with()
+        self.assertTrue(pubsub.closed)
+        self.assertTrue(client.closed)
+
     async def test_public_streams_share_revalidation_key_across_viewers(self) -> None:
         contexts = iter(
             (
@@ -185,19 +215,10 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(first, second)
 
-    async def test_stream_recycles_after_bounded_lifetime(self) -> None:
-        pubsub = _FakePubSub([])
+    async def test_stream_stays_open_past_the_old_forced_lifetime(self) -> None:
+        pubsub = _FakePubSub([{"data": '{"revision":4}'}])
         client = _FakeRedisClient(pubsub)
         access_check = AsyncMock(return_value=True)
-        monotonic_values = iter(
-            (10.0, 10.0 + bracket_events.SSE_STREAM_MAX_LIFETIME_SECONDS)
-        )
-
-        def fake_monotonic() -> float:
-            return next(
-                monotonic_values,
-                10.0 + bracket_events.SSE_STREAM_MAX_LIFETIME_SECONDS,
-            )
 
         with (
             patch.object(bracket_events, "redis_client", MagicMock(return_value=client)),
@@ -207,19 +228,17 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 access_check,
             ),
             patch.object(bracket_events.secrets, "randbelow", return_value=0),
-            patch.object(
-                bracket_events,
-                "monotonic",
-                side_effect=fake_monotonic,
-            ),
         ):
             stream = bracket_events.stream_bracket_events("tournament-4")
             self.assertEqual(
                 await anext(stream),
                 "retry: 5000\nevent: connected\ndata: {}\n\n",
             )
-            with self.assertRaises(StopAsyncIteration):
-                await anext(stream)
+            self.assertEqual(
+                await anext(stream),
+                'event: bracket\ndata: {"revision":4}\n\n',
+            )
+            await stream.aclose()
 
         access_check.assert_awaited_once_with("tournament-4")
         self.assertEqual(pubsub.unsubscribed, ["platform:bracket:tournament-4"])
