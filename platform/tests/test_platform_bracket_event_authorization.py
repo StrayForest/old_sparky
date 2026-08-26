@@ -229,7 +229,10 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(bracket_events.secrets, "randbelow", return_value=0),
         ):
-            stream = bracket_events.stream_bracket_events("tournament-4")
+            stream = bracket_events.stream_bracket_events(
+                "tournament-4",
+                admission_verified=True,
+            )
             self.assertEqual(
                 await anext(stream),
                 "retry: 5000\nevent: connected\ndata: {}\n\n",
@@ -249,7 +252,7 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         pubsub = _FakePubSub([None])
         client = _FakeRedisClient(pubsub)
         access_check = AsyncMock(return_value=False)
-        monotonic_values = iter((10.0, 10.0, 40.0))
+        monotonic_values = iter((10.0, 40.0))
 
         def fake_monotonic() -> float:
             return next(monotonic_values, 40.0)

@@ -57,7 +57,7 @@ sse_event_interval=1
 combined_polling_duration=30
 combined_polling_open_stagger=300
 sse_origin_mode=public
-sse_admission_mode=ticket
+  sse_admission_mode=ticket
 
 case "$profile" in
   matrix|browser-polling) ;;
@@ -66,16 +66,29 @@ case "$profile" in
     sse_duration="${8:-60}"
     sse_open_concurrency="${9:-256}"
     sse_open_timeout="${10:-5}"
-    sse_open_rate="${11:-0}"
-    sse_capacity_limit="${12:-0}"
-    sse_reconnect_cycles="${13:-0}"
-    sse_users_per_tournament="${14:-500}"
-    sse_event_count="${15:-3}"
-    sse_event_interval="${16:-1}"
-    combined_polling_duration="${17:-30}"
-    combined_polling_open_stagger="${18:-300}"
-    sse_origin_mode="${19:-public}"
-    sse_admission_mode="${20:-ticket}"
+    if (( $# <= 18 )); then
+      # Accept the pre-capacity positional form for one release so an older
+      # operator workflow cannot shift reconnect/origin controls silently.
+      sse_reconnect_cycles="${11:-0}"
+      sse_users_per_tournament="${12:-500}"
+      sse_event_count="${13:-3}"
+      sse_event_interval="${14:-1}"
+      combined_polling_duration="${15:-30}"
+      combined_polling_open_stagger="${16:-300}"
+      sse_origin_mode="${17:-public}"
+      sse_admission_mode="${18:-ticket}"
+    else
+      sse_open_rate="${11:-0}"
+      sse_capacity_limit="${12:-0}"
+      sse_reconnect_cycles="${13:-0}"
+      sse_users_per_tournament="${14:-500}"
+      sse_event_count="${15:-3}"
+      sse_event_interval="${16:-1}"
+      combined_polling_duration="${17:-30}"
+      combined_polling_open_stagger="${18:-300}"
+      sse_origin_mode="${19:-public}"
+      sse_admission_mode="${20:-ticket}"
+    fi
     [[ "$sse_admission_mode" == "ticket" || "$sse_admission_mode" == "legacy" ]] || {
       echo "SSE admission mode must be ticket or legacy." >&2
       exit 1
