@@ -378,50 +378,43 @@ Exact cleanup `32986913152` deleted 10,000 users and one tournament, preserved
 the control account and verified zero remaining users, tournaments, sessions
 and audit rows.
 
-## Final unified SSE package and stopping verdict — 2026-08-27
+## Final unified SSE package and burst boundary — 2026-08-27
 
-The remaining SSE hypotheses were implemented as one protected package ending
-at `578771b3`. Workspace authorization now issues a short-lived signed
-admission ticket. Ticket verification checks HMAC, expiry, tournament slug,
-and private session binding without PostgreSQL at the SSE open boundary.
-Private streams still perform periodic fail-closed session and participant
-revalidation. Public streams use the same signed path, while unticketed
-legacy clients retain the bounded database admission path. The route no longer
-inherits write-policy dependencies; the relay shares one Redis subscription
-per worker/tournament; the browser shares one SSE per tournament via
-SharedWorker where available and falls back to polling; and the existing
-global/source/user leases remain `3,000/32/4`.
+The protected package ending at `578771b3` remains deployed: signed tickets,
+PostgreSQL-free ticketed opens, private fail-closed revalidation, shared
+worker/tournament relay, SharedWorker deduplication, polling fallback and
+global/source/user leases `3,000/32/4`. The limiter pool is `512` with a
+finite `2s` wait. The origin-only 60-second QA ceiling was added in `bed454a9`;
+its security/build, auto-deploy and production live-smoke runs were
+`33016007753`, `33016498518`, `33016504858`.
 
-The final limiter starvation fix raised only the reusable Redis limiter pool
-to `512` with a finite `2s` wait. It did not remove fail-closed behavior or
-raise source/user admission caps. The exact-SHA security/build,
-auto-deploy and production deploy/live-smoke runs were respectively
-`33009663151`, `33010232007` and `33010239695`; all passed for
-`578771b3`.
+Origin-local, 3,000 ticket SSE, 60-second hold, three events:
 
-Final retained-load evidence:
-
-| Contour | Result | Latency / resource evidence | Verdict |
+| Open | Result | p95 connect/event | Resource verdict |
 | --- | --- | --- | --- |
-| Ticket vs legacy public control, 32 opens | Ticket `32/32` HTTP 200, `96/96` events, zero errors; legacy `28/32` HTTP 200 and four controlled DB-admission `503`s | Ticket connect p95 about `462ms`; legacy about `1.02s` | Ticket path removes the PostgreSQL open bottleneck without removing protection |
-| Public ticket, 1,000 opens, 5s UX budget | `0/1,000` persistent SSE, all 1,000 became fallback-eligible; zero errors/429/503 | Origin CPU was not saturated | Valid edge/transport queue result; not an origin failure |
-| Origin-local ticket, 1,000 opens, 30s budget | `1,000/1,000` streams, `3,000/3,000` events, zero errors/429/503 | Connect p95 about `7.30s`; API peak about `68.8%`; no DB waits/locks | Origin upper bound passed; latency is too high for a 5s UX gate |
-| Public 10k browsing + 32 SSE | `10,000/10,000` workspace requests, `32/32` SSE, `96/96` events, zero errors/429/503/timeouts | SSE p95 about `1.13s`; workspace p95 about `324ms`; API peak about `121%`; PostgreSQL peak about `80%`, no waits/locks | Combined product contour passed |
-| Origin-local ticket, 3,000 opens, 30s budget | `2,650/3,000` streams, `7,950/7,950` events, zero errors/429/503; 350 open timeouts | API peak about `76%`; Redis peak about `4%`; no DB waits/locks | Upper-bound contour; no single remaining origin bottleneck proven |
+| 16 | 3000/3000 200; 9000/9000 events; 0 errors | 37.22s / 1.03s | API 18.0/72.7%; no DB waits/locks |
+| 32 | 3000/3000 200; 9000/9000; 0 errors | 31.61s / 1.37s | API 16.1/91.5%; no DB waits/locks |
+| 64 | 3000/3000 200; 9000/9000; 0 errors | 32.31s / 1.27s | API 14.3/71.4%; no DB waits/locks |
+| 128 | 3000/3000 200; 9000/9000; 0 errors | 31.63s / 1.13s | API 12.5/76.5%; no DB waits/locks |
+| 256 | 2943 200; 57 global 429; 8829/8829 events | 32.58s / 1.27s | Intentional global cap; no 503/outage |
 
-Every valid retained run had an immediate exact cleanup. Cleanup reports for
-all final runs verified zero synthetic users, tournaments, sessions and audit
-rows while preserving the control account. The attempted 3,000-open,
-60-second run was rejected by the harness validation before the origin-local
-diagnostic ceiling was extended; it was before fixture creation and is
-excluded from the matrix. Public timeout policy remains capped at 30 seconds.
+Runs `33016818414`, `33017119366`, `33017386258`, `33017697095`,
+`33017935368` and exact cleanups all left zero synthetic rows. `open=128`
+is the best balanced burst. At `256`, server logs classify all 57 responses as
+`scope=global`; source/user caps, Redis outage and database saturation were not
+involved.
 
-The final conclusion is intentionally bounded: the ticketed origin path and
-Redis limiter starvation are fixed, the protected combined 10k-user site
-contour passes, and accepted streams deliver all probe events. The remaining
-customer-facing constraint is Cloudflare/transport handshake queueing: a
-public 1,000-open wave does not establish persistent SSE within five seconds,
-although the origin can eventually hold 1,000 streams. Therefore neither
-10,000 persistent public SSE nor the full 180% two-core target is claimed.
-Further gains require edge/transport admission architecture or a separately
-authorized infrastructure change, not another safe FastAPI handshake tweak.
+Public/Cloudflare repeats at the same 3,000 target and 30-second UX timeout:
+`open=128` reached `1917/3000` with `1083` timeouts, `open=64` reached
+`1886/3000` with `1114`, and `open=32` reached `1825/3000` with `1175`.
+Every accepted stream delivered all events; there were no 429/503/application
+errors, and origin CPU, Redis, PostgreSQL connections and locks stayed below
+saturation. Cleanups `33018457197`, `33018811387`, `33019085692` verified zero
+fixture rows.
+
+The customer-facing bottleneck is therefore Cloudflare/transport handshake
+queueing at roughly 1.8–1.9k persistent opens, not SSE origin admission.
+Raising application caps would weaken deliberate backpressure without a safe
+capacity gain. Ten-thousand public persistent SSE and the full 180% two-core
+target remain unclaimed; further progress requires an operator-owned
+edge/transport capacity change and a new protected measurement.

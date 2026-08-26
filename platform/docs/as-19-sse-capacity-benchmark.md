@@ -559,41 +559,38 @@ release candidate is verified.
   as `server-observability.log` beside the compact matrix summary, so a future
   setup stall can be classified while it is occurring instead of inferred only
   from the final CI status.
-## Final unified SSE package — 2026-08-27
+## Protected SSE package and burst boundary — 2026-08-27
 
-The historical staircase above is superseded for the current production
-decision by the protected package ending at `578771b3`. It combines signed
-short-lived SSE admission tickets, PostgreSQL-free ticketed opens, the
-existing fail-closed Redis global/source/user leases (`3,000/32/4`), a shared
-worker/tournament relay, one SSE per tournament through SharedWorker where
-available, and polling fallback. Private streams retain periodic session and
-participant revalidation. The Redis limiter pool is bounded at `512` with a
-finite `2s` wait; this is a resource-capacity fix, not a protection bypass.
+The package ending at `578771b3` remains deployed: signed tickets, PostgreSQL-
+free ticketed opens, private revalidation, shared worker/tournament relay,
+SharedWorker deduplication, polling fallback and fail-closed Redis leases
+(`3,000/32/4`). The origin-only 60-second QA ceiling was added in `bed454a9`;
+security/build `33016007753`, auto-deploy `33016498518` and production
+live-smoke `33016504858` passed for that SHA.
 
-The exact release chain for the final code was security/build
-`33009663151`, auto-deploy `33010232007`, and production deploy/live smoke
-`33010239695`, all successful for the same SHA.
+| Mode / open | Run / cleanup | Result and latency | Resources / bottleneck |
+| --- | --- | --- | --- |
+| Origin / 16 | `33016818414` / `33017042334` | 3000/3000 200; 9000/9000 events; p95 37.22s/1.03s | API avg/max 18.0/72.7%; no DB waits/locks |
+| Origin / 32 | `33017119366` / `33017333149` | 3000/3000 200; 9000/9000; p95 31.61s/1.37s | API 16.1/91.5%; no DB waits/locks |
+| Origin / 64 | `33017386258` / `33017558076` | 3000/3000 200; 9000/9000; p95 32.31s/1.27s | API 14.3/71.4%; no DB waits/locks |
+| Origin / 128 | `33017697095` / `33017898463` | 3000/3000 200; 9000/9000; p95 31.63s/1.13s | API 12.5/76.5%; no DB waits/locks |
+| Origin / 256 | `33017935368` / `33018159006` | 2943 200; 57 controlled global 429; 8829/8829 events; p95 32.58s/1.27s | Hard cap, not CPU/Redis/DB saturation |
+| Public / 128 | `33018208319` / `33018457197` | 1917/3000 200; 1083 timeout; all accepted events | No 429/503/app errors; edge queue |
+| Public / 64 | `33018533513` / `33018811387` | 1886/3000 200; 1114 timeout; all accepted events | No 429/503/app errors; edge queue |
+| Public / 32 | `33018860593` / `33019085692` | 1825/3000 200; 1175 timeout; all accepted events | No 429/503/app errors; edge queue |
 
-| Final contour | Result | Key evidence |
-| --- | --- | --- |
-| Ticket vs legacy public control, 32 opens | Ticket `32/32` HTTP 200 and `96/96` events; legacy `28/32` HTTP 200 with four controlled `503`s | Ticket path avoids the legacy PostgreSQL admission bottleneck; protection remains active |
-| Public ticket, 1,000 opens, 5s timeout | `0/1,000` persistent SSE, 1,000 fast fallbacks, zero errors/429/503 | Customer-facing edge/transport queue dominates this wave |
-| Origin-local ticket, 1,000 opens, 30s timeout | `1,000/1,000` SSE and `3,000/3,000` events, zero errors/429/503 | Connect p95 `7.30s`; API peak `68.8%`; no DB waits/locks |
-| Public 10k browsing + 32 SSE | `10,000/10,000` workspace requests; `32/32` SSE; `96/96` events; zero errors/429/503/timeouts | SSE p95 `1.13s`; workspace p95 `324ms`; API peak `121%`; PostgreSQL peak `80%`, no waits/locks |
-| Origin-local ticket, 3,000 opens, 30s timeout | `2,650/3,000` SSE; `7,950/7,950` events; 350 open timeouts; zero errors/429/503 | API peak `76%`; Redis peak `4%`; no single remaining origin bottleneck |
+`open=128` is the best balanced origin burst: it fills the protected 3,000-
+stream ceiling with zero rejection and the lowest event tail among full-pass
+profiles. At `256`, all 57 rejections were logged as `scope=global`; the
+deliberate cap worked and was not a failure. Every cleanup verified zero
+synthetic users, tournaments, sessions and audit rows and preserved the
+control account.
 
-All valid retained runs were followed by exact cleanup, with zero synthetic
-users, tournaments, sessions and audit rows remaining and the control account
-preserved. The earlier 3,000-open, 60-second request was rejected by QA input
-validation before the origin-local diagnostic ceiling was extended; it
-contributes no capacity result. Public timeout policy remains capped at 30s.
-
-The final stopping verdict is: safe origin handshake improvements are
-complete. The ticket path removes PostgreSQL from normal opening, the Redis
-limiter pool no longer generates resource-starvation `503`s, and the combined
-10k-user product contour passes. The public 1k five-second wave still falls
-back because of edge/transport handshake queueing, so this work does not claim
-10k persistent public SSE or the full 180% two-core target. Further progress
-requires edge/transport architecture or a separately authorized infrastructure
-capacity change; raising application caps would weaken the current protection
-without evidence of a new safe limit.
+The public ceiling is approximately 1.8–1.9k persistent opens in this
+contour, independent of lowering burst concurrency. Only a small number of
+long-lived SSE requests reached the origin, while API/Redis/PostgreSQL stayed
+below saturation. This identifies Cloudflare/transport handshake queueing as
+the customer-facing bottleneck. No safe repository-side fix remains; raising
+the application cap would weaken backpressure. Ten-thousand public persistent
+SSE and the full 180% two-core target are not claimed without an operator-owned
+edge/transport capacity change and a new protected measurement.

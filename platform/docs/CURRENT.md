@@ -411,52 +411,48 @@ database guards and applies migration `20260822_0040`. Exact commit
 `gha-32574455599-1-87525bab34c4-20260822T125945Z`; closure evidence is in
 [`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md).
 
-### AS-19 final unified SSE package — 2026-08-27
+### AS-19 SSE capacity and burst boundary — 2026-08-27
 
-The protected SSE admission work is complete and deployed in the coherent
-package ending at commit `578771b3`. The package issues a short-lived HMAC
-ticket from an already-authorized workspace/bracket response, binds private
-tickets to the session, verifies expiry/slug/access without PostgreSQL at
-ticketed open, and preserves periodic private session/participant
-revalidation. Unticketed legacy clients retain the bounded database-backed
-path. SSE write-policy dependencies were removed from the read route, the
-per-worker/tournament relay shares one Redis subscription, and the browser
-uses one SharedWorker SSE per tournament where supported with polling fallback.
-Global/source/user Redis leases remain `3,000/32/4`; Redis failure still
-returns a controlled fail-closed response. The final limiter pool is
-`512/2s`, which removed the observed limiter-pool starvation without
-weakening admission protection.
+The protected package ending at `578771b3` remains deployed: signed HMAC
+tickets, PostgreSQL-free ticketed opens, private-stream revalidation, shared
+worker/tournament relay, SharedWorker deduplication, polling fallback and
+fail-closed Redis global/source/user leases (`3,000/32/4`). The origin-only
+60-second QA ceiling was safely added in `bed454a9`; its exact security/build,
+auto-deploy and production live-smoke chain was `33016007753`,
+`33016498518`, `33016504858`.
 
-The final exact-SHA chain for this package was security/build
-`33009663151`, automatic deploy `33010232007`, and production deploy/live
-smoke `33010239695`; all passed for the same target SHA. The ticket-vs-legacy
-control A/B proved the admission change: ticketed public `32/32` returned
-HTTP 200 with `96/96` events and no errors, while legacy public admission
-returned `28/32` HTTP 200 and four deliberate bounded database-admission
-`503`s. The final origin-local ticket run at `1,000` users with a 30-second
-open budget reached `1,000/1,000` streams and `3,000/3,000` events with zero
-errors, `429`s or `503`s. The combined public contour reached `10,000/10,000`
-workspace users plus `32/32` SSE streams and `96/96` events with zero errors,
-`429`s, `503`s or timeouts; SSE connect p95 was about `1.13s`, workspace p95
-about `324ms`, API peak about `121%`, and no PostgreSQL waits or locks.
+Origin-local burst matrix at `3,000` ticket SSE, `60s` hold, three events:
 
-The public `1,000`-SSE, five-second UX run intentionally classified all
-attempts as polling fallback without errors: Cloudflare/transport handshake
-queueing, not origin admission failure, remains the customer-facing
-bottleneck. Origin-local `3,000` with the allowed 30-second QA ceiling reached
-`2,650/3,000` streams and delivered `7,950/7,950` events, again without
-errors or rejected requests; the earlier 60-second request was rejected by QA
-before the origin-local diagnostic ceiling was extended and is not a
-measurement. These results do
-not claim `10,000` persistent public SSE connections or a full 180% CPU
-target. They show that the low-risk origin admission fixes are exhausted:
-the remaining optimization is edge/transport handshake architecture or
-operator capacity, while the application protection and fast polling
-fallback remain in force.
+| Open concurrency | Result | Connect p95 / event p95 | Resource result |
+| --- | --- | --- | --- |
+| 16 | 3000/3000 HTTP 200; 9000/9000 events; 0 errors | 37.22s / 1.03s | API avg/max 18.0/72.7%; no DB waits/locks |
+| 32 | 3000/3000 HTTP 200; 9000/9000 events; 0 errors | 31.61s / 1.37s | API 16.1/91.5%; no DB waits/locks |
+| 64 | 3000/3000 HTTP 200; 9000/9000 events; 0 errors | 32.31s / 1.27s | API 14.3/71.4%; no DB waits/locks |
+| 128 | 3000/3000 HTTP 200; 9000/9000 events; 0 errors | 31.63s / 1.13s | API 12.5/76.5%; no DB waits/locks |
+| 256 | 2943 HTTP 200; 57 controlled global 429; 8829/8829 events | 32.58s / 1.27s | No 503/outage; hard cap worked as designed |
 
-Every retained load run was followed by its exact cleanup; the final cleanup
-reports verified zero synthetic users, tournaments, sessions and audit rows
-and preserved `aleksei.lisitsin1@gmail.com`.
+Runs were `33016818414`, `33017119366`, `33017386258`, `33017697095`,
+`33017935368`; each exact cleanup succeeded with zero synthetic users,
+tournaments, sessions and audit rows. `open=128` is the best balanced origin
+burst: zero rejection through the 3,000-stream ceiling and the lowest event
+tail among the full-pass profiles. `open=256` hit the intentional global cap,
+not CPU, Redis or PostgreSQL saturation.
+
+Public/Cloudflare repeat at `3,000`, `60s`, ticket mode and 30-second UX
+timeout: `open=128` connected `1917/3000` and timed out `1083`; `open=64`
+connected `1886/3000` and timed out `1114`; `open=32` connected `1825/3000`
+and timed out `1175`. All accepted streams delivered every event, with zero
+429/503/application errors; origin CPU, Redis, PostgreSQL connections and
+locks remained below saturation. The three runs were `33018208319`,
+`33018533513`, `33018860593`, and their cleanups verified zero fixture rows.
+
+The customer-facing boundary is therefore Cloudflare/transport handshake
+queueing at roughly 1.8–1.9k persistent opens in this contour, not the
+ticketed origin path. No repository-side change can safely remove that edge
+queue; raising the application cap would weaken deliberate backpressure.
+The result does not claim 10,000 public persistent SSE or the full 180%
+two-core target. Further capacity requires an operator-owned edge/transport
+architecture or capacity change, followed by the same protected tests.
 
 AS-17 — End-to-end release transaction and recovery is resolved and deployed.
 The release receipt now has an explicit Nginx uncertainty boundary, idempotent
