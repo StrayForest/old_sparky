@@ -108,12 +108,12 @@ otherwise it closes the attempt and uses revision polling with conditional
 ETags. The SSE timeout is a UX guard, not a Cloudflare bypass and not an
 authorization relaxation.
 
-The local candidate currently uses a 5-second browser handshake timeout and a
+The local candidate now uses a 1-second browser handshake timeout and a
 60-second SSE retry cooldown. The retained-load runner accepts the same
 timeout as an explicit A/B parameter and records timeout/fallback eligibility
 separately from unexpected errors. The browser value is a bounded build-time
 configuration named `NEXT_PUBLIC_PLATFORM_SSE_OPEN_TIMEOUT_MS`; when unset it
-defaults to 5 seconds.
+defaults to 1 second.
 
 ### Ten hypotheses
 
@@ -162,7 +162,7 @@ round.
 | --- | --- | --- |
 | 1s handshake timeout | PASS | Stalled SSE moved to polling within the configured budget. |
 | 3s handshake timeout | PASS | Same correctness and conditional-response behavior. |
-| 5s handshake timeout | PASS | Same correctness and conditional-response behavior; retained as the current default pending live active-SSE comparison. |
+| 5s handshake timeout | PASS | Same correctness and conditional-response behavior; rejected for the production UX budget. |
 
 This local mock test deliberately does not choose the production winner: it
 cannot measure healthy SSE handshake rate, Cloudflare edge behavior or VPS
@@ -179,7 +179,10 @@ rate, edge errors and API CPU at each timeout.
   `platformdb_test` credential for `platform_test_user` is invalid; 860 tests
   ran and 153 failed during database setup. This is an environment failure,
   not evidence against the candidate.
-- No commit, CI run or production deployment has been made for this candidate.
+- The bounded-admission candidate `c7874f3b` passed exact-SHA security/build
+  `32958837837`, automatic deploy `32959335972` and production deploy/live
+  smoke `32959345140`. The browser jitter/default-timeout change is the next
+  local candidate and has not yet been promoted.
 
 ## Bounded admission follow-up
 
@@ -208,5 +211,27 @@ The first public 5k attempt with the 1-second budget was not a product result:
 4,972 opens timed out, while 28 cancelled HTTP contexts later emitted
 `RemoteProtocolError` after roughly 47 seconds. The load harness now closes a
 timed-out stream context with a 250ms bound and classifies a no-response
-disconnect after the open budget as fallback-eligible. A new async regression
-test protects this measurement boundary before the next 5k/10k run.
+disconnect after the open budget as fallback-eligible. The regression test
+protecting this measurement boundary passes.
+
+The repaired public 5k run `32959670815` completed with exact cleanup
+`32959892162`: 5,000/5,000 attempts became fallback-eligible in the 1-second
+budget, with zero client errors, 429s, 503s or Cloudflare 1200 responses, but
+zero streams reached HTTP 200. VPS API CPU averaged 68.7% (peak 141.7%),
+PostgreSQL averaged 30.5%, Redis 0.3%, and no lock contention was observed.
+This is a valid UX/fallback result, not a 5k SSE-capacity pass; Nginx logs
+showed upstream SSE timeouts after the clients had already abandoned the
+handshakes.
+
+The public 1k low-burst A/B `32960050840` (`open_concurrency=32`) completed
+with exact cleanup `32960232187`: 13 HTTP 200 streams, zero errors/429/503,
+and 987 fallback-eligible attempts. Connect p50/p95/p99 was
+`0.88/4.90/4.90s`; API CPU averaged 47.4% and PostgreSQL 12.4%, with no
+locks. Lowering burst alone therefore did not produce a sub-second p95.
+
+The current web candidate changes the default browser timeout to 1s, adds a
+maximum 500ms randomized SSE open delay, and starts the first conditional
+revision poll within a maximum 500ms after fallback. Local web lint, build,
+typecheck and the focused stalled-SSE Playwright test pass. The next public
+A/B must verify that this reduces edge-held abandoned streams before any
+additional capacity claim.

@@ -1,10 +1,10 @@
 import { expect, test } from "@playwright/test";
 
 test("abandons a stalled SSE handshake and starts bracket polling", async ({ page }) => {
-  const configuredTimeoutMs = Number(process.env.NEXT_PUBLIC_PLATFORM_SSE_OPEN_TIMEOUT_MS ?? "5000");
+  const configuredTimeoutMs = Number(process.env.NEXT_PUBLIC_PLATFORM_SSE_OPEN_TIMEOUT_MS ?? "1000");
   const fallbackTimeoutMs = Number.isFinite(configuredTimeoutMs)
     ? Math.min(30_000, Math.max(500, Math.round(configuredTimeoutMs)))
-    : 5_000;
+    : 1_000;
   await page.context().addCookies([
     {
       name: "deadlock_platform_session",

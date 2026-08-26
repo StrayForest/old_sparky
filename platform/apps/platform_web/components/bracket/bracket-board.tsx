@@ -27,12 +27,14 @@ const BRACKET_POLL_BASE_MS = 10_000;
 const BRACKET_POLL_JITTER_MS = 3000;
 const BRACKET_POLL_MIN_MS = 3_000;
 const BRACKET_POLL_MAX_MS = 60_000;
+const SSE_OPEN_JITTER_MS = 500;
+const SSE_FALLBACK_POLL_JITTER_MS = 500;
 const configuredSseOpenTimeoutMs = Number(
   process.env.NEXT_PUBLIC_PLATFORM_SSE_OPEN_TIMEOUT_MS ?? "",
 );
 const SSE_OPEN_TIMEOUT_MS = Number.isFinite(configuredSseOpenTimeoutMs)
   ? Math.min(30_000, Math.max(500, Math.round(configuredSseOpenTimeoutMs)))
-  : 5_000;
+  : 1_000;
 const SSE_RETRY_COOLDOWN_MS = 60_000;
 const PANNING_IGNORE_SELECTOR = "button,input,select,textarea,a,[role='button']";
 
@@ -250,7 +252,7 @@ export function BracketBoard({
         schedulePollingTick(next ?? bracketRef.current);
       }, delayMs);
     };
-    const startPolling = () => {
+    const startPolling = (immediate = false) => {
       if (pollingActive || pollingTimer !== null || pollingDelayTimer !== null) {
         return;
       }
@@ -258,6 +260,9 @@ export function BracketBoard({
         return;
       }
       pollingActive = true;
+      const delayMs = immediate
+        ? Math.floor(Math.random() * SSE_FALLBACK_POLL_JITTER_MS)
+        : Math.floor(Math.random() * BRACKET_POLL_JITTER_MS);
       pollingDelayTimer = setTimeout(async () => {
         pollingDelayTimer = null;
         const next = await refreshIfVisible();
@@ -279,6 +284,7 @@ export function BracketBoard({
       }
     };
     let source: EventSource | null = null;
+    let sseOpenDelayTimer: ReturnType<typeof setTimeout> | null = null;
     let sseOpenTimer: ReturnType<typeof setTimeout> | null = null;
     let sseRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let sseRetryNotBefore = 0;
@@ -291,6 +297,10 @@ export function BracketBoard({
     };
 
     const closeSource = () => {
+      if (sseOpenDelayTimer !== null) {
+        clearTimeout(sseOpenDelayTimer);
+        sseOpenDelayTimer = null;
+      }
       clearSseOpenTimer();
       if (source !== null) {
         source.close();
@@ -301,7 +311,7 @@ export function BracketBoard({
     const fallBackToPolling = () => {
       closeSource();
       sseRetryNotBefore = Date.now() + SSE_RETRY_COOLDOWN_MS;
-      startPolling();
+      startPolling(true);
       scheduleSseRetry();
     };
 
@@ -326,30 +336,40 @@ export function BracketBoard({
       ) {
         return;
       }
-      source = new EventSource(
-        platformApiUrl(`/tournaments/${slug}/bracket/events`),
-        { withCredentials: true },
-      );
-      sseOpenTimer = setTimeout(() => {
-        // A slow edge handshake is not useful to a visitor. Abort it before
-        // an upstream queue can turn a normal fallback into a multi-minute
-        // wait, then retry only after the cooldown.
-        if (source !== null) {
-          fallBackToPolling();
+      sseOpenDelayTimer = setTimeout(() => {
+        sseOpenDelayTimer = null;
+        if (
+          document.visibilityState !== "visible"
+          || Date.now() < sseRetryNotBefore
+          || source !== null
+        ) {
+          return;
         }
-      }, SSE_OPEN_TIMEOUT_MS);
-      source.onopen = () => {
-        clearSseOpenTimer();
-        stopPolling();
-      };
-      source.addEventListener("bracket", () => {
-        scheduleEventRefresh();
-      });
-      source.onerror = () => {
-        // EventSource retries automatically, which would keep hammering a
-        // saturated edge. Close it and use revision polling during cooldown.
-        fallBackToPolling();
-      };
+        source = new EventSource(
+          platformApiUrl(`/tournaments/${slug}/bracket/events`),
+          { withCredentials: true },
+        );
+        sseOpenTimer = setTimeout(() => {
+          // A slow edge handshake is not useful to a visitor. Abort it before
+          // an upstream queue can turn a normal fallback into a multi-minute
+          // wait, then retry only after the cooldown.
+          if (source !== null) {
+            fallBackToPolling();
+          }
+        }, SSE_OPEN_TIMEOUT_MS);
+        source.onopen = () => {
+          clearSseOpenTimer();
+          stopPolling();
+        };
+        source.addEventListener("bracket", () => {
+          scheduleEventRefresh();
+        });
+        source.onerror = () => {
+          // EventSource retries automatically, which would keep hammering a
+          // saturated edge. Close it and use revision polling during cooldown.
+          fallBackToPolling();
+        };
+      }, Math.floor(Math.random() * SSE_OPEN_JITTER_MS));
     };
 
     const handleVisibilityChange = () => {

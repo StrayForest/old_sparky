@@ -595,6 +595,6 @@ release candidate is verified.
   validator accepts its loopback origin only for `mode=sse` when
   `request_origin` is still the canonical public origin. Public-origin runs
   remain the acceptance gate.
-- Public ramp A/B `open_concurrency=16` (`32888021777`) still failed through Cloudflare: 3,466/5,000 HTTP 200, 1,533 Error 1200, one 502 and zero app 429s; slower opening did not solve the edge queue.
-- Public candidate `1d0f56d5` produced 3,000 HTTP 200 SSE plus 2,000 fast app 429s for 5,000 attempts, zero Cloudflare 1200/503/errors and all 3,000 events; connect p95 remained 61.8s.
-- The deployed fast-fallback A/B (`368f6170`) proved client-side polling fallback, but public 1k SSE-only runs still showed 5s connect p95 at 5.0s and server route p95 at 19.2s with no lock contention. The next candidate bounds Redis, middleware auth and stream-DB admission waits at 0.5s, returns controlled 503/fallback responses, and leaves Cloudflare/app caps unchanged.
+- Public ramp A/B `open_concurrency=16` (`32888021777`) still failed through Cloudflare: 3,466/5,000 HTTP 200, 1,533 Error 1200, one 502 and zero app 429s; slower opening did not solve the edge queue. The current bounded-admission candidate `c7874f3b` instead makes overload fail fast and keeps Cloudflare/Nginx limits unchanged.
+- On the repaired public 5k run `32959670815` (exact cleanup `32959892162`), all 5,000 attempts became fallback-eligible within 1s with zero client errors/429/503/1200, but zero HTTP 200 streams; API CPU averaged 68.7% and no locks were observed. This is a valid UX fallback result, not an SSE-capacity pass.
+- The 1k low-burst A/B `32960050840` (exact cleanup `32960232187`) reached 13 HTTP 200 streams and 987 fallbacks; connect p95 was 4.90s. The next promotion candidate reduces browser timeout to 1s, adds up to 500ms SSE jitter and starts conditional polling promptly; it still requires public validation.
