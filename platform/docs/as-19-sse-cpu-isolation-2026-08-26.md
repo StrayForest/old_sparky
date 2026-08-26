@@ -265,8 +265,8 @@ previous parameters). A timeout is recorded as a diagnostic FAIL and still
 emits the exact cleanup manifest; it cannot occupy the VPS for the 180-minute
 supervisor limit. The focused SSE QA/unittest and shell syntax checks pass.
 
-The next harness candidate removes a separate measurement contaminant exposed
-by the canceled combined run. SSE/combined fixture setup now creates only the
+The deployed harness revision removes a separate measurement contaminant
+exposed by the canceled combined run. SSE/combined fixture setup now creates only the
 requested number of synthetic users and one public tournament on the single
 Redis hot key; it does not run the browser profile's ready-check or assignment
 workflow first. A 90-second fixture budget fails fast and leaves the durable
@@ -286,3 +286,21 @@ The fix closes the shared resources only after the last queue leaves and adds a
 regression test that closes one of two subscribers before delivering the next
 event. Exact cleanup `32970738275` deleted 32 users and one tournament and
 preserved `aleksei.lisitsin1@gmail.com`.
+
+The post-fix public staircase on `8c0103e7` confirmed the relay result. The
+32-SSE A/B delivered 24/24 events with Redis subscriber counts `[1, 1, 1]`,
+event p95 about 40ms and connect p95 about 947ms. Public 1k admitted 6 streams
+and delivered 18/18 events; public 5k admitted 4 and delivered 12/12; public
+10k classified all 10,000 opens as fallback within one second with no
+unexpected errors. API CPU remained below sustained saturation throughout.
+Exact cleanups `32972274118`, `32972607636`, `32972913089` and `32973507881`
+removed the fixtures and preserved the control account.
+
+The first mixed 10k users + 32 SSE run `32973657012` exposed a load-harness
+problem: 10,000 polling coroutines had no shared request-concurrency gate, and
+the load generator reached 97.5% CPU while API CPU stayed near 1%. Its
+bounded-run cancellation also waited on the overloaded gather. Abort
+`32974261688` and exact cleanup `32974326125` recovered the process tree and
+fixture. The harness now caps combined polling requests at the configured
+concurrency and uses `asyncio.wait` with explicit task cancellation/draining so
+the mixed test cannot turn a client-side queue into an unbounded VPS run.

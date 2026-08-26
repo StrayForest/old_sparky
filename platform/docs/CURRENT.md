@@ -100,9 +100,25 @@ reported `[0, 0, 0]` subscribers and 0/21 events while API CPU averaged 36.3%,
 PostgreSQL 6.1% and lock contention was false. Code review found a relay
 lifecycle race: closing one queue unconditionally closed the shared Redis
 Pub/Sub resources for the remaining queues. The fix is covered by a regression
-test and is being rechecked through the exact-SHA release gate before repeating
-the public staircase. The fixture was removed by exact cleanup `32970738275`,
+test and was verified by the exact-SHA release gate before repeating the public
+staircase. The fixture was removed by exact cleanup `32970738275`,
 which preserved `aleksei.lisitsin1@gmail.com` and left zero synthetic rows.
+
+The public staircase after the relay fix is now measured on `8c0103e7`: the
+32-SSE A/B delivered 24/24 events with event p95 40ms; the 1k run admitted
+6 streams and delivered 18/18 events (connect p95 860ms); the 5k run admitted
+4 and delivered 12/12 (connect p95 985ms); and the 10k run classified all
+10,000 opens as one-second fallback with zero unexpected errors. API CPU was
+not sustained at saturation in any of these public runs. Exact cleanups
+`32972274118`, `32972607636`, `32972913089` and `32973507881` preserved the
+control account and left zero synthetic rows.
+
+The first 10k mixed SSE+polling attempt `32973657012` was canceled because the
+load generator, not the VPS, reached 97.5% CPU while 10,000 polling tasks were
+opened without a shared request gate. Abort `32974261688` and cleanup
+`32974326125` removed its process tree and fixture. The harness now bounds
+combined polling requests by the configured concurrency and cancels/drains
+both workload tasks on timeout before the next mixed acceptance run.
 
 AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact

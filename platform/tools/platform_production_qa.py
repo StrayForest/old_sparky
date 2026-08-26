@@ -3541,7 +3541,22 @@ class ProductionQa:
         *,
         profile_duration: float,
         inflight: set[str],
+        request_gate: asyncio.Semaphore | None = None,
     ) -> None:
+        async def execute_polling_request() -> dict[str, Any] | None:
+            if request_gate is None:
+                return await self.execute_browser_polling_request(
+                    api_client,
+                    tab,
+                    inflight,
+                )
+            async with request_gate:
+                return await self.execute_browser_polling_request(
+                    api_client,
+                    tab,
+                    inflight,
+                )
+
         open_stagger_seconds = float(tab.get("open_stagger_seconds") or 0.0)
         if open_stagger_seconds > 0:
             await asyncio.sleep(open_stagger_seconds)
@@ -3555,7 +3570,7 @@ class ProductionQa:
         )
         if route_label == "GET /tournaments/{slug}/bracket":
             first = asyncio.create_task(
-                self.execute_browser_polling_request(api_client, tab, inflight)
+                execute_polling_request()
             )
             await asyncio.sleep(0)
             self.polling_metrics.mark(
@@ -3564,10 +3579,10 @@ class ProductionQa:
                 role=str(tab["role"]),
                 tournament_status=str(tab["tournament_status"]),
             )
-            await self.execute_browser_polling_request(api_client, tab, inflight)
+            await execute_polling_request()
             payload = await first
         else:
-            payload = await self.execute_browser_polling_request(api_client, tab, inflight)
+            payload = await execute_polling_request()
         raw_delay_ms = self.extract_next_poll_delay_ms(payload)
         if raw_delay_ms == 0 or self.payload_is_terminal(payload):
             tab["terminal_known"] = True
@@ -3634,18 +3649,18 @@ class ProductionQa:
             if tab.get("abort_once"):
                 tab["abort_once"] = False
                 tab["abort_next"] = True
-                await self.execute_browser_polling_request(api_client, tab, inflight)
+                await execute_polling_request()
                 continue
             if route_label == "GET /tournaments/{slug}/bracket" and not duplicate_probe_done:
                 duplicate_probe_done = True
                 first = asyncio.create_task(
-                    self.execute_browser_polling_request(api_client, tab, inflight)
+                    execute_polling_request()
                 )
                 await asyncio.sleep(0)
-                await self.execute_browser_polling_request(api_client, tab, inflight)
+                await execute_polling_request()
                 payload = await first
             else:
-                payload = await self.execute_browser_polling_request(api_client, tab, inflight)
+                payload = await execute_polling_request()
             raw_delay_ms = self.extract_next_poll_delay_ms(payload)
             if raw_delay_ms == 0 or self.payload_is_terminal(payload):
                 tab["terminal_known"] = True

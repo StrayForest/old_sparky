@@ -738,6 +738,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 "profile": "combined-polling-with-sse",
                 "duration_seconds": args.combined_polling_duration,
                 "open_stagger_seconds": args.combined_polling_open_stagger,
+                "request_concurrency": max(1, min(128, qa.concurrency)),
                 "tabs_planned": len(tabs),
                 "visible_tabs": sum(1 for tab in tabs if not tab["hidden_after_open"]),
                 "hidden_tabs": sum(1 for tab in tabs if tab["hidden_after_open"]),
@@ -745,6 +746,8 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             }
             with qa.phase("combined_sse_and_polling"):
                 inflight: set[str] = set()
+                polling_request_gate = asyncio.Semaphore(max(1, min(128, qa.concurrency)))
+
                 async def run_polling() -> None:
                     await asyncio.gather(
                         *(
@@ -753,6 +756,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                                 tab,
                                 profile_duration=args.combined_polling_duration,
                                 inflight=inflight,
+                                request_gate=polling_request_gate,
                             )
                             for tab in tabs
                         )
@@ -779,17 +783,30 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     polling_open_stagger_seconds=args.combined_polling_open_stagger,
                     http_timeout_seconds=args.http_timeout,
                 )
-                try:
-                    _, sse_report = await asyncio.wait_for(
-                        asyncio.gather(polling_task, sse_task),
-                        timeout=combined_timeout,
-                    )
-                except TimeoutError as exc:
+                done, pending = await asyncio.wait(
+                    {polling_task, sse_task},
+                    timeout=combined_timeout,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+                if pending:
+                    for task in pending:
+                        task.cancel()
+                    with suppress(asyncio.TimeoutError, TimeoutError):
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending, return_exceptions=True),
+                            timeout=5.0,
+                        )
                     qa.report["combined_execution_timeout_seconds"] = combined_timeout
                     raise RuntimeError(
                         "combined workload exceeded its bounded execution budget "
                         f"of {combined_timeout:.1f}s"
-                    ) from exc
+                    )
+                results = [task.result() for task in done]
+                sse_report = next(
+                    result
+                    for result in results
+                    if isinstance(result, dict) and "metrics" in result
+                )
             qa.report["polling"].update(qa.polling_metrics.summary())
             qa.report["sse"] = sse_report
             qa.scenario(
@@ -926,6 +943,7 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
         },
         "polling": {
             "tabs_planned": polling.get("tabs_planned"),
+            "request_concurrency": polling.get("request_concurrency"),
             "executed": polling.get("executed"),
             "errors": polling.get("errors"),
             "not_modified": polling.get("not_modified"),
