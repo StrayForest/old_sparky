@@ -14,6 +14,7 @@ from tools.platform_sse_qa import (
     SSE_EVENT_TYPE,
     SseMetrics,
     _close_sse_stream_context,
+    combined_profile_timeout_seconds,
     summary,
 )
 
@@ -97,6 +98,24 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         await _close_sse_stream_context(SlowContext())
 
         self.assertLess(asyncio.get_running_loop().time() - started, 1)
+
+    def test_combined_profile_has_a_bounded_execution_budget(self) -> None:
+        self.assertEqual(
+            combined_profile_timeout_seconds(
+                polling_duration_seconds=30,
+                polling_open_stagger_seconds=60,
+                http_timeout_seconds=10,
+            ),
+            115,
+        )
+        self.assertEqual(
+            combined_profile_timeout_seconds(
+                polling_duration_seconds=1,
+                polling_open_stagger_seconds=0,
+                http_timeout_seconds=1,
+            ),
+            30,
+        )
 
     def test_error_samples_keep_bounded_stream_correlation(self) -> None:
         metrics = SseMetrics()
@@ -232,6 +251,7 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("platform_sse_qa.py", supervisor)
         self.assertIn('sse_setup_concurrency=20', supervisor)
         self.assertIn('--concurrency "$sse_setup_concurrency"', supervisor)
+        self.assertIn('--http-timeout 10', supervisor)
         self.assertIn('--request-origin "$EXPECTED_ORIGIN"', supervisor)
         self.assertIn('--sse-open-timeout "$sse_open_timeout"', supervisor)
         self.assertIn('sse_origin="http://127.0.0.1:8010"', supervisor)

@@ -181,8 +181,9 @@ rate, edge errors and API CPU at each timeout.
   not evidence against the candidate.
 - The bounded-admission candidate `c7874f3b` passed exact-SHA security/build
   `32958837837`, automatic deploy `32959335972` and production deploy/live
-  smoke `32959345140`. The browser jitter/default-timeout change is the next
-  local candidate and has not yet been promoted.
+  smoke `32959345140`. The browser jitter/default-timeout candidate `e772bd76`
+  passed exact-SHA security/build `32960850480`, automatic deploy `32961358905`
+  and production deploy/live smoke `32961367264`; it is live on production.
 
 ## Bounded admission follow-up
 
@@ -235,3 +236,31 @@ revision poll within a maximum 500ms after fallback. Local web lint, build,
 typecheck and the focused stalled-SSE Playwright test pass. The next public
 A/B must verify that this reduces edge-held abandoned streams before any
 additional capacity claim.
+
+## Public 10k fallback diagnostic and combined-run recovery
+
+The deployed `e772bd76` public SSE-only run `32961754619` created 10,000 users
+and 20 tournaments, then classified all 10,000 SSE attempts as fallback
+eligible within the 1-second open budget. It produced zero HTTP 200 streams,
+zero errors/429/503/1200 and zero active SSE connections. Server CPU averaged
+58.0% for `deadlock-api` and 26.5% for PostgreSQL; sustained CPU saturation and
+lock contention were false. This is a valid fast-fallback result, not proof of
+10,000 persistent public SSE capacity. Exact cleanup `32962201314` removed the
+fixture and preserved the control account.
+
+The first combined public contour (`32962289708`, 1,000 SSE plus 10,000
+polling tabs) was canceled after about 10 minutes without a summary. Abort
+evidence showed the load-generator Python process at roughly 98% CPU while API
+workers were only 2–3%; the test was measuring its own 512-connection queue and
+180-second request timeout rather than the VPS. Exact abort `32964342080`
+stopped only that process tree. Exact cleanup `32964417347` then recovered the
+durable manifest and deleted 10,000 users and 20 tournaments, leaving zero
+users, tournaments, sessions or audit rows and preserving
+`aleksei.lisitsin1@gmail.com`.
+
+The retained-load harness now bounds workload HTTP requests to 10 seconds,
+closes SSE tasks and clients on cancellation, and bounds combined execution to
+`open_stagger + polling_duration + request_timeout + 15s` (115s for the
+previous parameters). A timeout is recorded as a diagnostic FAIL and still
+emits the exact cleanup manifest; it cannot occupy the VPS for the 180-minute
+supervisor limit. The focused SSE QA/unittest and shell syntax checks pass.

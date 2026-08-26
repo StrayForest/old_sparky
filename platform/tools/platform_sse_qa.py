@@ -41,6 +41,7 @@ from tools.platform_production_qa import (
 DEFAULT_REPORT_PATH = Path("/tmp/platform-sse-qa-report.json")
 DEFAULT_ORIGIN = "http://127.0.0.1"
 SSE_EVENT_TYPE = "qa_sse_probe"
+COMBINED_TIMEOUT_GRACE_SECONDS = 15.0
 SSE_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
 
 
@@ -215,7 +216,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--combined-polling-open-stagger", type=float, default=300.0)
     parser.add_argument("--concurrency", type=int, default=20)
     parser.add_argument("--http-max-connections", type=int, default=40)
-    parser.add_argument("--http-timeout", type=float, default=180.0)
+    parser.add_argument(
+        "--http-timeout",
+        type=float,
+        default=10.0,
+        help="Bound each workload HTTP request so edge queues become a measured failure, not a multi-minute wait.",
+    )
     parser.add_argument("--system-sample-interval", type=float, default=1.0)
     parser.add_argument("--keep-data", action="store_true")
     args = parser.parse_args()
@@ -592,31 +598,63 @@ async def run_connections(
         )
         for user, tournament in connections
     ]
-    await all_attempts_done.wait()
-    await asyncio.sleep(min(2.0, max(0.1, duration_seconds / 4)))
-    publisher = asyncio.create_task(
-        publish_probe_events(
-            [str(tournament["id"]) for tournament in tournaments],
-            count=event_count,
-            interval_seconds=event_interval,
+    publisher: asyncio.Task[None] | None = None
+    try:
+        await all_attempts_done.wait()
+        await asyncio.sleep(min(2.0, max(0.1, duration_seconds / 4)))
+        publisher = asyncio.create_task(
+            publish_probe_events(
+                [str(tournament["id"]) for tournament in tournaments],
+                count=event_count,
+                interval_seconds=event_interval,
+            )
         )
+        await asyncio.gather(*tasks)
+        await publisher
+        return {
+            "profile": "sse-only",
+            "target_connections": connection_count,
+            "duration_seconds": duration_seconds,
+            "open_concurrency": open_concurrency,
+            "open_timeout_seconds": open_timeout_seconds,
+            "reconnect_cycles": reconnect_cycles,
+            "probe_event_count": event_count,
+            "probe_event_interval_seconds": event_interval,
+            "expected_events": metrics.counters["initial_connected"] * max(0, event_count),
+            "application_global_admission_limit": SSE_GLOBAL_LIMIT,
+            "load_generator_resources": load_generator_resource_limits(),
+            "metrics": metrics.summary(),
+        }
+    finally:
+        if publisher is not None and not publisher.done():
+            publisher.cancel()
+        if publisher is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                await publisher
+        pending_tasks = [task for task in tasks if not task.done()]
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        with suppress(Exception):
+            await sse_client.aclose()
+
+
+def combined_profile_timeout_seconds(
+    *,
+    polling_duration_seconds: float,
+    polling_open_stagger_seconds: float,
+    http_timeout_seconds: float,
+) -> float:
+    """Bound a combined run after the last virtual tab is allowed to open."""
+
+    return max(
+        30.0,
+        max(0.0, polling_open_stagger_seconds)
+        + max(1.0, polling_duration_seconds)
+        + max(1.0, http_timeout_seconds)
+        + COMBINED_TIMEOUT_GRACE_SECONDS,
     )
-    await asyncio.gather(*tasks)
-    await publisher
-    return {
-        "profile": "sse-only",
-        "target_connections": connection_count,
-        "duration_seconds": duration_seconds,
-        "open_concurrency": open_concurrency,
-        "open_timeout_seconds": open_timeout_seconds,
-        "reconnect_cycles": reconnect_cycles,
-        "probe_event_count": event_count,
-        "probe_event_interval_seconds": event_interval,
-        "expected_events": metrics.counters["initial_connected"] * max(0, event_count),
-        "application_global_admission_limit": SSE_GLOBAL_LIMIT,
-        "load_generator_resources": load_generator_resource_limits(),
-        "metrics": metrics.summary(),
-    }
 
 
 async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
@@ -743,7 +781,22 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                         http_max_connections=max(args.http_max_connections, args.sse_connections),
                     )
                 )
-                _, sse_report = await asyncio.gather(polling_task, sse_task)
+                combined_timeout = combined_profile_timeout_seconds(
+                    polling_duration_seconds=args.combined_polling_duration,
+                    polling_open_stagger_seconds=args.combined_polling_open_stagger,
+                    http_timeout_seconds=args.http_timeout,
+                )
+                try:
+                    _, sse_report = await asyncio.wait_for(
+                        asyncio.gather(polling_task, sse_task),
+                        timeout=combined_timeout,
+                    )
+                except TimeoutError as exc:
+                    qa.report["combined_execution_timeout_seconds"] = combined_timeout
+                    raise RuntimeError(
+                        "combined workload exceeded its bounded execution budget "
+                        f"of {combined_timeout:.1f}s"
+                    ) from exc
             qa.report["polling"].update(qa.polling_metrics.summary())
             qa.report["sse"] = sse_report
             qa.scenario(
@@ -882,6 +935,9 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
         "performance_collection_error": report.get("performance_collection_error"),
         "performance_collection_traceback": report.get(
             "performance_collection_traceback"
+        ),
+        "combined_execution_timeout_seconds": report.get(
+            "combined_execution_timeout_seconds"
         ),
         "scenarios": report.get("scenarios", []),
         "rows": [{

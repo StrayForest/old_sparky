@@ -276,6 +276,7 @@ elif [[ "$profile" == "browser-polling" ]]; then
     --origin "$EXPECTED_ORIGIN" \
     --concurrency "$browser_setup_concurrency" \
     --http-max-connections "$browser_http_connections" \
+    --http-timeout 10 \
     --browser-polling-duration 30 \
     --browser-polling-open-stagger 300 \
     --collect-performance \
@@ -398,6 +399,7 @@ else
     --combined-polling-open-stagger "$combined_polling_open_stagger" \
     --concurrency "$sse_setup_concurrency" \
     --http-max-connections "$HTTP_MAX_CONNECTIONS" \
+    --http-timeout 10 \
     --report-path "$sse_report" \
     --summary-path "$sse_summary" \
     --keep-data
