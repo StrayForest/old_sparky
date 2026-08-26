@@ -23,12 +23,39 @@ about 3,500 concurrent streams while the VPS still had no sustained CPU,
 PostgreSQL or lock saturation. The selected next hypothesis lowers only the
 application global ceiling to `3,000`, leaving Nginx at `10,240`, so excess
 viewers receive a fast application `429` and can use polling rather than wait
-in the Cloudflare edge queue. The production load runner uses a signed,
-secret-derived QA header to bypass only the application per-source bucket;
-global, per-user, Redis fail-closed and Nginx limits remain active. Ordinary
-clients never receive this bypass. These are capacity ceilings, not a claim
+in the Cloudflare edge queue. Current public retained-load runs send no
+source-bucket bypass header: application global/source, per-user, Redis
+fail-closed and Nginx limits remain active. These are capacity ceilings, not a claim
 that a single VPS can sustain 10,000 persistent streams; 10,000 virtual users
 must be measured as a mixed active-SSE/passive-polling workload.
+
+## Current public combined-load checkpoint
+
+Baseline `3d09aa0a`; public runs `1787697719` (1k), `1787698223` (5k), and
+`1787698626` (10k, pool40) passed with exact cleanup. Pool512 run `1787699600`
+(cleanup `1787699601`) removed generator queueing but showed CPU ~91% and peak
+pool wait ~1.9s. The selected contour is the frontend-aligned lean workspace
+contract (`include_current_user=false`) with client pool512; F1 `1787700510`
+(stagger 450s) and F2 `1787700610` (600s) passed. F2 was best: p95/p99
+262/388ms, CPU ~49.6%, zero errors, 1,201 conditional 304s, 32/32 SSE events.
+These runs open only 32 SSE, not 10,000 persistent SSE. Local DB integration
+remains blocked by the developer `platformdb_test` password and is a CI item.
+
+Workspace follow-up results are recorded here before any commit or CI release:
+
+| Run | Variant | Result | Key evidence |
+| --- | --- | --- | --- |
+| `1787700510` | lean, pool512, stagger450s | PASS | p95/p99 279/435ms; CPU 59.4%; 0 errors |
+| `1787700610` | lean, pool512, stagger600s | BEST | p95/p99 262/388ms; CPU 49.6%; 0 errors |
+| `1787700710` | lean, pool256, stagger300s | FAIL | 9 workspace 500s from pool16 timeout |
+| `1787700810` | viewer `bracket_summary` | PASS, not best | p95/p99 365/647ms; CPU 86.4% |
+| `1787700910` | server early workspace `304` | FAIL | 20 errors; 18 workspace 500s from pool16 timeout |
+
+Every run used the public domain without a bypass and was cleaned immediately;
+each removed 10,000 users and 20 tournaments, left zero fixture rows and
+preserved the control account. The early-304 live patch was restored byte-for-byte
+to baseline and health returned 200; it is rejected because first reads still
+need the pool and extra preflight work did not prevent timeouts.
 
 ## Ordered protocol
 
@@ -261,26 +288,16 @@ broad database delete.
 
 ## Results
 
-Results are added after the CI/deploy gate and each production run. Detailed
-JSON and bounded logs remain in the GitHub artifacts/VPS run root; this document
-stores only the measured conclusion and run identifiers.
-
-- Limit candidate CI/deploy: `32819954714` / production `32820833942` passed for
-  `da1435c`. Signed QA-bypass and failed-run summary fix: exact CI
-  `32826238833`, auto-deploy `32826794523`, production deploy/live smoke
-  `32826801617`, all passed for `39499dfc`.
-- Local ten-hypothesis A/B classification: complete for the origin transport
-  contour; production/CI matrix remains pending by design.
-- Local five follow-up variants around the relay winner: complete for the
-  transport contour; slow-consumer/reconnect correctness and production matrix
-  remain pending.
-- Combined 10,000-user SSE + polling gate: pending.
-- The local origin probe is `platform/tools/platform_sse_origin_probe.py` and
-  runs only with `PLATFORM_ENVIRONMENT=test`, `platformdb_test`, Redis DB 15
-  and a loopback origin. It clears only its exact test admission key and
-  deletes its exact tournament/user fixture in `finally`.
-- Local staircase evidence, using a barrier so all attempts reached terminal
-  status before the event probe:
+Results are added after each measured run. Detailed JSON and bounded logs remain
+in the VPS run root; the pre-release workspace A/Bs above were intentionally
+run directly on the public server before committing or starting CI. The next
+release gate is to keep only the selected, measured changes, update tests/docs,
+commit to `dev`, then wait for exact-SHA security/build, auto-deploy and live
+smoke. A combined 10,000-user SSE + polling gate remains required after that
+release candidate is verified.
+- Local origin probe: `platform/tools/platform_sse_origin_probe.py` uses only
+  `PLATFORM_ENVIRONMENT=test`, `platformdb_test`, Redis DB 15 and exact cleanup.
+- Local staircase evidence uses a barrier so all attempts reach terminal status:
 
   | Profile | Result | Connect p95 | Redis peak | PostgreSQL peak |
   | --- | --- | ---: | ---: | ---: |
@@ -291,13 +308,10 @@ stores only the measured conclusion and run identifiers.
   | 5k, worker/tournament relay | 5,000/5,000 HTTP 200; 15,000/15,000 events | 99.3s | 4,602 | 31 |
   | 10k, relay + blocking limiter pool | 10,000/10,000 HTTP 200; 10,000/10,000 events | 309.4s | 146 | 31 |
 
-  The final 10k local run held the streams for 30 seconds after a 5-second
-  settle period, took 425.2 seconds end to end, had zero probe errors, API
-  peak 10,000, load-1m peak 1.72 and Redis `rejected_connections` delta 0.
-  PostgreSQL connections stayed at 31 rather than growing with active SSE.
-  The 10-second hold variant delivered only 167 events before its readers
-  drained; it was rejected as a measurement shape and repeated with the
-  settle/hold profile before selecting the winner.
+  The final 10k local run held streams 30s after a 5s settle, took 425.2s,
+  had zero probe errors, API peak 10,000, load-1m peak 1.72, Redis rejected
+  delta 0 and PostgreSQL fixed at 31 connections. The 10s hold variant
+  delivered only 167 events and was rejected before the settle/hold repeat.
 - Diagnostic H1 attempt `32823477661` did not reach a valid SSE result: the
   setup completed, but the application source bucket held at 32 (`connected=171`,
   `max_active=32`, `rejected_other=829`, `errors=149`, no events). It was
@@ -544,24 +558,10 @@ stores only the measured conclusion and run identifiers.
   as `server-observability.log` beside the compact matrix summary, so a future
   setup stall can be classified while it is occurring instead of inferred only
   from the final CI status.
-- The ANALYZE diagnostic run `32874380384` exceeded the ten-minute observation
-  window and was stopped by exact abort `32875410391`; the first observer-enabled
-  rerun `32877021919` behaved the same and was stopped by `32878007693`. Neither
-  produced a completed matrix summary, so neither is a capacity measurement.
-  Exact cleanups `32875508695` and `32878057962` removed their
-  10,000-user/20-tournament fixtures and preserved the control account. The
-  abort workflow now exports partial matrix/QA/server logs and an exact process
-  snapshot before cleanup. The observer samples every five seconds and bounds
-  journalctl to 4,000 records to avoid an unbounded post-run collection phase.
-- The first complete observer-enabled 1,000-SSE diagnostic (`32879752207`) did
-  not reach a production admission limit: the load generator exited with
-  `IndexError: list index out of range` before producing a valid matrix summary.
-  VPS snapshots showed the generator around 80--90% CPU, unchanged Redis
-  `rejected_connections` during the run and no sampled PostgreSQL lock wait.
-  The runner now preserves the full traceback, separates performance-summary
-  failures from the primary error and exports raw `qa-command.log`. Exact
-  cleanup `32880184859` removed the fixture and preserved the control account;
-  this run is invalid and is not included in the SSE staircase.
+- Two observer-enabled setup attempts were aborted after exact cleanup because
+  no valid matrix summary was produced. The supervisor now retains bounded VPS
+  snapshots, raw QA traceback and partial reports; neither attempt is a
+  capacity measurement.
 - The next observer-enabled 1,000-SSE run (`32881488410`) reached the
   application cleanly: 1,000/1,000 connections returned HTTP 200, with zero
   errors, 429s or 503s, and all 1,000 expected events delivered. Connect

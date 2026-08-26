@@ -121,6 +121,43 @@ class ProductionQaPollingProfileTests(unittest.TestCase):
         self.assertEqual(qa.browser_polling_state_participant_count(users), 32)
         self.assertEqual(qa.browser_polling_state_participant_count(users[:10]), 9)
 
+    def test_browser_polling_workspace_reads_use_the_frontend_lean_contract(self) -> None:
+        qa = ProductionQa(
+            origin="http://127.0.0.1",
+            report_path=Path("/tmp/platform-production-qa-route-contract-test.json"),
+            browser_gate_dir=None,
+            browser_gate_timeout=1.0,
+            http_timeout=1.0,
+            keep_data=True,
+            mode="browser-polling",
+            scale_users=2_000,
+            browser_polling_users_per_tournament=500,
+        )
+        tournaments = [
+            {"slug": "registration", "category": "registration_open"},
+            {"slug": "bracket", "category": "bracket_active"},
+        ]
+        users = [
+            [{"id": f"user-{index}-{offset}"} for offset in range(1_000)]
+            for index in range(2)
+        ]
+
+        tabs = qa.build_browser_polling_tabs(
+            tournaments=tournaments,
+            user_chunks=users,
+        )
+        workspace_tabs = [
+            tab
+            for tab in tabs
+            if tab["route_label"] == "GET /tournaments/{slug}/workspace"
+        ]
+        workspace_routes = [str(tab["route"]) for tab in workspace_tabs]
+
+        self.assertTrue(workspace_routes)
+        self.assertTrue(
+            all("include_current_user=false" in route for route in workspace_routes)
+        )
+
     def test_browser_polling_defaults_to_10000_virtual_users(self) -> None:
         qa = ProductionQa(
             origin="http://127.0.0.1",

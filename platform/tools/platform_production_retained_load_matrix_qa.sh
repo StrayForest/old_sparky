@@ -14,6 +14,12 @@ CONFIRMATION="RUN-PRODUCTION-RETAINED-LOAD-MATRIX"
 LOCK_PATH="/run/lock/oldsparky-retained-load-matrix.lock"
 EXPECTED_ORIGIN="https://old-sparky.com"
 MAX_RUNTIME="180m"
+HTTP_MAX_CONNECTIONS="${PLATFORM_QA_HTTP_MAX_CONNECTIONS:-512}"
+
+if [[ ! "$HTTP_MAX_CONNECTIONS" =~ ^[1-9][0-9]{0,4}$ ]] || (( HTTP_MAX_CONNECTIONS > 10000 )); then
+  echo "PLATFORM_QA_HTTP_MAX_CONNECTIONS must be an integer from 1 to 10000." >&2
+  exit 1
+fi
 
 if [[ "$EUID" -ne 0 ]]; then
   echo "Production retained load matrix supervisor must run as root." >&2
@@ -254,7 +260,7 @@ elif [[ "$profile" == "browser-polling" ]]; then
   # The measured 10k profile uses a bounded client pool.  The previous
   # concurrency*4 rule opened 320 connections for the normal concurrency=80
   # dispatch and exhausted the API database pool before the VPS CPU was busy.
-  browser_http_connections=40
+  browser_http_connections="$HTTP_MAX_CONNECTIONS"
   browser_setup_concurrency=20
   set +e
   run_monitored "$log_path" \
@@ -359,6 +365,11 @@ else
   # Fixture creation performs authenticated CSRF/session reads. Keep that
   # setup below the API pool budget; SSE opening pressure is controlled
   # independently by --sse-open-concurrency below.
+  # Keep setup concurrency bounded separately from the client connection
+  # ceiling. A 40-connection pool makes a 10k browser profile measure the
+  # load generator's own queue instead of the public origin. The API pool
+  # remains bounded server-side; this only lets the public client contour
+  # expose origin saturation when many tabs become ready together.
   sse_setup_concurrency=20
   set +e
   run_monitored "$log_path" \
@@ -380,7 +391,7 @@ else
     --combined-polling-duration "$combined_polling_duration" \
     --combined-polling-open-stagger "$combined_polling_open_stagger" \
     --concurrency "$sse_setup_concurrency" \
-    --http-max-connections 40 \
+    --http-max-connections "$HTTP_MAX_CONNECTIONS" \
     --report-path "$sse_report" \
     --summary-path "$sse_summary" \
     --keep-data

@@ -3392,6 +3392,7 @@ class ProductionQa:
                             f"/tournaments/{slug}/workspace"
                             "?participants_limit=0&participants_offset=0"
                             "&workspace_view=bracket_summary"
+                            "&include_current_user=false"
                         )
                         route_label = "GET /tournaments/{slug}/workspace"
                 elif category != "terminal":
@@ -3399,6 +3400,7 @@ class ProductionQa:
                         f"/tournaments/{slug}/workspace"
                         "?participants_limit=0&participants_offset=0"
                         "&workspace_view=detail"
+                        "&include_current_user=false"
                     )
                     route_label = "GET /tournaments/{slug}/workspace"
                 tabs.append(

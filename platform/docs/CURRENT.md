@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-25
+- Last reviewed: 2026-08-26
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -79,26 +79,18 @@ completed all 20 tournaments and 11,659 polling GETs, including 1,201
 conditional `304` responses, with p95 433ms/p99 700ms and no sustained CPU,
 connection or lock saturation. Exact cleanup (`32803657743`) deleted 10,000
 users and 20 tournaments, left zero fixture users/tournaments/sessions/audit
-rows and preserved the control account. The required ten A/B experiments and
-five follow-up variants are now complete; the selected profile is the bounded
-active/passive mix with HTTP40, 300s opening stagger, 30s polling window and
-API pool 12+0.
-The load work required a ten-run controlled A/B matrix followed by five
-follow-up variants around the winning configuration; that matrix is complete.
-The winner was selected by zero errors/cleanup first, then latency, CPU and
-pool wait, not by raw throughput alone.
+  rows and preserved the control account. The transport ten-hypothesis matrix
+  and its five follow-ups are complete. The current combined-load winner is the
+  frontend-aligned lean workspace contract with client pool512 and a 600s
+  opening stagger; F2 was selected by zero errors first, then p95/p99, CPU and
+  pool wait rather than raw throughput.
 
-AS-19 — SSE capacity and combined-load measurement is in progress. The
-reviewed runner adds separate SSE-only and polling+SSE profiles to the existing
-production retained-load workflow, with exact cleanup/recovery/abort support.
-The limit candidate raises the previously observed Nginx/app admission
-ceilings and manages the Nginx main worker connection capacity. The first
-post-deploy diagnostic stopped at the application per-source bucket of 32, so
-the runner now carries a signed QA-only bypass for that bucket while retaining
-global, per-user, Redis and Nginx admission. Failed runs also export compact
-metrics for diagnosis. The required ten hypotheses followed by five variants
-around the winner are specified in the protocol and acceptance rules maintained
-in [`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md).
+AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
+runner adds separate SSE-only and polling+SSE profiles with exact
+cleanup/recovery support. Public tests send no source-bucket bypass: Cloudflare,
+Nginx, Redis admission and application caps remain active. Failed runs export
+compact server metrics; the ten hypotheses and five follow-ups are specified in
+[`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md).
 
 The local loopback origin staircase now passes the selected transport contour:
 the worker/tournament relay plus coalesced authorization and a shared blocking
@@ -109,11 +101,11 @@ peak 31, no Redis rejection increase and no PostgreSQL connection growth with
 active SSE. Its p95 connection-open latency was 309.4s, so handshake speed and
 the combined polling+SSE profile remain release gates. This local result does
 not authorize a 10,000-persistent-SSE claim: the exact-SHA CI/deploy gate and
-live smoke passed, but the first guarded live diagnostic stopped during
-authenticated fixture setup before any SSE opened. The five follow-up
-correctness checks and the combined run are still required. The prior per-stream Redis
-shape is rejected at 10k because it produced 18 limiter `503`s and Redis peak
-10,000.
+ live smoke passed, but the first guarded live diagnostic stopped during
+ authenticated fixture setup before any SSE opened. The prior per-stream Redis
+ shape is rejected at 10k because it produced 18 limiter `503`s and Redis peak
+ 10,000. Combined public runs below open 32 SSE and therefore do not prove
+ 10,000 persistent SSE capacity.
 
 The relay winner is deployed in `4f4b5863207e37cc2c9993be8d03f0cb72d10a66`;
 security/build `32865611322`, automatic deploy `32866234695` and production
@@ -210,28 +202,28 @@ admission to 3,000 and makes the browser close failed EventSource connections
 and use revision polling during a cooldown. Its public 5k run produced
 3,000 HTTP 200 SSE plus 2,000 fast app 429s, zero Cloudflare 1200/503/errors
 and all 3,000 events; successful-stream connect p95 was still 61.8s.
-The public mixed 10k profile then exposed a separate revalidation burst:
-`pool_wait_ms` reached about 4.4s and workspace/SSE requests returned 500s.
-Candidate `c7da9230` passed a public 1k mixed control through Cloudflare:
-1,000 users, 300/300 SSE 200, 300/300 events and 1,783 polling requests with
-zero errors; SSE connect p95 was 5.8s and event p95 322ms. Its public mixed
-10k run still produced API `QueuePool` 500s while SSE stayed 200: one worker's
-pool was exhausted by six stream-admission DB sessions plus polling. The next
-candidate reduces stream admission and revalidation to two per worker and
-coalesces public revalidation by tournament/slug; private viewer-specific
-authorization remains unchanged and fail-closed. Candidate `a3908a45` reduced
-early pool waits but its public 10k mixed run still hit 500s after 1,691 SSE;
-VPS snapshots showed ordinary and stream work sharing the API pool. The next
-candidate moves admission and revalidation to a bounded SSE-only pool of two
-connections per API worker, leaving the API pool isolated for polling.
+The public mixed 10k profile then exposed a separate revalidation burst. The
+optional-read authentication A/B was deployed as `3d09aa0a`; it removed the
+second `last_seen_at` checkout from read routes while preserving mutation
+touches and SSE revalidation. Public 1k (`1787697719`) and 5k
+(`1787698223`) combined runs passed through Cloudflare with zero errors and
+exact cleanup. The 10k run with the default HTTP client pool of 40
+(`1787698626`, cleaned by `1787698627`) also had zero errors, 304s and
+Cloudflare/5xx/429/503 responses, but its client p95 was about 80.6s because
+the load generator queued work behind its own 40-connection pool. The origin
+was materially faster but API CPU averaged about 84% and workspace origin p95
+was about 1.66s.
 
-To reduce repeated CI/CD runs, AS-19 uses one origin-local control only to
-separate origin from Nginx/edge closes, then treats public Cloudflare runs as
-the acceptance contour. Compare Redis TCP connections with active SSE and
-reject candidates that produce edge 1200s before promoting them.
-The benchmark document records the completed ten local A/B classifications and
-five transport follow-ups; full delta-response measurement and
-slow-consumer/reconnect correctness remain open before live promotion.
+The corrected 10k public A/B with HTTP pool512 (`1787699600`, cleaned by
+`1787699601`) removed generator queueing but averaged ~91% API CPU. The selected
+lean-contour F2 (`1787700610`, cleaned by `1787700611`) passed 10,000 users with
+11,659 polling requests, p95/p99 262/388ms, ~49.6% API CPU, 1,201 304s and
+zero errors; F1 also passed. F3 pool256 failed with 9 pool-timeout 500s, F4
+viewer `bracket_summary` passed but was slower (365/647ms, ~86.4% CPU), and
+F5 server early workspace `304` failed with 20 errors. The F5 live patch was
+removed, baseline hash restored and health returned 200. A local integration
+test is present but `platformdb_test` credentials are invalid; CI remains the
+release gate after the selected changes are committed.
 The first valid 1k run reached the application but failed with 500s while
 long-lived responses held request-scoped PostgreSQL connections; removing a
 duplicate QA-only session lookup was not sufficient. The next focused A/B

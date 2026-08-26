@@ -29,8 +29,6 @@ from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import dispose_engine
 from python_packages.platform_infra.sse_connection_limit import (
     SSE_GLOBAL_LIMIT,
-    SSE_LOAD_TEST_BYPASS_HEADER,
-    sse_load_test_bypass_token,
 )
 from tools.platform_production_qa import (
     BROWSER_POLLING_TOURNAMENT_PLAN,
@@ -340,7 +338,6 @@ async def consume_sse_connection(
         "Origin": qa.request_origin,
         "Cookie": f"{qa.session_cookie_name}={token}",
         "X-Platform-QA-Phase": qa.current_phase,
-        SSE_LOAD_TEST_BYPASS_HEADER: sse_load_test_bypass_token(get_settings()),
     }
     deadline: float | None = None
     cycles = max(0, reconnect_cycles)
