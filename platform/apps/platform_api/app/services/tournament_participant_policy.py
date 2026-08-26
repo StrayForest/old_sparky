@@ -4,7 +4,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from python_packages.platform_infra.db import get_db_session
+from python_packages.platform_infra.db import get_db_session, get_stream_db_session
 from python_packages.platform_infra.models import TournamentInvite, TournamentParticipant
 from python_packages.platform_infra.security import (
     get_optional_authenticated_session,
@@ -83,8 +83,8 @@ async def enforce_tournament_participant_policy(
 async def enforce_tournament_participant_policy_for_stream(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session_for_stream),
-    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+    db_session: AsyncSession = Depends(get_stream_db_session, scope="function"),
 ) -> None:
-    """Apply the participant policy without extending a DB session into SSE."""
+    """Apply the participant policy without reserving the ordinary API pool."""
 
     await enforce_tournament_participant_policy(request, auth_session, db_session)

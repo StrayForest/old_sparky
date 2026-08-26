@@ -72,6 +72,14 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(db_dependencies), 2)
         self.assertTrue(all(item.scope == "function" for item in db_dependencies))
 
+    def test_sse_router_does_not_reserve_the_ordinary_api_db_pool(self) -> None:
+        app = create_app()
+        route_context = self._route_context(
+            app,
+            "/api/v1/tournaments/{slug}/bracket/events",
+        )
+        self.assertEqual(self._db_dependencies(route_context, get_db_session), [])
+
     def test_sse_router_admits_authenticated_user_after_route_auth(self) -> None:
         app = create_app()
         route_context = self._route_context(
