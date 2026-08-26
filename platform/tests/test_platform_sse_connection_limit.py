@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from starlette.requests import Request
 
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.redis import redis_client
@@ -210,6 +214,67 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         )
         await stale.release()
         await replacement.release()
+
+    async def test_authenticated_user_scope_uses_route_auth_result(self) -> None:
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/tournaments/test/bracket/events",
+            "headers": [],
+            "client": ("127.0.0.1", 443),
+        }
+        lease = sse.SseConnectionLease(member="member", settings=self.settings)
+        scope[sse.SSE_CONNECTION_LEASE_SCOPE] = lease
+        auth_session = SimpleNamespace(user=SimpleNamespace(id="user-1"))
+
+        with patch.object(
+            sse.SseConnectionLease,
+            "add_user_scope",
+            new_callable=AsyncMock,
+        ) as add_user_scope:
+            await sse.admit_sse_authenticated_user(scope=Request(scope), auth_session=auth_session)
+
+        add_user_scope.assert_awaited_once_with("user-1")
+
+
+class PlatformSseConnectionMiddlewareTests(unittest.IsolatedAsyncioTestCase):
+    async def test_user_limit_failure_is_returned_as_controlled_429(self) -> None:
+        settings = get_settings()
+        lease = MagicMock(spec=sse.SseConnectionLease)
+        lease.release = AsyncMock()
+        sent_messages = []
+
+        async def app(_scope, _receive, _send):
+            raise sse.SseConnectionLimitExceeded("user")
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent_messages.append(message)
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/tournaments/test/bracket/events",
+            "headers": [],
+            "client": ("127.0.0.1", 443),
+        }
+        middleware = sse.SseConnectionLimitMiddleware(
+            app,
+            settings_factory=lambda: settings,
+        )
+
+        with patch.object(
+            sse,
+            "reserve_sse_connection",
+            new=AsyncMock(return_value=lease),
+        ):
+            await middleware(scope, receive, send)
+
+        self.assertEqual(sent_messages[0]["type"], "http.response.start")
+        self.assertEqual(sent_messages[0]["status"], 429)
+        lease.release.assert_awaited_once_with()
 
 
 class PlatformSseNginxGuardTests(unittest.TestCase):

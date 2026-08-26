@@ -7,27 +7,24 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Callable
 
+from fastapi import Depends
 from redis.asyncio import BlockingConnectionPool, Redis
 from redis.exceptions import RedisError
-from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from python_packages.platform_infra.auth_lifecycle import email_verification_required
 from python_packages.platform_infra.config import (
     PlatformSettings,
     get_settings,
     is_load_test_source,
 )
-from python_packages.platform_infra.db import session_factory
-from python_packages.platform_infra.models import User, UserSession
-from python_packages.platform_infra.security import session_token_digest
+from python_packages.platform_infra.security import (
+    get_optional_authenticated_session_for_stream,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +49,7 @@ SSE_LOAD_TEST_BYPASS_HEADER = "x-platform-qa-sse-bypass"
 SSE_LOAD_TEST_BYPASS_CONTEXT = b"platform-sse-load-test-v1"
 SSE_LIMITER_REDIS_POOL_MAX_CONNECTIONS = 64
 SSE_LIMITER_REDIS_POOL_TIMEOUT_SECONDS = 0.5
-SSE_LIMITER_DB_LOOKUP_TIMEOUT_SECONDS = 0.5
+SSE_CONNECTION_LEASE_SCOPE = "platform.sse_connection_lease"
 
 _limiter_redis_client: Redis | None = None
 
@@ -295,47 +292,6 @@ def _source_address(scope: Scope) -> str:
     return str(client[0])
 
 
-async def _authenticated_user_id(
-    scope: Scope,
-    settings: PlatformSettings,
-) -> str | None:
-    request = Request(scope)
-    token = request.cookies.get(settings.platform_session_cookie_name)
-    if not token:
-        return None
-
-    now = datetime.now(UTC)
-    predicates = [User.status == "active"]
-    if email_verification_required(settings):
-        predicates.append(
-            (User.email.is_(None)) | (User.email_verified_at.is_not(None))
-        )
-
-    try:
-        async with asyncio.timeout(SSE_LIMITER_DB_LOOKUP_TIMEOUT_SECONDS):
-            async with session_factory()() as db_session:
-                user_id = await db_session.scalar(
-                    select(UserSession.user_id)
-                    .join(User, User.id == UserSession.user_id)
-                    .where(
-                        UserSession.token_digest == session_token_digest(token),
-                        UserSession.invalidated_at.is_(None),
-                        UserSession.expires_at > now,
-                        *predicates,
-                    )
-                )
-    except (SQLAlchemyError, TimeoutError) as exc:
-        logger.info(
-            "SSE limiter user lookup failed closed; returning controlled admission response.",
-            exc_info=logger.isEnabledFor(logging.DEBUG),
-        )
-        raise SseConnectionLimiterUnavailable(
-            "SSE connection protection could not verify the session promptly."
-        ) from exc
-
-    return str(user_id) if user_id is not None else None
-
-
 class SseConnectionLimitMiddleware:
     def __init__(
         self,
@@ -370,55 +326,89 @@ class SseConnectionLimitMiddleware:
                 settings=settings,
                 bypass_source_limit=bypass_source_limit,
             )
-            # The signed QA probe uses one distinct session per virtual user and
-            # is already admitted through the route's normal auth dependency.
-            # Avoid a second session lookup in middleware for that probe only;
-            # real clients retain the authenticated-user cap and its lookup.
-            user_id = (
-                None
-                if bypass_source_limit
-                else await _authenticated_user_id(scope, settings)
-            )
-            if user_id is not None:
-                await lease.add_user_scope(user_id)
         except SseConnectionLimitExceeded as exc:
             if lease is not None:
                 await lease.release()
-            logger.warning(
-                "Rejected SSE connection: scope=%s source=%s",
-                exc.scope,
-                source_fingerprint,
-            )
-            response = JSONResponse(
-                {"detail": "Too many live-update connections. Try again shortly."},
-                status_code=429,
-                headers={
-                    "Retry-After": str(SSE_RETRY_AFTER_SECONDS),
-                    "Cache-Control": "no-store",
-                },
-            )
-            await response(scope, receive, send)
+            await self._send_limit_response(scope, receive, send, exc, source_fingerprint)
             return
         except SseConnectionLimiterUnavailable:
             if lease is not None:
                 await lease.release()
-            logger.error(
-                "Rejected SSE connection because the limiter backend is unavailable: source=%s",
-                source_fingerprint,
-            )
-            response = JSONResponse(
-                {"detail": "Live-update connection protection is temporarily unavailable."},
-                status_code=503,
-                headers={
-                    "Retry-After": str(SSE_RETRY_AFTER_SECONDS),
-                    "Cache-Control": "no-store",
-                },
-            )
-            await response(scope, receive, send)
+            await self._send_unavailable_response(scope, receive, send, source_fingerprint)
             return
 
+        scope[SSE_CONNECTION_LEASE_SCOPE] = lease
         try:
             await self.app(scope, receive, send)
+        except SseConnectionLimitExceeded as exc:
+            await self._send_limit_response(scope, receive, send, exc, source_fingerprint)
+        except SseConnectionLimiterUnavailable:
+            await self._send_unavailable_response(scope, receive, send, source_fingerprint)
         finally:
             if lease is not None:
                 await lease.release()
+            scope.pop(SSE_CONNECTION_LEASE_SCOPE, None)
+
+    @staticmethod
+    async def _send_limit_response(
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        exc: SseConnectionLimitExceeded,
+        source_fingerprint: str,
+    ) -> None:
+        logger.warning(
+            "Rejected SSE connection: scope=%s source=%s",
+            exc.scope,
+            source_fingerprint,
+        )
+        response = JSONResponse(
+            {"detail": "Too many live-update connections. Try again shortly."},
+            status_code=429,
+            headers={
+                "Retry-After": str(SSE_RETRY_AFTER_SECONDS),
+                "Cache-Control": "no-store",
+            },
+        )
+        await response(scope, receive, send)
+
+    @staticmethod
+    async def _send_unavailable_response(
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        source_fingerprint: str,
+    ) -> None:
+        logger.error(
+            "Rejected SSE connection because the limiter backend is unavailable: source=%s",
+            source_fingerprint,
+        )
+        response = JSONResponse(
+            {"detail": "Live-update connection protection is temporarily unavailable."},
+            status_code=503,
+            headers={
+                "Retry-After": str(SSE_RETRY_AFTER_SECONDS),
+                "Cache-Control": "no-store",
+            },
+        )
+        await response(scope, receive, send)
+
+
+async def admit_sse_authenticated_user(
+    request: Request,
+    auth_session=Depends(get_optional_authenticated_session_for_stream),
+) -> None:
+    """Attach the authenticated-user lease after the route auth check.
+
+    The middleware intentionally reserves only global/source capacity. The
+    route dependency already performs the authoritative session and visibility
+    checks using the bounded stream DB session; re-querying the same cookie in
+    middleware creates avoidable DB pressure during a handshake burst.
+    """
+
+    if auth_session is None:
+        return
+    lease = request.scope.get(SSE_CONNECTION_LEASE_SCOPE)
+    if not isinstance(lease, SseConnectionLease):
+        raise RuntimeError("SSE connection lease is missing from the request scope.")
+    await lease.add_user_scope(str(auth_session.user.id))

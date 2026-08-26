@@ -11,6 +11,7 @@ from apps.platform_api.app.services.tournament_workspace_access import (
     TournamentStreamAccessContext,
 )
 from python_packages.platform_infra.db import get_db_session, get_stream_db_session
+from python_packages.platform_infra.sse_connection_limit import admit_sse_authenticated_user
 
 
 class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
@@ -60,6 +61,37 @@ class PlatformBracketStreamRouteTests(unittest.IsolatedAsyncioTestCase):
         ).parameters["db_session"]
         self.assertEqual(parameter.default.scope, "function")
         self.assertIs(parameter.default.dependency, get_stream_db_session)
+
+    def test_sse_router_auth_and_access_share_stream_db_dependency(self) -> None:
+        app = create_app()
+        route_context = self._route_context(
+            app,
+            "/api/v1/tournaments/{slug}/bracket/events",
+        )
+        db_dependencies = self._db_dependencies(route_context, get_stream_db_session)
+        self.assertGreaterEqual(len(db_dependencies), 2)
+        self.assertTrue(all(item.scope == "function" for item in db_dependencies))
+
+    def test_sse_router_admits_authenticated_user_after_route_auth(self) -> None:
+        app = create_app()
+        route_context = self._route_context(
+            app,
+            "/api/v1/tournaments/{slug}/bracket/events",
+        )
+        dependencies = []
+
+        def collect(dependant) -> None:
+            if dependant.call is admit_sse_authenticated_user:
+                dependencies.append(dependant)
+            for child in dependant.dependencies:
+                collect(child)
+
+        collect(route_context.dependant)
+        self.assertEqual(len(dependencies), 1)
+        self.assertEqual(
+            dependencies[0].dependencies[0].call.__name__,
+            "get_optional_authenticated_session_for_stream",
+        )
 
     async def test_sse_endpoint_reuses_stream_access_participant_snapshot(self) -> None:
         tournament = SimpleNamespace(id="tournament-1")

@@ -375,7 +375,7 @@ async def ensure_private_tournament_read_membership_is_active(
 async def ensure_private_tournament_read_membership_is_active_for_stream(
     request: Request,
     auth_session=Depends(get_optional_authenticated_session_for_stream),
-    db_session: AsyncSession = Depends(get_db_session, scope="function"),
+    db_session: AsyncSession = Depends(get_stream_db_session, scope="function"),
 ) -> None:
     """Apply private-read authorization with endpoint-scoped DB access."""
 
