@@ -358,3 +358,22 @@ participant mutations, and remains an optimization of public representation
 data rather than authoritative state. H4 must be rejected if the mixed contour
 shows stale permission-sensitive fields, incorrect ETags/304s, unexpected
 errors, or no measurable reduction in API CPU/route latency.
+
+The first H4 dispatch `32986215002` is excluded from ranking: it used a `600s`
+polling stagger while the H2/H3 comparison contour used the `85s` bounded
+diagnostic budget, and its SSE subprofile returned three live-update `503`s.
+Exact cleanup `32986648873` removed 10,000 users and one tournament and
+verified zero synthetic users, tournaments, sessions and audit rows.
+
+The corrected same-shape H4 run `32986759039` reached the same `85s` bounded
+diagnostic budget. It executed 5,093 workspace requests before the combined
+task timeout, with client p50/p95/p99 `297/586/773ms`; server workspace
+p50/p95/p99 was `359/743/1,268ms`. Workspace SQL fell to `4.08` queries/request
+and `163.8ms` DB time, compared with H3 `5.0` and `198.4ms`; API CPU fell to
+`105.0%` average from `106.6%`, but remained sustained at the two-core ceiling.
+There were no polling request errors, lock contention or backend waits. The
+run is therefore a valid component A/B and the current H4 winner, but not a
+full combined-capacity pass because the bounded workload did not complete.
+Exact cleanup `32986913152` deleted 10,000 users and one tournament, preserved
+the control account and verified zero remaining users, tournaments, sessions
+and audit rows.

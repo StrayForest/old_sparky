@@ -152,10 +152,18 @@ winner. The next local H4 adds a 128-entry/2-second public registration-open
 workspace snapshot for the lean detail polling contract, with fresh
 permission checks and mutation invalidation. H4 is deployed from
 `706dd0ab` after security/build `32982759177`, automatic deploy `32983323484`
-and production deploy/live smoke `32983333250`; it is not yet counted as a
-production performance result because the public mixed A/B
-`32985062916` is still waiting for a GitHub Actions runner and has not reached
-the VPS. No retained-load fixture was created by that queued run.
+and production deploy/live smoke `32983333250`. The first public mixed run
+`32986215002` used a `600s` polling stagger instead of the H2/H3 `85s` contour,
+returned three live-update `503`s and is excluded from H4 ranking; exact
+cleanup `32986648873` removed 10,000 users and one tournament. The corrected
+same-shape run `32986759039` reached the bounded `85s` diagnostic budget with
+no polling request errors, but sustained API CPU remained `105.0%`. It reduced
+workspace server p95 from H3 `996ms` to `743ms`, DB time from `198ms` to
+`164ms` and SQL from `5.0` to `4.08/request`; exact cleanup
+`32986913152` removed 10,000 users and one tournament and verified zero
+synthetic users, tournaments, sessions and audit rows. H4 is the current
+component-level winner, not a full combined-capacity pass; the remaining
+ceiling is API CPU and the bounded mixed workload still does not complete.
 
 AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact
