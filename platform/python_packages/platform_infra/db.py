@@ -37,10 +37,11 @@ logger = logging.getLogger(__name__)
 PUBLIC_AUTOMATION_FAILURE_MESSAGE = "Tournament automation failed. A retry is scheduled."
 # A stream admission request needs a short DB transaction, but a burst of
 # thousands of EventSource opens must not occupy the ordinary API pool. Keep a
-# separate explicit two-connection budget for stream admission/revalidation.
-SSE_STREAM_DB_CONCURRENCY = 2
+# separate explicit four-connection budget per API worker for stream
+# admission/revalidation.
+SSE_STREAM_DB_CONCURRENCY = PLATFORM_SSE_DB_POOL_SIZE
 SSE_STREAM_DB_POOL_SIZE = PLATFORM_SSE_DB_POOL_SIZE
-# This is admission work, not a queue.  Once the two short-lived stream DB
+# This is admission work, not a queue. Once the short-lived stream DB
 # slots are busy, the client must switch to revision polling instead of
 # waiting behind a burst of EventSource handshakes.
 SSE_STREAM_DB_ACQUIRE_TIMEOUT_SECONDS = 0.5

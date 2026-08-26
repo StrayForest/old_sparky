@@ -41,8 +41,8 @@ Browser -> cdn.old-sparky.com -> Cloudflare cache -> public R2 variants
 
 The platform connects directly to PostgreSQL with explicit API, worker and SSE
 pool limits: the measured 10k browser-polling baseline reserves `2 x (16 + 0)`
-API connections, `2 x (2 + 0)` worker connections and `2 x 2` separate SSE
-authorization-pool connections within a 40-connection budget. This is a
+API connections, `2 x (2 + 0)` worker connections and `2 x 4` separate SSE
+authorization-pool connections within a 44-connection budget. This is a
 bounded increase, not unlimited overflow; add a database pooler only from new
 measured scaling evidence. High-volume optional-authenticated reads validate
 the session in their request transaction but do not perform a second

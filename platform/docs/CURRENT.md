@@ -462,7 +462,7 @@ against the current web/api/worker identities and units.
   and SSE remains admission-limited.
 - API and worker SQLAlchemy pools are explicit and bounded: the measured
   10k-polling baseline is API `2 x (16 + 0)`, worker `2 x (2 + 0)` and the
-  separate SSE authorization pool `2 x 2` within a 40-connection budget.
+  separate SSE authorization pool `2 x 4` within a 44-connection budget.
   Celery uses high/default/low queues, prefetch one and late acks;
   backlog/retry pressure is part of the load evidence. This is the next
   retained-load candidate after release `2ca7a8df` still exhausted the

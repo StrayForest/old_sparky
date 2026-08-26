@@ -11,7 +11,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 PLATFORM_SCHEMA = "platform"
-PLATFORM_SSE_DB_POOL_SIZE = 2
+# Keep stream admission/revalidation isolated from the ordinary API pool while
+# allowing a bounded opening burst to make progress without immediate fallback.
+PLATFORM_SSE_DB_POOL_SIZE = 4
 PLATFORM_ROOT = Path(__file__).resolve().parents[2]
 DEVELOPMENT_SECRET_KEY = "development-only-secret-key-change-before-production"
 
@@ -203,7 +205,7 @@ class PlatformSettings(BaseSettings):
     platform_worker_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
     platform_worker_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
     platform_worker_concurrency: int = Field(default=2, gt=0)
-    platform_db_connection_budget: int = Field(default=40, gt=0)
+    platform_db_connection_budget: int = Field(default=44, gt=0)
 
 
 @lru_cache(maxsize=1)

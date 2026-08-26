@@ -72,7 +72,7 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_DB_MAX_OVERFLOW"], "0")
         self.assertEqual(
             configure.PUBLIC_BASELINE["PLATFORM_DB_CONNECTION_BUDGET"],
-            "40",
+            "44",
         )
 
     def test_atomic_write_preserves_private_owner_group_and_mode(self) -> None:
