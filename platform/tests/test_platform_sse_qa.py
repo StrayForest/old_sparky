@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import tempfile
@@ -9,7 +10,12 @@ from uuid import uuid4
 import httpx
 
 from tools.platform_cleanup_retained_matrix import load_matrix_manifest
-from tools.platform_sse_qa import SSE_EVENT_TYPE, SseMetrics, summary
+from tools.platform_sse_qa import (
+    SSE_EVENT_TYPE,
+    SseMetrics,
+    _close_sse_stream_context,
+    summary,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -79,6 +85,18 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(result["open_timeouts"], 1)
         self.assertEqual(result["fallback_polling_eligible"], 1)
         self.assertEqual(result["errors"], 0)
+
+
+class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_timed_out_http_context_close_is_bounded(self) -> None:
+        class SlowContext:
+            async def __aexit__(self, *_args) -> None:
+                await asyncio.sleep(10)
+
+        started = asyncio.get_running_loop().time()
+        await _close_sse_stream_context(SlowContext())
+
+        self.assertLess(asyncio.get_running_loop().time() - started, 1)
 
     def test_error_samples_keep_bounded_stream_correlation(self) -> None:
         metrics = SseMetrics()

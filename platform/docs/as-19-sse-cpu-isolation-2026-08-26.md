@@ -203,3 +203,10 @@ including the 503 mapping. The public A/B gate for this candidate is response
 time to either SSE 200 or deliberate 503, zero unexpected 5xx/1200, normal
 polling fallback, and a decreasing server route p95. Only after that gate will
 the staircase continue to 5k and 10k public virtual users.
+
+The first public 5k attempt with the 1-second budget was not a product result:
+4,972 opens timed out, while 28 cancelled HTTP contexts later emitted
+`RemoteProtocolError` after roughly 47 seconds. The load harness now closes a
+timed-out stream context with a 250ms bound and classifies a no-response
+disconnect after the open budget as fallback-eligible. A new async regression
+test protects this measurement boundary before the next 5k/10k run.

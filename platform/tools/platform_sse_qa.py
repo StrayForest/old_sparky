@@ -41,6 +41,19 @@ from tools.platform_production_qa import (
 DEFAULT_REPORT_PATH = Path("/tmp/platform-sse-qa-report.json")
 DEFAULT_ORIGIN = "http://127.0.0.1"
 SSE_EVENT_TYPE = "qa_sse_probe"
+SSE_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
+
+
+async def _close_sse_stream_context(stream_context: Any | None) -> None:
+    """Close a timed-out httpx stream without extending the open budget."""
+
+    if stream_context is None:
+        return
+    with suppress(Exception):
+        await asyncio.wait_for(
+            stream_context.__aexit__(None, None, None),
+            timeout=SSE_STREAM_CLOSE_TIMEOUT_SECONDS,
+        )
 
 
 def load_generator_resource_limits() -> dict[str, int]:
@@ -370,6 +383,7 @@ async def consume_sse_connection(
         stream_context = None
         response = None
         connected_this_attempt = False
+        open_timed_out = False
         try:
             stream_context = client.stream(
                 "GET",
@@ -381,8 +395,11 @@ async def consume_sse_connection(
                     async with open_gate:
                         response = await stream_context.__aenter__()
             except TimeoutError:
+                open_timed_out = True
                 metrics.mark("open_timeouts")
                 metrics.mark("fallback_polling_eligible")
+                await _close_sse_stream_context(stream_context)
+                stream_context = None
                 continue
             metrics.response_status(response.status_code)
             if cycle == 0 and not initial_attempt_marked:
@@ -403,7 +420,7 @@ async def consume_sse_connection(
                         headers=response.headers,
                         request_id=request_id,
                     )
-                await stream_context.__aexit__(None, None, None)
+                await _close_sse_stream_context(stream_context)
                 stream_context = None
                 continue
 
@@ -449,9 +466,15 @@ async def consume_sse_connection(
                 metrics.mark("reconnects")
                 await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
+            elapsed_ms = (time.monotonic() - attempt_started) * 1000
+            if open_timed_out or (response is None and elapsed_ms >= open_timeout_seconds * 1000):
+                if not open_timed_out:
+                    metrics.mark("open_timeouts")
+                    metrics.mark("fallback_polling_eligible")
+                continue
             details: dict[str, Any] = {
                 "request_id": request_id,
-                "elapsed_ms": round((time.monotonic() - attempt_started) * 1000, 2),
+                "elapsed_ms": round(elapsed_ms, 2),
                 "bytes_received": metrics.counters["bytes_received"]
                 - counters_before["bytes_received"],
                 "events": metrics.counters["events"] - counters_before["events"],
@@ -483,8 +506,7 @@ async def consume_sse_connection(
                 initial_attempt_marked = True
                 await mark_attempt_finished()
             if stream_context is not None:
-                with suppress(Exception):
-                    await stream_context.__aexit__(None, None, None)
+                await _close_sse_stream_context(stream_context)
             if connected_this_attempt:
                 metrics.connection_closed()
 
