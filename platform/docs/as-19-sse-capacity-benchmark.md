@@ -598,3 +598,42 @@ release candidate is verified.
 - Public ramp A/B `open_concurrency=16` (`32888021777`) still failed through Cloudflare: 3,466/5,000 HTTP 200, 1,533 Error 1200, one 502 and zero app 429s; slower opening did not solve the edge queue. The current bounded-admission candidate `c7874f3b` instead makes overload fail fast and keeps Cloudflare/Nginx limits unchanged.
 - On the repaired public 5k run `32959670815` (exact cleanup `32959892162`), all 5,000 attempts became fallback-eligible within 1s with zero client errors/429/503/1200, but zero HTTP 200 streams; API CPU averaged 68.7% and no locks were observed. This is a valid UX fallback result, not an SSE-capacity pass.
 - The 1k low-burst A/B `32960050840` (exact cleanup `32960232187`) reached 13 HTTP 200 streams and 987 fallbacks; connect p95 was 4.90s. Candidate `e772bd76` is now deployed with a 1s browser timeout, up to 500ms SSE jitter and prompt conditional polling; public 10k run `32961754619` (cleanup `32962201314`) produced 10,000 fast fallbacks and no persistent SSE 200s.
+
+## Final unified SSE package — 2026-08-27
+
+The historical staircase above is superseded for the current production
+decision by the protected package ending at `578771b3`. It combines signed
+short-lived SSE admission tickets, PostgreSQL-free ticketed opens, the
+existing fail-closed Redis global/source/user leases (`3,000/32/4`), a shared
+worker/tournament relay, one SSE per tournament through SharedWorker where
+available, and polling fallback. Private streams retain periodic session and
+participant revalidation. The Redis limiter pool is bounded at `512` with a
+finite `2s` wait; this is a resource-capacity fix, not a protection bypass.
+
+The exact release chain for the final code was security/build
+`33009663151`, auto-deploy `33010232007`, and production deploy/live smoke
+`33010239695`, all successful for the same SHA.
+
+| Final contour | Result | Key evidence |
+| --- | --- | --- |
+| Ticket vs legacy public control, 32 opens | Ticket `32/32` HTTP 200 and `96/96` events; legacy `28/32` HTTP 200 with four controlled `503`s | Ticket path avoids the legacy PostgreSQL admission bottleneck; protection remains active |
+| Public ticket, 1,000 opens, 5s timeout | `0/1,000` persistent SSE, 1,000 fast fallbacks, zero errors/429/503 | Customer-facing edge/transport queue dominates this wave |
+| Origin-local ticket, 1,000 opens, 30s timeout | `1,000/1,000` SSE and `3,000/3,000` events, zero errors/429/503 | Connect p95 `7.30s`; API peak `68.8%`; no DB waits/locks |
+| Public 10k browsing + 32 SSE | `10,000/10,000` workspace requests; `32/32` SSE; `96/96` events; zero errors/429/503/timeouts | SSE p95 `1.13s`; workspace p95 `324ms`; API peak `121%`; PostgreSQL peak `80%`, no waits/locks |
+| Origin-local ticket, 3,000 opens, 30s timeout | `2,650/3,000` SSE; `7,950/7,950` events; 350 open timeouts; zero errors/429/503 | API peak `76%`; Redis peak `4%`; no single remaining origin bottleneck |
+
+All valid retained runs were followed by exact cleanup, with zero synthetic
+users, tournaments, sessions and audit rows remaining and the control account
+preserved. A requested 3,000-open, 60-second run was rejected by QA input
+validation before fixture setup because the supported timeout maximum is 30
+seconds; it contributes no capacity result.
+
+The final stopping verdict is: safe origin handshake improvements are
+complete. The ticket path removes PostgreSQL from normal opening, the Redis
+limiter pool no longer generates resource-starvation `503`s, and the combined
+10k-user product contour passes. The public 1k five-second wave still falls
+back because of edge/transport handshake queueing, so this work does not claim
+10k persistent public SSE or the full 180% two-core target. Further progress
+requires edge/transport architecture or a separately authorized infrastructure
+capacity change; raising application caps would weaken the current protection
+without evidence of a new safe limit.

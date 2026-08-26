@@ -377,3 +377,50 @@ full combined-capacity pass because the bounded workload did not complete.
 Exact cleanup `32986913152` deleted 10,000 users and one tournament, preserved
 the control account and verified zero remaining users, tournaments, sessions
 and audit rows.
+
+## Final unified SSE package and stopping verdict — 2026-08-27
+
+The remaining SSE hypotheses were implemented as one protected package ending
+at `578771b3`. Workspace authorization now issues a short-lived signed
+admission ticket. Ticket verification checks HMAC, expiry, tournament slug,
+and private session binding without PostgreSQL at the SSE open boundary.
+Private streams still perform periodic fail-closed session and participant
+revalidation. Public streams use the same signed path, while unticketed
+legacy clients retain the bounded database admission path. The route no longer
+inherits write-policy dependencies; the relay shares one Redis subscription
+per worker/tournament; the browser shares one SSE per tournament via
+SharedWorker where available and falls back to polling; and the existing
+global/source/user leases remain `3,000/32/4`.
+
+The final limiter starvation fix raised only the reusable Redis limiter pool
+to `512` with a finite `2s` wait. It did not remove fail-closed behavior or
+raise source/user admission caps. The exact-SHA security/build,
+auto-deploy and production deploy/live-smoke runs were respectively
+`33009663151`, `33010232007` and `33010239695`; all passed for
+`578771b3`.
+
+Final retained-load evidence:
+
+| Contour | Result | Latency / resource evidence | Verdict |
+| --- | --- | --- | --- |
+| Ticket vs legacy public control, 32 opens | Ticket `32/32` HTTP 200, `96/96` events, zero errors; legacy `28/32` HTTP 200 and four controlled DB-admission `503`s | Ticket connect p95 about `462ms`; legacy about `1.02s` | Ticket path removes the PostgreSQL open bottleneck without removing protection |
+| Public ticket, 1,000 opens, 5s UX budget | `0/1,000` persistent SSE, all 1,000 became fallback-eligible; zero errors/429/503 | Origin CPU was not saturated | Valid edge/transport queue result; not an origin failure |
+| Origin-local ticket, 1,000 opens, 30s budget | `1,000/1,000` streams, `3,000/3,000` events, zero errors/429/503 | Connect p95 about `7.30s`; API peak about `68.8%`; no DB waits/locks | Origin upper bound passed; latency is too high for a 5s UX gate |
+| Public 10k browsing + 32 SSE | `10,000/10,000` workspace requests, `32/32` SSE, `96/96` events, zero errors/429/503/timeouts | SSE p95 about `1.13s`; workspace p95 about `324ms`; API peak about `121%`; PostgreSQL peak about `80%`, no waits/locks | Combined product contour passed |
+| Origin-local ticket, 3,000 opens, 30s budget | `2,650/3,000` streams, `7,950/7,950` events, zero errors/429/503; 350 open timeouts | API peak about `76%`; Redis peak about `4%`; no DB waits/locks | Upper-bound contour; no single remaining origin bottleneck proven |
+
+Every valid retained run had an immediate exact cleanup. Cleanup reports for
+all final runs verified zero synthetic users, tournaments, sessions and audit
+rows while preserving the control account. The attempted 3,000-open,
+60-second run was rejected by the harness validation (`max=30s`) before
+fixture creation and is excluded from the matrix.
+
+The final conclusion is intentionally bounded: the ticketed origin path and
+Redis limiter starvation are fixed, the protected combined 10k-user site
+contour passes, and accepted streams deliver all probe events. The remaining
+customer-facing constraint is Cloudflare/transport handshake queueing: a
+public 1,000-open wave does not establish persistent SSE within five seconds,
+although the origin can eventually hold 1,000 streams. Therefore neither
+10,000 persistent public SSE nor the full 180% two-core target is claimed.
+Further gains require edge/transport admission architecture or a separately
+authorized infrastructure change, not another safe FastAPI handshake tweak.

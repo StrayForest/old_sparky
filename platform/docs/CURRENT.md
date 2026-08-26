@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-26
+- Last reviewed: 2026-08-27
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -23,7 +23,7 @@ Read this file for the current production baseline and next engineering priority
 - Tournament invite claims/revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Last invite use and last participant slot cannot be consumed twice, and restoring a retained inactive participant rechecks capacity before making the row active again.
 - Anonymous public profile contracts omit account/contact email and Steam authentication identity. Public tournament participant/workspace contracts omit moderation note, moderator identity and moderation timestamps; organizer management uses a separate response DTO that retains those fields.
 - Public tournament automation errors are persistence-sanitized before commit: `automation_last_error` can contain only the stable generic retry message, while restricted logs retain only tournament/failure metadata and a one-way error fingerprint. Migration `20260821_0039` rewrites historical non-null values to the same safe message.
-- Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. The AS-19 candidate now uses an application global ceiling of `3,000` with `32/source` and `4/user`, while Nginx retains `10,240` source/global ceilings and `worker_connections=32,768`; relay fan-out, short-lived DB access checks and bounded Redis limiter pooling are enabled. The lower application ceiling is a controlled-degradation guard against the observed Cloudflare Error 1200 edge queue, not a claim that 3,000 is final capacity.
+- Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. The deployed AS-19 package uses an application global ceiling of `3,000` with `32/source` and `4/user`, while Nginx retains `10,240` source/global ceilings and `worker_connections=32,768`; signed short-lived admission tickets remove PostgreSQL from the ticketed open path, relay fan-out is shared per worker/tournament, and the limiter pool is bounded at `512` connections with a `2s` wait. Private streams retain periodic session/participant revalidation and all Redis leases remain fail-closed. The lower application ceiling is a controlled-degradation guard against the observed Cloudflare Error 1200 edge queue, not a claim that 3,000 is final customer-facing capacity.
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
@@ -411,6 +411,52 @@ database guards and applies migration `20260822_0040`. Exact commit
 `gha-32574455599-1-87525bab34c4-20260822T125945Z`; closure evidence is in
 [`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md).
 
+### AS-19 final unified SSE package — 2026-08-27
+
+The protected SSE admission work is complete and deployed in the coherent
+package ending at commit `578771b3`. The package issues a short-lived HMAC
+ticket from an already-authorized workspace/bracket response, binds private
+tickets to the session, verifies expiry/slug/access without PostgreSQL at
+ticketed open, and preserves periodic private session/participant
+revalidation. Unticketed legacy clients retain the bounded database-backed
+path. SSE write-policy dependencies were removed from the read route, the
+per-worker/tournament relay shares one Redis subscription, and the browser
+uses one SharedWorker SSE per tournament where supported with polling fallback.
+Global/source/user Redis leases remain `3,000/32/4`; Redis failure still
+returns a controlled fail-closed response. The final limiter pool is
+`512/2s`, which removed the observed limiter-pool starvation without
+weakening admission protection.
+
+The final exact-SHA chain for this package was security/build
+`33009663151`, automatic deploy `33010232007`, and production deploy/live
+smoke `33010239695`; all passed for the same target SHA. The ticket-vs-legacy
+control A/B proved the admission change: ticketed public `32/32` returned
+HTTP 200 with `96/96` events and no errors, while legacy public admission
+returned `28/32` HTTP 200 and four deliberate bounded database-admission
+`503`s. The final origin-local ticket run at `1,000` users with a 30-second
+open budget reached `1,000/1,000` streams and `3,000/3,000` events with zero
+errors, `429`s or `503`s. The combined public contour reached `10,000/10,000`
+workspace users plus `32/32` SSE streams and `96/96` events with zero errors,
+`429`s, `503`s or timeouts; SSE connect p95 was about `1.13s`, workspace p95
+about `324ms`, API peak about `121%`, and no PostgreSQL waits or locks.
+
+The public `1,000`-SSE, five-second UX run intentionally classified all
+attempts as polling fallback without errors: Cloudflare/transport handshake
+queueing, not origin admission failure, remains the customer-facing
+bottleneck. Origin-local `3,000` with the allowed 30-second QA ceiling reached
+`2,650/3,000` streams and delivered `7,950/7,950` events, again without
+errors or rejected requests; a requested 60-second run was rejected by QA
+validation before fixture setup and is not a measurement. These results do
+not claim `10,000` persistent public SSE connections or a full 180% CPU
+target. They show that the low-risk origin admission fixes are exhausted:
+the remaining optimization is edge/transport handshake architecture or
+operator capacity, while the application protection and fast polling
+fallback remain in force.
+
+Every retained load run was followed by its exact cleanup; the final cleanup
+reports verified zero synthetic users, tournaments, sessions and audit rows
+and preserved `aleksei.lisitsin1@gmail.com`.
+
 AS-17 — End-to-end release transaction and recovery is resolved and deployed.
 The release receipt now has an explicit Nginx uncertainty boundary, idempotent
 `activation-committed` completion, retained runtime recovery, and rollback
@@ -461,8 +507,12 @@ against the current web/api/worker identities and units.
   the existing short interval, hidden/passive/terminal views back off or stop,
   and SSE remains admission-limited.
 - API and worker SQLAlchemy pools are explicit and bounded: the measured
-  10k-polling baseline is API `2 x (16 + 0)`, worker `2 x (2 + 0)` and the
-  separate SSE authorization pool `2 x 4` within a 44-connection budget.
+  10k-polling baseline is API `2 x (16 + 0)` and worker `2 x (2 + 0)` within
+  the ordinary 44-connection budget. Ticketed SSE admission does not consume
+  PostgreSQL at open; unticketed legacy admission and periodic private
+  revalidation use the bounded stream database pool. The separate SSE
+  authorization pool was removed. Redis admission uses the bounded `512`
+  connection pool with a `2s` wait and remains fail-closed.
   Celery uses high/default/low queues, prefetch one and late acks;
   backlog/retry pressure is part of the load evidence. This is the next
   retained-load candidate after release `2ca7a8df` still exhausted the
