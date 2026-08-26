@@ -304,3 +304,27 @@ bounded-run cancellation also waited on the overloaded gather. Abort
 fixture. The harness now caps combined polling requests at the configured
 concurrency and uses `asyncio.wait` with explicit task cancellation/draining so
 the mixed test cannot turn a client-side queue into an unbounded VPS run.
+
+The bounded mixed rerun `32975890344` reached the VPS and stopped at its
+85-second execution budget with an explicit diagnostic FAIL rather than an
+unbounded wait. It created 10,000 polling tabs, used request concurrency 20,
+and recorded workspace response p50/p95/p99 `374/711/1,149ms` on the partial
+client sample. Server evidence identified `deadlock-api` as the dominant
+process: API CPU averaged 104.1% and peaked at 152.8%; workspace origin p95
+was 879.9ms and p99 2.09s; PostgreSQL averaged 17.3%, Redis 0.3%, and no
+lock/backend-wait contention was observed. Exact cleanup `32976226545`
+removed the 10,000-user/one-tournament fixture and preserved the control
+account.
+
+### CPU follow-up A/B: single-tournament count plan
+
+The first implementation candidate changes only direct tournament reads. The
+old count subqueries grouped active participants and locked rosters across all
+tournaments before joining the requested slug. The candidate uses correlated
+counts against the selected tournament, backed by the existing tournament
+indexes. Collection/list queries keep the old grouped shape. Visibility,
+participant status, commitment checks, ETags and SSE admission are unchanged.
+
+The candidate is accepted only if the repeated mixed contour shows lower
+workspace p95/p99 and API CPU with zero unexpected responses, unchanged
+conditional polling behavior and no increase in PostgreSQL lock/pool waits.

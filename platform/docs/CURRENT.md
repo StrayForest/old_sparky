@@ -120,6 +120,21 @@ opened without a shared request gate. Abort `32974261688` and cleanup
 combined polling requests by the configured concurrency and cancels/drains
 both workload tasks on timeout before the next mixed acceptance run.
 
+The first bounded mixed rerun `32975890344` completed its diagnostic budget
+instead of hanging, but correctly failed because the 10,000-tab polling phase
+did not finish within 85 seconds. It is still useful bottleneck evidence:
+`deadlock-api` averaged 104.1% CPU (peak 152.8%), workspace origin p95 was
+879.9ms and p99 2.09s, PostgreSQL averaged 17.3%, Redis 0.3%, and no lock or
+backend-wait contention was observed. The load generator was no longer the
+dominant process. Exact cleanup `32976226545` removed 10,000 users and one
+tournament and preserved the control account.
+
+The next CPU follow-up uses a single-tournament count query for direct
+`/{slug}` and `/{slug}/workspace` reads. It avoids grouping participant counts
+for every tournament when the route already selects one slug, while collection
+list queries retain their grouped plan. This is an A/B candidate; it does not
+alter visibility, per-user access checks, ETags or SSE admission.
+
 AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact
 cleanup/recovery support. Public tests send no source-bucket bypass: Cloudflare,
