@@ -90,7 +90,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: platform-production-retained-load-matrix
+  # The previous group was left holding GitHub startup-failure ghost runs;
+  # version the operator workflow while keeping all new retained loads serial.
+  group: platform-production-retained-load-matrix-v2
   cancel-in-progress: false
 
 jobs:
