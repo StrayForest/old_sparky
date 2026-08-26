@@ -69,7 +69,12 @@ BROWSER_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
 )
 
 
-def _regular_root_file(path: Path, *, root: Path) -> Path:
+def _regular_root_file(
+    path: Path,
+    *,
+    root: Path,
+    repair_permissions: bool = False,
+) -> Path:
     if not path.is_absolute():
         raise ValueError("manifest paths must be absolute")
     root_resolved = root.resolve(strict=True)
@@ -80,13 +85,25 @@ def _regular_root_file(path: Path, *, root: Path) -> Path:
         raise ValueError("manifest path escapes the selected run root") from exc
     resolved = path.resolve(strict=True)
     metadata = path.lstat()
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-    ):
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         raise ValueError("manifest files must be root-owned regular 0600 files")
+    if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
+        if not repair_permissions or os.geteuid() != 0:
+            raise ValueError("manifest files must be root-owned regular 0600 files")
+        try:
+            os.chown(path, 0, 0)
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            raise ValueError("manifest files must be root-owned regular 0600 files") from exc
+        metadata = path.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ValueError("manifest files must be root-owned regular 0600 files")
     return resolved
 
 
@@ -126,8 +143,13 @@ def load_matrix_manifest(
     *,
     run_root: Path,
     expected_control_email: str,
+    repair_permissions: bool = False,
 ) -> dict[str, Any]:
-    summary_path = _regular_root_file(summary_path, root=run_root)
+    summary_path = _regular_root_file(
+        summary_path,
+        root=run_root,
+        repair_permissions=repair_permissions,
+    )
     try:
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -162,7 +184,11 @@ def load_matrix_manifest(
         report_raw = result.get("report_path") or row.get("report_path")
         if not isinstance(report_raw, str):
             raise ValueError("matrix row report path is missing")
-        report_path = _regular_root_file(Path(report_raw), root=run_root)
+        report_path = _regular_root_file(
+            Path(report_raw),
+            root=run_root,
+            repair_permissions=repair_permissions,
+        )
         try:
             report = json.loads(report_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -543,6 +569,7 @@ async def async_main() -> int:
         args.summary,
         run_root=args.run_root,
         expected_control_email=args.control_email,
+        repair_permissions=True,
     )
     result = await cleanup_manifest(manifest)
     args.result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

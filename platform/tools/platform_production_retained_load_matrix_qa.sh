@@ -85,10 +85,9 @@ case "$profile" in
       echo "SSE open concurrency must be an integer from 1 to 10000." >&2
       exit 1
     }
-    sse_open_timeout_max=30
-    if [[ "$sse_origin_mode" == "origin-local" ]]; then
-      sse_open_timeout_max=60
-    fi
+    # Public 60s is a diagnostic ceiling only; the browser's own fallback
+    # policy remains short and is not changed by this retained-load input.
+    sse_open_timeout_max=60
     [[ "$sse_open_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_open_timeout >= 0.5 && $sse_open_timeout <= $sse_open_timeout_max)}") == 1 )) || {
       echo "SSE open timeout must be between 0.5 and $sse_open_timeout_max seconds for this origin mode." >&2
       exit 1
@@ -449,7 +448,11 @@ fi
 
 # Reports are retained on the server and are intentionally private to root
 # until the compact summary/log export has been copied to the workflow caller.
-find "$run_root" -xdev -type f -exec chmod 0600 -- {} +
+# The exact-run root is root-owned 0700, and hardlinks are excluded so a
+# report cannot change permissions on an inode outside this retained fixture.
+find "$run_root" -xdev -type f -links 1 \
+  -exec chown root:root -- {} + \
+  -exec chmod 0600 -- {} +
 
 install -o "$export_uid" -g "$export_gid" -m 0600 "$summary_path" "$export_dir/matrix-summary.json"
 install -o "$export_uid" -g "$export_gid" -m 0600 "$log_path" "$export_dir/matrix.log"

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -143,6 +145,27 @@ class RetainedMatrixManifestTests(unittest.TestCase):
                     expected_control_email="aleksei.lisitsin1@gmail.com",
                 )
 
+    @unittest.skipUnless(os.geteuid() == 0, "permission repair requires the root test user")
+    def test_manifest_permission_repair_is_root_only_and_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "sse" / "report.json"
+            report_path.parent.mkdir()
+            summary_path = self._write_manifest(root, report_path)
+
+            summary_path.chmod(0o644)
+            report_path.chmod(0o644)
+            manifest = cleanup.load_matrix_manifest(
+                summary_path,
+                run_root=root,
+                expected_control_email="aleksei.lisitsin1@gmail.com",
+                repair_permissions=True,
+            )
+
+            self.assertEqual(len(manifest["user_ids"]), 1)
+            self.assertEqual(stat.S_IMODE(summary_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(report_path.stat().st_mode), 0o600)
+
     def test_valid_manifest_is_identity_bound_to_each_report(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -150,7 +173,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
             report_path.parent.mkdir()
             summary_path = self._write_manifest(root, report_path)
 
-            def trusted_file(path: Path, *, root: Path) -> Path:
+            def trusted_file(path: Path, *, root: Path, **_: object) -> Path:
                 resolved = path.resolve()
                 resolved.relative_to(root.resolve())
                 return resolved
@@ -207,7 +230,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def trusted_file(path: Path, *, root: Path) -> Path:
+            def trusted_file(path: Path, *, root: Path, **_: object) -> Path:
                 resolved = path.resolve()
                 resolved.relative_to(root.resolve())
                 return resolved
@@ -264,7 +287,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
             report_path.chmod(0o600)
             summary_path.chmod(0o600)
 
-            def trusted_file(path: Path, *, root: Path) -> Path:
+            def trusted_file(path: Path, *, root: Path, **_: object) -> Path:
                 resolved = path.resolve()
                 resolved.relative_to(root.resolve())
                 return resolved

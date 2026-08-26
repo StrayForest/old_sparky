@@ -46,7 +46,10 @@ SSE_EVENT_TYPE = "qa_sse_probe"
 COMBINED_TIMEOUT_GRACE_SECONDS = 15.0
 SSE_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
 SSE_FIXTURE_TIMEOUT_SECONDS = 90.0
-SSE_OPEN_TIMEOUT_MAX_PUBLIC_SECONDS = 30.0
+# The browser keeps its own short fallback/cooldown policy.  This is only the
+# retained-load diagnostic ceiling: public edge queueing must be observable for
+# a full minute before the harness classifies an attempt as fallback-eligible.
+SSE_OPEN_TIMEOUT_MAX_PUBLIC_SECONDS = 60.0
 SSE_OPEN_TIMEOUT_MAX_ORIGIN_LOCAL_SECONDS = 60.0
 
 

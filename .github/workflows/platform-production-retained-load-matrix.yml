@@ -43,7 +43,7 @@ on:
         default: "256"
         type: string
       sse_open_timeout:
-        description: "Client-side SSE handshake timeout (public 0.5-30s; origin-local diagnostic 0.5-60s)"
+        description: "Diagnostic SSE handshake timeout (public/origin-local 0.5-60s; browser fallback policy is unchanged)"
         required: true
         default: "5"
         type: string
