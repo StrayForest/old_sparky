@@ -352,6 +352,44 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         redis_factory.assert_called_once_with()
         self.assertEqual(pubsub.subscribed, ["platform:bracket:shared-tournament"])
 
+    async def test_closing_one_shared_stream_keeps_relay_for_remaining_stream(self) -> None:
+        pubsub = _FakePubSub([])
+        client = _FakeRedisClient(pubsub)
+        redis_factory = MagicMock(return_value=client)
+
+        with (
+            patch.object(bracket_events, "redis_client", redis_factory),
+            patch.object(
+                bracket_events,
+                "current_tournament_stream_access_is_valid",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            first_relay, first_queue = await bracket_events._subscribe_to_bracket_relay(
+                "platform:bracket:shared-tournament"
+            )
+            second_relay, second_queue = await bracket_events._subscribe_to_bracket_relay(
+                "platform:bracket:shared-tournament"
+            )
+
+            self.assertIs(first_relay, second_relay)
+            await bracket_events._unsubscribe_from_bracket_relay(
+                "platform:bracket:shared-tournament",
+                first_relay,
+                first_queue,
+            )
+            self.assertFalse(first_relay.resources_closed)
+            self.assertFalse(client.closed)
+
+            await bracket_events._unsubscribe_from_bracket_relay(
+                "platform:bracket:shared-tournament",
+                second_relay,
+                second_queue,
+            )
+
+        self.assertTrue(first_relay.resources_closed)
+        self.assertTrue(client.closed)
+
 
 if __name__ == "__main__":
     unittest.main()

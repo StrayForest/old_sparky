@@ -274,8 +274,15 @@ marker for exact cleanup. The full 20-tournament stateful fixture remains in
 the browser-polling profile, where those workflow transitions are part of the
 test rather than an SSE prerequisite.
 
-The next diagnostic revision also records Redis `PUBLISH` subscriber counts,
-stream disconnects, keepalives and bytes in the compact summary. This makes a
-mass fan-out failure distinguishable as a Redis/relay subscription miss, an
-edge-side stream close, or a client parser/lifecycle issue before any limit is
-raised.
+The deployed diagnostic revision records Redis `PUBLISH` subscriber counts,
+stream disconnects, keepalives and bytes in the compact summary. Public run
+`32970619144` (32 SSE, open concurrency 16, one-second open budget) produced
+7/32 HTTP 200 streams with connect p95 938ms, but 0/21 events and subscriber
+counts `[0, 0, 0]`; API CPU averaged 36.3%, PostgreSQL 6.1%, and no lock or
+connection saturation was observed. This was not a CPU result. The evidence
+identified a shared-relay lifecycle race: `_unsubscribe_from_bracket_relay`
+closed the Redis Pub/Sub client even while other queues remained subscribed.
+The fix closes the shared resources only after the last queue leaves and adds a
+regression test that closes one of two subscribers before delivering the next
+event. Exact cleanup `32970738275` deleted 32 users and one tournament and
+preserved `aleksei.lisitsin1@gmail.com`.

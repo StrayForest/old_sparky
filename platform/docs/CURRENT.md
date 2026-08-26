@@ -93,10 +93,16 @@ full 20-tournament stateful fixture remains owned by the browser-polling
 profile, so a slow background workflow cannot be mistaken for SSE admission
 latency.
 
-The next diagnostic revision records Redis publisher subscriber counts and
-stream close/keepalive/byte counters in the compact artifact. This separates
-"Redis published to no relay", "origin relay received but edge closed", and
-"client parser missed the event" before changing production limits.
+The deployed diagnostic revision records Redis publisher subscriber counts and
+stream close/keepalive/byte counters in the compact artifact. The public 32-SSE
+run `32970619144` then showed 7 HTTP 200 streams (connect p95 938ms), but Redis
+reported `[0, 0, 0]` subscribers and 0/21 events while API CPU averaged 36.3%,
+PostgreSQL 6.1% and lock contention was false. Code review found a relay
+lifecycle race: closing one queue unconditionally closed the shared Redis
+Pub/Sub resources for the remaining queues. The fix is covered by a regression
+test and is being rechecked through the exact-SHA release gate before repeating
+the public staircase. The fixture was removed by exact cleanup `32970738275`,
+which preserved `aleksei.lisitsin1@gmail.com` and left zero synthetic rows.
 
 AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact

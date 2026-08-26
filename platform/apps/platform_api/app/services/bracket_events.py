@@ -126,15 +126,18 @@ async def _unsubscribe_from_bracket_relay(
     queue: asyncio.Queue[object],
 ) -> None:
     task: asyncio.Task[None] | None = None
+    should_close_resources = False
     async with _relay_registry_lock:
         relay.subscribers.discard(queue)
         if not relay.subscribers and _relays.get(channel) is relay:
             _relays.pop(channel, None)
             task = relay.task
+            should_close_resources = True
     if task is not None and not task.done():
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-    await relay._close_resources()
+    if should_close_resources:
+        await relay._close_resources()
 
 
 async def dispose_bracket_event_relays() -> None:
