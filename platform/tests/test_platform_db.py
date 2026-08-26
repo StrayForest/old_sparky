@@ -28,7 +28,7 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
             platform_worker_concurrency=2,
             platform_worker_db_pool_size=2,
             platform_worker_db_max_overflow=0,
-            platform_db_connection_budget=16,
+            platform_db_connection_budget=20,
         )
         engine = Mock()
         engine.sync_engine = sentinel.sync_engine
