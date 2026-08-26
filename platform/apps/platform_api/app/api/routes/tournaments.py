@@ -312,6 +312,15 @@ def _representation_etag(*parts: object) -> str:
     return f'"{sha256(fingerprint.encode("utf-8")).hexdigest()}"'
 
 
+def _serialized_model_response(payload: Any, *, etag: str) -> Response:
+    response = Response(
+        content=payload.model_dump_json(),
+        media_type="application/json",
+    )
+    response.headers["ETag"] = etag
+    return response
+
+
 def _etag_weak_value(value: str) -> str:
     normalized = value.strip()
     if normalized.startswith("W/"):
@@ -6390,7 +6399,7 @@ async def get_tournament_workspace(
             auth_session.user.id if auth_session is not None else "anonymous",
         )
         not_modified = _conditional_response(request, response, etag=etag)
-        return not_modified or workspace_response
+        return not_modified or _serialized_model_response(workspace_response, etag=etag)
 
     if participants_limit > 0:
         participants, participants_total, participants_has_more = await tournament_participant_page(
@@ -6528,7 +6537,7 @@ async def get_tournament_workspace(
         ),
     )
     not_modified = _conditional_response(request, response, etag=etag)
-    return not_modified or workspace_response
+    return not_modified or _serialized_model_response(workspace_response, etag=etag)
 
 
 @router.get("/{slug}", response_model=TournamentResponse)

@@ -134,6 +134,16 @@ The next candidate skips the published-assignment lookup only for
 `registration_open` detail workspaces. The domain guard makes assignment
 staging unavailable before `registration_closed`; all access checks,
 participant state, ETags, response fields and SSE admission remain unchanged.
+The H2 live run `32979781513` (cleanup `32980077832`) reduced workspace SQL
+from 6.0 to 5.0 queries/request and average DB time from 246ms to 201ms, but
+did not yet lower the full server contour: workspace p95 was 909ms and API
+CPU 107.1%. It remains a safe component improvement, not the final CPU winner.
+
+H3 now measures the response boundary itself: workspace routes return the
+already validated Pydantic payload through `model_dump_json()` with the same
+ETag, avoiding a second response-model validation/JSON encoding pass. It is
+accepted only with unchanged status/body/ETag contracts and lower API CPU and
+workspace p95 on the same mixed contour.
 
 AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact

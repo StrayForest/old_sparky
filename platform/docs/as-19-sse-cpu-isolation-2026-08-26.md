@@ -321,3 +321,18 @@ assignment lookup only for `registration_open` detail workspaces. The domain
 guard rejects assignment staging before `registration_closed`, so this saves
 one read without weakening access checks, ETags, response shape or SSE
 admission.
+
+The H2 public run `32979781513` (exact cleanup `32980077832`) reduced the
+workspace route from 6.0 to 5.0 SQL queries/request and average DB time from
+246ms to 201ms. The full contour still measured workspace p95 909ms/p99
+2.64s and API CPU 107.1%, so H2 is retained as a safe sub-optimization but is
+not selected as the CPU winner by itself.
+
+### CPU follow-up H3: response serialization boundary
+
+The next candidate returns the already constructed Pydantic workspace payload
+through `model_dump_json()` and a plain JSON `Response`, preserving body,
+status, ETag and conditional `304` behavior while avoiding FastAPI's second
+response-model validation/encoding pass. The live gate compares API CPU,
+workspace p95/p99, payload bytes, conditional responses and error counts with
+the same mixed contour.

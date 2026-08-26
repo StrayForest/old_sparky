@@ -4,10 +4,26 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from pydantic import BaseModel
+
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
 
 
 class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
+    def test_serialized_model_response_uses_json_payload_and_etag(self) -> None:
+        class Payload(BaseModel):
+            value: int
+
+        response = tournament_routes._serialized_model_response(
+            Payload(value=7),
+            etag='"revision"',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "application/json")
+        self.assertEqual(response.headers["etag"], '"revision"')
+        self.assertEqual(response.body, b'{"value":7}')
+
     async def test_registration_open_detail_does_not_query_assignment_state(self) -> None:
         published_lookup = AsyncMock(return_value=None)
         tournament = SimpleNamespace(
