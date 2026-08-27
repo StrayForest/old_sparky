@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import secrets
+from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from time import monotonic
@@ -41,13 +42,24 @@ _relays: dict[str, "_BracketEventRelay"] = {}
 _RELAY_CLOSED = object()
 
 
+class _BracketEventSubscription:
+    def __init__(self, next_sequence: int) -> None:
+        self.next_sequence = next_sequence
+
+
 class _BracketEventRelay:
     def __init__(self, channel: str) -> None:
         self.channel = channel
         self.client = None
         self.pubsub = None
         self.task: asyncio.Task[None] | None = None
-        self.subscribers: set[asyncio.Queue[object]] = set()
+        self.subscribers: set[_BracketEventSubscription] = set()
+        self.messages: deque[tuple[int, str]] = deque(
+            maxlen=SSE_RELAY_QUEUE_MAXSIZE
+        )
+        self.next_sequence = 0
+        self.message_event = asyncio.Event()
+        self.closed = False
         self.resources_closed = False
 
     async def start(self) -> None:
@@ -74,23 +86,24 @@ class _BracketEventRelay:
                 if message is None:
                     await asyncio.sleep(0.01)
                     continue
-                for queue in tuple(self.subscribers):
-                    if queue.full():
-                        with suppress(asyncio.QueueEmpty):
-                            queue.get_nowait()
-                    with suppress(asyncio.QueueFull):
-                        queue.put_nowait(message)
+                data = message.get("data") if isinstance(message, dict) else None
+                if not isinstance(data, str):
+                    continue
+                self.next_sequence += 1
+                self.messages.append(
+                    (
+                        self.next_sequence,
+                        f"event: bracket\ndata: {data}\n\n",
+                    )
+                )
+                self.message_event.set()
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Bracket event relay failed for channel %s.", self.channel)
         finally:
-            for queue in tuple(self.subscribers):
-                if queue.full():
-                    with suppress(asyncio.QueueEmpty):
-                        queue.get_nowait()
-                with suppress(asyncio.QueueFull):
-                    queue.put_nowait(_RELAY_CLOSED)
+            self.closed = True
+            self.message_event.set()
             await self._close_resources()
 
     async def _close_resources(self) -> None:
@@ -109,27 +122,27 @@ class _BracketEventRelay:
 
 async def _subscribe_to_bracket_relay(
     channel: str,
-) -> tuple[_BracketEventRelay, asyncio.Queue[object]]:
+) -> tuple[_BracketEventRelay, _BracketEventSubscription]:
     async with _relay_registry_lock:
         relay = _relays.get(channel)
-        if relay is None:
+        if relay is None or relay.closed:
             relay = _BracketEventRelay(channel)
             await relay.start()
             _relays[channel] = relay
-        queue: asyncio.Queue[object] = asyncio.Queue(maxsize=SSE_RELAY_QUEUE_MAXSIZE)
-        relay.subscribers.add(queue)
-        return relay, queue
+        subscription = _BracketEventSubscription(relay.next_sequence + 1)
+        relay.subscribers.add(subscription)
+        return relay, subscription
 
 
 async def _unsubscribe_from_bracket_relay(
     channel: str,
     relay: _BracketEventRelay,
-    queue: asyncio.Queue[object],
+    subscription: _BracketEventSubscription,
 ) -> None:
     task: asyncio.Task[None] | None = None
     should_close_resources = False
     async with _relay_registry_lock:
-        relay.subscribers.discard(queue)
+        relay.subscribers.discard(subscription)
         if not relay.subscribers and _relays.get(channel) is relay:
             _relays.pop(channel, None)
             task = relay.task
@@ -139,6 +152,27 @@ async def _unsubscribe_from_bracket_relay(
         await asyncio.gather(task, return_exceptions=True)
     if should_close_resources:
         await relay._close_resources()
+
+
+async def _next_bracket_event(
+    relay: _BracketEventRelay,
+    subscription: _BracketEventSubscription,
+) -> str | object:
+    while True:
+        if relay.closed:
+            return _RELAY_CLOSED
+        if relay.messages and subscription.next_sequence <= relay.next_sequence:
+            first_sequence = relay.messages[0][0]
+            if subscription.next_sequence < first_sequence:
+                subscription.next_sequence = first_sequence
+            message_index = subscription.next_sequence - first_sequence
+            message = relay.messages[message_index][1]
+            subscription.next_sequence += 1
+            return message
+        relay.message_event.clear()
+        if relay.closed:
+            return _RELAY_CLOSED
+        await relay.message_event.wait()
 
 
 async def dispose_bracket_event_relays() -> None:
@@ -257,7 +291,7 @@ async def stream_bracket_events(
         return
 
     channel = bracket_channel(tournament_id)
-    relay, event_queue = await _subscribe_to_bracket_relay(channel)
+    relay, subscription = await _subscribe_to_bracket_relay(channel)
     started_at = monotonic()
     last_access_check_at = started_at
     last_lease_renewal_at = started_at
@@ -267,7 +301,7 @@ async def stream_bracket_events(
         while True:
             try:
                 message = await asyncio.wait_for(
-                    event_queue.get(),
+                    _next_bracket_event(relay, subscription),
                     timeout=float(SSE_KEEPALIVE_SECONDS),
                 )
             except TimeoutError:
@@ -296,6 +330,6 @@ async def stream_bracket_events(
             if message is None:
                 yield ": keepalive\n\n"
                 continue
-            yield f"event: bracket\ndata: {message['data']}\n\n"
+            yield message
     finally:
-        await _unsubscribe_from_bracket_relay(channel, relay, event_queue)
+        await _unsubscribe_from_bracket_relay(channel, relay, subscription)
