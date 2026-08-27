@@ -117,13 +117,29 @@ async function captainUpdate(request, response) {
 }
 
 function proxyRequest(request, response) {
+  const headers = { ...request.headers };
+  for (const header of [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ]) {
+    delete headers[header];
+  }
+  headers.host = `${upstreamHost}:${upstreamPort}`;
+  headers.connection = "close";
   const upstream = httpRequest(
     {
       hostname: upstreamHost,
       port: upstreamPort,
       method: request.method,
       path: request.url,
-      headers: request.headers,
+      headers,
+      agent: false,
     },
     (upstreamResponse) => {
       response.writeHead(
