@@ -347,6 +347,7 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"combined_polling_requests_without_errors",', sse_source)
         self.assertIn('"combined_sse_no_unexpected_errors",', sse_source)
         self.assertIn("run_normal_api_traffic", sse_source)
+        self.assertIn('not qa.report.get("fatal_error")', sse_source)
         self.assertIn('"combined_normal_api_without_errors",', sse_source)
         self.assertIn('"invite_create"', sse_source)
         self.assertIn('"auth_session"', sse_source)

@@ -1170,13 +1170,27 @@ async def run_normal_api_traffic(
                 expected=expected,
             )
 
-    organizer = sampled_users[0]
-    deadline = time.monotonic()
-    next_mutation_at = deadline
-    while not stop_event.is_set():
-        await asyncio.gather(*(read_user(user) for user in sampled_users))
-        now = time.monotonic()
-        if now >= next_mutation_at:
+    async def wait_until_stop(timeout_seconds: float) -> None:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=timeout_seconds)
+        except TimeoutError:
+            pass
+
+    async def read_loop(user: dict[str, Any], user_index: int) -> None:
+        # Real browser tabs do not all render and refetch on the same event
+        # loop tick. Spread the first pass and keep a small deterministic
+        # per-user offset so the probe measures ordinary traffic, not a
+        # synthetic 32-user barrier burst.
+        await wait_until_stop(user_index * 0.25)
+        while not stop_event.is_set():
+            await read_user(user)
+            await wait_until_stop(
+                NORMAL_TRAFFIC_INTERVAL_SECONDS + (user_index % 8) * 0.5
+            )
+
+    async def mutation_loop() -> None:
+        organizer = sampled_users[0]
+        while not stop_event.is_set():
             invite = await request(
                 organizer,
                 "POST",
@@ -1194,14 +1208,12 @@ async def run_normal_api_traffic(
                     kind="invite_revoke",
                     expected=204,
                 )
-            next_mutation_at = now + NORMAL_TRAFFIC_MUTATION_INTERVAL_SECONDS
-        try:
-            await asyncio.wait_for(
-                stop_event.wait(),
-                timeout=NORMAL_TRAFFIC_INTERVAL_SECONDS,
-            )
-        except TimeoutError:
-            continue
+            await wait_until_stop(NORMAL_TRAFFIC_MUTATION_INTERVAL_SECONDS)
+
+    await asyncio.gather(
+        *(read_loop(user, index) for index, user in enumerate(sampled_users)),
+        mutation_loop(),
+    )
 
 
 def combined_profile_timeout_seconds(
@@ -1566,7 +1578,9 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         else:
             qa.report["cleanup"] = {"ok": False, "kept": True}
         qa.report["finished_at"] = datetime.now(UTC).isoformat()
-        qa.report["passed"] = all(item["ok"] for item in qa.scenarios)
+        qa.report["passed"] = not qa.report.get("fatal_error") and all(
+            item["ok"] for item in qa.scenarios
+        )
         qa.report_path.parent.mkdir(parents=True, exist_ok=True)
         qa.report_path.write_text(
             json.dumps(qa.report, indent=2, ensure_ascii=False),
