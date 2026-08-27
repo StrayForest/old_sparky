@@ -1340,6 +1340,7 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
                 report.get("sse_admission") or {}
             ).get("mode"),
             "target_connections": sse.get("target_connections"),
+            "transport": sse.get("transport"),
             "open_rate_per_second": sse.get("open_rate_per_second"),
             "capacity_mode": sse.get("capacity_mode"),
             "application_global_admission_limit": sse.get(
