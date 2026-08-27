@@ -7,10 +7,16 @@ import hashlib
 import hmac
 import json
 import logging
+from time import monotonic
 
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.redis import redis_client
 from python_packages.platform_infra.ready_check_admission import READY_CHECK_ADMISSION_TTL_SECONDS
+from python_packages.platform_infra.sse_connection_limit import (
+    SSE_KEEPALIVE_SECONDS,
+    SseConnectionLease,
+    SseConnectionLeaseRenewalFailed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +27,8 @@ READY_CHECK_RELAY_QUEUE_MAXSIZE = 32
 
 _relay_lock = asyncio.Lock()
 _relay: "_ReadyCheckEventRelay | None" = None
+
+
 def _state_key(tournament_id: str, user_id: str, ready_check_starts_at: int) -> str:
     # IDs are not secret, but keeping user IDs out of Redis key names makes
     # operational dumps less revealing and matches other platform hot paths.
@@ -212,9 +220,33 @@ async def read_ready_check_state(
         await client.aclose()
 
 
-async def stream_ready_check_events(tournament_ids: tuple[str, ...]) -> AsyncIterator[str]:
+async def stream_ready_check_events(
+    tournament_ids: tuple[str, ...],
+    *,
+    connection_lease: SseConnectionLease | None = None,
+) -> AsyncIterator[str]:
     relay = await _get_relay()
     subscription = _ReadyCheckSubscription(set(tournament_ids))
+    last_lease_renewal_at = monotonic()
+
+    async def renew_lease_if_due() -> bool:
+        nonlocal last_lease_renewal_at
+        if connection_lease is None:
+            return True
+        now = monotonic()
+        if now - last_lease_renewal_at < SSE_KEEPALIVE_SECONDS:
+            return True
+        try:
+            await connection_lease.renew()
+        except SseConnectionLeaseRenewalFailed:
+            logger.error(
+                "Closing Ready Check SSE because its connection lease "
+                "could not be renewed."
+            )
+            return False
+        last_lease_renewal_at = now
+        return True
+
     try:
         yield "retry: 5000\nevent: connected\ndata: {}\n\n"
         while True:
@@ -235,6 +267,8 @@ async def stream_ready_check_events(tournament_ids: tuple[str, ...]) -> AsyncIte
                     message = candidate
                     break
             if message is not None:
+                if not await renew_lease_if_due():
+                    return
                 yield message
                 continue
             relay.message_event.clear()
@@ -243,9 +277,11 @@ async def stream_ready_check_events(tournament_ids: tuple[str, ...]) -> AsyncIte
             try:
                 await asyncio.wait_for(
                     relay.message_event.wait(),
-                    timeout=15.0,
+                    timeout=float(SSE_KEEPALIVE_SECONDS),
                 )
             except TimeoutError:
+                if not await renew_lease_if_due():
+                    return
                 yield ": keepalive\n\n"
     finally:
         # The global relay is shared by every stream in this worker. It is

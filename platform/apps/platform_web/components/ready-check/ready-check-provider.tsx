@@ -10,7 +10,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { usePathname } from "next/navigation";
 
 import { useAuth } from "@/components/auth/auth-provider";
 import {
@@ -20,11 +19,16 @@ import {
   type ReadyCheckAgendaItem,
   type ReadyCheckStateProbe,
 } from "@/lib/platform-api";
+import { sseRetryDelayMs } from "@/lib/sse-reconnect-policy";
 
 const READY_CHECK_POLL_VISIBLE_MS = 1_500;
 const READY_CHECK_HARD_TIMEOUT_MS = 5_000;
-const READY_CHECK_SSE_RETRY_BASE_MS = 5_000;
-const READY_CHECK_SSE_RETRY_MAX_MS = 60_000;
+const configuredSseOpenTimeoutMs = Number(
+  process.env.NEXT_PUBLIC_PLATFORM_SSE_OPEN_TIMEOUT_MS ?? "",
+);
+const READY_CHECK_SSE_OPEN_TIMEOUT_MS = Number.isFinite(configuredSseOpenTimeoutMs)
+  ? Math.min(30_000, Math.max(500, Math.round(configuredSseOpenTimeoutMs)))
+  : 1_000;
 
 type ReadyCheckLiveState = ReadyCheckStateProbe;
 
@@ -37,7 +41,6 @@ const ReadyCheckContext = createContext<ReadyCheckContextValue | null>(null);
 
 export function ReadyCheckProvider({ children }: { children: ReactNode }) {
   const { status: authStatus, user } = useAuth();
-  const pathname = usePathname();
   const [agenda, setAgenda] = useState<ReadyCheckAgendaItem[]>([]);
   const [sseTicket, setSseTicket] = useState<string | null>(null);
   const [liveStates, setLiveStates] = useState<Record<string, ReadyCheckLiveState>>({});
@@ -107,7 +110,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       // will retry the inexpensive agenda read.
     });
     return () => controller.abort();
-  }, [authStatus, pathname, user, agendaRefreshVersion]);
+  }, [authStatus, user, agendaRefreshVersion]);
 
   useEffect(() => {
     const checks = agendaRef.current;
@@ -116,8 +119,9 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
     let active = true;
     let stream: EventSource | null = null;
     let pollController: AbortController | null = null;
-    let streamRetryAttempt = 0;
+    let streamConnected = false;
     let streamRetryAt = 0;
+    let sseOpenTimer: ReturnType<typeof setTimeout> | null = null;
 
     const clearPollingTimer = () => {
       if (pollingTimer !== null) {
@@ -126,15 +130,25 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       }
     };
 
-    const closeStream = () => {
-      if (stream !== null) {
-        stream.close();
-        stream = null;
+    const clearSseOpenTimer = () => {
+      if (sseOpenTimer !== null) {
+        clearTimeout(sseOpenTimer);
+        sseOpenTimer = null;
       }
     };
 
-    const stateFor = (item: ReadyCheckAgendaItem): ReadyCheckLiveState => (
-      liveStatesRef.current[item.tournamentId] ?? { revision: 0, status: "waiting" }
+    const closeStream = () => {
+      const currentStream = stream;
+      stream = null;
+      streamConnected = false;
+      clearSseOpenTimer();
+      if (currentStream !== null) {
+        currentStream.close();
+      }
+    };
+
+    const liveStateFor = (item: ReadyCheckAgendaItem): ReadyCheckLiveState | undefined => (
+      liveStatesRef.current[item.tournamentId]
     );
 
     const probe = async (item: ReadyCheckAgendaItem, signal: AbortSignal) => {
@@ -161,7 +175,8 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         && Number.isFinite(endsAt)
         && now >= startsAt
         && now <= endsAt + READY_CHECK_HARD_TIMEOUT_MS
-        && stateFor(item).status === "waiting";
+        && (liveStateFor(item)?.status ?? "waiting") === "waiting"
+        && (item.admissionMode === "polling" || !streamConnected);
     });
 
     const shouldOpenStream = (now: number) => checks.some((item) => {
@@ -173,18 +188,21 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         || !Number.isFinite(openAt)
         || !Number.isFinite(endsAt)
         || now > endsAt + READY_CHECK_HARD_TIMEOUT_MS
-        || stateFor(item).status !== "waiting"
+        || liveStateFor(item)?.status === "active"
+        || liveStateFor(item)?.status === "closed"
+        || item.admissionMode === "polling"
       ) {
         return false;
-      }
-      if (item.admissionMode === "polling") {
-        return now >= startsAt;
       }
       return now >= openAt;
     });
 
     const hasPendingStreamDemand = (now: number) => checks.some((item) => {
-      if (stateFor(item).status !== "waiting") {
+      if (
+        item.admissionMode === "polling"
+        || liveStateFor(item)?.status === "active"
+        || liveStateFor(item)?.status === "closed"
+      ) {
         return false;
       }
       const startsAt = Date.parse(item.readyCheckStartsAt);
@@ -198,8 +216,59 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       ) {
         return false;
       }
-      return item.admissionMode !== "polling" || now >= startsAt;
+      return true;
     });
+
+    function scheduleNext() {
+      clearPollingTimer();
+      if (!active || document.visibilityState === "hidden") {
+        return;
+      }
+      const now = Date.now();
+      let nextAt = Number.POSITIVE_INFINITY;
+      if (dueForPolling(now).length > 0) {
+        nextAt = now + READY_CHECK_POLL_VISIBLE_MS;
+      }
+      for (const item of checks) {
+        if (liveStateFor(item)?.status === "active" || liveStateFor(item)?.status === "closed") {
+          continue;
+        }
+        const startsAt = Date.parse(item.readyCheckStartsAt);
+        const openAt = Date.parse(item.admissionOpenAt);
+        const endsAt = Date.parse(item.readyCheckEndsAt);
+        if (!Number.isFinite(startsAt) || !Number.isFinite(openAt) || !Number.isFinite(endsAt)) {
+          continue;
+        }
+        if (now < startsAt) {
+          nextAt = Math.min(nextAt, startsAt);
+        }
+        if (item.admissionMode !== "polling" && now < openAt) {
+          nextAt = Math.min(nextAt, openAt);
+        }
+      }
+      if (shouldOpenStream(now) && now < streamRetryAt) {
+        nextAt = Math.min(nextAt, streamRetryAt);
+      }
+      if (!Number.isFinite(nextAt)) {
+        return;
+      }
+      pollingTimer = setTimeout(() => {
+        pollingTimer = null;
+        void runCycle().finally(scheduleNext);
+      }, Math.max(0, nextAt - now));
+    }
+
+    const failStream = (source: EventSource) => {
+      if (stream !== source) {
+        return;
+      }
+      closeStream();
+      // Keep fallback probes available immediately, but spread the next SSE
+      // admission over the measured recovery window so mass disconnects do
+      // not create a synchronized reconnect herd.
+      streamRetryAt = Date.now() + sseRetryDelayMs();
+      scheduleNext();
+    };
 
     const openStream = () => {
       if (!streamTicket || stream || document.visibilityState === "hidden") {
@@ -211,7 +280,11 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       );
       stream = source;
       source.onopen = () => {
-        streamRetryAttempt = 0;
+        if (stream !== source) {
+          return;
+        }
+        streamConnected = true;
+        clearSseOpenTimer();
         streamRetryAt = 0;
       };
       source.addEventListener("ready_check", (event) => {
@@ -239,16 +312,13 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         }
       });
       source.onerror = () => {
-        if (stream === source) {
-          source.close();
-          stream = null;
-        }
-        streamRetryAttempt += 1;
-        streamRetryAt = Date.now() + Math.min(
-          READY_CHECK_SSE_RETRY_MAX_MS,
-          READY_CHECK_SSE_RETRY_BASE_MS * (2 ** Math.min(streamRetryAttempt - 1, 4)),
-        );
+        failStream(source);
       };
+      sseOpenTimer = setTimeout(() => {
+        if (stream === source && !streamConnected) {
+          failStream(source);
+        }
+      }, READY_CHECK_SSE_OPEN_TIMEOUT_MS);
     };
 
     const runCycle = async () => {
@@ -256,14 +326,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         return;
       }
       const now = Date.now();
-      const due = [
-        ...dueForPolling(now),
-        ...checks.filter((item) => (
-          item.admissionMode === "late_sse"
-          && stateFor(item).status === "waiting"
-          && Date.now() <= Date.parse(item.readyCheckEndsAt) + READY_CHECK_HARD_TIMEOUT_MS
-        )),
-      ].filter((item, index, items) => (
+      const due = dueForPolling(now).filter((item, index, items) => (
         items.findIndex((candidate) => candidate.tournamentId === item.tournamentId) === index
       ));
       if (due.length > 0) {
@@ -274,44 +337,6 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       if (active && shouldOpenStream(Date.now()) && Date.now() >= streamRetryAt) {
         openStream();
       }
-    };
-
-    const scheduleNext = () => {
-      clearPollingTimer();
-      if (!active || document.visibilityState === "hidden") {
-        return;
-      }
-      const now = Date.now();
-      let nextAt = Number.POSITIVE_INFINITY;
-      for (const item of checks) {
-        if (stateFor(item).status !== "waiting") {
-          continue;
-        }
-        const startsAt = Date.parse(item.readyCheckStartsAt);
-        const openAt = Date.parse(item.admissionOpenAt);
-        const endsAt = Date.parse(item.readyCheckEndsAt);
-        if (!Number.isFinite(startsAt) || !Number.isFinite(openAt) || !Number.isFinite(endsAt)) {
-          continue;
-        }
-        if (now >= startsAt && now <= endsAt + READY_CHECK_HARD_TIMEOUT_MS) {
-          nextAt = Math.min(nextAt, now + READY_CHECK_POLL_VISIBLE_MS);
-        } else if (now < startsAt) {
-          nextAt = Math.min(nextAt, startsAt);
-        }
-        if (item.admissionMode !== "polling" && now < openAt) {
-          nextAt = Math.min(nextAt, openAt);
-        }
-      }
-      if (shouldOpenStream(now) && now < streamRetryAt) {
-        nextAt = Math.min(nextAt, streamRetryAt);
-      }
-      if (!Number.isFinite(nextAt)) {
-        return;
-      }
-      pollingTimer = setTimeout(() => {
-        pollingTimer = null;
-        void runCycle().finally(scheduleNext);
-      }, Math.max(0, nextAt - now));
     };
 
     const handleVisibilityChange = () => {
@@ -340,7 +365,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
 
   const stateForTournament = useCallback((slug: string) => {
     const item = agendaRef.current.find((candidate) => candidate.slug === slug);
-    return item ? liveStates[item.tournamentId] ?? { revision: 0, status: "waiting" } : null;
+    return item ? liveStates[item.tournamentId] ?? null : null;
   }, [liveStates]);
 
   const value = useMemo(

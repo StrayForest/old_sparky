@@ -494,7 +494,7 @@ def parse_args() -> argparse.Namespace:
         "--sse-capacity-limit",
         type=int,
         default=0,
-        help="Explicit QA-only global cap; high-cap runs are restricted to the loopback origin.",
+        help="Explicit QA-only global cap; high-cap runs are restricted to ticketed Ready Check.",
     )
     parser.add_argument(
         "--sse-open-timeout",
@@ -1572,22 +1572,17 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
 
     settings = get_settings()
     if args.sse_capacity_limit:
-        is_loopback_origin = urlsplit(str(args.origin)).hostname in {
-            "127.0.0.1",
-            "localhost",
-            "::1",
-        }
         is_ready_check_capacity_probe = (
             args.mode == "sse"
             and args.sse_scope == "ready-check"
             and args.sse_admission_mode == "ticket"
         )
         if args.sse_capacity_limit > SSE_GLOBAL_LIMIT and not (
-            is_loopback_origin and args.sse_admission_mode == "ticket"
-        ) and not is_ready_check_capacity_probe:
+            is_ready_check_capacity_probe
+        ):
             raise RuntimeError(
                 "QA SSE capacity mode above the production cap requires the "
-                "ticketed Ready Check scope or a ticketed loopback origin."
+                "ticketed Ready Check scope."
             )
         sse_capacity_token = sse_load_test_capacity_token(
             settings,

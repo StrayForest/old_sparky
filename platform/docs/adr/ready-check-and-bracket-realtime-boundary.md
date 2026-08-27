@@ -15,14 +15,18 @@ Ready Check is the only product-critical realtime flow. It uses one global
 application pool across all tournaments. The current production guard is
 `READY_CHECK_SSE_GLOBAL_LIMIT=3000`; `READY_CHECK_SSE_HARD_TARGET=10000` is a
 capacity-test target, not a production setting. Source and authenticated-user
-limits remain independent safety guards.
+limits remain independent safety guards. Ready Check uses one stream per
+authenticated user to prevent multi-tab duplication; the compatibility bracket
+contour retains its separate four-per-user limit.
 
 The authenticated `/ready-check/agenda` read is the only PostgreSQL-backed
 admission planning request. It returns a short-lived, session-bound HMAC proof
 for the user’s state probes and one proof containing the bounded set of
 eligible tournament IDs for the global SSE stream. The proof is not an
 authorization grant for voting; PostgreSQL remains authoritative for workflow
-actions.
+actions. The browser refreshes this agenda at authentication/app start, after
+registration or leave mutations, and when visibility is restored; pathname
+transitions do not independently trigger the PostgreSQL read.
 
 ## Admission policy
 
@@ -44,11 +48,14 @@ Redis lookup. It returns only `revision` and `status` (`waiting`, `active` or
 `closed`). It does not load workspace, participants, teams, bracket data or
 perform a PostgreSQL join/session lookup on every poll.
 
-The browser does zero fallback requests before `T`. At `T` it performs an
-immediate state probe, then polls at approximately 1.5 seconds while visible.
-Hidden tabs stop polling and close the stream; returning to visible immediately
-probes again. `READY_CHECK_STARTED` closes the critical stream as soon as no
-other upcoming check needs it, with the Ready Check end plus a short client
+The browser does zero fallback requests before `T` when a scheduled stream is
+healthy. At `T` it performs an immediate state probe only for polling-admitted,
+rejected, failed, timed-out or disconnected streams, then polls at
+approximately 1.5 seconds while visible. Hidden tabs stop polling and close
+the stream; returning to visible immediately probes again. Stream opening has
+a bounded handshake timeout and reconnect uses full jitter over the measured
+recovery window. `READY_CHECK_STARTED` closes the critical stream as soon as
+no other upcoming check needs it, with the Ready Check end plus a short client
 timeout as a safety boundary.
 
 ## Bracket policy
@@ -86,3 +93,6 @@ use the production default; the 5,000/7,500/10,000 stages pass the requested
 stage through a short-lived signed QA capacity override. That override is
 accepted on the public path only for this ticketed Ready Check contour, and
 never changes the default production cap or permits high-cap bracket testing.
+The proportional allocator is covered for simultaneous unequal demand, spare
+capacity, late arrivals and existing occupancy; those tests validate the
+planning contract, not production fairness until the public staircase is run.

@@ -20,6 +20,7 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
     def test_ready_check_has_separate_production_cap_and_explicit_hard_target(self) -> None:
         self.assertEqual(sse.READY_CHECK_SSE_GLOBAL_LIMIT, 3_000)
         self.assertEqual(sse.READY_CHECK_SSE_HARD_TARGET, 10_000)
+        self.assertEqual(sse.READY_CHECK_SSE_USER_LIMIT, 1)
         settings = SimpleNamespace()
         self.assertEqual(
             sse._global_limit_for_path(
@@ -185,7 +186,7 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         scope = {
             "type": "http",
             "method": "GET",
-            "path": "/api/v1/tournaments/test/bracket/events",
+            "path": "/api/v1/ready-check/events",
             "headers": [
                 (
                     sse.SSE_LOAD_TEST_CAPACITY_HEADER.encode("ascii"),
@@ -197,6 +198,15 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(sse.time, "time", return_value=now):
             self.assertEqual(sse._qa_global_limit(scope, self.settings), 15_000)
 
+        scope["path"] = "/api/v1/ready-check/agenda"
+        with patch.object(sse.time, "time", return_value=now):
+            self.assertEqual(sse._qa_global_limit(scope, self.settings), 15_000)
+
+        scope["path"] = "/api/v1/tournaments/test/bracket/events"
+        with patch.object(sse.time, "time", return_value=now):
+            self.assertIsNone(sse._qa_global_limit(scope, self.settings))
+
+        scope["path"] = "/api/v1/ready-check/events"
         with patch.object(
             sse.time,
             "time",
@@ -239,6 +249,36 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(context.exception.scope, "user")
         finally:
             await asyncio.gather(*(lease.release() for lease in leases))
+
+    async def test_ready_check_user_limit_allows_one_stream_per_user(self) -> None:
+        leases = [
+            await sse.reserve_sse_connection(
+                f"203.0.113.{45 + index}",
+                settings=self.settings,
+                global_limit=10,
+                source_limit=10,
+            )
+            for index in range(2)
+        ]
+        try:
+            await leases[0].add_user_scope(
+                "ready-check-user",
+                user_limit=sse.READY_CHECK_SSE_USER_LIMIT,
+            )
+            with self.assertRaises(sse.SseConnectionLimitExceeded) as context:
+                await leases[1].add_user_scope(
+                    "ready-check-user",
+                    user_limit=sse.READY_CHECK_SSE_USER_LIMIT,
+                )
+            self.assertEqual(context.exception.scope, "user")
+
+            await leases[0].release()
+            await leases[1].add_user_scope(
+                "ready-check-user",
+                user_limit=sse.READY_CHECK_SSE_USER_LIMIT,
+            )
+        finally:
+            await leases[1].release()
 
     async def test_release_immediately_returns_source_capacity(self) -> None:
         first = await sse.reserve_sse_connection(
@@ -304,6 +344,42 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(lease.last_renewed_epoch, 130)
 
+    async def test_ready_check_occupancy_matches_open_leases_after_renewal(self) -> None:
+        now = int(__import__("time").time())
+        leases = [
+            await sse.reserve_sse_connection(
+                f"203.0.113.{60 + index}",
+                settings=self.settings,
+                global_limit=3,
+                source_limit=3,
+                bypass_source_limit=True,
+                global_key=sse._ready_check_global_key(),
+                now_epoch=now,
+            )
+            for index in range(2)
+        ]
+        try:
+            self.assertEqual(
+                await sse.current_ready_check_sse_connection_count(now_epoch=now),
+                2,
+            )
+            await leases[0].renew(now_epoch=now + sse.SSE_LEASE_SECONDS + 1)
+            self.assertEqual(
+                await sse.current_ready_check_sse_connection_count(
+                    now_epoch=now + sse.SSE_LEASE_SECONDS + 1,
+                ),
+                2,
+            )
+            await leases[0].release()
+            self.assertEqual(
+                await sse.current_ready_check_sse_connection_count(
+                    now_epoch=now + sse.SSE_LEASE_SECONDS + 1,
+                ),
+                1,
+            )
+        finally:
+            await leases[1].release()
+
     async def test_authenticated_user_scope_uses_route_auth_result(self) -> None:
         scope = {
             "type": "http",
@@ -326,7 +402,10 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
                 auth_session=auth_session,
             )
 
-        add_user_scope.assert_awaited_once_with("user-1")
+        add_user_scope.assert_awaited_once_with(
+            "user-1",
+            user_limit=sse.SSE_USER_LIMIT,
+        )
 
 
 class PlatformSseConnectionReleaseTests(unittest.IsolatedAsyncioTestCase):
@@ -419,7 +498,7 @@ class PlatformSseConnectionMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         scope = {
             "type": "http",
             "method": "GET",
-            "path": "/api/v1/tournaments/test/bracket/events",
+            "path": "/api/v1/ready-check/events",
             "headers": [
                 (
                     sse.SSE_LOAD_TEST_CAPACITY_HEADER.encode("ascii"),
@@ -447,6 +526,7 @@ class PlatformSseConnectionMiddlewareTests(unittest.IsolatedAsyncioTestCase):
             settings=settings,
             global_limit=15_000,
             bypass_source_limit=False,
+            global_key=sse._ready_check_global_key(),
         )
         lease.release.assert_awaited_once_with()
 

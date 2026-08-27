@@ -39,6 +39,7 @@ from python_packages.platform_infra.ready_check_policy import (
 from python_packages.platform_infra.security import get_authenticated_session
 from python_packages.platform_infra.sse_connection_limit import (
     READY_CHECK_SSE_GLOBAL_LIMIT,
+    READY_CHECK_SSE_USER_LIMIT,
     SSE_CONNECTION_LEASE_SCOPE,
     SseConnectionLease,
     add_sse_authenticated_user_scope,
@@ -96,10 +97,30 @@ async def get_ready_check_agenda(
     if not rows:
         return ReadyCheckAgendaResponse()
 
+    # Planning demand is global to the simultaneous Ready Check cohort, not
+    # just the tournaments visible to this user. The returned agenda remains
+    # user-scoped, while the deterministic quota calculation sees every
+    # approaching eligible tournament so independent agenda requests converge
+    # on the same proportional plan before Redis applies the final cap.
+    planning_rows = (
+        await db_session.execute(
+            select(Tournament)
+            .where(
+                Tournament.format_slug == SOLO_TOURNAMENT_FORMAT,
+                Tournament.ready_check_starts_at.is_not(None),
+                Tournament.ready_check_ends_at > now,
+                Tournament.status.not_in(("completed", "cancelled")),
+            )
+            .order_by(Tournament.ready_check_starts_at, Tournament.id)
+        )
+    ).scalars().all()
+    if not planning_rows:
+        return ReadyCheckAgendaResponse()
+
     already_connected = await current_ready_check_sse_connection_count()
     ready_check_capacity = qa_sse_capacity_limit(request) or READY_CHECK_SSE_GLOBAL_LIMIT
 
-    tournament_ids = [tournament.id for tournament in rows]
+    tournament_ids = [tournament.id for tournament in planning_rows]
     count_rows = await db_session.execute(
         select(
             TournamentParticipant.tournament_id,
@@ -128,7 +149,7 @@ async def get_ready_check_agenda(
             if str(tournament.id) in active_rounds
             else eligible_counts.get(str(tournament.id), 0),
         )
-        for tournament in rows
+        for tournament in planning_rows
         if tournament.ready_check_starts_at is not None
     )
     checks: list[ReadyCheckAgendaItemResponse] = []
@@ -275,9 +296,16 @@ async def get_ready_check_events(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Live-update connection protection is temporarily unavailable.",
         )
-    await add_sse_authenticated_user_scope(request, proof.user_id)
+    await add_sse_authenticated_user_scope(
+        request,
+        proof.user_id,
+        user_limit=READY_CHECK_SSE_USER_LIMIT,
+    )
     return StreamingResponse(
-        stream_ready_check_events(proof.tournament_ids),
+        stream_ready_check_events(
+            proof.tournament_ids,
+            connection_lease=lease,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

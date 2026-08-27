@@ -143,10 +143,10 @@ case "$profile" in
     }
     if (( sse_capacity_limit > 3000 )) && {
       [[ "$profile" != "sse" || "$sse_admission_mode" != "ticket" ]] || {
-        [[ "$sse_scope" != "ready-check" && "$sse_origin_mode" != "origin-local" ]]
+        [[ "$sse_scope" != "ready-check" ]]
       }
     }; then
-      echo "High SSE capacity mode requires ticketed Ready Check scope or ticketed loopback origin." >&2
+      echo "High SSE capacity mode requires the ticketed Ready Check scope." >&2
       exit 1
     fi
     [[ "$sse_reconnect_cycles" =~ ^[0-9]{1,2}$ ]] && (( sse_reconnect_cycles <= 10 )) || {

@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-21
+- Last reviewed: 2026-08-27
 
 ## Invariants
 
@@ -22,9 +22,11 @@
 - Ready Check SSE uses one layered global admission pool across tournaments:
   Redis-backed application leases bind global, source and authenticated-user
   concurrency, while Nginx retains an independent coarse source/global
-  connection ceiling. The browser uses no bracket SSE; bracket pages use a
-  Redis-backed revision probe and fetch the full bracket only after a revision
-  change. See [the realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
+  connection ceiling. Ready Check admits at most one stream per authenticated
+  user to prevent multi-tab duplication; the compatibility bracket contour
+  retains its separate four-per-user limit. The browser uses no bracket SSE;
+  bracket pages use a Redis-backed revision probe and fetch the full bracket
+  only after a revision change. See [the realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
 - Public media rendering is one-way `R2 -> CDN -> browser`; the API does not proxy media object bytes or fall back to local-disk reads.
 
 ## Request and data flow
@@ -114,16 +116,19 @@ Daily maintenance restore-verifies DB backups before pruning known artifacts. Of
 
 The current VPS has two CPU cores and about 3.7 GiB RAM. Ready Check SSE
 application admission is currently capped at 3,000 streams globally, 32 per
-source address and 4 per authenticated user; Nginx retains independent
+source address and 1 per authenticated user; the compatibility bracket SSE
+contour retains 4 per authenticated user. Nginx retains independent
 physical 10,240 source/global ceilings. The 10,000 value is a hard staged-load
 target only, not a production cap. Ready Check opens are dynamically spread
 using the measured safe 25 opens/sec rate, simultaneous demand and a bounded
 preparation window; late arrivals are admitted immediately when Redis capacity
 exists. After a Ready Check event the browser closes the critical stream, and
-overflow users use the tiny revision/status probe only from `T` onward. Bracket
-pages use the same style of one-Redis-key revision probe, then fetch the full
-bracket only after a higher revision. These values are capacity safeguards, not
-product entitlements; change them only from retained public-path load/resource
+overflow users use the tiny revision/status probe only from `T` onward. A
+healthy Ready Check stream suppresses that fallback probe; opening has a
+bounded handshake timeout and full-jitter recovery. Bracket pages use the same
+style of one-Redis-key revision probe, then fetch the full bracket only after a
+higher revision. These values are capacity safeguards, not product
+entitlements; change them only from retained public-path load/resource
 evidence.
 
 Additional workers, exporters, transforms, poolers or nodes require retained CPU/RSS/queue/DB evidence against the operations targets.

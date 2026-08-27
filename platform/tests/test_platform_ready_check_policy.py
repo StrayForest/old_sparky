@@ -41,6 +41,76 @@ class PlatformReadyCheckPolicyTests(unittest.TestCase):
 
         self.assertEqual(allocations, {"a": 5_833, "b": 4_167})
 
+    def test_distributed_simultaneous_schedule_matches_global_proportional_quotas(self) -> None:
+        demands = (
+            ReadyCheckDemand("a", self.starts_at, 7_000),
+            ReadyCheckDemand("b", self.starts_at, 5_000),
+        )
+        plan = ready_check_preparation_plan(demands, already_connected=2_000)
+        allocations = proportional_ready_check_capacity(
+            demands,
+            capacity=10_000 - plan.already_connected,
+        )
+
+        scheduled = {tournament_id: 0 for tournament_id in allocations}
+        polling = {tournament_id: 0 for tournament_id in allocations}
+        for demand in demands:
+            for user_index in range(demand.eligible_count):
+                _, _, mode = ready_check_user_admission(
+                    plan,
+                    demand=demand,
+                    user_id=f"{demand.tournament_id}-user-{user_index}",
+                    sse_quota=allocations[demand.tournament_id],
+                    now=plan.preparation_starts_at,
+                )
+                if mode == "scheduled_sse":
+                    scheduled[demand.tournament_id] += 1
+                elif mode == "polling":
+                    polling[demand.tournament_id] += 1
+
+        self.assertEqual(allocations, {"a": 4_667, "b": 3_333})
+        # User IDs are independently hashed, so the distributed client-side
+        # schedule samples each quota rather than enumerating a global user
+        # list. Validate proportional fairness with a bounded sampling error;
+        # Redis remains the final 10,000-seat admission guard at T.
+        self.assertAlmostEqual(scheduled["a"] / sum(scheduled.values()), 7 / 12, delta=0.02)
+        self.assertAlmostEqual(scheduled["b"] / sum(scheduled.values()), 5 / 12, delta=0.02)
+        self.assertLessEqual(sum(scheduled.values()), 10_000 - plan.already_connected)
+        self.assertEqual(
+            polling,
+            {
+                "a": 7_000 - scheduled["a"],
+                "b": 5_000 - scheduled["b"],
+            },
+        )
+
+    def test_total_demand_below_capacity_is_not_renormalized(self) -> None:
+        self.assertEqual(
+            proportional_ready_check_capacity(
+                [
+                    ReadyCheckDemand("a", self.starts_at, 700),
+                    ReadyCheckDemand("b", self.starts_at, 300),
+                ],
+                capacity=10_000,
+            ),
+            {"a": 700, "b": 300},
+        )
+
+    def test_late_arrivals_are_admitted_even_when_the_planned_quota_is_full(self) -> None:
+        demand = ReadyCheckDemand("a", self.starts_at, 7_000)
+        plan = ready_check_preparation_plan((demand,))
+        open_at, priority, mode = ready_check_user_admission(
+            plan,
+            demand=demand,
+            user_id="late-arrival",
+            sse_quota=0,
+            now=self.starts_at + timedelta(seconds=1),
+        )
+
+        self.assertEqual(open_at, self.starts_at + timedelta(seconds=1))
+        self.assertEqual(priority, READY_CHECK_LATE_ADMISSION_PRIORITY)
+        self.assertEqual(mode, "late_sse")
+
     def test_outside_quota_uses_polling_until_ready_check_start(self) -> None:
         demand = ReadyCheckDemand("a", self.starts_at, 100)
         plan = ready_check_preparation_plan([demand], max_preparation_seconds=120)

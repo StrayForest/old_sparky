@@ -228,9 +228,9 @@ jobs:
               if int(sse_capacity_limit) > 3000 and (
                   profile != "sse"
                   or sse_admission_mode != "ticket"
-                  or (sse_scope != "ready-check" and sse_origin_mode != "origin-local")
+                  or sse_scope != "ready-check"
               ):
-                  raise SystemExit("high SSE capacity mode requires ticketed Ready Check scope or ticketed loopback origin")
+                  raise SystemExit("high SSE capacity mode requires ticketed Ready Check scope")
               # This is a retained-load diagnostic ceiling only. A hold above
               # 600s is allowed to prove healthy streams are not force-rotated.
               sse_open_timeout_max = 60

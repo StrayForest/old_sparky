@@ -41,6 +41,7 @@ READY_CHECK_SSE_HARD_TARGET = 10_000
 SSE_QA_GLOBAL_LIMIT_MAX = 30_000
 SSE_SOURCE_LIMIT = 32
 SSE_USER_LIMIT = 4
+READY_CHECK_SSE_USER_LIMIT = 1
 SSE_KEEPALIVE_SECONDS = 15
 SSE_RECONNECT_MIN_MS = 5_000
 SSE_RECONNECT_JITTER_MS = 7_000
@@ -193,6 +194,14 @@ def _has_sse_load_test_bypass(scope: Scope, settings: PlatformSettings) -> bool:
 
 
 def _qa_global_limit(scope: Scope, settings: PlatformSettings) -> int | None:
+    # Capacity proofs are deliberately scoped to the Ready Check contour. A
+    # valid proof must not be reusable to raise the compatibility bracket
+    # contour, even if a caller supplies the header outside the QA wrapper.
+    if str(scope.get("path", "")) not in {
+        "/api/v1/ready-check/agenda",
+        "/api/v1/ready-check/events",
+    }:
+        return None
     request = Request(scope)
     parts = request.headers.get(SSE_LOAD_TEST_CAPACITY_HEADER, "").split(":")
     if len(parts) != 3:
@@ -599,10 +608,15 @@ async def admit_sse_authenticated_user(
     await add_sse_authenticated_user_scope(request, str(auth_session.user.id))
 
 
-async def add_sse_authenticated_user_scope(request: Request, user_id: str) -> None:
+async def add_sse_authenticated_user_scope(
+    request: Request,
+    user_id: str,
+    *,
+    user_limit: int = SSE_USER_LIMIT,
+) -> None:
     """Add the authenticated-user lease after stream authorization."""
 
     lease = request.scope.get(SSE_CONNECTION_LEASE_SCOPE)
     if not isinstance(lease, SseConnectionLease):
         raise RuntimeError("SSE connection lease is missing from the request scope.")
-    await lease.add_user_scope(user_id)
+    await lease.add_user_scope(user_id, user_limit=user_limit)
