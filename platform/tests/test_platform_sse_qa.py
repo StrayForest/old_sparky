@@ -313,6 +313,8 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(profile, workflow)
         self.assertIn("platform_sse_qa.py", supervisor)
         self.assertIn('sse_setup_concurrency=20', supervisor)
+        self.assertIn('sse_setup_concurrency=4', supervisor)
+        self.assertIn('if [[ "$sse_scope" == "ready-check" ]]', supervisor)
         self.assertIn('--concurrency "$sse_setup_concurrency"', supervisor)
         self.assertIn('--http-timeout 10', supervisor)
         self.assertIn('--request-origin "$EXPECTED_ORIGIN"', supervisor)

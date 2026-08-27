@@ -378,6 +378,7 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
                     {
                         **default_workspace["bracket"],
                         "sse_admission_ticket": None,
+                        "bracket_probe_ticket": None,
                     }
                     if default_workspace["bracket"] is not None
                     else None
@@ -389,6 +390,7 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
                     {
                         **lean_workspace["bracket"],
                         "sse_admission_ticket": None,
+                        "bracket_probe_ticket": None,
                     }
                     if lean_workspace["bracket"] is not None
                     else None

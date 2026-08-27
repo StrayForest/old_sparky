@@ -525,7 +525,14 @@ else
   # load generator's own queue instead of the public origin. The API pool
   # remains bounded server-side; this only lets the public client contour
   # expose origin saturation when many tabs become ready together.
-  sse_setup_concurrency=20
+  if [[ "$sse_scope" == "ready-check" ]]; then
+    # Sparse participant allocation is deliberately contention-sensitive.
+    # Keep fixture joins below the retry-free conflict threshold; measured
+    # SSE opening remains controlled independently by --sse-open-concurrency.
+    sse_setup_concurrency=4
+  else
+    sse_setup_concurrency=20
+  fi
   set +e
   run_monitored "$log_path" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_sse_qa.py" \
