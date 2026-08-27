@@ -17,7 +17,6 @@ from apps.platform_api.app.services.tournament_workspace_access import (
 from python_packages.platform_infra.redis import redis_client
 from python_packages.platform_infra.sse_connection_limit import (
     SSE_KEEPALIVE_SECONDS,
-    SSE_LEASE_RENEW_INTERVAL_SECONDS,
     SSE_RECONNECT_JITTER_MS,
     SSE_RECONNECT_MIN_MS,
     SseConnectionLease,
@@ -312,7 +311,11 @@ async def stream_bracket_events(
             now = monotonic()
             if (
                 connection_lease is not None
-                and now - last_lease_renewal_at >= SSE_LEASE_RENEW_INTERVAL_SECONDS
+                # Try at every keepalive checkpoint. The lease itself
+                # suppresses redundant Redis calls until its configured
+                # renewal interval, while the earlier checkpoint prevents a
+                # lease from expiring if the stream is otherwise idle.
+                and now - last_lease_renewal_at >= SSE_KEEPALIVE_SECONDS
             ):
                 try:
                     await connection_lease.renew()
