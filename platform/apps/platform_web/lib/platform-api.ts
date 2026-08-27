@@ -160,6 +160,7 @@ type ApiBracket = {
   next_poll_after_ms?: number | null;
   state_version?: number | null;
   sse_admission_ticket?: string | null;
+  bracket_probe_ticket?: string | null;
 };
 
 type ApiBracketCapabilities = {
@@ -273,6 +274,27 @@ export type TournamentCreatePayload = {
 export type TournamentInviteCodeAvailability = {
   code: string;
   available: boolean;
+};
+
+export type ReadyCheckAgendaItem = {
+  tournamentId: string;
+  slug: string;
+  readyCheckStartsAt: string;
+  readyCheckEndsAt: string;
+  admissionOpenAt: string;
+  admissionPriority: string;
+  admissionMode: "scheduled_sse" | "late_sse" | "polling";
+  stateTicket: string;
+};
+
+export type ReadyCheckAgenda = {
+  checks: ReadyCheckAgendaItem[];
+  sseTicket: string | null;
+};
+
+export type ReadyCheckStateProbe = {
+  revision: number;
+  status: "waiting" | "active" | "closed";
 };
 
 const serverApiBaseUrl = process.env.PLATFORM_API_BASE_URL
@@ -1082,6 +1104,103 @@ export async function getTournamentReadyCheckState(
   }
 }
 
+export async function getReadyCheckAgenda(
+  signal?: AbortSignal,
+): Promise<ReadyCheckAgenda | null> {
+  try {
+    const response = await platformFetch(`${apiBaseUrl}/ready-check/agenda`, {
+      headers: { accept: "application/json" },
+      credentials: "include",
+      cache: "no-store",
+      signal,
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = await response.json() as {
+      checks?: Array<{
+        tournament_id?: string;
+        slug?: string;
+        ready_check_starts_at?: string;
+        ready_check_ends_at?: string;
+        admission_open_at?: string;
+        admission_priority?: string;
+        admission_mode?: string;
+        state_ticket?: string;
+      }>;
+      sse_ticket?: string | null;
+    };
+    const checks = (payload.checks ?? []).flatMap((item) => {
+      const admissionMode = item.admission_mode;
+      if (
+        !item.tournament_id
+        || !item.slug
+        || !item.ready_check_starts_at
+        || !item.ready_check_ends_at
+        || !item.admission_open_at
+        || !item.state_ticket
+        || !["scheduled_sse", "late_sse", "polling"].includes(admissionMode ?? "")
+      ) {
+        return [];
+      }
+      return [{
+        tournamentId: item.tournament_id,
+        slug: item.slug,
+        readyCheckStartsAt: item.ready_check_starts_at,
+        readyCheckEndsAt: item.ready_check_ends_at,
+        admissionOpenAt: item.admission_open_at,
+        admissionPriority: item.admission_priority ?? "scheduled",
+        admissionMode: admissionMode as ReadyCheckAgendaItem["admissionMode"],
+        stateTicket: item.state_ticket,
+      }];
+    });
+    return {
+      checks,
+      sseTicket: typeof payload.sse_ticket === "string" ? payload.sse_ticket : null,
+    };
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw error;
+    }
+    return null;
+  }
+}
+
+export async function getReadyCheckStateProbe(
+  slug: string,
+  ticket: string,
+  signal?: AbortSignal,
+): Promise<ReadyCheckStateProbe | null> {
+  try {
+    const params = new URLSearchParams({ slug, ticket });
+    const response = await platformFetch(`${apiBaseUrl}/ready-check/state?${params.toString()}`, {
+      headers: { accept: "application/json" },
+      credentials: "include",
+      cache: "no-store",
+      signal,
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = await response.json() as { revision?: number; status?: string };
+    if (
+      !Number.isFinite(payload.revision)
+      || !["waiting", "active", "closed"].includes(payload.status ?? "")
+    ) {
+      return null;
+    }
+    return {
+      revision: Number(payload.revision),
+      status: payload.status as ReadyCheckStateProbe["status"],
+    };
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw error;
+    }
+    return null;
+  }
+}
+
 export async function getTournamentAutoAssignmentState(
   slug: string,
   requestHeaders: HeadersInit = {}
@@ -1156,6 +1275,38 @@ export async function getTournamentBracket(
       return null;
     }
     return mapBracket(await response.json() as ApiBracket);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw error;
+    }
+    return null;
+  }
+}
+
+export async function getTournamentBracketProbe(
+  slug: string,
+  ticket: string,
+  signal?: AbortSignal,
+): Promise<{ revision: number; status: Bracket["status"] } | null> {
+  try {
+    const params = new URLSearchParams({ slug, ticket });
+    const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/bracket/probe?${params.toString()}`, {
+      headers: { accept: "application/json" },
+      credentials: "include",
+      cache: "no-store",
+      signal,
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = await response.json() as { revision?: number; status?: string };
+    if (!Number.isFinite(payload.revision) || !["pending", "teams_ready", "ready"].includes(payload.status ?? "")) {
+      return null;
+    }
+    return {
+      revision: Number(payload.revision),
+      status: payload.status as Bracket["status"],
+    };
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
       throw error;
@@ -1545,6 +1696,7 @@ function mapBracket(item: ApiBracket): Bracket {
     nextPollAfterMs: item.next_poll_after_ms ?? null,
     stateVersion: item.state_version ?? null,
     sseAdmissionTicket: item.sse_admission_ticket ?? null,
+    bracketProbeTicket: item.bracket_probe_ticket ?? null,
   };
 }
 
@@ -1565,6 +1717,7 @@ function emptyBracket(tournamentId: string, tournamentStatus: TournamentStatus):
     nextPollAfterMs: null,
     stateVersion: null,
     sseAdmissionTicket: null,
+    bracketProbeTicket: null,
   };
 }
 

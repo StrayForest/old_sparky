@@ -34,8 +34,8 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# < 5 || $# > 20 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-open-rate sse-capacity-limit sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local] [ticket|legacy]]" >&2
+if (( $# < 5 || $# > 21 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-open-rate sse-capacity-limit sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local] [ticket|legacy] [bracket|ready-check]]" >&2
   exit 2
 fi
 
@@ -57,7 +57,10 @@ sse_event_interval=1
 combined_polling_duration=30
 combined_polling_open_stagger=300
 sse_origin_mode=public
-  sse_admission_mode=ticket
+sse_admission_mode=ticket
+sse_scope=bracket
+# The controlled high-cap contour is explicitly invoked with
+# sse_scope=ready-check; the default remains the compatibility bracket scope.
 
 case "$profile" in
   matrix|browser-polling) ;;
@@ -77,6 +80,7 @@ case "$profile" in
       combined_polling_open_stagger="${16:-300}"
       sse_origin_mode="${17:-public}"
       sse_admission_mode="${18:-ticket}"
+      sse_scope="${19:-bracket}"
     else
       sse_open_rate="${11:-0}"
       sse_capacity_limit="${12:-0}"
@@ -88,11 +92,20 @@ case "$profile" in
       combined_polling_open_stagger="${18:-300}"
       sse_origin_mode="${19:-public}"
       sse_admission_mode="${20:-ticket}"
+      sse_scope="${21:-bracket}"
     fi
     [[ "$sse_admission_mode" == "ticket" || "$sse_admission_mode" == "legacy" ]] || {
       echo "SSE admission mode must be ticket or legacy." >&2
       exit 1
     }
+    [[ "$sse_scope" == "bracket" || "$sse_scope" == "ready-check" ]] || {
+      echo "SSE scope must be bracket or ready-check." >&2
+      exit 1
+    }
+    if [[ "$sse_scope" == "ready-check" && ( "$profile" != "sse" || "$sse_admission_mode" != "ticket" ) ]]; then
+      echo "Ready Check scope requires the ticketed SSE-only profile." >&2
+      exit 1
+    fi
     [[ "$sse_origin_mode" == "public" || "$sse_origin_mode" == "origin-local" ]] || {
       echo "SSE origin mode must be public or origin-local." >&2
       exit 1
@@ -129,9 +142,11 @@ case "$profile" in
       exit 1
     }
     if (( sse_capacity_limit > 3000 )) && {
-      [[ "$profile" != "sse" || "$sse_origin_mode" != "origin-local" || "$sse_admission_mode" != "ticket" ]]
+      [[ "$profile" != "sse" || "$sse_admission_mode" != "ticket" ]] || {
+        [[ "$sse_scope" != "ready-check" && "$sse_origin_mode" != "origin-local" ]]
+      }
     }; then
-      echo "High SSE capacity mode requires the ticketed SSE-only loopback origin." >&2
+      echo "High SSE capacity mode requires ticketed Ready Check scope or ticketed loopback origin." >&2
       exit 1
     fi
     [[ "$sse_reconnect_cycles" =~ ^[0-9]{1,2}$ ]] && (( sse_reconnect_cycles <= 10 )) || {
@@ -534,6 +549,7 @@ else
     --combined-polling-duration "$combined_polling_duration" \
     --combined-polling-open-stagger "$combined_polling_open_stagger" \
     --sse-admission-mode "$sse_admission_mode" \
+    --sse-scope "$sse_scope" \
     --concurrency "$sse_setup_concurrency" \
     --http-max-connections "$HTTP_MAX_CONNECTIONS" \
     --http-timeout 10 \

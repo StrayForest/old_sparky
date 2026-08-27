@@ -1,0 +1,368 @@
+"use client";
+
+import {
+  createContext,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { usePathname } from "next/navigation";
+
+import { useAuth } from "@/components/auth/auth-provider";
+import {
+  getReadyCheckAgenda,
+  getReadyCheckStateProbe,
+  platformApiUrl,
+  type ReadyCheckAgendaItem,
+  type ReadyCheckStateProbe,
+} from "@/lib/platform-api";
+
+const READY_CHECK_POLL_VISIBLE_MS = 1_500;
+const READY_CHECK_HARD_TIMEOUT_MS = 5_000;
+const READY_CHECK_SSE_RETRY_BASE_MS = 5_000;
+const READY_CHECK_SSE_RETRY_MAX_MS = 60_000;
+
+type ReadyCheckLiveState = ReadyCheckStateProbe;
+
+type ReadyCheckContextValue = {
+  stateForTournament: (slug: string) => ReadyCheckLiveState | null;
+  refreshAgenda: () => void;
+};
+
+const ReadyCheckContext = createContext<ReadyCheckContextValue | null>(null);
+
+export function ReadyCheckProvider({ children }: { children: ReactNode }) {
+  const { status: authStatus, user } = useAuth();
+  const pathname = usePathname();
+  const [agenda, setAgenda] = useState<ReadyCheckAgendaItem[]>([]);
+  const [sseTicket, setSseTicket] = useState<string | null>(null);
+  const [liveStates, setLiveStates] = useState<Record<string, ReadyCheckLiveState>>({});
+  const [agendaRefreshVersion, setAgendaRefreshVersion] = useState(0);
+  const [visibilityVersion, setVisibilityVersion] = useState(0);
+  const agendaRef = useRef<ReadyCheckAgendaItem[]>([]);
+  const liveStatesRef = useRef<Record<string, ReadyCheckLiveState>>({});
+
+  const refreshAgenda = useCallback(() => {
+    setAgendaRefreshVersion((value) => value + 1);
+  }, []);
+
+  const updateLiveState = useCallback((tournamentId: string, next: ReadyCheckLiveState) => {
+    const updated = {
+      ...liveStatesRef.current,
+      [tournamentId]: next,
+    };
+    liveStatesRef.current = updated;
+    setLiveStates(updated);
+  }, []);
+
+  useEffect(() => {
+    agendaRef.current = agenda;
+  }, [agenda]);
+
+  useEffect(() => {
+    liveStatesRef.current = liveStates;
+  }, [liveStates]);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      setVisibilityVersion((value) => value + 1);
+      if (document.visibilityState === "visible") {
+        refreshAgenda();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, [refreshAgenda]);
+
+  useEffect(() => {
+    if (authStatus !== "authenticated" || !user) {
+      setAgenda([]);
+      setSseTicket(null);
+      liveStatesRef.current = {};
+      setLiveStates({});
+      return;
+    }
+
+    const controller = new AbortController();
+    const requestUserId = user.id;
+    void getReadyCheckAgenda(controller.signal).then((nextAgenda) => {
+      if (controller.signal.aborted || requestUserId !== user.id || !nextAgenda) {
+        return;
+      }
+      const nextIds = new Set(nextAgenda.checks.map((item) => item.tournamentId));
+      const retainedStates = Object.fromEntries(
+        Object.entries(liveStatesRef.current).filter(([tournamentId]) => nextIds.has(tournamentId)),
+      );
+      liveStatesRef.current = retainedStates;
+      setLiveStates(retainedStates);
+      setAgenda(nextAgenda.checks);
+      setSseTicket(nextAgenda.sseTicket);
+    }).catch(() => {
+      // A transient agenda failure must not tear down an already admitted
+      // stream. The next navigation, visibility change, or explicit refresh
+      // will retry the inexpensive agenda read.
+    });
+    return () => controller.abort();
+  }, [authStatus, pathname, user, agendaRefreshVersion]);
+
+  useEffect(() => {
+    const checks = agendaRef.current;
+    const streamTicket = sseTicket;
+    let pollingTimer: ReturnType<typeof setTimeout> | null = null;
+    let active = true;
+    let stream: EventSource | null = null;
+    let pollController: AbortController | null = null;
+    let streamRetryAttempt = 0;
+    let streamRetryAt = 0;
+
+    const clearPollingTimer = () => {
+      if (pollingTimer !== null) {
+        clearTimeout(pollingTimer);
+        pollingTimer = null;
+      }
+    };
+
+    const closeStream = () => {
+      if (stream !== null) {
+        stream.close();
+        stream = null;
+      }
+    };
+
+    const stateFor = (item: ReadyCheckAgendaItem): ReadyCheckLiveState => (
+      liveStatesRef.current[item.tournamentId] ?? { revision: 0, status: "waiting" }
+    );
+
+    const probe = async (item: ReadyCheckAgendaItem, signal: AbortSignal) => {
+      try {
+        const next = await getReadyCheckStateProbe(item.slug, item.stateTicket, signal);
+        if (active && !signal.aborted && next) {
+          updateLiveState(item.tournamentId, next);
+          if (!hasPendingStreamDemand(Date.now())) {
+            closeStream();
+          }
+        }
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          // Missing/temporarily unavailable state remains waiting. The next
+          // visible cadence retries without loading the tournament workspace.
+        }
+      }
+    };
+
+    const dueForPolling = (now: number) => checks.filter((item) => {
+      const startsAt = Date.parse(item.readyCheckStartsAt);
+      const endsAt = Date.parse(item.readyCheckEndsAt);
+      return Number.isFinite(startsAt)
+        && Number.isFinite(endsAt)
+        && now >= startsAt
+        && now <= endsAt + READY_CHECK_HARD_TIMEOUT_MS
+        && stateFor(item).status === "waiting";
+    });
+
+    const shouldOpenStream = (now: number) => checks.some((item) => {
+      const startsAt = Date.parse(item.readyCheckStartsAt);
+      const openAt = Date.parse(item.admissionOpenAt);
+      const endsAt = Date.parse(item.readyCheckEndsAt);
+      if (
+        !Number.isFinite(startsAt)
+        || !Number.isFinite(openAt)
+        || !Number.isFinite(endsAt)
+        || now > endsAt + READY_CHECK_HARD_TIMEOUT_MS
+        || stateFor(item).status !== "waiting"
+      ) {
+        return false;
+      }
+      if (item.admissionMode === "polling") {
+        return now >= startsAt;
+      }
+      return now >= openAt;
+    });
+
+    const hasPendingStreamDemand = (now: number) => checks.some((item) => {
+      if (stateFor(item).status !== "waiting") {
+        return false;
+      }
+      const startsAt = Date.parse(item.readyCheckStartsAt);
+      const openAt = Date.parse(item.admissionOpenAt);
+      const endsAt = Date.parse(item.readyCheckEndsAt);
+      if (
+        !Number.isFinite(startsAt)
+        || !Number.isFinite(openAt)
+        || !Number.isFinite(endsAt)
+        || now > endsAt + READY_CHECK_HARD_TIMEOUT_MS
+      ) {
+        return false;
+      }
+      return item.admissionMode !== "polling" || now >= startsAt;
+    });
+
+    const openStream = () => {
+      if (!streamTicket || stream || document.visibilityState === "hidden") {
+        return;
+      }
+      const source = new EventSource(
+        platformApiUrl(`/ready-check/events?ticket=${encodeURIComponent(streamTicket)}`),
+        { withCredentials: true },
+      );
+      stream = source;
+      source.onopen = () => {
+        streamRetryAttempt = 0;
+        streamRetryAt = 0;
+      };
+      source.addEventListener("ready_check", (event) => {
+        if (!(event instanceof MessageEvent) || typeof event.data !== "string") {
+          return;
+        }
+        try {
+          const payload = JSON.parse(event.data) as {
+            tournament_id?: string;
+            revision?: number;
+            status?: string;
+          };
+          const item = checks.find((candidate) => candidate.tournamentId === payload.tournament_id);
+          if (!item || !payload.tournament_id || !["active", "closed"].includes(payload.status ?? "")) {
+            return;
+          }
+          // The global event is only a wake-up hint. The user-scoped Redis
+          // projection is authoritative so a participant revoked after the
+          // agenda read cannot receive an active button from a stale stream.
+          const eventController = new AbortController();
+          void probe(item, eventController.signal).finally(() => eventController.abort());
+        } catch {
+          // Ignore malformed relay data; the revision probe remains the
+          // authoritative fallback for the current user's ticket.
+        }
+      });
+      source.onerror = () => {
+        if (stream === source) {
+          source.close();
+          stream = null;
+        }
+        streamRetryAttempt += 1;
+        streamRetryAt = Date.now() + Math.min(
+          READY_CHECK_SSE_RETRY_MAX_MS,
+          READY_CHECK_SSE_RETRY_BASE_MS * (2 ** Math.min(streamRetryAttempt - 1, 4)),
+        );
+      };
+    };
+
+    const runCycle = async () => {
+      if (!active || document.visibilityState === "hidden") {
+        return;
+      }
+      const now = Date.now();
+      const due = [
+        ...dueForPolling(now),
+        ...checks.filter((item) => (
+          item.admissionMode === "late_sse"
+          && stateFor(item).status === "waiting"
+          && Date.now() <= Date.parse(item.readyCheckEndsAt) + READY_CHECK_HARD_TIMEOUT_MS
+        )),
+      ].filter((item, index, items) => (
+        items.findIndex((candidate) => candidate.tournamentId === item.tournamentId) === index
+      ));
+      if (due.length > 0) {
+        pollController?.abort();
+        pollController = new AbortController();
+        await Promise.all(due.map((item) => probe(item, pollController!.signal)));
+      }
+      if (active && shouldOpenStream(Date.now()) && Date.now() >= streamRetryAt) {
+        openStream();
+      }
+    };
+
+    const scheduleNext = () => {
+      clearPollingTimer();
+      if (!active || document.visibilityState === "hidden") {
+        return;
+      }
+      const now = Date.now();
+      let nextAt = Number.POSITIVE_INFINITY;
+      for (const item of checks) {
+        if (stateFor(item).status !== "waiting") {
+          continue;
+        }
+        const startsAt = Date.parse(item.readyCheckStartsAt);
+        const openAt = Date.parse(item.admissionOpenAt);
+        const endsAt = Date.parse(item.readyCheckEndsAt);
+        if (!Number.isFinite(startsAt) || !Number.isFinite(openAt) || !Number.isFinite(endsAt)) {
+          continue;
+        }
+        if (now >= startsAt && now <= endsAt + READY_CHECK_HARD_TIMEOUT_MS) {
+          nextAt = Math.min(nextAt, now + READY_CHECK_POLL_VISIBLE_MS);
+        } else if (now < startsAt) {
+          nextAt = Math.min(nextAt, startsAt);
+        }
+        if (item.admissionMode !== "polling" && now < openAt) {
+          nextAt = Math.min(nextAt, openAt);
+        }
+      }
+      if (shouldOpenStream(now) && now < streamRetryAt) {
+        nextAt = Math.min(nextAt, streamRetryAt);
+      }
+      if (!Number.isFinite(nextAt)) {
+        return;
+      }
+      pollingTimer = setTimeout(() => {
+        pollingTimer = null;
+        void runCycle().finally(scheduleNext);
+      }, Math.max(0, nextAt - now));
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        clearPollingTimer();
+        pollController?.abort();
+        closeStream();
+        return;
+      }
+      void runCycle().finally(scheduleNext);
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    if (document.visibilityState === "visible") {
+      void runCycle().finally(scheduleNext);
+    }
+
+    return () => {
+      active = false;
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      clearPollingTimer();
+      pollController?.abort();
+      closeStream();
+    };
+  }, [agenda, sseTicket, updateLiveState, visibilityVersion]);
+
+  const stateForTournament = useCallback((slug: string) => {
+    const item = agendaRef.current.find((candidate) => candidate.slug === slug);
+    return item ? liveStates[item.tournamentId] ?? { revision: 0, status: "waiting" } : null;
+  }, [liveStates]);
+
+  const value = useMemo(
+    () => ({ stateForTournament, refreshAgenda }),
+    [refreshAgenda, stateForTournament],
+  );
+
+  return <ReadyCheckContext.Provider value={value}>{children}</ReadyCheckContext.Provider>;
+}
+
+export function useReadyCheckState(slug: string): ReadyCheckLiveState | null {
+  const context = useContext(ReadyCheckContext);
+  if (!context) {
+    throw new Error("useReadyCheckState must be used inside ReadyCheckProvider.");
+  }
+  return context.stateForTournament(slug);
+}
+
+export function useReadyCheckAgendaRefresh(): () => void {
+  const context = useContext(ReadyCheckContext);
+  if (!context) {
+    throw new Error("useReadyCheckAgendaRefresh must be used inside ReadyCheckProvider.");
+  }
+  return context.refreshAgenda;
+}

@@ -646,6 +646,27 @@ class TournamentDeadlockReadyCheckStateResponse(BaseModel):
     state_version: int | None = None
 
 
+class ReadyCheckAgendaItemResponse(BaseModel):
+    tournament_id: str
+    slug: str
+    ready_check_starts_at: datetime
+    ready_check_ends_at: datetime
+    admission_open_at: datetime
+    admission_priority: str
+    admission_mode: Literal["scheduled_sse", "late_sse", "polling"]
+    state_ticket: str
+
+
+class ReadyCheckAgendaResponse(BaseModel):
+    checks: list[ReadyCheckAgendaItemResponse] = Field(default_factory=list)
+    sse_ticket: str | None = None
+
+
+class ReadyCheckStateProbeResponse(BaseModel):
+    revision: int = 0
+    status: Literal["waiting", "active", "closed"] = "waiting"
+
+
 class TournamentDeadlockCaptainPreviewCandidateResponse(BaseModel):
     user_id: str
     display_name: str
@@ -1087,6 +1108,14 @@ class TournamentBracketResponse(BaseModel):
     # A short-lived proof issued only after the surrounding workspace access
     # check. It removes PostgreSQL from the subsequent SSE handshake.
     sse_admission_ticket: str | None = None
+    # A short-lived proof for the cheap revision probe. It carries only the
+    # already-authorized viewer binding and the last known revision.
+    bracket_probe_ticket: str | None = None
+
+
+class BracketProbeResponse(BaseModel):
+    revision: int = 0
+    status: Literal["pending", "teams_ready", "ready"] = "pending"
 
 
 class AuditLogResponse(BaseModel):

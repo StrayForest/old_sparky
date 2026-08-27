@@ -28,12 +28,16 @@ from python_packages.platform_infra.security import (
 
 logger = logging.getLogger(__name__)
 
-SSE_PATH_RE = re.compile(r"^/api/v1/tournaments/[^/]+/bracket/events$")
+SSE_PATH_RE = re.compile(
+    r"^(?:/api/v1/tournaments/[^/]+/bracket/events|/api/v1/ready-check/events)$"
+)
 # Cloudflare's public edge starts returning Error 1200 while the origin is
 # still below its own CPU/DB ceilings. Keep a deliberate local headroom so
 # excess viewers receive an immediate, controlled 429 and can fall back to
 # revision polling instead of waiting in the edge queue.
 SSE_GLOBAL_LIMIT = 3_000
+READY_CHECK_SSE_GLOBAL_LIMIT = 3_000
+READY_CHECK_SSE_HARD_TARGET = 10_000
 SSE_QA_GLOBAL_LIMIT_MAX = 30_000
 SSE_SOURCE_LIMIT = 32
 SSE_USER_LIMIT = 4
@@ -45,6 +49,7 @@ SSE_LEASE_SECONDS = 120
 SSE_LEASE_RENEW_INTERVAL_SECONDS = 30
 SSE_KEY_EXPIRY_GRACE_SECONDS = 60
 SSE_KEY_PREFIX = "platform:sse-limit:v1"
+READY_CHECK_SSE_KEY_PREFIX = "platform:ready-check-sse-limit:v1"
 SSE_LOAD_TEST_BYPASS_HEADER = "x-platform-qa-sse-bypass"
 SSE_LOAD_TEST_BYPASS_CONTEXT = b"platform-sse-load-test-v1"
 SSE_LOAD_TEST_CAPACITY_HEADER = "x-platform-qa-sse-capacity"
@@ -208,8 +213,18 @@ def _qa_global_limit(scope: Scope, settings: PlatformSettings) -> int | None:
     return global_limit
 
 
+def qa_sse_capacity_limit(request: Request) -> int | None:
+    """Return an operator-signed QA capacity override for this request."""
+
+    return _qa_global_limit(request.scope, get_settings())
+
+
 def _global_key() -> str:
     return f"{SSE_KEY_PREFIX}:global"
+
+
+def _ready_check_global_key() -> str:
+    return f"{READY_CHECK_SSE_KEY_PREFIX}:global"
 
 
 def _source_key(settings: PlatformSettings, source_address: str) -> str:
@@ -394,11 +409,12 @@ async def reserve_sse_connection(
     bypass_source_limit: bool = False,
     lease_seconds: int = SSE_LEASE_SECONDS,
     now_epoch: int | None = None,
+    global_key: str | None = None,
 ) -> SseConnectionLease:
     resolved_settings = settings or get_settings()
     now = int(time.time()) if now_epoch is None else now_epoch
     member = secrets.token_urlsafe(18)
-    keys = [_global_key()]
+    keys = [global_key or _global_key()]
     limits = [global_limit]
     scopes = ["global"]
     if not bypass_source_limit and not is_load_test_source(
@@ -424,11 +440,43 @@ async def reserve_sse_connection(
     )
 
 
+async def current_ready_check_sse_connection_count(
+    *,
+    now_epoch: int | None = None,
+) -> int:
+    """Return the bounded Ready Check pool count for admission planning."""
+
+    now = int(time.time()) if now_epoch is None else now_epoch
+    cache = _limiter_client()
+    try:
+        await cache.zremrangebyscore(_ready_check_global_key(), "-inf", now)
+        return int(await cache.zcard(_ready_check_global_key()))
+    except RedisError:
+        # Planning is advisory. The atomic lease remains fail-closed when the
+        # actual stream attempts to open, so a stale/unknown count cannot grant
+        # capacity.
+        logger.warning("Failed to read Ready Check SSE occupancy for planning.", exc_info=True)
+        return 0
+
+
 def _source_address(scope: Scope) -> str:
     client = scope.get("client")
     if client is None or not client[0]:
         return "unknown"
     return str(client[0])
+
+
+def _global_limit_for_path(scope: Scope, settings: PlatformSettings) -> int:
+    path = str(scope.get("path", ""))
+    if path == "/api/v1/ready-check/events":
+        return READY_CHECK_SSE_GLOBAL_LIMIT
+    return SSE_GLOBAL_LIMIT
+
+
+def _global_key_for_path(scope: Scope) -> str:
+    if str(scope.get("path", "")) == "/api/v1/ready-check/events":
+        return _ready_check_global_key()
+    return _global_key()
 
 
 class SseConnectionLimitMiddleware:
@@ -458,15 +506,17 @@ class SseConnectionLimitMiddleware:
         source_address = _source_address(scope)
         source_fingerprint = _fingerprint(settings, f"source:{source_address}")
         bypass_source_limit = _has_sse_load_test_bypass(scope, settings)
-        global_limit = _qa_global_limit(scope, settings) or SSE_GLOBAL_LIMIT
+        global_limit = _qa_global_limit(scope, settings) or _global_limit_for_path(scope, settings)
         lease: SseConnectionLease | None = None
         try:
-            lease = await reserve_sse_connection(
-                source_address,
-                settings=settings,
-                global_limit=global_limit,
-                bypass_source_limit=bypass_source_limit,
-            )
+            reservation_kwargs = {
+                "settings": settings,
+                "global_limit": global_limit,
+                "bypass_source_limit": bypass_source_limit,
+            }
+            if str(scope.get("path", "")) == "/api/v1/ready-check/events":
+                reservation_kwargs["global_key"] = _global_key_for_path(scope)
+            lease = await reserve_sse_connection(source_address, **reservation_kwargs)
         except SseConnectionLimitExceeded as exc:
             if lease is not None:
                 await lease.release()

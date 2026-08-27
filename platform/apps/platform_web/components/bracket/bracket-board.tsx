@@ -8,13 +8,12 @@ import { useI18n } from "@/components/i18n-provider";
 import { useCspNonce } from "@/components/security/csp-nonce-provider";
 import {
   getTournamentBracket,
+  getTournamentBracketProbe,
   PlatformApiError,
   platformApiMessage,
   platformApiRequest,
-  platformApiUrl,
 } from "@/lib/platform-api";
 import type { Bracket, Match, Team } from "@/lib/types";
-import { sseRetryDelayMs } from "@/lib/sse-reconnect-policy";
 
 const MATCH_W = 272;
 const MATCH_H_VIEW = 146;
@@ -23,19 +22,10 @@ const GAP_X = 70;
 const GAP_Y = 26;
 const MATCH_FRAME_CENTER_Y = 92;
 const BRACKET_INITIAL_LOAD_JITTER_MS = 3000;
-const BRACKET_EVENT_JITTER_MS = 3000;
 const BRACKET_POLL_BASE_MS = 10_000;
 const BRACKET_POLL_JITTER_MS = 3000;
 const BRACKET_POLL_MIN_MS = 3_000;
 const BRACKET_POLL_MAX_MS = 60_000;
-const SSE_OPEN_JITTER_MS = 500;
-const SSE_FALLBACK_POLL_JITTER_MS = 500;
-const configuredSseOpenTimeoutMs = Number(
-  process.env.NEXT_PUBLIC_PLATFORM_SSE_OPEN_TIMEOUT_MS ?? "",
-);
-const SSE_OPEN_TIMEOUT_MS = Number.isFinite(configuredSseOpenTimeoutMs)
-  ? Math.min(30_000, Math.max(500, Math.round(configuredSseOpenTimeoutMs)))
-  : 1_000;
 const PANNING_IGNORE_SELECTOR = "button,input,select,textarea,a,[role='button']";
 
 type LayoutMatch = {
@@ -211,28 +201,35 @@ export function BracketBoard({
 
   useEffect(() => {
     let pollingTimer: ReturnType<typeof setTimeout> | null = null;
-    let pollingDelayTimer: ReturnType<typeof setTimeout> | null = null;
-    let eventRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     let pollingActive = false;
-    const refreshIfVisible = async () => {
+    let activeProbeController: AbortController | null = null;
+    const probeIfVisible = async () => {
       if (document.visibilityState === "hidden") {
-        abortRefresh();
         return null;
       }
-      return refresh();
-    };
-    const clearEventRefresh = () => {
-      if (eventRefreshTimer !== null) {
-        clearTimeout(eventRefreshTimer);
-        eventRefreshTimer = null;
+      const current = bracketRef.current;
+      const ticket = current?.bracketProbeTicket;
+      if (!ticket) {
+        return refresh();
       }
-    };
-    const scheduleEventRefresh = () => {
-      clearEventRefresh();
-      eventRefreshTimer = setTimeout(
-        () => void refreshIfVisible(),
-        Math.floor(Math.random() * BRACKET_EVENT_JITTER_MS),
-      );
+      activeProbeController?.abort();
+      const controller = new AbortController();
+      activeProbeController = controller;
+      try {
+        const probe = await getTournamentBracketProbe(slug, ticket, controller.signal);
+        if (
+          probe
+          && current
+          && probe.revision > current.revision
+        ) {
+          return refresh();
+        }
+        return current;
+      } finally {
+        if (activeProbeController === controller) {
+          activeProbeController = null;
+        }
+      }
     };
     const schedulePollingTick = (sourceBracket: Bracket | null = bracketRef.current) => {
       if (!pollingActive) {
@@ -245,199 +242,59 @@ export function BracketBoard({
       }
       pollingTimer = setTimeout(async () => {
         pollingTimer = null;
-        const next = await refreshIfVisible();
-        if (!pollingActive) {
-          return;
+        try {
+          const next = await probeIfVisible();
+          if (!pollingActive) {
+            return;
+          }
+          schedulePollingTick(next ?? bracketRef.current);
+        } catch (caught) {
+          if (!(caught instanceof DOMException && caught.name === "AbortError")) {
+            setError(t("bracket.loadFailed"));
+          }
         }
-        schedulePollingTick(next ?? bracketRef.current);
       }, delayMs);
     };
     const startPolling = (immediate = false) => {
-      if (pollingActive || pollingTimer !== null || pollingDelayTimer !== null) {
-        return;
-      }
-      if (bracketPollDelayMs(bracketRef.current) === null) {
+      if (pollingActive || pollingTimer !== null || bracketPollDelayMs(bracketRef.current) === null) {
         return;
       }
       pollingActive = true;
-      const delayMs = immediate
-        ? Math.floor(Math.random() * SSE_FALLBACK_POLL_JITTER_MS)
-        : Math.floor(Math.random() * BRACKET_POLL_JITTER_MS);
-      pollingDelayTimer = setTimeout(async () => {
-        pollingDelayTimer = null;
-        const next = await refreshIfVisible();
-        if (!pollingActive) {
-          return;
-        }
-        schedulePollingTick(next ?? bracketRef.current);
-      }, delayMs);
+      if (immediate) {
+        void probeIfVisible()
+          .then((next) => schedulePollingTick(next ?? bracketRef.current))
+          .catch((caught) => {
+            if (!(caught instanceof DOMException && caught.name === "AbortError")) {
+              setError(t("bracket.loadFailed"));
+            }
+          });
+        return;
+      }
+      schedulePollingTick(bracketRef.current);
     };
     const stopPolling = () => {
       pollingActive = false;
-      if (pollingDelayTimer !== null) {
-        clearTimeout(pollingDelayTimer);
-        pollingDelayTimer = null;
-      }
       if (pollingTimer !== null) {
         clearTimeout(pollingTimer);
         pollingTimer = null;
       }
-    };
-    let source: EventSource | null = null;
-    let sharedPort: MessagePort | null = null;
-    let sseActive = false;
-    let sseOpenDelayTimer: ReturnType<typeof setTimeout> | null = null;
-    let sseOpenTimer: ReturnType<typeof setTimeout> | null = null;
-    let sseRetryTimer: ReturnType<typeof setTimeout> | null = null;
-    let sseRetryNotBefore = 0;
-
-    const clearSseOpenTimer = () => {
-      if (sseOpenTimer !== null) {
-        clearTimeout(sseOpenTimer);
-        sseOpenTimer = null;
-      }
-    };
-
-    const closeSource = () => {
-      if (sseOpenDelayTimer !== null) {
-        clearTimeout(sseOpenDelayTimer);
-        sseOpenDelayTimer = null;
-      }
-      clearSseOpenTimer();
-      if (sharedPort !== null) {
-        sharedPort.postMessage({ type: "unsubscribe", key: slug });
-        sharedPort.onmessage = null;
-        sharedPort.close();
-        sharedPort = null;
-      }
-      if (source !== null) {
-        source.close();
-        source = null;
-      }
-      sseActive = false;
-    };
-
-    const fallBackToPolling = () => {
-      closeSource();
-      // Keep polling available immediately, but spread the next admission
-      // attempt across the measured safe establishment window. This applies
-      // equally to a timeout, 429/503, network failure and mass disconnect.
-      sseRetryNotBefore = Date.now() + sseRetryDelayMs();
-      startPolling(true);
-      scheduleSseRetry();
-    };
-
-    const scheduleSseRetry = () => {
-      if (sseRetryTimer !== null) {
-        clearTimeout(sseRetryTimer);
-      }
-      const delayMs = Math.max(0, sseRetryNotBefore - Date.now());
-      sseRetryTimer = setTimeout(() => {
-        sseRetryTimer = null;
-        if (document.visibilityState === "visible") {
-          void refreshIfVisible().finally(openSse);
-        }
-      }, delayMs);
-    };
-
-    const openSse = () => {
-      if (
-        sseActive
-        || document.visibilityState !== "visible"
-        || Date.now() < sseRetryNotBefore
-      ) {
-        return;
-      }
-      sseOpenDelayTimer = setTimeout(() => {
-        sseOpenDelayTimer = null;
-        if (
-          document.visibilityState !== "visible"
-          || Date.now() < sseRetryNotBefore
-          || sseActive
-        ) {
-          return;
-        }
-        const ticket = bracketRef.current?.sseAdmissionTicket;
-        const streamUrl = platformApiUrl(`/tournaments/${slug}/bracket/events`);
-        const url = ticket
-          ? `${streamUrl}?ticket=${encodeURIComponent(ticket)}`
-          : streamUrl;
-        sseActive = true;
-        const onOpen = () => {
-          clearSseOpenTimer();
-          stopPolling();
-        };
-        const onBracket = () => {
-          scheduleEventRefresh();
-        };
-        const onError = () => {
-          // Close the source and use revision polling during cooldown. This
-          // also stops a shared worker from reconnecting every browser tab.
-          fallBackToPolling();
-        };
-        sseOpenTimer = setTimeout(() => {
-          // A slow edge handshake is not useful to a visitor. Abort it before
-          // an upstream queue can turn a normal fallback into a multi-minute
-          // wait, then retry only after the cooldown.
-          if (sseActive) {
-            fallBackToPolling();
-          }
-        }, SSE_OPEN_TIMEOUT_MS);
-        try {
-          if (typeof SharedWorker !== "undefined") {
-            const worker = new SharedWorker("/sse-shared-worker.js");
-            worker.onerror = onError;
-            sharedPort = worker.port;
-            sharedPort.onmessage = (event: MessageEvent<{
-              key?: string;
-              type?: string;
-            }>) => {
-              if (event.data.key !== slug) {
-                return;
-              }
-              if (event.data.type === "open") {
-                onOpen();
-              } else if (event.data.type === "bracket") {
-                onBracket();
-              } else if (event.data.type === "error") {
-                onError();
-              }
-            };
-            sharedPort.start();
-            sharedPort.postMessage({ type: "subscribe", key: slug, url });
-          } else {
-            source = new EventSource(url, { withCredentials: true });
-            source.onopen = onOpen;
-            source.addEventListener("bracket", onBracket);
-            source.onerror = onError;
-          }
-        } catch {
-          onError();
-        }
-      }, Math.floor(Math.random() * SSE_OPEN_JITTER_MS));
+      activeProbeController?.abort();
+      activeProbeController = null;
     };
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") {
-        void refreshIfVisible();
-        openSse();
+        startPolling(true);
       } else {
-        abortRefresh();
-        closeSource();
         stopPolling();
       }
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
-    openSse();
+    startPolling();
 
     return () => {
-      closeSource();
-      if (sseRetryTimer !== null) {
-        clearTimeout(sseRetryTimer);
-      }
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-      clearEventRefresh();
       stopPolling();
       abortRefresh();
     };

@@ -8,6 +8,7 @@ from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.platform_api.app.services.bracket_events import publish_bracket_event
+from apps.platform_api.app.services.ready_check_events import publish_ready_check_event
 from apps.platform_api.app.services.brackets import create_full_bracket_graph
 from apps.platform_api.app.services.brackets import bracket_event_payload
 from apps.platform_api.app.services.tournament_workflow import (
@@ -108,6 +109,36 @@ def _increment(result: DeadlockAutomationResult, field: str, amount: int = 1) ->
 
 def _aware_now() -> datetime:
     return datetime.now(UTC)
+
+
+async def _publish_ready_check_transition(
+    db_session: AsyncSession,
+    *,
+    tournament: Tournament,
+    result: DeadlockAutomationResult,
+) -> None:
+    if not result.ready_started and not result.ready_closed:
+        return
+    round_row = await deadlock_ready_round_for_tournament(
+        db_session,
+        tournament_id=tournament.id,
+        active_only=False,
+    )
+    if round_row is None or tournament.ready_check_starts_at is None:
+        return
+    if round_row.status == "active" and result.ready_started:
+        transition = "active"
+    elif round_row.status == "closed" and result.ready_closed:
+        transition = "closed"
+    else:
+        return
+    await publish_ready_check_event(
+        tournament_id=tournament.id,
+        round_id=round_row.id,
+        status=transition,
+        eligible_user_ids=list(round_row.eligible_user_ids or []),
+        ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
+    )
 
 
 def reset_automation_failure(tournament: Tournament) -> None:
@@ -404,6 +435,11 @@ async def run_deadlock_automation_tick(
                 now=current_time,
             )
             await db_session.commit()
+            await _publish_ready_check_transition(
+                db_session,
+                tournament=tournament,
+                result=step_result,
+            )
             if int(tournament.bracket_revision or 0) != previous_bracket_revision:
                 await publish_bracket_event(
                     tournament.id,
@@ -474,6 +510,11 @@ async def advance_deadlock_tournament_automation(
     if result != DeadlockAutomationResult():
         await db_session.commit()
         await db_session.refresh(tournament)
+        await _publish_ready_check_transition(
+            db_session,
+            tournament=tournament,
+            result=result,
+        )
         if int(tournament.bracket_revision or 0) != previous_bracket_revision:
             await publish_bracket_event(
                 tournament.id,

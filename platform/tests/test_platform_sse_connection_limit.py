@@ -17,6 +17,26 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
     def test_global_cap_leaves_headroom_below_observed_edge_queue(self) -> None:
         self.assertEqual(sse.SSE_GLOBAL_LIMIT, 3_000)
 
+    def test_ready_check_has_separate_production_cap_and_explicit_hard_target(self) -> None:
+        self.assertEqual(sse.READY_CHECK_SSE_GLOBAL_LIMIT, 3_000)
+        self.assertEqual(sse.READY_CHECK_SSE_HARD_TARGET, 10_000)
+        settings = SimpleNamespace()
+        self.assertEqual(
+            sse._global_limit_for_path(
+                {"path": "/api/v1/ready-check/events"},
+                settings,
+            ),
+            sse.READY_CHECK_SSE_GLOBAL_LIMIT,
+        )
+        self.assertEqual(
+            sse._global_limit_for_path(
+                {"path": "/api/v1/tournaments/cup/bracket/events"},
+                settings,
+            ),
+            sse.SSE_GLOBAL_LIMIT,
+        )
+        self.assertNotEqual(sse._ready_check_global_key(), sse._global_key())
+
     async def asyncSetUp(self) -> None:
         self.settings = get_settings()
         if self.settings.platform_environment.strip().lower() != "test":
@@ -34,6 +54,8 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
                 key
                 async for key in cache.scan_iter(match=f"{sse.SSE_KEY_PREFIX}:*")
             ]
+            async for key in cache.scan_iter(match=f"{sse.READY_CHECK_SSE_KEY_PREFIX}:*"):
+                keys.append(key)
             if keys:
                 await cache.delete(*keys)
         finally:

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useReadyCheckAgendaRefresh, useReadyCheckState } from "@/components/ready-check/ready-check-provider";
 import { useI18n } from "@/components/i18n-provider";
 import { leaveTournament, registerForTournament, setTournamentReadyCheckChoice } from "@/lib/platform-api";
 import { isActiveParticipantStatus } from "@/lib/tournament-model";
@@ -29,6 +30,8 @@ export function TournamentRegistrationActions({
   onReadyChoiceChange
 }: TournamentRegistrationActionsProps) {
   const { t } = useI18n();
+  const liveReadyCheckState = useReadyCheckState(tournament.slug);
+  const refreshReadyCheckAgenda = useReadyCheckAgendaRefresh();
   const initialRegistration = useMemo(
     () => currentUserRegistration(tournament, actorUserId),
     [actorUserId, tournament]
@@ -96,13 +99,18 @@ export function TournamentRegistrationActions({
   }, [initialReadyCheckChoice, initialRegistration]);
 
   const registered = Boolean(state.registration);
-  const readyCheckActive = tournament.readyCheckState?.active_round?.status === "active";
+  const readyCheckActive = liveReadyCheckState
+    ? liveReadyCheckState.status === "active"
+    : tournament.readyCheckState?.active_round?.status === "active";
   const readyCheckClosed = Boolean(
+    liveReadyCheckState?.status === "closed"
+    || (
     (nowMs !== null && confirmationEndsAtMs !== null && nowMs >= confirmationEndsAtMs)
     || (
       !readyCheckActive
       && tournament.readyCheckState?.latest_round
       && tournament.readyCheckState.latest_round.status !== "active"
+    )
     )
   );
   const checkedIn = state.readyCheckChoice === "yes";
@@ -168,6 +176,7 @@ export function TournamentRegistrationActions({
           removedRegistrationId: null
         });
     if (result) {
+      refreshReadyCheckAgenda();
       onRegistrationChange?.(result, previous);
     }
   }
@@ -206,6 +215,7 @@ export function TournamentRegistrationActions({
           removedRegistrationId: null
         });
     if (result) {
+      refreshReadyCheckAgenda();
       onRegistrationChange?.(null, previous);
     }
   }

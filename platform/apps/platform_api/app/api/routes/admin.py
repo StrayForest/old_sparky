@@ -64,6 +64,7 @@ from apps.platform_api.app.services.player_commitments import (
     reactivate_viable_tournament_commitments,
     release_active_commitments,
 )
+from apps.platform_api.app.services.ready_check_events import publish_ready_check_event
 
 router = APIRouter()
 PREPROD_CLEANUP_CHUNK_SIZE = 10_000
@@ -1002,6 +1003,14 @@ async def admin_override_tournament(
         tournament.captain_selection_starts_at,
         tournament.starts_at,
     )
+    active_ready_round = await db_session.scalar(
+        select(TournamentDeadlockReadyRound)
+        .where(
+            TournamentDeadlockReadyRound.tournament_id == tournament.id,
+            TournamentDeadlockReadyRound.status == "active",
+        )
+        .with_for_update()
+    )
     note = (payload.note or "").strip() or None
 
     if payload.status is None and payload.visibility is None:
@@ -1085,6 +1094,17 @@ async def admin_override_tournament(
         tournament.captain_selection_starts_at,
         tournament.starts_at,
     )
+    ready_check_schedule_changed = original_schedule[2:4] != (
+        tournament.ready_check_starts_at,
+        tournament.ready_check_ends_at,
+    )
+    ready_round_closed_by_override = active_ready_round is not None and (
+        tournament.status in {"completed", "cancelled"}
+        or ready_check_schedule_changed
+    )
+    if ready_round_closed_by_override:
+        active_ready_round.status = "closed"
+        active_ready_round.closed_at = active_ready_round.closed_at or auth_session.now
     if (
         tournament.status == original_status
         and tournament.visibility == original_visibility
@@ -1170,6 +1190,16 @@ async def admin_override_tournament(
             detail="Турнир с таким публичным названием уже существует.",
         ) from exc
     await db_session.refresh(tournament)
+    if ready_round_closed_by_override and active_ready_round is not None:
+        await db_session.refresh(active_ready_round)
+        if original_schedule[2] is not None:
+            await publish_ready_check_event(
+                tournament_id=tournament.id,
+                round_id=active_ready_round.id,
+                status="closed",
+                eligible_user_ids=list(active_ready_round.eligible_user_ids or []),
+                ready_check_starts_at=int(original_schedule[2].timestamp()),
+            )
 
     row = (
         await db_session.execute(

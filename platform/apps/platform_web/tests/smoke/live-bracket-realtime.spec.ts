@@ -16,7 +16,7 @@ const gateDir = process.env.PLATFORM_QA_BROWSER_GATE_DIR;
 
 test.skip(!gateDir, "PLATFORM_QA_BROWSER_GATE_DIR is required.");
 
-test("authenticated bracket pans and receives a real SSE refresh in two contexts", async ({ browser }) => {
+test("authenticated bracket pans and refreshes after a cheap revision probe", async ({ browser }) => {
   const statePath = newestStatePath(gateDir!);
   const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as GateState;
   const resultPath = path.join(gateDir!, `result-${state.marker}.json`);
@@ -37,19 +37,9 @@ test("authenticated bracket pans and receives a real SSE refresh in two contexts
     const organizerPage = await organizerContext.newPage();
     const watcherPage = await watcherContext.newPage();
     const route = `${state.origin}/tournaments/${state.slug}/bracket`;
-    const eventPath = `/api/v1/tournaments/${state.slug}/bracket/events`;
-    const organizerEventRequest = organizerPage.waitForRequest((request) => (
-      new URL(request.url()).pathname === eventPath
-    ));
-    const watcherEventRequest = watcherPage.waitForRequest((request) => (
-      new URL(request.url()).pathname === eventPath
-    ));
-
     await Promise.all([
       organizerPage.goto(route),
       watcherPage.goto(route),
-      organizerEventRequest,
-      watcherEventRequest,
     ]);
     await expect(organizerPage.locator(".bracket-toolbar")).toHaveCount(0);
     await expect(watcherPage.locator(".bracket-toolbar")).toHaveCount(0);
@@ -57,7 +47,7 @@ test("authenticated bracket pans and receives a real SSE refresh in two contexts
     await expect(watcherPage.locator(".team-drag-handle")).toHaveCount(0);
     await expect(organizerPage.getByLabel("Управление масштабом сетки")).toBeVisible();
     const panDistance = await panBracket(organizerPage);
-    const latencies = await triggerAndMeasureRealtimeRefresh(
+    const latencies = await triggerAndMeasureProbeRefresh(
       organizerContext,
       organizerPage,
       watcherPage,
@@ -109,7 +99,7 @@ type BracketState = {
   }>;
 };
 
-async function triggerAndMeasureRealtimeRefresh(
+async function triggerAndMeasureProbeRefresh(
   organizerContext: import("@playwright/test").BrowserContext,
   organizerPage: import("@playwright/test").Page,
   watcherPage: import("@playwright/test").Page,
@@ -170,7 +160,7 @@ async function waitForRevision(
     }
     const payload = await response.json().catch(() => null) as { revision?: number } | null;
     return Number(payload?.revision ?? -1) >= revision;
-  }, { timeout: 2_000 });
+  }, { timeout: 25_000 });
 }
 
 async function panBracket(page: import("@playwright/test").Page) {

@@ -161,6 +161,7 @@ export type Bracket = {
   nextPollAfterMs?: number | null;
   stateVersion?: number | null;
   sseAdmissionTicket?: string | null;
+  bracketProbeTicket?: string | null;
 };
 
 export type ActiveTournamentCommitment = {

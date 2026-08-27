@@ -33,6 +33,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Security findings and evidence | [Application security audit](application-security-audit.md) |
 | Historical implementation context | [`archive/`](archive/) |
 | Accepted architectural decisions | [`adr/`](adr/) |
+| Ready Check / bracket realtime boundary | [Realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md) |
 
 ## Token-efficient reading contract
 

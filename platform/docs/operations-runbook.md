@@ -295,13 +295,23 @@ bounded polling test, not a request to raise the 10,000-user SSE ceiling.
 Clean the exact browser load run with the same cleanup workflow before starting
 another production load.
 
-The same workflow also exposes `profile=sse` and `profile=combined`. The SSE
-staircase uses 1,000, 5,000 and 10,000 connection attempts with 50/250/500
-users per tournament. Above the application global limit, connected streams at
-or below the cap plus explicit `429` admissions are expected; `503`, other
-unexpected responses, client errors or resource saturation are not. The
-combined profile runs the selected polling mix and SSE target together. Follow
-the ordered protocol in [`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md).
+The same workflow also exposes `profile=sse`. Set `sse_scope=ready-check` and
+`sse_admission_mode=ticket` for the current product flow; the harness creates
+one authenticated/eligible cohort, obtains the per-user agenda proofs during
+setup, opens `/ready-check/events`, starts the round after the admission
+barrier, and probes `/ready-check/state` once only for streams rejected by the
+global lease. The public staircase is 3,000, 5,000, 7,500 and 10,000 established
+streams through Cloudflare. For the 5,000/7,500/10,000 stages, pass that stage
+as `sse_capacity_limit`; the workflow supplies a short-lived signed QA override
+only for `profile=sse`, `sse_scope=ready-check`, and ticket admission. The
+default `sse_capacity_limit=0` still exercises the production cap of 3,000 and
+the cheap Ready Check overflow fallback. `503`, other unexpected responses,
+missing active state from an overflow probe, client errors or resource
+saturation are not. A matching `sse_scope=bracket` run is compatibility
+coverage for the retired bracket stream, not evidence for the Ready Check
+capacity claim; bracket high-cap overrides remain loopback-only. Follow the
+ordered protocol in
+[`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md).
 
 The measured pool baseline is a reviewed runtime configuration, not a load-test
 CLI override. During the planned production configuration window, apply only

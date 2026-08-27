@@ -19,7 +19,12 @@
   bounded free-slot inventory and allocates sparse slot rows on demand above
   the inventory window, so a large advertised capacity never materializes
   millions of rows.
-- Public bracket SSE uses layered admission protection: Redis-backed application leases bound global, source and authenticated-user concurrency, while Nginx retains an independent coarse source/global connection ceiling.
+- Ready Check SSE uses one layered global admission pool across tournaments:
+  Redis-backed application leases bind global, source and authenticated-user
+  concurrency, while Nginx retains an independent coarse source/global
+  connection ceiling. The browser uses no bracket SSE; bracket pages use a
+  Redis-backed revision probe and fetch the full bracket only after a revision
+  change. See [the realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
 - Public media rendering is one-way `R2 -> CDN -> browser`; the API does not proxy media object bytes or fall back to local-disk reads.
 
 ## Request and data flow
@@ -83,7 +88,11 @@ FastAPI exposes no `/api/v1/uploads/*` media-serving route and has no uploads `S
 - Cookie mutations require application CSRF controls even behind Cloudflare.
 - Anonymous public response DTOs are explicit schema allowlists: account/contact email and Steam authentication identity do not cross the public-profile boundary, while participant moderation note, moderator identity and moderation timestamps are restricted to the organizer-management DTO.
 - Invite-only tournament workspace reads (`workspace`, roster, matches, bracket and bracket SSE admission) require active participant membership or explicit organizer/admin authority; retained `withdrawn`/`disqualified` participant rows are historical and grant no workspace access.
-- SSE admission state is ephemeral Redis state. Admission fails closed when that state cannot be consulted; normal termination releases the lease immediately, and bounded lease expiry recovers capacity after abnormal process/client termination.
+- Ready Check SSE admission state is ephemeral Redis state. Admission fails
+  closed when that state cannot be consulted; normal termination releases the
+  lease immediately, and bounded lease expiry recovers capacity after abnormal
+  process/client termination. The signed Ready Check state probe performs one
+  Redis lookup and returns only revision/status.
 - R2, DB, mail, session and Turnstile secrets are backend-only and are not present in the web runtime environment.
 - The public media bucket and private backup bucket/tokens are separate.
 
@@ -103,6 +112,18 @@ Daily maintenance restore-verifies DB backups before pruning known artifacts. Of
 
 ## Capacity boundary
 
-The current VPS has two CPU cores and about 3.7 GiB RAM. Image concurrency starts at one. Public bracket SSE application admission is capped at 3,000 streams globally, 32 per source address and 4 per authenticated user; Nginx retains independent physical 10,240 source/global ceilings. A healthy stream has no artificial 600-second rotation: it sends keepalives about every 15 seconds, renews its Redis lease and revalidates private access about every 30 seconds until the client, network or server closes it. New admission uses a short-lived signed ticket and does not make ticket expiry the lifetime of an established stream. Public tickets are deliberately anonymous because the bracket data is public; private tickets remain bound to the session and private streams remain fail-closed on session/role/participant revalidation. Visible bracket tabs use SSE, while hidden tabs, slow/erroring admission and capacity rejections fall back immediately to conditional revision polling. SSE recovery retries use a full-jitter 60–180-second window derived from the measured 25 new public SSE/sec safe opening rate and the 3,000-stream cap, so a mass disconnect cannot create a synchronized refill burst. Stream admission and private-stream revalidation DB work are bounded per API worker so an open/event fan-out cannot consume the entire ordinary-request DB pool. These values are capacity safeguards, not product entitlements; change them only from retained load/resource evidence.
+The current VPS has two CPU cores and about 3.7 GiB RAM. Ready Check SSE
+application admission is currently capped at 3,000 streams globally, 32 per
+source address and 4 per authenticated user; Nginx retains independent
+physical 10,240 source/global ceilings. The 10,000 value is a hard staged-load
+target only, not a production cap. Ready Check opens are dynamically spread
+using the measured safe 25 opens/sec rate, simultaneous demand and a bounded
+preparation window; late arrivals are admitted immediately when Redis capacity
+exists. After a Ready Check event the browser closes the critical stream, and
+overflow users use the tiny revision/status probe only from `T` onward. Bracket
+pages use the same style of one-Redis-key revision probe, then fetch the full
+bracket only after a higher revision. These values are capacity safeguards, not
+product entitlements; change them only from retained public-path load/resource
+evidence.
 
 Additional workers, exporters, transforms, poolers or nodes require retained CPU/RSS/queue/DB evidence against the operations targets.

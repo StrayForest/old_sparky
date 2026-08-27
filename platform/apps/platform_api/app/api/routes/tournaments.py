@@ -50,6 +50,7 @@ from apps.platform_api.app.api.schemas import (
     TournamentInviteRedeemResponse,
     TournamentInviteResponse,
     TournamentBracketMatchResponse,
+    BracketProbeResponse,
     TournamentBracketCapabilitiesResponse,
     TournamentBracketResponse,
     TournamentBracketTeamMemberResponse,
@@ -84,7 +85,12 @@ from apps.platform_api.app.services.media import (
 )
 from apps.platform_api.app.services.bracket_events import (
     publish_bracket_event,
+    read_bracket_probe_state,
     stream_bracket_events,
+)
+from apps.platform_api.app.services.ready_check_events import (
+    publish_ready_check_event,
+    revoke_ready_check_state,
 )
 from apps.platform_api.app.services.brackets import (
     advance_revision,
@@ -242,6 +248,11 @@ from python_packages.platform_infra.security import (
     get_authenticated_session,
     get_optional_authenticated_session,
 )
+from python_packages.platform_infra.bracket_probe import (
+    BracketProbeInvalid,
+    issue_bracket_probe_ticket,
+    verify_bracket_probe_ticket,
+)
 from python_packages.platform_infra.sse_admission import issue_sse_admission_ticket
 from python_packages.platform_infra.tournament_names import (
     lock_tournament_name,
@@ -255,6 +266,7 @@ from python_packages.platform_infra.sse_connection_limit import (
 
 router = APIRouter()
 stream_router = APIRouter()
+probe_router = APIRouter()
 
 INVITE_CODE_ALPHABET = string.ascii_uppercase + string.digits
 INACTIVE_PARTICIPANT_STATUSES = ("withdrawn", "disqualified")
@@ -341,8 +353,47 @@ def _with_tournament_sse_ticket(
                 tournament=tournament,
                 auth_session=auth_session,
                 has_participant_record=has_participant_record,
-            )
+            ),
+            "bracket_probe_ticket": _issue_bracket_probe_ticket(
+                request,
+                bracket=bracket,
+                tournament=tournament,
+                auth_session=auth_session,
+                has_participant_record=has_participant_record,
+            ),
         }
+    )
+
+
+def _issue_bracket_probe_ticket(
+    request: Request,
+    *,
+    bracket: TournamentBracketResponse,
+    tournament: Tournament,
+    auth_session,
+    has_participant_record: bool,
+) -> str:
+    user_id: str | None = None
+    session_id: str | None = None
+    session_token: str | None = None
+    if tournament.visibility == "invite_only":
+        if auth_session is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+        user_id = str(auth_session.user.id)
+        session_id = str(auth_session.session.id)
+        session_token = request.cookies.get(get_settings().platform_session_cookie_name)
+        if not has_participant_record and not auth_session_has_admin_role(auth_session) and tournament.organizer_user_id != auth_session.user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tournament bracket access is unavailable.")
+        if not session_token:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+    return issue_bracket_probe_ticket(
+        tournament_id=tournament.id,
+        slug=tournament.slug,
+        revision=bracket.revision,
+        bracket_status=bracket.status,
+        user_id=user_id,
+        session_id=session_id,
+        session_token=session_token,
     )
 
 
@@ -3645,11 +3696,12 @@ async def organizer_remove_participant(
     participant.moderation_note = "Removed by organizer."
     participant.moderated_at = auth_session.now
     participant.moderated_by_user_id = auth_session.user.id
+    ready_round_projection = None
     if (
         is_solo_tournament_format(tournament.format_slug)
         and not participant_status_is_inactive(previous_status)
     ):
-        await prune_participant_from_active_ready_round(
+        ready_round_projection = await prune_participant_from_active_ready_round(
             db_session,
             tournament=tournament,
             user_id=participant.user_id,
@@ -3689,6 +3741,21 @@ async def organizer_remove_participant(
     )
     await db_session.commit()
     invalidate_tournament_runtime_caches(tournament.id)
+    if ready_round_projection is not None and tournament.ready_check_starts_at is not None:
+        await db_session.refresh(ready_round_projection)
+        await publish_ready_check_event(
+            tournament_id=tournament.id,
+            round_id=ready_round_projection.id,
+            status=ready_round_projection.status,
+            eligible_user_ids=list(ready_round_projection.eligible_user_ids or []),
+            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
+        )
+    if tournament.ready_check_starts_at is not None:
+        await revoke_ready_check_state(
+            tournament_id=tournament.id,
+            user_id=participant.user_id,
+            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
+        )
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
 
@@ -3774,13 +3841,14 @@ async def organizer_moderate_participant(
     participant.moderation_note = next_note
     participant.moderated_at = auth_session.now
     participant.moderated_by_user_id = auth_session.user.id
+    ready_round_projection = None
 
     if (
         is_solo_tournament_format(tournament.format_slug)
         and participant_status_is_inactive(participant.status)
         and not participant_status_is_inactive(previous_status)
     ):
-        await prune_participant_from_active_ready_round(
+        ready_round_projection = await prune_participant_from_active_ready_round(
             db_session,
             tournament=tournament,
             user_id=participant.user_id,
@@ -3820,6 +3888,21 @@ async def organizer_moderate_participant(
     )
     await db_session.commit()
     invalidate_tournament_runtime_caches(tournament.id)
+    if ready_round_projection is not None and tournament.ready_check_starts_at is not None:
+        await db_session.refresh(ready_round_projection)
+        await publish_ready_check_event(
+            tournament_id=tournament.id,
+            round_id=ready_round_projection.id,
+            status=ready_round_projection.status,
+            eligible_user_ids=list(ready_round_projection.eligible_user_ids or []),
+            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
+        )
+    if participant_status_is_inactive(participant.status) and tournament.ready_check_starts_at is not None:
+        await revoke_ready_check_state(
+            tournament_id=tournament.id,
+            user_id=participant.user_id,
+            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
+        )
     await db_session.refresh(participant)
     return serialize_participant(
         participant,
@@ -4052,6 +4135,48 @@ async def get_tournament_bracket(
         auth_session=auth_session,
         has_participant_record=has_active_participant_record,
     )
+
+
+@probe_router.get("/{slug}/bracket/probe", response_model=BracketProbeResponse)
+async def get_tournament_bracket_probe(
+    slug: str,
+    request: Request,
+    response: Response,
+    ticket: str = Query(min_length=1, max_length=16384),
+) -> BracketProbeResponse:
+    """Return only the current bracket revision for an authorized viewer.
+
+    The ticket was issued by the full bracket/workspace read. The hot path is
+    deliberately PostgreSQL-free: HMAC verification plus one Redis GET. A
+    subsequent full bracket read still performs the authoritative permission
+    check whenever the revision changes.
+    """
+
+    response.headers["Cache-Control"] = "private, no-store"
+    session_token = request.cookies.get(get_settings().platform_session_cookie_name)
+    try:
+        proof = verify_bracket_probe_ticket(
+            ticket,
+            expected_slug=slug,
+            session_token=session_token,
+        )
+    except BracketProbeInvalid as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Bracket probe ticket is invalid or expired.",
+            headers={"Cache-Control": "no-store"},
+        ) from exc
+    projected = await read_bracket_probe_state(proof.tournament_id)
+    if projected is None:
+        return BracketProbeResponse(revision=proof.revision, status=proof.bracket_status)
+    try:
+        projected_revision = int(projected.get("revision") or 0)
+    except (TypeError, ValueError):
+        projected_revision = 0
+    revision = max(proof.revision, projected_revision)
+    projected_status = projected.get("status")
+    bracket_status = projected_status if projected_status in {"pending", "teams_ready", "ready"} else proof.bracket_status
+    return BracketProbeResponse(revision=revision, status=bracket_status)
 
 
 @stream_router.get("/{slug}/bracket/events")
@@ -5039,6 +5164,15 @@ async def start_deadlock_ready_check(
     )
     await db_session.commit()
     await db_session.refresh(round_row)
+    await publish_ready_check_event(
+        tournament_id=tournament.id,
+        round_id=round_row.id,
+        status="active",
+        eligible_user_ids=list(round_row.eligible_user_ids or []),
+        ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp())
+        if tournament.ready_check_starts_at is not None
+        else 0,
+    )
     return await serialize_deadlock_ready_round(
         db_session,
         round_row,
@@ -5213,6 +5347,15 @@ async def close_deadlock_ready_check(
     )
     await db_session.commit()
     await db_session.refresh(active_round)
+    await publish_ready_check_event(
+        tournament_id=tournament.id,
+        round_id=active_round.id,
+        status="closed",
+        eligible_user_ids=list(active_round.eligible_user_ids or []),
+        ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp())
+        if tournament.ready_check_starts_at is not None
+        else 0,
+    )
     return await serialize_deadlock_ready_round(
         db_session,
         active_round,
@@ -6261,8 +6404,9 @@ async def leave_tournament(
         db_session,
         participant_id=participant.id,
     )
+    ready_round_projection = None
     if is_solo_tournament_format(tournament.format_slug):
-        await prune_participant_from_active_ready_round(
+        ready_round_projection = await prune_participant_from_active_ready_round(
             db_session,
             tournament=tournament,
             user_id=participant.user_id,
@@ -6292,6 +6436,21 @@ async def leave_tournament(
     )
     await db_session.commit()
     invalidate_tournament_runtime_caches(tournament.id)
+    if ready_round_projection is not None and tournament.ready_check_starts_at is not None:
+        await db_session.refresh(ready_round_projection)
+        await publish_ready_check_event(
+            tournament_id=tournament.id,
+            round_id=ready_round_projection.id,
+            status=ready_round_projection.status,
+            eligible_user_ids=list(ready_round_projection.eligible_user_ids or []),
+            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
+        )
+    if tournament.ready_check_starts_at is not None:
+        await revoke_ready_check_state(
+            tournament_id=tournament.id,
+            user_id=auth_session.user.id,
+            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
+        )
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
 

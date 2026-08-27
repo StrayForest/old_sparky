@@ -23,7 +23,7 @@ Read this file for the current production baseline and next engineering priority
 - Tournament invite claims/revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Last invite use and last participant slot cannot be consumed twice, and restoring a retained inactive participant rechecks capacity before making the row active again.
 - Anonymous public profile contracts omit account/contact email and Steam authentication identity. Public tournament participant/workspace contracts omit moderation note, moderator identity and moderation timestamps; organizer management uses a separate response DTO that retains those fields.
 - Public tournament automation errors are persistence-sanitized before commit: `automation_last_error` can contain only the stable generic retry message, while restricted logs retain only tournament/failure metadata and a one-way error fingerprint. Migration `20260821_0039` rewrites historical non-null values to the same safe message.
-- Public bracket SSE connection pressure is bounded in two layers: Redis-backed application leases enforce global, source and authenticated-user admission caps with fail-closed behavior, while Nginx adds coarse source/global connection caps. The active production package uses an application global ceiling of `3,000` with `32/source` and `4/user`, while Nginx retains `10,240` source/global ceilings and `worker_connections=32,768`; signed short-lived admission tickets remove PostgreSQL from the ticketed open path, relay fan-out is shared per worker/tournament, and the limiter pool is bounded at `512` connections with a `2s` wait. Private streams retain periodic session/participant revalidation and all Redis leases remain fail-closed. The lower application ceiling is a controlled-degradation guard against the observed Cloudflare Error 1200 edge queue, not a claim that 3,000 is final customer-facing capacity.
+- Ready Check is now the only current product realtime flow: `/tournaments` has no realtime client; one global pool is capped at production `3,000` (`32/source`, `4/user`) while `10,000` is only a staged Cloudflare-load target. Its agenda dynamically spreads opens at the measured safe `25`/sec rate with proportional simultaneous-tournament quotas and immediate late admission; overflow waits until `T` for the signed HMAC + one-Redis-key `revision/status` probe, visible polling is about `1.5s`, hidden tabs stop, and visible tabs probe immediately. Bracket pages use the same probe and fetch the full bracket only after a revision change. See the [realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
@@ -478,12 +478,13 @@ injection were not performed because the repository has no safe external-edge
 fault injector; the client-side mass-disconnect test covers the same fallback
 and jittered recovery contract without mutating Cloudflare state.
 
-Final boundary: origin-only `20,000` established SSE is the physical/lab point;
-public `3,000` with `25/s` gradual opening is the customer-facing protected
-point; and mixed `2,400` is the highest current functional contour, not a
-low-latency production recommendation. The exact 180% two-core target and
-10,000 public persistent SSE remain unclaimed until an operator-owned VPS/
-Cloudflare resource change is made and the protected matrix is repeated.
+Final legacy boundary: origin-only `20,000` established SSE is the
+physical/lab point; public `3,000` with `25/s` gradual opening is the
+customer-facing protected point; and mixed `2,400` is the highest current
+functional contour, not a low-latency production recommendation. Those results
+do not claim capacity for the new short-lived Ready Check profile: its public
+`10,000` target remains unverified until the staged Cloudflare run repeats the
+measurement with event-triggered release and overflow state probes.
 
 AS-17 — End-to-end release transaction and recovery is resolved and deployed.
 The release receipt now has an explicit Nginx uncertainty boundary, idempotent
@@ -595,6 +596,4 @@ against the current web/api/worker identities and units.
   test. Repository checks do not prove live state.
 - Real-user CSP follow-up and classification of new enforcement reports.
 - Post-grace physical removal of runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers when no longer required.
-- Non-security feature expansion that does not remove a launch or production blocker.
-
-For priorities and backlog, use [`platform-roadmap.md`](platform-roadmap.md). For evidence and details, follow the task router in [`README.md`](README.md).
+- Non-security feature expansion that does not remove a launch or production blocker. For priorities and backlog, use [`platform-roadmap.md`](platform-roadmap.md); for evidence and details, follow [`README.md`](README.md).

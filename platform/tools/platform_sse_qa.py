@@ -7,7 +7,7 @@ import argparse
 import asyncio
 from collections import Counter
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -40,6 +40,7 @@ from python_packages.platform_infra.sse_connection_limit import (
 from tools.platform_production_qa import (
     BROWSER_POLLING_TOURNAMENT_PLAN,
     ProductionQa,
+    VALID_RANKS,
     load_env_file,
     percentile,
 )
@@ -50,6 +51,7 @@ SSE_EVENT_TYPE = "qa_sse_probe"
 COMBINED_TIMEOUT_GRACE_SECONDS = 15.0
 SSE_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
 SSE_FIXTURE_TIMEOUT_SECONDS = 90.0
+READY_CHECK_FIXTURE_TIMEOUT_SECONDS = 900.0
 # This is a bounded QA hold, not a production stream lifetime. It is long
 # enough to prove that a healthy stream survives the old 600-second rotation
 # boundary while keeping an operator mistake bounded to fifteen minutes.
@@ -276,6 +278,7 @@ class SseMetrics:
         self.response_statuses: Counter[str] = Counter()
         self.connect_latencies: list[float] = []
         self.event_latencies: list[float] = []
+        self.initial_connected_user_ids: set[str] = set()
         self.error_samples: list[dict[str, Any]] = []
         self.response_error_samples: list[dict[str, Any]] = []
         self.max_error_samples = 25
@@ -283,9 +286,11 @@ class SseMetrics:
     def mark(self, name: str, amount: int = 1) -> None:
         self.counters[name] += amount
 
-    def connection_opened(self) -> None:
+    def connection_opened(self, *, user_id: str | None = None) -> None:
         self.mark("connected")
         self.mark("active_connections")
+        if user_id is not None:
+            self.initial_connected_user_ids.add(str(user_id))
         self.counters["max_active_connections"] = max(
             self.counters["max_active_connections"],
             self.counters["active_connections"],
@@ -354,6 +359,7 @@ class SseMetrics:
             "connection_attempts": attempts,
             "connected": connected,
             "initial_connected": self.counters["initial_connected"],
+            "initial_connected_user_count": len(self.initial_connected_user_ids),
             "max_active_connections": self.counters["max_active_connections"],
             "active_connections": self.counters["active_connections"],
             "completed": self.counters["completed"],
@@ -503,6 +509,12 @@ def parse_args() -> argparse.Namespace:
         default="ticket",
         help="Use a signed workspace-issued ticket or the legacy DB-backed SSE admission path.",
     )
+    parser.add_argument(
+        "--sse-scope",
+        choices=("bracket", "ready-check"),
+        default="bracket",
+        help="Measure the legacy bracket stream or the global Ready Check stream.",
+    )
     parser.add_argument("--sse-event-count", type=int, default=3)
     parser.add_argument("--sse-event-interval", type=float, default=1.0)
     parser.add_argument("--combined-polling-duration", type=float, default=30.0)
@@ -542,6 +554,10 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             f"--sse-capacity-limit must be between 0 and {SSE_QA_GLOBAL_LIMIT_MAX}"
         )
+    if args.sse_scope == "ready-check" and args.sse_admission_mode != "ticket":
+        parser.error("--sse-scope ready-check requires signed ticket admission")
+    if args.sse_scope == "ready-check" and args.mode != "sse":
+        parser.error("--sse-scope ready-check is supported only by --mode sse")
     return args
 
 
@@ -596,6 +612,154 @@ async def prepare_fixture(
     }
     qa.report["planned_tournaments"] = 1
     return users, tournaments, [users]
+
+
+async def prepare_ready_check_fixture(
+    qa: ProductionQa,
+    api_client: httpx.AsyncClient,
+    *,
+    sse_capacity_token: str | None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[list[dict[str, Any]]],
+    dict[str, str],
+    dict[str, str],
+]:
+    """Build a ticketed, eligible Ready Check cohort for the SSE staircase.
+
+    Fixture setup is deliberately completed before the measured connection
+    phase. The agenda calls exercise the one-time PostgreSQL admission path;
+    the measured stream and overflow probes exercise only HMAC/Redis hot
+    paths. The active round is started after initial stream admission so the
+    test measures event delivery and immediate client-side release as well.
+    """
+
+    with qa.phase("ready_check_seed_users"):
+        users = await qa.bulk_register_scale_users()
+    qa.scenario(
+        "ready_check_users_created",
+        len(users) == qa.scale_users,
+        {"users": len(users), "requested": qa.scale_users},
+    )
+    if not users:
+        raise RuntimeError("Ready Check fixture requires at least one synthetic user")
+
+    organizer = users[0]
+    now = datetime.now(UTC)
+    registration_starts_at = now + timedelta(seconds=1)
+    registration_closes_at = now + timedelta(minutes=10)
+    ready_check_starts_at = now + timedelta(minutes=11)
+    ready_check_ends_at = now + timedelta(minutes=21)
+    captain_selection_starts_at = now + timedelta(minutes=22)
+    starts_at = now + timedelta(minutes=23)
+    with qa.phase("ready_check_tournament_setup"):
+        created = await qa.request_as(
+            api_client,
+            organizer,
+            "POST",
+            "/tournaments",
+            expected=201,
+            json_payload={
+                "name": f"RC {qa.marker[-20:]}"[:25],
+                "description": f"Ready Check SSE profile {qa.marker}.",
+                "visibility": "public",
+                "format_slug": "solo",
+                "allowed_ranks": VALID_RANKS,
+                "max_participants": qa.scale_users,
+                "registration_starts_at": registration_starts_at.isoformat(),
+                "registration_closes_at": registration_closes_at.isoformat(),
+                "ready_check_starts_at": ready_check_starts_at.isoformat(),
+                "ready_check_ends_at": ready_check_ends_at.isoformat(),
+                "captain_selection_starts_at": captain_selection_starts_at.isoformat(),
+                "starts_at": starts_at.isoformat(),
+                "match_format": "bo3",
+                "final_format": "bo5",
+                "teams_count": 2,
+            },
+        )
+        tournament = {**created, "category": "ready_check_upcoming", "organizer": organizer}
+        qa.tournament_id = str(created["id"])
+        qa.tournament_slug = str(created["slug"])
+        qa.tournament_ids.append(qa.tournament_id)
+        qa.tournament_slugs.append(qa.tournament_slug)
+        qa.report["tournament_ids"] = list(qa.tournament_ids)
+        qa.report["tournament_slugs"] = list(qa.tournament_slugs)
+        await asyncio.sleep(2.0)
+        await qa.request_as(
+            api_client,
+            organizer,
+            "PATCH",
+            f"/tournaments/{qa.tournament_slug}/status",
+            expected=200,
+            json_payload={"status": "registration_open"},
+        )
+        await qa.record_preprod_run(tournaments_created=1)
+
+    with qa.phase("ready_check_join_setup"):
+        await qa.join_browser_polling_participants(
+            api_client,
+            tournament=tournament,
+            participants=users,
+        )
+        await qa.request_as(
+            api_client,
+            organizer,
+            "PATCH",
+            f"/tournaments/{qa.tournament_slug}/status",
+            expected=200,
+            json_payload={"status": "registration_closed"},
+        )
+
+    sse_tickets: dict[str, str] = {}
+    state_tickets: dict[str, str] = {}
+
+    async def issue_user_tickets(user: dict[str, Any]) -> None:
+        extra_headers = (
+            {SSE_LOAD_TEST_CAPACITY_HEADER: sse_capacity_token}
+            if sse_capacity_token is not None
+            else None
+        )
+        payload = await qa.request_as(
+            api_client,
+            user,
+            "GET",
+            "/ready-check/agenda",
+            expected=200,
+            extra_headers=extra_headers,
+        )
+        checks = payload.get("checks") if isinstance(payload, dict) else None
+        check = next(
+            (
+                item
+                for item in checks or []
+                if isinstance(item, dict)
+                and str(item.get("tournament_id")) == qa.tournament_id
+            ),
+            None,
+        )
+        stream_ticket = payload.get("sse_ticket") if isinstance(payload, dict) else None
+        state_ticket = check.get("state_ticket") if isinstance(check, dict) else None
+        if not isinstance(stream_ticket, str) or not stream_ticket:
+            raise RuntimeError(f"Ready Check stream ticket missing for {user['label']}")
+        if not isinstance(state_ticket, str) or not state_ticket:
+            raise RuntimeError(f"Ready Check state ticket missing for {user['label']}")
+        sse_tickets[str(user["id"])] = stream_ticket
+        state_tickets[str(user["id"])] = state_ticket
+
+    with qa.phase("ready_check_admission_tickets"):
+        await qa.bounded_each(users, issue_user_tickets)
+
+    qa.report["sse_fixture"] = {
+        "profile": "global-ready-check-cohort",
+        "background_workflows": False,
+        "users": len(users),
+        "tournaments": 1,
+        "agenda_requests": len(sse_tickets),
+        "state_endpoint": "/ready-check/state",
+    }
+    qa.report["planned_tournaments"] = 1
+    return users, [tournament], [users], sse_tickets, state_tickets
 
 
 async def issue_public_sse_admission_ticket(
@@ -667,6 +831,58 @@ async def publish_probe_events(
     }
 
 
+async def probe_ready_check_overflow(
+    qa: ProductionQa,
+    api_client: httpx.AsyncClient,
+    users: list[dict[str, Any]],
+    *,
+    tournament_slug: str,
+    state_tickets: dict[str, str],
+    metrics: SseMetrics,
+) -> dict[str, Any]:
+    """Probe only streams rejected by admission, once after the active event."""
+
+    overflow_users = [
+        user
+        for user in users
+        if str(user["id"]) not in metrics.initial_connected_user_ids
+    ]
+    status_counts: Counter[str] = Counter()
+
+    async def probe_one(user: dict[str, Any]) -> None:
+        user_id = str(user["id"])
+        state_ticket = state_tickets.get(user_id)
+        if not state_ticket:
+            raise RuntimeError(f"Ready Check state ticket missing for {user['label']}")
+        payload = await qa.request_as(
+            api_client,
+            user,
+            "GET",
+            (
+                f"/ready-check/state?slug={quote(tournament_slug, safe='')}"
+                f"&ticket={quote(state_ticket, safe='')}"
+            ),
+            expected=200,
+        )
+        state = str(payload.get("status")) if isinstance(payload, dict) else "missing"
+        status_counts[state] += 1
+        if state != "active":
+            raise RuntimeError(
+                f"Ready Check overflow probe did not observe active state for {user['label']}: {payload}"
+            )
+
+    request_gate = asyncio.Semaphore(max(1, min(256, qa.concurrency * 4)))
+    with qa.phase("ready_check_overflow_state_probe"):
+        await qa.bounded_each(overflow_users, probe_one, semaphore=request_gate)
+    return {
+        "users": len(overflow_users),
+        "requests": len(overflow_users),
+        "status_counts": dict(sorted(status_counts.items())),
+        "route": "GET /ready-check/state",
+        "trigger": "after_ready_check_start_event",
+    }
+
+
 async def consume_sse_connection(
     qa: ProductionQa,
     client: httpx.AsyncClient | None,
@@ -675,6 +891,8 @@ async def consume_sse_connection(
     user: dict[str, Any],
     tournament_slug: str,
     sse_ticket: str | None,
+    sse_ticket_by_user_id: dict[str, str] | None,
+    sse_scope: str,
     duration_seconds: float,
     reconnect_cycles: int,
     open_gate: asyncio.Semaphore,
@@ -749,12 +967,23 @@ async def consume_sse_connection(
             open_timed_out = False
             retry_reconnect = False
             try:
-                stream_path = (
-                    f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
-                    f"?ticket={quote(sse_ticket, safe='')}"
-                    if sse_ticket
-                    else f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
+                user_ticket = (
+                    sse_ticket_by_user_id.get(str(user["id"]))
+                    if sse_ticket_by_user_id is not None
+                    else sse_ticket
                 )
+                if sse_scope == "ready-check":
+                    stream_path = (
+                        "/ready-check/events"
+                        f"?ticket={quote(user_ticket or '', safe='')}"
+                    )
+                else:
+                    stream_path = (
+                        f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
+                        f"?ticket={quote(user_ticket, safe='')}"
+                        if user_ticket
+                        else f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
+                    )
                 if raw_sse_transport:
                     stream_context = _RawSseStream(
                         f"{qa.api_origin}{stream_path}",
@@ -816,7 +1045,7 @@ async def consume_sse_connection(
                     await wait_before_reconnect(reconnect_attempt)
                     continue
 
-                metrics.connection_opened()
+                metrics.connection_opened(user_id=str(user["id"]))
                 if not initial_connection_marked:
                     metrics.mark("initial_connected")
                     initial_connection_marked = True
@@ -843,7 +1072,7 @@ async def consume_sse_connection(
                                 metrics.mark("keepalives")
                             elif line == "event: connected":
                                 current_event = False
-                            elif line == "event: bracket":
+                            elif line == f"event: {'ready_check' if sse_scope == 'ready-check' else 'bracket'}":
                                 current_event = True
                             elif current_event and line.startswith("data: "):
                                 metrics.mark("events")
@@ -860,6 +1089,9 @@ async def consume_sse_connection(
                                                 time.time() * 1000 - published_at_ms,
                                             )
                                         )
+                                if sse_scope == "ready-check":
+                                    metrics.mark("ready_check_events")
+                                    break
                             if time.monotonic() >= cycle_deadline:
                                 break
                 except TimeoutError:
@@ -949,6 +1181,10 @@ async def run_connections(
     global_admission_limit: int,
     plateau_probe_connections: int,
     http_max_connections: int,
+    sse_scope: str = "bracket",
+    sse_ticket_by_user_id: dict[str, str] | None = None,
+    after_connection_barrier=None,
+    fallback_probe=None,
 ) -> dict[str, Any]:
     metrics = SseMetrics()
     raw_sse_transport = urlsplit(str(qa.api_origin)).hostname in {
@@ -1036,6 +1272,8 @@ async def run_connections(
                     user=user,
                     tournament_slug=str(tournament["slug"]),
                     sse_ticket=sse_ticket,
+                    sse_ticket_by_user_id=sse_ticket_by_user_id,
+                    sse_scope=sse_scope,
                     duration_seconds=duration_seconds,
                     reconnect_cycles=reconnect_cycles,
                     open_gate=open_gate,
@@ -1072,6 +1310,11 @@ async def run_connections(
     try:
         await all_attempts_done.wait()
         plateau_report["base_connected"] = metrics.counters["initial_connected"]
+        if after_connection_barrier is not None:
+            await after_connection_barrier()
+        fallback_report: dict[str, Any] | None = None
+        if fallback_probe is not None:
+            fallback_report = await fallback_probe(metrics)
         if (
             plateau_probe_connections > 0
             and sse_capacity_token is not None
@@ -1097,17 +1340,25 @@ async def run_connections(
                 }
             )
         await asyncio.sleep(min(2.0, max(0.1, duration_seconds / 4)))
-        publisher = asyncio.create_task(
-            publish_probe_events(
-                [str(tournament["id"]) for tournament in tournaments],
-                count=event_count,
-                interval_seconds=event_interval,
+        if sse_scope == "ready-check":
+            publisher_report = {
+                "published_events": 0,
+                "subscriber_counts": [],
+                "max_subscribers_reported": 0,
+            }
+        else:
+            publisher = asyncio.create_task(
+                publish_probe_events(
+                    [str(tournament["id"]) for tournament in tournaments],
+                    count=event_count,
+                    interval_seconds=event_interval,
+                )
             )
-        )
         await asyncio.gather(*tasks, *probe_tasks)
-        publisher_report = await publisher
+        if publisher is not None:
+            publisher_report = await publisher
         return {
-            "profile": "sse-only",
+            "profile": "ready-check-sse" if sse_scope == "ready-check" else "sse-only",
             "target_connections": connection_count,
             "duration_seconds": duration_seconds,
             "open_concurrency": open_concurrency,
@@ -1116,12 +1367,22 @@ async def run_connections(
             "open_timeout_seconds": open_timeout_seconds,
             "open_rate_per_second": open_rate_per_second,
             "capacity_mode": sse_capacity_token is not None,
-            "admission_mode": "ticket" if sse_ticket else "legacy",
+            "admission_mode": (
+                "ready-check-ticket"
+                if sse_scope == "ready-check"
+                else ("ticket" if sse_ticket else "legacy")
+            ),
+            "sse_scope": sse_scope,
             "reconnect_cycles": reconnect_cycles,
             "probe_event_count": event_count,
             "probe_event_interval_seconds": event_interval,
-            "expected_events": metrics.counters["initial_connected"] * max(0, event_count),
+            "expected_events": (
+                metrics.counters["initial_connected"]
+                if sse_scope == "ready-check"
+                else metrics.counters["initial_connected"] * max(0, event_count)
+            ),
             "publisher": publisher_report,
+            "fallback_probe": fallback_report,
             "application_global_admission_limit": global_admission_limit,
             "plateau_probe": plateau_report,
             "load_generator_resources": load_generator_resource_limits(),
@@ -1311,15 +1572,22 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
 
     settings = get_settings()
     if args.sse_capacity_limit:
-        if args.sse_capacity_limit > SSE_GLOBAL_LIMIT and (
-            args.mode != "sse"
-            or urlsplit(str(args.origin)).hostname
-            not in {"127.0.0.1", "localhost", "::1"}
-            or args.sse_admission_mode != "ticket"
-        ):
+        is_loopback_origin = urlsplit(str(args.origin)).hostname in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }
+        is_ready_check_capacity_probe = (
+            args.mode == "sse"
+            and args.sse_scope == "ready-check"
+            and args.sse_admission_mode == "ticket"
+        )
+        if args.sse_capacity_limit > SSE_GLOBAL_LIMIT and not (
+            is_loopback_origin and args.sse_admission_mode == "ticket"
+        ) and not is_ready_check_capacity_probe:
             raise RuntimeError(
                 "QA SSE capacity mode above the production cap requires the "
-                "ticketed SSE-only loopback origin."
+                "ticketed Ready Check scope or a ticketed loopback origin."
             )
         sse_capacity_token = sse_load_test_capacity_token(
             settings,
@@ -1365,20 +1633,77 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     api_client = await qa.new_client()
     try:
         await qa.record_preprod_run(status="running", requested_users=qa.scale_users)
-        await qa.start_performance_collection()
+        if args.sse_scope != "ready-check":
+            await qa.start_performance_collection()
         try:
-            users, tournaments, user_chunks = await asyncio.wait_for(
-                prepare_fixture(qa, api_client),
-                timeout=SSE_FIXTURE_TIMEOUT_SECONDS,
-            )
+            if args.sse_scope == "ready-check":
+                (
+                    users,
+                    tournaments,
+                    user_chunks,
+                    sse_ticket_by_user_id,
+                    state_tickets_by_user_id,
+                ) = await asyncio.wait_for(
+                    prepare_ready_check_fixture(
+                        qa,
+                        api_client,
+                        sse_capacity_token=sse_capacity_token,
+                    ),
+                    timeout=READY_CHECK_FIXTURE_TIMEOUT_SECONDS,
+                )
+            else:
+                users, tournaments, user_chunks = await asyncio.wait_for(
+                    prepare_fixture(qa, api_client),
+                    timeout=SSE_FIXTURE_TIMEOUT_SECONDS,
+                )
+                sse_ticket_by_user_id = None
+                state_tickets_by_user_id = None
         except TimeoutError as exc:
-            qa.report["sse_fixture_timeout_seconds"] = SSE_FIXTURE_TIMEOUT_SECONDS
+            fixture_timeout = (
+                READY_CHECK_FIXTURE_TIMEOUT_SECONDS
+                if args.sse_scope == "ready-check"
+                else SSE_FIXTURE_TIMEOUT_SECONDS
+            )
+            qa.report["sse_fixture_timeout_seconds"] = fixture_timeout
             raise RuntimeError(
                 "SSE fixture setup exceeded its bounded budget of "
-                f"{SSE_FIXTURE_TIMEOUT_SECONDS:.1f}s"
+                f"{fixture_timeout:.1f}s"
             ) from exc
+        if args.sse_scope == "ready-check":
+            await qa.start_performance_collection()
         sse_ticket: str | None = None
-        if args.sse_admission_mode == "ticket":
+        after_connection_barrier = None
+        fallback_probe = None
+        if args.sse_scope == "ready-check":
+            qa.report["sse_admission"] = {
+                "mode": "ticket",
+                "issued": True,
+                "scope": "authenticated-eligible-ready-check",
+            }
+
+            async def start_ready_check() -> None:
+                await qa.request_as(
+                    api_client,
+                    users[0],
+                    "POST",
+                    f"/tournaments/{tournaments[0]['slug']}/deadlock/ready-check/start",
+                    expected=201,
+                )
+
+            async def probe_overflow(metrics: SseMetrics) -> dict[str, Any]:
+                assert state_tickets_by_user_id is not None
+                return await probe_ready_check_overflow(
+                    qa,
+                    api_client,
+                    users,
+                    tournament_slug=str(tournaments[0]["slug"]),
+                    state_tickets=state_tickets_by_user_id,
+                    metrics=metrics,
+                )
+
+            after_connection_barrier = start_ready_check
+            fallback_probe = probe_overflow
+        elif args.sse_admission_mode == "ticket":
             with qa.phase("sse_admission_ticket"):
                 sse_ticket = await issue_public_sse_admission_ticket(
                     qa,
@@ -1426,6 +1751,10 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     event_count=args.sse_event_count,
                     event_interval=args.sse_event_interval,
                     http_max_connections=max(args.http_max_connections, args.sse_connections),
+                    sse_scope=args.sse_scope,
+                    sse_ticket_by_user_id=sse_ticket_by_user_id,
+                    after_connection_barrier=after_connection_barrier,
+                    fallback_probe=fallback_probe,
                 )
             qa.report["sse"] = sse_report
             metrics = sse_report["metrics"]

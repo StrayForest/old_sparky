@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import hashlib
+import hmac
 import secrets
 from collections import deque
 from collections.abc import AsyncIterator
@@ -15,6 +17,7 @@ from apps.platform_api.app.services.tournament_workspace_access import (
     current_tournament_stream_access_is_valid,
 )
 from python_packages.platform_infra.redis import redis_client
+from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.sse_connection_limit import (
     SSE_KEEPALIVE_SECONDS,
     SSE_RECONNECT_JITTER_MS,
@@ -32,6 +35,8 @@ SSE_ACCESS_CHECK_COALESCE_SECONDS = 0.5
 # to revalidate concurrently turns that fan-out into a DB pool outage.
 SSE_ACCESS_REVALIDATION_CONCURRENCY = 2
 SSE_RELAY_QUEUE_MAXSIZE = 32
+BRACKET_PROBE_STATE_PREFIX = "platform:bracket-probe:v1"
+BRACKET_PROBE_STATE_TTL_SECONDS = 900
 
 _access_check_registry_lock = asyncio.Lock()
 _access_check_cache: dict[str, tuple[float, bool]] = {}
@@ -197,6 +202,16 @@ def bracket_channel(tournament_id: str) -> str:
     return f"platform:bracket:{tournament_id}"
 
 
+def _bracket_probe_key(tournament_id: str) -> str:
+    settings = get_settings()
+    digest = hmac.new(
+        settings.platform_secret_key.encode("utf-8"),
+        str(tournament_id).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+    return f"{BRACKET_PROBE_STATE_PREFIX}:{digest}"
+
+
 def _access_check_cache_key(tournament_id: str) -> str:
     context = current_tournament_stream_access_context()
     if context is None:
@@ -258,6 +273,17 @@ async def publish_bracket_event(
 ) -> None:
     client = redis_client()
     try:
+        await client.set(
+            _bracket_probe_key(tournament_id),
+            json.dumps(
+                {
+                    "revision": int(payload.get("revision") or 0),
+                    "status": "ready" if int(payload.get("revision") or 0) > 0 else "pending",
+                },
+                separators=(",", ":"),
+            ),
+            ex=BRACKET_PROBE_STATE_TTL_SECONDS,
+        )
         await client.publish(
             bracket_channel(tournament_id),
             json.dumps(payload, separators=(",", ":")),
@@ -267,6 +293,25 @@ async def publish_bracket_event(
             "Failed to publish bracket event for tournament %s.",
             tournament_id,
         )
+    finally:
+        await client.aclose()
+
+
+async def read_bracket_probe_state(tournament_id: str) -> dict[str, object] | None:
+    client = redis_client()
+    try:
+        value = await client.get(_bracket_probe_key(tournament_id))
+        if not isinstance(value, str):
+            return None
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            logger.warning(
+                "Ignoring malformed bracket probe projection: tournament=%s",
+                tournament_id,
+            )
+            return None
+        return decoded if isinstance(decoded, dict) else None
     finally:
         await client.aclose()
 
