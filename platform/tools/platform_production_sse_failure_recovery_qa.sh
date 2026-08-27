@@ -363,7 +363,7 @@ initial_connected = int(
     if sse.get("initial_connected") is not None
     else sse.get("connected") or 0
 )
-expected_client_reconnect = fault == "mass-disconnect"
+expected_client_reconnect = fault in {"api-restart", "redis-hiccup", "mass-disconnect"}
 recovery = {
     "passed": (
         int(fault_status) == 0

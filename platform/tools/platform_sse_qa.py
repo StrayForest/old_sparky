@@ -65,6 +65,7 @@ NORMAL_TRAFFIC_MUTATION_INTERVAL_SECONDS = 30.0
 # fallback-eligible.
 SSE_OPEN_TIMEOUT_MAX_PUBLIC_SECONDS = 60.0
 SSE_OPEN_TIMEOUT_MAX_ORIGIN_LOCAL_SECONDS = 60.0
+SSE_RECONNECT_MAX_BACKOFF_SECONDS = 5.0
 
 
 async def _close_sse_stream_context(stream_context: Any | None) -> None:
@@ -712,159 +713,219 @@ async def consume_sse_connection(
     if open_delay_seconds > 0:
         await asyncio.sleep(open_delay_seconds)
 
+    async def wait_before_reconnect(attempt: int) -> None:
+        if deadline is None:
+            return
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            return
+        backoff_cap = min(
+            SSE_RECONNECT_MAX_BACKOFF_SECONDS,
+            0.25 * (2 ** min(attempt, 4)),
+            remaining,
+        )
+        jitter = secrets.randbelow(1_000_000) / 1_000_000
+        await asyncio.sleep(backoff_cap * jitter)
+
     for cycle in range(cycles + 1):
         if deadline is not None and time.monotonic() >= deadline:
             break
-        metrics.mark("connection_attempts")
-        attempt_started = time.monotonic()
-        request_id = f"sseqa-{secrets.token_hex(8)}"
-        headers["X-Request-ID"] = request_id
-        counters_before = {
-            name: metrics.counters[name]
-            for name in ("bytes_received", "events", "keepalives")
-        }
-        stream_context = None
-        response = None
-        connected_this_attempt = False
-        open_timed_out = False
-        try:
-            stream_path = (
-                f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
-                f"?ticket={quote(sse_ticket, safe='')}"
-                if sse_ticket
-                else f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
-            )
-            if raw_sse_transport:
-                stream_context = _RawSseStream(
-                    f"{qa.api_origin}{stream_path}",
-                    headers,
-                )
-            else:
-                assert client is not None
-                stream_context = client.stream(
-                    "GET",
-                    stream_path,
-                    headers=headers,
-                )
+        reconnect_attempt = 0
+        while True:
+            if cycle > 0 and deadline is not None and time.monotonic() >= deadline:
+                break
+            metrics.mark("connection_attempts")
+            attempt_started = time.monotonic()
+            request_id = f"sseqa-{secrets.token_hex(8)}"
+            headers["X-Request-ID"] = request_id
+            counters_before = {
+                name: metrics.counters[name]
+                for name in ("bytes_received", "events", "keepalives")
+            }
+            stream_context = None
+            response = None
+            connected_this_attempt = False
+            open_timed_out = False
+            retry_reconnect = False
             try:
-                async with asyncio.timeout(max(0.1, open_timeout_seconds)):
-                    async with open_gate:
-                        response = await stream_context.__aenter__()
-            except TimeoutError:
-                open_timed_out = True
-                metrics.mark("open_timeouts")
-                metrics.mark("fallback_polling_eligible")
-                await _close_sse_stream_context(stream_context)
-                stream_context = None
-                continue
-            metrics.response_status(response.status_code)
-            if cycle == 0 and not initial_attempt_marked:
-                initial_attempt_marked = True
-                await mark_attempt_finished()
-            if response.status_code != 200:
-                metrics.mark("fallback_polling_eligible")
-                if response.status_code == 429:
-                    metrics.mark("rejected_429")
-                elif response.status_code == 503:
-                    metrics.mark("rejected_503")
-                else:
-                    metrics.mark("rejected_other")
-                with suppress(Exception):
-                    metrics.record_response_error(
-                        status_code=response.status_code,
-                        body=await response.aread(),
-                        headers=response.headers,
-                        request_id=request_id,
+                stream_path = (
+                    f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
+                    f"?ticket={quote(sse_ticket, safe='')}"
+                    if sse_ticket
+                    else f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
+                )
+                if raw_sse_transport:
+                    stream_context = _RawSseStream(
+                        f"{qa.api_origin}{stream_path}",
+                        headers,
                     )
-                await _close_sse_stream_context(stream_context)
-                stream_context = None
-                continue
-
-            metrics.connection_opened()
-            if cycle == 0:
-                metrics.mark("initial_connected")
-            connected_this_attempt = True
-            metrics.connect_latencies.append((time.monotonic() - attempt_started) * 1000)
-            if cycle == 0:
-                deadline = await hold_deadline_after_barrier(
-                    all_attempts_done,
-                    duration_seconds,
-                )
-            cycle_deadline = min(deadline, time.monotonic() + per_cycle_hold)
-            current_event = False
-            try:
-                async with asyncio.timeout(max(0.1, cycle_deadline - time.monotonic())):
-                    async for line in response.aiter_lines():
-                        metrics.mark("bytes_received", len(line.encode("utf-8")) + 1)
-                        if line.startswith(": keepalive"):
-                            metrics.mark("keepalives")
-                        elif line == "event: connected":
-                            current_event = False
-                        elif line == "event: bracket":
-                            current_event = True
-                        elif current_event and line.startswith("data: "):
-                            metrics.mark("events")
-                            current_event = False
-                            with suppress(TypeError, ValueError):
-                                payload = json.loads(line[6:])
-                                published_at_ms = int(payload.get("qa_published_at_ms", 0))
-                                if published_at_ms:
-                                    metrics.event_latencies.append(
-                                        max(0.0, time.time() * 1000 - published_at_ms)
-                                    )
-                        if time.monotonic() >= cycle_deadline:
-                            break
-            except TimeoutError:
-                metrics.mark("completed")
-            else:
-                metrics.mark("completed")
-            if cycle < cycles and time.monotonic() < deadline:
-                metrics.mark("reconnects")
-                await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
-        except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
-            elapsed_ms = (time.monotonic() - attempt_started) * 1000
-            if open_timed_out or (response is None and elapsed_ms >= open_timeout_seconds * 1000):
-                if not open_timed_out:
+                else:
+                    assert client is not None
+                    stream_context = client.stream(
+                        "GET",
+                        stream_path,
+                        headers=headers,
+                    )
+                try:
+                    async with asyncio.timeout(max(0.1, open_timeout_seconds)):
+                        async with open_gate:
+                            response = await stream_context.__aenter__()
+                except TimeoutError:
+                    open_timed_out = True
                     metrics.mark("open_timeouts")
                     metrics.mark("fallback_polling_eligible")
-                continue
-            details: dict[str, Any] = {
-                "request_id": request_id,
-                "elapsed_ms": round(elapsed_ms, 2),
-                "bytes_received": metrics.counters["bytes_received"]
-                - counters_before["bytes_received"],
-                "events": metrics.counters["events"] - counters_before["events"],
-                "keepalives": metrics.counters["keepalives"]
-                - counters_before["keepalives"],
-            }
-            if response is not None:
-                details["status"] = response.status_code
-                for header_name in ("cf-ray", "server", "x-request-id"):
-                    value = response.headers.get(header_name)
-                    if value:
-                        details[header_name.replace("-", "_")] = value[:200]
-            metrics.record_error(exc, details=details)
-        except Exception as exc:  # pragma: no cover - defensive load-harness boundary
-            metrics.record_error(
-                exc,
-                details={
-                    "request_id": request_id,
-                    "elapsed_ms": round((time.monotonic() - attempt_started) * 1000, 2),
-                    "bytes_received": metrics.counters["bytes_received"]
-                    - counters_before["bytes_received"],
-                    "events": metrics.counters["events"] - counters_before["events"],
-                    "keepalives": metrics.counters["keepalives"]
-                    - counters_before["keepalives"],
-                },
-            )
-        finally:
-            if cycle == 0 and not initial_attempt_marked:
-                initial_attempt_marked = True
-                await mark_attempt_finished()
-            if stream_context is not None:
-                await _close_sse_stream_context(stream_context)
-            if connected_this_attempt:
-                metrics.connection_closed()
+                    if cycle > 0 and deadline is not None and time.monotonic() < deadline:
+                        retry_reconnect = True
+                    else:
+                        break
+                if open_timed_out:
+                    await _close_sse_stream_context(stream_context)
+                    stream_context = None
+                    if retry_reconnect:
+                        reconnect_attempt += 1
+                        await wait_before_reconnect(reconnect_attempt)
+                    continue
+                metrics.response_status(response.status_code)
+                if cycle == 0 and not initial_attempt_marked:
+                    initial_attempt_marked = True
+                    await mark_attempt_finished()
+                if response.status_code != 200:
+                    metrics.mark("fallback_polling_eligible")
+                    if response.status_code == 429:
+                        metrics.mark("rejected_429")
+                    elif response.status_code == 503:
+                        metrics.mark("rejected_503")
+                    else:
+                        metrics.mark("rejected_other")
+                    with suppress(Exception):
+                        metrics.record_response_error(
+                            status_code=response.status_code,
+                            body=await response.aread(),
+                            headers=response.headers,
+                            request_id=request_id,
+                        )
+                    if cycle > 0 and deadline is not None and time.monotonic() < deadline:
+                        retry_reconnect = True
+                    else:
+                        break
+                if retry_reconnect:
+                    await _close_sse_stream_context(stream_context)
+                    stream_context = None
+                    reconnect_attempt += 1
+                    await wait_before_reconnect(reconnect_attempt)
+                    continue
+
+                metrics.connection_opened()
+                if cycle == 0:
+                    metrics.mark("initial_connected")
+                connected_this_attempt = True
+                metrics.connect_latencies.append(
+                    (time.monotonic() - attempt_started) * 1000
+                )
+                if cycle == 0:
+                    deadline = await hold_deadline_after_barrier(
+                        all_attempts_done,
+                        duration_seconds,
+                    )
+                cycle_deadline = min(deadline, time.monotonic() + per_cycle_hold)
+                current_event = False
+                try:
+                    async with asyncio.timeout(
+                        max(0.1, cycle_deadline - time.monotonic())
+                    ):
+                        async for line in response.aiter_lines():
+                            metrics.mark("bytes_received", len(line.encode("utf-8")) + 1)
+                            if line.startswith(": keepalive"):
+                                metrics.mark("keepalives")
+                            elif line == "event: connected":
+                                current_event = False
+                            elif line == "event: bracket":
+                                current_event = True
+                            elif current_event and line.startswith("data: "):
+                                metrics.mark("events")
+                                current_event = False
+                                with suppress(TypeError, ValueError):
+                                    payload = json.loads(line[6:])
+                                    published_at_ms = int(
+                                        payload.get("qa_published_at_ms", 0)
+                                    )
+                                    if published_at_ms:
+                                        metrics.event_latencies.append(
+                                            max(
+                                                0.0,
+                                                time.time() * 1000 - published_at_ms,
+                                            )
+                                        )
+                            if time.monotonic() >= cycle_deadline:
+                                break
+                except TimeoutError:
+                    metrics.mark("completed")
+                else:
+                    metrics.mark("completed")
+                if cycle < cycles and time.monotonic() < deadline:
+                    metrics.mark("reconnects")
+                    await wait_before_reconnect(0)
+                break
+            except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
+                elapsed_ms = (time.monotonic() - attempt_started) * 1000
+                if open_timed_out or (
+                    response is None and elapsed_ms >= open_timeout_seconds * 1000
+                ):
+                    if not open_timed_out:
+                        metrics.mark("open_timeouts")
+                        metrics.mark("fallback_polling_eligible")
+                    if cycle > 0 and deadline is not None and time.monotonic() < deadline:
+                        retry_reconnect = True
+                    else:
+                        break
+                else:
+                    details: dict[str, Any] = {
+                        "request_id": request_id,
+                        "elapsed_ms": round(elapsed_ms, 2),
+                        "bytes_received": metrics.counters["bytes_received"]
+                        - counters_before["bytes_received"],
+                        "events": metrics.counters["events"] - counters_before["events"],
+                        "keepalives": metrics.counters["keepalives"]
+                        - counters_before["keepalives"],
+                    }
+                    if response is not None:
+                        details["status"] = response.status_code
+                        for header_name in ("cf-ray", "server", "x-request-id"):
+                            value = response.headers.get(header_name)
+                            if value:
+                                details[header_name.replace("-", "_")] = value[:200]
+                    metrics.record_error(exc, details=details)
+                    if cycle > 0 and deadline is not None and time.monotonic() < deadline:
+                        retry_reconnect = True
+                    else:
+                        break
+            except Exception as exc:  # pragma: no cover - defensive load-harness boundary
+                metrics.record_error(
+                    exc,
+                    details={
+                        "request_id": request_id,
+                        "elapsed_ms": round(
+                            (time.monotonic() - attempt_started) * 1000, 2
+                        ),
+                        "bytes_received": metrics.counters["bytes_received"]
+                        - counters_before["bytes_received"],
+                        "events": metrics.counters["events"] - counters_before["events"],
+                        "keepalives": metrics.counters["keepalives"]
+                        - counters_before["keepalives"],
+                    },
+                )
+                break
+            finally:
+                if cycle == 0 and not initial_attempt_marked:
+                    initial_attempt_marked = True
+                    await mark_attempt_finished()
+                if stream_context is not None:
+                    await _close_sse_stream_context(stream_context)
+                if connected_this_attempt:
+                    metrics.connection_closed()
+            if retry_reconnect:
+                reconnect_attempt += 1
+                await wait_before_reconnect(reconnect_attempt)
 
 
 async def run_connections(
