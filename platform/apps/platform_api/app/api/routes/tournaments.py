@@ -303,10 +303,14 @@ def _issue_tournament_sse_admission_ticket(
     else:
         access = "public"
 
+    # Public bracket data is intentionally available to anonymous viewers.
+    # Do not bind a public ticket to an authenticated session: the binding
+    # adds no authorization value for public content, but would make every
+    # public stream carry a user lease and session revalidation query.
     session_token = None
     session_id = None
     user_id = None
-    if auth_session is not None:
+    if auth_session is not None and access != "public":
         session_token = request.cookies.get(get_settings().platform_session_cookie_name)
         session_id = str(getattr(auth_session.session, "id", "") or "")
         user_id = str(getattr(auth_session.user, "id", "") or "")

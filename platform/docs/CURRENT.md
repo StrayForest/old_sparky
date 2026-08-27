@@ -411,15 +411,16 @@ database guards and applies migration `20260822_0040`. Exact commit
 `gha-32574455599-1-87525bab34c4-20260822T125945Z`; closure evidence is in
 [`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md).
 
-### AS-19 SSE capacity and burst boundary — 2026-08-27
+### AS-20 SSE persistence, opening and mixed boundary — 2026-08-27
 
-The protected package ending at `2c551c50` is deployed: signed HMAC tickets,
-PostgreSQL-free ticketed opens, private-stream revalidation, shared
-worker/tournament relay, SharedWorker deduplication, polling fallback and
-fail-closed Redis global/source/user leases (`3,000/32/4`). The relay now
-formats each event once into a bounded shared sequence buffer, avoiding a
-synchronous queue fan-out loop for every subscriber. Application caps and
-authorization semantics were not weakened.
+The deployed package is `c3e8a5dff105ac2bbbed6d60c79e582258b42867`: signed
+HMAC tickets, PostgreSQL-free ticketed opens, private-stream revalidation,
+shared worker/tournament relay, SharedWorker deduplication, polling fallback
+and fail-closed Redis global/source/user leases (`3,000/32/4`). Public tickets
+are anonymous because bracket data is public; private tickets remain
+session-bound. Recovery uses full jitter `60–180s`, based on a measured safe
+public fill of `25 opens/s`. The relay formats each event once into a bounded
+shared sequence buffer; authorization and admission semantics remain intact.
 
 Origin-local ticket capacity exceeded the 10,000-user target:
 
@@ -436,34 +437,35 @@ no higher origin cap is claimed without a memory plan. Earlier 15,000 and
 `33034425381`. All exact cleanups verified zero fixture users, tournaments,
 sessions and audit rows.
 
-Public/Cloudflare ticket opening at the protected application cap of 3,000
-passed without application errors at paced rates, but the handshake tail is
-edge/transport-bound: rate 50/s reached 3,000/3,000 with connect p95 4.94s;
-rate 75/s reached all 3,000 with p95 15.83s; rate 100/s reached all 3,000
-with p95 24.14s. Event p95 stayed 1.42–1.66s and origin CPU/Redis/PostgreSQL
-remained below saturation. The runs were `33035099910`, `33035798822` and
-`33035593586`; exact cleanups were `33035266312`, `33036000968` and
-`33035761732`. A 5,000-attempt overflow test (`33035307148`, cleanup
-`33035561336`) respected the 3,000 cap: 3,000 connected, 193 received the
-expected 429, and the rest timed out in the edge queue, with no 503 or
-application error.
+The current protected limit was isolated on the live path. Origin-local 3,000
+(`33040760791`, cleanup `33040911848`) produced `3,000/3,000` HTTP 200; N+10
+produced ten expected 429, zero 503/timeout/error and `9,000/9,000` events,
+with connect/event p95 `103ms/727ms`. Public 3,000 at `25/s`
+(`33040985301`, cleanup `33041234047`) and `40/s` (`33041292794`, cleanup
+`33041492597`) also reached `3,000/3,000` with N+10 429 and zero errors;
+connect p95 was `534ms` and `2.99s`. At `50/s` (`33040501257`, cleanup
+`33040712758`), only `2,154/3,000` opened and `846` public handshakes timed
+out. Therefore `25/s` is the safe refill/opening rate, `40/s` is a high-tail
+diagnostic point, and `50/s` is not safe through the current edge path.
 
-The mixed production contour also passed at 3,000 SSE plus 10,000 polling
-users: run `33036740237`, cleanup `33037055264`, 3,000/3,000 HTTP 200,
-9,000/9,000 events, 10,000/10,000 polling requests and zero errors. Connect
-p95 was 12.33s and event p95 1.68s. The dominant measured resource was the
-API at 80.9% average and 140.3% peak CPU with about 919MB peak RSS; PostgreSQL
-and Redis had no lock/backend-wait or admission saturation. A 1,000-SSE
-mixed control also passed (`33036365159`, cleanup `33036695877`).
+The mixed production contour at public `50/s` (`33041564210`, cleanup
+`33041917423`) completed `10,000/10,000` polling without errors, but only
+`2,209/3,000` SSE opened and `791` timed out. At the safe `25/s`
+(`33041962825`, cleanup `33042299928`), it completed `10,000/10,000` polling,
+`3,000/3,000` SSE, `9,000/9,000` events and zero errors. Workspace p95 was
+`1.08s`, SSE connect p95 `1.47s`, and event p95 `3.83s`; API CPU averaged/
+peaked at `80.8%/143.0%`, with sustained CPU and PostgreSQL connection pressure
+flagged by the resource classifier. This is a functional 10k-user baseline,
+not evidence for raising the cap.
 
-The current safe boundary is therefore: origin-local 20,000 verified, public
-3,000 protected and paced, and mixed 3,000 SSE plus 10,000 polling verified.
-The remaining customer-facing bottleneck is Cloudflare/transport opening
-queueing, while the next origin boundary is API memory/CPU. Raising the
-application cap would remove deliberate backpressure without fixing either
-boundary. Ten-thousand public persistent SSE and the exact 180% two-core
-target remain unclaimed; further progress requires an operator-owned
-edge/transport or VPS resource change followed by the same protected tests.
+The safe boundary is therefore origin-local `20,000` SSE (near the roughly
+1GB API memory boundary), public `3,000` established SSE with `25/s` gradual
+opening, and mixed `3,000` SSE plus `10,000` polling at that opening rate. The
+remaining bottlenecks are Cloudflare/transport opening queueing and mixed API
+CPU/event latency. Raising the application cap would remove deliberate
+backpressure without fixing either boundary; 10,000 public persistent SSE and
+the exact 180% two-core target remain unclaimed and require an operator-owned
+edge/VPS resource change followed by the same protected load/cleanup cycle.
 
 AS-17 — End-to-end release transaction and recovery is resolved and deployed.
 The release receipt now has an explicit Nginx uncertainty boundary, idempotent
@@ -546,7 +548,7 @@ against the current web/api/worker identities and units.
   replace-all request leaves exactly its selected profile-level slots, never a
   merge of concurrent payloads; slot values remain in the supported range.
 - Public API contracts are explicit allowlists. Account/contact email and Steam authentication identity do not belong to anonymous public-profile DTOs, participant moderation metadata belongs only to organizer-management DTOs, and public automation error fields must never contain arbitrary exception text. A future public email feature requires a separate explicit opt-in contract rather than reusing account contact data.
-- Public bracket SSE must retain layered application/Nginx connection caps, fail closed when Redis-backed admission state is unavailable, release leases on normal termination and retain bounded expiry recovery after abnormal termination. Healthy streams have no artificial lifetime rotation: keepalive, renewable leases and access revalidation govern their lifetime, while reconnect admission remains bounded and fully jittered.
+- Public bracket SSE must retain layered application/Nginx connection caps, fail closed when Redis-backed admission state is unavailable, release leases on normal termination and retain bounded expiry recovery after abnormal termination. Public tickets may be anonymous because bracket data is public; private tickets remain session-bound and private revalidation remains fail-closed. Healthy streams have no artificial lifetime rotation: keepalive, renewable leases and access revalidation govern their lifetime, while reconnect admission remains bounded and fully jittered over the measured 60–180 second recovery window.
 - Public media rendering must remain `R2 -> CDN -> browser`; normal API runtime must not proxy R2 objects, serve legacy upload paths or fall back to local-disk reads. Legacy URL columns and migration helpers may remain only while runtime-inert and migration/grace-period scoped.
 - Unknown public patch IDs must not make the request path wait on external refresh work. Retain per-ID negative caching, cross-worker refresh coalescing and explicit no-redirect/response-size bounds for miss-triggered upstream requests.
 - Password-login protection must retain independent per-IP and account-wide buckets. Account-wide Redis state must use private HMAC fingerprints rather than plaintext identifiers; cooldowns remain bounded and must not extend on blocked requests, and a successful login clears the account failure/cooldown state.

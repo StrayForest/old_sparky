@@ -158,6 +158,19 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
                 return False
 
             async with stream_db_session() as db_session:
+                if access_context.decision == "public":
+                    # Public tickets are deliberately unbound to a viewer
+                    # session. The content is public, while this check still
+                    # fails closed if the tournament disappears or becomes
+                    # private during the established stream.
+                    public_visibility = await db_session.scalar(
+                        select(Tournament.visibility).where(
+                            Tournament.id == tournament_id,
+                            Tournament.slug == access_context.slug,
+                        )
+                    )
+                    return public_visibility == "public"
+
                 row = (
                     await db_session.execute(
                         select(
@@ -186,15 +199,6 @@ async def current_tournament_stream_access_is_valid(tournament_id: str) -> bool:
                 organizer_user_id = str(row[1])
                 participant_status = row[2]
 
-                if access_context.decision == "public":
-                    if access_context.user_id and access_context.session_id:
-                        if not await _authenticated_stream_session_is_current(
-                            db_session,
-                            user_id=access_context.user_id,
-                            session_id=access_context.session_id,
-                        ):
-                            return False
-                    return tournament_visibility == "public"
                 if tournament_visibility != "invite_only":
                     return True
                 if not access_context.user_id or not access_context.session_id:

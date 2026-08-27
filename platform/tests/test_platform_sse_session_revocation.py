@@ -28,7 +28,57 @@ class _FakeSession:
         return _ExecuteResult(self._row)
 
 
+class _FakePublicSession:
+    def __init__(self, visibility: str) -> None:
+        self.visibility = visibility
+        self.scalar_calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        del exc_type, exc, tb
+
+    async def scalar(self, _statement):
+        self.scalar_calls += 1
+        return self.visibility
+
+
 class PlatformSseSessionRevocationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_stream_revalidation_checks_visibility_without_session_sql(self) -> None:
+        context = access.TournamentStreamAccessContext(
+            decision="public",
+            slug="public-cup",
+            user_id="user-1",
+            session_id="session-1",
+        )
+        token = access._tournament_stream_access_context.set(context)
+        db_session = _FakePublicSession("public")
+        session_check = AsyncMock(return_value=False)
+        try:
+            with (
+                patch.object(
+                    access,
+                    "stream_db_session",
+                    MagicMock(return_value=db_session),
+                ),
+                patch.object(
+                    access,
+                    "_authenticated_stream_session_is_current",
+                    session_check,
+                ),
+            ):
+                self.assertTrue(
+                    await access.current_tournament_stream_access_is_valid(
+                        "tournament-1"
+                    )
+                )
+        finally:
+            access._tournament_stream_access_context.reset(token)
+
+        self.assertEqual(db_session.scalar_calls, 1)
+        session_check.assert_not_awaited()
+
     async def test_private_organizer_stream_stops_when_session_is_revoked(self) -> None:
         context = access.TournamentStreamAccessContext(
             decision="organizer",

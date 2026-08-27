@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from starlette.requests import Request
 
+from apps.platform_api.app.api.routes import tournaments
 from apps.platform_api.app.services import tournament_workspace_access
 from python_packages.platform_infra.sse_admission import (
     SseAdmissionTicket,
@@ -110,6 +111,60 @@ class PlatformSseAdmissionTicketTests(unittest.TestCase):
                     expected_slug="public-cup",
                     now=self.now,
                 )
+
+    def test_public_route_ticket_is_not_bound_to_authenticated_session(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/tournaments/public-cup/workspace",
+                "headers": [(b"cookie", b"deadlock_platform_session=session-token")],
+                "query_string": b"",
+                "client": ("127.0.0.1", 1000),
+                "server": ("127.0.0.1", 8010),
+                "scheme": "http",
+            }
+        )
+        auth_session = SimpleNamespace(
+            user=SimpleNamespace(id="user-1"),
+            session=SimpleNamespace(id="session-1"),
+        )
+        tournament = SimpleNamespace(
+            id="tournament-1",
+            slug="public-cup",
+            visibility="public",
+            organizer_user_id="organizer-1",
+        )
+        with (
+            patch.object(
+                tournaments,
+                "get_settings",
+                return_value=SimpleNamespace(
+                    platform_session_cookie_name="deadlock_platform_session"
+                ),
+            ),
+            patch.object(
+                tournaments,
+                "issue_sse_admission_ticket",
+                return_value="ticket",
+            ) as issue_ticket,
+        ):
+            result = tournaments._issue_tournament_sse_admission_ticket(
+                request,
+                tournament=tournament,
+                auth_session=auth_session,
+                has_participant_record=False,
+            )
+
+        self.assertEqual(result, "ticket")
+        issue_ticket.assert_called_once_with(
+            tournament_id="tournament-1",
+            slug="public-cup",
+            access="public",
+            user_id=None,
+            session_id=None,
+            session_token=None,
+        )
 
 
 class PlatformSseTicketRouteAdmissionTests(unittest.IsolatedAsyncioTestCase):
