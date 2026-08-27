@@ -178,7 +178,7 @@ class PlatformReadyCheckRouteGuardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(agenda.checks[0].tournament_id, "tournament-a")
-        self.assertEqual(user_admission.call_args.kwargs["plan"].expected_demand, 12_000)
+        self.assertEqual(user_admission.call_args.args[0].expected_demand, 12_000)
         self.assertEqual(user_admission.call_args.kwargs["sse_quota"], 5_833)
 
     async def test_ready_check_stream_uses_one_connection_per_authenticated_user(self) -> None:

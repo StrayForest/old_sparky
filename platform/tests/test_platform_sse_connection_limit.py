@@ -363,7 +363,12 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
                 await sse.current_ready_check_sse_connection_count(now_epoch=now),
                 2,
             )
-            await leases[0].renew(now_epoch=now + sse.SSE_LEASE_SECONDS + 1)
+            await asyncio.gather(
+                *(
+                    lease.renew(now_epoch=now + sse.SSE_LEASE_SECONDS + 1)
+                    for lease in leases
+                )
+            )
             self.assertEqual(
                 await sse.current_ready_check_sse_connection_count(
                     now_epoch=now + sse.SSE_LEASE_SECONDS + 1,
