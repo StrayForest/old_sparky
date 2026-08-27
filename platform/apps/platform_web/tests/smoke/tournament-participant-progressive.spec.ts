@@ -21,7 +21,7 @@ let usersMeRequests = 0;
 let csrfRequests = 0;
 let readyVoteRequests = 0;
 let bracketRequests = 0;
-let bracketEventRequests = 0;
+let bracketProbeRequests = 0;
 
 let apiServer: Server | null = null;
 
@@ -65,15 +65,9 @@ test.beforeAll(async () => {
       return;
     }
 
-    if (url.pathname.match(/^\/api\/v1\/tournaments\/[^/]+\/bracket\/events$/)) {
-      bracketEventRequests += 1;
-      response.writeHead(200, {
-        "Cache-Control": "no-store",
-        "Content-Type": "text/event-stream",
-        Connection: "keep-alive"
-      });
-      response.write(": connected\n\n");
-      request.once("close", () => response.end());
+    if (url.pathname.match(/^\/api\/v1\/tournaments\/[^/]+\/bracket\/probe$/)) {
+      bracketProbeRequests += 1;
+      respondJson(response, 200, { revision: 0, status: "pending" });
       return;
     }
 
@@ -128,7 +122,7 @@ test.beforeEach(() => {
   csrfRequests = 0;
   readyVoteRequests = 0;
   bracketRequests = 0;
-  bracketEventRequests = 0;
+  bracketProbeRequests = 0;
 });
 
 test.afterAll(async () => {
@@ -208,7 +202,7 @@ test("registered detail uses compact workspace state and ready vote avoids full 
   await expectNoHorizontalOverflow(page);
 });
 
-test("bracket shell omits the duplicate current-user workspace snapshot", async ({ page }) => {
+test("bracket shell uses the cheap revision probe without duplicate workspace state", async ({ page }) => {
   await blockNextRoutePrefetch(page);
   await page.context().addCookies([{
     name: "deadlock_platform_session",
@@ -229,7 +223,7 @@ test("bracket shell omits the duplicate current-user workspace snapshot", async 
     includeCurrentUser: false
   }]);
   await expect.poll(() => usersMeRequests).toBe(1);
-  await expect.poll(() => bracketEventRequests).toBe(1);
+  await expect.poll(() => bracketProbeRequests).toBe(1);
   expect(bracketRequests).toBe(0);
   expect(participantRequests).toEqual([]);
   await expect.poll(() => csrfRequests).toBe(0);
@@ -282,7 +276,9 @@ function workspacePayload(slug: string, authenticated: boolean, includeCurrentUs
       revision: 0,
       can_manage: false,
       teams: [],
-      matches: []
+      matches: [],
+      next_poll_after_ms: 3000,
+      bracket_probe_ticket: "lean-bracket-probe"
     },
     ready_check: isReady ? {
       active_round: readyRound(null),
