@@ -19,6 +19,7 @@ from tools.platform_sse_qa import (
     combined_profile_timeout_seconds,
     max_sse_open_timeout_seconds,
     plateau_probe_count,
+    sse_open_delay_seconds,
     summary,
 )
 
@@ -118,6 +119,26 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(max_sse_open_timeout_seconds("http://127.0.0.1:8010"), 60.0)
         self.assertEqual(max_sse_open_timeout_seconds("http://localhost:8010"), 60.0)
         self.assertEqual(max_sse_open_timeout_seconds("https://old-sparky.com"), 60.0)
+
+    def test_ready_check_open_delay_honors_signed_admission_slot(self) -> None:
+        self.assertEqual(
+            sse_open_delay_seconds(
+                index=0,
+                open_rate_per_second=25,
+                scheduled_open_at=130.0,
+                now_epoch=100.0,
+            ),
+            30.0,
+        )
+        self.assertEqual(
+            sse_open_delay_seconds(
+                index=100,
+                open_rate_per_second=25,
+                scheduled_open_at=101.0,
+                now_epoch=100.0,
+            ),
+            4.0,
+        )
 
     def test_qa_hold_can_prove_stream_lifetime_beyond_old_rotation_boundary(self) -> None:
         self.assertGreater(SSE_HOLD_MAX_SECONDS, 600.0)

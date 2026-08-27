@@ -70,6 +70,27 @@ SSE_OPEN_TIMEOUT_MAX_ORIGIN_LOCAL_SECONDS = 60.0
 SSE_RECONNECT_MAX_BACKOFF_SECONDS = 5.0
 
 
+def sse_open_delay_seconds(
+    *,
+    index: int,
+    open_rate_per_second: float,
+    scheduled_open_at: float | None = None,
+    now_epoch: float | None = None,
+) -> float:
+    """Honor a signed per-user admission slot while retaining open-rate pacing."""
+
+    rate_delay = (
+        max(0, index) / open_rate_per_second
+        if open_rate_per_second > 0
+        else 0.0
+    )
+    scheduled_delay = 0.0
+    if scheduled_open_at is not None:
+        reference_epoch = now_epoch if now_epoch is not None else time.time()
+        scheduled_delay = max(0.0, scheduled_open_at - reference_epoch)
+    return max(rate_delay, scheduled_delay)
+
+
 async def _close_sse_stream_context(stream_context: Any | None) -> None:
     """Close a timed-out httpx stream without extending the open budget."""
 
@@ -626,6 +647,7 @@ async def prepare_ready_check_fixture(
     list[list[dict[str, Any]]],
     dict[str, str],
     dict[str, str],
+    dict[str, float],
 ]:
     """Build a ticketed, eligible Ready Check cohort for the SSE staircase.
 
@@ -714,6 +736,7 @@ async def prepare_ready_check_fixture(
 
     sse_tickets: dict[str, str] = {}
     state_tickets: dict[str, str] = {}
+    sse_open_at_by_user_id: dict[str, float] = {}
 
     async def issue_user_tickets(user: dict[str, Any]) -> None:
         extra_headers = (
@@ -745,8 +768,23 @@ async def prepare_ready_check_fixture(
             raise RuntimeError(f"Ready Check stream ticket missing for {user['label']}")
         if not isinstance(state_ticket, str) or not state_ticket:
             raise RuntimeError(f"Ready Check state ticket missing for {user['label']}")
+        admission_open_at = check.get("admission_open_at") if isinstance(check, dict) else None
+        if not isinstance(admission_open_at, str) or not admission_open_at:
+            raise RuntimeError(f"Ready Check admission slot missing for {user['label']}")
+        try:
+            admission_open_time = datetime.fromisoformat(
+                admission_open_at.replace("Z", "+00:00")
+            )
+            if admission_open_time.tzinfo is None or admission_open_time.utcoffset() is None:
+                raise ValueError("Ready Check admission slot must include a timezone")
+            admission_open_epoch = admission_open_time.timestamp()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Ready Check admission slot is invalid for {user['label']}"
+            ) from exc
         sse_tickets[str(user["id"])] = stream_ticket
         state_tickets[str(user["id"])] = state_ticket
+        sse_open_at_by_user_id[str(user["id"])] = admission_open_epoch
 
     with qa.phase("ready_check_admission_tickets"):
         await qa.bounded_each(users, issue_user_tickets)
@@ -758,9 +796,19 @@ async def prepare_ready_check_fixture(
         "tournaments": 1,
         "agenda_requests": len(sse_tickets),
         "state_endpoint": "/ready-check/state",
+        "scheduled_streams": len(sse_open_at_by_user_id),
+        "admission_open_at_min": min(sse_open_at_by_user_id.values()),
+        "admission_open_at_max": max(sse_open_at_by_user_id.values()),
     }
     qa.report["planned_tournaments"] = 1
-    return users, [tournament], [users], sse_tickets, state_tickets
+    return (
+        users,
+        [tournament],
+        [users],
+        sse_tickets,
+        state_tickets,
+        sse_open_at_by_user_id,
+    )
 
 
 async def issue_public_sse_admission_ticket(
@@ -1187,6 +1235,7 @@ async def run_connections(
     http_max_connections: int,
     sse_scope: str = "bracket",
     sse_ticket_by_user_id: dict[str, str] | None = None,
+    sse_open_at_by_user_id: dict[str, float] | None = None,
     after_connection_barrier=None,
     fallback_probe=None,
 ) -> dict[str, Any]:
@@ -1282,8 +1331,14 @@ async def run_connections(
                     reconnect_cycles=reconnect_cycles,
                     open_gate=open_gate,
                     open_timeout_seconds=open_timeout_seconds,
-                    open_delay_seconds=(
-                        index / open_rate_per_second if open_rate_per_second > 0 else 0
+                    open_delay_seconds=sse_open_delay_seconds(
+                        index=index,
+                        open_rate_per_second=open_rate_per_second,
+                        scheduled_open_at=(
+                            sse_open_at_by_user_id.get(str(user["id"]))
+                            if sse_open_at_by_user_id is not None
+                            else None
+                        ),
                     ),
                     sse_capacity_token=sse_capacity_token,
                     all_attempts_done=all_attempts_done,
@@ -1642,6 +1697,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     user_chunks,
                     sse_ticket_by_user_id,
                     state_tickets_by_user_id,
+                    sse_open_at_by_user_id,
                 ) = await asyncio.wait_for(
                     prepare_ready_check_fixture(
                         qa,
@@ -1657,6 +1713,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 sse_ticket_by_user_id = None
                 state_tickets_by_user_id = None
+                sse_open_at_by_user_id = None
         except TimeoutError as exc:
             fixture_timeout = (
                 READY_CHECK_FIXTURE_TIMEOUT_SECONDS
@@ -1752,6 +1809,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     http_max_connections=max(args.http_max_connections, args.sse_connections),
                     sse_scope=args.sse_scope,
                     sse_ticket_by_user_id=sse_ticket_by_user_id,
+                    sse_open_at_by_user_id=sse_open_at_by_user_id,
                     after_connection_barrier=after_connection_barrier,
                     fallback_probe=fallback_probe,
                 )
