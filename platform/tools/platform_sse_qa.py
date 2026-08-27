@@ -110,7 +110,7 @@ def ready_check_fixture_schedule(
     )
     ready_check_starts_at = now + timedelta(seconds=ready_check_lead_seconds)
     return {
-        "registration_starts_at": now + timedelta(seconds=1),
+        "registration_starts_at": now + timedelta(minutes=1),
         "registration_closes_at": ready_check_starts_at - timedelta(minutes=1),
         "ready_check_starts_at": ready_check_starts_at,
         "ready_check_ends_at": ready_check_starts_at + timedelta(minutes=10),
@@ -777,7 +777,6 @@ async def prepare_ready_check_fixture(
         qa.tournament_slugs.append(qa.tournament_slug)
         qa.report["tournament_ids"] = list(qa.tournament_ids)
         qa.report["tournament_slugs"] = list(qa.tournament_slugs)
-        await asyncio.sleep(2.0)
         await qa.request_as(
             fixture_client,
             organizer,
