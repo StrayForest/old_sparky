@@ -89,7 +89,9 @@ if [[ -e "$run_root" || -L "$run_root" ]]; then
   echo "A retained run already exists for this run id." >&2
   exit 1
 fi
-install -d -o root -g root -m 0700 "$RUN_ROOT_BASE" "$run_root/sse"
+install -d -o root -g root "$RUN_ROOT_BASE" "$run_root" "$run_root/sse"
+chown root:root "$RUN_ROOT_BASE" "$run_root" "$run_root/sse"
+chmod 0700 "$RUN_ROOT_BASE" "$run_root" "$run_root/sse"
 rm -rf -- "$export_dir"
 install -d -o "$export_uid" -g "$export_gid" -m 0700 "$export_dir"
 
