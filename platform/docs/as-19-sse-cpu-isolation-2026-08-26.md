@@ -378,43 +378,35 @@ Exact cleanup `32986913152` deleted 10,000 users and one tournament, preserved
 the control account and verified zero remaining users, tournaments, sessions
 and audit rows.
 
-## Final unified SSE package and burst boundary — 2026-08-27
+## Final unified SSE boundary — 2026-08-27
 
-The protected package ending at `578771b3` remains deployed: signed tickets,
+The deployed package ending at `2c551c50` retains signed HMAC tickets,
 PostgreSQL-free ticketed opens, private fail-closed revalidation, shared
 worker/tournament relay, SharedWorker deduplication, polling fallback and
-global/source/user leases `3,000/32/4`. The limiter pool is `512` with a
-finite `2s` wait. The origin-only 60-second QA ceiling was added in `bed454a9`;
-its security/build, auto-deploy and production live-smoke runs were
-`33016007753`, `33016498518`, `33016504858`.
+global/source/user leases `3,000/32/4`. The relay formats each event once into
+a bounded shared sequence buffer; this reduces fan-out overhead without
+changing authorization, revocation or admission behavior.
 
-Origin-local, 3,000 ticket SSE, 60-second hold, three events:
+The origin-local ticket profile passed at 15,000, 17,000 and 20,000 concurrent
+60-second SSE streams with complete event delivery and zero errors. The
+20,000 point (`33034469879`, cleanup `33034798652`) delivered `60,000/60,000`
+events, with connect p95 `2.85s` and event p95 `6.52s`. API CPU was
+`54.0%` average / `119.5%` peak; API cgroup memory reached about `985MB`, so
+memory—not SSE admission, Redis or PostgreSQL—is the next origin boundary.
 
-| Open | Result | p95 connect/event | Resource verdict |
-| --- | --- | --- | --- |
-| 16 | 3000/3000 200; 9000/9000 events; 0 errors | 37.22s / 1.03s | API 18.0/72.7%; no DB waits/locks |
-| 32 | 3000/3000 200; 9000/9000; 0 errors | 31.61s / 1.37s | API 16.1/91.5%; no DB waits/locks |
-| 64 | 3000/3000 200; 9000/9000; 0 errors | 32.31s / 1.27s | API 14.3/71.4%; no DB waits/locks |
-| 128 | 3000/3000 200; 9000/9000; 0 errors | 31.63s / 1.13s | API 12.5/76.5%; no DB waits/locks |
-| 256 | 2943 200; 57 global 429; 8829/8829 events | 32.58s / 1.27s | Intentional global cap; no 503/outage |
+The public application cap remains deliberately `3,000`. With ticket opens,
+the same target passed at 50/s, 75/s and 100/s with zero errors; connect p95
+was `4.94s`, `15.83s` and `24.14s` respectively, while event p95 remained
+about `1.42–1.66s`. A 5,000-attempt overflow respected the cap: 3,000
+connected, 193 received expected 429 responses and the rest timed out in the
+edge queue; no 503 or application error occurred.
 
-Runs `33016818414`, `33017119366`, `33017386258`, `33017697095`,
-`33017935368` and exact cleanups all left zero synthetic rows. `open=128`
-is the best balanced burst. At `256`, server logs classify all 57 responses as
-`scope=global`; source/user caps, Redis outage and database saturation were not
-involved.
-
-Public/Cloudflare repeats at the same 3,000 target and 30-second UX timeout:
-`open=128` reached `1917/3000` with `1083` timeouts, `open=64` reached
-`1886/3000` with `1114`, and `open=32` reached `1825/3000` with `1175`.
-Every accepted stream delivered all events; there were no 429/503/application
-errors, and origin CPU, Redis, PostgreSQL connections and locks stayed below
-saturation. Cleanups `33018457197`, `33018811387`, `33019085692` verified zero
-fixture rows.
-
-The customer-facing bottleneck is therefore Cloudflare/transport handshake
-queueing at roughly 1.8–1.9k persistent opens, not SSE origin admission.
-Raising application caps would weaken deliberate backpressure without a safe
-capacity gain. Ten-thousand public persistent SSE and the full 180% two-core
-target remain unclaimed; further progress requires an operator-owned
-edge/transport capacity change and a new protected measurement.
+The mixed production point (`33036740237`, cleanup `33037055264`) passed with
+3,000 SSE and 10,000 polling users: 3,000 streams, 9,000 events and 10,000
+polling requests completed with zero errors. API CPU averaged `80.9%` and
+peaked at `140.3%`, with about `919MB` RSS; PostgreSQL and Redis showed no
+lock/backend-wait or admission saturation. The remaining bottlenecks are
+Cloudflare/transport opening queueing on the public path and API CPU/memory
+on the origin path. Ten-thousand public persistent SSE and exact 180% CPU are
+not claimed without operator-owned edge/VPS capacity changes and a new
+protected measurement.

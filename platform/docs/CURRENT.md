@@ -413,46 +413,57 @@ database guards and applies migration `20260822_0040`. Exact commit
 
 ### AS-19 SSE capacity and burst boundary — 2026-08-27
 
-The protected package ending at `578771b3` remains deployed: signed HMAC
-tickets, PostgreSQL-free ticketed opens, private-stream revalidation, shared
+The protected package ending at `2c551c50` is deployed: signed HMAC tickets,
+PostgreSQL-free ticketed opens, private-stream revalidation, shared
 worker/tournament relay, SharedWorker deduplication, polling fallback and
-fail-closed Redis global/source/user leases (`3,000/32/4`). The origin-only
-60-second QA ceiling was safely added in `bed454a9`; its exact security/build,
-auto-deploy and production live-smoke chain was `33016007753`,
-`33016498518`, `33016504858`.
+fail-closed Redis global/source/user leases (`3,000/32/4`). The relay now
+formats each event once into a bounded shared sequence buffer, avoiding a
+synchronous queue fan-out loop for every subscriber. Application caps and
+authorization semantics were not weakened.
 
-Origin-local burst matrix at `3,000` ticket SSE, `60s` hold, three events:
+Origin-local ticket capacity exceeded the 10,000-user target:
 
-| Open concurrency | Result | Connect p95 / event p95 | Resource result |
+| SSE target | Result | Connect p95 / event p95 | Resource result |
 | --- | --- | --- | --- |
-| 16 | 3000/3000 HTTP 200; 9000/9000 events; 0 errors | 37.22s / 1.03s | API avg/max 18.0/72.7%; no DB waits/locks |
-| 32 | 3000/3000 HTTP 200; 9000/9000 events; 0 errors | 31.61s / 1.37s | API 16.1/91.5%; no DB waits/locks |
-| 64 | 3000/3000 HTTP 200; 9000/9000 events; 0 errors | 32.31s / 1.27s | API 14.3/71.4%; no DB waits/locks |
-| 128 | 3000/3000 HTTP 200; 9000/9000 events; 0 errors | 31.63s / 1.13s | API 12.5/76.5%; no DB waits/locks |
-| 256 | 2943 HTTP 200; 57 controlled global 429; 8829/8829 events | 32.58s / 1.27s | No 503/outage; hard cap worked as designed |
+| 15,000 | 15,000/15,000; 45,000/45,000 events; 0 errors | 1.46s / 7.71s | API avg/max 52.8/121.0%; cgroup peak 830MB |
+| 17,000 | 17,000/17,000; 51,000/51,000 events; 0 errors | 2.18s / 5.55s | API 52.7/131.2%; cgroup peak 866MB |
+| 20,000 | 20,000/20,000; 60,000/60,000 events; 0 errors | 2.85s / 6.52s | API 54.0/119.5%; cgroup peak 985MB |
 
-Runs were `33016818414`, `33017119366`, `33017386258`, `33017697095`,
-`33017935368`; each exact cleanup succeeded with zero synthetic users,
-tournaments, sessions and audit rows. `open=128` is the best balanced origin
-burst: zero rejection through the 3,000-stream ceiling and the lowest event
-tail among the full-pass profiles. `open=256` hit the intentional global cap,
-not CPU, Redis or PostgreSQL saturation.
+The 20,000 run (`33034469879`, exact cleanup `33034798652`) is the highest
+verified origin point and is near the current roughly 1GB API memory boundary;
+no higher origin cap is claimed without a memory plan. Earlier 15,000 and
+17,000 runs were `33032746181` / `33033042381` and `33034096316` /
+`33034425381`. All exact cleanups verified zero fixture users, tournaments,
+sessions and audit rows.
 
-Public/Cloudflare repeat at `3,000`, `60s`, ticket mode and 30-second UX
-timeout: `open=128` connected `1917/3000` and timed out `1083`; `open=64`
-connected `1886/3000` and timed out `1114`; `open=32` connected `1825/3000`
-and timed out `1175`. All accepted streams delivered every event, with zero
-429/503/application errors; origin CPU, Redis, PostgreSQL connections and
-locks remained below saturation. The three runs were `33018208319`,
-`33018533513`, `33018860593`, and their cleanups verified zero fixture rows.
+Public/Cloudflare ticket opening at the protected application cap of 3,000
+passed without application errors at paced rates, but the handshake tail is
+edge/transport-bound: rate 50/s reached 3,000/3,000 with connect p95 4.94s;
+rate 75/s reached all 3,000 with p95 15.83s; rate 100/s reached all 3,000
+with p95 24.14s. Event p95 stayed 1.42–1.66s and origin CPU/Redis/PostgreSQL
+remained below saturation. The runs were `33035099910`, `33035798822` and
+`33035593586`; exact cleanups were `33035266312`, `33036000968` and
+`33035761732`. A 5,000-attempt overflow test (`33035307148`, cleanup
+`33035561336`) respected the 3,000 cap: 3,000 connected, 193 received the
+expected 429, and the rest timed out in the edge queue, with no 503 or
+application error.
 
-The customer-facing boundary is therefore Cloudflare/transport handshake
-queueing at roughly 1.8–1.9k persistent opens in this contour, not the
-ticketed origin path. No repository-side change can safely remove that edge
-queue; raising the application cap would weaken deliberate backpressure.
-The result does not claim 10,000 public persistent SSE or the full 180%
-two-core target. Further capacity requires an operator-owned edge/transport
-architecture or capacity change, followed by the same protected tests.
+The mixed production contour also passed at 3,000 SSE plus 10,000 polling
+users: run `33036740237`, cleanup `33037055264`, 3,000/3,000 HTTP 200,
+9,000/9,000 events, 10,000/10,000 polling requests and zero errors. Connect
+p95 was 12.33s and event p95 1.68s. The dominant measured resource was the
+API at 80.9% average and 140.3% peak CPU with about 919MB peak RSS; PostgreSQL
+and Redis had no lock/backend-wait or admission saturation. A 1,000-SSE
+mixed control also passed (`33036365159`, cleanup `33036695877`).
+
+The current safe boundary is therefore: origin-local 20,000 verified, public
+3,000 protected and paced, and mixed 3,000 SSE plus 10,000 polling verified.
+The remaining customer-facing bottleneck is Cloudflare/transport opening
+queueing, while the next origin boundary is API memory/CPU. Raising the
+application cap would remove deliberate backpressure without fixing either
+boundary. Ten-thousand public persistent SSE and the exact 180% two-core
+target remain unclaimed; further progress requires an operator-owned
+edge/transport or VPS resource change followed by the same protected tests.
 
 AS-17 — End-to-end release transaction and recovery is resolved and deployed.
 The release receipt now has an explicit Nginx uncertainty boundary, idempotent
@@ -511,13 +522,13 @@ against the current web/api/worker identities and units.
   authorization pool was removed. Redis admission uses the bounded `512`
   connection pool with a `2s` wait and remains fail-closed.
   Celery uses high/default/low queues, prefetch one and late acks;
-  backlog/retry pressure is part of the load evidence. This is the next
-  retained-load candidate after release `2ca7a8df` still exhausted the
-  16-slot API pool during the live 10k mixed run with five-second checkout
-  timeouts. VPS logs show optional read authentication opening a second
-  `last_seen_at` transaction while the primary read session is checked out;
-  the next public A/B removes that non-authoritative write from optional read
-  auth while retaining mutation touches and SSE revalidation.
+  backlog/retry pressure is part of the load evidence. The current mixed
+  3,000-SSE plus 10,000-polling contour completed without pool checkout,
+  lock or backend-wait errors; its remaining origin pressure was API CPU and
+  memory, not SSE admission or Redis/PostgreSQL saturation. Any future
+  increase must remeasure the ordinary workspace workload and the roughly
+  1GB API memory boundary without weakening the bounded pools or fail-closed
+  admission.
 - The final 20×500 browser-polling gate keeps fixture state bounded to at most
   32 participants per tournament and uses four setup lanes plus one shared
   request semaphore. Its production runner retains 10,000 virtual tabs but
