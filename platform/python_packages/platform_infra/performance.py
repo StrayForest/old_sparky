@@ -15,6 +15,7 @@ from python_packages.platform_infra.config import get_settings
 
 logger = logging.getLogger("platform.performance")
 QA_PHASE_RE = re.compile(r"^(?:write|browser|scale|qa)_[a-z0-9_]{1,63}$")
+READY_CHECK_AGENDA_PATH = "/api/v1/ready-check/agenda"
 
 
 @dataclass(slots=True)
@@ -210,22 +211,29 @@ class RequestPerformanceMiddleware:
         total_seconds = perf_counter() - metrics.started_at
         total_ms = total_seconds * 1000
         sql_ms = metrics.sql_time_seconds * 1000
+        route = scope.get("route")
+        route_path = getattr(route, "path", None) or metrics.path
+        is_ready_check_agenda = (
+            metrics.path == READY_CHECK_AGENDA_PATH
+            or route_path == READY_CHECK_AGENDA_PATH
+            or str(route_path).endswith("/ready-check/agenda")
+        )
         should_log = (
-            (
-                settings.platform_perf_log_mutations
-                and metrics.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+            is_ready_check_agenda
+            or (
+                (
+                    settings.platform_perf_log_mutations
+                    and metrics.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+                )
+                or total_ms >= settings.platform_perf_slow_request_ms
+                or sql_ms >= settings.platform_perf_slow_db_ms
+                or metrics.sql_query_count >= settings.platform_perf_sql_count_threshold
+                or metrics.pool_checkout_wait_seconds >= 0.1
             )
-            or
-            total_ms >= settings.platform_perf_slow_request_ms
-            or sql_ms >= settings.platform_perf_slow_db_ms
-            or metrics.sql_query_count >= settings.platform_perf_sql_count_threshold
-            or metrics.pool_checkout_wait_seconds >= 0.1
         )
         if not should_log:
             return
 
-        route = scope.get("route")
-        route_path = getattr(route, "path", None) or metrics.path
         logger.info(
             "request_perf request_id=%s method=%s path=%s route=%s status=%s "
             "total_ms=%.2f sql_ms=%.2f sql_count=%s max_sql_ms=%.2f "

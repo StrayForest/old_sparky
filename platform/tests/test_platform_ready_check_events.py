@@ -208,6 +208,7 @@ class PlatformReadyCheckRouteGuardTests(unittest.IsolatedAsyncioTestCase):
             request,
             "user-1",
             user_limit=READY_CHECK_SSE_USER_LIMIT,
+            user_scope="ready_check",
         )
         stream_events.assert_called_once_with(
             ("tournament-1",),

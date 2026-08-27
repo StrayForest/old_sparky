@@ -173,6 +173,27 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             1,
         )
 
+    def test_request_perf_summary_exposes_ready_check_agenda_pressure(self) -> None:
+        summary = summarize_request_perf_logs(
+            [
+                "request_perf request_id=one method=GET path=/api/v1/ready-check/agenda "
+                "route=/ready-check/agenda status=200 total_ms=125.00 sql_ms=80.00 "
+                "sql_count=6 max_sql_ms=30.00 compute_ms=5.00 compute_blocks=1 "
+                "response_bytes=640 qa_phase=- pool_wait_ms=12.00",
+                "request_perf request_id=two method=GET path=/api/v1/ready-check/agenda "
+                "route=/ready-check/agenda status=200 total_ms=250.00 sql_ms=160.00 "
+                "sql_count=6 max_sql_ms=40.00 compute_ms=8.00 compute_blocks=1 "
+                "response_bytes=640 qa_phase=- pool_wait_ms=20.00",
+            ],
+            tournament_slug=None,
+        )
+
+        agenda = summary["ready_check_agenda"]
+        self.assertEqual(agenda["requests"], 2)
+        self.assertEqual(agenda["setup_duration_ms"]["p95_ms"], 243.75)
+        self.assertEqual(agenda["sql_query_count"]["avg_ms"], 6.0)
+        self.assertEqual(agenda["pool_wait_ms"]["p99_ms"], 19.92)
+
     def test_write_burst_acceptance_separates_target_budget(self) -> None:
         acceptance = evaluate_write_burst_profiles(
             [

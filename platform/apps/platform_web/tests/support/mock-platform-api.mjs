@@ -6,6 +6,7 @@ const now = "2026-06-07T12:00:00Z";
 const mockCsrfToken = `mock.${"c".repeat(64)}`;
 let mockMediaSequence = 0;
 const mockMediaAssets = new Map();
+let proofRefreshAgendaCalls = 0;
 const deadlockHeroNames = [
   "Abrams", "Apollo", "Bebop", "Billy", "Calico", "Celeste", "The Doorman", "Drifter",
   "Dynamo", "Graves", "Grey Talon", "Haze", "Holliday", "Infernus", "Ivy", "Kelvin",
@@ -361,26 +362,68 @@ const server = createServer((request, response) => {
     const cookie = request.headers.cookie ?? "";
     const mode = cookie.includes("ready-check-provider-sse-smoke=1")
       || cookie.includes("ready-check-provider-stalled-smoke=1")
+      || cookie.includes("ready-check-provider-future-gap-smoke=1")
+      || cookie.includes("ready-check-provider-proof-refresh-smoke=1")
       ? "scheduled_sse"
       : cookie.includes("ready-check-provider-polling-smoke=1")
         ? "polling"
         : null;
-    json(response, 200, mode ? {
-      checks: [{
+    const futureGap = cookie.includes("ready-check-provider-future-gap-smoke=1");
+    const proofRefresh = cookie.includes("ready-check-provider-proof-refresh-smoke=1");
+    if (proofRefresh) {
+      proofRefreshAgendaCalls += 1;
+    }
+    const checks = futureGap ? [
+      {
         tournament_id: "t_night_veil_5",
         slug: "night-veil-open-5",
         ready_check_starts_at: "2026-06-07T15:30:00Z",
-        ready_check_ends_at: "2026-06-07T16:00:00Z",
+        ready_check_ends_at: "2026-06-07T15:36:00Z",
         admission_open_at: "2026-06-07T15:29:00Z",
         admission_priority: "scheduled",
         admission_mode: mode,
-        state_ticket: "mock-ready-check-state"
-      }],
-      sse_ticket: mode === "scheduled_sse" ? "mock-ready-check-stream" : null
-    } : { checks: [], sse_ticket: null }, { "cache-control": "no-store" });
+        state_ticket: "mock-ready-check-state-a"
+      },
+      {
+        tournament_id: "t_ready_check_future",
+        slug: "future-ready-check",
+        ready_check_starts_at: "2026-06-07T15:40:00Z",
+        ready_check_ends_at: "2026-06-07T16:00:00Z",
+        admission_open_at: "2026-06-07T15:40:00Z",
+        admission_priority: "scheduled",
+        admission_mode: mode,
+        state_ticket: "mock-ready-check-state-b"
+      }
+    ] : mode ? [{
+      tournament_id: "t_night_veil_5",
+      slug: "night-veil-open-5",
+      ready_check_starts_at: "2026-06-07T15:30:00Z",
+      ready_check_ends_at: "2026-06-07T16:00:00Z",
+      admission_open_at: "2026-06-07T15:29:00Z",
+      admission_priority: "scheduled",
+      admission_mode: mode,
+      state_ticket: "mock-ready-check-state"
+    }] : [];
+    json(response, 200, {
+      checks,
+      sse_ticket: mode === "scheduled_sse" ? "mock-ready-check-stream" : null,
+      sse_ticket_expires_at: proofRefresh
+        ? proofRefreshAgendaCalls > 1
+          ? "2026-06-07T16:45:00Z"
+          : "2026-06-07T15:45:00Z"
+        : null
+    }, { "cache-control": "no-store" });
     return;
   }
   if (path === "/api/v1/ready-check/state" && request.method === "GET") {
+    if ((request.headers.cookie ?? "").includes("ready-check-provider-future-gap-smoke=1")) {
+      const slug = url.searchParams.get("slug");
+      json(response, 200, {
+        revision: 1,
+        status: slug === "night-veil-open-5" ? "active" : "waiting"
+      });
+      return;
+    }
     if ((request.headers.cookie ?? "").includes("ready-check-provider-")) {
       json(response, 503, { detail: "Mock Ready Check state unavailable." });
       return;
@@ -392,13 +435,27 @@ const server = createServer((request, response) => {
       request.on("close", () => response.end());
       return;
     }
-    if (cookie.includes("ready-check-provider-sse-smoke=1")) {
+    if (
+      cookie.includes("ready-check-provider-sse-smoke=1")
+      || cookie.includes("ready-check-provider-proof-refresh-smoke=1")
+    ) {
       response.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         connection: "keep-alive"
       });
       response.write("retry: 5000\nevent: connected\ndata: {}\n\n");
+      request.on("close", () => response.end());
+      return;
+    }
+    if (cookie.includes("ready-check-provider-future-gap-smoke=1")) {
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive"
+      });
+      response.write("retry: 5000\nevent: connected\ndata: {}\n\n");
+      response.write("event: ready_check\ndata: {\"tournament_id\":\"t_night_veil_5\",\"revision\":1,\"status\":\"active\"}\n\n");
       request.on("close", () => response.end());
       return;
     }

@@ -290,6 +290,7 @@ export type ReadyCheckAgendaItem = {
 export type ReadyCheckAgenda = {
   checks: ReadyCheckAgendaItem[];
   sseTicket: string | null;
+  sseTicketExpiresAt: string | null;
 };
 
 export type ReadyCheckStateProbe = {
@@ -1129,6 +1130,7 @@ export async function getReadyCheckAgenda(
         state_ticket?: string;
       }>;
       sse_ticket?: string | null;
+      sse_ticket_expires_at?: string | null;
     };
     const checks = (payload.checks ?? []).flatMap((item) => {
       const admissionMode = item.admission_mode;
@@ -1157,6 +1159,9 @@ export async function getReadyCheckAgenda(
     return {
       checks,
       sseTicket: typeof payload.sse_ticket === "string" ? payload.sse_ticket : null,
+      sseTicketExpiresAt: typeof payload.sse_ticket_expires_at === "string"
+        ? payload.sse_ticket_expires_at
+        : null,
     };
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {

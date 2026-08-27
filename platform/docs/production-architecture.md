@@ -93,8 +93,12 @@ FastAPI exposes no `/api/v1/uploads/*` media-serving route and has no uploads `S
 - Ready Check SSE admission state is ephemeral Redis state. Admission fails
   closed when that state cannot be consulted; normal termination releases the
   lease immediately, and bounded lease expiry recovers capacity after abnormal
-  process/client termination. The signed Ready Check state probe performs one
-  Redis lookup and returns only revision/status.
+  process/client termination. Ready Check and compatibility bracket user
+  leases use separate Redis namespaces. The signed Ready Check state probe
+  performs one Redis lookup and returns only revision/status. Ready Check
+  proofs end at the workflow boundary with a bounded maximum, and the agenda
+  exposes request-performance telemetry for duration, SQL/query pressure and
+  PostgreSQL pool wait.
 - R2, DB, mail, session and Turnstile secrets are backend-only and are not present in the web runtime environment.
 - The public media bucket and private backup bucket/tokens are separate.
 
@@ -122,13 +126,14 @@ physical 10,240 source/global ceilings. The 10,000 value is a hard staged-load
 target only, not a production cap. Ready Check opens are dynamically spread
 using the measured safe 25 opens/sec rate, simultaneous demand and a bounded
 preparation window; late arrivals are admitted immediately when Redis capacity
-exists. After a Ready Check event the browser closes the critical stream, and
-overflow users use the tiny revision/status probe only from `T` onward. A
-healthy Ready Check stream suppresses that fallback probe; opening has a
-bounded handshake timeout and full-jitter recovery. Bracket pages use the same
-style of one-Redis-key revision probe, then fetch the full bracket only after a
-higher revision. These values are capacity safeguards, not product
-entitlements; change them only from retained public-path load/resource
-evidence.
+exists. Streams remain open only for checks inside their current admission
+windows, so a distant future check does not hold a global slot. After a Ready
+Check event the browser closes the critical stream, and overflow users use the
+tiny revision/status probe only from `T` onward. A healthy Ready Check stream
+suppresses that fallback probe; opening has a bounded handshake timeout and
+full-jitter recovery. Bracket pages use the same style of one-Redis-key
+revision probe, then fetch the full bracket only after a higher revision.
+These values are capacity safeguards, not product entitlements; change them
+only from retained public-path load/resource evidence.
 
 Additional workers, exporters, transforms, poolers or nodes require retained CPU/RSS/queue/DB evidence against the operations targets.

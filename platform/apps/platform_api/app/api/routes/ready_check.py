@@ -27,6 +27,7 @@ from python_packages.platform_infra.ready_check_admission import (
     ReadyCheckAdmissionInvalid,
     issue_ready_check_state_proof,
     issue_ready_check_stream_proof,
+    ready_check_proof_expiration,
     verify_ready_check_state_proof,
     verify_ready_check_stream_proof,
 )
@@ -209,6 +210,21 @@ async def get_ready_check_agenda(
     if not checks:
         return ReadyCheckAgendaResponse()
     stream_checks = [item for item in checks if item.admission_mode != "polling"]
+    stream_open_at = min(item.admission_open_at for item in stream_checks) if stream_checks else None
+    stream_ends_at = max(item.ready_check_ends_at for item in stream_checks) if stream_checks else None
+    stream_ticket_expires_at = None
+    if stream_open_at is not None and stream_ends_at is not None:
+        stream_issued_at = max(
+            int(now.timestamp()),
+            int(stream_open_at.timestamp()),
+        )
+        stream_ticket_expires_at = datetime.fromtimestamp(
+            ready_check_proof_expiration(
+                issued_at=stream_issued_at,
+                ready_check_ends_at=int(stream_ends_at.timestamp()),
+            ),
+            UTC,
+        )
     return ReadyCheckAgendaResponse(
         checks=checks,
         sse_ticket=(
@@ -217,12 +233,14 @@ async def get_ready_check_agenda(
                 session_id=str(auth_session.session.id),
                 session_token=session_token,
                 tournament_ids=[item.tournament_id for item in stream_checks],
-                admission_open_at=min(item.admission_open_at for item in stream_checks),
+                admission_open_at=stream_open_at,
+                ready_check_ends_at=stream_ends_at,
                 now=now,
             )
             if stream_checks
             else None
         ),
+        sse_ticket_expires_at=stream_ticket_expires_at,
     )
 
 @router.get("/state", response_model=ReadyCheckStateProbeResponse)
@@ -300,6 +318,7 @@ async def get_ready_check_events(
         request,
         proof.user_id,
         user_limit=READY_CHECK_SSE_USER_LIMIT,
+        user_scope="ready_check",
     )
     return StreamingResponse(
         stream_ready_check_events(

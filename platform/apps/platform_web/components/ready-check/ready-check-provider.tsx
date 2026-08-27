@@ -23,6 +23,7 @@ import { sseRetryDelayMs } from "@/lib/sse-reconnect-policy";
 
 const READY_CHECK_POLL_VISIBLE_MS = 1_500;
 const READY_CHECK_HARD_TIMEOUT_MS = 5_000;
+const READY_CHECK_SSE_PROOF_REFRESH_SKEW_MS = 60_000;
 const configuredSseOpenTimeoutMs = Number(
   process.env.NEXT_PUBLIC_PLATFORM_SSE_OPEN_TIMEOUT_MS ?? "",
 );
@@ -43,6 +44,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
   const { status: authStatus, user } = useAuth();
   const [agenda, setAgenda] = useState<ReadyCheckAgendaItem[]>([]);
   const [sseTicket, setSseTicket] = useState<string | null>(null);
+  const [sseTicketExpiresAt, setSseTicketExpiresAt] = useState<string | null>(null);
   const [liveStates, setLiveStates] = useState<Record<string, ReadyCheckLiveState>>({});
   const [agendaRefreshVersion, setAgendaRefreshVersion] = useState(0);
   const [visibilityVersion, setVisibilityVersion] = useState(0);
@@ -85,6 +87,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
     if (authStatus !== "authenticated" || !user) {
       setAgenda([]);
       setSseTicket(null);
+      setSseTicketExpiresAt(null);
       liveStatesRef.current = {};
       setLiveStates({});
       return;
@@ -104,6 +107,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       setLiveStates(retainedStates);
       setAgenda(nextAgenda.checks);
       setSseTicket(nextAgenda.sseTicket);
+      setSseTicketExpiresAt(nextAgenda.sseTicketExpiresAt);
     }).catch(() => {
       // A transient agenda failure must not tear down an already admitted
       // stream. The next navigation, visibility change, or explicit refresh
@@ -115,7 +119,9 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const checks = agendaRef.current;
     const streamTicket = sseTicket;
+    const streamTicketExpiry = sseTicketExpiresAt;
     let pollingTimer: ReturnType<typeof setTimeout> | null = null;
+    let agendaRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     let active = true;
     let stream: EventSource | null = null;
     let pollController: AbortController | null = null;
@@ -134,6 +140,13 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       if (sseOpenTimer !== null) {
         clearTimeout(sseOpenTimer);
         sseOpenTimer = null;
+      }
+    };
+
+    const clearAgendaRefreshTimer = () => {
+      if (agendaRefreshTimer !== null) {
+        clearTimeout(agendaRefreshTimer);
+        agendaRefreshTimer = null;
       }
     };
 
@@ -174,7 +187,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       return Number.isFinite(startsAt)
         && Number.isFinite(endsAt)
         && now >= startsAt
-        && now <= endsAt + READY_CHECK_HARD_TIMEOUT_MS
+        && now < endsAt + READY_CHECK_HARD_TIMEOUT_MS
         && (liveStateFor(item)?.status ?? "waiting") === "waiting"
         && (item.admissionMode === "polling" || !streamConnected);
     });
@@ -187,7 +200,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         !Number.isFinite(startsAt)
         || !Number.isFinite(openAt)
         || !Number.isFinite(endsAt)
-        || now > endsAt + READY_CHECK_HARD_TIMEOUT_MS
+        || now >= endsAt + READY_CHECK_HARD_TIMEOUT_MS
         || liveStateFor(item)?.status === "active"
         || liveStateFor(item)?.status === "closed"
         || item.admissionMode === "polling"
@@ -212,12 +225,42 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         !Number.isFinite(startsAt)
         || !Number.isFinite(openAt)
         || !Number.isFinite(endsAt)
-        || now > endsAt + READY_CHECK_HARD_TIMEOUT_MS
+        || now < openAt
+        || now >= endsAt + READY_CHECK_HARD_TIMEOUT_MS
       ) {
         return false;
       }
       return true;
     });
+
+    const scheduleAgendaRefreshBeforeStreamProofExpiry = () => {
+      clearAgendaRefreshTimer();
+      if (!streamTicket || !streamTicketExpiry) {
+        return;
+      }
+      const expiresAt = Date.parse(streamTicketExpiry);
+      if (!Number.isFinite(expiresAt)) {
+        return;
+      }
+      const latestCheckEnd = Math.max(
+        ...checks
+          .filter((item) => item.admissionMode !== "polling")
+          .map((item) => Date.parse(item.readyCheckEndsAt))
+          .filter(Number.isFinite),
+      );
+      // A proof that naturally ends with its last Ready Check needs no
+      // refresh. Refresh only when the bounded proof horizon ends before a
+      // check still represented by the agenda.
+      if (!Number.isFinite(latestCheckEnd) || latestCheckEnd <= expiresAt) {
+        return;
+      }
+      const refreshAt = expiresAt - READY_CHECK_SSE_PROOF_REFRESH_SKEW_MS;
+      const delay = Math.max(0, refreshAt - Date.now());
+      agendaRefreshTimer = setTimeout(() => {
+        agendaRefreshTimer = null;
+        refreshAgenda();
+      }, delay);
+    };
 
     function scheduleNext() {
       clearPollingTimer();
@@ -225,6 +268,9 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         return;
       }
       const now = Date.now();
+      if (stream && !hasPendingStreamDemand(now)) {
+        closeStream();
+      }
       let nextAt = Number.POSITIVE_INFINITY;
       if (dueForPolling(now).length > 0) {
         nextAt = now + READY_CHECK_POLL_VISIBLE_MS;
@@ -245,6 +291,9 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         if (item.admissionMode !== "polling" && now < openAt) {
           nextAt = Math.min(nextAt, openAt);
         }
+        if (now < endsAt + READY_CHECK_HARD_TIMEOUT_MS) {
+          nextAt = Math.min(nextAt, endsAt + READY_CHECK_HARD_TIMEOUT_MS);
+        }
       }
       if (shouldOpenStream(now) && now < streamRetryAt) {
         nextAt = Math.min(nextAt, streamRetryAt);
@@ -263,10 +312,20 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         return;
       }
       closeStream();
+      const streamTicketExpired = Boolean(
+        streamTicketExpiry
+        && Number.isFinite(Date.parse(streamTicketExpiry))
+        && Date.parse(streamTicketExpiry) <= Date.now()
+      );
       // Keep fallback probes available immediately, but spread the next SSE
       // admission over the measured recovery window so mass disconnects do
       // not create a synchronized reconnect herd.
-      streamRetryAt = Date.now() + sseRetryDelayMs();
+      streamRetryAt = streamTicketExpired
+        ? Number.POSITIVE_INFINITY
+        : Date.now() + sseRetryDelayMs();
+      if (streamTicketExpired) {
+        refreshAgenda();
+      }
       scheduleNext();
     };
 
@@ -326,6 +385,9 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         return;
       }
       const now = Date.now();
+      if (stream && !hasPendingStreamDemand(now)) {
+        closeStream();
+      }
       const due = dueForPolling(now).filter((item, index, items) => (
         items.findIndex((candidate) => candidate.tournamentId === item.tournamentId) === index
       ));
@@ -342,14 +404,17 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
     const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
         clearPollingTimer();
+        clearAgendaRefreshTimer();
         pollController?.abort();
         closeStream();
         return;
       }
+      scheduleAgendaRefreshBeforeStreamProofExpiry();
       void runCycle().finally(scheduleNext);
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    scheduleAgendaRefreshBeforeStreamProofExpiry();
     if (document.visibilityState === "visible") {
       void runCycle().finally(scheduleNext);
     }
@@ -358,10 +423,11 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       active = false;
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       clearPollingTimer();
+      clearAgendaRefreshTimer();
       pollController?.abort();
       closeStream();
     };
-  }, [agenda, sseTicket, updateLiveState, visibilityVersion]);
+  }, [agenda, refreshAgenda, sseTicket, sseTicketExpiresAt, updateLiveState, visibilityVersion]);
 
   const stateForTournament = useCallback((slug: string) => {
     const item = agendaRef.current.find((candidate) => candidate.slug === slug);

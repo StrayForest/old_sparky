@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from python_packages.platform_domain.deadlock.constants import RANKS
+from python_packages.platform_domain.tournaments import READY_CHECK_MAX_DURATION_SECONDS
 
 
 class HealthResponse(BaseModel):
@@ -503,6 +504,10 @@ class TournamentCreateRequest(BaseModel):
                 raise ValueError("Team formation start must be later than ready-check start.")
             if effective_ready_check_ends_at - self.ready_check_starts_at < timedelta(minutes=10):
                 raise ValueError("Ready-check duration must be at least 10 minutes.")
+            if effective_ready_check_ends_at - self.ready_check_starts_at > timedelta(
+                seconds=READY_CHECK_MAX_DURATION_SECONDS
+            ):
+                raise ValueError("Ready-check duration cannot exceed 24 hours.")
             if self.captain_selection_starts_at < effective_ready_check_ends_at:
                 raise ValueError("Captain selection cannot start before ready-check ends.")
             self.ready_check_ends_at = effective_ready_check_ends_at
@@ -660,6 +665,7 @@ class ReadyCheckAgendaItemResponse(BaseModel):
 class ReadyCheckAgendaResponse(BaseModel):
     checks: list[ReadyCheckAgendaItemResponse] = Field(default_factory=list)
     sse_ticket: str | None = None
+    sse_ticket_expires_at: datetime | None = None
 
 
 class ReadyCheckStateProbeResponse(BaseModel):
@@ -1201,6 +1207,10 @@ class AdminTournamentOverrideRequest(BaseModel):
             assert self.ready_check_ends_at is not None
             if self.ready_check_ends_at - self.ready_check_starts_at < timedelta(minutes=10):
                 raise ValueError("Ready-check duration must be at least 10 minutes.")
+            if self.ready_check_ends_at - self.ready_check_starts_at > timedelta(
+                seconds=READY_CHECK_MAX_DURATION_SECONDS
+            ):
+                raise ValueError("Ready-check duration cannot exceed 24 hours.")
         elif any(value is not None for value in schedule):
             raise ValueError("Workflow dates can be changed only while opening registration.")
         return self

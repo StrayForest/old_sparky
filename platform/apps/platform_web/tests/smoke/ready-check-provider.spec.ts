@@ -62,6 +62,56 @@ test("does not poll at T while the Ready Check SSE is established", async ({ pag
   expect(stateRequests).toHaveLength(0);
 });
 
+test("refreshes the stream proof before a bounded multi-check horizon expires", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-06-07T15:35:00Z") });
+  await page.context().addCookies([
+    sessionCookie,
+    {
+      name: "ready-check-provider-proof-refresh-smoke",
+      value: "1",
+      url: "http://127.0.0.1:3100",
+    },
+  ]);
+
+  let agendaRequests = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/v1/ready-check/agenda") {
+      agendaRequests += 1;
+    }
+  });
+
+  await page.goto("/tournaments/night-veil-open-5");
+  await expect.poll(() => agendaRequests).toBe(1);
+  await page.clock.fastForward(9 * 60_000 + 1);
+  await expect.poll(() => agendaRequests, { timeout: 5_000 }).toBe(2);
+});
+
+test("closes the stream between Ready Checks and reopens at the next admission window", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-06-07T15:35:00Z") });
+  await page.context().addCookies([
+    sessionCookie,
+    {
+      name: "ready-check-provider-future-gap-smoke",
+      value: "1",
+      url: "http://127.0.0.1:3100",
+    },
+  ]);
+
+  const streamRequests: string[] = [];
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/v1/ready-check/events") {
+      streamRequests.push(request.url());
+    }
+  });
+
+  await page.goto("/tournaments/night-veil-open-5");
+  await expect.poll(() => streamRequests.length, { timeout: 5_000 }).toBe(1);
+  await page.clock.fastForward(4 * 60_000);
+  expect(streamRequests).toHaveLength(1);
+  await page.clock.fastForward(60_001);
+  await expect.poll(() => streamRequests.length, { timeout: 5_000 }).toBe(2);
+});
+
 test("falls back after a bounded SSE handshake timeout and jitters recovery", async ({ page }) => {
   await page.addInitScript(() => {
     Math.random = () => 0;

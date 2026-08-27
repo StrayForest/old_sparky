@@ -1546,8 +1546,22 @@ def summarize_request_perf_logs(
             "pool_checkout_wait_ms": row_metric_stats("pool_wait_ms", row_values),
         }
 
+    agenda_rows = [
+        row
+        for row in rows
+        if str(row.get("path") or "") == "/api/v1/ready-check/agenda"
+        or str(row.get("route") or "").endswith("/ready-check/agenda")
+    ]
+
     return {
         "logged_requests": len(rows),
+        "ready_check_agenda": {
+            "requests": len(agenda_rows),
+            "setup_duration_ms": row_metric_stats("total_ms", agenda_rows),
+            "sql_query_count": row_metric_stats("sql_count", agenda_rows),
+            "sql_time_ms": row_metric_stats("sql_ms", agenda_rows),
+            "pool_wait_ms": row_metric_stats("pool_wait_ms", agenda_rows),
+        },
         "overall": metric_stats(totals),
         "avg_sql_queries_per_request": round(sum(sql_counts) / len(sql_counts), 3) if sql_counts else None,
         "avg_db_time_ms": round(sum(sql_times) / len(sql_times), 3) if sql_times else None,

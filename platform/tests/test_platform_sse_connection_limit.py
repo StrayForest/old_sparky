@@ -37,6 +37,11 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
             sse.SSE_GLOBAL_LIMIT,
         )
         self.assertNotEqual(sse._ready_check_global_key(), sse._global_key())
+        key_settings = SimpleNamespace(platform_secret_key="test-sse-user-namespace")
+        self.assertNotEqual(
+            sse._ready_check_user_key(key_settings, "user-1"),
+            sse._user_key(key_settings, "user-1"),
+        )
 
     async def asyncSetUp(self) -> None:
         self.settings = get_settings()
@@ -279,6 +284,49 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await leases[1].release()
+
+    async def test_ready_check_user_namespace_is_independent_from_legacy_bracket(self) -> None:
+        bracket = await sse.reserve_sse_connection(
+            "203.0.113.48",
+            settings=self.settings,
+            global_limit=10,
+            source_limit=10,
+            global_key=sse._global_key(),
+        )
+        ready_check = await sse.reserve_sse_connection(
+            "203.0.113.49",
+            settings=self.settings,
+            global_limit=10,
+            source_limit=10,
+            global_key=sse._ready_check_global_key(),
+        )
+        second_ready_check = await sse.reserve_sse_connection(
+            "203.0.113.50",
+            settings=self.settings,
+            global_limit=10,
+            source_limit=10,
+            global_key=sse._ready_check_global_key(),
+        )
+        try:
+            await bracket.add_user_scope("shared-user", user_limit=sse.SSE_USER_LIMIT)
+            await ready_check.add_user_scope(
+                "shared-user",
+                user_limit=sse.READY_CHECK_SSE_USER_LIMIT,
+                user_scope="ready_check",
+            )
+            with self.assertRaises(sse.SseConnectionLimitExceeded) as context:
+                await second_ready_check.add_user_scope(
+                    "shared-user",
+                    user_limit=sse.READY_CHECK_SSE_USER_LIMIT,
+                    user_scope="ready_check",
+                )
+            self.assertEqual(context.exception.scope, "user")
+        finally:
+            await asyncio.gather(
+                bracket.release(),
+                ready_check.release(),
+                second_ready_check.release(),
+            )
 
     async def test_release_immediately_returns_source_capacity(self) -> None:
         first = await sse.reserve_sse_connection(

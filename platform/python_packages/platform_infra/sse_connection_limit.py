@@ -8,7 +8,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Callable
+from typing import Callable, Literal
 
 from fastapi import Depends
 from redis.asyncio import BlockingConnectionPool, Redis
@@ -51,6 +51,7 @@ SSE_LEASE_RENEW_INTERVAL_SECONDS = 30
 SSE_KEY_EXPIRY_GRACE_SECONDS = 60
 SSE_KEY_PREFIX = "platform:sse-limit:v1"
 READY_CHECK_SSE_KEY_PREFIX = "platform:ready-check-sse-limit:v1"
+SseUserScope = Literal["legacy", "ready_check"]
 SSE_LOAD_TEST_BYPASS_HEADER = "x-platform-qa-sse-bypass"
 SSE_LOAD_TEST_BYPASS_CONTEXT = b"platform-sse-load-test-v1"
 SSE_LOAD_TEST_CAPACITY_HEADER = "x-platform-qa-sse-capacity"
@@ -244,6 +245,22 @@ def _user_key(settings: PlatformSettings, user_id: str) -> str:
     return f"{SSE_KEY_PREFIX}:user:{_fingerprint(settings, f'user:{user_id}')}"
 
 
+def _ready_check_user_key(settings: PlatformSettings, user_id: str) -> str:
+    return f"{READY_CHECK_SSE_KEY_PREFIX}:user:{_fingerprint(settings, f'user:{user_id}')}"
+
+
+def _user_key_for_scope(
+    settings: PlatformSettings,
+    user_id: str,
+    user_scope: SseUserScope,
+) -> str:
+    if user_scope == "legacy":
+        return _user_key(settings, user_id)
+    if user_scope == "ready_check":
+        return _ready_check_user_key(settings, user_id)
+    raise ValueError(f"Unsupported SSE user scope: {user_scope}")
+
+
 def _limiter_client() -> Redis:
     global _limiter_redis_client
     if _limiter_redis_client is None:
@@ -363,12 +380,13 @@ class SseConnectionLease:
         user_id: str,
         *,
         user_limit: int = SSE_USER_LIMIT,
+        user_scope: SseUserScope = "legacy",
         lease_seconds: int | None = None,
         now_epoch: int | None = None,
     ) -> None:
         if self.released:
             raise RuntimeError("Cannot extend a released SSE connection lease.")
-        key = _user_key(self.settings, user_id)
+        key = _user_key_for_scope(self.settings, user_id, user_scope)
         if key in self.keys:
             return
         now = int(time.time()) if now_epoch is None else now_epoch
@@ -613,10 +631,18 @@ async def add_sse_authenticated_user_scope(
     user_id: str,
     *,
     user_limit: int = SSE_USER_LIMIT,
+    user_scope: SseUserScope = "legacy",
 ) -> None:
     """Add the authenticated-user lease after stream authorization."""
 
     lease = request.scope.get(SSE_CONNECTION_LEASE_SCOPE)
     if not isinstance(lease, SseConnectionLease):
         raise RuntimeError("SSE connection lease is missing from the request scope.")
-    await lease.add_user_scope(user_id, user_limit=user_limit)
+    if user_scope == "legacy":
+        await lease.add_user_scope(user_id, user_limit=user_limit)
+        return
+    await lease.add_user_scope(
+        user_id,
+        user_limit=user_limit,
+        user_scope=user_scope,
+    )

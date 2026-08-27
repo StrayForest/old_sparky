@@ -20,13 +20,16 @@ authenticated user to prevent multi-tab duplication; the compatibility bracket
 contour retains its separate four-per-user limit.
 
 The authenticated `/ready-check/agenda` read is the only PostgreSQL-backed
-admission planning request. It returns a short-lived, session-bound HMAC proof
-for the user’s state probes and one proof containing the bounded set of
-eligible tournament IDs for the global SSE stream. The proof is not an
-authorization grant for voting; PostgreSQL remains authoritative for workflow
-actions. The browser refreshes this agenda at authentication/app start, after
-registration or leave mutations, and when visibility is restored; pathname
-transitions do not independently trigger the PostgreSQL read.
+admission planning request. It returns a session-bound HMAC proof for the
+user’s state probes and one proof containing the bounded set of eligible
+tournament IDs for the global SSE stream. Proofs expire at the applicable
+Ready Check end with a bounded maximum; the response exposes the stream-proof
+expiry so a multi-check agenda can refresh before that horizon. The proof is
+not an authorization grant for voting; PostgreSQL remains authoritative for
+workflow actions. The browser refreshes this agenda at authentication/app
+start, after registration or leave mutations, when visibility is restored and
+before a bounded stream proof expires; pathname transitions do not
+independently trigger the PostgreSQL read.
 
 ## Admission policy
 
@@ -55,8 +58,10 @@ approximately 1.5 seconds while visible. Hidden tabs stop polling and close
 the stream; returning to visible immediately probes again. Stream opening has
 a bounded handshake timeout and reconnect uses full jitter over the measured
 recovery window. `READY_CHECK_STARTED` closes the critical stream as soon as
-no other upcoming check needs it, with the Ready Check end plus a short client
-timeout as a safety boundary.
+no other check is inside its current admission window. A distant future check
+does not keep the stream open; its own `admission_open_at` schedules a later
+reopen. The Ready Check end plus a short client timeout remains the safety
+boundary.
 
 ## Bracket policy
 
@@ -96,3 +101,9 @@ never changes the default production cap or permits high-cap bracket testing.
 The proportional allocator is covered for simultaneous unequal demand, spare
 capacity, late arrivals and existing occupancy; those tests validate the
 planning contract, not production fairness until the public staircase is run.
+
+Every `/ready-check/agenda` request is included in request-performance
+telemetry. The retained-load report exposes p50/p95/p99 setup duration, SQL
+query count/time and PostgreSQL pool wait for this route; global connection and
+wait snapshots remain the load-run resource evidence. No shared planning cache
+is introduced before those measurements demonstrate a bottleneck.

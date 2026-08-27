@@ -11,7 +11,7 @@ from time import monotonic
 
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.redis import redis_client
-from python_packages.platform_infra.ready_check_admission import READY_CHECK_ADMISSION_TTL_SECONDS
+from python_packages.platform_infra.ready_check_admission import READY_CHECK_ADMISSION_MAX_TTL_SECONDS
 from python_packages.platform_infra.sse_connection_limit import (
     SSE_KEEPALIVE_SECONDS,
     SseConnectionLease,
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 READY_CHECK_EVENT_CHANNEL = "platform:ready-check:events:v1"
 READY_CHECK_STATE_KEY_PREFIX = "platform:ready-check:state:v1"
-READY_CHECK_STATE_TTL_SECONDS = READY_CHECK_ADMISSION_TTL_SECONDS + 60
+READY_CHECK_STATE_TTL_SECONDS = READY_CHECK_ADMISSION_MAX_TTL_SECONDS + 60
 READY_CHECK_RELAY_QUEUE_MAXSIZE = 32
 
 _relay_lock = asyncio.Lock()

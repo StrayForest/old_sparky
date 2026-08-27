@@ -1,15 +1,16 @@
-# AS-20 SSE production boundary
+# AS-20 legacy SSE production boundary
 
-Status: closed at the current measured production contour on 2026-08-27.
+Status: historical legacy contour; superseded by the Ready Check boundary on
+2026-08-27.
 
 ## Deployed protection
 
-The active package is commit
+The measured legacy package was commit
 `b86ec1e6937184e5de698ad4e9258a9df4a0d792`. Its security/build run was
 `33055132124`, automatic deploy `33055567733` and production deploy/live smoke
 `33055574062`.
 
-The package retains:
+The package retained:
 
 - signed short-lived SSE admission tickets;
 - anonymous tickets only for public bracket data;
