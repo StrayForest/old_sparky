@@ -104,6 +104,13 @@ test ! -L "$run_root" || {
 }
 run_root_uid="$(stat -c '%u' -- "$run_root")"
 run_root_mode="$(stat -c '%a' -- "$run_root")"
+if [[ "$run_root_uid" == "0" ]]; then
+  # Recovery fixtures created by the pre-0700 supervisor may have inherited
+  # the default mode on an intermediate directory. Normalize that exact,
+  # already root-owned non-symlink path before enforcing the invariant.
+  chmod 0700 -- "$run_root"
+  run_root_mode="$(stat -c '%a' -- "$run_root")"
+fi
 test "$run_root_uid" = "0" && test "$run_root_mode" = "700" || {
   echo "The selected retained load run root must be root-owned mode 0700." >&2
   exit 1
