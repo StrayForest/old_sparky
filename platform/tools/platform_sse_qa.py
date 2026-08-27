@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import re
 import resource
 import secrets
 import ssl
@@ -39,6 +40,7 @@ from python_packages.platform_infra.sse_connection_limit import (
 )
 from tools.platform_production_qa import (
     BROWSER_POLLING_TOURNAMENT_PLAN,
+    QaFailure,
     ProductionQa,
     VALID_RANKS,
     load_env_file,
@@ -963,6 +965,7 @@ async def probe_ready_check_overflow(
     tournament_slug: str,
     state_tickets: dict[str, str],
     metrics: SseMetrics,
+    rate_per_second: float = READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND,
 ) -> dict[str, Any]:
     """Probe only streams rejected by admission, once after the active event."""
 
@@ -972,22 +975,33 @@ async def probe_ready_check_overflow(
         if str(user["id"]) not in metrics.initial_connected_user_ids
     ]
     status_counts: Counter[str] = Counter()
+    errors = 0
 
     async def probe_one(user: dict[str, Any]) -> None:
         user_id = str(user["id"])
         state_ticket = state_tickets.get(user_id)
         if not state_ticket:
             raise RuntimeError(f"Ready Check state ticket missing for {user['label']}")
-        payload = await qa.request_as(
-            api_client,
-            user,
-            "GET",
-            (
-                f"/ready-check/state?slug={quote(tournament_slug, safe='')}"
-                f"&ticket={quote(state_ticket, safe='')}"
-            ),
-            expected=200,
-        )
+        nonlocal errors
+        try:
+            payload = await qa.request_as(
+                api_client,
+                user,
+                "GET",
+                (
+                    f"/ready-check/state?slug={quote(tournament_slug, safe='')}"
+                    f"&ticket={quote(state_ticket, safe='')}"
+                ),
+                expected=200,
+            )
+        except QaFailure as exc:
+            # An edge rejection is part of the measured overflow contour. Do
+            # not discard the completed SSE metrics merely because one source
+            # IP was rate-limited while probing fallback polling.
+            errors += 1
+            match = re.search(r"got (\d{3})", str(exc))
+            status_counts[f"error_{match.group(1) if match else 'unknown'}"] += 1
+            return
         state = str(payload.get("status")) if isinstance(payload, dict) else "missing"
         status_counts[state] += 1
         if state != "active":
@@ -997,11 +1011,18 @@ async def probe_ready_check_overflow(
 
     request_gate = asyncio.Semaphore(max(1, min(256, qa.concurrency * 4)))
     with qa.phase("ready_check_overflow_state_probe"):
-        await qa.bounded_each(overflow_users, probe_one, semaphore=request_gate)
+        await qa.bounded_each_at_rate(
+            overflow_users,
+            probe_one,
+            rate_per_second=max(0.1, rate_per_second),
+            semaphore=request_gate,
+        )
     return {
         "users": len(overflow_users),
         "requests": len(overflow_users),
         "status_counts": dict(sorted(status_counts.items())),
+        "errors": errors,
+        "rate_per_second": max(0.1, rate_per_second),
         "route": "GET /ready-check/state",
         "trigger": "after_ready_check_start_event",
     }
@@ -1519,7 +1540,7 @@ async def run_connections(
             "probe_event_count": event_count,
             "probe_event_interval_seconds": event_interval,
             "expected_events": (
-                metrics.counters["initial_connected"]
+                len(metrics.initial_connected_user_ids)
                 if sse_scope == "ready-check"
                 else metrics.counters["initial_connected"] * max(0, event_count)
             ),
@@ -1856,6 +1877,9 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     tournament_slug=str(tournaments[0]["slug"]),
                     state_tickets=state_tickets_by_user_id,
                     metrics=metrics,
+                    rate_per_second=args.sse_open_rate
+                    if args.sse_open_rate > 0
+                    else READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND,
                 )
 
             after_connection_barrier = start_ready_check
@@ -1944,6 +1968,14 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 },
                 fatal=False,
             )
+            fallback_report = sse_report.get("fallback_probe")
+            if fallback_report is not None:
+                qa.scenario(
+                    "sse_overflow_state_probe_complete",
+                    fallback_report.get("errors", 0) == 0,
+                    fallback_report,
+                    fatal=False,
+                )
         else:
             tabs = qa.build_browser_polling_tabs(
                 tournaments=tournaments,
