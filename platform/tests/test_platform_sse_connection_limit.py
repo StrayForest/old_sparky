@@ -307,6 +307,36 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         add_user_scope.assert_awaited_once_with("user-1")
 
 
+class PlatformSseConnectionReleaseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_release_commands_are_bounded_during_mass_teardown(self) -> None:
+        active = 0
+        maximum_active = 0
+
+        async def eval_script(*_args):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return 0
+
+        cache = MagicMock()
+        cache.eval = eval_script
+        with patch.object(
+            sse,
+            "_sse_release_semaphore",
+            asyncio.Semaphore(2),
+        ), patch.object(sse, "_limiter_client", return_value=cache):
+            await asyncio.gather(
+                *(
+                    sse._release_keys(["global"], member=f"member-{index}")
+                    for index in range(8)
+                )
+            )
+
+        self.assertLessEqual(maximum_active, 2)
+
+
 class PlatformSseConnectionMiddlewareTests(unittest.IsolatedAsyncioTestCase):
     async def test_user_limit_failure_is_returned_as_controlled_429(self) -> None:
         settings = get_settings()

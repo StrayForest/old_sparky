@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import re
@@ -58,9 +59,15 @@ SSE_LOAD_TEST_CAPACITY_TTL_SECONDS = 1_800
 # retaining a finite wait so Redis failure remains fail-closed.
 SSE_LIMITER_REDIS_POOL_MAX_CONNECTIONS = 512
 SSE_LIMITER_REDIS_POOL_TIMEOUT_SECONDS = 2.0
+# Stream teardown can happen in a single cancellation wave. Bound only the
+# best-effort release commands so that teardown cannot exhaust the Redis pool
+# needed by admission and renewal. A missed release remains safe: the lease
+# expires and is pruned by the next reservation.
+SSE_RELEASE_CONCURRENCY = 128
 SSE_CONNECTION_LEASE_SCOPE = "platform.sse_connection_lease"
 
 _limiter_redis_client: Redis | None = None
+_sse_release_semaphore: asyncio.Semaphore | None = None
 
 _ACQUIRE_SCRIPT = """
 local now = tonumber(ARGV[1])
@@ -228,9 +235,10 @@ def _limiter_client() -> Redis:
 
 
 async def dispose_sse_connection_limiter() -> None:
-    global _limiter_redis_client
+    global _limiter_redis_client, _sse_release_semaphore
     client = _limiter_redis_client
     _limiter_redis_client = None
+    _sse_release_semaphore = None
     if client is not None:
         await client.aclose()
 
@@ -276,8 +284,12 @@ async def _reserve_keys(
 async def _release_keys(keys: list[str], *, member: str) -> None:
     if not keys:
         return
-    cache = _limiter_client()
-    await cache.eval(_RELEASE_SCRIPT, len(keys), *keys, member)
+    global _sse_release_semaphore
+    if _sse_release_semaphore is None:
+        _sse_release_semaphore = asyncio.Semaphore(SSE_RELEASE_CONCURRENCY)
+    async with _sse_release_semaphore:
+        cache = _limiter_client()
+        await cache.eval(_RELEASE_SCRIPT, len(keys), *keys, member)
 
 
 async def _renew_keys(
