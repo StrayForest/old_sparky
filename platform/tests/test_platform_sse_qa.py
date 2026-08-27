@@ -336,6 +336,7 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sse_event_delivery_complete", sse_source)
         self.assertIn("expected_events", sse_source)
         self.assertIn('metrics["initial_connected"] == args.sse_connections', sse_source)
+        self.assertIn('"initial_connected": metrics.get("initial_connected")', sse_source)
         self.assertIn("fallback_polling_eligible", sse_source)
         self.assertIn("plateau_probe", sse_source)
         self.assertIn("SSE_QA_GLOBAL_LIMIT_MAX", sse_source)

@@ -1630,6 +1630,7 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
             ),
             "plateau_probe": sse.get("plateau_probe"),
             "connected": metrics.get("connected"),
+            "initial_connected": metrics.get("initial_connected"),
             "max_active_connections": metrics.get("max_active_connections"),
             "completed": metrics.get("completed"),
             "disconnects": metrics.get("disconnects"),
