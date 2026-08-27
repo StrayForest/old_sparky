@@ -72,6 +72,25 @@ READY_CHECK_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
 )
 
 
+def _tournament_description_matches(
+    description: object,
+    *,
+    marker: str,
+    mode: str,
+) -> bool:
+    description_text = str(description or "")
+    if mode == "scale":
+        return description_text == f"Large preprod QA tournament {marker}."
+    for pattern in (
+        BROWSER_TOURNAMENT_DESCRIPTION_PATTERN,
+        READY_CHECK_TOURNAMENT_DESCRIPTION_PATTERN,
+    ):
+        match = pattern.fullmatch(description_text)
+        if match is not None and match.group("marker") == marker:
+            return True
+    return False
+
+
 def _regular_root_file(
     path: Path,
     *,
@@ -278,10 +297,11 @@ def _merge_recovered_browser_tournaments(
     recovered_ids: set[str] = set()
     for candidate in candidate_rows:
         description = str(candidate.description or "")
-        match = BROWSER_TOURNAMENT_DESCRIPTION_PATTERN.fullmatch(description)
-        if match is None:
-            match = READY_CHECK_TOURNAMENT_DESCRIPTION_PATTERN.fullmatch(description)
-        if match is None or match.group("marker") != marker:
+        if not _tournament_description_matches(
+            description,
+            marker=marker,
+            mode="browser-polling",
+        ):
             raise RuntimeError("browser cleanup found an invalid marker-owned tournament")
         if str(candidate.organizer_user_id) not in user_ids:
             raise RuntimeError("browser cleanup found a tournament owned outside the exact inventory")
@@ -414,12 +434,11 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         for row in manifest["rows"]:
             for tournament_id in row["tournament_ids"]:
                 tournament = next(item for item in tournament_rows if str(item.id) == tournament_id)
-                if manifest["mode"] == "scale":
-                    description_ok = tournament.description == f"Large preprod QA tournament {row['marker']}."
-                else:
-                    description_ok = str(tournament.description or "").startswith(
-                        f"Browser polling profile {row['marker']} "
-                    )
+                description_ok = _tournament_description_matches(
+                    tournament.description,
+                    marker=row["marker"],
+                    mode=manifest["mode"],
+                )
                 if (
                     not description_ok
                     or str(tournament.organizer_user_id) not in set(row["user_ids"])

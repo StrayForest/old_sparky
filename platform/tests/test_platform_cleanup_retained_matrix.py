@@ -100,6 +100,20 @@ class RetainedMatrixManifestTests(unittest.TestCase):
 
         self.assertEqual(recovered, {candidate.id})
         self.assertEqual(row["tournament_ids"], [candidate.id])
+        self.assertTrue(
+            cleanup._tournament_description_matches(
+                candidate.description,
+                marker=marker,
+                mode="sse",
+            )
+        )
+        self.assertFalse(
+            cleanup._tournament_description_matches(
+                f"Ready Check SSE profile {marker} unexpected.",
+                marker=marker,
+                mode="sse",
+            )
+        )
 
     def _write_manifest(self, root: Path, report_path: Path) -> Path:
         marker = "preprod260824120000abcd"
