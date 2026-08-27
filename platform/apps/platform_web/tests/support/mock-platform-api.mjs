@@ -478,6 +478,7 @@ const server = createServer((request, response) => {
         "cache-control": "no-cache",
         connection: "keep-alive"
       });
+      request.on("close", () => response.end());
       response.write("retry: 5000\nevent: connected\ndata: {}\n\n");
       if (cookie.includes("ready-check-provider-resync")) {
         response.write("event: resync\ndata: {\"reason\":\"relay_gap\"}\n\n");
