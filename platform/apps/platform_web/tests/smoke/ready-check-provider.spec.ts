@@ -64,11 +64,12 @@ test("does not poll at T while the Ready Check SSE is established", async ({ pag
 
 test("refreshes the stream proof before a bounded multi-check horizon expires", async ({ page }) => {
   await page.clock.install({ time: new Date("2026-06-07T15:35:00Z") });
+  const proofRefreshScope = `${test.info().project.name}-${test.info().retry}`;
   await page.context().addCookies([
     sessionCookie,
     {
       name: "ready-check-provider-proof-refresh-smoke",
-      value: "1",
+      value: proofRefreshScope,
       url: "http://127.0.0.1:3100",
     },
   ]);
@@ -108,7 +109,7 @@ test("closes the stream between Ready Checks and reopens at the next admission w
   await expect.poll(() => streamRequests.length, { timeout: 5_000 }).toBe(1);
   await page.clock.fastForward(4 * 60_000);
   expect(streamRequests).toHaveLength(1);
-  await page.clock.fastForward(60_001);
+  await page.clock.runFor(60_001);
   await expect.poll(() => streamRequests.length, { timeout: 5_000 }).toBe(2);
 });
 

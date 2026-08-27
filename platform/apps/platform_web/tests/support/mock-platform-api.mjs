@@ -6,7 +6,7 @@ const now = "2026-06-07T12:00:00Z";
 const mockCsrfToken = `mock.${"c".repeat(64)}`;
 let mockMediaSequence = 0;
 const mockMediaAssets = new Map();
-let proofRefreshAgendaCalls = 0;
+const proofRefreshAgendaCalls = new Map();
 const deadlockHeroNames = [
   "Abrams", "Apollo", "Bebop", "Billy", "Calico", "Celeste", "The Doorman", "Drifter",
   "Dynamo", "Graves", "Grey Talon", "Haze", "Holliday", "Infernus", "Ivy", "Kelvin",
@@ -360,18 +360,23 @@ const server = createServer((request, response) => {
   }
   if (path === "/api/v1/ready-check/agenda" && request.method === "GET") {
     const cookie = request.headers.cookie ?? "";
+    const hasProofRefreshCookie = Boolean(cookie.match(/(?:^|;\s*)ready-check-provider-proof-refresh-smoke=/));
     const mode = cookie.includes("ready-check-provider-sse-smoke=1")
       || cookie.includes("ready-check-provider-stalled-smoke=1")
       || cookie.includes("ready-check-provider-future-gap-smoke=1")
-      || cookie.includes("ready-check-provider-proof-refresh-smoke=1")
+      || hasProofRefreshCookie
       ? "scheduled_sse"
       : cookie.includes("ready-check-provider-polling-smoke=1")
         ? "polling"
         : null;
     const futureGap = cookie.includes("ready-check-provider-future-gap-smoke=1");
-    const proofRefresh = cookie.includes("ready-check-provider-proof-refresh-smoke=1");
+    const proofRefreshScope = cookie.match(/(?:^|;\s*)ready-check-provider-proof-refresh-smoke=([^;]+)/)?.[1] ?? "default";
+    const proofRefresh = Boolean(cookie.match(/(?:^|;\s*)ready-check-provider-proof-refresh-smoke=/));
     if (proofRefresh) {
-      proofRefreshAgendaCalls += 1;
+      proofRefreshAgendaCalls.set(
+        proofRefreshScope,
+        (proofRefreshAgendaCalls.get(proofRefreshScope) ?? 0) + 1,
+      );
     }
     const checks = futureGap ? [
       {
@@ -408,7 +413,7 @@ const server = createServer((request, response) => {
       checks,
       sse_ticket: mode === "scheduled_sse" ? "mock-ready-check-stream" : null,
       sse_ticket_expires_at: proofRefresh
-        ? proofRefreshAgendaCalls > 1
+        ? (proofRefreshAgendaCalls.get(proofRefreshScope) ?? 0) > 1
           ? "2026-06-07T16:45:00Z"
           : "2026-06-07T15:45:00Z"
         : null
@@ -437,7 +442,7 @@ const server = createServer((request, response) => {
     }
     if (
       cookie.includes("ready-check-provider-sse-smoke=1")
-      || cookie.includes("ready-check-provider-proof-refresh-smoke=1")
+      || cookie.includes("ready-check-provider-proof-refresh-smoke=")
     ) {
       response.writeHead(200, {
         "content-type": "text/event-stream",

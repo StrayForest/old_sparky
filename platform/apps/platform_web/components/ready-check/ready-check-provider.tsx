@@ -126,6 +126,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
     let stream: EventSource | null = null;
     let pollController: AbortController | null = null;
     let streamConnected = false;
+    let streamFallbackAvailable = false;
     let streamRetryAt = 0;
     let sseOpenTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -154,6 +155,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       const currentStream = stream;
       stream = null;
       streamConnected = false;
+      streamFallbackAvailable = false;
       clearSseOpenTimer();
       if (currentStream !== null) {
         currentStream.close();
@@ -189,7 +191,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         && now >= startsAt
         && now < endsAt + READY_CHECK_HARD_TIMEOUT_MS
         && (liveStateFor(item)?.status ?? "waiting") === "waiting"
-        && (item.admissionMode === "polling" || !streamConnected);
+        && (item.admissionMode === "polling" || (!streamConnected && streamFallbackAvailable));
     });
 
     const shouldOpenStream = (now: number) => checks.some((item) => {
@@ -295,8 +297,8 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
           nextAt = Math.min(nextAt, endsAt + READY_CHECK_HARD_TIMEOUT_MS);
         }
       }
-      if (shouldOpenStream(now) && now < streamRetryAt) {
-        nextAt = Math.min(nextAt, streamRetryAt);
+      if (!stream && shouldOpenStream(now)) {
+        nextAt = Math.min(nextAt, now < streamRetryAt ? streamRetryAt : now);
       }
       if (!Number.isFinite(nextAt)) {
         return;
@@ -323,6 +325,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       streamRetryAt = streamTicketExpired
         ? Number.POSITIVE_INFINITY
         : Date.now() + sseRetryDelayMs();
+      streamFallbackAvailable = true;
       if (streamTicketExpired) {
         refreshAgenda();
       }
