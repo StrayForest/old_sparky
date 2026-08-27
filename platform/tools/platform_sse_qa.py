@@ -1071,6 +1071,11 @@ async def consume_sse_connection(
         await asyncio.sleep(backoff_cap * jitter)
 
     for cycle in range(cycles + 1):
+        # Reconnect cycles model recovery after an established stream.  A
+        # client that never completed its initial handshake must fail closed
+        # into the separate fallback path rather than retrying in a hot loop.
+        if cycle > 0 and not initial_connection_marked:
+            break
         if deadline is not None and time.monotonic() >= deadline:
             break
         reconnect_attempt = 0
@@ -1138,7 +1143,8 @@ async def consume_sse_connection(
                     if retry_reconnect:
                         reconnect_attempt += 1
                         await wait_before_reconnect(reconnect_attempt)
-                    continue
+                        continue
+                    break
                 metrics.response_status(response.status_code)
                 if cycle == 0 and not initial_attempt_marked:
                     initial_attempt_marked = True

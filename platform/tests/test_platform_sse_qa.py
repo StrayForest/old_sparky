@@ -20,6 +20,7 @@ from tools.platform_sse_qa import (
     SseMetrics,
     _close_sse_stream_context,
     combined_profile_timeout_seconds,
+    consume_sse_connection,
     max_sse_open_timeout_seconds,
     plateau_probe_count,
     ready_check_fixture_schedule,
@@ -214,6 +215,67 @@ class PlatformSseQaTests(unittest.TestCase):
 
 
 class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_sse_open_timeout_fails_closed_without_retry_loop(self) -> None:
+        class SlowContext:
+            async def __aenter__(self):
+                await asyncio.sleep(10)
+                return httpx.Response(200)
+
+            async def __aexit__(self, *_args) -> None:
+                return None
+
+        class SlowClient:
+            def stream(self, *_args, **_kwargs):
+                return SlowContext()
+
+        class Qa:
+            api_origin = "https://old-sparky.com"
+            request_origin = "https://old-sparky.com"
+            session_cookie_name = "platform_session"
+            current_phase = "test"
+            session_tokens_by_user_id = {"user-1": "session-token"}
+
+        metrics = SseMetrics()
+        attempts_finished = asyncio.Event()
+        attempt_count = 0
+
+        async def mark_attempt_finished() -> None:
+            nonlocal attempt_count
+            attempt_count += 1
+            attempts_finished.set()
+
+        async def hold_deadline_after_barrier(*_args):
+            raise AssertionError("initial timeout must not enter the hold phase")
+
+        started = asyncio.get_running_loop().time()
+        await consume_sse_connection(
+            Qa(),
+            SlowClient(),
+            metrics,
+            user={"id": "user-1"},
+            tournament_slug="unused",
+            sse_ticket=None,
+            sse_ticket_by_user_id=None,
+            sse_scope="bracket",
+            duration_seconds=1.0,
+            reconnect_cycles=3,
+            open_gate=asyncio.Semaphore(1),
+            open_timeout_seconds=0.01,
+            open_delay_seconds=0.0,
+            sse_capacity_token=None,
+            all_attempts_done=asyncio.Event(),
+            mark_attempt_finished=mark_attempt_finished,
+            hold_deadline_after_barrier=hold_deadline_after_barrier,
+            raw_sse_transport=False,
+        )
+
+        self.assertLess(asyncio.get_running_loop().time() - started, 1.0)
+        self.assertTrue(attempts_finished.is_set())
+        self.assertEqual(attempt_count, 1)
+        self.assertEqual(metrics.counters["connection_attempts"], 1)
+        self.assertEqual(metrics.counters["open_timeouts"], 1)
+        self.assertEqual(metrics.counters["fallback_polling_eligible"], 1)
+
     async def test_timed_out_http_context_close_is_bounded(self) -> None:
         class SlowContext:
             async def __aexit__(self, *_args) -> None:
