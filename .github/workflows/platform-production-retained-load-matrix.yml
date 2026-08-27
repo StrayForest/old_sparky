@@ -33,7 +33,7 @@ on:
         default: "128"
         type: string
       sse_duration:
-        description: "SSE hold duration in seconds (1-600)"
+        description: "SSE hold duration in seconds (1-900; >600 proves no forced rotation)"
         required: true
         default: "60"
         type: string
@@ -213,11 +213,11 @@ jobs:
                   raise SystemExit("sse_capacity_limit must be between 0 and 30000")
               if int(sse_capacity_limit) > 3000 and (profile != "sse" or sse_origin_mode != "origin-local" or sse_admission_mode != "ticket"):
                   raise SystemExit("high SSE capacity mode requires the ticketed SSE-only loopback origin")
-              # This is a retained-load diagnostic ceiling only. The browser
-              # fallback/cooldown policy is independent and remains unchanged.
+              # This is a retained-load diagnostic ceiling only. A hold above
+              # 600s is allowed to prove healthy streams are not force-rotated.
               sse_open_timeout_max = 60
               decimal_ranges = {
-                  "sse_duration": (sse_duration, 1, 600),
+                  "sse_duration": (sse_duration, 1, 900),
                   "sse_open_timeout": (sse_open_timeout, 0.5, sse_open_timeout_max),
                   "sse_open_rate": (sse_open_rate, 0, 1000),
                   "sse_event_interval": (sse_event_interval, 0, 60),

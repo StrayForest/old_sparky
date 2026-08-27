@@ -14,6 +14,7 @@ import {
   platformApiUrl,
 } from "@/lib/platform-api";
 import type { Bracket, Match, Team } from "@/lib/types";
+import { sseRetryDelayMs } from "@/lib/sse-reconnect-policy";
 
 const MATCH_W = 272;
 const MATCH_H_VIEW = 146;
@@ -35,7 +36,6 @@ const configuredSseOpenTimeoutMs = Number(
 const SSE_OPEN_TIMEOUT_MS = Number.isFinite(configuredSseOpenTimeoutMs)
   ? Math.min(30_000, Math.max(500, Math.round(configuredSseOpenTimeoutMs)))
   : 1_000;
-const SSE_RETRY_COOLDOWN_MS = 60_000;
 const PANNING_IGNORE_SELECTOR = "button,input,select,textarea,a,[role='button']";
 
 type LayoutMatch = {
@@ -319,7 +319,10 @@ export function BracketBoard({
 
     const fallBackToPolling = () => {
       closeSource();
-      sseRetryNotBefore = Date.now() + SSE_RETRY_COOLDOWN_MS;
+      // Keep polling available immediately, but spread the next admission
+      // attempt across the measured safe establishment window. This applies
+      // equally to a timeout, 429/503, network failure and mass disconnect.
+      sseRetryNotBefore = Date.now() + sseRetryDelayMs();
       startPolling(true);
       scheduleSseRetry();
     };

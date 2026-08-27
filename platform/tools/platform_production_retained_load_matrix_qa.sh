@@ -105,8 +105,8 @@ case "$profile" in
       echo "SSE connections must be an integer from 1 to 30000." >&2
       exit 1
     }
-    [[ "$sse_duration" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_duration >= 1 && $sse_duration <= 600)}") == 1 )) || {
-      echo "SSE duration must be between 1 and 600 seconds." >&2
+    [[ "$sse_duration" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_duration >= 1 && $sse_duration <= 900)}") == 1 )) || {
+      echo "SSE duration must be between 1 and 900 seconds." >&2
       exit 1
     }
     [[ "$sse_open_concurrency" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_open_concurrency <= 30000 )) || {
@@ -266,13 +266,14 @@ start_server_observer() {
       local pid="$2"
       [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
       [[ -d "/proc/$pid" ]] || return 0
-      local rss_kb fd_count vm_rss vm_peak threads
+      local rss_kb pss_kb fd_count vm_rss vm_peak threads
       rss_kb="$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print $1}')"
       fd_count="$(find "/proc/$pid/fd" -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l)"
       vm_rss="$(awk '/^VmRSS:/ {print $2 " " $3}' "/proc/$pid/status" 2>/dev/null)"
       vm_peak="$(awk '/^VmPeak:/ {print $2 " " $3}' "/proc/$pid/status" 2>/dev/null)"
+      pss_kb="$(awk '/^Pss:/ {print $2 " " $3}' "/proc/$pid/smaps_rollup" 2>/dev/null)"
       threads="$(awk '/^Threads:/ {print $2}' "/proc/$pid/status" 2>/dev/null)"
-      echo "$label pid=$pid rss_kb=${rss_kb:-0} fd_count=${fd_count:-0} vm_rss=${vm_rss:-unknown} vm_peak=${vm_peak:-unknown} threads=${threads:-0}"
+      echo "$label pid=$pid rss_kb=${rss_kb:-0} pss=${pss_kb:-unknown} fd_count=${fd_count:-0} vm_rss=${vm_rss:-unknown} vm_peak=${vm_peak:-unknown} threads=${threads:-0}"
       ps -p "$pid" -o pid=,ppid=,stat=,pcpu=,pmem=,rss=,etime=,comm=,args= 2>/dev/null || true
     }
 

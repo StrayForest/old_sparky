@@ -17,6 +17,7 @@ from apps.platform_api.app.services.tournament_workspace_access import (
 from python_packages.platform_infra.redis import redis_client
 from python_packages.platform_infra.sse_connection_limit import (
     SSE_KEEPALIVE_SECONDS,
+    SSE_LEASE_RENEW_INTERVAL_SECONDS,
     SSE_RECONNECT_JITTER_MS,
     SSE_RECONNECT_MIN_MS,
     SseConnectionLease,
@@ -311,7 +312,7 @@ async def stream_bracket_events(
             now = monotonic()
             if (
                 connection_lease is not None
-                and now - last_lease_renewal_at >= 15.0
+                and now - last_lease_renewal_at >= SSE_LEASE_RENEW_INTERVAL_SECONDS
             ):
                 try:
                     await connection_lease.renew()

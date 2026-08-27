@@ -248,6 +248,41 @@ class PlatformBracketEventAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pubsub.closed)
         self.assertTrue(client.closed)
 
+    async def test_healthy_stream_has_no_forced_rotation_after_600_seconds(self) -> None:
+        pubsub = _FakePubSub([])
+        client = _FakeRedisClient(pubsub)
+        access_check = AsyncMock(return_value=True)
+        virtual_time = 0.0
+
+        async def timeout_without_waiting(awaitable, *, timeout):
+            del timeout
+            awaitable.close()
+            nonlocal virtual_time
+            virtual_time += 15.0
+            raise TimeoutError
+
+        def fake_monotonic() -> float:
+            return virtual_time
+
+        with (
+            patch.object(bracket_events, "redis_client", MagicMock(return_value=client)),
+            patch.object(bracket_events, "_coalesced_stream_access_check", access_check),
+            patch.object(bracket_events, "monotonic", side_effect=fake_monotonic),
+            patch.object(bracket_events.asyncio, "wait_for", new=timeout_without_waiting),
+        ):
+            stream = bracket_events.stream_bracket_events(
+                "tournament-long-lived",
+                admission_verified=True,
+            )
+            self.assertIn("event: connected", await anext(stream))
+            for _ in range(41):
+                self.assertEqual(await anext(stream), ": keepalive\n\n")
+            self.assertGreater(virtual_time, 600.0)
+            await stream.aclose()
+
+        self.assertGreaterEqual(access_check.await_count, 20)
+        self.assertTrue(client.closed)
+
     async def test_idle_stream_revalidates_at_periodic_checkpoint(self) -> None:
         pubsub = _FakePubSub([None])
         client = _FakeRedisClient(pubsub)

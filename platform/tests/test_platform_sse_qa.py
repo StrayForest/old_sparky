@@ -12,6 +12,7 @@ import httpx
 from tools.platform_cleanup_retained_matrix import load_matrix_manifest
 from tools.platform_sse_qa import (
     SSE_EVENT_TYPE,
+    SSE_HOLD_MAX_SECONDS,
     SseMetrics,
     _close_sse_stream_context,
     combined_profile_timeout_seconds,
@@ -93,6 +94,9 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(max_sse_open_timeout_seconds("http://localhost:8010"), 60.0)
         self.assertEqual(max_sse_open_timeout_seconds("https://old-sparky.com"), 60.0)
 
+    def test_qa_hold_can_prove_stream_lifetime_beyond_old_rotation_boundary(self) -> None:
+        self.assertGreater(SSE_HOLD_MAX_SECONDS, 600.0)
+
 
 class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_timed_out_http_context_close_is_bounded(self) -> None:
@@ -121,6 +125,16 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
                 http_timeout_seconds=1,
             ),
             30,
+        )
+        self.assertEqual(
+            combined_profile_timeout_seconds(
+                polling_duration_seconds=30,
+                polling_open_stagger_seconds=0,
+                http_timeout_seconds=10,
+                sse_duration_seconds=605,
+                sse_open_span_seconds=120,
+            ),
+            740,
         )
 
     def test_error_samples_keep_bounded_stream_correlation(self) -> None:
@@ -263,6 +277,7 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('--sse-open-rate "$sse_open_rate"', supervisor)
         self.assertIn('--sse-capacity-limit "$sse_capacity_limit"', supervisor)
         self.assertIn('--sse-admission-mode "$sse_admission_mode"', supervisor)
+        self.assertIn("sse_duration <= 900", supervisor)
         self.assertIn('sse_origin="http://127.0.0.1:8010"', supervisor)
         self.assertIn('--control-email "$control_email"', supervisor)
         self.assertIn('ulimit -n "$nofile_target"', supervisor)
@@ -283,6 +298,7 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("plateau_probe", sse_source)
         self.assertIn("SSE_QA_GLOBAL_LIMIT_MAX", sse_source)
         self.assertIn("fatal_traceback", sse_source)
+        self.assertIn("SSE_HOLD_MAX_SECONDS = 900.0", sse_source)
         self.assertIn("performance_collection_error", sse_source)
         self.assertIn("--request-origin", sse_source)
         self.assertIn('"scenarios": report.get("scenarios", [])', sse_source)

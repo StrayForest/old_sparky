@@ -68,8 +68,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("origin probe is restricted to an HTTP loopback origin")
     if not 1 <= args.connections <= SSE_GLOBAL_LIMIT:
         raise SystemExit(f"connections must be between 1 and {SSE_GLOBAL_LIMIT}")
-    if not 0.1 <= args.hold_seconds <= 600:
-        raise SystemExit("hold-seconds must be between 0.1 and 600")
+    if not 0.1 <= args.hold_seconds <= 900:
+        raise SystemExit("hold-seconds must be between 0.1 and 900")
     if not 1 <= args.open_concurrency <= args.connections:
         raise SystemExit("open-concurrency must be between 1 and connections")
     if not 0 <= args.probe_delay <= 60:

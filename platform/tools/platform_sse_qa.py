@@ -50,9 +50,14 @@ SSE_EVENT_TYPE = "qa_sse_probe"
 COMBINED_TIMEOUT_GRACE_SECONDS = 15.0
 SSE_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
 SSE_FIXTURE_TIMEOUT_SECONDS = 90.0
-# The browser keeps its own short fallback/cooldown policy.  This is only the
-# retained-load diagnostic ceiling: public edge queueing must be observable for
-# a full minute before the harness classifies an attempt as fallback-eligible.
+# This is a bounded QA hold, not a production stream lifetime. It is long
+# enough to prove that a healthy stream survives the old 600-second rotation
+# boundary while keeping an operator mistake bounded to fifteen minutes.
+SSE_HOLD_MAX_SECONDS = 900.0
+# The browser keeps its own immediate-polling/full-jitter recovery policy. This
+# is only the retained-load diagnostic ceiling: public edge queueing must be
+# observable for a full minute before the harness classifies an attempt as
+# fallback-eligible.
 SSE_OPEN_TIMEOUT_MAX_PUBLIC_SECONDS = 60.0
 SSE_OPEN_TIMEOUT_MAX_ORIGIN_LOCAL_SECONDS = 60.0
 
@@ -432,6 +437,10 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--sse-open-timeout must be between 0.5 and "
             f"{max_open_timeout:g} seconds for this origin"
+        )
+    if not 1.0 <= args.sse_duration <= SSE_HOLD_MAX_SECONDS:
+        parser.error(
+            f"--sse-duration must be between 1 and {SSE_HOLD_MAX_SECONDS:g} seconds"
         )
     if not 0.0 <= args.sse_open_rate <= 1000.0:
         parser.error("--sse-open-rate must be between 0 and 1000 new SSE/sec")
@@ -990,6 +999,8 @@ def combined_profile_timeout_seconds(
     polling_duration_seconds: float,
     polling_open_stagger_seconds: float,
     http_timeout_seconds: float,
+    sse_duration_seconds: float = 0.0,
+    sse_open_span_seconds: float = 0.0,
 ) -> float:
     """Bound a combined run after the last virtual tab is allowed to open."""
 
@@ -998,6 +1009,9 @@ def combined_profile_timeout_seconds(
         max(0.0, polling_open_stagger_seconds)
         + max(1.0, polling_duration_seconds)
         + max(1.0, http_timeout_seconds)
+        + COMBINED_TIMEOUT_GRACE_SECONDS,
+        max(0.0, sse_open_span_seconds)
+        + max(0.0, sse_duration_seconds)
         + COMBINED_TIMEOUT_GRACE_SECONDS,
     )
 
@@ -1200,6 +1214,12 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     polling_duration_seconds=args.combined_polling_duration,
                     polling_open_stagger_seconds=args.combined_polling_open_stagger,
                     http_timeout_seconds=args.http_timeout,
+                    sse_duration_seconds=args.sse_duration,
+                    sse_open_span_seconds=(
+                        max(0, args.sse_connections - 1) / args.sse_open_rate
+                        if args.sse_open_rate > 0
+                        else 0.0
+                    ),
                 )
                 done, pending = await asyncio.wait(
                     {polling_task, sse_task},

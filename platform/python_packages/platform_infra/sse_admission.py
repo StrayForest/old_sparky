@@ -12,9 +12,9 @@ from typing import Literal
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.security import session_token_digest
 
-# The proof is intentionally shorter than the 10-minute stream lifetime. Five
-# minutes also covers a bounded 10k opening wave without forcing clients to
-# perform another database-backed workspace request midway through the wave.
+# The proof is intentionally short-lived and only authorizes a new admission.
+# It never defines the lifetime of an established stream: the stream keeps its
+# renewable lease and periodic authoritative access revalidation instead.
 SSE_ADMISSION_TICKET_TTL_SECONDS = 300
 SSE_ADMISSION_TICKET_CLOCK_SKEW_SECONDS = 5
 SSE_ADMISSION_TICKET_PREFIX = "platform-sse-ticket-v1"
