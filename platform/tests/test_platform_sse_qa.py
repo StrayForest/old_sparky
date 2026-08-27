@@ -13,6 +13,7 @@ from tools.platform_cleanup_retained_matrix import load_matrix_manifest
 from tools.platform_sse_qa import (
     SSE_EVENT_TYPE,
     SSE_HOLD_MAX_SECONDS,
+    NormalApiMetrics,
     SseMetrics,
     _close_sse_stream_context,
     combined_profile_timeout_seconds,
@@ -26,6 +27,27 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class PlatformSseQaTests(unittest.TestCase):
+    def test_normal_api_metrics_keep_kind_and_latency_accounting(self) -> None:
+        metrics = NormalApiMetrics()
+        metrics.record_success(status_code=200, elapsed_ms=12.0, kind="workspace")
+        metrics.record_success(status_code=304, elapsed_ms=18.0, kind="workspace")
+        metrics.record_error(
+            RuntimeError("temporary API error"),
+            path="/auth/session",
+            elapsed_ms=25.0,
+            kind="auth_session",
+        )
+
+        result = metrics.summary()
+
+        self.assertEqual(result["attempts"], 3)
+        self.assertEqual(result["successes"], 2)
+        self.assertEqual(result["errors"], 1)
+        self.assertEqual(result["statuses"], {"200": 1, "304": 1})
+        self.assertEqual(result["kinds"]["workspace"], 2)
+        self.assertEqual(result["kinds"]["auth_session:error"], 1)
+        self.assertEqual(result["error_samples"][0]["path"], "/auth/session")
+
     def test_metrics_record_admission_fanout_and_latency_percentiles(self) -> None:
         metrics = SseMetrics()
         for _ in range(4):
@@ -324,6 +346,11 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('RLIMIT_NOFILE', sse_source)
         self.assertIn('"combined_polling_requests_without_errors",', sse_source)
         self.assertIn('"combined_sse_no_unexpected_errors",', sse_source)
+        self.assertIn("run_normal_api_traffic", sse_source)
+        self.assertIn('"combined_normal_api_without_errors",', sse_source)
+        self.assertIn('"invite_create"', sse_source)
+        self.assertIn('"auth_session"', sse_source)
+        self.assertIn("args.ready_file", sse_source)
         self.assertIn("polling_request_gate = asyncio.Semaphore", sse_source)
         self.assertIn('"request_concurrency"', sse_source)
         self.assertIn("return_when=asyncio.ALL_COMPLETED", sse_source)
@@ -334,3 +361,43 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("if SCRIPT_PATH in args and run_id in args:", abort)
         self.assertIn("ABORT_EVIDENCE_EXPORT=", abort)
         self.assertIn("server-observability.log", abort)
+
+    def test_failure_recovery_contour_is_allowlisted_and_exactly_cleaned(self) -> None:
+        supervisor = (
+            REPO_ROOT
+            / "platform/tools/platform_production_sse_failure_recovery_qa.sh"
+        ).read_text()
+        workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-sse-failure-recovery.yml"
+        ).read_text()
+        publisher = (
+            REPO_ROOT / "platform/tools/platform_sse_publish_probe.py"
+        ).read_text()
+
+        for fault in (
+            "api-worker-restart",
+            "api-restart",
+            "redis-hiccup",
+            "nginx-reload",
+            "mass-disconnect",
+        ):
+            self.assertIn(fault, supervisor)
+            self.assertIn(fault, workflow)
+        self.assertIn("RUN-PRODUCTION-SSE-FAILURE-RECOVERY", supervisor)
+        self.assertIn("flock -n 9", supervisor)
+        self.assertIn("systemctl restart deadlock-api.service", supervisor)
+        self.assertIn("systemctl restart deadlock-worker.service", supervisor)
+        self.assertIn("systemctl restart redis-server.service", supervisor)
+        self.assertIn("systemctl reload nginx.service", supervisor)
+        self.assertIn("platform_sse_publish_probe.py", supervisor)
+        self.assertIn('"recovery_subscribers"', supervisor)
+        self.assertIn("PRODUCTION_SSE_FAILURE_RECOVERY_PASSED=1", supervisor)
+        self.assertNotIn("systemctl stop", supervisor)
+        self.assertNotIn("eval ", supervisor)
+        self.assertIn("if: ${{ always() && needs.failure-recovery.result != 'skipped' }}", workflow)
+        self.assertIn("platform_production_retained_load_cleanup_qa.sh", workflow)
+        self.assertIn("DELETE-PRODUCTION-RETAINED-LOAD", workflow)
+        self.assertIn("actions/upload-artifact@v6", workflow)
+        self.assertIn("--tournament-id", publisher)
+        self.assertIn("bracket_channel", publisher)

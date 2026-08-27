@@ -55,6 +55,10 @@ SSE_FIXTURE_TIMEOUT_SECONDS = 90.0
 # boundary while keeping an operator mistake bounded to fifteen minutes.
 SSE_HOLD_MAX_SECONDS = 900.0
 SSE_PLATEAU_PROBE_CONNECTIONS = 10
+NORMAL_TRAFFIC_USER_LIMIT = 32
+NORMAL_TRAFFIC_REQUEST_CONCURRENCY = 8
+NORMAL_TRAFFIC_INTERVAL_SECONDS = 15.0
+NORMAL_TRAFFIC_MUTATION_INTERVAL_SECONDS = 30.0
 # The browser keeps its own immediate-polling/full-jitter recovery policy. This
 # is only the retained-load diagnostic ceiling: public edge queueing must be
 # observable for a full minute before the harness classifies an attempt as
@@ -382,6 +386,70 @@ class SseMetrics:
         }
 
 
+class NormalApiMetrics:
+    """Bounded metrics for ordinary authenticated traffic during SSE load."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.successes = 0
+        self.errors = 0
+        self.statuses: Counter[str] = Counter()
+        self.kinds: Counter[str] = Counter()
+        self.latencies: list[float] = []
+        self.error_samples: list[dict[str, Any]] = []
+
+    def record_success(
+        self,
+        *,
+        status_code: int,
+        elapsed_ms: float,
+        kind: str,
+    ) -> None:
+        self.attempts += 1
+        self.successes += 1
+        self.statuses[str(status_code)] += 1
+        self.kinds[kind] += 1
+        self.latencies.append(elapsed_ms)
+
+    def record_error(
+        self,
+        error: BaseException,
+        *,
+        path: str,
+        elapsed_ms: float,
+        kind: str,
+    ) -> None:
+        self.attempts += 1
+        self.errors += 1
+        self.kinds[f"{kind}:error"] += 1
+        if len(self.error_samples) < 25:
+            self.error_samples.append(
+                {
+                    "type": type(error).__name__,
+                    "message": str(error)[:300],
+                    "path": path,
+                    "kind": kind,
+                    "elapsed_ms": round(elapsed_ms, 2),
+                }
+            )
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "attempts": self.attempts,
+            "successes": self.successes,
+            "errors": self.errors,
+            "statuses": dict(sorted(self.statuses.items())),
+            "kinds": dict(sorted(self.kinds.items())),
+            "latency_ms": {
+                "count": len(self.latencies),
+                "p50": percentile(self.latencies, 50),
+                "p95": percentile(self.latencies, 95),
+                "p99": percentile(self.latencies, 99),
+            },
+            "error_samples": list(self.error_samples),
+        }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run retained SSE-only or polling+SSE production QA."
@@ -395,6 +463,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-file", type=Path, default=None)
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
     parser.add_argument("--summary-path", type=Path, default=None)
+    parser.add_argument(
+        "--ready-file",
+        type=Path,
+        default=None,
+        help="Write a private readiness marker after fixture/ticket setup and before opening SSE.",
+    )
     parser.add_argument("--control-email", required=True)
     parser.add_argument("--target-sha", default=None)
     parser.add_argument("--github-run-id", type=int, default=None)
@@ -1005,6 +1079,131 @@ async def run_connections(
                 await sse_client.aclose()
 
 
+async def run_normal_api_traffic(
+    qa: ProductionQa,
+    api_client: httpx.AsyncClient,
+    users: list[dict[str, Any]],
+    *,
+    tournament_slug: str,
+    stop_event: asyncio.Event,
+    metrics: NormalApiMetrics,
+) -> None:
+    """Keep a bounded ordinary-user workload beside persistent SSE.
+
+    This is intentionally small and deterministic. The browser-polling tasks
+    already supply the large conditional workspace population; this companion
+    workload exercises authenticated/session/profile reads and one
+    organizer-owned, immediately reversible invite mutation. It keeps normal
+    application traffic visible in the mixed-load decision without turning
+    the test into a second uncontrolled burst.
+    """
+
+    sampled_users = users[: min(NORMAL_TRAFFIC_USER_LIMIT, len(users))]
+    if not sampled_users:
+        return
+    request_gate = asyncio.Semaphore(NORMAL_TRAFFIC_REQUEST_CONCURRENCY)
+    slug = quote(tournament_slug, safe="")
+    workspace_path = (
+        f"/tournaments/{slug}/workspace?participants_limit=0"
+        "&participants_offset=0&workspace_view=detail&include_current_user=false"
+    )
+    bracket_path = f"/tournaments/{slug}/bracket?teams_view=summary"
+
+    async def request(
+        user: dict[str, Any],
+        method: str,
+        path: str,
+        *,
+        kind: str,
+        expected: int | tuple[int, ...] = 200,
+        json_payload: dict[str, Any] | None = None,
+    ) -> Any | None:
+        started = time.monotonic()
+        try:
+            async with request_gate:
+                payload, status_code, _headers = await qa.request_as(
+                    api_client,
+                    user,
+                    method,
+                    path,
+                    expected=expected,
+                    json_payload=json_payload,
+                    return_response_meta=True,
+                )
+        except Exception as exc:
+            metrics.record_error(
+                exc,
+                path=path,
+                elapsed_ms=(time.monotonic() - started) * 1000,
+                kind=kind,
+            )
+            return None
+        metrics.record_success(
+            status_code=status_code,
+            elapsed_ms=(time.monotonic() - started) * 1000,
+            kind=kind,
+        )
+        return payload
+
+    async def read_user(user: dict[str, Any]) -> None:
+        for method, path, kind, expected in (
+            ("GET", "/auth/session", "auth_session", 200),
+            ("GET", "/users/me", "user", 200),
+            ("GET", "/profiles/me", "profile", 200),
+            ("GET", "/profiles/me/deadlock", "deadlock_profile", 200),
+            ("GET", "/profiles/me/deadlock/dream-slots", "dream_slots", 200),
+            (
+                "GET",
+                "/tournaments?limit=9&offset=0&open_registration=true",
+                "tournament_list",
+                200,
+            ),
+            ("GET", f"/tournaments/{slug}", "tournament_detail", 200),
+            ("GET", workspace_path, "workspace", (200, 304)),
+            ("GET", bracket_path, "bracket", (200, 304)),
+        ):
+            await request(
+                user,
+                method,
+                path,
+                kind=kind,
+                expected=expected,
+            )
+
+    organizer = sampled_users[0]
+    deadline = time.monotonic()
+    next_mutation_at = deadline
+    while not stop_event.is_set():
+        await asyncio.gather(*(read_user(user) for user in sampled_users))
+        now = time.monotonic()
+        if now >= next_mutation_at:
+            invite = await request(
+                organizer,
+                "POST",
+                f"/tournaments/{slug}/invites",
+                kind="invite_create",
+                expected=201,
+                json_payload={"note": f"AS20 probe {qa.marker}", "max_uses": 1},
+            )
+            invite_id = invite.get("id") if isinstance(invite, dict) else None
+            if invite_id:
+                await request(
+                    organizer,
+                    "DELETE",
+                    f"/tournaments/{slug}/invites/{quote(str(invite_id), safe='')}",
+                    kind="invite_revoke",
+                    expected=204,
+                )
+            next_mutation_at = now + NORMAL_TRAFFIC_MUTATION_INTERVAL_SECONDS
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=NORMAL_TRAFFIC_INTERVAL_SECONDS,
+            )
+        except TimeoutError:
+            continue
+
+
 def combined_profile_timeout_seconds(
     *,
     polling_duration_seconds: float,
@@ -1115,6 +1314,23 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 "issued": True,
                 "scope": "anonymous-public",
             }
+        if args.ready_file is not None:
+            args.ready_file.parent.mkdir(parents=True, exist_ok=True)
+            args.ready_file.write_text(
+                json.dumps(
+                    {
+                        "ready": True,
+                        "marker": qa.marker,
+                        "mode": args.mode,
+                        "tournament_id": str(tournaments[0]["id"]),
+                        "tournament_slug": str(tournaments[0]["slug"]),
+                        "written_at": datetime.now(UTC).isoformat(),
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         if args.mode == "sse":
             with qa.phase("sse_only_run"):
                 sse_report = await run_connections(
@@ -1183,6 +1399,8 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             with qa.phase("combined_sse_and_polling"):
                 inflight: set[str] = set()
                 polling_request_gate = asyncio.Semaphore(max(1, min(128, qa.concurrency)))
+                normal_metrics = NormalApiMetrics()
+                normal_stop_event = asyncio.Event()
 
                 async def run_polling() -> None:
                     await asyncio.gather(
@@ -1219,6 +1437,16 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                         http_max_connections=max(args.http_max_connections, args.sse_connections),
                     )
                 )
+                normal_api_task = asyncio.create_task(
+                    run_normal_api_traffic(
+                        qa,
+                        api_client,
+                        users,
+                        tournament_slug=str(tournaments[0]["slug"]),
+                        stop_event=normal_stop_event,
+                        metrics=normal_metrics,
+                    )
+                )
                 combined_timeout = combined_profile_timeout_seconds(
                     polling_duration_seconds=args.combined_polling_duration,
                     polling_open_stagger_seconds=args.combined_polling_open_stagger,
@@ -1230,11 +1458,16 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                         else 0.0
                     ),
                 )
-                done, pending = await asyncio.wait(
-                    {polling_task, sse_task},
-                    timeout=combined_timeout,
-                    return_when=asyncio.ALL_COMPLETED,
-                )
+                try:
+                    done, pending = await asyncio.wait(
+                        {polling_task, sse_task},
+                        timeout=combined_timeout,
+                        return_when=asyncio.ALL_COMPLETED,
+                    )
+                finally:
+                    normal_stop_event.set()
+                    await asyncio.gather(normal_api_task, return_exceptions=True)
+                qa.report["normal_api"] = normal_metrics.summary()
                 if pending:
                     for task in pending:
                         task.cancel()
@@ -1260,6 +1493,12 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 "combined_polling_requests_without_errors",
                 qa.report["polling"]["errors"] == 0,
                 qa.report["polling"],
+                fatal=True,
+            )
+            qa.scenario(
+                "combined_normal_api_without_errors",
+                qa.report["normal_api"]["errors"] == 0,
+                qa.report["normal_api"],
                 fatal=True,
             )
             qa.scenario(
@@ -1408,6 +1647,7 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
         }
         if polling
         else None,
+        "normal_api": report.get("normal_api"),
         "performance": report.get("performance", {}).get("bottleneck_summary", {}),
         "fatal_error": report.get("fatal_error"),
         "fatal_traceback": report.get("fatal_traceback"),

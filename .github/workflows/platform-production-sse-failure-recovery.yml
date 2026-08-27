@@ -1,0 +1,285 @@
+name: Platform production SSE failure and recovery QA
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RUN-PRODUCTION-SSE-FAILURE-RECOVERY to inject one bounded fault"
+        required: true
+        type: string
+      control_email:
+        description: "Existing account used by the retained SSE fixture"
+        required: true
+        default: "aleksei.lisitsin1@gmail.com"
+        type: string
+      fault:
+        description: "One allowlisted production failure/recovery scenario"
+        required: true
+        default: "nginx-reload"
+        type: choice
+        options:
+          - nginx-reload
+          - api-worker-restart
+          - api-restart
+          - redis-hiccup
+          - mass-disconnect
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-sse-failure-recovery-v1
+  cancel-in-progress: false
+
+jobs:
+  failure-recovery:
+    name: Bounded production SSE failure/recovery scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      QA_CONFIRMATION: ${{ inputs.confirmation }}
+      CONTROL_EMAIL: ${{ inputs.control_email }}
+      QA_FAULT: ${{ inputs.fault }}
+      TARGET_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Validate explicit production fault confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Production failure QA must run from the reviewed dev branch." >&2; exit 1; }
+          test "$QA_CONFIRMATION" = "RUN-PRODUCTION-SSE-FAILURE-RECOVERY" \
+            || { echo "Refusing production fault injection without exact confirmation." >&2; exit 1; }
+          case "$QA_FAULT" in
+            nginx-reload|api-worker-restart|api-restart|redis-hiccup|mass-disconnect) ;;
+            *) echo "Unsupported production failure scenario." >&2; exit 1 ;;
+          esac
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
+          /usr/bin/python3 - "$CONTROL_EMAIL" <<'PY'
+          import re
+          import sys
+
+          if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", sys.argv[1]):
+              raise SystemExit("control_email is invalid")
+          PY
+
+      - name: Configure production SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-sse-recovery-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan"
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1"
+          test "$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Run the bounded failure/recovery scenario
+        id: run-recovery
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_log="$RUNNER_TEMP/production-sse-recovery-remote.log"
+          ssh_output_file="$RUNNER_TEMP/production-sse-recovery-ssh-output"
+          set +e
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$CONTROL_EMAIL" "$GITHUB_RUN_ID" "$QA_FAULT" \
+            > "$ssh_output_file" 2>&1 <<'REMOTE'
+          set -Eeuo pipefail
+          sudo -n -- /root/old_sparky/platform/tools/platform_production_sse_failure_recovery_qa.sh "$@"
+          REMOTE
+          remote_status=$?
+          set -e
+          cp "$ssh_output_file" "$remote_log"
+          cat "$remote_log"
+          echo "remote_exit_code=$remote_status" >> "$GITHUB_OUTPUT"
+
+          export_dir="$(sed -n 's/^PRODUCTION_RETAINED_LOAD_MATRIX_EXPORT=//p' "$remote_log" | tail -n 1)"
+          if [[ -n "$export_dir" ]]; then
+            [[ "$export_dir" =~ ^/tmp/old-sparky-production-sse-recovery-[0-9]+$ ]]
+            install -d -m 700 "$RUNNER_TEMP/production-sse-recovery-artifacts"
+            for artifact in matrix-summary.json matrix.log recovery-summary.json qa-command.log server-observability.log; do
+              scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+                -i "$SSH_DIR/id_ed25519" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/$artifact" \
+                "$RUNNER_TEMP/production-sse-recovery-artifacts/$artifact"
+            done
+          fi
+          exit "$remote_status"
+
+      - name: Publish failure/recovery artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: platform-production-sse-failure-recovery-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/production-sse-recovery-artifacts/matrix-summary.json
+            ${{ runner.temp }}/production-sse-recovery-artifacts/matrix.log
+            ${{ runner.temp }}/production-sse-recovery-artifacts/recovery-summary.json
+            ${{ runner.temp }}/production-sse-recovery-artifacts/qa-command.log
+            ${{ runner.temp }}/production-sse-recovery-artifacts/server-observability.log
+            ${{ runner.temp }}/production-sse-recovery-remote.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write failure/recovery summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          summary="$RUNNER_TEMP/production-sse-recovery-artifacts/recovery-summary.json"
+          if [[ ! -s "$summary" ]]; then
+            echo "### Production SSE failure/recovery QA" >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "No recovery summary was exported from the production server." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          /usr/bin/python3 - "$summary" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print("### Production SSE failure/recovery QA")
+          print()
+          print(f"- Fault: **{payload.get('fault')}**")
+          print(f"- Recovery gate: **{'passed' if payload.get('passed') else 'failed'}**")
+          print(f"- Initial SSE: {payload.get('initial_connected')}/{payload.get('target_connections')}")
+          print(f"- Reconnects: {payload.get('sse_reconnects')}")
+          print(f"- Ready probes after fault: {payload.get('polling_2xx_after_fault')}")
+          print(f"- Redis subscribers after fault: {payload.get('recovery_subscribers')}")
+          print(f"- QA exit code: {payload.get('qa_exit_code')}")
+          PY
+
+      - name: Fail if recovery was not verified
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.run-recovery.outputs.remote_exit_code }}" = "0" \
+            || { echo "Production SSE failure/recovery gate failed." >&2; exit 1; }
+          /usr/bin/python3 - "$RUNNER_TEMP/production-sse-recovery-artifacts/recovery-summary.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          if json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("passed") is not True:
+              raise SystemExit("recovery-summary.json does not report passed=true")
+          PY
+
+  cleanup:
+    name: Exact cleanup of the failure/recovery fixture
+    needs: failure-recovery
+    if: ${{ always() && needs.failure-recovery.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      TARGET_SHA: ${{ github.sha }}
+      CONTROL_EMAIL: ${{ inputs.control_email }}
+
+    steps:
+      - name: Configure production SSH for exact cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-sse-recovery-cleanup-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1"
+          test "$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Clean exact failure/recovery fixture
+        id: cleanup
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_log="$RUNNER_TEMP/production-sse-recovery-cleanup-remote.log"
+          set +e
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_cleanup_qa.sh \
+              DELETE-PRODUCTION-RETAINED-LOAD "$TARGET_SHA" "$GITHUB_RUN_ID" "$CONTROL_EMAIL" "$GITHUB_RUN_ID" \
+            > "$remote_log" 2>&1
+          remote_status=$?
+          set -e
+          cat "$remote_log"
+          echo "remote_exit_code=$remote_status" >> "$GITHUB_OUTPUT"
+
+          export_dir="$(sed -n 's/^PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=//p' "$remote_log" | tail -n 1)"
+          if [[ -n "$export_dir" ]]; then
+            [[ "$export_dir" =~ ^/tmp/old-sparky-production-retained-cleanup-[0-9]+$ ]]
+            install -d -m 700 "$RUNNER_TEMP/production-sse-recovery-cleanup-artifacts"
+            scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/cleanup-summary.json" \
+              "$RUNNER_TEMP/production-sse-recovery-cleanup-artifacts/cleanup-summary.json"
+          fi
+          exit "$remote_status"
+
+      - name: Publish cleanup artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: platform-production-sse-failure-recovery-cleanup-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/production-sse-recovery-cleanup-artifacts/cleanup-summary.json
+            ${{ runner.temp }}/production-sse-recovery-cleanup-remote.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail if cleanup was not verified
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.cleanup.outputs.remote_exit_code }}" = "0"
+          grep -q '^PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1$' \
+            "$RUNNER_TEMP/production-sse-recovery-cleanup-remote.log"
