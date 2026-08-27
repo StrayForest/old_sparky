@@ -118,6 +118,12 @@ WRITE_BURST_JOIN_SPREAD_SECONDS = (10.0, 30.0, 60.0)
 WRITE_BURST_READY_SPREAD_SECONDS = (5.0, 10.0, 30.0)
 WRITE_BURST_MULTI_SPREAD_SECONDS = 30.0
 WRITE_BURST_MULTI_START_STAGGER_SECONDS = 1.0
+RESPONSE_DIAGNOSTIC_BODY_LIMIT = 4096
+RESPONSE_DIAGNOSTIC_SAMPLE_LIMIT = 25
+SENSITIVE_RESPONSE_HEADER_RE = re.compile(
+    r"(?:authorization|cookie|set-cookie|token|secret|password|credential|signature)",
+    re.IGNORECASE,
+)
 
 
 def qa_display_name(marker: str, label: str) -> str:
@@ -277,6 +283,34 @@ def load_env_file(path: Path) -> None:
 
 class QaFailure(RuntimeError):
     pass
+
+
+def response_diagnostics(
+    response: httpx.Response,
+    *,
+    method: str,
+    path: str,
+) -> dict[str, Any]:
+    """Return bounded, secret-safe evidence for an unexpected HTTP response."""
+
+    headers: dict[str, str] = {}
+    for name, value in response.headers.items():
+        headers[name.lower()] = (
+            "<redacted>"
+            if SENSITIVE_RESPONSE_HEADER_RE.search(name)
+            else value[:500]
+        )
+    return {
+        "captured_at": datetime.now(UTC).isoformat(),
+        "method": method,
+        "path": path.split("?", 1)[0],
+        "status": response.status_code,
+        "headers": headers,
+        "body": response.content[:RESPONSE_DIAGNOSTIC_BODY_LIMIT].decode(
+            "utf-8",
+            errors="replace",
+        ),
+    }
 
 
 def percentile(values: list[float], percent: float) -> float | None:
@@ -2020,6 +2054,7 @@ class ProductionQa:
             "retained_participant": None,
             "rostered_participant": None,
             "control_participant": None,
+            "http_failure_diagnostics": [],
         }
 
     def scenario(
@@ -2119,9 +2154,10 @@ class ProductionQa:
             },
         }
 
-    async def new_client(self) -> httpx.AsyncClient:
+    async def new_client(self, origin: str | None = None) -> httpx.AsyncClient:
+        client_origin = (origin or self.origin).rstrip("/")
         client = httpx.AsyncClient(
-            base_url=self.api_origin,
+            base_url=f"{client_origin}/api/v1",
             follow_redirects=True,
             timeout=httpx.Timeout(self.http_timeout),
             limits=httpx.Limits(
@@ -2178,9 +2214,14 @@ class ProductionQa:
                     response_bytes=response_bytes,
                 )
         if response.status_code != expected:
+            diagnostics = response_diagnostics(response, method=method, path=path)
+            failure_samples = self.report.setdefault("http_failure_diagnostics", [])
+            if len(failure_samples) < RESPONSE_DIAGNOSTIC_SAMPLE_LIMIT:
+                failure_samples.append(diagnostics)
             raise QaFailure(
                 f"{method} {path}: expected {expected}, got {response.status_code}: "
-                f"{response.text[:1000]}"
+                f"{response.text[:1000]} diagnostics="
+                f"{json.dumps(diagnostics, ensure_ascii=False, separators=(',', ':'))}"
             )
         if not response.content:
             return None
@@ -2261,9 +2302,14 @@ class ProductionQa:
             else set(expected)
         )
         if response.status_code not in expected_statuses:
+            diagnostics = response_diagnostics(response, method=method, path=path)
+            failure_samples = self.report.setdefault("http_failure_diagnostics", [])
+            if len(failure_samples) < RESPONSE_DIAGNOSTIC_SAMPLE_LIMIT:
+                failure_samples.append(diagnostics)
             raise QaFailure(
                 f"{method} {path} as {user['label']}: expected {sorted(expected_statuses)}, got "
-                f"{response.status_code}: {response.text[:1000]}"
+                f"{response.status_code}: {response.text[:1000]} diagnostics="
+                f"{json.dumps(diagnostics, ensure_ascii=False, separators=(',', ':'))}"
             )
         payload = response.json() if response.content else None
         if return_response_meta:
@@ -2308,11 +2354,18 @@ class ProductionQa:
                     response_bytes=response_bytes,
                 )
         if response.status_code != 200:
-            request_id = response.headers.get("x-request-id") or response.headers.get("cf-ray")
+            diagnostics = response_diagnostics(
+                response,
+                method="GET",
+                path="/auth/csrf",
+            )
+            failure_samples = self.report.setdefault("http_failure_diagnostics", [])
+            if len(failure_samples) < RESPONSE_DIAGNOSTIC_SAMPLE_LIMIT:
+                failure_samples.append(diagnostics)
             raise QaFailure(
                 f"GET /auth/csrf as {user['label']}: expected 200, got "
-                f"{response.status_code}: {response.text[:1000]} "
-                f"request_id={request_id or 'missing'}"
+                f"{response.status_code}: {response.text[:1000]} diagnostics="
+                f"{json.dumps(diagnostics, ensure_ascii=False, separators=(',', ':'))}"
             )
         try:
             csrf_token = str(response.json()["csrf_token"])
@@ -2829,6 +2882,38 @@ class ProductionQa:
         request_semaphore = semaphore or asyncio.Semaphore(self.concurrency)
 
         async def run_one(item: dict[str, Any]) -> None:
+            async with request_semaphore:
+                await task(item)
+
+        await asyncio.gather(*(run_one(item) for item in items))
+
+    async def bounded_each_at_rate(
+        self,
+        items: list[dict[str, Any]],
+        task,
+        *,
+        rate_per_second: float,
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
+        """Start bounded requests at a fixed rate instead of in one burst."""
+
+        if rate_per_second <= 0:
+            await self.bounded_each(items, task, semaphore=semaphore)
+            return
+        request_semaphore = semaphore or asyncio.Semaphore(self.concurrency)
+        launch_lock = asyncio.Lock()
+        next_launch_at = time.monotonic()
+        interval = 1.0 / rate_per_second
+
+        async def run_one(item: dict[str, Any]) -> None:
+            nonlocal next_launch_at
+            async with launch_lock:
+                now = time.monotonic()
+                launch_at = max(now, next_launch_at)
+                next_launch_at = launch_at + interval
+            delay = launch_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
             async with request_semaphore:
                 await task(item)
 

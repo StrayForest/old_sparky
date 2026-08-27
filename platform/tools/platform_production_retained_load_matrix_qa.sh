@@ -34,8 +34,8 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# < 5 || $# > 21 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-open-rate sse-capacity-limit sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local] [ticket|legacy] [bracket|ready-check]]" >&2
+if (( $# < 5 || $# > 22 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-open-rate sse-capacity-limit sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local] [ticket|legacy] [bracket|ready-check] [public|origin-local fixture-origin]]" >&2
   exit 2
 fi
 
@@ -59,6 +59,7 @@ combined_polling_open_stagger=300
 sse_origin_mode=public
 sse_admission_mode=ticket
 sse_scope=bracket
+sse_fixture_origin_mode=public
 # The controlled high-cap contour is explicitly invoked with
 # sse_scope=ready-check; the default remains the compatibility bracket scope.
 
@@ -93,6 +94,13 @@ case "$profile" in
       sse_origin_mode="${19:-public}"
       sse_admission_mode="${20:-ticket}"
       sse_scope="${21:-bracket}"
+      sse_fixture_origin_mode="${22:-public}"
+    fi
+    if [[ "$sse_scope" == "ready-check" && $# -lt 22 ]]; then
+      # Older direct invocations of the Ready Check profile get the safe
+      # split-transport default instead of sending fixture/control bursts
+      # through the public Cloudflare contour.
+      sse_fixture_origin_mode=origin-local
     fi
     [[ "$sse_admission_mode" == "ticket" || "$sse_admission_mode" == "legacy" ]] || {
       echo "SSE admission mode must be ticket or legacy." >&2
@@ -108,6 +116,10 @@ case "$profile" in
     fi
     [[ "$sse_origin_mode" == "public" || "$sse_origin_mode" == "origin-local" ]] || {
       echo "SSE origin mode must be public or origin-local." >&2
+      exit 1
+    }
+    [[ "$sse_fixture_origin_mode" == "public" || "$sse_fixture_origin_mode" == "origin-local" ]] || {
+      echo "SSE fixture origin mode must be public or origin-local." >&2
       exit 1
     }
     if [[ "$sse_origin_mode" == "origin-local" && "$profile" != "sse" ]]; then
@@ -517,6 +529,10 @@ else
   if [[ "$sse_origin_mode" == "origin-local" ]]; then
     sse_origin="http://127.0.0.1:8010"
   fi
+  fixture_origin="$EXPECTED_ORIGIN"
+  if [[ "$sse_scope" == "ready-check" && "$sse_fixture_origin_mode" == "origin-local" ]]; then
+    fixture_origin="http://127.0.0.1:8010"
+  fi
   # Fixture creation performs authenticated CSRF/session reads. Keep that
   # setup below the API pool budget; SSE opening pressure is controlled
   # independently by --sse-open-concurrency below.
@@ -539,6 +555,7 @@ else
     --env-file "$RUNTIME_ROOT/shared/.env.platform" \
     --origin "$sse_origin" \
     --request-origin "$EXPECTED_ORIGIN" \
+    --fixture-origin "$fixture_origin" \
     --mode "$profile" \
     --control-email "$control_email" \
     --target-sha "$target_sha" \

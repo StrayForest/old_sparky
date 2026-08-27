@@ -85,6 +85,14 @@ on:
         options:
           - public
           - origin-local
+      sse_fixture_origin_mode:
+        description: "Ready Check fixture/control target; origin-local keeps setup and start off the public edge"
+        required: true
+        default: "origin-local"
+        type: choice
+        options:
+          - origin-local
+          - public
       sse_admission_mode:
         description: "SSE admission path; signed ticket removes PostgreSQL from opening, legacy is the control"
         required: true
@@ -146,6 +154,7 @@ jobs:
       QA_SSE_EVENT_COUNT: ${{ inputs.sse_event_count }}
       QA_SSE_EVENT_INTERVAL: ${{ inputs.sse_event_interval }}
       QA_SSE_ORIGIN_MODE: ${{ inputs.sse_origin_mode }}
+      QA_SSE_FIXTURE_ORIGIN_MODE: ${{ inputs.sse_fixture_origin_mode }}
       QA_SSE_ADMISSION_MODE: ${{ inputs.sse_admission_mode }}
       QA_SSE_SCOPE: ${{ inputs.sse_scope }}
       QA_COMBINED_POLLING_DURATION: ${{ inputs.combined_polling_duration }}
@@ -174,7 +183,8 @@ jobs:
             "$QA_SSE_RECONNECT_CYCLES" "$QA_SSE_USERS_PER_TOURNAMENT" \
             "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
             "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" \
-            "$QA_SSE_ORIGIN_MODE" "$QA_SSE_ADMISSION_MODE" "$QA_SSE_SCOPE" <<'PY'
+            "$QA_SSE_ORIGIN_MODE" "$QA_SSE_ADMISSION_MODE" "$QA_SSE_SCOPE" \
+            "$QA_SSE_FIXTURE_ORIGIN_MODE" <<'PY'
           import re
           import sys
 
@@ -197,6 +207,7 @@ jobs:
               sse_origin_mode,
               sse_admission_mode,
               sse_scope,
+              sse_fixture_origin_mode,
           ) = sys.argv[1:]
           if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email):
               raise SystemExit("control_email is invalid")
@@ -204,6 +215,8 @@ jobs:
               raise SystemExit("concurrency must be an integer from 1 to 256")
           if sse_origin_mode not in {"public", "origin-local"}:
               raise SystemExit("sse_origin_mode must be public or origin-local")
+          if sse_fixture_origin_mode not in {"public", "origin-local"}:
+              raise SystemExit("sse_fixture_origin_mode must be public or origin-local")
           if sse_admission_mode not in {"ticket", "legacy"}:
               raise SystemExit("sse_admission_mode must be ticket or legacy")
           if sse_scope not in {"bracket", "ready-check"}:
@@ -301,7 +314,7 @@ jobs:
               "$QA_SSE_OPEN_RATE" "$QA_SSE_CAPACITY_LIMIT" "$QA_SSE_RECONNECT_CYCLES" \
               "$QA_SSE_USERS_PER_TOURNAMENT" "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
               "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" "$QA_SSE_ORIGIN_MODE" \
-              "$QA_SSE_ADMISSION_MODE" "$QA_SSE_SCOPE" \
+              "$QA_SSE_ADMISSION_MODE" "$QA_SSE_SCOPE" "$QA_SSE_FIXTURE_ORIGIN_MODE" \
             > "$ssh_output_file" 2>&1 <<'REMOTE'
           set -Eeuo pipefail
           confirmation="$1"

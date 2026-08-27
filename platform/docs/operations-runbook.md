@@ -313,6 +313,16 @@ capacity claim; bracket high-cap overrides remain loopback-only. Follow the
 ordered protocol in
 [`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md).
 
+For a Ready Check run, keep `sse_origin_mode=public` so `/ready-check/events`
+is measured through Cloudflare and keep `sse_fixture_origin_mode=origin-local`
+so user creation, joins and the organizer's `ready-check/start` control call do
+not create an unpaced public setup burst. The harness still sends every
+`/ready-check/agenda` request through the public origin at 25 requests per
+second. The report records the three transports separately and preserves
+bounded, secret-safe diagnostics for every unexpected HTTP response, including
+Cloudflare correlation headers and a short response body. This split is a
+measurement control; it does not bypass Cloudflare for the SSE stream.
+
 The measured pool baseline is a reviewed runtime configuration, not a load-test
 CLI override. During the planned production configuration window, apply only
 the three changed connection keys to the root-only canonical env and let the renderer

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,15 +11,18 @@ from uuid import uuid4
 import httpx
 
 from tools.platform_cleanup_retained_matrix import load_matrix_manifest
+from tools.platform_production_qa import response_diagnostics
 from tools.platform_sse_qa import (
     SSE_EVENT_TYPE,
     SSE_HOLD_MAX_SECONDS,
+    READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND,
     NormalApiMetrics,
     SseMetrics,
     _close_sse_stream_context,
     combined_profile_timeout_seconds,
     max_sse_open_timeout_seconds,
     plateau_probe_count,
+    ready_check_fixture_schedule,
     sse_open_delay_seconds,
     summary,
 )
@@ -28,6 +32,51 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class PlatformSseQaTests(unittest.TestCase):
+    def test_unexpected_response_diagnostics_keep_edge_headers_and_redact_secrets(self) -> None:
+        response = httpx.Response(
+            503,
+            headers={
+                "server": "cloudflare",
+                "cf-ray": "ray-test-SIN",
+                "cf-cache-status": "BYPASS",
+                "retry-after": "30",
+                "x-debug-token": "must-not-leak",
+                "set-cookie": "session=secret",
+            },
+            content=b"<html>Rate Limited</html>",
+        )
+
+        diagnostics = response_diagnostics(
+            response,
+            method="POST",
+            path="/deadlock/ready-check/start?ticket=secret",
+        )
+
+        self.assertEqual(diagnostics["status"], 503)
+        self.assertEqual(diagnostics["headers"]["cf-ray"], "ray-test-SIN")
+        self.assertEqual(diagnostics["headers"]["retry-after"], "30")
+        self.assertEqual(diagnostics["headers"]["x-debug-token"], "<redacted>")
+        self.assertEqual(diagnostics["headers"]["set-cookie"], "<redacted>")
+        self.assertNotIn("secret", diagnostics["path"])
+        self.assertEqual(diagnostics["body"], "<html>Rate Limited</html>")
+
+    def test_ready_check_fixture_window_covers_paced_agenda_setup(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        schedule = ready_check_fixture_schedule(
+            now=now,
+            user_count=10_000,
+            agenda_open_rate_per_second=READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND,
+        )
+
+        self.assertEqual(
+            schedule["ready_check_starts_at"] - now,
+            timedelta(seconds=1_000),
+        )
+        self.assertGreater(
+            schedule["ready_check_starts_at"],
+            now + timedelta(seconds=10_000 / READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND),
+        )
+
     def test_normal_api_metrics_keep_kind_and_latency_accounting(self) -> None:
         metrics = NormalApiMetrics()
         metrics.record_success(status_code=200, elapsed_ms=12.0, kind="workspace")
@@ -103,6 +152,8 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(samples[0]["body"], '{"detail":"pool timeout"}')
         self.assertEqual(samples[0]["cf_ray"], "abc123-SIN")
         self.assertEqual(samples[0]["cf_cache_status"], "DYNAMIC")
+        self.assertEqual(samples[0]["headers"]["cf-ray"], "abc123-SIN")
+        self.assertIn("captured_at", samples[0])
 
     def test_open_timeout_is_reported_as_polling_fallback_signal(self) -> None:
         metrics = SseMetrics()
@@ -339,6 +390,9 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('--concurrency "$sse_setup_concurrency"', supervisor)
         self.assertIn('--http-timeout 10', supervisor)
         self.assertIn('--request-origin "$EXPECTED_ORIGIN"', supervisor)
+        self.assertIn('--fixture-origin "$fixture_origin"', supervisor)
+        self.assertIn('sse_fixture_origin_mode=public', supervisor)
+        self.assertIn('sse_fixture_origin_mode', workflow)
         self.assertIn('--sse-open-timeout "$sse_open_timeout"', supervisor)
         self.assertIn('--sse-open-rate "$sse_open_rate"', supervisor)
         self.assertIn('--sse-capacity-limit "$sse_capacity_limit"', supervisor)
@@ -358,6 +412,10 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('default="ticket"', sse_source)
         self.assertIn('issue_public_sse_admission_ticket', sse_source)
         self.assertIn('prepare_ready_check_fixture', sse_source)
+        self.assertIn('agenda_client=public_client', sse_source)
+        self.assertIn('fixture_origin = args.fixture_origin or args.origin', sse_source)
+        self.assertIn('bounded_each_at_rate', sse_source)
+        self.assertIn('READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND = 25.0', sse_source)
         self.assertIn('"/ready-check/events"', sse_source)
         self.assertIn('"/ready-check/state"', sse_source)
         self.assertIn('probe_ready_check_overflow', sse_source)

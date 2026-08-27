@@ -56,6 +56,9 @@ READY_CHECK_FIXTURE_TIMEOUT_SECONDS = 900.0
 # enough to prove that a healthy stream survives the old 600-second rotation
 # boundary while keeping an operator mistake bounded to fifteen minutes.
 SSE_HOLD_MAX_SECONDS = 900.0
+READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND = 25.0
+READY_CHECK_FIXTURE_MIN_LEAD_SECONDS = 900.0
+READY_CHECK_FIXTURE_SETUP_GRACE_SECONDS = 600.0
 SSE_PLATEAU_PROBE_CONNECTIONS = 10
 NORMAL_TRAFFIC_USER_LIMIT = 32
 NORMAL_TRAFFIC_REQUEST_CONCURRENCY = 8
@@ -89,6 +92,31 @@ def sse_open_delay_seconds(
         reference_epoch = now_epoch if now_epoch is not None else time.time()
         scheduled_delay = max(0.0, scheduled_open_at - reference_epoch)
     return max(rate_delay, scheduled_delay)
+
+
+def ready_check_fixture_schedule(
+    *,
+    now: datetime,
+    user_count: int,
+    agenda_open_rate_per_second: float = READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND,
+) -> dict[str, datetime]:
+    """Leave enough time for paced public agenda setup before the Ready Check."""
+
+    agenda_rate = max(0.1, agenda_open_rate_per_second)
+    agenda_span_seconds = max(0, user_count) / agenda_rate
+    ready_check_lead_seconds = max(
+        READY_CHECK_FIXTURE_MIN_LEAD_SECONDS,
+        agenda_span_seconds + READY_CHECK_FIXTURE_SETUP_GRACE_SECONDS,
+    )
+    ready_check_starts_at = now + timedelta(seconds=ready_check_lead_seconds)
+    return {
+        "registration_starts_at": now + timedelta(seconds=1),
+        "registration_closes_at": ready_check_starts_at - timedelta(minutes=1),
+        "ready_check_starts_at": ready_check_starts_at,
+        "ready_check_ends_at": ready_check_starts_at + timedelta(minutes=10),
+        "captain_selection_starts_at": ready_check_starts_at + timedelta(minutes=11),
+        "starts_at": ready_check_starts_at + timedelta(minutes=12),
+    }
 
 
 async def _close_sse_stream_context(stream_context: Any | None) -> None:
@@ -348,14 +376,40 @@ class SseMetrics:
         body: bytes,
         headers: httpx.Headers,
         request_id: str | None = None,
+        method: str = "GET",
+        path: str = "/ready-check/events",
     ) -> None:
         if len(self.response_error_samples) >= self.max_error_samples:
             return
+        safe_headers = {
+            name.lower(): (
+                "<redacted>"
+                if any(
+                    marker in name.lower()
+                    for marker in (
+                        "authorization",
+                        "cookie",
+                        "set-cookie",
+                        "token",
+                        "secret",
+                        "password",
+                        "credential",
+                        "signature",
+                    )
+                )
+                else value[:500]
+            )
+            for name, value in headers.items()
+        }
         sample: dict[str, Any] = {
+            "captured_at": datetime.now(UTC).isoformat(),
+            "method": method,
+            "path": path.split("?", 1)[0],
             "status": status_code,
-            "content_type": headers.get("content-type", ""),
-            "server": headers.get("server", ""),
-            "body": body[:500].decode("utf-8", errors="replace"),
+            "headers": safe_headers,
+            "content_type": safe_headers.get("content-type", ""),
+            "server": safe_headers.get("server", ""),
+            "body": body[:4096].decode("utf-8", errors="replace"),
         }
         if request_id:
             sample["request_id"] = request_id
@@ -488,6 +542,14 @@ def parse_args() -> argparse.Namespace:
         "--request-origin",
         default=None,
         help="Origin header to send when --origin points at a direct origin address.",
+    )
+    parser.add_argument(
+        "--fixture-origin",
+        default=None,
+        help=(
+            "Origin for authenticated fixture/control requests. Ready Check "
+            "measurement remains on --origin; production runs use loopback here."
+        ),
     )
     parser.add_argument("--env-file", type=Path, default=None)
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
@@ -638,9 +700,11 @@ async def prepare_fixture(
 
 async def prepare_ready_check_fixture(
     qa: ProductionQa,
-    api_client: httpx.AsyncClient,
+    fixture_client: httpx.AsyncClient,
     *,
+    agenda_client: httpx.AsyncClient,
     sse_capacity_token: str | None,
+    agenda_open_rate_per_second: float = READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -670,15 +734,20 @@ async def prepare_ready_check_fixture(
 
     organizer = users[0]
     now = datetime.now(UTC)
-    registration_starts_at = now + timedelta(seconds=1)
-    registration_closes_at = now + timedelta(minutes=10)
-    ready_check_starts_at = now + timedelta(minutes=11)
-    ready_check_ends_at = now + timedelta(minutes=21)
-    captain_selection_starts_at = now + timedelta(minutes=22)
-    starts_at = now + timedelta(minutes=23)
+    schedule = ready_check_fixture_schedule(
+        now=now,
+        user_count=len(users),
+        agenda_open_rate_per_second=agenda_open_rate_per_second,
+    )
+    registration_starts_at = schedule["registration_starts_at"]
+    registration_closes_at = schedule["registration_closes_at"]
+    ready_check_starts_at = schedule["ready_check_starts_at"]
+    ready_check_ends_at = schedule["ready_check_ends_at"]
+    captain_selection_starts_at = schedule["captain_selection_starts_at"]
+    starts_at = schedule["starts_at"]
     with qa.phase("ready_check_tournament_setup"):
         created = await qa.request_as(
-            api_client,
+            fixture_client,
             organizer,
             "POST",
             "/tournaments",
@@ -710,7 +779,7 @@ async def prepare_ready_check_fixture(
         qa.report["tournament_slugs"] = list(qa.tournament_slugs)
         await asyncio.sleep(2.0)
         await qa.request_as(
-            api_client,
+            fixture_client,
             organizer,
             "PATCH",
             f"/tournaments/{qa.tournament_slug}/status",
@@ -721,12 +790,12 @@ async def prepare_ready_check_fixture(
 
     with qa.phase("ready_check_join_setup"):
         await qa.join_browser_polling_participants(
-            api_client,
+            fixture_client,
             tournament=tournament,
             participants=users,
         )
         await qa.request_as(
-            api_client,
+            fixture_client,
             organizer,
             "PATCH",
             f"/tournaments/{qa.tournament_slug}/status",
@@ -745,7 +814,7 @@ async def prepare_ready_check_fixture(
             else None
         )
         payload = await qa.request_as(
-            api_client,
+            agenda_client,
             user,
             "GET",
             "/ready-check/agenda",
@@ -787,7 +856,11 @@ async def prepare_ready_check_fixture(
         sse_open_at_by_user_id[str(user["id"])] = admission_open_epoch
 
     with qa.phase("ready_check_admission_tickets"):
-        await qa.bounded_each(users, issue_user_tickets)
+        await qa.bounded_each_at_rate(
+            users,
+            issue_user_tickets,
+            rate_per_second=agenda_open_rate_per_second,
+        )
 
     qa.report["sse_fixture"] = {
         "profile": "global-ready-check-cohort",
@@ -799,6 +872,9 @@ async def prepare_ready_check_fixture(
         "scheduled_streams": len(sse_open_at_by_user_id),
         "admission_open_at_min": min(sse_open_at_by_user_id.values()),
         "admission_open_at_max": max(sse_open_at_by_user_id.values()),
+        "agenda_open_rate_per_second": agenda_open_rate_per_second,
+        "fixture_origin": str(fixture_client.base_url),
+        "agenda_origin": str(agenda_client.base_url),
     }
     qa.report["planned_tournaments"] = 1
     return (
@@ -1082,6 +1158,8 @@ async def consume_sse_connection(
                             body=await response.aread(),
                             headers=response.headers,
                             request_id=request_id,
+                            method="GET",
+                            path=stream_path,
                         )
                     if cycle > 0 and deadline is not None and time.monotonic() < deadline:
                         retry_reconnect = True
@@ -1684,7 +1762,24 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
     qa.report["sse"] = {}
     qa.report["sse_admission"] = {"mode": args.sse_admission_mode, "issued": False}
     started = time.monotonic()
-    api_client = await qa.new_client()
+    public_client = await qa.new_client()
+    fixture_origin = args.fixture_origin or args.origin
+    fixture_client = (
+        await qa.new_client(origin=fixture_origin)
+        if args.sse_scope == "ready-check"
+        else public_client
+    )
+    qa.report["sse_transport"] = {
+        "measured_origin": qa.origin,
+        "fixture_origin": fixture_origin,
+        "fixture_origin_mode": (
+            "origin-local"
+            if urlsplit(fixture_origin).hostname in {"127.0.0.1", "localhost", "::1"}
+            else "public"
+        ),
+        "agenda_origin": qa.origin if args.sse_scope == "ready-check" else None,
+        "events_origin": qa.origin,
+    }
     try:
         await qa.record_preprod_run(status="running", requested_users=qa.scale_users)
         if args.sse_scope != "ready-check":
@@ -1701,14 +1796,15 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 ) = await asyncio.wait_for(
                     prepare_ready_check_fixture(
                         qa,
-                        api_client,
+                        fixture_client,
+                        agenda_client=public_client,
                         sse_capacity_token=sse_capacity_token,
                     ),
                     timeout=READY_CHECK_FIXTURE_TIMEOUT_SECONDS,
                 )
             else:
                 users, tournaments, user_chunks = await asyncio.wait_for(
-                    prepare_fixture(qa, api_client),
+                    prepare_fixture(qa, public_client),
                     timeout=SSE_FIXTURE_TIMEOUT_SECONDS,
                 )
                 sse_ticket_by_user_id = None
@@ -1739,7 +1835,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
 
             async def start_ready_check() -> None:
                 await qa.request_as(
-                    api_client,
+                    fixture_client,
                     users[0],
                     "POST",
                     f"/tournaments/{tournaments[0]['slug']}/deadlock/ready-check/start",
@@ -1750,7 +1846,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 assert state_tickets_by_user_id is not None
                 return await probe_ready_check_overflow(
                     qa,
-                    api_client,
+                    public_client,
                     users,
                     tournament_slug=str(tournaments[0]["slug"]),
                     state_tickets=state_tickets_by_user_id,
@@ -1763,7 +1859,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             with qa.phase("sse_admission_ticket"):
                 sse_ticket = await issue_public_sse_admission_ticket(
                     qa,
-                    api_client,
+                    public_client,
                     str(tournaments[0]["slug"]),
                 )
             qa.report["sse_admission"] = {
@@ -1868,7 +1964,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                     await asyncio.gather(
                         *(
                             qa.run_browser_polling_tab(
-                                api_client,
+                                public_client,
                                 tab,
                                 profile_duration=args.combined_polling_duration,
                                 inflight=inflight,
@@ -1902,7 +1998,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
                 normal_api_task = asyncio.create_task(
                     run_normal_api_traffic(
                         qa,
-                        api_client,
+                        public_client,
                         users,
                         tournament_slug=str(tournaments[0]["slug"]),
                         stop_event=normal_stop_event,
@@ -2121,6 +2217,8 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
         "performance_collection_traceback": report.get(
             "performance_collection_traceback"
         ),
+        "sse_transport": report.get("sse_transport"),
+        "http_failure_diagnostics": report.get("http_failure_diagnostics", []),
         "combined_execution_timeout_seconds": report.get(
             "combined_execution_timeout_seconds"
         ),
