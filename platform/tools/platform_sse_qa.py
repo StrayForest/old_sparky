@@ -620,6 +620,11 @@ async def run_connections(
     http_max_connections: int,
 ) -> dict[str, Any]:
     metrics = SseMetrics()
+    client_connection_ceiling = max(
+        1,
+        http_max_connections,
+        connection_count + max(0, plateau_probe_connections),
+    )
     sse_client = httpx.AsyncClient(
         base_url=qa.api_origin,
         follow_redirects=True,
@@ -630,8 +635,8 @@ async def run_connections(
             pool=10.0,
         ),
         limits=httpx.Limits(
-            max_connections=max(1, http_max_connections),
-            max_keepalive_connections=max(1, http_max_connections),
+            max_connections=client_connection_ceiling,
+            max_keepalive_connections=client_connection_ceiling,
         ),
     )
     qa.clients.append(sse_client)
@@ -767,6 +772,7 @@ async def run_connections(
             "target_connections": connection_count,
             "duration_seconds": duration_seconds,
             "open_concurrency": open_concurrency,
+            "client_connection_ceiling": client_connection_ceiling,
             "open_timeout_seconds": open_timeout_seconds,
             "open_rate_per_second": open_rate_per_second,
             "capacity_mode": sse_capacity_token is not None,
@@ -829,7 +835,8 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             or args.sse_admission_mode != "ticket"
         ):
             raise RuntimeError(
-                "QA SSE capacity mode above the production cap requires the ticketed SSE-only loopback origin."
+                "QA SSE capacity mode above the production cap requires the "
+                "ticketed SSE-only loopback origin."
             )
         sse_capacity_token = sse_load_test_capacity_token(
             settings,

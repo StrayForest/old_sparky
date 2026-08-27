@@ -175,7 +175,11 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(sse.time, "time", return_value=now):
             self.assertEqual(sse._qa_global_limit(scope, self.settings), 15_000)
 
-        with patch.object(sse.time, "time", return_value=now + sse.SSE_LOAD_TEST_CAPACITY_TTL_SECONDS):
+        with patch.object(
+            sse.time,
+            "time",
+            return_value=now + sse.SSE_LOAD_TEST_CAPACITY_TTL_SECONDS,
+        ):
             self.assertIsNone(sse._qa_global_limit(scope, self.settings))
 
         tampered = token.replace("15000:", "30000:", 1)
@@ -342,7 +346,9 @@ class PlatformSseConnectionMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_messages[0]["status"], 429)
         lease.release.assert_awaited_once_with()
 
-    async def test_signed_qa_capacity_limit_is_passed_without_bypassing_global_admission(self) -> None:
+    async def test_signed_qa_capacity_limit_is_passed_without_bypassing_global_admission(
+        self,
+    ) -> None:
         settings = get_settings()
         lease = MagicMock(spec=sse.SseConnectionLease)
         lease.release = AsyncMock()
