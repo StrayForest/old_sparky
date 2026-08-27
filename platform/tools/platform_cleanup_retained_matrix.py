@@ -22,7 +22,7 @@ import sys
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLATFORM_ROOT))
@@ -66,6 +66,9 @@ EMAIL_PATTERN = re.compile(
 BROWSER_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
     r"^Browser polling profile (?P<marker>preprod[0-9]{12}[0-9a-f]{4}) "
     r"(?P<category>registration_open|ready_check_active|bracket_active|terminal)\.$"
+)
+READY_CHECK_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
+    r"^Ready Check SSE profile (?P<marker>preprod[0-9]{12}[0-9a-f]{4})\.$"
 )
 
 
@@ -276,6 +279,8 @@ def _merge_recovered_browser_tournaments(
     for candidate in candidate_rows:
         description = str(candidate.description or "")
         match = BROWSER_TOURNAMENT_DESCRIPTION_PATTERN.fullmatch(description)
+        if match is None:
+            match = READY_CHECK_TOURNAMENT_DESCRIPTION_PATTERN.fullmatch(description)
         if match is None or match.group("marker") != marker:
             raise RuntimeError("browser cleanup found an invalid marker-owned tournament")
         if str(candidate.organizer_user_id) not in user_ids:
@@ -303,7 +308,9 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         recovered_tournament_ids: dict[str, set[str]] = {}
         if manifest["mode"] in {"browser-polling", "sse", "combined"}:
             for row in manifest["rows"]:
-                marker_prefix = f"Browser polling profile {row['marker']} "
+                marker = row["marker"]
+                marker_prefix = f"Browser polling profile {marker} "
+                ready_check_description = f"Ready Check SSE profile {marker}."
                 candidates = list(
                     (
                         await db_session.execute(
@@ -311,7 +318,12 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
                                 Tournament.id,
                                 Tournament.description,
                                 Tournament.organizer_user_id,
-                            ).where(Tournament.description.like(f"{marker_prefix}%"))
+                            ).where(
+                                or_(
+                                    Tournament.description.like(f"{marker_prefix}%"),
+                                    Tournament.description == ready_check_description,
+                                )
+                            )
                         )
                     ).all()
                 )

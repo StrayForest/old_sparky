@@ -78,6 +78,29 @@ class RetainedMatrixManifestTests(unittest.TestCase):
                 user_ids={candidate.organizer_user_id},
             )
 
+    def test_ready_check_timeout_recovery_requires_exact_marker_description(self) -> None:
+        marker = "preprod260824120000abcd"
+        user_id = str(uuid4())
+        candidate = type(
+            "Candidate",
+            (),
+            {
+                "id": str(uuid4()),
+                "description": f"Ready Check SSE profile {marker}.",
+                "organizer_user_id": user_id,
+            },
+        )()
+        row = {"marker": marker, "tournament_ids": []}
+
+        recovered = cleanup._merge_recovered_browser_tournaments(
+            row,
+            [candidate],
+            user_ids={user_id},
+        )
+
+        self.assertEqual(recovered, {candidate.id})
+        self.assertEqual(row["tournament_ids"], [candidate.id])
+
     def _write_manifest(self, root: Path, report_path: Path) -> Path:
         marker = "preprod260824120000abcd"
         user_id = str(uuid4())
