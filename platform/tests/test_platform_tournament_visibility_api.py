@@ -406,7 +406,10 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
                 lean_workspace["tournament"]["current_user_participant_status"],
                 default_workspace["tournament"]["current_user_participant_status"],
             )
-            self.assertEqual(lean_workspace["bracket"], default_workspace["bracket"])
+            self.assertEqual(
+                lean_workspace_without_ticket["bracket"],
+                default_workspace_without_ticket["bracket"],
+            )
             if lean_workspace["bracket"] is not None:
                 self.assertEqual(
                     lean_workspace["bracket"]["can_manage"],
