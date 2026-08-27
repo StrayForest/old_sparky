@@ -1379,7 +1379,7 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             )
             qa.scenario(
                 "sse_capacity_or_explicit_admission_observed",
-                metrics["connected"] == args.sse_connections
+                metrics["initial_connected"] == args.sse_connections
                 or metrics["rejected_429"] > 0
                 or metrics["open_timeouts"] > 0,
                 metrics,

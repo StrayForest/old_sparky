@@ -358,7 +358,11 @@ if not isinstance(summary, dict):
     summary = {}
 sse = summary.get("sse") if isinstance(summary.get("sse"), dict) else {}
 reconnects = int(sse.get("reconnects") or 0)
-initial_connected = int(sse.get("connected") or 0)
+initial_connected = int(
+    sse.get("initial_connected")
+    if sse.get("initial_connected") is not None
+    else sse.get("connected") or 0
+)
 expected_client_reconnect = fault == "mass-disconnect"
 recovery = {
     "passed": (
