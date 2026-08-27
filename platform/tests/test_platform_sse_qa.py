@@ -17,6 +17,7 @@ from tools.platform_sse_qa import (
     _close_sse_stream_context,
     combined_profile_timeout_seconds,
     max_sse_open_timeout_seconds,
+    plateau_probe_count,
     summary,
 )
 
@@ -96,6 +97,24 @@ class PlatformSseQaTests(unittest.TestCase):
 
     def test_qa_hold_can_prove_stream_lifetime_beyond_old_rotation_boundary(self) -> None:
         self.assertGreater(SSE_HOLD_MAX_SECONDS, 600.0)
+
+    def test_explicit_capacity_plateau_always_gets_n_plus_ten_probe(self) -> None:
+        self.assertEqual(
+            plateau_probe_count(capacity_limit=3_000, connection_count=3_000),
+            10,
+        )
+        self.assertEqual(
+            plateau_probe_count(capacity_limit=15_000, connection_count=15_000),
+            10,
+        )
+        self.assertEqual(
+            plateau_probe_count(capacity_limit=3_000, connection_count=2_999),
+            0,
+        )
+        self.assertEqual(
+            plateau_probe_count(capacity_limit=0, connection_count=3_000),
+            0,
+        )
 
 
 class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):

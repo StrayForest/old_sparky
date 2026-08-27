@@ -54,6 +54,7 @@ SSE_FIXTURE_TIMEOUT_SECONDS = 90.0
 # enough to prove that a healthy stream survives the old 600-second rotation
 # boundary while keeping an operator mistake bounded to fifteen minutes.
 SSE_HOLD_MAX_SECONDS = 900.0
+SSE_PLATEAU_PROBE_CONNECTIONS = 10
 # The browser keeps its own immediate-polling/full-jitter recovery policy. This
 # is only the retained-load diagnostic ceiling: public edge queueing must be
 # observable for a full minute before the harness classifies an attempt as
@@ -252,6 +253,16 @@ def max_sse_open_timeout_seconds(origin: str) -> float:
     if hostname in {"127.0.0.1", "localhost", "::1"}:
         return SSE_OPEN_TIMEOUT_MAX_ORIGIN_LOCAL_SECONDS
     return SSE_OPEN_TIMEOUT_MAX_PUBLIC_SECONDS
+
+
+def plateau_probe_count(*, capacity_limit: int, connection_count: int) -> int:
+    """Return the explicit N+10 probe size for a signed-cap plateau run."""
+
+    return (
+        SSE_PLATEAU_PROBE_CONNECTIONS
+        if capacity_limit > 0 and connection_count == capacity_limit
+        else 0
+    )
 
 
 class SseMetrics:
@@ -1041,11 +1052,9 @@ async def run_profile(args: argparse.Namespace) -> dict[str, Any]:
         )
     else:
         sse_capacity_token = None
-    plateau_probe_connections = (
-        10
-        if args.sse_capacity_limit > SSE_GLOBAL_LIMIT
-        and args.sse_connections == args.sse_capacity_limit
-        else 0
+    plateau_probe_connections = plateau_probe_count(
+        capacity_limit=args.sse_capacity_limit,
+        connection_count=args.sse_connections,
     )
 
     combined_users = sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN) * args.users_per_tournament
