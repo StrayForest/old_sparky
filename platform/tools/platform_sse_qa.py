@@ -709,6 +709,7 @@ async def consume_sse_connection(
     cycles = max(0, reconnect_cycles)
     per_cycle_hold = duration_seconds / (cycles + 1) if cycles else duration_seconds
     initial_attempt_marked = False
+    initial_connection_marked = False
 
     if open_delay_seconds > 0:
         await asyncio.sleep(open_delay_seconds)
@@ -816,8 +817,11 @@ async def consume_sse_connection(
                     continue
 
                 metrics.connection_opened()
-                if cycle == 0:
+                if not initial_connection_marked:
                     metrics.mark("initial_connected")
+                    initial_connection_marked = True
+                else:
+                    metrics.mark("reconnects")
                 connected_this_attempt = True
                 metrics.connect_latencies.append(
                     (time.monotonic() - attempt_started) * 1000
@@ -863,7 +867,6 @@ async def consume_sse_connection(
                 else:
                     metrics.mark("completed")
                 if cycle < cycles and time.monotonic() < deadline:
-                    metrics.mark("reconnects")
                     await wait_before_reconnect(0)
                 break
             except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
