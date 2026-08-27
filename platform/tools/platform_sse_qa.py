@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import resource
 import secrets
+import ssl
 import sys
 import time
 import traceback
@@ -66,6 +67,169 @@ async def _close_sse_stream_context(stream_context: Any | None) -> None:
             stream_context.__aexit__(None, None, None),
             timeout=SSE_STREAM_CLOSE_TIMEOUT_SECONDS,
         )
+
+
+class _RawSseStream:
+    """Small HTTP/1.1 SSE client for high-volume loopback measurements.
+
+    httpx is intentionally retained for the public/Cloudflare contour, where
+    its normal transport gives us the production-facing response metadata. A
+    loopback capacity run is different: it creates thousands of long-lived
+    sockets on the same two-core VPS. The standard client and per-line decoder
+    can consume a full core before the API is saturated, which makes the load
+    generator—not the origin—the measured bottleneck. This client keeps the
+    same HTTP/1.1 request and SSE parsing contract with much less overhead.
+    """
+
+    def __init__(self, url: str, headers: dict[str, str]) -> None:
+        self.url = url
+        self.request_headers = headers
+        self.reader: asyncio.StreamReader | None = None
+        self.writer: asyncio.StreamWriter | None = None
+        self.status_code = 0
+        self.headers_received: dict[str, str] = {}
+        self._error_body: bytes | None = None
+
+    async def __aenter__(self) -> "_RawSseStream":
+        parsed = urlsplit(self.url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("SSE origin must use http or https with a hostname.")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        ssl_context = None
+        server_hostname = None
+        if parsed.scheme == "https":
+            ssl_context = ssl.create_default_context()
+            server_hostname = parsed.hostname
+        self.reader, self.writer = await asyncio.open_connection(
+            parsed.hostname,
+            port,
+            ssl=ssl_context,
+            server_hostname=server_hostname,
+            limit=128 * 1024,
+        )
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        default_port = (parsed.scheme == "http" and port == 80) or (
+            parsed.scheme == "https" and port == 443
+        )
+        host_header = host if default_port else f"{host}:{port}"
+        request_target = parsed.path or "/"
+        if parsed.query:
+            request_target += f"?{parsed.query}"
+        request_lines = [
+            f"GET {request_target} HTTP/1.1",
+            f"Host: {host_header}",
+            "Connection: keep-alive",
+        ]
+        request_lines.extend(
+            f"{name}: {value}" for name, value in self.request_headers.items()
+        )
+        self.writer.write(("\r\n".join(request_lines) + "\r\n\r\n").encode("utf-8"))
+        await self.writer.drain()
+        header_block = await self.reader.readuntil(b"\r\n\r\n")
+        header_lines = header_block[:-4].split(b"\r\n")
+        if not header_lines:
+            raise OSError("SSE origin returned an empty HTTP response.")
+        status_parts = header_lines[0].decode("latin-1").split(" ", 2)
+        if len(status_parts) < 2 or not status_parts[1].isdigit():
+            raise OSError("SSE origin returned an invalid HTTP status line.")
+        self.status_code = int(status_parts[1])
+        for raw_line in header_lines[1:]:
+            name, separator, value = raw_line.decode("latin-1").partition(":")
+            if separator:
+                self.headers_received[name.strip().lower()] = value.strip()
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        await self.close()
+
+    @property
+    def headers(self) -> httpx.Headers:
+        return httpx.Headers(self.headers_received)
+
+    async def aread(self) -> bytes:
+        if self._error_body is not None:
+            return self._error_body
+        if self.reader is None or self.status_code == 200:
+            self._error_body = b""
+            return self._error_body
+        raw_length = self.headers_received.get("content-length", "0")
+        try:
+            length = min(4096, max(0, int(raw_length)))
+        except ValueError:
+            length = 4096
+        body = bytearray()
+        async for chunk in self._body_chunks():
+            body.extend(chunk)
+            if len(body) >= length:
+                break
+        self._error_body = bytes(body[:length])
+        return self._error_body
+
+    async def _body_chunks(self):
+        if self.reader is None:
+            return
+        if "chunked" not in self.headers_received.get("transfer-encoding", "").lower():
+            content_length = self.headers_received.get("content-length")
+            try:
+                remaining = max(0, int(content_length)) if content_length is not None else None
+            except ValueError:
+                remaining = None
+            if remaining is not None:
+                while remaining:
+                    chunk = await self.reader.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        return
+                    remaining -= len(chunk)
+                    yield chunk
+                return
+            while True:
+                chunk = await self.reader.read(64 * 1024)
+                if not chunk:
+                    return
+                yield chunk
+        else:
+            while True:
+                size_line = await self.reader.readline()
+                if not size_line:
+                    return
+                raw_size = size_line.split(b";", 1)[0].strip()
+                try:
+                    size = int(raw_size, 16)
+                except ValueError as exc:
+                    raise OSError("SSE origin returned an invalid chunk size.") from exc
+                if size == 0:
+                    # Consume the optional trailer block before returning.
+                    while await self.reader.readline() not in {b"\r\n", b"\n", b""}:
+                        pass
+                    return
+                yield await self.reader.readexactly(size)
+                await self.reader.readexactly(2)
+
+    async def aiter_lines(self):
+        pending = bytearray()
+        async for chunk in self._body_chunks():
+            pending.extend(chunk)
+            while True:
+                newline = pending.find(b"\n")
+                if newline < 0:
+                    break
+                line = bytes(pending[:newline]).rstrip(b"\r")
+                del pending[: newline + 1]
+                yield line.decode("utf-8", errors="replace")
+        if pending:
+            yield bytes(pending).rstrip(b"\r").decode("utf-8", errors="replace")
+
+    async def close(self) -> None:
+        writer = self.writer
+        self.writer = None
+        self.reader = None
+        if writer is None:
+            return
+        writer.close()
+        with suppress(Exception):
+            await asyncio.wait_for(writer.wait_closed(), timeout=SSE_STREAM_CLOSE_TIMEOUT_SECONDS)
 
 
 def load_generator_resource_limits() -> dict[str, int]:
@@ -410,7 +574,7 @@ async def publish_probe_events(
 
 async def consume_sse_connection(
     qa: ProductionQa,
-    client: httpx.AsyncClient,
+    client: httpx.AsyncClient | None,
     metrics: SseMetrics,
     *,
     user: dict[str, Any],
@@ -425,6 +589,7 @@ async def consume_sse_connection(
     all_attempts_done: asyncio.Event,
     mark_attempt_finished,
     hold_deadline_after_barrier,
+    raw_sse_transport: bool,
 ) -> None:
     token = qa.session_tokens_by_user_id[str(user["id"])]
     headers = {
@@ -469,16 +634,24 @@ async def consume_sse_connection(
         connected_this_attempt = False
         open_timed_out = False
         try:
-            stream_context = client.stream(
-                "GET",
-                (
-                    f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
-                    f"?ticket={quote(sse_ticket, safe='')}"
-                    if sse_ticket
-                    else f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
-                ),
-                headers=headers,
+            stream_path = (
+                f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
+                f"?ticket={quote(sse_ticket, safe='')}"
+                if sse_ticket
+                else f"/tournaments/{quote(tournament_slug, safe='')}/bracket/events"
             )
+            if raw_sse_transport:
+                stream_context = _RawSseStream(
+                    f"{qa.api_origin}{stream_path}",
+                    headers,
+                )
+            else:
+                assert client is not None
+                stream_context = client.stream(
+                    "GET",
+                    stream_path,
+                    headers=headers,
+                )
             try:
                 async with asyncio.timeout(max(0.1, open_timeout_seconds)):
                     async with open_gate:
@@ -620,26 +793,33 @@ async def run_connections(
     http_max_connections: int,
 ) -> dict[str, Any]:
     metrics = SseMetrics()
+    raw_sse_transport = urlsplit(str(qa.api_origin)).hostname in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
     client_connection_ceiling = max(
         1,
         http_max_connections,
         connection_count + max(0, plateau_probe_connections),
     )
-    sse_client = httpx.AsyncClient(
-        base_url=qa.api_origin,
-        follow_redirects=True,
-        timeout=httpx.Timeout(
-            connect=max(10.0, open_timeout_seconds + 5.0),
-            read=None,
-            write=10.0,
-            pool=10.0,
-        ),
-        limits=httpx.Limits(
-            max_connections=client_connection_ceiling,
-            max_keepalive_connections=client_connection_ceiling,
-        ),
-    )
-    qa.clients.append(sse_client)
+    sse_client: httpx.AsyncClient | None = None
+    if not raw_sse_transport:
+        sse_client = httpx.AsyncClient(
+            base_url=qa.api_origin,
+            follow_redirects=True,
+            timeout=httpx.Timeout(
+                connect=max(10.0, open_timeout_seconds + 5.0),
+                read=None,
+                write=10.0,
+                pool=10.0,
+            ),
+            limits=httpx.Limits(
+                max_connections=client_connection_ceiling,
+                max_keepalive_connections=client_connection_ceiling,
+            ),
+        )
+        qa.clients.append(sse_client)
     open_gate = asyncio.Semaphore(max(1, open_concurrency))
     attempts_finished = 0
     attempts_lock = asyncio.Lock()
@@ -709,6 +889,7 @@ async def run_connections(
                     all_attempts_done=all_attempts_done,
                     mark_attempt_finished=attempt_finished,
                     hold_deadline_after_barrier=hold_deadline_after_barrier,
+                    raw_sse_transport=raw_sse_transport,
                 )
             )
             for index, (user, tournament) in enumerate(connections)
@@ -773,6 +954,7 @@ async def run_connections(
             "duration_seconds": duration_seconds,
             "open_concurrency": open_concurrency,
             "client_connection_ceiling": client_connection_ceiling,
+            "transport": "asyncio-http11" if raw_sse_transport else "httpx",
             "open_timeout_seconds": open_timeout_seconds,
             "open_rate_per_second": open_rate_per_second,
             "capacity_mode": sse_capacity_token is not None,
@@ -798,8 +980,9 @@ async def run_connections(
             task.cancel()
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
-        with suppress(Exception):
-            await sse_client.aclose()
+        if sse_client is not None:
+            with suppress(Exception):
+                await sse_client.aclose()
 
 
 def combined_profile_timeout_seconds(

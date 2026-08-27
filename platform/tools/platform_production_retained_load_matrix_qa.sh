@@ -289,6 +289,22 @@ start_server_observer() {
       done
     }
 
+    load_generator_pid() {
+      local parent_pid="$1"
+      local candidate cmdline
+      for candidate in $(pgrep -P "$parent_pid" 2>/dev/null || true); do
+        [[ -r "/proc/$candidate/cmdline" ]] || continue
+        cmdline="$(tr '\0' ' ' < "/proc/$candidate/cmdline" 2>/dev/null || true)"
+        case "$cmdline" in
+          *platform_sse_qa.py*|*platform_production_qa.py*|*platform_seed_retained_tournament_matrix.py*)
+            echo "$candidate"
+            return 0
+            ;;
+        esac
+      done
+      echo "$parent_pid"
+    }
+
     echo "observer_started_at=$started_at"
     echo "observer_target_pid=$target_pid"
     while kill -0 "$target_pid" 2>/dev/null; do
@@ -296,7 +312,8 @@ start_server_observer() {
       echo "--- process ---"
       ps -eo pid=,ppid=,stat=,pcpu=,pmem=,rss=,comm=,args= --sort=-pcpu | head -n 32
       echo "--- process resources ---"
-      print_process_resource "load_generator" "$target_pid"
+      load_pid="$(load_generator_pid "$target_pid")"
+      print_process_resource "load_generator" "$load_pid"
       api_pid="$(service_main_pid deadlock-api)"
       worker_pid="$(service_main_pid deadlock-worker)"
       nginx_pid="$(service_main_pid nginx)"

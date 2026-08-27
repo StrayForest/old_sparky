@@ -880,7 +880,7 @@ def process_label(process: dict[str, Any]) -> str | None:
         return "redis-server"
     if comm == "nginx" or cmdline.startswith("nginx:"):
         return "nginx"
-    if "platform_production_qa.py" in cmdline:
+    if "platform_production_qa.py" in cmdline or "platform_sse_qa.py" in cmdline:
         return "load-generator"
     return None
 
