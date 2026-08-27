@@ -5,9 +5,9 @@ Status: closed at the current production contour on 2026-08-27.
 ## Deployed protection
 
 The verified package is commit
-`c3e8a5dff105ac2bbbed6d60c79e582258b42867`. Its security/build run was
-`33039355206`, automatic deploy `33039663179` and production deploy/live smoke
-`33039669418`.
+`0c6f0ae369b5dad935e2cc4b8123b5480aabf326`. Its security/build run was
+`33042821250`, automatic deploy `33043138900` and production deploy/live smoke
+`33043143157`.
 
 The package retains:
 
@@ -36,6 +36,7 @@ visibility revalidation and all private authorization checks remain active.
 | Origin-local cap | load `33040760791`, cleanup `33040911848` | 3,000/3,000 HTTP 200; N+10 probe 10 expected 429; 0 503/timeouts/errors; 9,000/9,000 events |
 | Public gradual fill 25/s | load `33040985301`, cleanup `33041234047` | 3,000/3,000; N+10 429; 0 errors; connect/event p95 534ms/1.63s |
 | Public gradual fill 40/s | load `33041292794`, cleanup `33041492597` | 3,000/3,000; N+10 429; 0 errors; connect/event p95 2.99/1.79s |
+| Post-deploy public ticket validation | load `33043458814`, cleanup `33043714003` | 3,000/3,000; N+10 429; 0 errors; connect/event p95 448ms/2.39s |
 | Public gradual fill 50/s | load `33040501257`, cleanup `33040712758` | 2,154/3,000; 846 edge/open timeouts; 0 503/429/application errors |
 | Mixed 10k at 50/s | load `33041564210`, cleanup `33041917423` | 10,000/10,000 polling, but 2,209/3,000 SSE and 791 edge/open timeouts |
 | Mixed 10k at 25/s | load `33041962825`, cleanup `33042299928` | 10,000/10,000 polling, 3,000/3,000 SSE, 9,000/9,000 events, 0 errors |

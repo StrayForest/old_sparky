@@ -413,14 +413,16 @@ database guards and applies migration `20260822_0040`. Exact commit
 
 ### AS-20 SSE persistence, opening and mixed boundary — 2026-08-27
 
-The deployed package is `c3e8a5dff105ac2bbbed6d60c79e582258b42867`: signed
+The deployed package is `0c6f0ae369b5dad935e2cc4b8123b5480aabf326`: signed
 HMAC tickets, PostgreSQL-free ticketed opens, private-stream revalidation,
 shared worker/tournament relay, SharedWorker deduplication, polling fallback
-and fail-closed Redis global/source/user leases (`3,000/32/4`). Public tickets
-are anonymous because bracket data is public; private tickets remain
-session-bound. Recovery uses full jitter `60–180s`, based on a measured safe
-public fill of `25 opens/s`. The relay formats each event once into a bounded
-shared sequence buffer; authorization and admission semantics remain intact.
+and fail-closed Redis global/source/user leases (`3,000/32/4`). Its exact-SHA
+security/build, automatic deploy and production deploy/live smoke were
+`33042821250`, `33043138900` and `33043143157`. Public tickets are anonymous
+because bracket data is public; private tickets remain session-bound. Recovery
+uses full jitter `60–180s`, based on a measured safe public fill of `25 opens/s`.
+The relay formats each event once into a bounded shared sequence buffer;
+authorization and admission semantics remain intact.
 
 Origin-local ticket capacity exceeded the 10,000-user target:
 
@@ -445,7 +447,10 @@ with connect/event p95 `103ms/727ms`. Public 3,000 at `25/s`
 `33041492597`) also reached `3,000/3,000` with N+10 429 and zero errors;
 connect p95 was `534ms` and `2.99s`. At `50/s` (`33040501257`, cleanup
 `33040712758`), only `2,154/3,000` opened and `846` public handshakes timed
-out. Therefore `25/s` is the safe refill/opening rate, `40/s` is a high-tail
+out. The post-deploy public-ticket validation (`33043458814`, cleanup
+`33043714003`) repeated the 25/s point with `3,000/3,000`, N+10 429,
+`9,000/9,000` events and zero errors; connect/event p95 was `448ms/2.39s`.
+Therefore `25/s` is the safe refill/opening rate, `40/s` is a high-tail
 diagnostic point, and `50/s` is not safe through the current edge path.
 
 The mixed production contour at public `50/s` (`33041564210`, cleanup
