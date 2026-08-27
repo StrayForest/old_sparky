@@ -60,6 +60,7 @@ class PlatformSseQaTests(unittest.TestCase):
         metrics.response_status(429)
         metrics.response_status(429)
         metrics.mark("events", 3)
+        metrics.mark("resyncs", 2)
         metrics.connect_latencies.extend([1.0, 2.0])
         metrics.event_latencies.extend([3.0, 5.0, 7.0])
 
@@ -73,6 +74,7 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(result["response_statuses"], {"429": 2})
         self.assertEqual(result["response_error_samples"], [])
         self.assertEqual(result["events"], 3)
+        self.assertEqual(result["resyncs"], 2)
         self.assertEqual(result["connected_percent"], 50.0)
         self.assertEqual(result["connect_latency_ms"]["p95"], 1.95)
         self.assertAlmostEqual(result["event_delivery_latency_ms"]["p99"], 6.96)
@@ -348,6 +350,7 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SSE_RECONNECT_MAX_BACKOFF_SECONDS", sse_source)
         self.assertIn("secrets.randbelow(1_000_000)", sse_source)
         self.assertIn("fallback_polling_eligible", sse_source)
+        self.assertIn('"resyncs": metrics.get("resyncs")', sse_source)
         self.assertIn("plateau_probe", sse_source)
         self.assertIn("SSE_QA_GLOBAL_LIMIT_MAX", sse_source)
         self.assertIn("fatal_traceback", sse_source)

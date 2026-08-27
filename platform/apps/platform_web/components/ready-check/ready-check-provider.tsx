@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { usePathname } from "next/navigation";
 
 import { useAuth } from "@/components/auth/auth-provider";
 import {
@@ -31,6 +32,18 @@ const READY_CHECK_SSE_OPEN_TIMEOUT_MS = Number.isFinite(configuredSseOpenTimeout
   ? Math.min(30_000, Math.max(500, Math.round(configuredSseOpenTimeoutMs)))
   : 1_000;
 
+function tournamentDetailSlug(pathname: string | null): string | null {
+  const match = pathname?.match(/^\/tournaments\/([^/]+)\/?$/u);
+  if (!match) {
+    return null;
+  }
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
 type ReadyCheckLiveState = ReadyCheckStateProbe;
 
 type ReadyCheckContextValue = {
@@ -42,6 +55,8 @@ const ReadyCheckContext = createContext<ReadyCheckContextValue | null>(null);
 
 export function ReadyCheckProvider({ children }: { children: ReactNode }) {
   const { status: authStatus, user } = useAuth();
+  const pathname = usePathname();
+  const currentTournamentSlug = tournamentDetailSlug(pathname);
   const [agenda, setAgenda] = useState<ReadyCheckAgendaItem[]>([]);
   const [sseTicket, setSseTicket] = useState<string | null>(null);
   const [sseTicketExpiresAt, setSseTicketExpiresAt] = useState<string | null>(null);
@@ -117,7 +132,12 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
   }, [authStatus, user, agendaRefreshVersion]);
 
   useEffect(() => {
-    const checks = agendaRef.current;
+    // The provider may stay mounted in the root layout so state consumers do
+    // not remount across navigation, but a critical stream is a page-scoped
+    // resource. Only the visible tournament detail can create its stream.
+    const checks = currentTournamentSlug
+      ? agendaRef.current.filter((item) => item.slug === currentTournamentSlug)
+      : [];
     const streamTicket = sseTicket;
     const streamTicketExpiry = sseTicketExpiresAt;
     let pollingTimer: ReturnType<typeof setTimeout> | null = null;
@@ -183,6 +203,16 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       }
     };
 
+    const probeUnresolvedChecks = (items: ReadyCheckAgendaItem[]) => {
+      for (const item of items) {
+        if (liveStateFor(item)?.status === "active" || liveStateFor(item)?.status === "closed") {
+          continue;
+        }
+        const controller = new AbortController();
+        void probe(item, controller.signal).finally(() => controller.abort());
+      }
+    };
+
     const dueForPolling = (now: number) => checks.filter((item) => {
       const startsAt = Date.parse(item.readyCheckStartsAt);
       const endsAt = Date.parse(item.readyCheckEndsAt);
@@ -203,6 +233,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         || !Number.isFinite(openAt)
         || !Number.isFinite(endsAt)
         || now >= endsAt + READY_CHECK_HARD_TIMEOUT_MS
+        || now >= startsAt
         || liveStateFor(item)?.status === "active"
         || liveStateFor(item)?.status === "closed"
         || item.admissionMode === "polling"
@@ -348,6 +379,15 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
         streamConnected = true;
         clearSseOpenTimer();
         streamRetryAt = 0;
+        // If the stream was established around T, the connected frame may
+        // legitimately follow the relay event. Catch up from the
+        // user-scoped authoritative state instead of relying on relay history.
+        probeUnresolvedChecks(
+          checks.filter((item) => {
+            const startsAt = Date.parse(item.readyCheckStartsAt);
+            return Number.isFinite(startsAt) && startsAt <= Date.now();
+          }),
+        );
       };
       source.addEventListener("ready_check", (event) => {
         if (!(event instanceof MessageEvent) || typeof event.data !== "string") {
@@ -366,12 +406,17 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
           // The global event is only a wake-up hint. The user-scoped Redis
           // projection is authoritative so a participant revoked after the
           // agenda read cannot receive an active button from a stale stream.
-          const eventController = new AbortController();
-          void probe(item, eventController.signal).finally(() => eventController.abort());
+          probeUnresolvedChecks([item]);
         } catch {
           // Ignore malformed relay data; the revision probe remains the
           // authoritative fallback for the current user's ticket.
         }
+      });
+      source.addEventListener("resync", () => {
+        // A bounded relay can evict events before a slow subscriber consumes
+        // them. Probe every unresolved visible check so a healthy connection
+        // can recover without enabling periodic polling.
+        probeUnresolvedChecks(checks);
       });
       source.onerror = () => {
         failStream(source);
@@ -430,7 +475,7 @@ export function ReadyCheckProvider({ children }: { children: ReactNode }) {
       pollController?.abort();
       closeStream();
     };
-  }, [agenda, refreshAgenda, sseTicket, sseTicketExpiresAt, updateLiveState, visibilityVersion]);
+  }, [agenda, currentTournamentSlug, refreshAgenda, sseTicket, sseTicketExpiresAt, updateLiveState, visibilityVersion]);
 
   const stateForTournament = useCallback((slug: string) => {
     const item = agendaRef.current.find((candidate) => candidate.slug === slug);

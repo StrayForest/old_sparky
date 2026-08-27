@@ -37,6 +37,47 @@ class PlatformReadyCheckStateProjectionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PlatformReadyCheckEventStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_emits_resync_when_relay_window_evicts_unconsumed_event(self) -> None:
+        relay = SimpleNamespace(
+            closed=False,
+            messages=deque(maxlen=ready_check_events.READY_CHECK_RELAY_QUEUE_MAXSIZE),
+            next_sequence=0,
+            message_event=asyncio.Event(),
+        )
+        with patch.object(ready_check_events, "_get_relay", AsyncMock(return_value=relay)):
+            stream = ready_check_events.stream_ready_check_events(("tournament-1",))
+            self.assertIn("event: connected", await anext(stream))
+
+            relay.messages.append((1, "tournament-1", "event: ready_check\ndata: {\"status\":\"active\"}\n\n"))
+            relay.next_sequence = 1
+            for sequence in range(2, ready_check_events.READY_CHECK_RELAY_QUEUE_MAXSIZE + 2):
+                relay.messages.append((sequence, f"unrelated-{sequence}", "event: ready_check\ndata: {}\n\n"))
+                relay.next_sequence = sequence
+
+            self.assertEqual(
+                await anext(stream),
+                ready_check_events.READY_CHECK_RELAY_RESYNC_EVENT,
+            )
+            await stream.aclose()
+
+    async def test_stream_delivers_retained_relevant_event_without_resync(self) -> None:
+        relay = SimpleNamespace(
+            closed=False,
+            messages=deque(maxlen=ready_check_events.READY_CHECK_RELAY_QUEUE_MAXSIZE),
+            next_sequence=0,
+            message_event=asyncio.Event(),
+        )
+        with patch.object(ready_check_events, "_get_relay", AsyncMock(return_value=relay)):
+            stream = ready_check_events.stream_ready_check_events(("tournament-1",))
+            self.assertIn("event: connected", await anext(stream))
+            relay.next_sequence = 1
+            relay.messages.append(
+                (1, "tournament-1", "event: ready_check\ndata: {\"status\":\"active\"}\n\n")
+            )
+
+            self.assertIn("event: ready_check", await anext(stream))
+            await stream.aclose()
+
     async def test_idle_stream_renews_lease_past_120_seconds(self) -> None:
         relay = SimpleNamespace(
             closed=False,
@@ -111,6 +152,70 @@ class PlatformReadyCheckEventStreamTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PlatformReadyCheckRouteGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_active_round_does_not_reintroduce_post_start_late_sse(self) -> None:
+        starts_at = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
+        tournament = SimpleNamespace(
+            id="tournament-a",
+            slug="a",
+            ready_check_starts_at=starts_at,
+            ready_check_ends_at=starts_at + timedelta(minutes=20),
+        )
+        active_round = SimpleNamespace(
+            tournament_id="tournament-a",
+            eligible_user_ids=["user-1"],
+        )
+
+        class FakeResult:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def scalars(self):
+                return self
+
+            def all(self):
+                return self.rows
+
+        class FakeDbSession:
+            def __init__(self):
+                self.execute_calls = 0
+
+            async def execute(self, _statement):
+                self.execute_calls += 1
+                if self.execute_calls == 1:
+                    return FakeResult([tournament])
+                if self.execute_calls == 2:
+                    return FakeResult([tournament])
+                return FakeResult([("tournament-a", 1)])
+
+            async def scalars(self, _statement):
+                return FakeResult([active_round])
+
+        auth_session = SimpleNamespace(
+            now=starts_at + timedelta(seconds=1),
+            user=SimpleNamespace(id="user-1"),
+            session=SimpleNamespace(id="session-1"),
+        )
+
+        with (
+            patch.object(ready_check, "_stream_cookie", return_value="session-token"),
+            patch.object(ready_check, "current_ready_check_sse_connection_count", new=AsyncMock(return_value=0)),
+            patch.object(ready_check, "qa_sse_capacity_limit", return_value=3_000),
+            patch.object(ready_check, "issue_ready_check_state_proof", return_value="state-proof"),
+            patch.object(ready_check, "ready_check_user_admission", return_value=(
+                starts_at,
+                "polling",
+                "polling",
+            )),
+        ):
+            agenda = await ready_check.get_ready_check_agenda(
+                SimpleNamespace(),
+                response=MagicMock(),
+                auth_session=auth_session,
+                db_session=FakeDbSession(),
+            )
+
+        self.assertEqual(agenda.checks[0].admission_mode, "polling")
+
     async def test_agenda_quotas_use_the_global_simultaneous_tournament_demand(self) -> None:
         starts_at = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
         tournament_a = SimpleNamespace(

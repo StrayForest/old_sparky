@@ -24,6 +24,7 @@ READY_CHECK_EVENT_CHANNEL = "platform:ready-check:events:v1"
 READY_CHECK_STATE_KEY_PREFIX = "platform:ready-check:state:v1"
 READY_CHECK_STATE_TTL_SECONDS = READY_CHECK_ADMISSION_MAX_TTL_SECONDS + 60
 READY_CHECK_RELAY_QUEUE_MAXSIZE = 32
+READY_CHECK_RELAY_RESYNC_EVENT = "event: resync\ndata: {\"reason\":\"relay_gap\"}\n\n"
 
 _relay_lock = asyncio.Lock()
 _relay: "_ReadyCheckEventRelay | None" = None
@@ -42,9 +43,9 @@ def _state_key(tournament_id: str, user_id: str, ready_check_starts_at: int) -> 
 
 
 class _ReadyCheckSubscription:
-    def __init__(self, tournament_ids: set[str]) -> None:
+    def __init__(self, tournament_ids: set[str], *, next_sequence: int) -> None:
         self.tournament_ids = tournament_ids
-        self.next_sequence = 1
+        self.next_sequence = next_sequence
 
 
 class _ReadyCheckEventRelay:
@@ -226,7 +227,13 @@ async def stream_ready_check_events(
     connection_lease: SseConnectionLease | None = None,
 ) -> AsyncIterator[str]:
     relay = await _get_relay()
-    subscription = _ReadyCheckSubscription(set(tournament_ids))
+    # Do not replay the relay history that predates this stream. The browser
+    # performs an authoritative probe on a post-T connection, while sequence
+    # gaps after subscription are explicitly surfaced below.
+    subscription = _ReadyCheckSubscription(
+        set(tournament_ids),
+        next_sequence=relay.next_sequence + 1,
+    )
     last_lease_renewal_at = monotonic()
 
     async def renew_lease_if_due() -> bool:
@@ -252,15 +259,31 @@ async def stream_ready_check_events(
         while True:
             if relay.closed:
                 return
-            message: str | object | None = None
+            message: str | None = None
+            resync_emitted = False
             while relay.messages and subscription.next_sequence <= relay.next_sequence:
                 first_sequence = relay.messages[0][0]
                 if subscription.next_sequence < first_sequence:
+                    # The shared bounded relay has evicted at least one event
+                    # that this subscriber would have observed. Never silently
+                    # skip it: the browser must probe its user-scoped state.
                     subscription.next_sequence = first_sequence
+                    if not await renew_lease_if_due():
+                        return
+                    yield READY_CHECK_RELAY_RESYNC_EVENT
+                    resync_emitted = True
+                    break
                 message_index = subscription.next_sequence - first_sequence
                 if message_index >= len(relay.messages):
-                    subscription.next_sequence = relay.messages[0][0]
-                    continue
+                    # This should not happen in the single-threaded relay
+                    # loop, but fail closed if the retained window is ever
+                    # observed in an inconsistent state.
+                    subscription.next_sequence = relay.next_sequence + 1
+                    if not await renew_lease_if_due():
+                        return
+                    yield READY_CHECK_RELAY_RESYNC_EVENT
+                    resync_emitted = True
+                    break
                 sequence, tournament_id, candidate = relay.messages[message_index]
                 subscription.next_sequence = sequence + 1
                 if tournament_id in subscription.tournament_ids:
@@ -270,6 +293,10 @@ async def stream_ready_check_events(
                 if not await renew_lease_if_due():
                     return
                 yield message
+                continue
+            if resync_emitted:
+                # A resync frame was emitted in the loop above. Continue from
+                # the retained head without waiting for another Redis event.
                 continue
             relay.message_event.clear()
             if relay.closed:

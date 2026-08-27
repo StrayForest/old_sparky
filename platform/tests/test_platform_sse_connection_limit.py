@@ -607,6 +607,12 @@ class PlatformSseNginxGuardTests(unittest.TestCase):
         self.assertIn('"request_completion":"$request_completion"', nginx)
         self.assertIn('"connection_requests":$connection_requests', nginx)
         self.assertIn("proxy_read_timeout 60s;", nginx)
+        ready_check_location = nginx.split('location = /api/v1/ready-check/events {', 1)[1].split(
+            "    location = /api/v1/security/csp-report {", 1
+        )[0]
+        self.assertIn("proxy_buffering off;", ready_check_location)
+        self.assertIn('add_header X-Accel-Buffering "no" always;', ready_check_location)
+        self.assertIn('add_header Cache-Control "no-store" always;', ready_check_location)
 
 
 if __name__ == "__main__":

@@ -96,7 +96,7 @@ class PlatformReadyCheckPolicyTests(unittest.TestCase):
             {"a": 700, "b": 300},
         )
 
-    def test_late_arrivals_are_admitted_even_when_the_planned_quota_is_full(self) -> None:
+    def test_late_arrivals_use_authoritative_state_polling_after_ready_check_start(self) -> None:
         demand = ReadyCheckDemand("a", self.starts_at, 7_000)
         plan = ready_check_preparation_plan((demand,))
         open_at, priority, mode = ready_check_user_admission(
@@ -107,9 +107,9 @@ class PlatformReadyCheckPolicyTests(unittest.TestCase):
             now=self.starts_at + timedelta(seconds=1),
         )
 
-        self.assertEqual(open_at, self.starts_at + timedelta(seconds=1))
-        self.assertEqual(priority, READY_CHECK_LATE_ADMISSION_PRIORITY)
-        self.assertEqual(mode, "late_sse")
+        self.assertEqual(open_at, self.starts_at)
+        self.assertEqual(priority, READY_CHECK_POLLING_ADMISSION_PRIORITY)
+        self.assertEqual(mode, "polling")
 
     def test_outside_quota_uses_polling_until_ready_check_start(self) -> None:
         demand = ReadyCheckDemand("a", self.starts_at, 100)
@@ -148,9 +148,9 @@ class PlatformReadyCheckPolicyTests(unittest.TestCase):
             sse_quota=100,
             now=self.starts_at + timedelta(seconds=1),
         )
-        self.assertEqual(late_open_at, self.starts_at + timedelta(seconds=1))
-        self.assertEqual(late_priority, READY_CHECK_LATE_ADMISSION_PRIORITY)
-        self.assertEqual(late_mode, "late_sse")
+        self.assertEqual(late_open_at, self.starts_at)
+        self.assertEqual(late_priority, READY_CHECK_POLLING_ADMISSION_PRIORITY)
+        self.assertEqual(late_mode, "polling")
 
     def test_invalid_rate_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

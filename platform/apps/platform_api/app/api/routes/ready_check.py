@@ -181,11 +181,6 @@ async def get_ready_check_agenda(
             sse_quota=quotas.get(tournament_id, 0),
             now=now,
         )
-        active_round = active_rounds.get(tournament_id)
-        if active_round is not None:
-            open_at = now
-            priority = "late"
-            admission_mode = "late_sse"
         checks.append(
             ReadyCheckAgendaItemResponse(
                 tournament_id=tournament_id,

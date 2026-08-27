@@ -22,11 +22,15 @@
 - Ready Check SSE uses one layered global admission pool across tournaments:
   Redis-backed application leases bind global, source and authenticated-user
   concurrency, while Nginx retains an independent coarse source/global
-  connection ceiling. Ready Check admits at most one stream per authenticated
-  user to prevent multi-tab duplication; the compatibility bracket contour
-  retains its separate four-per-user limit. The browser uses no bracket SSE;
-  bracket pages use a Redis-backed revision probe and fetch the full bracket
-  only after a revision change. See [the realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
+  connection ceiling. The root-mounted provider creates a critical stream only
+  for the visible matching tournament-detail route; unrelated pages and hidden
+  tabs consume no Ready Check stream. Ready Check admits at most one stream per
+  authenticated user in its own Redis namespace; the compatibility bracket
+  contour retains its separate four-per-user namespace and limit. The browser
+  uses no bracket SSE; bracket pages use a Redis-backed revision probe and
+  fetch the full bracket only after a revision change. Production Nginx routes
+  Ready Check SSE with buffering disabled so relay frames reach the browser
+  incrementally. See [the realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
 - Public media rendering is one-way `R2 -> CDN -> browser`; the API does not proxy media object bytes or fall back to local-disk reads.
 
 ## Request and data flow

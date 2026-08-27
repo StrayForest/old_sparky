@@ -373,6 +373,7 @@ class SseMetrics:
             "errors": self.counters["errors"],
             "keepalives": self.counters["keepalives"],
             "events": self.counters["events"],
+            "resyncs": self.counters["resyncs"],
             "bytes_received": self.counters["bytes_received"],
             "connected_percent": round(connected / attempts * 100, 3) if attempts else 0.0,
             "connect_latency_ms": {
@@ -1071,6 +1072,9 @@ async def consume_sse_connection(
                             if line.startswith(": keepalive"):
                                 metrics.mark("keepalives")
                             elif line == "event: connected":
+                                current_event = False
+                            elif line == "event: resync":
+                                metrics.mark("resyncs")
                                 current_event = False
                             elif line == f"event: {'ready_check' if sse_scope == 'ready-check' else 'bracket'}":
                                 current_event = True
@@ -2032,6 +2036,7 @@ def summary(report: dict[str, Any]) -> dict[str, Any]:
             "bytes_received": metrics.get("bytes_received"),
             "error_samples": metrics.get("error_samples", []),
             "events": metrics.get("events"),
+            "resyncs": metrics.get("resyncs"),
             "expected_events": sse.get("expected_events"),
             "publisher": sse.get("publisher"),
             "reconnects": metrics.get("reconnects"),

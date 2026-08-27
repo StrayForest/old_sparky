@@ -100,8 +100,10 @@ def ready_check_user_admission(
     """Return a deterministic, fair opening slot for one eligible user.
 
     Users inside the finite planning quota are spread across the preparation
-    window. Users outside it remain polling-only until the Ready Check start,
-    where they can make a late, high-priority admission attempt. This is a
+    window. Users outside it remain polling-only until the Ready Check start.
+    A late SSE admission is still useful when a participant reaches the page
+    after their scheduled slot but before T; after T the initial tournament
+    state is authoritative and the client stays polling-only. This is a
     client schedule, not a correctness guard: Redis remains the final global
     lease decision.
     """
@@ -110,7 +112,7 @@ def ready_check_user_admission(
     starts_at = _utc(demand.starts_at)
     preparation_start = _utc(plan.preparation_starts_at)
     if now_utc >= starts_at:
-        return now_utc, READY_CHECK_LATE_ADMISSION_PRIORITY, "late_sse"
+        return starts_at, READY_CHECK_POLLING_ADMISSION_PRIORITY, "polling"
 
     eligible_count = max(0, int(demand.eligible_count))
     quota = min(max(0, int(sse_quota)), eligible_count)
