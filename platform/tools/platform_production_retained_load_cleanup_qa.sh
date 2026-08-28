@@ -94,6 +94,55 @@ test "$platform_origin" = "$EXPECTED_ORIGIN" || {
 }
 
 run_root="$RUN_ROOT_BASE/gha-$load_run_id"
+if [[ -L "$run_root" ]]; then
+  echo "The selected retained load run root must not be a symlink." >&2
+  exit 1
+fi
+if [[ ! -e "$run_root" ]]; then
+  export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
+  export_uid="${SUDO_UID:-0}"
+  export_gid="${SUDO_GID:-0}"
+  [[ "$export_uid" =~ ^[0-9]+$ && "$export_gid" =~ ^[0-9]+$ ]] || {
+    echo "Unable to determine the SSH caller identity for cleanup export." >&2
+    exit 1
+  }
+  rm -rf -- "$export_dir"
+  install -d -o root -g root -m 0700 "$export_dir"
+  log_path="$export_dir/cleanup.log"
+  result_path="$export_dir/cleanup-summary.json"
+  set +e
+  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+    --pythonpath "$PLATFORM_ROOT" \
+    -- "$QA_PYTHON" "$TOOLS_DIR/platform_cleanup_retained_orphan.py" \
+    --load-run-id "$load_run_id" \
+    --control-email "$control_email" \
+    --confirm "$CONFIRMATION" \
+    --result-path "$result_path" \
+    2>&1 | tee "$log_path"
+  pipeline_status=("${PIPESTATUS[@]}")
+  cleanup_status="${pipeline_status[0]}"
+  tee_status="${pipeline_status[1]}"
+  set -e
+  if [[ "$tee_status" != "0" ]]; then
+    cleanup_status=1
+  fi
+  if [[ "$cleanup_status" == "0" ]]; then
+    test -s "$result_path" || {
+      echo "Orphan cleanup returned success without a result manifest." >&2
+      cleanup_status=1
+    }
+  fi
+  chown -R "$export_uid:$export_gid" "$export_dir"
+  chmod 0700 "$export_dir"
+  chmod 0600 "$log_path" "$result_path" 2>/dev/null || true
+  printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=%s\n' "$export_dir"
+  printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$result_path"
+  printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXIT_CODE=%s\n' "$cleanup_status"
+  if [[ "$cleanup_status" == "0" ]]; then
+    printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1\n'
+  fi
+  exit "$cleanup_status"
+fi
 test -d "$run_root" || {
   echo "The selected retained load run root does not exist." >&2
   exit 1

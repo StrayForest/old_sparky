@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+import unittest
+
+from tools import platform_cleanup_retained_orphan as cleanup
+
+
+class RetainedOrphanCleanupTests(unittest.TestCase):
+    def _run(self, **overrides: object) -> SimpleNamespace:
+        marker = "preprod260829000001abcd"
+        mode = "read-mix"
+        report_path = (
+            "/opt/oldsparky/platform/shared/production-retained-matrix/"
+            "gha-12345/read-mix/read-mix.json"
+        )
+        report = {
+            "marker": marker,
+            "origin": cleanup.EXPECTED_ORIGIN,
+            "request_origin": cleanup.EXPECTED_ORIGIN,
+            "mode": mode,
+            "report_path": report_path,
+            "user_ids": ["00000000-0000-0000-0000-000000000001"],
+            "tournament_ids": [],
+        }
+        values = {
+            "marker": marker,
+            "origin": cleanup.EXPECTED_ORIGIN,
+            "report_path": report_path,
+            "report": report,
+            "status": "running",
+            "cleanup_state": {},
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_builds_manifest_from_one_exact_durable_row(self) -> None:
+        manifest = cleanup.build_durable_manifest(
+            self._run(),
+            load_run_id="12345",
+            control_email="Control@example.com",
+        )
+        self.assertEqual(manifest["control_email"], "control@example.com")
+        self.assertEqual(manifest["markers"], {"preprod260829000001abcd"})
+        self.assertEqual(len(manifest["user_ids"]), 1)
+        self.assertEqual(manifest["rows"][0]["report_path"], self._run().report_path)
+
+    def test_refuses_row_with_noncanonical_report_path(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "report path"):
+            cleanup.build_durable_manifest(
+                self._run(report_path="/tmp/not-a-retained-run.json"),
+                load_run_id="12345",
+                control_email="control@example.com",
+            )
+
+    def test_refuses_already_cleaned_row(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "already records cleanup"):
+            cleanup.build_durable_manifest(
+                self._run(status="cleaned"),
+                load_run_id="12345",
+                control_email="control@example.com",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

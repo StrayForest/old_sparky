@@ -4881,12 +4881,6 @@ async def vote_deadlock_ready_check(
                 detail="You are not eligible for the active ready-check.",
             )
 
-        existing_choice = await db_session.scalar(
-            select(TournamentDeadlockReadyVote.choice).where(
-                TournamentDeadlockReadyVote.round_id == active_round.id,
-                TournamentDeadlockReadyVote.user_id == current_user_id,
-            )
-        )
         vote_changed = await upsert_deadlock_ready_vote(
             db_session,
             round_id=active_round.id,
@@ -4908,7 +4902,11 @@ async def vote_deadlock_ready_check(
                     detail="Deadlock ready-check is no longer active.",
                 ) from exc
 
-        outcome = "idempotent" if existing_choice == payload.choice and not vote_changed else "accepted"
+        # The conditional upsert is the authoritative idempotency check: an
+        # unchanged existing choice returns no row, while an insert or changed
+        # choice returns the affected vote id.  Avoid a second pre-read on the
+        # hot vote path and keep the decision atomic under concurrent requests.
+        outcome = "idempotent" if not vote_changed else "accepted"
         starts_at = tournament.ready_check_starts_at
         relative_ms = (
             round((auth_session.now - starts_at).total_seconds() * 1000)
