@@ -396,6 +396,8 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
                     else None
                 ),
             }
+            default_workspace_without_ticket.pop("server_time", None)
+            lean_workspace_without_ticket.pop("server_time", None)
             self.assertEqual(
                 lean_workspace_without_ticket,
                 {**default_workspace_without_ticket, "current_user": None},

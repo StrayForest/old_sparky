@@ -979,7 +979,7 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             await organizer["client"].post(
                 "/api/v1/tournaments",
                 json={
-                    "name": f"{self.prefix}-delayed-worker",
+                    "name": f"{self.prefix}-d",
                     "description": "Ready vote must not wait for automation.",
                     "visibility": "public",
                     "format_slug": "solo",
@@ -1512,6 +1512,18 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
                 201,
             )
 
+        ready_start = datetime.now(UTC) - timedelta(seconds=1)
+        ready_end = ready_start + timedelta(minutes=10)
+        captain_start = ready_end
+        async with session_factory()() as db_session:
+            tournament = await db_session.scalar(select(Tournament).where(Tournament.slug == slug))
+            self.assertIsNotNone(tournament, f"Tournament {slug} is missing.")
+            tournament.registration_closes_at = ready_start
+            tournament.ready_check_starts_at = ready_start
+            tournament.ready_check_ends_at = ready_end
+            tournament.captain_selection_starts_at = captain_start
+            await db_session.commit()
+
         ready_start_result = await self._advance_deadlock_automation_for_slug(slug, now=ready_start)
         self.assertEqual(ready_start_result["ready_started"], 1)
         ready_state = self._assert_status(
@@ -1631,6 +1643,18 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 201,
             )
+
+        ready_start = datetime.now(UTC) - timedelta(seconds=1)
+        ready_end = ready_start + timedelta(minutes=10)
+        captain_start = ready_end
+        async with session_factory()() as db_session:
+            tournament = await db_session.scalar(select(Tournament).where(Tournament.slug == slug))
+            self.assertIsNotNone(tournament, f"Tournament {slug} is missing.")
+            tournament.registration_closes_at = ready_start
+            tournament.ready_check_starts_at = ready_start
+            tournament.ready_check_ends_at = ready_end
+            tournament.captain_selection_starts_at = captain_start
+            await db_session.commit()
 
         participants_payload = self._assert_status(
             await organizer["client"].get(f"/api/v1/tournaments/{slug}/participants"),
