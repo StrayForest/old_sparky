@@ -655,8 +655,8 @@ test("authenticated header stays resolved across client navigation without a bro
 test("status and rank filters operate on typed tournament data", async ({ page }) => {
   await page.goto("/tournaments");
 
-  await page.getByTestId("status-filter").selectOption("registration_closed");
-  await expect(page.getByTestId("status-filter")).not.toBeFocused();
+  await page.getByRole("main").getByTestId("status-filter").selectOption("registration_closed");
+  await expect(page.getByRole("main").getByTestId("status-filter")).not.toBeFocused();
   await expect(page.getByRole("heading", { name: "Citadel Clash #3" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Night Veil Open #5" })).toHaveCount(0);
 
@@ -670,15 +670,15 @@ test("status and rank filters operate on typed tournament data", async ({ page }
 test("tournament filters keep invite and dropdown controls equal while search stays wider", async ({ page }) => {
   await page.setViewportSize({ width: 1800, height: 1000 });
   await page.goto("/tournaments");
-  await expect(page.getByTestId("status-filter")).toBeVisible();
+  await expect(page.getByRole("main").getByTestId("status-filter")).toBeVisible();
 
-  const panelBox = await page.locator(".filters-panel").boundingBox();
+  const panelBox = await page.getByRole("main").locator(".filters-panel").boundingBox();
   const searchBox = await page.getByTestId("tournament-search-filter").locator("..").locator("..").boundingBox();
   const inviteBox = await page.getByTestId("tournament-invite-code").locator("..").locator("..").boundingBox();
-  const statusBox = await page.getByTestId("status-filter").locator("..").locator("..").boundingBox();
-  const rankBox = await page.getByTestId("rank-filter").locator("..").locator("..").boundingBox();
-  const scopeBox = await page.getByTestId("tournament-scope-filter").locator("..").locator("..").boundingBox();
-  const dateBox = await page.getByTestId("date-sort-filter").boundingBox();
+  const statusBox = await page.getByRole("main").getByTestId("status-filter").locator("..").locator("..").boundingBox();
+  const rankBox = await page.getByRole("main").getByTestId("rank-filter").locator("..").locator("..").boundingBox();
+  const scopeBox = await page.getByRole("main").getByTestId("tournament-scope-filter").locator("..").locator("..").boundingBox();
+  const dateBox = await page.getByRole("main").getByTestId("date-sort-filter").boundingBox();
 
   expect(searchBox?.width).toBeGreaterThan(statusBox?.width ?? 0);
   for (const box of [inviteBox, rankBox, scopeBox, dateBox]) {
@@ -694,7 +694,7 @@ test("tournament filters keep invite and dropdown controls equal while search st
 test("tournament filters and profile actions do not overflow a mobile viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 1000 });
   await page.goto("/tournaments");
-  await expect(page.locator(".filters-panel")).toBeVisible();
+  await expect(page.getByRole("main").locator(".filters-panel")).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
 
   await page.context().addCookies([{
@@ -1080,11 +1080,11 @@ test("tournament scope filter loads private organizer and registered tournaments
 
   await page.goto("/tournaments");
 
-  await page.getByTestId("tournament-scope-filter").selectOption("mine");
+  await page.getByRole("main").getByTestId("tournament-scope-filter").selectOption("mine");
   await expect(page.getByRole("heading", { name: "Private Owned Cup" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Private Registered Cup" })).toHaveCount(0);
 
-  await page.getByTestId("tournament-scope-filter").selectOption("registered");
+  await page.getByRole("main").getByTestId("tournament-scope-filter").selectOption("registered");
   await expect(page.getByRole("heading", { name: "Private Registered Cup" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Private Owned Cup" })).toHaveCount(0);
 });
@@ -1133,14 +1133,14 @@ test("tournament list loads nine cards at a time on scroll and centers the count
   });
 
   await page.goto("/tournaments");
-  await page.getByTestId("tournament-scope-filter").selectOption("mine");
+  await page.getByRole("main").getByTestId("tournament-scope-filter").selectOption("mine");
 
-  await page.getByTestId("status-filter").selectOption("registration_open");
+  await page.getByRole("main").getByTestId("status-filter").selectOption("registration_open");
   await expect(page.getByTestId("tournament-card")).toHaveCount(9);
   await expect(page.getByTestId("tournaments-load-more")).toHaveCount(0);
   await expect(page.getByTestId("shown-count")).toHaveText("Показано 9 из 9 турниров");
 
-  await page.getByTestId("status-filter").selectOption("all");
+  await page.getByRole("main").getByTestId("status-filter").selectOption("all");
   await expect(page.getByTestId("tournament-card")).toHaveCount(9);
   await page.getByTestId("tournaments-load-sentinel").scrollIntoViewIfNeeded();
   await expect(page.getByTestId("tournament-card")).toHaveCount(10);
@@ -1354,7 +1354,7 @@ test("mobile tournament metadata keeps limits together and the organizer last", 
     await route.fulfill({ response, json: tournaments });
   });
   await page.goto("/tournaments");
-  await page.getByTestId("status-filter").selectOption("registration_open");
+  await page.getByRole("main").getByTestId("status-filter").selectOption("registration_open");
 
   const card = page.getByTestId("tournament-card").first();
   await expect(card).toBeVisible();
@@ -1657,7 +1657,7 @@ test("home hierarchy collapses without overflow on configured viewports", async 
 test("bracket route does not fabricate teams when the API returns an empty bracket", async ({ page }) => {
   await page.goto("/tournaments/citadel-clash-3/bracket");
 
-  await expect(page.getByTestId("bracket-empty")).toBeVisible();
+  await expect(page.getByRole("main").getByTestId("bracket-empty")).toBeVisible();
   await expect(page.getByTestId("bracket-match")).toHaveCount(0);
   await expect(page.getByTestId("bracket-team-name")).toHaveCount(0);
 });
@@ -1730,8 +1730,8 @@ test("organizer schedules a match above its teams while score controls stay belo
   });
 
   await page.goto("/tournaments/bracket-manager-smoke/bracket");
-  const dateInput = page.getByLabel("Дата матча 1-1");
-  const timeInput = page.getByLabel("Время матча 1-1");
+  const dateInput = page.getByRole("main").getByLabel("Дата матча 1-1");
+  const timeInput = page.getByRole("main").getByLabel("Время матча 1-1");
   await dateInput.fill("2099-07-26");
   await timeInput.fill("18:00");
   await expect(dateInput).toHaveValue("2099-07-26");
@@ -1820,7 +1820,7 @@ test("primary navigation links point to Next routes", async ({ page }) => {
 
   await page.goto("/tournaments/night-veil-open-5", { waitUntil: "domcontentloaded" });
   await expect(page.getByRole("link", { name: "Перейти к сетке" })).toHaveAttribute("href", "/tournaments/night-veil-open-5/bracket");
-  await expect(page.locator(".bracket-icon path")).toHaveAttribute(
+  await expect(page.getByRole("main").locator(".bracket-icon path")).toHaveAttribute(
     "d",
     "M10 8h14v12H10zM10 26h14v12H10zM10 44h14v12H10zM24 14h10v18h8M24 32h18M24 50h10V32M42 26h12v12H42z"
   );
@@ -1849,7 +1849,7 @@ test("create tournament page distinguishes an unavailable session from anonymous
 test("registration action panel has balanced top and bottom spacing", async ({ page }) => {
   await page.goto("/tournaments/night-veil-open-5");
 
-  const spacing = await page.locator(".steps-panel").evaluate((panel) => {
+  const spacing = await page.getByRole("main").locator(".steps-panel").evaluate((panel) => {
     const style = getComputedStyle(panel);
     return {
       top: Number.parseFloat(style.paddingTop),
@@ -1858,13 +1858,13 @@ test("registration action panel has balanced top and bottom spacing", async ({ p
   });
   expect(spacing.top).toBeGreaterThanOrEqual(16);
   expect(Math.abs(spacing.top - spacing.bottom)).toBeLessThanOrEqual(1);
-  await expect(page.getByTestId("registration-steps")).toContainText("Подтверждение с");
-  await expect(page.getByTestId("registration-steps")).not.toContainText("Подтверждение участия с");
-  const actionWeights = await page.locator(".steps-panel .primary-action, .steps-panel .disabled-action, .steps-panel .status-action").evaluateAll(
+  await expect(page.getByRole("main").getByTestId("registration-steps")).toContainText("Подтверждение с");
+  await expect(page.getByRole("main").getByTestId("registration-steps")).not.toContainText("Подтверждение участия с");
+  const actionWeights = await page.getByRole("main").locator(".steps-panel .primary-action, .steps-panel .disabled-action, .steps-panel .status-action").evaluateAll(
     (actions) => actions.map((action) => getComputedStyle(action).fontWeight)
   );
   expect(actionWeights.every((weight) => Number(weight) <= 500)).toBe(true);
-  const registrationSteps = page.getByTestId("registration-steps");
+  const registrationSteps = page.getByRole("main").getByTestId("registration-steps");
   await expect(registrationSteps.getByText("Авторизуйтесь", { exact: true })).toBeVisible();
   await expect(registrationSteps.getByText("Авторизуйтесь", { exact: true })).toHaveAttribute("aria-disabled", "true");
   await expect(registrationSteps.getByRole("button", { name: "Зарегистрироваться" })).toHaveCount(0);
@@ -1946,7 +1946,7 @@ test("create tournament form posts to API and navigates to detail", async ({ pag
   });
 
   await page.goto("/tournaments/new");
-  await page.locator('form[aria-label="Форма создания турнира"]').getByLabel(/Название турнира/).fill("Old Sparky Cup #1");
+  await page.getByRole("main").locator('form[aria-label="Форма создания турнира"]').getByLabel(/Название турнира/).fill("Old Sparky Cup #1");
   await page.getByLabel(/Краткое описание/).fill("Smoke tournament");
   await page.getByLabel("Макс. команд").fill("128");
   const inviteCodeInput = page.getByLabel(/Код приглашения/);
@@ -2027,7 +2027,7 @@ test("create tournament form uses organizer defaults and tournament limits", asy
   expect(optionLabels[0] >= firstTimeMinimum!).toBe(true);
   await page.keyboard.press("Escape");
 
-  const titleInput = page.locator('form[aria-label="Форма создания турнира"]').getByLabel(/Название турнира/);
+  const titleInput = page.getByRole("main").locator('form[aria-label="Форма создания турнира"]').getByLabel(/Название турнира/);
   await expect(titleInput).toHaveValue("");
   await expect(titleInput).toHaveAttribute("maxlength", "25");
   await expect(titleInput).toHaveAttribute("placeholder", "Например, Old Sparky Cup");
@@ -2312,7 +2312,7 @@ test("create tournament rejects an invite code shorter than the API contract bef
   });
 
   await page.goto("/tournaments/new");
-  await page.locator('form[aria-label="Форма создания турнира"]').getByLabel(/Название турнира/).fill("Invite Contract Test");
+  await page.getByRole("main").locator('form[aria-label="Форма создания турнира"]').getByLabel(/Название турнира/).fill("Invite Contract Test");
   await page.getByLabel(/Краткое описание/).fill("Contract validation");
   await page.getByLabel("Макс. команд").fill("128");
   await page.getByLabel(/Код приглашения/).fill("SHORT1234");
@@ -2333,7 +2333,7 @@ test("create tournament form validation blocks invalid payload before API", asyn
   });
 
   await page.goto("/tournaments/new");
-  await page.locator('form[aria-label="Форма создания турнира"]').getByLabel(/Название турнира/).fill("");
+  await page.getByRole("main").locator('form[aria-label="Форма создания турнира"]').getByLabel(/Название турнира/).fill("");
   await page.getByRole("button", { name: "Создать турнир" }).click();
 
   await expect(page.getByText("Проверьте название, код приглашения, расписание и допустимые ранги.")).toBeVisible();
@@ -3285,8 +3285,8 @@ test("registration and check-in actions work before teams are formed", async ({ 
   await page.goto("/tournaments/night-veil-open-5");
   await expect(page.getByRole("button", { name: "Зарегистрироваться" })).toBeEnabled();
   await expect(page.getByText("Не выполнено").first()).toBeVisible();
-  await expect(page.getByTestId("registration-steps").getByText("Формирование команд", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("registration-steps").getByRole("button", { name: "Формирование команд" })).toHaveCount(0);
+  await expect(page.getByRole("main").getByTestId("registration-steps").getByText("Формирование команд", { exact: true })).toBeVisible();
+  await expect(page.getByRole("main").getByTestId("registration-steps").getByRole("button", { name: "Формирование команд" })).toHaveCount(0);
   await expect(page.locator(".team-auto-text")).toContainText("~");
   await expect(page.locator(".steps-panel .step-number")).toHaveCount(0);
   await expect(page.locator(".steps-panel .step-title")).toHaveCount(0);
@@ -3319,10 +3319,10 @@ test("registration and check-in actions work before teams are formed", async ({ 
   await page.getByRole("button", { name: "Подтвердить участие" }).click();
   await expect(page.getByRole("button", { name: "Отменить подтверждение" })).toBeEnabled();
   await page.clock.fastForward(25 * 60 * 1000 + 100);
-  await expect(page.getByTestId("registration-steps").getByText("Участие подтверждено", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("registration-steps").getByRole("button", { name: "Участие подтверждено" })).toHaveCount(0);
-  await expect(page.getByTestId("registration-steps").getByText("Зарегистрирован", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("registration-steps").getByRole("button", { name: "Зарегистрирован" })).toHaveCount(0);
+  await expect(page.getByRole("main").getByTestId("registration-steps").getByText("Участие подтверждено", { exact: true })).toBeVisible();
+  await expect(page.getByRole("main").getByTestId("registration-steps").getByRole("button", { name: "Участие подтверждено" })).toHaveCount(0);
+  await expect(page.getByRole("main").getByTestId("registration-steps").getByText("Зарегистрирован", { exact: true })).toBeVisible();
+  await expect(page.getByRole("main").getByTestId("registration-steps").getByRole("button", { name: "Зарегистрирован" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Отменить регистрацию" })).toHaveCount(0);
   expect(registered).toBe(true);
   expect(checkedIn).toBe(true);
@@ -3335,7 +3335,7 @@ test("formed teams replace registration control with a status", async ({ page })
   ]);
 
   await page.goto("/tournaments/night-veil-open-5");
-  const steps = page.getByTestId("registration-steps");
+  const steps = page.getByRole("main").getByTestId("registration-steps");
   await expect(steps.getByText("Регистрация закрыта", { exact: true })).toBeVisible();
   await expect(steps.getByRole("button", { name: "Зарегистрироваться" })).toHaveCount(0);
   await expect(steps.getByRole("button", { name: "Регистрация закрыта" })).toHaveCount(0);
@@ -3348,7 +3348,7 @@ test("tournament detail aligns its sections and keeps match formats with the bra
   await page.goto("/tournaments/night-veil-open-5");
 
   const description = page.locator(".description-panel");
-  const bracket = page.locator(".bracket-panel");
+  const bracket = page.getByRole("main").locator(".bracket-panel");
   await expect(description.getByText("Формат матчей", { exact: true })).toHaveCount(0);
   await expect(description.getByText("Формат финала", { exact: true })).toHaveCount(0);
   await expect(bracket).toContainText("Матчи");
@@ -3446,9 +3446,9 @@ test("registration button is unavailable outside registration_open state", async
   await page.goto("/tournaments/citadel-clash-3");
 
   await expect(page.getByRole("button", { name: "Зарегистрироваться" })).toHaveCount(0);
-  await expect(page.getByTestId("registration-steps").locator(".status-action").first()).toHaveText("Регистрация закрыта");
-  await expect(page.getByTestId("registration-steps").getByText("Команды сформированы", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("registration-steps").getByRole("button", { name: "Команды сформированы" })).toHaveCount(0);
+  await expect(page.getByRole("main").getByTestId("registration-steps").locator(".status-action").first()).toHaveText("Регистрация закрыта");
+  await expect(page.getByRole("main").getByTestId("registration-steps").getByText("Команды сформированы", { exact: true })).toBeVisible();
+  await expect(page.getByRole("main").getByTestId("registration-steps").getByRole("button", { name: "Команды сформированы" })).toHaveCount(0);
 });
 
 test("team panels stay hidden for visitors who are not registered", async ({ page }) => {
@@ -3456,7 +3456,7 @@ test("team panels stay hidden for visitors who are not registered", async ({ pag
 
   await expect(page.getByText("Моя команда", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Команды соперников", { exact: true })).toHaveCount(0);
-  await expect(page.getByTestId("tournament-team-unassigned")).toHaveCount(0);
+  await expect(page.getByRole("main").getByTestId("tournament-team-unassigned")).toHaveCount(0);
 });
 
 test("registered player outside the published roster sees the unassigned state", async ({ page }) => {
@@ -3473,7 +3473,7 @@ test("registered player outside the published roster sees the unassigned state",
     }
   ]);
   await page.goto("/tournaments/night-veil-open-5");
-  await expect(page.getByTestId("tournament-team-unassigned")).toContainText(
+  await expect(page.getByRole("main").getByTestId("tournament-team-unassigned")).toContainText(
     "К сожалению, вы не попали ни в одну команду"
   );
   await expect(page.getByText("Моя команда", { exact: true })).toHaveCount(0);
@@ -3490,12 +3490,12 @@ test("active team commitment warns before formation and becomes generic afterwar
   await expect(page.getByTestId("tournament-commitment-blocked")).toContainText(
     "Вы можете зарегистрироваться и подтвердить готовность, но вы не попадете в команду на этом турнире, пока ваша команда «Синие» не завершит участие в турнире «Active Cup»."
   );
-  await expect(page.getByTestId("tournament-team-unassigned")).toHaveCount(0);
+  await expect(page.getByRole("main").getByTestId("tournament-team-unassigned")).toHaveCount(0);
 
   await page.context().clearCookies({ name: "teams-pending-smoke" });
   await page.goto("/tournaments/night-veil-open-5");
   await expect(page.getByTestId("tournament-commitment-blocked")).toHaveCount(0);
-  await expect(page.getByTestId("tournament-team-unassigned")).toContainText(
+  await expect(page.getByRole("main").getByTestId("tournament-team-unassigned")).toContainText(
     "К сожалению, вы не попали ни в одну команду"
   );
   await expect(page.getByText("Регистрация сохранена, но в опубликованный состав команд вы не вошли.")).toHaveCount(0);
