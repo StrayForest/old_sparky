@@ -1,20 +1,17 @@
 # AS-19 — Historical SSE capacity and combined-load benchmark
 
-> Retired historical evidence. Ready Check and the bracket grid no longer use
-> SSE or automatic polling. This document is preserved for audit history and
-> is not a current architecture, capacity target or release gate.
+> Retired historical evidence: Ready Check and bracket grid no longer use SSE or
+> automatic polling; preserved for audit, not current architecture, target or gate.
 
 - Status: Retired historical measurement plan and controlled limit experiment
-- Owner: Platform maintainers
-- Started: 2026-08-25
+- Owner: Platform maintainers; started: 2026-08-25
 
 ## Objective
 
-Measure the deployed public bracket SSE behavior separately from the existing
-10,000-user browser-polling gate, then measure both paths together. The test
-must distinguish a deliberate admission response (`429`) from an application
-failure (`5xx`, unexpected disconnect or client error) and must leave no
-synthetic data behind.
+Measure the deployed public bracket SSE behavior separately from the historical
+10,000-user browser-polling gate, then measure both paths together. Distinguish
+deliberate admission (`429`) from failure (`5xx`, disconnect or client error),
+and leave no synthetic data behind.
 
 The previous deployed contour was application global `128`, Nginx
 `8/source + 160/global`, and Nginx `worker_connections=768`. That contour

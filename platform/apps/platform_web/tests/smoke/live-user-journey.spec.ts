@@ -748,14 +748,17 @@ async function assertManualBracketRefresh(
     await playerPage.reload();
     await expect(playerPage.getByTestId("bracket-shell")).toBeVisible();
     const expectedScheduledAt = Date.parse(scheduledAt);
-    await expect.poll(async () => playerPage.locator("time[datetime]").evaluateAll((elements, expectedTimestamp) => (
-      elements.some((element) => {
-        const value = element.getAttribute("datetime");
-        const actualScheduledAt = value ? Date.parse(value) : Number.NaN;
-        return Number.isFinite(actualScheduledAt)
-          && Math.abs(actualScheduledAt - expectedTimestamp) <= 5_000;
-      })
-    ), expectedScheduledAt))).toBe(true);
+    await expect.poll(async () => (
+      playerPage.locator("time[datetime]").evaluateAll(
+        (elements, expectedTimestamp) => elements.some((element) => {
+          const value = element.getAttribute("datetime");
+          const actualScheduledAt = value ? Date.parse(value) : Number.NaN;
+          return Number.isFinite(actualScheduledAt)
+            && Math.abs(actualScheduledAt - expectedTimestamp) <= 5_000;
+        }),
+        expectedScheduledAt,
+      )
+    )).toBe(true);
   } finally {
     playerPage.off("request", recordBackgroundBracketRequest);
   }
