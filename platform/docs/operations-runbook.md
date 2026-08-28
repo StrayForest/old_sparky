@@ -327,6 +327,12 @@ duplicate/idempotency behavior. It exercises only vote POSTs; the timer phase
 is entirely local. Clean the exact load run with the same cleanup workflow
 before starting another production load.
 
+Retained users are provisioned with authenticated sessions rather than logging
+in inside the burst. The harness derives the same session-bound CSRF token that
+the login response issues, so `/auth/csrf` is not an artificial
+first-mutation dependency in the write latency numbers; authentication/CSRF
+endpoint load is covered by the ordinary read/auth profiles.
+
 Ready Check load testing uses the `write-burst` mode of
 `platform_production_qa.py`. The test creates marked
 eligible participants, uses the real Ready Check vote endpoint after its

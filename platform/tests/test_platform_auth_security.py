@@ -30,6 +30,7 @@ from python_packages.platform_infra.csrf import (
     CsrfProtectionMiddleware,
     PUBLIC_AUTH_PATHS,
     csrf_cookie_name,
+    generate_csrf_token,
     issue_csrf_token,
 )
 from python_packages.platform_infra.db import dispose_engine, session_factory
@@ -252,6 +253,24 @@ class AuthSecurityUnitTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(origin_response.status_code, 200, origin_response.text)
         self.assertEqual(referer_response.status_code, 200, referer_response.text)
+
+    async def test_pre_generated_csrf_token_uses_the_same_session_binding(self) -> None:
+        client, settings = await self._csrf_client()
+        async with client:
+            session_token = "session-token"
+            token = generate_csrf_token(session_token, settings)
+            client.cookies.set(settings.platform_session_cookie_name, session_token)
+            client.cookies.set(csrf_cookie_name(settings), token)
+            response = await client.post(
+                "/unsafe",
+                headers={
+                    "Origin": "https://old-sparky.com",
+                    "Sec-Fetch-Site": "same-origin",
+                    "X-CSRF-Token": token,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
 
     async def test_csrf_rejects_cross_site_origin_and_fetch_metadata(self) -> None:
         client, settings = await self._csrf_client()

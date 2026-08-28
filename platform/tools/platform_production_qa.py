@@ -27,7 +27,7 @@ sys.path.insert(0, str(PLATFORM_ROOT))
 
 from python_packages.platform_domain.deadlock.constants import RANKS
 from python_packages.platform_infra.config import get_settings
-from python_packages.platform_infra.csrf import UNSAFE_METHODS
+from python_packages.platform_infra.csrf import UNSAFE_METHODS, generate_csrf_token
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.media.hard_delete import (
     MediaCleanupRequired,
@@ -1786,6 +1786,7 @@ class ProductionQa:
         self.user_ids: list[str] = []
         self.session_tokens_by_user_id: dict[str, str] = {}
         self.csrf_tokens_by_user_id: dict[str, str] = {}
+        self.csrf_tokens_preseeded = False
         self.rostered_session_token_digest: str | None = None
         self.control_participant_session_token_digest: str | None = None
         self.tournament_id: str | None = None
@@ -2133,6 +2134,18 @@ class ProductionQa:
             raise QaFailure(f"GET /auth/csrf as {user['label']}: token invalid")
         self.csrf_tokens_by_user_id[user_id] = csrf_token
         return csrf_token
+
+    def preseed_csrf_tokens(self, users: list[dict[str, Any]]) -> None:
+        """Model tokens issued during login without measuring /auth/csrf."""
+
+        settings = get_settings()
+        for user in users:
+            user_id = str(user["id"])
+            self.csrf_tokens_by_user_id[user_id] = generate_csrf_token(
+                self.session_tokens_by_user_id[user_id],
+                settings,
+            )
+        self.csrf_tokens_preseeded = True
 
     async def wait_for_auto_assignment_run_as(
         self,
@@ -3627,6 +3640,7 @@ class ProductionQa:
             await self.start_performance_collection()
             with self.phase("write_burst_seed_users"):
                 users = await self.bulk_register_scale_users()
+            self.preseed_csrf_tokens(users)
             self.scenario("write_burst_users_created", len(users) == self.scale_users, {"users": len(users)})
             organizer_users = list(users[:6])
             if self.write_burst_profile in {"all", "multi-staggered"}:
@@ -3677,6 +3691,7 @@ class ProductionQa:
                 "time_scale": self.write_burst_time_scale,
                 "profiles": profiles,
                 "load_generator_local": is_local_origin(self.origin),
+                "csrf_preseeded": self.csrf_tokens_preseeded,
                 "acceptance": acceptance,
                 "follow_up_reads": follow_up_read_counts(
                     self.http_metrics.samples,

@@ -5913,14 +5913,22 @@ async def join_tournament(
             existing_participant,
             auth_session.user.display_name,
         )
-    refreshed_preflight = await participant_join_preflight(
-        db_session,
-        slug=slug,
-        user_id=auth_session.user.id,
-    )
-    if refreshed_preflight is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
-    preflight = refreshed_preflight
+    # Without an idempotency reservation there was no await between the
+    # initial preflight and this point, so repeating the same correlated query
+    # only added database/serialization work. Capacity remains authoritative
+    # in create_participant -> claim_participant_slot, and the insert
+    # constraint still closes the concurrent duplicate-user race. Keep the
+    # refresh for idempotent retries because reserving an existing key may
+    # have waited on another request before returning.
+    if idempotency is not None:
+        refreshed_preflight = await participant_join_preflight(
+            db_session,
+            slug=slug,
+            user_id=auth_session.user.id,
+        )
+        if refreshed_preflight is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+        preflight = refreshed_preflight
     tournament = preflight.tournament
     if tournament.visibility == "invite_only":
         has_invite_access = tournament.organizer_user_id == auth_session.user.id or preflight.has_invite_access

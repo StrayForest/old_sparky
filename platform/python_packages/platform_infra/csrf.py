@@ -119,8 +119,7 @@ def issue_csrf_token(
     settings: PlatformSettings | None = None,
 ) -> str:
     resolved_settings = settings or get_settings()
-    nonce = secrets.token_urlsafe(32)
-    token = f"{nonce}.{_csrf_signature(resolved_settings, session_token, nonce)}"
+    token = generate_csrf_token(session_token, resolved_settings)
     response.set_cookie(
         key=csrf_cookie_name(resolved_settings),
         value=token,
@@ -133,6 +132,17 @@ def issue_csrf_token(
     response.headers[CSRF_HEADER_NAME] = token
     response.headers["Cache-Control"] = "no-store"
     return token
+
+
+def generate_csrf_token(
+    session_token: str,
+    settings: PlatformSettings | None = None,
+) -> str:
+    """Create a session-bound token without requiring an HTTP response."""
+
+    resolved_settings = settings or get_settings()
+    nonce = secrets.token_urlsafe(32)
+    return f"{nonce}.{_csrf_signature(resolved_settings, session_token, nonce)}"
 
 
 def clear_csrf_cookie(response: Response, settings: PlatformSettings | None = None) -> None:
