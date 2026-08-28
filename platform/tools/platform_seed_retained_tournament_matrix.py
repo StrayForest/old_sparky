@@ -24,6 +24,10 @@ INVITE_MAX_USERS = min(
     INVITE_MAX_USES - INVITE_EXTRA_CAPACITY,
     INVITE_CLAIM_IP_LIMIT - INVITE_RATE_LIMIT_HEADROOM,
 )
+# The captain/assignment workflow requires seven players per team.  Keep the
+# retained fixture large enough for its 64-team control scenario instead of
+# relying on the six-player team shape used by an older fixture assumption.
+DEADLOCK_PLAYERS_PER_TEAM = 7
 
 
 MATRIX_STATES = {
@@ -153,7 +157,9 @@ def allocate_user_counts(
         for index, item in enumerate(plan)
         if item["control_state"] == "assigned"
     )
-    assigned_users = int(plan[assigned_index]["teams"]) * 6 - 1
+    assigned_users = (
+        int(plan[assigned_index]["teams"]) * DEADLOCK_PLAYERS_PER_TEAM - 1
+    )
     remaining_indexes = [index for index in range(len(plan)) if index != assigned_index]
     remaining_total = target_total - assigned_users
     if remaining_total < len(remaining_indexes) * 14:

@@ -176,7 +176,7 @@ The operator-owned pre-production matrix is a manual load-test gate. It is not
 the browser smoke suite and must not target the public production origin. The
 default plan runs 20 sequential retained scale runs with approximately 500
 generated users per tournament (10,000 generated users total; the exact
-assignment-control run uses 383 synthetic players plus the control account),
+assignment-control run uses 447 synthetic players plus the control account),
 19 public and 1 invite-only tournament, five tournaments each at 8, 16, 32
 and 64 teams, and 600 teams overall. Every generated account exercises
 ordinary profile writes, Deadlock profile writes,
