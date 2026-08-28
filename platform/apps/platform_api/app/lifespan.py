@@ -4,10 +4,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from apps.platform_api.app.services.bracket_events import dispose_bracket_event_relays
 from python_packages.platform_infra.db import dispose_engine, warm_up_engine
 from python_packages.platform_infra.logging import configure_logging
-from python_packages.platform_infra.redis import dispose_redis, warm_up_redis
+from python_packages.platform_infra.redis import warm_up_redis
 
 
 @asynccontextmanager
@@ -18,6 +17,4 @@ async def platform_lifespan(_: FastAPI):
     try:
         yield
     finally:
-        await dispose_bracket_event_relays()
-        await dispose_redis()
         await dispose_engine()

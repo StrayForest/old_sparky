@@ -131,22 +131,18 @@ dry-run by default; apply bounded batches only after a fresh verified backup,
 then verify by DB row and targeted HeadObject/CDN requests. Deletion requires a
 grace period and explicit approval.
 
-## SSE connection pressure
+## Request-driven tournament updates
 
-Public bracket SSE has layered application and Nginx admission limits; the stable capacity values belong in [`production-architecture.md`](production-architecture.md). Application rejections are emitted as HTTP 429 with a bounded retry hint, limiter-backend failure is fail-closed as HTTP 503, and Nginx connection-limit rejection is also HTTP 429.
+Ready Check and the bracket grid use no SSE and no automatic polling. The
+tournament page receives its schedule and initial bracket in the ordinary HTTP
+workspace response. Ready Check transitions are local timer updates; the grid
+shows passive bracket changes after a manual page reload. Explicit bracket
+mutations may refetch the authoritative response needed to display the result.
 
-Use the application journal and structured Nginx access log to distinguish ordinary reconnects from sustained pressure:
-
-```bash
-journalctl -u deadlock-api --since -1h --no-pager \
-  | grep -E 'Rejected SSE connection|Failed to release SSE connection lease|limiter backend is unavailable'
-
-grep '/bracket/events' /var/log/nginx/platform-access.log \
-  | grep '"status":429' \
-  | tail -n 50
-```
-
-The application logs a privacy-preserving source fingerprint rather than the raw source address for admission rejections. A failed immediate lease release is not by itself a leak: bounded expiry reclaims the slot, but repeated release failures indicate Redis/runtime trouble and require investigation. Do not raise SSE ceilings to suppress 429s without correlating them with legitimate concurrency and VPS/API/Redis resource evidence.
+When investigating stale tournament data, inspect the ordinary API request
+latency/status logs and ask the user to reload the page. Do not restore or
+increase retired stream, lease, admission or polling settings. Historical SSE
+measurements remain in the AS-19/AS-20 documents for audit context only.
 
 Approved load generators may be listed in the exact-address setting
 `PLATFORM_LOAD_TEST_SOURCE_IPS`. The allowlist skips only per-source/IP
@@ -198,14 +194,10 @@ matrix itself is started manually by an operator and is a load test, not a
 browser smoke run.
 
 The retained matrix is a 10,000-account data-volume test with bounded mutation
-concurrency. The separate browser-polling profile models 10,000 virtual tabs
-with `--browser-polling-users-per-tournament 500`,
-the default active/passive browser mix, HTTP40, a 300-second opening stagger
-and a 30-second polling window. This keeps the virtual-user count without
-making the same VPS allocate 10,000 load-generator sockets. It measures
-bounded virtual-user polling, not 10,000 long-lived SSE sockets or continuous
-10-second polling by every tab; the public SSE global/source ceilings remain capacity
-safeguards.
+concurrency. The separate `write-burst` profile measures real Ready Check vote
+POST contention after the server-known window; it creates no waiting-client
+transport. The `matrix` profile exercises the ordinary tournament workflow and
+manual/request-driven reads.
 
 The control account is passed at runtime and is never modified. The matrix
 places it in registered-only, ready-check and exactly one assignment-control
@@ -275,37 +267,28 @@ gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
 After the workflow is deployed and the ordinary retained matrix has been
-reviewed, run the final virtual-user gate with the same confirmation and
-control account, changing only the profile:
+reviewed, run the Ready Check vote-burst gate with the same confirmation and
+control account:
 
 ```bash
 gh workflow run platform-production-retained-load-matrix.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
   -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=80 \
-  -f profile=browser-polling
-gh run watch <browser-load-run-id> --repo StrayForest/old_sparky --exit-status
+  -f profile=write-burst -f write_burst_profile=all \
+  -f write_burst_users_per_tournament=500 -f write_burst_time_scale=1.0
+gh run watch <write-burst-load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The `browser-polling` profile creates 20 marked tournaments and 10,000
-synthetic users, opens 10,000 active virtual tabs over the bounded ramp, sends
-conditional revision reads and reports `304 Not Modified`, deduplication,
-response latency, pool wait, database/lock pressure and Celery backlog. It is a
-bounded compatibility-bracket polling test and does not create Ready Check
-transport traffic.
-Clean the exact browser load run with the same cleanup workflow before starting
-another production load.
-
-The same workflow exposes `profile=sse` only for the compatibility bracket
-transport. It measures the bracket SSE endpoint through the selected public or
-origin-local contour and retains the generic bracket admission, lease,
-revalidation and event-delivery checks. It is not a Ready Check test and must
-not be interpreted as a Ready Check capacity target. Historical Ready Check
-SSE benchmark plans and results remain linked from the documentation index for
-audit context only.
+The `write-burst` profile measures real Ready Check vote POST contention after
+the server-known window. It reports accepted/rejected votes, response latency,
+database pool wait, lock pressure, API/PostgreSQL CPU and connections, and
+duplicate/idempotency behavior. It creates no Ready Check SSE or polling
+traffic. Clean the exact load run with the same cleanup workflow before
+starting another production load.
 
 Ready Check load testing uses the `write-burst` mode of
-`platform_production_qa.py`, not the SSE profile. The test creates marked
+`platform_production_qa.py`. The test creates marked
 eligible participants, uses the real Ready Check vote endpoint after its
 server-known window, and reports accepted/rejected votes, response p50/p95/p99,
 database pool wait, lock pressure, API/PostgreSQL CPU and connections, and
@@ -360,13 +343,12 @@ its retained report and one-row summary from the matching durable
 ownership and graph-boundary check before deleting anything. A recovered run
 is never considered a passed load measurement.
 
-If a browser tournament was committed before its POST timed out at the edge,
-the durable report may contain the synthetic users but no tournament ID. The
-cleanup validator then recovers only exact `Browser polling profile <marker>
-<category>.` descriptions whose organizer is one of that run's synthetic
-users. Any malformed marker match or organizer outside the manifest remains a
-fail-closed cleanup error; this recovery never broadens deletion to a generic
-historical search.
+If a tournament was committed before its POST timed out at the edge, the
+durable report may contain the synthetic users but no tournament ID. The
+cleanup validator then recovers only the exact write-burst/matrix marker and
+organizer scope recorded for that run. Any malformed marker match or organizer
+outside the manifest remains a fail-closed cleanup error; this recovery never
+broadens deletion to a generic historical search.
 
 The cleanup command also disposes its async database engine in the same event
 loop as validation/deletion; cross-loop asyncpg errors in a successful cleanup
@@ -408,6 +390,7 @@ production.
 - newest backup older than 24 hours or not restore-verified;
 - sustained Celery queue growth or retry exhaustion;
 - repeated 5xx/security delivery errors;
-- sustained SSE 429/503 outside expected abusive traffic, especially with API/Redis resource pressure;
+- sustained API 429/5xx responses or timeouts outside expected abusive traffic,
+  especially with API/Redis resource pressure;
 - p95 breach correlated with CPU, DB wait or lock evidence;
 - Origin CA expiry inside the monitor threshold.

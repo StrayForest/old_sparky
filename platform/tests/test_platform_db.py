@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock, patch, sentinel
-
-from starlette.exceptions import HTTPException
+from unittest.mock import Mock, patch, sentinel
 
 from python_packages.platform_infra import db
 
@@ -59,76 +57,3 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
         finally:
             db._engine = previous_engine
             db._session_factory = previous_session_factory
-
-    def test_stream_engine_uses_a_separate_bounded_pool(self) -> None:
-        previous_engine = db._stream_engine
-        previous_session_factory = db._stream_session_factory
-        db._stream_engine = None
-        db._stream_session_factory = None
-        settings = Mock(
-            platform_database_url="postgresql+asyncpg://platform_user@127.0.0.1/platformdb",
-            platform_environment="development",
-            platform_db_schema="platform",
-            platform_load_test_source_ips="",
-            platform_api_workers=2,
-            platform_db_pool_size=12,
-            platform_db_max_overflow=0,
-            platform_db_pool_timeout_seconds=5,
-            platform_db_pool_recycle_seconds=1800,
-            platform_worker_concurrency=2,
-            platform_worker_db_pool_size=2,
-            platform_worker_db_max_overflow=0,
-            platform_db_connection_budget=40,
-        )
-        engine = Mock()
-        engine.sync_engine = sentinel.stream_sync_engine
-
-        try:
-            with (
-                patch.object(db, "get_settings", return_value=settings),
-                patch.object(db, "create_async_engine", return_value=engine) as create_engine,
-                patch.object(db, "async_sessionmaker") as create_session_factory,
-                patch.object(db, "install_sqlalchemy_query_metrics") as install_query_metrics,
-            ):
-                self.assertIs(db.stream_engine(), engine)
-
-            create_engine.assert_called_once_with(
-                settings.platform_database_url,
-                future=True,
-                pool_pre_ping=True,
-                pool_size=db.SSE_STREAM_DB_POOL_SIZE,
-                max_overflow=0,
-                pool_timeout=db.SSE_STREAM_DB_ACQUIRE_TIMEOUT_SECONDS,
-                pool_recycle=1800,
-            )
-            install_query_metrics.assert_called_once_with(sentinel.stream_sync_engine)
-            create_session_factory.assert_called_once_with(
-                engine,
-                expire_on_commit=False,
-                class_=db.AsyncSession,
-            )
-        finally:
-            db._stream_engine = previous_engine
-            db._stream_session_factory = previous_session_factory
-
-
-class PlatformStreamDbAdmissionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_saturated_stream_admission_fails_fast_and_maps_to_503(self) -> None:
-        session = Mock()
-        session.connection = AsyncMock(side_effect=TimeoutError)
-        session_context = MagicMock()
-        session_context.__aenter__ = AsyncMock(return_value=session)
-        session_context.__aexit__ = AsyncMock(return_value=None)
-        session_factory = MagicMock(return_value=session_context)
-        stream = db.get_stream_db_session()
-        try:
-            with patch.object(db, "stream_session_factory", return_value=session_factory):
-                with self.assertRaises(HTTPException) as context:
-                    await stream.__anext__()
-
-            self.assertEqual(context.exception.status_code, 503)
-            self.assertEqual(context.exception.headers["Retry-After"], "1")
-            self.assertEqual(context.exception.headers["Cache-Control"], "no-store")
-            self.assertIn("Use polling", str(context.exception.detail))
-        finally:
-            await stream.aclose()

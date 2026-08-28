@@ -35,15 +35,11 @@ the runner would measure its own CPU/network limits instead of the platform's
 database, workers and host resources.
 
 The retained matrix's 10,000 users are persisted scale-fixture accounts, not
-10,000 simultaneous request workers. The `browser-polling` profile is the
-concurrent virtual-user gate; use 20 tournaments × 500 users, the default
-active/passive browser mix, HTTP40, a 300-second opening stagger and a
-30-second polling window when that profile is the target. That polling profile
-measures compatibility bracket revision reads and other ordinary workspace
-traffic; it does not poll Ready Check to discover a known timestamp. The
-separate `sse` and `combined` profiles are retained only for compatibility
-bracket SSE and its interaction with generic polling; they do not measure or
-authorize a Ready Check SSE capacity claim.
+10,000 simultaneous request workers. Its `matrix` profile exercises ordinary
+tournament workflow writes and request-driven reads. Its `write-burst` profile
+measures Ready Check vote POST contention after the server-known window. The
+current product has no Ready Check or bracket SSE/polling profile; historical
+transport results remain in the archived AS-19/AS-20 records only.
 
 The production retained-load group is a deliberate exception to the normal
 release gate: it is never scheduled, never part of ordinary CI, and never runs
@@ -142,19 +138,16 @@ gh workflow run platform-production-retained-load-matrix.yml \
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The same workflow has `profile=browser-polling`, `profile=sse` and
-`profile=combined`. The browser profile uses
-20 tournaments × 500 users, 10,000 virtual tabs with the default active/passive
-browser mix opened over a 300-second ramp, a 30-second polling window, HTTP40
-and conditional revision reads with the same exact-marker cleanup path. Run it only after the ordinary
-retained matrix and use its own workflow run ID for cleanup; it does not mean
-10,000 persistent SSE connections.
+The workflow supports `profile=matrix` and `profile=write-burst`. The matrix
+profile is the ordinary retained data-volume/workflow run. The write-burst
+profile uses the server-known Ready Check window and measures vote writes; it
+does not create persistent client connections or polling traffic. The former
+browser-polling, `sse` and `combined` profiles are retired and are not current
+release gates.
 
-The historical Ready Check SSE staircase used 1,000, 5,000 and 10,000
-connection attempts with 50/250/500 users per tournament. It is retired and
-is not a current release gate. The remaining `sse` and `combined` profiles are
-manual, workflow-dispatch-only compatibility bracket measurements with exact
-cleanup; they must not be presented as Ready Check capacity tests.
+The historical Ready Check SSE staircase and compatibility-bracket transport
+measurements remain linked only as audit evidence. They must not be presented
+as current product behavior or a Ready Check capacity target.
 
 The detailed reports remain on the VPS under
 `/opt/oldsparky/platform/shared/production-retained-matrix/gha-<load-run-id>/`

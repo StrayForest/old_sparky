@@ -154,7 +154,6 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(unittest.IsolatedAsync
             "participants",
             "matches",
             "bracket",
-            "bracket/events",
             "invites",
             "deadlock/ready-check",
             "deadlock/captain-round",

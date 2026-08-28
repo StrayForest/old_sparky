@@ -11,9 +11,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 PLATFORM_SCHEMA = "platform"
-# Keep stream admission/revalidation isolated from the ordinary API pool while
-# allowing a bounded opening burst to make progress without immediate fallback.
-PLATFORM_SSE_DB_POOL_SIZE = 4
 PLATFORM_ROOT = Path(__file__).resolve().parents[2]
 DEVELOPMENT_SECRET_KEY = "development-only-secret-key-change-before-production"
 
@@ -301,9 +298,8 @@ def validate_platform_settings(
         settings.platform_worker_db_pool_size
         + settings.platform_worker_db_max_overflow
     )
-    stream_connection_budget = settings.platform_api_workers * PLATFORM_SSE_DB_POOL_SIZE
     if (
-        api_connection_budget + worker_connection_budget + stream_connection_budget
+        api_connection_budget + worker_connection_budget
         > settings.platform_db_connection_budget
     ):
         raise RuntimeError(

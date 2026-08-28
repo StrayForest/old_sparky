@@ -21,7 +21,7 @@ from python_packages.platform_infra.auth_lifecycle import (
 )
 from python_packages.platform_infra.config import PlatformSettings, get_settings
 from python_packages.platform_infra.csrf import clear_csrf_cookie
-from python_packages.platform_infra.db import get_db_session, get_stream_db_session, session_factory
+from python_packages.platform_infra.db import get_db_session, session_factory
 from python_packages.platform_infra.models import Role, User, UserRole, UserSession
 from python_packages.platform_infra.turnstile import (
     normalized_turnstile_mode,
@@ -153,7 +153,6 @@ def clear_auth_flow_cookie(
         secure=resolved.platform_cookie_secure,
         samesite="lax",
     )
-
 
 def validate_auth_security_settings(settings=None) -> None:
     resolved_settings = settings or get_settings()
@@ -611,24 +610,6 @@ async def get_optional_authenticated_session(
     # than an authorization decision.  Do not open a second transaction from
     # inside the request while the primary read session is checked out.  This
     # keeps a first authenticated GET at one DB connection instead of two.
-    return await _resolve_optional_authenticated_session(
-        request,
-        db_session,
-        touch_session=False,
-    )
-
-
-async def get_optional_authenticated_session_for_stream(
-    request: Request,
-    db_session: AsyncSession = Depends(get_stream_db_session, scope="function"),
-) -> AuthenticatedSession | None:
-    """Resolve stream auth in a bounded short-lived DB session.
-
-    Session last-seen metadata is deliberately not touched on stream connect:
-    it is not an authorization decision, and doing so would require a second
-    DB connection while the stream admission session is still checked out.
-    """
-
     return await _resolve_optional_authenticated_session(
         request,
         db_session,

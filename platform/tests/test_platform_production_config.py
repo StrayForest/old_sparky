@@ -73,7 +73,7 @@ class PlatformProductionConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "CONNECTION_BUDGET"):
             validate_platform_settings(settings)
 
-    def test_measured_10k_pool_shape_with_sse_headroom_fits_connection_budget(self) -> None:
+    def test_measured_10k_pool_shape_fits_connection_budget(self) -> None:
         validate_platform_settings(
             self.production_settings(
                 platform_api_workers=2,

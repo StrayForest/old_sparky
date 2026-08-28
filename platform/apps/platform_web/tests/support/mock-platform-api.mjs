@@ -306,10 +306,7 @@ function bracketPayload(slug, canManage = false, includeTeams = true) {
         && (tournamentStatus === "registration_closed" || tournamentStatus === "in_progress")
     },
     teams: includeTeams ? teams : [],
-    matches,
-    next_poll_after_ms: 3_000,
-    state_version: 0,
-    bracket_probe_ticket: "mock-bracket-probe"
+    matches
   };
 }
 
@@ -650,11 +647,6 @@ const server = createServer((request, response) => {
         vary: "Cookie, Accept-Encoding"
       }
     );
-    return;
-  }
-  const bracketProbeMatch = path.match(/^\/api\/v1\/tournaments\/([^/]+)\/bracket\/probe$/);
-  if (bracketProbeMatch && request.method === "GET") {
-    json(response, 200, { revision: 0, status: "ready" });
     return;
   }
   const readyMatch = path.match(/^\/api\/v1\/tournaments\/([^/]+)\/deadlock\/ready-check$/);

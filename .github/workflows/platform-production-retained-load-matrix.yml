@@ -18,16 +18,13 @@ on:
         default: "80"
         type: string
       profile:
-        description: "Load profile; SSE profiles measure compatibility bracket fan-out and write-burst measures Ready votes"
+        description: "Load profile for retained tournament reads or Ready vote writes"
         required: true
         default: "matrix"
         type: choice
         options:
           - matrix
-          - browser-polling
           - write-burst
-          - sse
-          - combined
       write_burst_profile:
         description: "Ready vote burst selection (all includes the 10k-user mixed workload)"
         required: true
@@ -48,78 +45,6 @@ on:
         required: true
         default: "1.0"
         type: string
-      sse_connections:
-        description: "SSE connection attempts (1-3000; compatibility bracket only)"
-        required: true
-        default: "128"
-        type: string
-      sse_duration:
-        description: "SSE hold duration in seconds (1-900; >600 proves no forced rotation)"
-        required: true
-        default: "60"
-        type: string
-      sse_open_concurrency:
-        description: "Concurrent SSE opens (1-3000)"
-        required: true
-        default: "256"
-        type: string
-      sse_open_timeout:
-        description: "Diagnostic SSE handshake timeout (public/origin-local 0.5-60s; browser fallback policy is unchanged)"
-        required: true
-        default: "5"
-        type: string
-      sse_open_rate:
-        description: "Gradual-fill opening rate in new SSE/sec (0 = burst; 1-1000 = paced)"
-        required: true
-        default: "0"
-        type: string
-      sse_reconnect_cycles:
-        description: "Forced reconnect cycles per SSE client (0-10)"
-        required: true
-        default: "0"
-        type: string
-      sse_users_per_tournament:
-        description: "Synthetic users per tournament: 50/250/500 for 1k/5k/10k"
-        required: true
-        default: "500"
-        type: string
-      sse_event_count:
-        description: "Synthetic Redis fan-out probe events (0-100)"
-        required: true
-        default: "3"
-        type: string
-      sse_event_interval:
-        description: "Seconds between fan-out probe events (0-60)"
-        required: true
-        default: "1"
-        type: string
-      sse_origin_mode:
-        description: "SSE transport target; public includes Cloudflare, origin-local measures the VPS origin"
-        required: true
-        default: "public"
-        type: choice
-        options:
-          - public
-          - origin-local
-      sse_admission_mode:
-        description: "SSE admission path; signed ticket removes PostgreSQL from opening, legacy is the control"
-        required: true
-        default: "ticket"
-        type: choice
-        options:
-          - ticket
-          - legacy
-      combined_polling_duration:
-        description: "Combined polling window in seconds (1-300)"
-        required: true
-        default: "30"
-        type: string
-      combined_polling_open_stagger:
-        description: "Combined polling opening stagger in seconds (0-600)"
-        required: true
-        default: "300"
-        type: string
-
 permissions:
   contents: read
 
@@ -146,19 +71,6 @@ jobs:
       QA_WRITE_BURST_PROFILE: ${{ inputs.write_burst_profile }}
       QA_WRITE_BURST_USERS_PER_TOURNAMENT: ${{ inputs.write_burst_users_per_tournament }}
       QA_WRITE_BURST_TIME_SCALE: ${{ inputs.write_burst_time_scale }}
-      QA_SSE_CONNECTIONS: ${{ inputs.sse_connections }}
-      QA_SSE_DURATION: ${{ inputs.sse_duration }}
-      QA_SSE_OPEN_CONCURRENCY: ${{ inputs.sse_open_concurrency }}
-      QA_SSE_OPEN_TIMEOUT: ${{ inputs.sse_open_timeout }}
-      QA_SSE_OPEN_RATE: ${{ inputs.sse_open_rate }}
-      QA_SSE_RECONNECT_CYCLES: ${{ inputs.sse_reconnect_cycles }}
-      QA_SSE_USERS_PER_TOURNAMENT: ${{ inputs.sse_users_per_tournament }}
-      QA_SSE_EVENT_COUNT: ${{ inputs.sse_event_count }}
-      QA_SSE_EVENT_INTERVAL: ${{ inputs.sse_event_interval }}
-      QA_SSE_ORIGIN_MODE: ${{ inputs.sse_origin_mode }}
-      QA_SSE_ADMISSION_MODE: ${{ inputs.sse_admission_mode }}
-      QA_COMBINED_POLLING_DURATION: ${{ inputs.combined_polling_duration }}
-      QA_COMBINED_POLLING_OPEN_STAGGER: ${{ inputs.combined_polling_open_stagger }}
       TARGET_SHA: ${{ github.sha }}
 
     steps:
@@ -170,20 +82,13 @@ jobs:
             || { echo "Production retained load must run from the reviewed dev branch." >&2; exit 1; }
           test "$QA_CONFIRMATION" = "RUN-PRODUCTION-RETAINED-LOAD-MATRIX" \
             || { echo "Refusing production load without exact confirmation." >&2; exit 1; }
-          test "$QA_PROFILE" = "matrix" || test "$QA_PROFILE" = "browser-polling" || \
-            test "$QA_PROFILE" = "write-burst" || test "$QA_PROFILE" = "sse" || test "$QA_PROFILE" = "combined" \
+          test "$QA_PROFILE" = "matrix" || test "$QA_PROFILE" = "write-burst" \
             || { echo "Unsupported production load profile" >&2; exit 1; }
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
           /usr/bin/python3 - \
             "$CONTROL_EMAIL" "$QA_CONCURRENCY" "$QA_PROFILE" \
-            "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" \
-            "$QA_SSE_OPEN_TIMEOUT" "$QA_SSE_OPEN_RATE" \
-            "$QA_SSE_RECONNECT_CYCLES" "$QA_SSE_USERS_PER_TOURNAMENT" \
-            "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" \
-            "$QA_COMBINED_POLLING_DURATION" "$QA_COMBINED_POLLING_OPEN_STAGGER" \
-            "$QA_SSE_ORIGIN_MODE" "$QA_SSE_ADMISSION_MODE" \
             "$QA_WRITE_BURST_PROFILE" "$QA_WRITE_BURST_USERS_PER_TOURNAMENT" \
             "$QA_WRITE_BURST_TIME_SCALE" <<'PY'
           import re
@@ -193,19 +98,6 @@ jobs:
               email,
               concurrency,
               profile,
-              sse_connections,
-              sse_duration,
-              sse_open_concurrency,
-              sse_open_timeout,
-              sse_open_rate,
-              sse_reconnect_cycles,
-              sse_users_per_tournament,
-              sse_event_count,
-              sse_event_interval,
-              combined_polling_duration,
-              combined_polling_open_stagger,
-              sse_origin_mode,
-              sse_admission_mode,
               write_burst_profile,
               write_burst_users_per_tournament,
               write_burst_time_scale,
@@ -214,12 +106,6 @@ jobs:
               raise SystemExit("control_email is invalid")
           if not re.fullmatch(r"[1-9][0-9]{0,2}", concurrency) or not 1 <= int(concurrency) <= 256:
               raise SystemExit("concurrency must be an integer from 1 to 256")
-          if sse_origin_mode not in {"public", "origin-local"}:
-              raise SystemExit("sse_origin_mode must be public or origin-local")
-          if sse_admission_mode not in {"ticket", "legacy"}:
-              raise SystemExit("sse_admission_mode must be ticket or legacy")
-          if sse_origin_mode == "origin-local" and profile != "sse":
-              raise SystemExit("origin-local is only supported for the SSE profile")
           if write_burst_profile not in {"all", "single-join", "single-ready", "multi-staggered"}:
               raise SystemExit("write_burst_profile is invalid")
           if (
@@ -233,35 +119,6 @@ jobs:
               raise SystemExit("write_burst_time_scale must be numeric") from None
           if not 0.01 <= write_burst_scale <= 10:
               raise SystemExit("write_burst_time_scale must be between 0.01 and 10")
-          if profile in {"sse", "combined"}:
-              integer_ranges = {
-                  "sse_connections": (sse_connections, 1, 3000),
-                  "sse_open_concurrency": (sse_open_concurrency, 1, 3000),
-                  "sse_reconnect_cycles": (sse_reconnect_cycles, 0, 10),
-                  "sse_users_per_tournament": (sse_users_per_tournament, 10, 500),
-                  "sse_event_count": (sse_event_count, 0, 100),
-              }
-              for name, (value, lower, upper) in integer_ranges.items():
-                  if not re.fullmatch(r"[0-9]+", value) or not lower <= int(value) <= upper:
-                      raise SystemExit(f"{name} must be between {lower} and {upper}")
-              # This is a retained-load diagnostic ceiling only. A hold above
-              # 600s is allowed to prove healthy streams are not force-rotated.
-              sse_open_timeout_max = 60
-              decimal_ranges = {
-                  "sse_duration": (sse_duration, 1, 900),
-                  "sse_open_timeout": (sse_open_timeout, 0.5, sse_open_timeout_max),
-                  "sse_open_rate": (sse_open_rate, 0, 1000),
-                  "sse_event_interval": (sse_event_interval, 0, 60),
-                  "combined_polling_duration": (combined_polling_duration, 1, 300),
-                  "combined_polling_open_stagger": (combined_polling_open_stagger, 0, 600),
-              }
-              for name, (value, lower, upper) in decimal_ranges.items():
-                  try:
-                      parsed = float(value)
-                  except ValueError:
-                      raise SystemExit(f"{name} must be numeric") from None
-                  if not lower <= parsed <= upper:
-                      raise SystemExit(f"{name} must be between {lower} and {upper}")
           PY
 
       - name: Configure production SSH
@@ -305,13 +162,6 @@ jobs:
           if [[ "$QA_PROFILE" == "write-burst" ]]; then
             remote_load_args+=(
               "$QA_WRITE_BURST_PROFILE" "$QA_WRITE_BURST_USERS_PER_TOURNAMENT" "$QA_WRITE_BURST_TIME_SCALE"
-            )
-          else
-            remote_load_args+=(
-              "$QA_SSE_CONNECTIONS" "$QA_SSE_DURATION" "$QA_SSE_OPEN_CONCURRENCY" "$QA_SSE_OPEN_TIMEOUT"
-              "$QA_SSE_OPEN_RATE" "$QA_SSE_RECONNECT_CYCLES" "$QA_SSE_USERS_PER_TOURNAMENT"
-              "$QA_SSE_EVENT_COUNT" "$QA_SSE_EVENT_INTERVAL" "$QA_COMBINED_POLLING_DURATION"
-              "$QA_COMBINED_POLLING_OPEN_STAGGER" "$QA_SSE_ORIGIN_MODE" "$QA_SSE_ADMISSION_MODE"
             )
           fi
           set +e
@@ -413,7 +263,6 @@ jobs:
 
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           performance = payload.get("performance_summary") or {}
-          polling = payload.get("polling") or {}
           write_burst = payload.get("write_burst") or {}
           print("### Production retained 10k-user load matrix")
           print()
@@ -424,16 +273,10 @@ jobs:
           print(f"- Planned teams: {payload.get('planned_teams', 0)}")
           print(f"- Worst HTTP p95: {performance.get('worst_http_p95_ms')} ms")
           print(f"- Worst HTTP p99: {performance.get('worst_http_p99_ms')} ms")
-          if polling:
-              print(f"- Polling tabs: {polling.get('tabs_planned')}; executed: {polling.get('executed')}; 304/not-modified: {polling.get('not_modified')}; deduped: {polling.get('deduped')}")
           if write_burst:
               print(f"- Ready vote burst: `{write_burst.get('selection')}`; users/tournament: {write_burst.get('users_per_tournament')}; time scale: {write_burst.get('time_scale')}")
               acceptance = write_burst.get("acceptance") or {}
               print(f"- Ready vote burst acceptance: {'healthy' if acceptance.get('healthy') else 'failed'}")
-          sse = payload.get("sse") or {}
-          if sse:
-              connect_latency = sse.get("connect_latency_ms") or {}
-              print(f"- SSE connections: {sse.get('connected')}/{sse.get('target_connections')}; 429 admissions: {sse.get('rejected_429')}; events: {sse.get('events')}; connect p95: {connect_latency.get('p95')} ms")
           print()
           print("#### Bottleneck classes")
           for row in performance.get("bottleneck_classes") or []:

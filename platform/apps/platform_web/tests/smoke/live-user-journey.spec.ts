@@ -199,9 +199,8 @@ test("live player completes the accelerated tournament journey through visible c
     ]);
     await expect(playerPage.getByTestId("bracket-shell")).toBeVisible();
     await expect(organizerPage.getByTestId("bracket-shell")).toBeVisible();
-    await assertTwoContextProbeRefresh(
+    await assertManualBracketRefresh(
       organizerContext,
-      organizerPage,
       playerPage,
       tournamentSlug,
     );
@@ -340,12 +339,6 @@ async function installBrowserGate(
     });
     page.on("requestfailed", (request) => {
       const errorText = request.failure()?.errorText ?? "failed";
-      if (
-        request.resourceType() === "eventsource"
-        && /abort|cancel/iu.test(errorText)
-      ) {
-        return;
-      }
       let requestPath = "invalid";
       try {
         const parsed = new URL(request.url());
@@ -714,9 +707,8 @@ async function logoutQaAccount(
   }
 }
 
-async function assertTwoContextProbeRefresh(
+async function assertManualBracketRefresh(
   organizerContext: import("@playwright/test").BrowserContext,
-  organizerPage: import("@playwright/test").Page,
   playerPage: import("@playwright/test").Page,
   slug: string,
 ) {
@@ -726,48 +718,47 @@ async function assertTwoContextProbeRefresh(
   }>(organizerContext, `/tournaments/${slug}/bracket?teams_view=summary`, "GET", undefined, 200);
   const openingMatch = bracket.matches.find((match) => match.round_number === 1);
   expect(openingMatch).toBeTruthy();
-  const nextRevision = bracket.revision + 1;
-  const organizerRefresh = waitForBracketRevision(organizerPage, slug, nextRevision);
-  const playerRefresh = waitForBracketRevision(playerPage, slug, nextRevision);
-  const startedAt = performance.now();
-  const organizerLatency = organizerRefresh.then(() => (performance.now() - startedAt) / 1000);
-  const playerLatency = playerRefresh.then(() => (performance.now() - startedAt) / 1000);
-
-  await apiJson(
-    organizerContext,
-    `/tournaments/${slug}/matches/${openingMatch!.id}/schedule`,
-    "PATCH",
-    {
-      scheduled_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-      expected_revision: bracket.revision,
-    },
-    200,
-  );
-  const [organizerSeconds, playerSeconds] = await Promise.all([
-    organizerLatency,
-    playerLatency,
-  ]);
-  expect(organizerSeconds).toBeLessThanOrEqual(20);
-  expect(playerSeconds).toBeLessThanOrEqual(20);
-}
-
-async function waitForBracketRevision(
-  page: import("@playwright/test").Page,
-  slug: string,
-  revision: number,
-) {
-  const pathName = `/api/v1/tournaments/${slug}/bracket`;
-  return page.waitForResponse(async (response) => {
+  const scheduledAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  let backgroundBracketRequests = 0;
+  const recordBackgroundBracketRequest = (request: import("@playwright/test").Request) => {
+    const url = new URL(request.url());
     if (
-      response.request().method() !== "GET"
-      || new URL(response.url()).pathname !== pathName
-      || response.status() !== 200
+      request.method() === "GET"
+      && url.pathname.startsWith(`/api/v1/tournaments/${slug}/bracket`)
     ) {
-      return false;
+      backgroundBracketRequests += 1;
     }
-    const payload = await response.json().catch(() => null) as { revision?: number } | null;
-    return Number(payload?.revision ?? -1) >= revision;
-  }, { timeout: 25_000 });
+  };
+  playerPage.on("request", recordBackgroundBracketRequest);
+
+  try {
+    await apiJson(
+      organizerContext,
+      `/tournaments/${slug}/matches/${openingMatch!.id}/schedule`,
+      "PATCH",
+      {
+        scheduled_at: scheduledAt,
+        expected_revision: bracket.revision,
+      },
+      200,
+    );
+    await playerPage.waitForTimeout(2_000);
+    expect(backgroundBracketRequests).toBe(0);
+
+    await playerPage.reload();
+    await expect(playerPage.getByTestId("bracket-shell")).toBeVisible();
+    const expectedScheduledAt = Date.parse(scheduledAt);
+    await expect.poll(async () => playerPage.locator("time[datetime]").evaluateAll((elements, expectedTimestamp) => (
+      elements.some((element) => {
+        const value = element.getAttribute("datetime");
+        const actualScheduledAt = value ? Date.parse(value) : Number.NaN;
+        return Number.isFinite(actualScheduledAt)
+          && Math.abs(actualScheduledAt - expectedTimestamp) <= 5_000;
+      })
+    ), expectedScheduledAt))).toBe(true);
+  } finally {
+    playerPage.off("request", recordBackgroundBracketRequest);
+  }
 }
 
 async function csrfToken(context: import("@playwright/test").BrowserContext) {

@@ -22,7 +22,7 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 |---|---|---|---|---|---|---|
 | Public home, patches, public profiles and public tournament summary | Read | Read | Read | Read | Read | Read |
 | Invite-only tournament summary | No, unless explicitly public metadata | With valid invite/access | Read | Read | Read | Read |
-| Roster, bracket, matches and SSE | Public tournaments: read; invite-only: no | No unless actively joined | Read | Own tournament: read/manage | Read/manage | Read/manage |
+| Roster, bracket and matches | Public tournaments: read; invite-only: no | No unless actively joined | Read | Own tournament: read/manage | Read/manage | Read/manage |
 | Own account/profile/media/session | No | Own records only | Own records only | Own records only | Own records only | Own records only |
 | Join/leave, ready and captain workflow | No | Subject to workflow eligibility | Own participant actions | Participant actions plus own-tournament management | App rules plus admin operations | App rules plus admin operations |
 | Tournament configuration, invites, moderation, bracket/results | No | No | No | Own tournament only | Administrative scope | Administrative scope |

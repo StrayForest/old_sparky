@@ -26,10 +26,11 @@
   and validates the schedule, participant, eligibility and workflow state;
   delayed automation cannot reject a valid in-window vote. No Ready Check
   leases, admission pool, polling fallback, ticket/proof or Cloudflare
-  capacity configuration exists. Generic/bracket SSE and Redis admission
-  remain available for bracket features, while the current bracket web view
-  uses a revision/status probe and fetches the full bracket after a revision
-  change. See [the realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
+  capacity configuration exists. The bracket grid is also request-driven: the
+  initial workspace contains the full bracket, passive changes appear after a
+  manual page reload, and explicit bracket mutations may refetch their
+  authoritative response. Redis remains available to unrelated platform
+  services. See [the realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
 - Public media rendering is one-way `R2 -> CDN -> browser`; the API does not proxy media object bytes or fall back to local-disk reads.
 
 ## Request and data flow
@@ -49,13 +50,10 @@ Browser
 Browser -> cdn.old-sparky.com -> Cloudflare cache -> public R2 variants
 ```
 
-The platform connects directly to PostgreSQL with explicit API, worker and
-bracket-stream pool limits: the measured 10k browser-polling baseline reserves
-`2 x (16 + 0)` API connections, `2 x (2 + 0)` worker connections and `2 x 4`
-separate bracket-stream authorization-pool connections within a 44-connection
-budget. This is a bounded increase, not unlimited overflow; add a database
-pooler only from new measured scaling evidence. High-volume optional-authenticated reads validate
-the session in their request transaction but do not perform a second
+The platform connects directly to PostgreSQL with explicit API and worker pool
+limits within the ordinary connection budget. High-volume
+optional-authenticated reads validate the session in their request transaction
+but do not perform a second
 `last_seen_at` write transaction; that metadata is not an authorization
 decision and must not double the connection demand of a read burst.
 
@@ -69,7 +67,7 @@ decision and must not double the connection demand of a read burst.
   external refresh work that must not block HTTP. Existing Redis transport is
   split into high/default/low queues with prefetch-one and late acknowledgements
   so workflow work has priority over cleanup/refresh backlog.
-- Nginx owns origin TLS, proxy limits, cache headers and browser-hardening headers for HTML, API, static, SSE and error responses.
+- Nginx owns origin TLS, proxy limits, cache headers and browser-hardening headers for HTML, API, static and error responses.
 - Cloudflare owns public DNS/edge TLS/HSTS/cache/WAF/Access. Edge controls never grant an application role.
 
 ## Runtime identity and credential boundary
@@ -92,7 +90,7 @@ FastAPI exposes no `/api/v1/uploads/*` media-serving route and has no uploads `S
 - Only managed Cloudflare ranges may supply `CF-Connecting-IP`; FastAPI accepts proxy headers only from loopback.
 - Cookie mutations require application CSRF controls even behind Cloudflare.
 - Anonymous public response DTOs are explicit schema allowlists: account/contact email and Steam authentication identity do not cross the public-profile boundary, while participant moderation note, moderator identity and moderation timestamps are restricted to the organizer-management DTO.
-- Invite-only tournament workspace reads (`workspace`, roster, matches, bracket and bracket SSE admission) require active participant membership or explicit organizer/admin authority; retained `withdrawn`/`disqualified` participant rows are historical and grant no workspace access.
+- Invite-only tournament workspace reads (`workspace`, roster, matches and bracket) require active participant membership or explicit organizer/admin authority; retained `withdrawn`/`disqualified` participant rows are historical and grant no workspace access.
 - Ready Check timing is carried by the authenticated/eligible tournament
   workspace response and is not an authorization grant. The browser timer is
   presentation-only; the vote transaction checks server time and all durable
@@ -119,13 +117,13 @@ Daily maintenance restore-verifies DB backups before pruning known artifacts. Of
 
 ## Capacity boundary
 
-The current VPS has two CPU cores and about 3.7 GiB RAM. Ready Check has no
-connection or capacity boundary: waiting users create no Ready Check network
-traffic, and the `starts_at`/`ends_at` transition creates no request. The
-replacement production QA is a short Ready vote burst that measures POST
-latency, accepted/rejected reasons, duplicate/idempotency behavior, database
-pool wait and locks, and API/PostgreSQL CPU and connections. Generic bracket
-SSE retains its independent application/source/user ceilings and Nginx
-physical ceilings; change those only from retained public-path evidence.
+The current VPS has two CPU cores and about 3.7 GiB RAM. Ready Check and the
+bracket grid have no persistent connection or polling boundary: waiting users
+create no Ready Check network traffic, and the `starts_at`/`ends_at` transition
+creates no request. The replacement production QA is a short Ready vote burst
+that measures POST latency, accepted/rejected reasons, duplicate/idempotency
+behavior, database pool wait and locks, and API/PostgreSQL CPU and
+connections. Historical SSE/browser-polling measurements are retained only
+as audit evidence.
 
 Additional workers, exporters, transforms, poolers or nodes require retained CPU/RSS/queue/DB evidence against the operations targets.

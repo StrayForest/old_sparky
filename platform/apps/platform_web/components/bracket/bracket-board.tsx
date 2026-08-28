@@ -8,7 +8,6 @@ import { useI18n } from "@/components/i18n-provider";
 import { useCspNonce } from "@/components/security/csp-nonce-provider";
 import {
   getTournamentBracket,
-  getTournamentBracketProbe,
   PlatformApiError,
   platformApiMessage,
   platformApiRequest,
@@ -21,11 +20,6 @@ const MATCH_H_MANAGE = MATCH_H_VIEW + 58;
 const GAP_X = 70;
 const GAP_Y = 26;
 const MATCH_FRAME_CENTER_Y = 92;
-const BRACKET_INITIAL_LOAD_JITTER_MS = 3000;
-const BRACKET_POLL_BASE_MS = 10_000;
-const BRACKET_POLL_JITTER_MS = 3000;
-const BRACKET_POLL_MIN_MS = 3_000;
-const BRACKET_POLL_MAX_MS = 60_000;
 const PANNING_IGNORE_SELECTOR = "button,input,select,textarea,a,[role='button']";
 
 type LayoutMatch = {
@@ -71,21 +65,6 @@ type PanState = {
   scrollTop: number;
 } | null;
 
-function bracketPollDelayMs(bracket: Bracket | null): number | null {
-  const serverDelayMs = bracket?.nextPollAfterMs;
-  if (serverDelayMs === 0) {
-    return null;
-  }
-  const baseDelayMs = typeof serverDelayMs === "number" && Number.isFinite(serverDelayMs)
-    ? serverDelayMs
-    : BRACKET_POLL_BASE_MS;
-  const clampedDelayMs = Math.min(
-    BRACKET_POLL_MAX_MS,
-    Math.max(BRACKET_POLL_MIN_MS, Math.round(baseDelayMs)),
-  );
-  return clampedDelayMs + Math.floor(Math.random() * BRACKET_POLL_JITTER_MS);
-}
-
 export function BracketBoard({
   initialBracket,
   slug,
@@ -100,7 +79,6 @@ export function BracketBoard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [panning, setPanning] = useState(false);
-  const initialRefreshRequested = useRef(false);
   const shellRef = useRef<HTMLElement | null>(null);
   const panState = useRef<PanState>(null);
   const bracketRef = useRef<Bracket | null>(initialBracket ?? null);
@@ -112,13 +90,6 @@ export function BracketBoard({
   useEffect(() => {
     bracketRef.current = bracket;
   }, [bracket]);
-
-  const abortRefresh = useCallback(() => {
-    refreshGeneration.current += 1;
-    activeRefreshController.current?.abort();
-    activeRefreshController.current = null;
-    refreshInFlight.current = null;
-  }, []);
 
   const refresh = useCallback(async (): Promise<Bracket | null> => {
     if (refreshInFlight.current) {
@@ -178,127 +149,6 @@ export function BracketBoard({
   useEffect(() => {
     bracketEtag.current = null;
   }, [slug]);
-
-  useEffect(() => {
-    const shouldLoadBracketMatches = !bracket || (
-      bracket.matches.length === 0
-      && (bracket.status === "ready" || bracket.revision > 0)
-    );
-    if (!shouldLoadBracketMatches || initialRefreshRequested.current) {
-      return;
-    }
-    initialRefreshRequested.current = true;
-    const timer = setTimeout(
-      () => {
-        if (document.visibilityState !== "hidden") {
-          void refresh();
-        }
-      },
-      Math.floor(Math.random() * BRACKET_INITIAL_LOAD_JITTER_MS),
-    );
-    return () => clearTimeout(timer);
-  }, [bracket, refresh]);
-
-  useEffect(() => {
-    let pollingTimer: ReturnType<typeof setTimeout> | null = null;
-    let pollingActive = false;
-    let activeProbeController: AbortController | null = null;
-    const probeIfVisible = async () => {
-      if (document.visibilityState === "hidden") {
-        return null;
-      }
-      const current = bracketRef.current;
-      const ticket = current?.bracketProbeTicket;
-      if (!ticket) {
-        return refresh();
-      }
-      activeProbeController?.abort();
-      const controller = new AbortController();
-      activeProbeController = controller;
-      try {
-        const probe = await getTournamentBracketProbe(slug, ticket, controller.signal);
-        if (
-          probe
-          && current
-          && probe.revision > current.revision
-        ) {
-          return refresh();
-        }
-        return current;
-      } finally {
-        if (activeProbeController === controller) {
-          activeProbeController = null;
-        }
-      }
-    };
-    const schedulePollingTick = (sourceBracket: Bracket | null = bracketRef.current) => {
-      if (!pollingActive) {
-        return;
-      }
-      const delayMs = bracketPollDelayMs(sourceBracket);
-      if (delayMs === null) {
-        stopPolling();
-        return;
-      }
-      pollingTimer = setTimeout(async () => {
-        pollingTimer = null;
-        try {
-          const next = await probeIfVisible();
-          if (!pollingActive) {
-            return;
-          }
-          schedulePollingTick(next ?? bracketRef.current);
-        } catch (caught) {
-          if (!(caught instanceof DOMException && caught.name === "AbortError")) {
-            setError(t("bracket.loadFailed"));
-          }
-        }
-      }, delayMs);
-    };
-    const startPolling = (immediate = false) => {
-      if (pollingActive || pollingTimer !== null || bracketPollDelayMs(bracketRef.current) === null) {
-        return;
-      }
-      pollingActive = true;
-      if (immediate) {
-        void probeIfVisible()
-          .then((next) => schedulePollingTick(next ?? bracketRef.current))
-          .catch((caught) => {
-            if (!(caught instanceof DOMException && caught.name === "AbortError")) {
-              setError(t("bracket.loadFailed"));
-            }
-          });
-        return;
-      }
-      schedulePollingTick(bracketRef.current);
-    };
-    const stopPolling = () => {
-      pollingActive = false;
-      if (pollingTimer !== null) {
-        clearTimeout(pollingTimer);
-        pollingTimer = null;
-      }
-      activeProbeController?.abort();
-      activeProbeController = null;
-    };
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        startPolling(true);
-      } else {
-        stopPolling();
-      }
-    };
-
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    startPolling();
-
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      stopPolling();
-      abortRefresh();
-    };
-  }, [abortRefresh, refresh, slug]);
 
   const mutate = useCallback(async (
     path: string,
@@ -367,12 +217,9 @@ export function BracketBoard({
   }, []);
 
   if (!bracket || bracket.matches.length === 0) {
-    const loadingBracketMatches = !error && (
-      !bracket || bracket.status === "ready" || bracket.revision > 0
-    );
     return (
       <section className="bracket-empty-state" data-testid="bracket-empty">
-        <strong>{loadingBracketMatches ? t("deadlock.refreshing") : t("tournament.bracketEmpty")}</strong>
+        <strong>{t("tournament.bracketEmpty")}</strong>
         <span>{error ?? t("bracket.noFabricatedData")}</span>
       </section>
     );

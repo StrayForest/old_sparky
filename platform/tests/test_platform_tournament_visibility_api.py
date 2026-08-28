@@ -374,27 +374,9 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
         for default_workspace, lean_workspace in workspace_pairs:
             default_workspace_without_ticket = {
                 **default_workspace,
-                "bracket": (
-                    {
-                        **default_workspace["bracket"],
-                        "sse_admission_ticket": None,
-                        "bracket_probe_ticket": None,
-                    }
-                    if default_workspace["bracket"] is not None
-                    else None
-                ),
             }
             lean_workspace_without_ticket = {
                 **lean_workspace,
-                "bracket": (
-                    {
-                        **lean_workspace["bracket"],
-                        "sse_admission_ticket": None,
-                        "bracket_probe_ticket": None,
-                    }
-                    if lean_workspace["bracket"] is not None
-                    else None
-                ),
             }
             default_workspace_without_ticket.pop("server_time", None)
             lean_workspace_without_ticket.pop("server_time", None)

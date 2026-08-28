@@ -57,15 +57,10 @@ _validate_tournament_graph_boundary = _HELPER_MODULE._validate_tournament_graph_
 
 CONFIRMATION = "DELETE-PRODUCTION-RETAINED-LOAD"
 EXPECTED_ORIGIN = "https://old-sparky.com"
-EXPECTED_ORIGIN_LOCAL = "http://127.0.0.1:8010"
 MAX_MATRIX_ROWS = 20
 MARKER_PATTERN = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
 EMAIL_PATTERN = re.compile(
     r"^(?P<marker>preprod[0-9]{12}[0-9a-f]{4})-[a-z0-9-]+@example\.com$"
-)
-BROWSER_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
-    r"^Browser polling profile (?P<marker>preprod[0-9]{12}[0-9a-f]{4}) "
-    r"(?P<category>registration_open|ready_check_active|bracket_active|terminal)\.$"
 )
 WRITE_BURST_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
     r"^Write burst profile (?P<marker>preprod[0-9]{12}[0-9a-f]{4}) "
@@ -82,11 +77,7 @@ def _tournament_description_matches(
     description_text = str(description or "")
     if mode == "scale":
         return description_text == f"Large preprod QA tournament {marker}."
-    patterns = (
-        (WRITE_BURST_TOURNAMENT_DESCRIPTION_PATTERN,)
-        if mode == "write-burst"
-        else (BROWSER_TOURNAMENT_DESCRIPTION_PATTERN,)
-    )
+    patterns = (WRITE_BURST_TOURNAMENT_DESCRIPTION_PATTERN,)
     for pattern in patterns:
         match = pattern.fullmatch(description_text)
         if match is not None and match.group("marker") == marker:
@@ -152,15 +143,9 @@ def _uuid_list(value: object, *, field: str, allow_empty: bool = True) -> list[s
 
 
 def _is_canonical_matrix_origin(report: dict[str, Any], *, mode: str) -> bool:
-    """Accept the public origin or the explicit local SSE control path only."""
+    """Accept only reports produced through the canonical public origin."""
     origin = str(report.get("origin") or "").rstrip("/")
-    if origin == EXPECTED_ORIGIN:
-        return True
-    return (
-        mode == "sse"
-        and origin == EXPECTED_ORIGIN_LOCAL
-        and str(report.get("request_origin") or "").rstrip("/") == EXPECTED_ORIGIN
-    )
+    return origin == EXPECTED_ORIGIN
 
 
 def load_matrix_manifest(
@@ -188,9 +173,9 @@ def load_matrix_manifest(
     if control_email != expected_control_email.strip().lower():
         raise ValueError("matrix control email does not match the cleanup input")
     mode = str(payload.get("mode") or "scale")
-    if mode not in {"scale", "browser-polling", "write-burst", "sse", "combined"}:
+    if mode not in {"scale", "write-burst"}:
         raise ValueError("matrix mode is not supported")
-    if mode in {"browser-polling", "write-burst", "sse", "combined"} and len(rows) != 1:
+    if mode == "write-burst" and len(rows) != 1:
         raise ValueError(f"{mode} manifest must contain exactly one row")
 
     markers: set[str] = set()
@@ -235,7 +220,7 @@ def load_matrix_manifest(
         if mode == "scale" and len(row_tournaments) > 1:
             raise ValueError("a matrix row may own at most one tournament")
         max_tournaments = 64 if mode == "write-burst" else MAX_MATRIX_ROWS
-        if mode in {"browser-polling", "write-burst", "sse", "combined"} and not 0 <= len(row_tournaments) <= max_tournaments:
+        if mode == "write-burst" and not 0 <= len(row_tournaments) <= max_tournaments:
             raise ValueError(f"{mode} manifest has an invalid tournament count")
         if int(row.get("synthetic_users", len(row_users))) != len(row_users):
             raise ValueError("matrix synthetic user count does not match its report")
@@ -318,22 +303,6 @@ def _merge_recovered_marker_tournaments(
     return recovered_ids - declared_ids
 
 
-def _merge_recovered_browser_tournaments(
-    row: dict[str, Any],
-    candidate_rows: list[Any],
-    *,
-    user_ids: set[str],
-) -> set[str]:
-    """Backward-compatible wrapper for browser-polling recovery tests."""
-
-    return _merge_recovered_marker_tournaments(
-        row,
-        candidate_rows,
-        user_ids=user_ids,
-        mode="browser-polling",
-    )
-
-
 async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     settings = get_settings()
     validate_platform_settings(settings)
@@ -348,15 +317,10 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     control_email = str(manifest["control_email"])
     async with session_factory()() as db_session:
         recovered_tournament_ids: dict[str, set[str]] = {}
-        if manifest["mode"] in {"browser-polling", "write-burst", "sse", "combined"}:
+        if manifest["mode"] == "write-burst":
             for row in manifest["rows"]:
                 marker = row["marker"]
-                is_write_burst = manifest["mode"] == "write-burst"
-                marker_prefix = (
-                    f"Write burst profile {marker} "
-                    if is_write_burst
-                    else f"Browser polling profile {marker} "
-                )
+                marker_prefix = f"Write burst profile {marker} "
                 candidates = list(
                     (
                         await db_session.execute(
@@ -395,13 +359,8 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         report_by_marker = {row["marker"]: row for row in manifest["rows"]}
         for run in runs:
             row = report_by_marker[run.marker]
-            report_is_local_control = (
-                run.origin == EXPECTED_ORIGIN_LOCAL
-                and manifest["mode"] == "sse"
-                and row.get("request_origin") == EXPECTED_ORIGIN
-            )
             if (
-                (run.origin != EXPECTED_ORIGIN and not report_is_local_control)
+                run.origin != EXPECTED_ORIGIN
                 or run.report_path != row["report_path"]
             ):
                 raise RuntimeError("database run provenance does not match the matrix report")

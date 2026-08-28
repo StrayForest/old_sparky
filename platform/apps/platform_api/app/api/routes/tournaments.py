@@ -11,7 +11,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
-from fastapi.responses import StreamingResponse
 from sqlalchemy import Select, and_, cast, delete, exists, func, or_, select, union
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
@@ -51,7 +50,6 @@ from apps.platform_api.app.api.schemas import (
     TournamentInviteRedeemResponse,
     TournamentInviteResponse,
     TournamentBracketMatchResponse,
-    BracketProbeResponse,
     TournamentBracketCapabilitiesResponse,
     TournamentBracketResponse,
     TournamentBracketTeamMemberResponse,
@@ -84,14 +82,8 @@ from apps.platform_api.app.services.media import (
     upload_file_chunks,
     upload_size_hint,
 )
-from apps.platform_api.app.services.bracket_events import (
-    publish_bracket_event,
-    read_bracket_probe_state,
-    stream_bracket_events,
-)
 from apps.platform_api.app.services.brackets import (
     advance_revision,
-    bracket_event_payload,
     clear_match_result_and_progression,
     create_full_bracket_graph,
     ensure_expected_revision,
@@ -151,9 +143,6 @@ from apps.platform_api.app.services.tournament_workflow import (
 )
 from apps.platform_api.app.services.tournament_runtime_cache import (
     register_tournament_runtime_cache_invalidator,
-)
-from apps.platform_api.app.services.tournament_workspace_access import (
-    current_tournament_stream_access_context,
 )
 from apps.platform_api.app.services.tournament_participant_capacity import (
     PARTICIPANT_SLOT_MATERIALIZATION_LIMIT,
@@ -216,7 +205,6 @@ from python_packages.platform_domain.tournaments import (
     transition_match_status,
 )
 from python_packages.platform_infra.audit import write_audit_log
-from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
 from python_packages.platform_infra.media.errors import MediaError
@@ -245,25 +233,13 @@ from python_packages.platform_infra.security import (
     get_authenticated_session,
     get_optional_authenticated_session,
 )
-from python_packages.platform_infra.bracket_probe import (
-    BracketProbeInvalid,
-    issue_bracket_probe_ticket,
-    verify_bracket_probe_ticket,
-)
-from python_packages.platform_infra.sse_admission import issue_sse_admission_ticket
 from python_packages.platform_infra.tournament_names import (
     lock_tournament_name,
     public_tournament_name_exists,
 )
 from python_packages.platform_infra.slugs import unique_slug_from_name
-from python_packages.platform_infra.sse_connection_limit import (
-    SSE_CONNECTION_LEASE_SCOPE,
-    SseConnectionLease,
-)
 
 router = APIRouter()
-stream_router = APIRouter()
-probe_router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
@@ -281,118 +257,8 @@ PARTICIPANT_PAGE_CACHE_TTL_SECONDS = 30.0
 PARTICIPANT_PAGE_CACHE_MAX_ENTRIES = 512
 PUBLIC_WORKSPACE_SNAPSHOT_CACHE_TTL_SECONDS = 2.0
 PUBLIC_WORKSPACE_SNAPSHOT_CACHE_MAX_ENTRIES = 128
-POLLING_DISABLED_MS = 0
-PUBLIC_SUMMARY_POLL_MS = 45_000
-WORKSPACE_VIEWER_POLL_MS = 45_000
-WORKSPACE_PARTICIPANT_POLL_MS = 15_000
-WORKSPACE_MANAGER_POLL_MS = 20_000
-BRACKET_ACTIVE_POLL_MS = 12_000
-BRACKET_IDLE_POLL_MS = 30_000
 MANUAL_READY_CHECK_DURATION = timedelta(minutes=10)
 TERMINAL_TOURNAMENT_STATUSES = frozenset(("completed", "cancelled"))
-
-
-def _issue_tournament_sse_admission_ticket(
-    request: Request,
-    *,
-    tournament: Tournament,
-    auth_session,
-    has_participant_record: bool,
-) -> str | None:
-    if tournament.visibility == "invite_only":
-        if auth_session is None:
-            return None
-        if auth_session_has_admin_role(auth_session):
-            access = "admin"
-        elif tournament.organizer_user_id == auth_session.user.id:
-            access = "organizer"
-        elif has_participant_record:
-            access = "active_participant"
-        else:
-            return None
-    else:
-        access = "public"
-
-    # Public bracket data is intentionally available to anonymous viewers.
-    # Do not bind a public ticket to an authenticated session: the binding
-    # adds no authorization value for public content, but would make every
-    # public stream carry a user lease and session revalidation query.
-    session_token = None
-    session_id = None
-    user_id = None
-    if auth_session is not None and access != "public":
-        session_token = request.cookies.get(get_settings().platform_session_cookie_name)
-        session_id = str(getattr(auth_session.session, "id", "") or "")
-        user_id = str(getattr(auth_session.user, "id", "") or "")
-        if not session_token or not session_id or not user_id:
-            return None
-    return issue_sse_admission_ticket(
-        tournament_id=str(tournament.id),
-        slug=tournament.slug,
-        access=access,
-        user_id=user_id,
-        session_id=session_id,
-        session_token=session_token,
-    )
-
-
-def _with_tournament_sse_ticket(
-    request: Request,
-    bracket: TournamentBracketResponse,
-    *,
-    tournament: Tournament,
-    auth_session,
-    has_participant_record: bool,
-) -> TournamentBracketResponse:
-    return bracket.model_copy(
-        update={
-            "sse_admission_ticket": _issue_tournament_sse_admission_ticket(
-                request,
-                tournament=tournament,
-                auth_session=auth_session,
-                has_participant_record=has_participant_record,
-            ),
-            "bracket_probe_ticket": _issue_bracket_probe_ticket(
-                request,
-                bracket=bracket,
-                tournament=tournament,
-                auth_session=auth_session,
-                has_participant_record=has_participant_record,
-            ),
-        }
-    )
-
-
-def _issue_bracket_probe_ticket(
-    request: Request,
-    *,
-    bracket: TournamentBracketResponse,
-    tournament: Tournament,
-    auth_session,
-    has_participant_record: bool,
-) -> str:
-    user_id: str | None = None
-    session_id: str | None = None
-    session_token: str | None = None
-    if tournament.visibility == "invite_only":
-        if auth_session is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
-        user_id = str(auth_session.user.id)
-        session_id = str(auth_session.session.id)
-        session_token = request.cookies.get(get_settings().platform_session_cookie_name)
-        if not has_participant_record and not auth_session_has_admin_role(auth_session) and tournament.organizer_user_id != auth_session.user.id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tournament bracket access is unavailable.")
-        if not session_token:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
-    return issue_bracket_probe_ticket(
-        tournament_id=tournament.id,
-        slug=tournament.slug,
-        revision=bracket.revision,
-        bracket_status=bracket.status,
-        user_id=user_id,
-        session_id=session_id,
-        session_token=session_token,
-    )
 
 
 def bracket_capabilities(
@@ -413,7 +279,7 @@ def bracket_capabilities(
     )
 
 
-def tournament_poll_state_version(
+def tournament_state_version(
     tournament: Tournament,
     *,
     participant_count: int = 0,
@@ -499,39 +365,6 @@ def _conditional_response(
             },
         )
     return None
-
-
-def tournament_summary_poll_delay_ms(tournament: Tournament) -> int:
-    if tournament.status in TERMINAL_TOURNAMENT_STATUSES:
-        return POLLING_DISABLED_MS
-    return PUBLIC_SUMMARY_POLL_MS
-
-
-def tournament_workspace_poll_delay_ms(
-    tournament: Tournament,
-    *,
-    has_participant_record: bool,
-    can_manage: bool,
-) -> int:
-    if tournament.status in TERMINAL_TOURNAMENT_STATUSES:
-        return POLLING_DISABLED_MS
-    if can_manage:
-        return WORKSPACE_MANAGER_POLL_MS
-    if has_participant_record:
-        return WORKSPACE_PARTICIPANT_POLL_MS
-    return WORKSPACE_VIEWER_POLL_MS
-
-
-def tournament_bracket_poll_delay_ms(
-    tournament: Tournament,
-    *,
-    bracket_status: str,
-) -> int:
-    if tournament.status in TERMINAL_TOURNAMENT_STATUSES:
-        return POLLING_DISABLED_MS
-    if bracket_status == "ready":
-        return BRACKET_ACTIVE_POLL_MS
-    return BRACKET_IDLE_POLL_MS
 
 
 def ready_check_state_version(
@@ -946,8 +779,7 @@ def serialize_tournament(
                 has_locked_deadlock_roster=has_locked_deadlock_roster,
             )
         ),
-        next_poll_after_ms=tournament_summary_poll_delay_ms(tournament),
-        state_version=tournament_poll_state_version(
+        state_version=tournament_state_version(
             tournament,
             participant_count=participant_count,
         ),
@@ -2335,11 +2167,6 @@ async def build_tournament_bracket_response(
             )
             for match in match_rows
         ],
-        next_poll_after_ms=tournament_bracket_poll_delay_ms(
-            tournament,
-            bracket_status=bracket_status,
-        ),
-        state_version=int(tournament.bracket_revision or 0),
     )
     if bracket_status == "ready":
         _set_bracket_response_cache(cache_key, response)
@@ -2393,11 +2220,6 @@ async def build_tournament_workspace_detail_bracket_response(
         ),
         teams=teams,
         matches=[],
-        next_poll_after_ms=tournament_bracket_poll_delay_ms(
-            tournament,
-            bracket_status=bracket_status,
-        ),
-        state_version=int(tournament.bracket_revision or 0),
     )
 
 
@@ -2419,11 +2241,6 @@ def build_tournament_workspace_bracket_summary_response(
         ),
         teams=[],
         matches=[],
-        next_poll_after_ms=tournament_bracket_poll_delay_ms(
-            tournament,
-            bracket_status=bracket_status,
-        ),
-        state_version=int(tournament.bracket_revision or 0),
     )
 
 
@@ -4040,7 +3857,6 @@ async def get_tournament_bracket(
     if not_modified is not None:
         return not_modified
     has_participant_record = False
-    has_active_participant_record = False
     if auth_session is not None and tournament.visibility == "invite_only":
         participant_record = await participant_for_user(
             db_session,
@@ -4048,10 +3864,6 @@ async def get_tournament_bracket(
             user_id=auth_session.user.id,
         )
         has_participant_record = participant_record is not None
-        has_active_participant_record = bool(
-            participant_record is not None
-            and not participant_status_is_inactive(participant_record.status)
-        )
     bracket = await build_tournament_bracket_response(
         db_session,
         tournament=tournament,
@@ -4059,89 +3871,7 @@ async def get_tournament_bracket(
         has_participant_record=has_participant_record,
         include_team_members=teams_view == "full",
     )
-    return _with_tournament_sse_ticket(
-        request,
-        bracket,
-        tournament=tournament,
-        auth_session=auth_session,
-        has_participant_record=has_active_participant_record,
-    )
-
-
-@probe_router.get("/{slug}/bracket/probe", response_model=BracketProbeResponse)
-async def get_tournament_bracket_probe(
-    slug: str,
-    request: Request,
-    response: Response,
-    ticket: str = Query(min_length=1, max_length=16384),
-) -> BracketProbeResponse:
-    """Return only the current bracket revision for an authorized viewer.
-
-    The ticket was issued by the full bracket/workspace read. The hot path is
-    deliberately PostgreSQL-free: HMAC verification plus one Redis GET. A
-    subsequent full bracket read still performs the authoritative permission
-    check whenever the revision changes.
-    """
-
-    response.headers["Cache-Control"] = "private, no-store"
-    session_token = request.cookies.get(get_settings().platform_session_cookie_name)
-    try:
-        proof = verify_bracket_probe_ticket(
-            ticket,
-            expected_slug=slug,
-            session_token=session_token,
-        )
-    except BracketProbeInvalid as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Bracket probe ticket is invalid or expired.",
-            headers={"Cache-Control": "no-store"},
-        ) from exc
-    projected = await read_bracket_probe_state(proof.tournament_id)
-    if projected is None:
-        return BracketProbeResponse(revision=proof.revision, status=proof.bracket_status)
-    try:
-        projected_revision = int(projected.get("revision") or 0)
-    except (TypeError, ValueError):
-        projected_revision = 0
-    revision = max(proof.revision, projected_revision)
-    projected_status = projected.get("status")
-    bracket_status = projected_status if projected_status in {"pending", "teams_ready", "ready"} else proof.bracket_status
-    return BracketProbeResponse(revision=revision, status=bracket_status)
-
-
-@stream_router.get("/{slug}/bracket/events")
-async def get_tournament_bracket_events(
-    slug: str,
-    request: Request,
-) -> StreamingResponse:
-    access_context = current_tournament_stream_access_context()
-    if access_context is None or access_context.slug != slug or access_context.decision == "deny":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
-    tournament = access_context.tournament
-    tournament_id = access_context.tournament_id
-    if tournament is not None:
-        tournament_id = str(tournament.id)
-    if not tournament_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
-    connection_lease = request.scope.get(SSE_CONNECTION_LEASE_SCOPE)
-    if not isinstance(connection_lease, SseConnectionLease):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Live-update connection protection is temporarily unavailable.",
-        )
-    return StreamingResponse(
-        stream_bracket_events(
-            tournament_id,
-            admission_verified=True,
-            connection_lease=connection_lease,
-        ),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return bracket
 
 
 @router.post(
@@ -4243,13 +3973,6 @@ async def seed_deadlock_opening_round_matches(
         )
         for match in opening_matches
     ]
-    await publish_bracket_event(
-        tournament.id,
-        bracket_event_payload(
-            tournament=tournament,
-            event_type="bracket_seeded",
-        ),
-    )
     return response
 
 
@@ -4407,13 +4130,6 @@ async def seed_next_round_matches(
         )
         for match in created_matches
     ]
-    await publish_bracket_event(
-        tournament.id,
-        bracket_event_payload(
-            tournament=tournament,
-            event_type="bracket_round_seeded",
-        ),
-    )
     return response
 
 
@@ -4529,14 +4245,6 @@ async def create_tournament_match(
         db_session,
         tournament=tournament,
         match=match,
-    )
-    await publish_bracket_event(
-        tournament.id,
-        bracket_event_payload(
-            tournament=tournament,
-            event_type="match_created",
-            match_id=match.id,
-        ),
     )
     return response
 
@@ -4655,14 +4363,6 @@ async def update_tournament_match_status(
         tournament=tournament,
         match=match,
     )
-    await publish_bracket_event(
-        tournament.id,
-        bracket_event_payload(
-            tournament=tournament,
-            event_type="match_status_changed",
-            match_id=match.id,
-        ),
-    )
     return response
 
 
@@ -4752,14 +4452,6 @@ async def update_tournament_match_schedule(
         db_session,
         tournament=tournament,
         match=match,
-    )
-    await publish_bracket_event(
-        tournament.id,
-        bracket_event_payload(
-            tournament=tournament,
-            event_type="match_schedule_changed",
-            match_id=match.id,
-        ),
     )
     return response
 
@@ -4902,14 +4594,6 @@ async def report_tournament_match(
         tournament=tournament,
         match=match,
     )
-    await publish_bracket_event(
-        tournament.id,
-        bracket_event_payload(
-            tournament=tournament,
-            event_type="tournament_completed" if is_final_match else "match_reported",
-            match_id=match.id,
-        ),
-    )
     return response
 
 
@@ -4974,14 +4658,6 @@ async def delete_tournament_match(
     await db_session.delete(match)
     advance_revision(tournament)
     await db_session.commit()
-    await publish_bracket_event(
-        tournament.id,
-        bracket_event_payload(
-            tournament=tournament,
-            event_type="match_deleted",
-            match_id=match.id,
-        ),
-    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -6597,19 +6273,6 @@ async def get_tournament_workspace(
                                 "current_user_active_commitment": active_commitment,
                             }
                         )
-                        workspace_response = workspace_response.model_copy(
-                            update={
-                                "bracket": _with_tournament_sse_ticket(
-                                    request,
-                                    workspace_response.bracket,
-                                    tournament=current_tournament,
-                                    auth_session=auth_session,
-                                    has_participant_record=False,
-                                )
-                                if workspace_response.bracket is not None
-                                else None,
-                            }
-                        )
                         etag = _workspace_response_etag(
                             workspace_response,
                             workspace_view=workspace_view,
@@ -6708,7 +6371,6 @@ async def get_tournament_workspace(
             bracket=None,
             ready_check=None,
             auto_assignment=None,
-            next_poll_after_ms=tournament_summary_poll_delay_ms(tournament),
             state_version=tournament_response.state_version,
         )
         etag = _workspace_response_etag(
@@ -6778,17 +6440,6 @@ async def get_tournament_workspace(
             visible_assignment_run=visible_assignment_run,
             assignment_run_loaded=assignment_runs_loaded,
         )
-    bracket = _with_tournament_sse_ticket(
-        request,
-        bracket,
-        tournament=tournament,
-        auth_session=auth_session,
-        has_participant_record=bool(
-            participant_record is not None
-            and not participant_status_is_inactive(participant_record.status)
-        ),
-    )
-
     ready_check: TournamentDeadlockReadyCheckStateResponse | None = None
     auto_assignment: TournamentDeadlockAutoAssignmentStateResponse | None = None
     current_user_can_view_deadlock_state = bool(
@@ -6834,11 +6485,6 @@ async def get_tournament_workspace(
         bracket=bracket,
         ready_check=ready_check,
         auto_assignment=auto_assignment,
-        next_poll_after_ms=tournament_workspace_poll_delay_ms(
-            tournament,
-            has_participant_record=has_participant_record,
-            can_manage=current_user_can_manage_bracket,
-        ),
         state_version=tournament_response.state_version,
     )
     if (
@@ -6860,13 +6506,6 @@ async def get_tournament_workspace(
                     ),
                     "current_user": None,
                     "current_user_active_commitment": None,
-                    "bracket": (
-                        workspace_response.bracket.model_copy(
-                            update={"sse_admission_ticket": None}
-                        )
-                        if workspace_response.bracket is not None
-                        else None
-                    ),
                 }
             ),
         )

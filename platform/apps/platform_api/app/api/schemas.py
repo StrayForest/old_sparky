@@ -572,7 +572,6 @@ class TournamentResponse(BaseModel):
     automation_retry_after: datetime | None = None
     created_at: datetime
     available_next_statuses: list[str] = Field(default_factory=list)
-    next_poll_after_ms: int | None = None
     state_version: int | None = None
 
 
@@ -848,7 +847,6 @@ class TournamentWorkspaceResponse(BaseModel):
     bracket: TournamentBracketResponse | None = None
     ready_check: TournamentDeadlockReadyCheckStateResponse | None = None
     auto_assignment: TournamentDeadlockAutoAssignmentStateResponse | None = None
-    next_poll_after_ms: int | None = None
     state_version: int | None = None
 
 
@@ -1089,19 +1087,6 @@ class TournamentBracketResponse(BaseModel):
     )
     teams: list[TournamentBracketTeamResponse] = Field(default_factory=list)
     matches: list[TournamentBracketMatchResponse] = Field(default_factory=list)
-    next_poll_after_ms: int | None = None
-    state_version: int | None = None
-    # A short-lived proof issued only after the surrounding workspace access
-    # check. It removes PostgreSQL from the subsequent SSE handshake.
-    sse_admission_ticket: str | None = None
-    # A short-lived proof for the cheap revision probe. It carries only the
-    # already-authorized viewer binding and the last known revision.
-    bracket_probe_ticket: str | None = None
-
-
-class BracketProbeResponse(BaseModel):
-    revision: int = 0
-    status: Literal["pending", "teams_ready", "ready"] = "pending"
 
 
 class AuditLogResponse(BaseModel):

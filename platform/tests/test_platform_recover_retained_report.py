@@ -12,21 +12,21 @@ from uuid import uuid4
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
     / "tools"
-    / "platform_recover_retained_browser_report.py"
+    / "platform_recover_retained_report.py"
 )
 SPEC = importlib.util.spec_from_file_location(
-    "platform_recover_retained_browser_report_tested", SCRIPT_PATH
+    "platform_recover_retained_report_tested", SCRIPT_PATH
 )
 assert SPEC is not None and SPEC.loader is not None
 recovery = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(recovery)
 
 
-class RetainedBrowserReportRecoveryTests(unittest.TestCase):
+class RetainedWriteBurstReportRecoveryTests(unittest.TestCase):
     @unittest.skipUnless(os.geteuid() == 0, "root-owned file contract")
     def test_existing_root_report_permissions_are_tightened(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            report_path = Path(temporary) / "browser-polling.json"
+            report_path = Path(temporary) / "write-burst.json"
             report_path.write_text("{}", encoding="utf-8")
             report_path.chmod(0o644)
 
@@ -38,12 +38,13 @@ class RetainedBrowserReportRecoveryTests(unittest.TestCase):
         tournament_ids = [str(uuid4())]
         report_path = Path(
             "/opt/oldsparky/platform/shared/production-retained-matrix/"
-            "gha-32767006384/browser-polling/browser-polling.json"
+            "gha-32767006384/write-burst/write-burst.json"
         )
         report = {
             "user_ids": user_ids,
             "tournament_ids": tournament_ids,
-            "polling": {"profile": "browser-polling-20x500", "deduped": 4},
+            "mode": "write-burst",
+            "write_burst": {"selection": "all"},
             "performance": {"http_client": {"overall": {"p95_ms": 12.5, "p99_ms": 19.0}}},
         }
 
@@ -55,14 +56,14 @@ class RetainedBrowserReportRecoveryTests(unittest.TestCase):
             control_email="aleksei.lisitsin1@gmail.com",
         )
 
-        self.assertEqual(summary["mode"], "browser-polling")
+        self.assertEqual(summary["mode"], "write-burst")
         self.assertFalse(summary["passed"])
         self.assertTrue(summary["recovered"])
         self.assertEqual(summary["completed_users"], 2)
         self.assertEqual(summary["completed_tournaments"], 1)
         self.assertEqual(len(summary["rows"]), 1)
         self.assertEqual(summary["rows"][0]["result"]["marker"], "preprod260824120000abcd")
-        self.assertEqual(summary["polling"]["deduped"], 4)
+        self.assertEqual(summary["write_burst"]["selection"], "all")
 
     def test_uuid_validation_rejects_duplicates_and_noncanonical_values(self) -> None:
         duplicate = str(uuid4())

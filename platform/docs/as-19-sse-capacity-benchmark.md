@@ -1,6 +1,10 @@
-# AS-19 — SSE capacity and combined-load benchmark
+# AS-19 — Historical SSE capacity and combined-load benchmark
 
-- Status: Active measurement plan and controlled limit experiment
+> Retired historical evidence. Ready Check and the bracket grid no longer use
+> SSE or automatic polling. This document is preserved for audit history and
+> is not a current architecture, capacity target or release gate.
+
+- Status: Retired historical measurement plan and controlled limit experiment
 - Owner: Platform maintainers
 - Started: 2026-08-25
 

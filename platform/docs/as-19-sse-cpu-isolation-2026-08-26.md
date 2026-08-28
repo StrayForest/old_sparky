@@ -1,12 +1,17 @@
-# AS-19 CPU-isolation round — 2026-08-26
+# AS-19 CPU-isolation round — 2026-08-26 (historical)
+
+> Retired historical evidence. Ready Check and the bracket grid no longer use
+> SSE or automatic polling. The measurements below are not a current
+> production architecture or release gate.
 
 ## Scope and gate
 
-This is the active measurement record for the public 1k → 5k → 10k SSE
-staircase. Cloudflare, Nginx, Redis admission and the application global cap
-remain enabled. A result is valid only when the intended stream hold/report
-completes without a load-generator, probe-Redis, edge-queue or unexpected
-application error. CPU from the QA process is not server CPU.
+This was the measurement record for the public 1k → 5k → 10k SSE staircase.
+At that time Cloudflare, Nginx, Redis admission and the application global cap
+were enabled. The results below are retained historical evidence; they are not
+an active transport or release gate. A result was valid only when the intended
+stream hold/report completed without a load-generator, probe-Redis, edge-queue
+or unexpected application error. CPU from the QA process was not server CPU.
 
 The supplied external review was also assessed. Its `HTTP pool 40/80/160`,
 generator-queue timing, workspace phase timing, early-304 short circuit and

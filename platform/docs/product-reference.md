@@ -55,9 +55,10 @@ exceptions live in the [security audit](application-security-audit.md).
 - Losing a single-elimination match, terminal tournament state, withdrawal or
   disqualification releases the relevant commitment. A periodic reconciliation
   task repairs stale rows; assignment JSON remains immutable evidence.
-- Match scheduling and result changes use tournament locks/revision checks and
-  publish bracket events. The public SSE stream is read-only; connection caps
-  remain an open security backlog item.
+- Match scheduling and result changes use tournament locks/revision checks. The
+  bracket grid is request-driven: the initial workspace carries the full
+  bracket, explicit mutations may refetch their authoritative result, and
+  passive changes become visible after a manual page reload.
 
 Workflow changes require the dedicated workflow guardrails and role-matrix
 regression coverage.

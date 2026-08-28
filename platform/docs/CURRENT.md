@@ -18,12 +18,12 @@ Read this file for the current production baseline and next engineering priority
 - Cloudflare Access now protects `/platform-ops*` and `/api/v1/admin*` with an operator-scoped Allow policy and independent MFA; a fresh incognito login verified the identity -> TOTP MFA -> application path while application `admin`/`superadmin` RBAC remains authoritative.
 - Cloudflare is the single visitor-facing HSTS owner. Dashboard verification on 2026-08-21 confirmed HSTS On with six-month `max-age=15552000`, `includeSubDomains` Off and preload Off; Nginx must continue to omit HSTS.
 - Cloudflare Full(strict), minimum visitor TLS 1.2, TLS 1.3/HTTP3 and DNSSEC were operator-confirmed on 2026-08-21.
-- Invite-only tournament workspace reads reject retained or otherwise inactive participant records; private bracket SSE also revalidates active participant membership while the connection remains open, so withdrawal/disqualification revokes an existing stream before further private events are emitted.
+- Invite-only tournament workspace reads reject retained or otherwise inactive participant records. Bracket data is delivered through the authorized workspace response; there is no persistent bracket stream whose membership must be revalidated.
 - Organizer participant removal is a retained `disqualified` record rather than a physical participant-row deletion. A disqualified participant cannot redeem another invite or self-rejoin that same tournament, and a retry does not consume another invite use. The organizer-only management roster retains inactive rows for explicit restoration; the exclusion remains scoped to that tournament and does not block participation in unrelated tournaments.
 - Tournament invite claims/revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Last invite use and last participant slot cannot be consumed twice, and restoring a retained inactive participant rechecks capacity before making the row active again.
 - Anonymous public profile contracts omit account/contact email and Steam authentication identity. Public tournament participant/workspace contracts omit moderation note, moderator identity and moderation timestamps; organizer management uses a separate response DTO that retains those fields.
 - Public tournament automation errors are persistence-sanitized before commit: `automation_last_error` can contain only the stable generic retry message, while restricted logs retain only tournament/failure metadata and a one-way error fingerprint. Migration `20260821_0039` rewrites historical non-null values to the same safe message.
-- Ready Check uses a deterministic timer contract, not realtime transport: the tournament workspace carries `starts_at`, `ends_at`, eligible/current-user state and a UTC `server_time` anchor; the browser uses elapsed monotonic time to activate and expire the button locally with zero Ready Check requests. The vote POST revalidates server time, eligibility and workflow state under the durable concurrency rules, and a delayed automation worker cannot reject a valid in-window vote. There are no Ready Check SSE, polling, leases, admission slots, proofs or capacity overrides. `/tournaments` remains request-driven. Generic/bracket SSE and Redis infrastructure remain separate and unchanged; bracket pages use a revision probe and fetch the full bracket after a revision change. See the [realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
+- Ready Check uses a deterministic timer contract, not realtime transport: the tournament workspace carries `starts_at`, `ends_at`, eligible/current-user state and a UTC `server_time` anchor; the browser uses elapsed monotonic time to activate and expire the button locally with zero Ready Check requests. The vote POST revalidates server time, eligibility and workflow state under the durable concurrency rules, and a delayed automation worker cannot reject a valid in-window vote. There are no Ready Check SSE, polling, leases, admission slots, proofs or capacity overrides. `/tournaments` and the bracket grid remain request-driven; the initial bracket is included in the workspace response, and passive bracket changes appear after manual page reload. Redis remains available to unrelated platform services. See the [realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
@@ -46,17 +46,15 @@ verification are complete. The scope and execution checklist are maintained in
 [`archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md`](archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md).
 The protected-account/database reset gate is resolved for the supplied
 production identity. Migration, exact-SHA CI, deploy smoke and retained-load
-evidence remain release gates. The canceled browser-polling run on 2026-08-24
-also exposed an operator-contour bug: canceling the GitHub SSH step did not
-propagate to the remote supervisor. The reviewed abort workflow, remote
-180-minute ceiling and durable-report recovery are now part of the retained
-load procedure; a canceled run remains a failed measurement and must be
-cleaned exactly. A production browser setup timeout also exposed the
-create-before-response boundary: the exact cleanup path now recovers only a
-marker-matching tournament owned by that run's synthetic organizer set before
-deletion, while malformed or foreign matches remain fail-closed.
+evidence remain release gates. The retained-load procedure keeps its reviewed
+abort workflow, remote 180-minute ceiling and durable-report recovery; a
+canceled run remains a failed measurement and must be cleaned exactly. A
+production setup timeout also exposed the create-before-response boundary:
+the exact cleanup path recovers only a marker-matching tournament owned by
+that run's synthetic organizer set before deletion, while malformed or
+foreign matches remain fail-closed.
 
-The measured local browser-polling staircase reached 1,000 → 5,000 → 10,000
+The historical local browser-polling staircase reached 1,000 → 5,000 → 10,000
 virtual users on the selected bounded profile. Production remains commit- and
 exact-SHA-gated;
 a canceled, recovered or setup-failed run is not a successful benchmark. The
@@ -80,7 +78,7 @@ conditional `304` responses, with p95 433ms/p99 700ms and no sustained CPU,
 connection or lock saturation. Exact cleanup (`32803657743`) deleted 10,000
 users and 20 tournaments, left zero fixture users/tournaments/sessions/audit
   rows and preserved the control account. The transport ten-hypothesis matrix
-  and its five follow-ups are complete. The current combined-load winner is the
+  and its five follow-ups are complete. The historical combined-load winner is the
   frontend-aligned lean workspace contract with client pool512 and a 600s
   opening stagger; F2 was selected by zero errors first, then p95/p99, CPU and
   pool wait rather than raw throughput.
@@ -92,7 +90,11 @@ expiration, idempotency and zero Ready Check transport traffic. The replacement
 load gate is a short Ready vote burst; the old Ready Check SSE staircase is
 retired.
 
-## Historical transport evidence (not current Ready Check architecture)
+## Historical transport evidence (not current product architecture)
+
+Every SSE and browser-polling result in this section describes a retired
+transport. It is retained for audit and capacity-history purposes only; it is
+not an active implementation, release gate or production capacity claim.
 
 The historical SSE harness follow-up isolated transport from fixture workflow
 latency. SSE and combined profiles use the requested synthetic-user count and
@@ -142,8 +144,7 @@ It was reverted from the follow-up candidate.
 The next candidate skips the published-assignment lookup only for
 `registration_open` detail workspaces. The domain guard makes assignment
 staging unavailable before `registration_closed`; all access checks,
-  participant state, ETags, response fields and generic bracket SSE admission
-  remain unchanged.
+  participant state, ETags and response fields remain unchanged.
 The H2 live run `32979781513` (cleanup `32980077832`) reduced workspace SQL
 from 6.0 to 5.0 queries/request and average DB time from 246ms to 201ms, but
 did not yet lower the full server contour: workspace p95 was 909ms and API
@@ -522,7 +523,7 @@ against the current web/api/worker identities and units.
 ## Production invariants
 
 - Profile-level Deadlock dream slots are the source of truth.
-- Invite-only workspace reads require active participant membership or explicit organizer/admin authority; historical inactive participant rows are not authorization grants, including for an already-open private bracket SSE stream.
+- Invite-only workspace reads require active participant membership or explicit organizer/admin authority; historical inactive participant rows are not authorization grants.
 - Organizer exclusion must retain the tournament participant row as `disqualified`; self-rejoin and same-tournament invite redemption remain blocked until the organizer deliberately restores an active status. This is tournament-scoped and must not become a platform-wide ban.
 - Invite use and participant capacity are transaction-scoped PostgreSQL invariants: invite claim/revoke locks the stable tournament and invite rows in tournament-to-invite order; ordinary joins claim durable free slots without locking the tournament row, while lifecycle/restore mutations retain the tournament-row boundary and recheck capacity. Authentication last-seen touches use an isolated database transaction and must never commit or release locks owned by a mutation request.
 - Resource-creating API retries use durable actor/scope `Idempotency-Key` records. A repeated key with the same payload resolves to the originally created tournament/invite; reusing a key with a different payload is rejected.
@@ -541,24 +542,15 @@ against the current web/api/worker identities and units.
   inventory and allocates sparse rows above it on demand, so the permitted
   nine-digit API capacity cannot trigger a massive slot backfill.
 - Bracket/workspace reads expose revision-derived private ETags and accept
-  `If-None-Match`; unchanged reads return `304`. Active browser views poll at
-  the existing short interval, hidden/passive/terminal views back off or stop,
-  and generic bracket SSE remains admission-limited.
-- API and worker SQLAlchemy pools are explicit and bounded: the measured 10k
-  polling baseline is API `2 x (16 + 0)` and worker `2 x (2 + 0)` within the
-  ordinary 44-connection budget. Generic bracket SSE ticket admission/private
-  revalidation use the bounded stream DB pool; Redis admission uses bounded
-  `512` connections with a `2s` wait and remains fail-closed. Celery uses
-  high/default/low queues, prefetch one and late acks; backlog/retry pressure is
-  evidence. Historical mixed SSE/polling results remain transport evidence; any
-  future bracket increase must remeasure ordinary workload and roughly 1GB API
-  memory without weakening bounded pools or fail-closed admission.
-- The final 20×500 browser-polling gate keeps fixture state bounded to at most
-  32 participants per tournament and uses four setup lanes plus one shared
-  request semaphore. Its production runner retains 10,000 virtual tabs with
-  HTTP40, a 300-second opening stagger and a 30-second mixed active/passive
-  polling window; its five-minute auto-assignment wait is fail-fast. The
-  write-burst profile owns join/ready-vote contention measurements.
+  `If-None-Match`; unchanged manual reloads return `304`. The browser does not
+  run a bracket poller or open a bracket stream. Explicit bracket mutations may
+  refetch their authoritative response; passive changes appear after manual
+  page reload.
+- API and worker SQLAlchemy pools are explicit and bounded within the ordinary
+  connection budget. Celery uses high/default/low queues, prefetch one and
+  late acks; backlog/retry pressure is evidence. Historical browser-polling
+  and SSE results remain transport evidence only. The write-burst profile owns
+  join/ready-vote contention measurements.
 - Ready-check votes must be committed only while their round is active and the voter remains an eligible active participant; a close or exclusion
   cannot leave a post-close or ineligible vote in persistence.
 - The database is the final concurrency guard for cardinal workflow state:
@@ -568,7 +560,9 @@ against the current web/api/worker identities and units.
   replace-all request leaves exactly its selected profile-level slots, never a
   merge of concurrent payloads; slot values remain in the supported range.
 - Public API contracts are explicit allowlists. Account/contact email and Steam authentication identity do not belong to anonymous public-profile DTOs, participant moderation metadata belongs only to organizer-management DTOs, and public automation error fields must never contain arbitrary exception text. A future public email feature requires a separate explicit opt-in contract rather than reusing account contact data.
-- Public bracket SSE must retain layered application/Nginx connection caps, fail closed when Redis-backed admission state is unavailable, release leases on normal termination and retain bounded expiry recovery after abnormal termination. Public tickets may be anonymous because bracket data is public; private tickets remain session-bound and private revalidation remains fail-closed. Healthy streams have no artificial lifetime rotation: keepalive, renewable leases and access revalidation govern their lifetime, while reconnect admission remains bounded and fully jittered over the measured 60–180 second recovery window.
+- Bracket/workspace access must remain authorized by the ordinary request
+  boundary. The active grid has no persistent stream, ticket, lease or
+  connection admission path; Redis is not a bracket transport dependency.
 - Public media rendering must remain `R2 -> CDN -> browser`; normal API runtime must not proxy R2 objects, serve legacy upload paths or fall back to local-disk reads. Legacy URL columns and migration helpers may remain only while runtime-inert and migration/grace-period scoped.
 - Unknown public patch IDs must not make the request path wait on external refresh work. Retain per-ID negative caching, cross-worker refresh coalescing and explicit no-redirect/response-size bounds for miss-triggered upstream requests.
 - Password-login protection must retain independent per-IP and account-wide buckets. Account-wide Redis state must use private HMAC fingerprints rather than plaintext identifiers; cooldowns remain bounded and must not extend on blocked requests, and a successful login clears the account failure/cooldown state.

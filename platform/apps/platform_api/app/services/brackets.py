@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -208,7 +207,6 @@ async def propagate_match_winner(
         destination.away_label = winner_label
     return destination
 
-
 async def clear_match_result_and_progression(
     db_session: AsyncSession,
     *,
@@ -249,17 +247,3 @@ async def clear_match_result_and_progression(
     match.reported_at = None
     match.reported_by_user_id = None
     return destination
-
-
-def bracket_event_payload(
-    *,
-    tournament: Tournament,
-    event_type: str,
-    match_id: str | None = None,
-) -> dict[str, Any]:
-    return {
-        "type": event_type,
-        "tournament_id": tournament.id,
-        "revision": int(tournament.bracket_revision or 0),
-        "match_id": match_id,
-    }

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Recover an interrupted retained-load report from its durable QA row.
+"""Recover an interrupted retained write-burst report from its durable QA row.
 
 The production retained-load supervisor updates ``PreprodTestRun.report`` after
 each material setup phase.  If the GitHub SSH client is canceled, the final
 JSON files may never be copied to the run directory even though the database
 still has the exact fixture identity.  This helper reconstructs only the
-browser-polling report and compact summary for one exact ``gha-<run-id>`` root;
+write-burst report and compact summary for one exact ``gha-<run-id>`` root;
 the normal exact cleanup validator remains the deletion authority.
 """
 
@@ -49,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-email", required=True)
     parser.add_argument(
         "--mode",
-        choices=("browser-polling", "write-burst", "sse", "combined"),
-        default="browser-polling",
+        choices=("write-burst",),
+        default="write-burst",
     )
     return parser.parse_args()
 
@@ -163,22 +163,15 @@ def build_recovered_summary(
 ) -> dict[str, Any]:
     user_ids = _uuid_list(report.get("user_ids"), field="user_ids")
     tournament_ids = _uuid_list(report.get("tournament_ids"), field="tournament_ids")
-    polling = report.get("polling") if isinstance(report.get("polling"), dict) else {}
     performance = report.get("performance") if isinstance(report.get("performance"), dict) else {}
     http_client = performance.get("http_client") if isinstance(performance.get("http_client"), dict) else {}
     http_overall = http_client.get("overall") if isinstance(http_client.get("overall"), dict) else {}
     bottleneck = performance.get("bottleneck_summary") if isinstance(performance.get("bottleneck_summary"), dict) else {}
-    mode = str(report.get("mode") or "browser-polling")
+    mode = str(report.get("mode") or "write-burst")
     write_burst = report.get("write_burst") if isinstance(report.get("write_burst"), dict) else {}
     selection = str(write_burst.get("selection") or "all")
-    planned_tournaments = (
-        {"all": 26, "single-join": 3, "single-ready": 3, "multi-staggered": 20}.get(selection, 0)
-        if mode == "write-burst"
-        else 20
-    )
+    planned_tournaments = {"all": 26, "single-join": 3, "single-ready": 3, "multi-staggered": 20}.get(selection, 0)
     planned_users = int(report.get("requested_users") or 10000)
-    sse = report.get("sse") if isinstance(report.get("sse"), dict) else {}
-    sse_metrics = sse.get("metrics") if isinstance(sse.get("metrics"), dict) else {}
     return {
         "mode": mode,
         "target_sha": "recovered-from-durable-run",
@@ -190,23 +183,6 @@ def build_recovered_summary(
         "completed_users": len(user_ids),
         "passed": False,
         "recovered": True,
-        "polling": {
-            "profile": polling.get("profile"),
-            "tabs_planned": polling.get("tabs_planned"),
-            "visible_tabs": polling.get("visible_tabs"),
-            "hidden_tabs": polling.get("hidden_tabs"),
-            "executed": polling.get("executed"),
-            "not_modified": polling.get("not_modified"),
-            "deduped": polling.get("deduped"),
-        } if polling else None,
-        "sse": {
-            "target_connections": sse.get("target_connections"),
-            "connected": sse_metrics.get("connected"),
-            "rejected_429": sse_metrics.get("rejected_429"),
-            "rejected_503": sse_metrics.get("rejected_503"),
-            "errors": sse_metrics.get("errors"),
-            "events": sse_metrics.get("events"),
-        } if sse else None,
         "write_burst": {
             "profile": write_burst.get("profile"),
             "selection": selection,
@@ -250,7 +226,7 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
     if settings.platform_environment.strip().lower() != "production":
         raise RuntimeError("retained report recovery is forbidden outside production")
     if settings.platform_web_origin.rstrip("/") != EXPECTED_ORIGIN:
-        raise RuntimeError("browser report recovery requires the canonical origin")
+        raise RuntimeError("retained report recovery requires the canonical origin")
 
     profile_root = run_root / args.mode
     report_path = profile_root / f"{args.mode}.json"

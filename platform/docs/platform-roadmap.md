@@ -16,8 +16,9 @@ implemented in the reviewed branch. The implementation plan and destructive-data
 recorded in [`archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md`](archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md).
 The package covers join capacity slots, compact conditional workflow reads,
 bounded API/worker pools, Celery priority/backpressure and retained load
-evidence. Existing 32-shard ready votes, PostgreSQL workflow authority and
-SSE admission limits remain in force.
+evidence. Existing 32-shard ready votes and PostgreSQL workflow authority
+remain in force. Ready Check and bracket realtime transports are retired;
+passive grid changes are visible after manual reload.
 
 ### AS-17 — End-to-end release transaction and recovery
 

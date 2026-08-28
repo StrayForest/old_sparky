@@ -90,9 +90,9 @@ class SafeEnvExecTests(unittest.TestCase):
                 pythonpath=safe_env.TRUSTED_PLATFORM_ROOT,
             )
 
-    def test_retained_browser_recovery_is_an_approved_db_tool(self) -> None:
+    def test_retained_report_recovery_is_an_approved_db_tool(self) -> None:
         self.assertIn(
-            "platform_recover_retained_browser_report.py",
+            "platform_recover_retained_report.py",
             safe_env.TRUSTED_DB_TOOLS,
         )
 

@@ -59,12 +59,14 @@ for the post-vote UI, so the client does not issue a follow-up GET.
 
 ## Bracket boundary
 
-Generic/bracket SSE and its Redis infrastructure remain scoped to bracket
-features; this decision does not remove or change them. The current bracket
-web view uses a short revision/status probe and fetches the full bracket only
-when the revision changes. Bracket connection limits, leases, tickets and
-revalidation therefore remain separate from Ready Check, which has no
-connection or Redis admission state.
+The bracket grid is request-driven. The tournament workspace carries the full
+bracket in its initial HTTP payload, and the browser does not open an
+EventSource, run a revision probe or poll while the page is open. A user action
+that changes a bracket may refetch the authoritative response needed to render
+the result; passive changes become visible after the user manually reloads the
+page. There are no bracket connection limits, leases, tickets, admission
+windows or relay infrastructure in the active product path. Redis remains
+available to unrelated platform services.
 
 ## Verification and load model
 

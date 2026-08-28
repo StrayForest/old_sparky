@@ -80,7 +80,7 @@ fields with request correlation. Reports never justify broadening the policy
 without reproducing the application need.
 
 Enforcement was activated on 2026-08-13 after the owner explicitly waived the
-manual auth/Turnstile contour, repeated enforcement browser/SSE contour and
+manual auth/Turnstile contour, repeated enforcement browser contour and
 30-minute/24-hour observation windows. These gaps must not be represented as
 passed evidence. Keep the live-QA tooling for future targeted validation and
 roll back to the Report-Only `previous` release on a confirmed first-party
@@ -91,7 +91,7 @@ regression; never weaken the policy merely to silence telemetry.
 The production gate deliberately has two non-overlapping contours. A root
 supervisor creates exactly 14 ephemeral browser sessions with a maximum
 one-hour TTL, then hands only their `0600` per-run file to a dedicated non-root,
-sandboxed Playwright runner for tournament/roster/bracket/SSE behavior. The
+sandboxed Playwright runner for tournament/roster/bracket behavior. The
 database stores only token digests; the plaintext file is reclaimed by root and
 destroyed after exact-ID cleanup. This contour never calls auth
 lifecycle or Turnstile flows and cannot be cited as auth evidence; it only

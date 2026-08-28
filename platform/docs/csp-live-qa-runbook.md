@@ -133,7 +133,7 @@ non-document security headers.
 The standard sequence below remains the required default for future CSP mode
 changes. The 2026-08-13 activation was an explicit owner exception: enforcement
 was activated after the owner waived manual auth/Turnstile, repeated
-enforcement browser/SSE and 30-minute/24-hour observation evidence. Do not
+enforcement browser and 30-minute/24-hour observation evidence. Do not
 reuse that exception implicitly or record the waived gates as passed.
 
 1. Build and activate an immutable fail-closed candidate using the normal
@@ -171,7 +171,7 @@ limiter are in the [security runbook](security-runbook.md).
 Candidate and enforcement each require two independent contours, in this
 order:
 
-1. an automated tournament/roster/bracket/SSE journey using short-lived QA
+1. an automated tournament/roster/bracket journey using short-lived QA
    sessions and no authentication route or Turnstile;
 2. after its exact-ID cleanup succeeds, a human auth lifecycle and production
    Turnstile check in ordinary Chrome.
@@ -250,7 +250,7 @@ root-controlled and not group/world writable. The mailbox boundary rejects a
 bundle older than four hours or more than 60 seconds in the future. Provision
 shortly before the run.
 
-### Automated tournament/bracket/SSE contour
+### Automated tournament/bracket contour
 
 First run the complete public production-browser suite through the dedicated
 non-root supervisor. Direct production `npm run test:live`, root Playwright,
@@ -309,7 +309,9 @@ host-only cookie into isolated contexts and confirms each exact user identity
 through the normal session endpoint before using it.
 
 This contour covers tournament creation and joining, ready/assignment flow,
-bracket progression, two-context SSE and the associated CSP/browser gate. It
+bracket progression and the associated CSP/browser gate. Ready Check uses its
+server-known local timer and the bracket is request-driven; the contour opens
+no realtime connection or polling loop. It
 does not exercise registration, verification, login, password reset/change or
 Turnstile and therefore is not evidence for those controls. Its only auth
 mutation is bounded teardown logout for the short-lived fixture sessions.
@@ -473,8 +475,8 @@ on disk and never commit or log their contents.
 
 - Alembic current equals head;
 - API, worker, web and Nginx active with no new warning-or-higher journal;
-- home, auth, API, SSE, Next static, local assets and 404 security policy pass;
-- automated tournament/bracket/SSE and exact cleanup pass;
+- home, auth, API, Next static, local assets and 404 security policy pass;
+- automated tournament/bracket and exact cleanup pass;
 - manual production Turnstile/auth lifecycle and its exact cleanup pass;
 - support and changed product paths pass live checks;
 - CDN/R2 assets and cache behavior remain valid;

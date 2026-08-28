@@ -7,9 +7,7 @@ from typing import Any
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.platform_api.app.services.bracket_events import publish_bracket_event
 from apps.platform_api.app.services.brackets import create_full_bracket_graph
-from apps.platform_api.app.services.brackets import bracket_event_payload
 from apps.platform_api.app.services.tournament_workflow import (
     INACTIVE_PARTICIPANT_STATUSES,
     build_deadlock_auto_assignment_inputs,
@@ -397,21 +395,12 @@ async def run_deadlock_automation_tick(
                 db_session,
                 tournament_id,
             )
-            previous_bracket_revision = int(tournament.bracket_revision or 0)
             step_result = await _advance_tournament(
                 db_session,
                 tournament=tournament,
                 now=current_time,
             )
             await db_session.commit()
-            if int(tournament.bracket_revision or 0) != previous_bracket_revision:
-                await publish_bracket_event(
-                    tournament.id,
-                    bracket_event_payload(
-                        tournament=tournament,
-                        event_type="bracket_seeded",
-                    ),
-                )
             result = DeadlockAutomationResult(
                 scanned=result.scanned,
                 deferred=result.deferred,
@@ -451,7 +440,6 @@ async def advance_deadlock_tournament_automation(
         db_session,
         tournament_id,
     )
-    previous_bracket_revision = int(tournament.bracket_revision or 0)
     try:
         result = await _advance_tournament(
             db_session,
@@ -474,14 +462,6 @@ async def advance_deadlock_tournament_automation(
     if result != DeadlockAutomationResult():
         await db_session.commit()
         await db_session.refresh(tournament)
-        if int(tournament.bracket_revision or 0) != previous_bracket_revision:
-            await publish_bracket_event(
-                tournament.id,
-                bracket_event_payload(
-                    tournament=tournament,
-                    event_type="bracket_seeded",
-                ),
-            )
     return result
 
 

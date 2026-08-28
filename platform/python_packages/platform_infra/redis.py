@@ -19,11 +19,3 @@ async def warm_up_redis() -> None:
         await client.ping()
     finally:
         await client.aclose()
-
-
-async def dispose_redis() -> None:
-    from python_packages.platform_infra.sse_connection_limit import (
-        dispose_sse_connection_limiter,
-    )
-
-    await dispose_sse_connection_limiter()

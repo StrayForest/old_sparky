@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 import unittest
@@ -10,10 +9,6 @@ import httpx
 from sqlalchemy import delete, select
 
 from apps.platform_api.app.main import create_app
-from apps.platform_api.app.services.bracket_events import (
-    publish_bracket_event,
-    stream_bracket_events,
-)
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
@@ -505,26 +500,3 @@ class PlatformBracketGraphApiTests(unittest.IsolatedAsyncioTestCase):
             method = "PATCH" if path.endswith("/schedule") else "POST"
             response = await organizer["client"].request(method, path, json=payload)
             self.assertEqual(response.status_code, 409, response.text)
-
-    async def test_bracket_sse_delivers_redis_event_within_two_seconds(self) -> None:
-        tournament_id = f"{self.prefix}-realtime"
-        stream = stream_bracket_events(tournament_id)
-        connected = await asyncio.wait_for(anext(stream), timeout=2)
-        self.assertIn("event: connected", connected)
-
-        await publish_bracket_event(
-            tournament_id,
-            {
-                "type": "test",
-                "tournament_id": tournament_id,
-                "revision": 11,
-                "match_id": None,
-            },
-        )
-        event = ""
-        async with asyncio.timeout(2):
-            while "event: bracket" not in event:
-                event = await anext(stream)
-        self.assertIn("event: bracket", event)
-        self.assertIn('"revision":11', event)
-        await stream.aclose()

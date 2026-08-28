@@ -157,7 +157,7 @@ if (( ${#summaries[@]} != 1 )); then
   fi
   profile_count=0
   recovery_profile=""
-  for candidate_profile in browser-polling write-burst sse combined; do
+  for candidate_profile in write-burst; do
     if [[ -d "$run_root/$candidate_profile" ]]; then
       profile_count=$((profile_count + 1))
       recovery_profile="$candidate_profile"
@@ -166,7 +166,7 @@ if (( ${#summaries[@]} != 1 )); then
   if (( profile_count == 1 )); then
     "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
       --pythonpath "$PLATFORM_ROOT" \
-      -- "$QA_PYTHON" "$TOOLS_DIR/platform_recover_retained_browser_report.py" \
+      -- "$QA_PYTHON" "$TOOLS_DIR/platform_recover_retained_report.py" \
       --run-root "$run_root" \
       --load-run-id "$load_run_id" \
       --control-email "$control_email" \

@@ -22,7 +22,6 @@ from apps.platform_api.app.services.tournament_participant_policy import (
     enforce_tournament_participant_policy,
 )
 from apps.platform_api.app.services.tournament_workspace_access import (
-    admit_tournament_bracket_stream,
     ensure_private_tournament_read_membership_is_active,
 )
 from apps.platform_api.app.services.tournament_write_serialization import (
@@ -45,20 +44,6 @@ tournament_dependencies = [
     Depends(serialize_tournament_write_invariants),
     Depends(enforce_tournament_participant_policy),
 ]
-stream_tournament_dependencies = [
-    Depends(admit_tournament_bracket_stream),
-]
-api_router.include_router(
-    tournaments.stream_router,
-    prefix="/tournaments",
-    tags=["tournaments"],
-    dependencies=stream_tournament_dependencies,
-)
-api_router.include_router(
-    tournaments.probe_router,
-    prefix="/tournaments",
-    tags=["tournaments"],
-)
 api_router.include_router(
     tournaments.router,
     prefix="/tournaments",

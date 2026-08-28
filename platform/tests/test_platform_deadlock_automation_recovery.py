@@ -235,7 +235,6 @@ class PlatformDeadlockAutomationRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value=([candidate], 0)),
             ),
             patch.object(automation, "_advance_tournament", side_effect=advance),
-            patch.object(automation, "publish_bracket_event", AsyncMock()),
         ):
             crashed_result = await automation.run_deadlock_automation_tick(
                 db_session,

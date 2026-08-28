@@ -80,7 +80,6 @@ class PlatformTournamentInactiveWorkspaceAccessTests(unittest.IsolatedAsyncioTes
             ("participants", None),
             ("matches", None),
             ("bracket", None),
-            ("bracket/events", None),
             ("deadlock/ready-check", None),
             ("profiles/user-2", "profiles/{user_id}"),
             ("future-private-surface", None),

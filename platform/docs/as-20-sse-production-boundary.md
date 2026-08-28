@@ -1,7 +1,9 @@
 # AS-20 legacy SSE production boundary
 
-Status: historical legacy contour; superseded by the Ready Check boundary on
-2026-08-27.
+Status: historical legacy contour; superseded by the Ready Check and bracket
+request-driven boundary on 2026-08-28. The measurements below are retained
+for audit history only and are not a current transport, capacity target or
+release gate.
 
 ## Deployed protection
 

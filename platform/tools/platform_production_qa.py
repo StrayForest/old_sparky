@@ -81,35 +81,11 @@ UUID_RE = re.compile(
 NUMERIC_PATH_RE = re.compile(r"/\d+(?=/|$)")
 REQUEST_PERF_RE = re.compile(r"\brequest_perf\b(?P<body>.*)$")
 PROCESS_CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-BROWSER_POLLING_PROFILE_NAME = "browser-polling-20x500"
-BROWSER_POLLING_TOURNAMENT_PLAN = (
-    ("registration_open", 10),
-    ("ready_check_active", 5),
-    ("bracket_active", 3),
-    ("terminal", 2),
-)
-BROWSER_POLLING_USERS_PER_TOURNAMENT = 500
-BROWSER_POLLING_DURATION_SECONDS = 300.0
-BROWSER_POLLING_OPEN_STAGGER_SECONDS = 30.0
-BROWSER_POLLING_FIXED_INTERVAL_MS = 10_000
-BROWSER_POLLING_DEFAULT_INTERVAL_MS = 15_000
-BROWSER_POLLING_JITTER_MS = 3_000
 # Progress checkpoints are written while a retained fixture is being built.
 # Do not serialize the complete 10k-user identity inventory on every batch;
 # the final report still contains the exact inventory used by cleanup.
 PREPROD_PROGRESS_ID_SAMPLE_SIZE = 4
-BROWSER_POLLING_READY_TEAMS = 2
-# The browser profile measures read fan-out, conditional responses and tab
-# lifecycle.  A small but valid roster keeps fixture creation from becoming a
-# second load test; join/vote contention is covered by the write-burst profile.
-BROWSER_POLLING_STATE_PARTICIPANTS = 32
-BROWSER_POLLING_SETUP_CONCURRENCY = 4
-BROWSER_POLLING_AUTO_ASSIGNMENT_TIMEOUT_SECONDS = 300.0
-BROWSER_POLLING_HOT_ROUTES = (
-    "GET /tournaments/{slug}",
-    "GET /tournaments/{slug}/workspace",
-    "GET /tournaments/{slug}/bracket",
-)
+READY_TEST_TEAMS = 2
 WRITE_BURST_PROFILE_NAME = "write-burst-v1"
 WRITE_BURST_USERS_PER_TOURNAMENT = 50
 WRITE_BURST_TOURNAMENT_COUNT = 20
@@ -136,12 +112,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--origin", default="http://127.0.0.1")
     parser.add_argument("--env-file", type=Path, default=None)
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
-    parser.add_argument("--browser-gate-dir", type=Path, default=None)
-    parser.add_argument("--browser-gate-timeout", type=float, default=120.0)
     parser.add_argument("--http-timeout", type=float, default=180.0)
     parser.add_argument(
         "--mode",
-        choices=("targeted", "scale", "browser-polling", "write-burst"),
+        choices=("targeted", "scale", "write-burst"),
         default="targeted",
     )
     parser.add_argument("--scale-users", type=int, default=10_000)
@@ -157,28 +131,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--system-sample-interval", type=float, default=1.0)
     parser.add_argument("--scale-site-mix-users", type=int, default=None)
     parser.add_argument("--scale-bracket-view-users", type=int, default=None)
-    parser.add_argument("--browser-polling-profile", default=BROWSER_POLLING_PROFILE_NAME)
-    parser.add_argument(
-        "--browser-polling-duration",
-        type=float,
-        default=BROWSER_POLLING_DURATION_SECONDS,
-    )
-    parser.add_argument(
-        "--browser-polling-users-per-tournament",
-        type=int,
-        default=BROWSER_POLLING_USERS_PER_TOURNAMENT,
-    )
-    parser.add_argument(
-        "--browser-polling-open-stagger",
-        type=float,
-        default=BROWSER_POLLING_OPEN_STAGGER_SECONDS,
-        help="Spread initial tab opens over this many seconds to avoid an artificial synchronized wave.",
-    )
-    parser.add_argument(
-        "--browser-polling-active-users-only",
-        action="store_true",
-        help="Keep every planned polling tab active instead of modeling hidden browser tabs.",
-    )
     parser.add_argument(
         "--write-burst-profile",
         choices=("all", "single-join", "single-ready", "multi-staggered"),
@@ -500,140 +452,10 @@ class HttpMetricsRecorder:
         }
 
 
-class PollingMetricsRecorder:
-    def __init__(self) -> None:
-        self.counters: Counter[str] = Counter()
-        self.by_route: dict[str, Counter[str]] = defaultdict(Counter)
-        self.by_role: dict[str, Counter[str]] = defaultdict(Counter)
-        self.by_tournament_status: dict[str, Counter[str]] = defaultdict(Counter)
-        self.route_executed_by_hidden: Counter[str] = Counter()
-        self.route_executed_by_terminal: Counter[str] = Counter()
-        self.error_samples: list[dict[str, str]] = []
-
-    def mark(
-        self,
-        event: str,
-        *,
-        route: str | None = None,
-        role: str | None = None,
-        tournament_status: str | None = None,
-        hidden: bool = False,
-        terminal_known: bool = False,
-    ) -> None:
-        self.counters[event] += 1
-        if route:
-            self.by_route[route][event] += 1
-            if event == "executed" and hidden:
-                self.route_executed_by_hidden[route] += 1
-            if event == "executed" and terminal_known:
-                self.route_executed_by_terminal[route] += 1
-        if role:
-            self.by_role[role][event] += 1
-        if tournament_status:
-            self.by_tournament_status[tournament_status][event] += 1
-
-    def record_error(
-        self,
-        *,
-        route: str,
-        role: str,
-        tournament_status: str,
-        error: BaseException,
-    ) -> None:
-        self.mark(
-            "errors",
-            route=route,
-            role=role,
-            tournament_status=tournament_status,
-        )
-        if len(self.error_samples) >= 25:
-            return
-        message = str(error).strip()
-        self.error_samples.append(
-            {
-                "type": type(error).__name__,
-                "route": route,
-                "role": role,
-                "tournament_status": tournament_status,
-                "message": message[:300],
-            }
-        )
-
-    @staticmethod
-    def _counter_row(counter: Counter[str]) -> dict[str, int]:
-        return {
-            "total_scheduled": int(counter.get("scheduled", 0)),
-            "executed": int(counter.get("executed", 0)),
-            "skipped_hidden": int(counter.get("skipped_hidden", 0)),
-            "skipped_terminal": int(counter.get("skipped_terminal", 0)),
-            "deduped": int(counter.get("deduped", 0)),
-            "aborted": int(counter.get("aborted", 0)),
-            "not_modified": int(counter.get("not_modified", 0)),
-            "sse_reconnect": int(counter.get("sse_reconnect", 0)),
-            "errors": int(counter.get("errors", 0)),
-        }
-
-    def summary(self) -> dict[str, Any]:
-        return {
-            **self._counter_row(self.counters),
-            "by_route": {
-                key: self._counter_row(counter)
-                for key, counter in sorted(self.by_route.items())
-            },
-            "by_role": {
-                key: self._counter_row(counter)
-                for key, counter in sorted(self.by_role.items())
-            },
-            "by_tournament_status": {
-                key: self._counter_row(counter)
-                for key, counter in sorted(self.by_tournament_status.items())
-            },
-            "executed_while_hidden": dict(sorted(self.route_executed_by_hidden.items())),
-            "executed_after_terminal": dict(sorted(self.route_executed_by_terminal.items())),
-            "error_samples": list(self.error_samples),
-        }
-
-
 def is_local_origin(origin: str) -> bool:
     parsed = urlparse(origin)
     hostname = (parsed.hostname or "").lower()
     return hostname in {"", "127.0.0.1", "localhost", "::1"}
-
-
-def polling_delay_seconds(raw_delay_ms: Any, *, tab_index: int, tick: int) -> float | None:
-    if raw_delay_ms == 0:
-        return None
-    if isinstance(raw_delay_ms, (int, float)) and raw_delay_ms > 0:
-        delay_ms = float(raw_delay_ms)
-    else:
-        delay_ms = float(BROWSER_POLLING_DEFAULT_INTERVAL_MS)
-    jitter_ms = (tab_index * 997 + tick * 389) % BROWSER_POLLING_JITTER_MS
-    return max(0.25, (delay_ms + jitter_ms) / 1000)
-
-
-def fixed_polling_expectation(
-    *,
-    duration_seconds: float,
-    tabs: list[dict[str, Any]],
-) -> dict[str, Any]:
-    ticks = max(1, int(duration_seconds // (BROWSER_POLLING_FIXED_INTERVAL_MS / 1000)))
-    by_route: Counter[str] = Counter()
-    by_role: Counter[str] = Counter()
-    by_tournament_status: Counter[str] = Counter()
-    for tab in tabs:
-        route = str(tab.get("route_label") or tab["route"])
-        by_route[route] += ticks
-        by_role[str(tab["role"])] += ticks
-        by_tournament_status[str(tab["tournament_status"])] += ticks
-    total = ticks * len(tabs)
-    return {
-        "interval_ms": BROWSER_POLLING_FIXED_INTERVAL_MS,
-        "ticks_per_tab": ticks,
-        "total_expected_gets": total,
-        "by_route": dict(sorted(by_route.items())),
-        "by_role": dict(sorted(by_role.items())),
-        "by_tournament_status": dict(sorted(by_tournament_status.items())),
-    }
 
 
 def burst_offsets(*, count: int, spread_seconds: float) -> list[float]:
@@ -730,17 +552,6 @@ def evaluate_write_burst_profiles(profiles: list[dict[str, Any]]) -> dict[str, A
         "healthy": not failures,
         "thresholds": thresholds,
         "failures": failures,
-    }
-
-
-def hot_route_counts(http_summary: dict[str, Any]) -> dict[str, int]:
-    by_route = http_summary.get("by_route", {}) if isinstance(http_summary, dict) else {}
-    if not isinstance(by_route, dict):
-        return {}
-    return {
-        route: int(metrics.get("count") or 0)
-        for route, metrics in by_route.items()
-        if route in BROWSER_POLLING_HOT_ROUTES and isinstance(metrics, dict)
     }
 
 
@@ -913,7 +724,7 @@ def process_label(process: dict[str, Any]) -> str | None:
         return "redis-server"
     if comm == "nginx" or cmdline.startswith("nginx:"):
         return "nginx"
-    if "platform_production_qa.py" in cmdline or "platform_sse_qa.py" in cmdline:
+    if "platform_production_qa.py" in cmdline:
         return "load-generator"
     return None
 
@@ -1857,8 +1668,6 @@ class ProductionQa:
         request_origin: str | None = None,
         report_path: Path,
         keep_data: bool,
-        browser_gate_dir: Path | None,
-        browser_gate_timeout: float,
         http_timeout: float,
         mode: str = "targeted",
         scale_users: int = 10_000,
@@ -1872,11 +1681,6 @@ class ProductionQa:
         scale_final_view_profile: str = "current",
         tournament_visibility: str = "public",
         profile_journey: bool = False,
-        browser_polling_profile: str = BROWSER_POLLING_PROFILE_NAME,
-        browser_polling_duration: float = BROWSER_POLLING_DURATION_SECONDS,
-        browser_polling_users_per_tournament: int = BROWSER_POLLING_USERS_PER_TOURNAMENT,
-        browser_polling_open_stagger: float = BROWSER_POLLING_OPEN_STAGGER_SECONDS,
-        browser_polling_active_users_only: bool = False,
         write_burst_profile: str = "all",
         write_burst_users_per_tournament: int = WRITE_BURST_USERS_PER_TOURNAMENT,
         write_burst_time_scale: float = 1.0,
@@ -1888,7 +1692,7 @@ class ProductionQa:
         control_participant_state: str | None = None,
     ) -> None:
         timestamp = datetime.now(UTC).strftime("%y%m%d%H%M%S")
-        prefix = "preprod" if mode in {"scale", "browser-polling", "write-burst", "sse"} else "qa"
+        prefix = "preprod" if mode in {"scale", "write-burst"} else "qa"
         self.marker = f"{prefix}{timestamp}{secrets.token_hex(2)}"
         self.origin = origin.rstrip("/")
         self.api_origin = f"{self.origin}/api/v1"
@@ -1934,37 +1738,17 @@ class ProductionQa:
                 "--control-participant-email is required with --control-participant-state."
             )
         self.control_participant_state = control_participant_state
-        self.browser_gate_dir = browser_gate_dir
-        self.browser_gate_timeout = browser_gate_timeout
         self.http_timeout = max(1.0, http_timeout)
         self.mode = mode
-        self.browser_polling_profile = browser_polling_profile or BROWSER_POLLING_PROFILE_NAME
-        self.browser_polling_duration = max(1.0, browser_polling_duration)
-        self.browser_polling_users_per_tournament = max(
-            10,
-            browser_polling_users_per_tournament,
-        )
-        self.browser_polling_state_participants = min(
-            BROWSER_POLLING_STATE_PARTICIPANTS,
-            max(1, self.browser_polling_users_per_tournament - 1),
-        )
-        self.browser_polling_open_stagger = max(0.0, browser_polling_open_stagger)
-        self.browser_polling_active_users_only = bool(browser_polling_active_users_only)
         self.write_burst_profile = write_burst_profile
         self.write_burst_users_per_tournament = max(14, write_burst_users_per_tournament)
         self.write_burst_time_scale = max(0.01, write_burst_time_scale)
-        browser_polling_users = (
-            sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN)
-            * self.browser_polling_users_per_tournament
-        )
         write_burst_users = (
             WRITE_BURST_TOURNAMENT_COUNT * self.write_burst_users_per_tournament
             if write_burst_profile in {"all", "multi-staggered"}
             else self.write_burst_users_per_tournament
         )
-        if mode == "browser-polling":
-            self.scale_users = browser_polling_users
-        elif mode == "write-burst":
+        if mode == "write-burst":
             self.scale_users = write_burst_users
         else:
             self.scale_users = max(14, scale_users)
@@ -2009,7 +1793,6 @@ class ProductionQa:
         self.tournament_slug: str | None = None
         self.tournament_ids: list[str] = []
         self.tournament_slugs: list[str] = []
-        self.polling_metrics = PollingMetricsRecorder()
         self.scenarios: list[dict[str, Any]] = []
         self.report: dict[str, Any] = {
             "marker": self.marker,
@@ -2018,7 +1801,7 @@ class ProductionQa:
             "request_origin": self.request_origin,
             "mode": mode,
             "report_path": str(report_path),
-            "requested_users": self.scale_users if mode in {"scale", "browser-polling", "write-burst", "sse"} else None,
+            "requested_users": self.scale_users if mode in {"scale", "write-burst"} else None,
             "http_timeout_seconds": self.http_timeout,
             "profile_journey": self.profile_journey,
             "scenarios": self.scenarios,
@@ -2034,7 +1817,6 @@ class ProductionQa:
             "preference_metrics_by_team": [],
             "cleanup": {},
             "performance": {},
-            "polling": {},
             "write_burst": {},
             "retained_participant": None,
             "rostered_participant": None,
@@ -2091,9 +1873,6 @@ class ProductionQa:
             tournament_slug=self.tournament_slug,
             tournament_slugs=self.tournament_slugs,
         )
-        polling_report = self.report.get("polling")
-        if self.mode == "browser-polling" and isinstance(polling_report, dict):
-            polling_report["http_route_counts"] = hot_route_counts(http_summary)
         write_burst_report = self.report.get("write_burst")
         if self.mode == "write-burst" and isinstance(write_burst_report, dict):
             server_by_phase = server_request_summary.get("by_qa_phase", {})
@@ -2127,11 +1906,6 @@ class ProductionQa:
                 "site_mix_users": self.scale_site_mix_users,
                 "bracket_view_users": self.scale_bracket_view_users,
                 "final_view_profile": self.scale_final_view_profile,
-                "browser_polling_profile": self.browser_polling_profile,
-                "browser_polling_duration": self.browser_polling_duration,
-                "browser_polling_users_per_tournament": self.browser_polling_users_per_tournament,
-                "browser_polling_open_stagger": self.browser_polling_open_stagger,
-                "browser_polling_active_users_only": self.browser_polling_active_users_only,
                 "write_burst_profile": self.write_burst_profile,
                 "write_burst_users_per_tournament": self.write_burst_users_per_tournament,
                 "write_burst_time_scale": self.write_burst_time_scale,
@@ -2424,11 +2198,7 @@ class ProductionQa:
         expected_teams: int | None,
         task_id: str,
     ) -> dict[str, Any]:
-        wait_seconds = (
-            BROWSER_POLLING_AUTO_ASSIGNMENT_TIMEOUT_SECONDS
-            if self.mode == "browser-polling"
-            else max(300.0, self.http_timeout * 12)
-        )
+        wait_seconds = max(300.0, self.http_timeout * 12)
         deadline = time.monotonic() + wait_seconds
         last_state: dict[str, Any] | None = None
         while time.monotonic() < deadline:
@@ -2471,11 +2241,7 @@ class ProductionQa:
         expected_teams: int | None,
         task_id: str,
     ) -> dict[str, Any]:
-        wait_seconds = (
-            BROWSER_POLLING_AUTO_ASSIGNMENT_TIMEOUT_SECONDS
-            if self.mode == "browser-polling"
-            else max(300.0, self.http_timeout * 12)
-        )
+        wait_seconds = max(300.0, self.http_timeout * 12)
         deadline = time.monotonic() + wait_seconds
         last_state: dict[str, Any] | None = None
         while time.monotonic() < deadline:
@@ -2555,7 +2321,7 @@ class ProductionQa:
                     origin=self.origin,
                     requested_users=(
                         self.scale_users
-                        if self.mode in {"scale", "browser-polling", "write-burst", "sse"}
+                        if self.mode in {"scale", "write-burst"}
                         else len(self.user_ids)
                     ),
                     report_path=str(self.report_path),
@@ -2904,14 +2670,6 @@ class ProductionQa:
 
         await asyncio.gather(*(run_one(item) for item in items))
 
-    def browser_polling_state_participant_count(
-        self,
-        users: list[dict[str, Any]],
-    ) -> int:
-        organizer_count = max(1, round(len(users) * 0.05))
-        available = max(0, len(users) - organizer_count)
-        return min(self.browser_polling_state_participants, available)
-
     async def bulk_register_scale_users(self) -> list[dict[str, Any]]:
         settings = get_settings()
         now = datetime.now(UTC)
@@ -3213,7 +2971,7 @@ class ProductionQa:
                     )
             await db_session.commit()
 
-    async def grant_browser_polling_permissions(
+    async def grant_tournament_permissions(
         self,
         organizers: list[dict[str, Any]],
         admins: list[dict[str, Any]],
@@ -3257,52 +3015,7 @@ class ProductionQa:
                             )
             await db_session.commit()
 
-    async def create_browser_polling_tournament(
-        self,
-        api_client: httpx.AsyncClient,
-        *,
-        organizer: dict[str, Any],
-        category: str,
-        index: int,
-    ) -> dict[str, Any]:
-        name = f"BP {index:02d} {category.replace('_', '-')}"[:25]
-        created = await self.request_as(
-            api_client,
-            organizer,
-            "POST",
-            "/tournaments",
-            expected=201,
-            json_payload={
-                "name": name,
-                "description": f"Browser polling profile {self.marker} {category}.",
-                "visibility": "public",
-                "format_slug": "solo",
-                "allowed_ranks": VALID_RANKS,
-                "max_participants": self.browser_polling_users_per_tournament,
-                "match_format": "bo3",
-                "final_format": "bo5",
-                "teams_count": BROWSER_POLLING_READY_TEAMS,
-            },
-        )
-        tournament_id = str(created["id"])
-        tournament_slug = str(created["slug"])
-        self.tournament_id = self.tournament_id or tournament_id
-        self.tournament_slug = self.tournament_slug or tournament_slug
-        self.tournament_ids.append(tournament_id)
-        self.tournament_slugs.append(tournament_slug)
-        self.report["tournament_ids"] = list(self.tournament_ids)
-        self.report["tournament_slugs"] = list(self.tournament_slugs)
-        await self.request_as(
-            api_client,
-            organizer,
-            "PATCH",
-            f"/tournaments/{tournament_slug}/status",
-            expected=200,
-            json_payload={"status": "registration_open"},
-        )
-        return {**created, "category": category}
-
-    async def join_browser_polling_participants(
+    async def join_tournament_participants(
         self,
         api_client: httpx.AsyncClient,
         *,
@@ -3324,7 +3037,7 @@ class ProductionQa:
 
         await self.bounded_each(participants, join_user, semaphore=request_semaphore)
 
-    async def setup_browser_polling_tournament_state(
+    async def setup_tournament_state(
         self,
         api_client: httpx.AsyncClient,
         *,
@@ -3336,7 +3049,7 @@ class ProductionQa:
         category = str(tournament["category"])
         slug = str(tournament["slug"])
         if participants and category != "terminal":
-            await self.join_browser_polling_participants(
+            await self.join_tournament_participants(
                 api_client,
                 tournament=tournament,
                 participants=participants,
@@ -3397,13 +3110,13 @@ class ProductionQa:
             "POST",
             f"/tournaments/{slug}/deadlock/captain-round/start",
             expected=201,
-            json_payload={"teams_count": BROWSER_POLLING_READY_TEAMS},
+            json_payload={"teams_count": READY_TEST_TEAMS},
         )
         final_run = await self.wait_for_auto_assignment_run_as(
             api_client,
             organizer,
             tournament_slug=slug,
-            expected_teams=BROWSER_POLLING_READY_TEAMS,
+            expected_teams=READY_TEST_TEAMS,
         )
         run_id = str(final_run["id"])
         await self.request_as(
@@ -3436,545 +3149,6 @@ class ProductionQa:
             json_payload={"status": "in_progress"},
         )
 
-    def build_browser_polling_tabs(
-        self,
-        *,
-        tournaments: list[dict[str, Any]],
-        user_chunks: list[list[dict[str, Any]]],
-    ) -> list[dict[str, Any]]:
-        tabs: list[dict[str, Any]] = []
-        for tournament_index, (tournament, users) in enumerate(zip(tournaments, user_chunks)):
-            slug = str(tournament["slug"])
-            category = str(tournament["category"])
-            organizer_count = max(1, round(len(users) * 0.05))
-            participant_count = self.browser_polling_state_participant_count(users)
-            for user_index, user in enumerate(users):
-                if user_index == 0:
-                    role = "organizer"
-                elif user_index < organizer_count:
-                    role = "admin"
-                elif user_index < organizer_count + participant_count:
-                    role = "participant"
-                else:
-                    role = "viewer"
-                hidden_after_open = (
-                    False
-                    if self.browser_polling_active_users_only
-                    else (len(tabs) % 10) in {0, 1, 2}
-                )
-                route = f"/tournaments/{slug}"
-                route_label = "GET /tournaments/{slug}"
-                if category == "bracket_active":
-                    if role in {"organizer", "admin"} or user_index % 2 == 0:
-                        route = f"/tournaments/{slug}/bracket?teams_view=summary"
-                        route_label = "GET /tournaments/{slug}/bracket"
-                    else:
-                        route = (
-                            f"/tournaments/{slug}/workspace"
-                            "?participants_limit=0&participants_offset=0"
-                            "&workspace_view=bracket_summary"
-                            "&include_current_user=false"
-                        )
-                        route_label = "GET /tournaments/{slug}/workspace"
-                elif category != "terminal":
-                    route = (
-                        f"/tournaments/{slug}/workspace"
-                        "?participants_limit=0&participants_offset=0"
-                        "&workspace_view=detail"
-                        "&include_current_user=false"
-                    )
-                    route_label = "GET /tournaments/{slug}/workspace"
-                tabs.append(
-                    {
-                        "client_id": f"tab-{tournament_index:02d}-{user_index:02d}",
-                        "tab_index": len(tabs),
-                        "user": user,
-                        "role": role,
-                        "tournament_status": category,
-                        "slug": slug,
-                        "route": route,
-                        "route_label": route_label,
-                        "hidden_after_open": hidden_after_open,
-                        "hidden": False,
-                        "terminal_known": False,
-                        "abort_once": (len(tabs) % 37) == 0,
-                        "open_stagger_seconds": (
-                            0.0
-                            if self.browser_polling_open_stagger <= 0
-                            else round(
-                                (
-                                    ((len(tabs) * 37) % 1000) / 999
-                                )
-                                * self.browser_polling_open_stagger,
-                                4,
-                            )
-                        ),
-                    }
-                )
-        return tabs
-
-    async def execute_browser_polling_request(
-        self,
-        api_client: httpx.AsyncClient,
-        tab: dict[str, Any],
-        inflight: set[str],
-    ) -> dict[str, Any] | None:
-        route_label = str(tab["route_label"])
-        inflight_key = f"{tab['client_id']}:{route_label}"
-        if inflight_key in inflight:
-            self.polling_metrics.mark(
-                "deduped",
-                route=route_label,
-                role=str(tab["role"]),
-                tournament_status=str(tab["tournament_status"]),
-                hidden=bool(tab.get("hidden")),
-                terminal_known=bool(tab.get("terminal_known")),
-            )
-            return None
-        if tab.get("abort_next"):
-            tab["abort_next"] = False
-            self.polling_metrics.mark(
-                "aborted",
-                route=route_label,
-                role=str(tab["role"]),
-                tournament_status=str(tab["tournament_status"]),
-                hidden=bool(tab.get("hidden")),
-                terminal_known=bool(tab.get("terminal_known")),
-            )
-            return None
-        inflight.add(inflight_key)
-        await asyncio.sleep(0)
-        try:
-            self.polling_metrics.mark(
-                "executed",
-                route=route_label,
-                role=str(tab["role"]),
-                tournament_status=str(tab["tournament_status"]),
-                hidden=bool(tab.get("hidden")),
-                terminal_known=bool(tab.get("terminal_known")),
-            )
-            try:
-                request_result = await self.request_as(
-                    api_client,
-                    tab["user"],
-                    "GET",
-                    str(tab["route"]),
-                    expected=(200, 304),
-                    extra_headers=(
-                        {"If-None-Match": str(tab["etag"])}
-                        if tab.get("etag")
-                        else None
-                    ),
-                    return_response_meta=True,
-                )
-            except Exception as exc:
-                self.polling_metrics.record_error(
-                    route=route_label,
-                    role=str(tab["role"]),
-                    tournament_status=str(tab["tournament_status"]),
-                    error=exc,
-                )
-                return None
-            payload, status_code, response_headers = request_result
-            if status_code == 304:
-                self.polling_metrics.mark(
-                    "not_modified",
-                    route=route_label,
-                    role=str(tab["role"]),
-                    tournament_status=str(tab["tournament_status"]),
-                    hidden=bool(tab.get("hidden")),
-                    terminal_known=bool(tab.get("terminal_known")),
-                )
-                return tab.get("last_payload")
-            if response_headers.get("etag"):
-                tab["etag"] = response_headers["etag"]
-            tab["last_payload"] = payload
-            return payload
-        finally:
-            inflight.discard(inflight_key)
-
-    @staticmethod
-    def extract_next_poll_delay_ms(payload: dict[str, Any] | None) -> int | None:
-        if not isinstance(payload, dict):
-            return None
-        raw = payload.get("next_poll_after_ms")
-        if isinstance(raw, int):
-            return raw
-        for key in ("tournament", "bracket"):
-            nested = payload.get(key)
-            if isinstance(nested, dict) and isinstance(nested.get("next_poll_after_ms"), int):
-                return int(nested["next_poll_after_ms"])
-        return None
-
-    @staticmethod
-    def payload_is_terminal(payload: dict[str, Any] | None) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        status_value = payload.get("status")
-        if status_value is None and isinstance(payload.get("tournament"), dict):
-            status_value = payload["tournament"].get("status")
-        return status_value in {"completed", "cancelled"}
-
-    async def run_browser_polling_tab(
-        self,
-        api_client: httpx.AsyncClient,
-        tab: dict[str, Any],
-        *,
-        profile_duration: float,
-        inflight: set[str],
-        request_gate: asyncio.Semaphore | None = None,
-    ) -> None:
-        async def execute_polling_request() -> dict[str, Any] | None:
-            if request_gate is None:
-                return await self.execute_browser_polling_request(
-                    api_client,
-                    tab,
-                    inflight,
-                )
-            async with request_gate:
-                return await self.execute_browser_polling_request(
-                    api_client,
-                    tab,
-                    inflight,
-                )
-
-        open_stagger_seconds = float(tab.get("open_stagger_seconds") or 0.0)
-        if open_stagger_seconds > 0:
-            await asyncio.sleep(open_stagger_seconds)
-        deadline = time.monotonic() + profile_duration
-        route_label = str(tab["route_label"])
-        self.polling_metrics.mark(
-            "scheduled",
-            route=route_label,
-            role=str(tab["role"]),
-            tournament_status=str(tab["tournament_status"]),
-        )
-        if route_label == "GET /tournaments/{slug}/bracket":
-            first = asyncio.create_task(
-                execute_polling_request()
-            )
-            await asyncio.sleep(0)
-            self.polling_metrics.mark(
-                "scheduled",
-                route=route_label,
-                role=str(tab["role"]),
-                tournament_status=str(tab["tournament_status"]),
-            )
-            await execute_polling_request()
-            payload = await first
-        else:
-            payload = await execute_polling_request()
-        raw_delay_ms = self.extract_next_poll_delay_ms(payload)
-        if raw_delay_ms == 0 or self.payload_is_terminal(payload):
-            tab["terminal_known"] = True
-        if tab.get("hidden_after_open"):
-            tab["hidden"] = True
-            self.polling_metrics.mark(
-                "skipped_hidden",
-                route=route_label,
-                role=str(tab["role"]),
-                tournament_status=str(tab["tournament_status"]),
-                hidden=True,
-                terminal_known=bool(tab.get("terminal_known")),
-            )
-            return
-        if tab.get("terminal_known"):
-            self.polling_metrics.mark(
-                "skipped_terminal",
-                route=route_label,
-                role=str(tab["role"]),
-                tournament_status=str(tab["tournament_status"]),
-                terminal_known=True,
-            )
-            return
-
-        tick = 0
-        duplicate_probe_done = False
-        while time.monotonic() < deadline:
-            delay_seconds = polling_delay_seconds(
-                raw_delay_ms,
-                tab_index=int(tab["tab_index"]),
-                tick=tick,
-            )
-            if delay_seconds is None or time.monotonic() + delay_seconds > deadline:
-                break
-            await asyncio.sleep(delay_seconds)
-            tick += 1
-            self.polling_metrics.mark(
-                "scheduled",
-                route=route_label,
-                role=str(tab["role"]),
-                tournament_status=str(tab["tournament_status"]),
-                hidden=bool(tab.get("hidden")),
-                terminal_known=bool(tab.get("terminal_known")),
-            )
-            if tab.get("hidden"):
-                self.polling_metrics.mark(
-                    "skipped_hidden",
-                    route=route_label,
-                    role=str(tab["role"]),
-                    tournament_status=str(tab["tournament_status"]),
-                    hidden=True,
-                    terminal_known=bool(tab.get("terminal_known")),
-                )
-                break
-            if tab.get("terminal_known"):
-                self.polling_metrics.mark(
-                    "skipped_terminal",
-                    route=route_label,
-                    role=str(tab["role"]),
-                    tournament_status=str(tab["tournament_status"]),
-                    terminal_known=True,
-                )
-                break
-            if tab.get("abort_once"):
-                tab["abort_once"] = False
-                tab["abort_next"] = True
-                await execute_polling_request()
-                continue
-            if route_label == "GET /tournaments/{slug}/bracket" and not duplicate_probe_done:
-                duplicate_probe_done = True
-                first = asyncio.create_task(
-                    execute_polling_request()
-                )
-                await asyncio.sleep(0)
-                await execute_polling_request()
-                payload = await first
-            else:
-                payload = await execute_polling_request()
-            raw_delay_ms = self.extract_next_poll_delay_ms(payload)
-            if raw_delay_ms == 0 or self.payload_is_terminal(payload):
-                tab["terminal_known"] = True
-
-    async def run_browser_polling_profile(self) -> dict[str, Any]:
-        api_client = await self.new_client()
-        started = time.monotonic()
-        try:
-            await self.record_preprod_run(status="running", requested_users=self.scale_users)
-            await self.start_performance_collection()
-            with self.phase("browser_polling_seed_users"):
-                users = await self.bulk_register_scale_users()
-            self.scenario(
-                "browser_polling_users_created",
-                len(users) == self.scale_users,
-                {"users": len(users)},
-            )
-
-            tournament_count = sum(count for _, count in BROWSER_POLLING_TOURNAMENT_PLAN)
-            chunk_size = self.browser_polling_users_per_tournament
-            user_chunks = [
-                users[index * chunk_size : (index + 1) * chunk_size]
-                for index in range(tournament_count)
-            ]
-            organizers = [chunk[0] for chunk in user_chunks if chunk]
-            admins = [chunk[1] for chunk in user_chunks if len(chunk) > 1]
-            await self.grant_browser_polling_permissions(organizers, admins)
-
-            tournament_categories = [
-                category
-                for category, count in BROWSER_POLLING_TOURNAMENT_PLAN
-                for _ in range(count)
-            ]
-            tournaments: list[dict[str, Any]] = []
-            with self.phase("browser_polling_tournament_setup"):
-                for index, (category, chunk) in enumerate(zip(tournament_categories, user_chunks), start=1):
-                    tournament = await self.create_browser_polling_tournament(
-                        api_client,
-                        organizer=chunk[0],
-                        category=category,
-                        index=index,
-                    )
-                    tournaments.append(tournament)
-                await self.record_preprod_run(tournaments_created=len(tournaments))
-            self.scenario(
-                "browser_polling_tournaments_created",
-                len(tournaments) == tournament_count,
-                {
-                    "tournaments": len(tournaments),
-                    "plan": dict(BROWSER_POLLING_TOURNAMENT_PLAN),
-                },
-            )
-
-            active_participants = 0
-            with self.phase("browser_polling_state_setup"):
-                setup_gate = asyncio.Semaphore(BROWSER_POLLING_SETUP_CONCURRENCY)
-                request_gate = asyncio.Semaphore(self.concurrency)
-
-                async def setup_one(
-                    tournament: dict[str, Any],
-                    chunk: list[dict[str, Any]],
-                ) -> None:
-                    organizer_count = max(1, round(len(chunk) * 0.05))
-                    participant_count = self.browser_polling_state_participant_count(chunk)
-                    participants = chunk[organizer_count : organizer_count + participant_count]
-                    async with setup_gate:
-                        await self.setup_browser_polling_tournament_state(
-                            api_client,
-                            tournament=tournament,
-                            organizer=chunk[0],
-                            participants=participants,
-                            request_semaphore=request_gate,
-                        )
-
-                active_participants = sum(
-                    self.browser_polling_state_participant_count(chunk)
-                    for tournament, chunk in zip(tournaments, user_chunks)
-                    if tournament["category"] != "terminal"
-                )
-                await asyncio.gather(
-                    *(setup_one(tournament, chunk) for tournament, chunk in zip(tournaments, user_chunks))
-                )
-            await self.record_preprod_run(active_participants=active_participants)
-
-            tabs = self.build_browser_polling_tabs(
-                tournaments=tournaments,
-                user_chunks=user_chunks,
-            )
-            fixed_expected = fixed_polling_expectation(
-                duration_seconds=self.browser_polling_duration,
-                tabs=tabs,
-            )
-            self.report["polling"] = {
-                "profile": self.browser_polling_profile,
-                "duration_seconds": self.browser_polling_duration,
-                "tournament_plan": dict(BROWSER_POLLING_TOURNAMENT_PLAN),
-                "users_per_tournament": self.browser_polling_users_per_tournament,
-                "state_participants_per_tournament": self.browser_polling_state_participants,
-                "setup_concurrency": BROWSER_POLLING_SETUP_CONCURRENCY,
-                "open_stagger_seconds": self.browser_polling_open_stagger,
-                "tabs_planned": len(tabs),
-                "visible_tabs": sum(1 for tab in tabs if not tab["hidden_after_open"]),
-                "hidden_tabs": sum(1 for tab in tabs if tab["hidden_after_open"]),
-                "load_generator_local": is_local_origin(self.origin),
-                "fixed_polling_expectation": fixed_expected,
-            }
-            self.scenario(
-                "browser_polling_tabs_planned",
-                len(tabs) == self.scale_users,
-                {
-                    "tabs": len(tabs),
-                    "visible": self.report["polling"]["visible_tabs"],
-                    "hidden": self.report["polling"]["hidden_tabs"],
-                },
-            )
-
-            with self.phase("browser_polling_run"):
-                inflight: set[str] = set()
-                await asyncio.gather(
-                    *(
-                        self.run_browser_polling_tab(
-                            api_client,
-                            tab,
-                            profile_duration=self.browser_polling_duration,
-                            inflight=inflight,
-                        )
-                        for tab in tabs
-                    )
-                )
-
-            polling_summary = self.polling_metrics.summary()
-            self.report["polling"].update(polling_summary)
-            self.scenario(
-                "browser_polling_hidden_tabs_do_not_poll",
-                not polling_summary["executed_while_hidden"],
-                polling_summary["executed_while_hidden"],
-            )
-            self.scenario(
-                "browser_polling_terminal_tabs_do_not_poll",
-                not polling_summary["executed_after_terminal"],
-                polling_summary["executed_after_terminal"],
-            )
-            self.scenario(
-                "browser_polling_bracket_deduped",
-                polling_summary["deduped"] > 0,
-                {"deduped": polling_summary["deduped"]},
-            )
-            self.scenario(
-                "browser_polling_conditional_reads_observed",
-                polling_summary["not_modified"] > 0
-                if self.browser_polling_duration >= 30
-                else True,
-                {
-                    "not_modified": polling_summary["not_modified"],
-                    "skipped_short_duration": self.browser_polling_duration < 30,
-                },
-            )
-            long_enough_for_polling_tick = (
-                self.browser_polling_duration
-                >= (BROWSER_POLLING_FIXED_INTERVAL_MS / 1000)
-            )
-            self.scenario(
-                "browser_polling_abort_counter_populated",
-                True if not long_enough_for_polling_tick else polling_summary["aborted"] > 0,
-                {
-                    "aborted": polling_summary["aborted"],
-                    "skipped_short_duration": not long_enough_for_polling_tick,
-                },
-            )
-            self.scenario(
-                "browser_polling_requests_without_errors",
-                polling_summary["errors"] == 0,
-                {
-                    "errors": polling_summary["errors"],
-                    "error_samples": polling_summary["error_samples"],
-                },
-                fatal=False,
-            )
-            self.scenario(
-                "browser_polling_repeated_gets_below_fixed_polling",
-                True
-                if not long_enough_for_polling_tick
-                else polling_summary["executed"] < fixed_expected["total_expected_gets"],
-                {
-                    "executed": polling_summary["executed"],
-                    "fixed_expected_gets": fixed_expected["total_expected_gets"],
-                    "skipped_short_duration": not long_enough_for_polling_tick,
-                },
-            )
-            self.report["duration_seconds"] = round(time.monotonic() - started, 4)
-            self.scenario("browser_polling_profile_complete", all(item["ok"] for item in self.scenarios))
-            await self.record_preprod_run(
-                status="passed",
-                created_users=len(users),
-                tournaments_created=len(tournaments),
-                active_participants=active_participants,
-                finished_at=datetime.now(UTC),
-            )
-        except Exception:
-            await self.record_preprod_run(status="failed", finished_at=datetime.now(UTC))
-            raise
-        finally:
-            await self.stop_performance_collection()
-            for client in self.clients:
-                await client.aclose()
-            if not self.keep_data:
-                cleanup = await self.cleanup_targeted()
-                self.report["cleanup"] = cleanup
-                self.scenarios.append(
-                    {
-                        "name": "browser_polling_cleanup",
-                        "ok": cleanup.get("ok", False),
-                        "detail": cleanup,
-                    }
-                )
-                await self.record_preprod_run(
-                    status="cleaned" if cleanup.get("ok") else "failed",
-                    cleanup_state=cleanup,
-                    finished_at=datetime.now(UTC),
-                )
-            else:
-                self.report["cleanup"] = {"ok": False, "kept": True}
-            self.report["duration_seconds"] = round(time.monotonic() - started, 4)
-            self.report["finished_at"] = datetime.now(UTC).isoformat()
-            self.report["passed"] = all(item["ok"] for item in self.scenarios)
-            self.report_path.parent.mkdir(parents=True, exist_ok=True)
-            self.report_path.write_text(
-                json.dumps(self.report, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            await self.record_preprod_run(report_path=str(self.report_path))
-        return self.report
-
     async def create_write_burst_tournament(
         self,
         api_client: httpx.AsyncClient,
@@ -3998,7 +3172,7 @@ class ProductionQa:
                 "max_participants": self.write_burst_users_per_tournament,
                 "match_format": "bo3",
                 "final_format": "bo5",
-                "teams_count": BROWSER_POLLING_READY_TEAMS,
+                "teams_count": READY_TEST_TEAMS,
             },
         )
         tournament_id = str(created["id"])
@@ -4169,7 +3343,7 @@ class ProductionQa:
             label=label,
             index=index,
         )
-        await self.join_browser_polling_participants(
+        await self.join_tournament_participants(
             api_client,
             tournament=tournament,
             participants=participants,
@@ -4300,7 +3474,7 @@ class ProductionQa:
                 tournaments.append(tournament)
                 if category == "join_active":
                     continue
-                await self.setup_browser_polling_tournament_state(
+                await self.setup_tournament_state(
                     api_client,
                     tournament=tournament,
                     organizer=chunk[0],
@@ -4465,7 +3639,7 @@ class ProductionQa:
                 str(user["id"]): user
                 for user in organizer_users
             }
-            await self.grant_browser_polling_permissions(list(organizers_by_id.values()), [])
+            await self.grant_tournament_permissions(list(organizers_by_id.values()), [])
 
             tournament_index = 1
             if self.write_burst_profile in {"all", "single-join"}:
@@ -4754,56 +3928,6 @@ class ProductionQa:
             )
         return response.json()
 
-    async def wait_for_browser_gate(
-        self,
-        *,
-        organizer: dict[str, Any],
-        watcher: dict[str, Any],
-        bracket: dict[str, Any],
-    ) -> None:
-        if self.browser_gate_dir is None:
-            return
-
-        self.browser_gate_dir.mkdir(parents=True, exist_ok=True)
-        state_path = self.browser_gate_dir / f"state-{self.marker}.json"
-        result_path = self.browser_gate_dir / f"result-{self.marker}.json"
-        state_path.write_text(
-            json.dumps(
-                {
-                    "marker": self.marker,
-                    "origin": self.origin,
-                    "slug": self.tournament_slug,
-                    "organizer_email": organizer["email"],
-                    "watcher_email": watcher["email"],
-                    "password": self.password,
-                    "initial_revision": bracket["revision"],
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        try:
-            deadline = time.monotonic() + self.browser_gate_timeout
-            while not result_path.exists():
-                if time.monotonic() >= deadline:
-                    raise QaFailure(
-                        f"two_browser_realtime: timed out waiting for {result_path}"
-                    )
-                await asyncio.sleep(0.25)
-
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            self.scenario(
-                "two_browser_realtime_under_two_seconds",
-                bool(result.get("ok"))
-                and float(result.get("pointer_seconds", 999)) <= 2
-                and float(result.get("keyboard_seconds", 999)) <= 2,
-                result,
-            )
-        finally:
-            state_path.unlink(missing_ok=True)
-            result_path.unlink(missing_ok=True)
-
     async def configure_captain_preferences(self, captain_ids: list[str]) -> None:
         slot_roles = ["Carry", "Semi-Carry", "Support", "Semi-Support", "Carry", "Support"]
         slot_heroes = ["Abrams", "Kelvin", "Seven", "Ivy", "Mina", "Apollo"]
@@ -4824,52 +3948,6 @@ class ProductionQa:
                 expected=200,
                 json_payload={"slots": slots},
             )
-
-    async def wait_for_bracket_event(
-        self,
-        *,
-        watcher: httpx.AsyncClient,
-        trigger,
-        expected_after_revision: int,
-    ) -> tuple[Any, float]:
-        connected = asyncio.Event()
-        event_future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-
-        async def listen() -> None:
-            timeout = httpx.Timeout(connect=10, read=None, write=10, pool=10)
-            async with watcher.stream(
-                "GET",
-                f"/tournaments/{self.tournament_slug}/bracket/events",
-                timeout=timeout,
-            ) as response:
-                if response.status_code != 200:
-                    raise QaFailure(
-                        f"SSE returned {response.status_code}: {await response.aread()}"
-                    )
-                current_event = ""
-                async for line in response.aiter_lines():
-                    if line.startswith("event:"):
-                        current_event = line.split(":", 1)[1].strip()
-                    elif line.startswith("data:"):
-                        connected.set()
-                        if current_event != "bracket":
-                            continue
-                        payload = json.loads(line.split(":", 1)[1].strip())
-                        if int(payload.get("revision") or 0) > expected_after_revision:
-                            if not event_future.done():
-                                event_future.set_result(payload)
-                            return
-
-        listener = asyncio.create_task(listen())
-        try:
-            await asyncio.wait_for(connected.wait(), timeout=2)
-            started = time.monotonic()
-            mutation_result = await trigger()
-            await asyncio.wait_for(event_future, timeout=2)
-            return mutation_result, time.monotonic() - started
-        finally:
-            listener.cancel()
-            await asyncio.gather(listener, return_exceptions=True)
 
     async def run_scale(self) -> dict[str, Any]:
         api_client = await self.new_client()
@@ -5738,12 +4816,6 @@ class ProductionQa:
                 }
                 for match in opening_matches
             ]
-            await self.wait_for_browser_gate(
-                organizer=organizer,
-                watcher=active_players[1],
-                bracket=bracket,
-            )
-
             async def refresh_bracket() -> dict[str, Any]:
                 return await self.request(
                     organizer["client"],
@@ -5782,20 +4854,8 @@ class ProductionQa:
                 [match for match in bracket["matches"] if match["round_number"] == 1],
                 key=lambda match: match["match_order"],
             )
-            async def opening_report_trigger() -> dict[str, Any]:
-                return await play_match(quarterfinals[0], 2, 0)
-
-            _, realtime_seconds = await self.wait_for_bracket_event(
-                watcher=active_players[1]["client"],
-                trigger=opening_report_trigger,
-                expected_after_revision=bracket["revision"],
-            )
-            self.scenario(
-                "edge_sse_realtime_under_two_seconds",
-                realtime_seconds <= 2,
-                {"seconds": round(realtime_seconds, 4)},
-            )
-            self.scenario("simplified_score_report_without_match_start", True)
+            await play_match(quarterfinals[0], 2, 0)
+            self.scenario("manual_bracket_refresh_after_mutation", True)
             bracket = await refresh_bracket()
             await self.request(
                 organizer["client"],
@@ -6140,13 +5200,6 @@ def summarize_team_preferences(team: dict[str, Any]) -> dict[str, Any]:
 
 def cli_report_summary(report: dict[str, Any]) -> dict[str, Any]:
     scenarios = list(report.get("scenarios") or [])
-    polling = report.get("polling") if isinstance(report.get("polling"), dict) else {}
-    fixed_expected = (
-        polling.get("fixed_polling_expectation")
-        if isinstance(polling, dict)
-        and isinstance(polling.get("fixed_polling_expectation"), dict)
-        else {}
-    )
     write_burst = report.get("write_burst") if isinstance(report.get("write_burst"), dict) else {}
     return {
         "marker": report.get("marker"),
@@ -6163,22 +5216,6 @@ def cli_report_summary(report: dict[str, Any]) -> dict[str, Any]:
         "duration_seconds": report.get("duration_seconds"),
         "assignment_seconds": report.get("assignment_seconds"),
         "fatal_error": report.get("fatal_error"),
-        "polling": (
-            {
-                "profile": polling.get("profile"),
-                "tabs_planned": polling.get("tabs_planned"),
-                "total_scheduled": polling.get("total_scheduled"),
-                "executed": polling.get("executed"),
-                "skipped_hidden": polling.get("skipped_hidden"),
-                "skipped_terminal": polling.get("skipped_terminal"),
-                "deduped": polling.get("deduped"),
-                "aborted": polling.get("aborted"),
-                "fixed_expected_gets": fixed_expected.get("total_expected_gets"),
-                "load_generator_local": polling.get("load_generator_local"),
-            }
-            if polling
-            else None
-        ),
         "write_burst": (
             {
                 "profile": write_burst.get("profile"),
@@ -6224,8 +5261,6 @@ async def async_main() -> int:
         origin=args.origin,
         report_path=args.report_path,
         keep_data=args.keep_data,
-        browser_gate_dir=args.browser_gate_dir,
-        browser_gate_timeout=args.browser_gate_timeout,
         http_timeout=args.http_timeout,
         mode=args.mode,
         scale_users=args.scale_users,
@@ -6239,11 +5274,6 @@ async def async_main() -> int:
         scale_final_view_profile=args.scale_final_view_profile,
         tournament_visibility=args.tournament_visibility,
         profile_journey=args.profile_journey,
-        browser_polling_profile=args.browser_polling_profile,
-        browser_polling_duration=args.browser_polling_duration,
-        browser_polling_users_per_tournament=args.browser_polling_users_per_tournament,
-        browser_polling_open_stagger=args.browser_polling_open_stagger,
-        browser_polling_active_users_only=args.browser_polling_active_users_only,
         write_burst_profile=args.write_burst_profile,
         write_burst_users_per_tournament=args.write_burst_users_per_tournament,
         write_burst_time_scale=args.write_burst_time_scale,
@@ -6257,8 +5287,6 @@ async def async_main() -> int:
     try:
         if args.mode == "scale":
             report = await qa.run_scale()
-        elif args.mode == "browser-polling":
-            report = await qa.run_browser_polling_profile()
         elif args.mode == "write-burst":
             report = await qa.run_write_burst_profile()
         else:

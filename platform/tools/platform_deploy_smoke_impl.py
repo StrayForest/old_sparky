@@ -686,15 +686,6 @@ async def main() -> int:
                 ),
                 check_http_security_headers(
                     edge_client,
-                    "edge_security_sse",
-                    (
-                        f"{args.edge_origin}/api/v1/tournaments/"
-                        "__deploy-smoke-missing__/bracket/events"
-                    ),
-                    expected_status=404,
-                ),
-                check_http_security_headers(
-                    edge_client,
                     "edge_security_asset_cache_busted",
                     (
                         f"{args.edge_origin}/assets/main_logo/"

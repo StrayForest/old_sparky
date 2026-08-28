@@ -21,7 +21,6 @@ let usersMeRequests = 0;
 let csrfRequests = 0;
 let readyVoteRequests = 0;
 let bracketRequests = 0;
-let bracketProbeRequests = 0;
 
 let apiServer: Server | null = null;
 
@@ -62,12 +61,6 @@ test.beforeAll(async () => {
         hasTestCookie,
         url.searchParams.get("include_current_user") !== "false"
       ));
-      return;
-    }
-
-    if (url.pathname.match(/^\/api\/v1\/tournaments\/[^/]+\/bracket\/probe$/)) {
-      bracketProbeRequests += 1;
-      respondJson(response, 200, { revision: 0, status: "pending" });
       return;
     }
 
@@ -122,7 +115,6 @@ test.beforeEach(() => {
   csrfRequests = 0;
   readyVoteRequests = 0;
   bracketRequests = 0;
-  bracketProbeRequests = 0;
 });
 
 test.afterAll(async () => {
@@ -202,7 +194,7 @@ test("registered detail uses compact workspace state and ready vote avoids full 
   await expectNoHorizontalOverflow(page);
 });
 
-test("bracket shell uses the cheap revision probe without duplicate workspace state", async ({ page }) => {
+test("bracket page uses the initial workspace and has no background refresh", async ({ page }) => {
   await blockNextRoutePrefetch(page);
   await page.context().addCookies([{
     name: "deadlock_platform_session",
@@ -219,14 +211,15 @@ test("bracket shell uses the cheap revision probe without duplicate workspace st
     slug: publicTournamentSlug,
     participantsLimit: 0,
     participantsOffset: 0,
-    workspaceView: "bracket_summary",
+    workspaceView: "bracket",
     includeCurrentUser: false
   }]);
   await expect.poll(() => usersMeRequests).toBe(1);
-  await expect.poll(() => bracketProbeRequests).toBe(1);
   expect(bracketRequests).toBe(0);
   expect(participantRequests).toEqual([]);
   await expect.poll(() => csrfRequests).toBe(0);
+  await new Promise((resolve) => setTimeout(resolve, 4_000));
+  expect(bracketRequests).toBe(0);
   await expectNoHorizontalOverflow(page);
 });
 
@@ -277,9 +270,7 @@ function workspacePayload(slug: string, authenticated: boolean, includeCurrentUs
       revision: 0,
       can_manage: false,
       teams: [],
-      matches: [],
-      next_poll_after_ms: 3000,
-      bracket_probe_ticket: "lean-bracket-probe"
+      matches: []
     },
     ready_check: isReady ? {
       active_round: readyRound(null),

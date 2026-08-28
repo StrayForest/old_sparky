@@ -24,7 +24,7 @@ export default async function TournamentBracketPage({
   try {
     workspace = await getTournamentWorkspace(slug, requestHeaders, {
       participantsLimit: 0,
-      workspaceView: "bracket_summary",
+      workspaceView: "bracket",
       includeCurrentUser: false
     });
   } catch (error) {

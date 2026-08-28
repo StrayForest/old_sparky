@@ -12,7 +12,6 @@ const standaloneWebServerCommand = [
 export default defineConfig({
   testDir: "./tests/smoke",
   testIgnore: [
-    "live-bracket-realtime.spec.ts",
     "live-launch.spec.ts",
     "tournament-participant-progressive.spec.ts"
   ],

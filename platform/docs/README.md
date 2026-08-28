@@ -24,9 +24,9 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |
 | Services, storage, media and performance | [Operations runbook](operations-runbook.md) |
-| Historical SSE benchmark evidence / former boundary | [AS-20 production boundary](as-20-sse-production-boundary.md) |
-| Historical SSE benchmark plan | [AS-19 benchmark plan](as-19-sse-capacity-benchmark.md) |
-| SSE CPU isolation round | [AS-19 CPU isolation](as-19-sse-cpu-isolation-2026-08-26.md) |
+| Historical/retired SSE benchmark evidence / former boundary | [AS-20 production boundary](as-20-sse-production-boundary.md) |
+| Historical/retired SSE benchmark plan | [AS-19 benchmark plan](as-19-sse-capacity-benchmark.md) |
+| Historical/retired SSE CPU isolation round | [AS-19 CPU isolation](as-19-sse-cpu-isolation-2026-08-26.md) |
 | Security operations / CSP policy | [Security runbook](security-runbook.md) |
 | Cloudflare dashboard work | [Cloudflare checklist](cloudflare-production-checklist.md) |
 | Incident handling | [Incident response](incident-response.md) |

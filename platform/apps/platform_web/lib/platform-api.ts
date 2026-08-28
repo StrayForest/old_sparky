@@ -64,7 +64,6 @@ type ApiTournamentListItem = {
   final_format?: string | null;
   current_user_participant_status?: string | null;
   current_user_has_invite_access?: boolean | null;
-  next_poll_after_ms?: number | null;
   state_version?: number | null;
 };
 
@@ -99,7 +98,6 @@ type ApiTournamentWorkspace = {
   bracket?: ApiBracket | null;
   ready_check?: PlatformTournamentDeadlockReadyCheckState | null;
   auto_assignment?: PlatformTournamentDeadlockAutoAssignmentState | null;
-  next_poll_after_ms?: number | null;
   state_version?: number | null;
 };
 
@@ -158,10 +156,6 @@ type ApiBracket = {
   capabilities?: ApiBracketCapabilities | null;
   teams?: ApiTeam[] | null;
   matches?: ApiMatch[] | null;
-  next_poll_after_ms?: number | null;
-  state_version?: number | null;
-  sse_admission_ticket?: string | null;
-  bracket_probe_ticket?: string | null;
 };
 
 type ApiBracketCapabilities = {
@@ -1146,38 +1140,6 @@ export async function getTournamentBracket(
   }
 }
 
-export async function getTournamentBracketProbe(
-  slug: string,
-  ticket: string,
-  signal?: AbortSignal,
-): Promise<{ revision: number; status: Bracket["status"] } | null> {
-  try {
-    const params = new URLSearchParams({ slug, ticket });
-    const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/bracket/probe?${params.toString()}`, {
-      headers: { accept: "application/json" },
-      credentials: "include",
-      cache: "no-store",
-      signal,
-    });
-    if (!response.ok) {
-      return null;
-    }
-    const payload = await response.json() as { revision?: number; status?: string };
-    if (!Number.isFinite(payload.revision) || !["pending", "teams_ready", "ready"].includes(payload.status ?? "")) {
-      return null;
-    }
-    return {
-      revision: Number(payload.revision),
-      status: payload.status as Bracket["status"],
-    };
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw error;
-    }
-    return null;
-  }
-}
-
 export async function generateTournamentBracket(slug: string): Promise<Bracket | null> {
   const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/matches/seed-opening-round`, {
     method: "POST",
@@ -1234,7 +1196,6 @@ function mapTournamentSummary(item: ApiTournamentListItem): TournamentSummary {
     teamsCount: item.teams_count ?? 128,
     currentUserParticipantStatus: item.current_user_participant_status ?? null,
     currentUserHasInviteAccess: Boolean(item.current_user_has_invite_access),
-    nextPollAfterMs: item.next_poll_after_ms ?? null,
     stateVersion: item.state_version ?? null
   };
 }
@@ -1558,10 +1519,6 @@ function mapBracket(item: ApiBracket): Bracket {
     canManage,
     teams: (item.teams ?? []).map(mapTeam),
     matches: (item.matches ?? []).map(mapMatch),
-    nextPollAfterMs: item.next_poll_after_ms ?? null,
-    stateVersion: item.state_version ?? null,
-    sseAdmissionTicket: item.sse_admission_ticket ?? null,
-    bracketProbeTicket: item.bracket_probe_ticket ?? null,
   };
 }
 
@@ -1579,10 +1536,6 @@ function emptyBracket(tournamentId: string, tournamentStatus: TournamentStatus):
     canManage: false,
     teams: [],
     matches: [],
-    nextPollAfterMs: null,
-    stateVersion: null,
-    sseAdmissionTicket: null,
-    bracketProbeTicket: null,
   };
 }
 

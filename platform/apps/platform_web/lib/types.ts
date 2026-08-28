@@ -54,7 +54,6 @@ export type TournamentSummary = {
   teamsCount: number;
   currentUserParticipantStatus?: string | null;
   currentUserHasInviteAccess?: boolean;
-  nextPollAfterMs?: number | null;
   stateVersion?: number | null;
 };
 
@@ -158,10 +157,6 @@ export type Bracket = {
   canManage: boolean;
   teams: Team[];
   matches: Match[];
-  nextPollAfterMs?: number | null;
-  stateVersion?: number | null;
-  sseAdmissionTicket?: string | null;
-  bracketProbeTicket?: string | null;
 };
 
 export type ActiveTournamentCommitment = {
