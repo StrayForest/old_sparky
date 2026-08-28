@@ -333,6 +333,9 @@ function readyPayload(tournament) {
 
 function serverTimeForRequest(request) {
   const cookie = request.headers.cookie ?? "";
+  if (cookie.includes("registration-deadline-session")) {
+    return "2026-06-07T15:59:50Z";
+  }
   if (cookie.includes("ready-check-timer-before-smoke=1")) {
     return "2026-06-07T15:29:00Z";
   }
