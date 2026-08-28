@@ -298,7 +298,7 @@ if [[ "$profile" == "matrix" ]]; then
     --origin "$EXPECTED_ORIGIN" \
     --control-email "$control_email" \
     --concurrency "$concurrency" \
-    --output-root "$run_root" \
+    --output-root "$run_root"
   qa_status="$?"
   set -e
 elif [[ "$profile" == "write-burst" ]]; then

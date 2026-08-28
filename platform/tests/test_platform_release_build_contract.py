@@ -225,6 +225,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("server-observability.log", load_workflow)
         self.assertIn("qa-command.log", load_supervisor)
         self.assertIn("qa-command.log", load_workflow)
+        matrix_block = load_supervisor.split('if [[ "$profile" == "matrix" ]]', 1)[1].split(
+            'elif [[ "$profile" == "write-burst" ]]', 1
+        )[0]
+        self.assertIn('    --output-root "$run_root"\n  qa_status="$?"', matrix_block)
+        self.assertNotIn('    --output-root "$run_root" \\\n  qa_status="$?"', matrix_block)
         self.assertIn("PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1", cleanup_supervisor)
         self.assertIn("control account", cleanup_tool)
         self.assertIn("_validate_tournament_graph_boundary", cleanup_tool)
