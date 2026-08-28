@@ -22,6 +22,10 @@ install -m 0644 "$RSYSLOG_SRC" \
 install -m 0644 "$LOGROTATE_SRC_DIR/nginx" "$LOGROTATE_DEST_DIR/nginx"
 install -m 0644 "$LOGROTATE_SRC_DIR/rsyslog" "$LOGROTATE_DEST_DIR/rsyslog"
 install -m 0644 "$LOGROTATE_SRC_DIR/btmp" "$LOGROTATE_DEST_DIR/btmp"
+# Own the package-provided UFW rule so its weekly rule cannot collide with the
+# platform's size-bounded policy. The path is intentionally the same package
+# path; no second rule for /var/log/ufw.log is loaded.
+install -m 0644 "$LOGROTATE_SRC_DIR/ufw" "$LOGROTATE_DEST_DIR/ufw"
 
 # A release may be installed in a test destination; only touch host daemons
 # when the real system configuration is being activated.
@@ -41,5 +45,5 @@ Platform logging policy installed.
 
 Journald:  $JOURNALD_DEST_DIR/60-deadlock-platform-retention.conf
 Rsyslog:   $RSYSLOG_DEST_DIR/05-deadlock-platform.conf
-Logrotate: $LOGROTATE_DEST_DIR/{nginx,rsyslog,btmp}
+Logrotate: $LOGROTATE_DEST_DIR/{nginx,rsyslog,ufw,btmp}
 EOF

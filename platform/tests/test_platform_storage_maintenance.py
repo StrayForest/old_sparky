@@ -230,6 +230,7 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
 
         nginx_logrotate = (REPO_ROOT / "platform/deploy/logrotate/nginx").read_text()
         rsyslog_logrotate = (REPO_ROOT / "platform/deploy/logrotate/rsyslog").read_text()
+        ufw_logrotate = (REPO_ROOT / "platform/deploy/logrotate/ufw").read_text()
         btmp_logrotate = (REPO_ROOT / "platform/deploy/logrotate/btmp").read_text()
         logrotate_service = (
             REPO_ROOT / "platform/deploy/systemd/deadlock-logrotate.service"
@@ -245,6 +246,9 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn("nginx -s reopen", nginx_logrotate)
         self.assertIn("size 50M", rsyslog_logrotate)
         self.assertIn("rotate 7", rsyslog_logrotate)
+        self.assertNotIn("/var/log/ufw.log", rsyslog_logrotate)
+        self.assertIn("size 50M", ufw_logrotate)
+        self.assertIn("rotate 7", ufw_logrotate)
         self.assertIn("size 16M", btmp_logrotate)
         self.assertIn("/usr/sbin/logrotate /etc/logrotate.conf", logrotate_service)
         self.assertIn("OnUnitActiveSec=15m", logrotate_timer)

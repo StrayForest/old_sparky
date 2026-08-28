@@ -1,0 +1,13 @@
+# Keep UFW audit records bounded without colliding with the distribution rule.
+/var/log/ufw.log {
+    size 50M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    nodelaycompress
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate
+    endscript
+}

@@ -6,7 +6,6 @@
 /var/log/auth.log
 /var/log/user.log
 /var/log/cron.log
-/var/log/ufw.log
 /var/log/mail.err {
     size 50M
     rotate 7
