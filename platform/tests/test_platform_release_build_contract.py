@@ -65,6 +65,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('EDGE_POLICY_TOOL="$SCRIPT_DIR/platform_validate_edge_policy.py"', preflight)
         self.assertIn("deadlock-offsite-backup.service", systemd_units)
         self.assertIn("deadlock-offsite-backup.timer", systemd_units)
+        self.assertIn("deadlock-logrotate.service", systemd_units)
+        self.assertIn("deadlock-logrotate.timer", systemd_units)
 
     def test_production_deploy_requires_green_security_status(self) -> None:
         workflow = (
@@ -210,6 +212,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertIn("actions/upload-artifact@v6", workflow)
         self.assertIn("RUN-PRODUCTION-RETAINED-LOAD-MATRIX", load_workflow)
         self.assertIn("write-burst", load_workflow)
+        self.assertIn("read-mix", load_workflow)
+        self.assertIn('--mode read-mix', load_supervisor)
         self.assertIn("write_burst_users_per_tournament", load_workflow)
         self.assertIn('--mode write-burst', load_supervisor)
         self.assertIn("DELETE-PRODUCTION-RETAINED-LOAD", cleanup_workflow)

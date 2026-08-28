@@ -222,9 +222,34 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertIn("IOSchedulingClass=idle", service)
         self.assertIn("Persistent=true", timer)
         self.assertIn("RandomizedDelaySec=30m", timer)
-        self.assertIn("SystemMaxUse=512M", journald)
+        self.assertIn("SystemMaxUse=256M", journald)
+        self.assertIn("SystemMaxFileSize=32M", journald)
+        self.assertIn("ForwardToSyslog=no", journald)
         self.assertIn("SystemKeepFree=5G", journald)
         self.assertIn("MaxRetentionSec=30day", journald)
+
+        nginx_logrotate = (REPO_ROOT / "platform/deploy/logrotate/nginx").read_text()
+        rsyslog_logrotate = (REPO_ROOT / "platform/deploy/logrotate/rsyslog").read_text()
+        btmp_logrotate = (REPO_ROOT / "platform/deploy/logrotate/btmp").read_text()
+        logrotate_service = (
+            REPO_ROOT / "platform/deploy/systemd/deadlock-logrotate.service"
+        ).read_text()
+        logrotate_timer = (
+            REPO_ROOT / "platform/deploy/systemd/deadlock-logrotate.timer"
+        ).read_text()
+        rsyslog_filter = (
+            REPO_ROOT / "platform/deploy/rsyslog/05-deadlock-platform.conf"
+        ).read_text()
+        self.assertIn("size 50M", nginx_logrotate)
+        self.assertIn("rotate 7", nginx_logrotate)
+        self.assertIn("nginx -s reopen", nginx_logrotate)
+        self.assertIn("size 50M", rsyslog_logrotate)
+        self.assertIn("rotate 7", rsyslog_logrotate)
+        self.assertIn("size 16M", btmp_logrotate)
+        self.assertIn("/usr/sbin/logrotate /etc/logrotate.conf", logrotate_service)
+        self.assertIn("OnUnitActiveSec=15m", logrotate_timer)
+        self.assertIn(':msg,contains,"[UFW " /var/log/ufw.log', rsyslog_filter)
+        self.assertIn("& stop", rsyslog_filter)
 
         release_install = (
             REPO_ROOT / "platform/tools/platform_release_install.sh"

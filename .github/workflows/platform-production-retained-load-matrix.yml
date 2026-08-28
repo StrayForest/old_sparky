@@ -13,17 +13,18 @@ on:
         default: "aleksei.lisitsin1@gmail.com"
         type: string
       concurrency:
-        description: "Concurrent API workers for each matrix phase (1-256)"
+        description: "Concurrent API workers for each phase (16 recommended; 1-256)"
         required: true
-        default: "80"
+        default: "16"
         type: string
       profile:
-        description: "Load profile for retained tournament reads or Ready vote writes"
+        description: "Load profile for current request-driven reads or Ready vote writes"
         required: true
         default: "matrix"
         type: choice
         options:
           - matrix
+          - read-mix
           - write-burst
       write_burst_profile:
         description: "Ready vote burst selection (all includes the 10k-user mixed workload)"
@@ -82,7 +83,7 @@ jobs:
             || { echo "Production retained load must run from the reviewed dev branch." >&2; exit 1; }
           test "$QA_CONFIRMATION" = "RUN-PRODUCTION-RETAINED-LOAD-MATRIX" \
             || { echo "Refusing production load without exact confirmation." >&2; exit 1; }
-          test "$QA_PROFILE" = "matrix" || test "$QA_PROFILE" = "write-burst" \
+          test "$QA_PROFILE" = "matrix" || test "$QA_PROFILE" = "read-mix" || test "$QA_PROFILE" = "write-burst" \
             || { echo "Unsupported production load profile" >&2; exit 1; }
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
@@ -264,6 +265,7 @@ jobs:
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           performance = payload.get("performance_summary") or {}
           write_burst = payload.get("write_burst") or {}
+          read_mix = payload.get("read_mix") or {}
           print("### Production retained 10k-user load matrix")
           print()
           print(f"- Profile: **{payload.get('mode', 'scale')}**")
@@ -277,6 +279,8 @@ jobs:
               print(f"- Ready vote burst: `{write_burst.get('selection')}`; users/tournament: {write_burst.get('users_per_tournament')}; time scale: {write_burst.get('time_scale')}")
               acceptance = write_burst.get("acceptance") or {}
               print(f"- Ready vote burst acceptance: {'healthy' if acceptance.get('healthy') else 'failed'}")
+          if read_mix:
+              print(f"- Read mix: {read_mix.get('users')} users; manual workspace refresh: {read_mix.get('manual_workspace_refresh')}")
           print()
           print("#### Bottleneck classes")
           for row in performance.get("bottleneck_classes") or []:

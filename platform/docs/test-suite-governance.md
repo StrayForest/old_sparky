@@ -36,11 +36,11 @@ database, workers and host resources.
 
 The retained matrix's 10,000 users are persisted scale-fixture accounts, not
 10,000 simultaneous request workers. Its `matrix` profile exercises ordinary
-tournament workflow writes and request-driven reads. Its `write-burst` profile
-measures Ready Check vote POST contention after the server-known window. The
-current product uses the ordinary workspace response and the write-burst
-vote profile; no background tournament-update profile is part of the test
-suite.
+tournament workflow writes and request-driven reads. The `read-mix` profile
+measures authenticated catalog/workspace reads and a conditional manual
+workspace reload. Its `write-burst` profile measures Ready Check vote POST
+contention after the server-known window. The current product has no
+background tournament-update profile.
 
 The production retained-load group is a deliberate exception to the normal
 release gate: it is never scheduled, never part of ordinary CI, and never runs
@@ -72,6 +72,19 @@ gh workflow run platform-live-launch.yml \
    persisted final state and the negative path, not only the HTTP response.
 4. Update this document only when the runner contract changes. Record detailed
    implementation evidence in an archive document after release.
+
+## Methodology references
+
+The separation of read, write, stress, spike and soak profiles follows the
+load-testing guidance from [Grafana k6](https://grafana.com/docs/k6/latest/testing-guides/api-load-testing/)
+and its recommendation to use explicit [thresholds](https://grafana.com/docs/k6/latest/using-k6/thresholds/).
+Browser-level coverage stays smaller than protocol-level coverage, following
+the [k6 website load-testing guidance](https://grafana.com/docs/k6/latest/testing-guides/load-testing-websites/).
+Capacity and overload behavior are reviewed using the [Google SRE capacity and
+load-testing guidance](https://sre.google/sre-book/introduction/) and its
+[cascading-failure guidance](https://sre.google/sre-book/addressing-cascading-failures/).
+These references inform the test shape; the VPS measurements and application
+contracts remain the acceptance authority for this repository.
 gh workflow run platform-security.yml \
   --repo StrayForest/old_sparky \
   --ref dev
@@ -117,7 +130,7 @@ gh workflow run platform-retained-load-matrix.yml \
   --ref dev \
   -f confirmation=RUN-RETAINED-LOAD-MATRIX \
   -f control_email=<existing-preprod-account-email> \
-  -f concurrency=80
+  -f concurrency=16
 gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
@@ -149,14 +162,16 @@ Run it only from `dev` after the reviewed commit has been deployed:
 gh workflow run platform-production-retained-load-matrix.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
-  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=80
+  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=16
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The workflow supports `profile=matrix` and `profile=write-burst`. The matrix
-profile is the ordinary retained data-volume/workflow run. The write-burst
-profile uses the server-known Ready Check window and measures vote writes; it
-does not create background tournament traffic.
+The workflow supports `profile=matrix`, `profile=read-mix` and
+`profile=write-burst`. The matrix profile is the ordinary retained
+data-volume/workflow run. The read-mix profile is the simultaneous current
+page-read benchmark. The write-burst profile uses the server-known Ready
+Check window and measures vote writes; it does not create background
+tournament traffic.
 
 The detailed reports remain on the VPS under
 `/opt/oldsparky/platform/shared/production-retained-matrix/gha-<load-run-id>/`

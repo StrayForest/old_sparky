@@ -1,0 +1,9 @@
+# Failed-login records remain available to lastb, but cannot grow without a
+# bound during an internet scan. Keep the two most recent uncompressed files.
+/var/log/btmp {
+    size 16M
+    rotate 2
+    missingok
+    notifempty
+    create 0660 root utmp
+}

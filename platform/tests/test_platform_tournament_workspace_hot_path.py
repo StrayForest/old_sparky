@@ -31,6 +31,13 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["etag"], '"revision"')
         self.assertEqual(response.body, b'{"value":7}')
 
+    def test_single_tournament_count_statement_uses_correlated_counts(self) -> None:
+        statement = tournament_routes.tournament_with_counts_stmt()
+        sql = str(statement.compile())
+
+        self.assertIn("SELECT count(", sql)
+        self.assertNotIn("GROUP BY", sql)
+
     async def test_registration_open_detail_does_not_query_assignment_state(self) -> None:
         published_lookup = AsyncMock(return_value=None)
         tournament = SimpleNamespace(

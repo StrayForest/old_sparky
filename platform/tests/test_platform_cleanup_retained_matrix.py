@@ -155,6 +155,62 @@ class RetainedMatrixManifestTests(unittest.TestCase):
             self.assertEqual(len(manifest["user_ids"]), 1)
             self.assertEqual(len(manifest["tournament_ids"]), 1)
 
+    @unittest.skipUnless(os.geteuid() == 0, "root-owned file contract")
+    def test_read_mix_manifest_allows_tournament_id_recovery_after_gateway_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "read-mix" / "read-mix.json"
+            report_path.parent.mkdir()
+            marker = "preprod260824120000abcd"
+            user_id = str(uuid4())
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "marker": marker,
+                        "report_path": str(report_path),
+                        "mode": "read-mix",
+                        "origin": "https://old-sparky.com",
+                        "user_ids": [user_id],
+                        "tournament_ids": [],
+                        "tournament_visibility": "public",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            summary_path = root / "matrix-summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "read-mix",
+                        "control_email": "aleksei.lisitsin1@gmail.com",
+                        "completed_tournaments": 0,
+                        "rows": [
+                            {
+                                "synthetic_users": 1,
+                                "report_path": str(report_path),
+                                "result": {
+                                    "marker": marker,
+                                    "report_path": str(report_path),
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report_path.chmod(0o600)
+            summary_path.chmod(0o600)
+
+            manifest = cleanup.load_matrix_manifest(
+                summary_path,
+                run_root=root,
+                expected_control_email="aleksei.lisitsin1@gmail.com",
+            )
+
+            self.assertEqual(manifest["mode"], "read-mix")
+            self.assertEqual(manifest["user_ids"], {user_id})
+            self.assertEqual(manifest["tournament_ids"], set())
+
 
 if __name__ == "__main__":
     unittest.main()

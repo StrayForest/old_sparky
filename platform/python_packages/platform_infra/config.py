@@ -24,6 +24,10 @@ class PlatformSettings(BaseSettings):
 
     platform_environment: str = "development"
     platform_log_level: str = "INFO"
+    # Nginx is the production request log owner.  Keep Gunicorn access logs
+    # available for local diagnostics but disable the duplicate stream in the
+    # reviewed production baseline.
+    platform_gunicorn_access_log: bool = True
     platform_web_origin: str = "http://127.0.0.1:3000"
     platform_api_host: str = "127.0.0.1"
     platform_api_port: int = 8010
@@ -188,7 +192,10 @@ class PlatformSettings(BaseSettings):
     platform_perf_slow_request_ms: int = Field(default=1000, ge=0)
     platform_perf_slow_db_ms: int = Field(default=500, ge=0)
     platform_perf_sql_count_threshold: int = Field(default=25, ge=0)
-    platform_perf_log_mutations: bool = True
+    # Mutation request performance is still captured when slow, contended or
+    # failed.  Logging every successful mutation in production adds more I/O
+    # and CPU precisely during the bursts we need to measure.
+    platform_perf_log_mutations: bool = False
     platform_api_workers: int = Field(default=2, gt=0)
     # Keep PostgreSQL connection count bounded per process. API and Celery
     # processes use separate budgets so background bursts cannot consume the

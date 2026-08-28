@@ -1,0 +1,21 @@
+# Keep system/auth logs available while preventing an unbounded single file.
+# The platform logrotate timer invokes this size policy every 15 minutes.
+/var/log/syslog
+/var/log/mail.log
+/var/log/kern.log
+/var/log/auth.log
+/var/log/user.log
+/var/log/cron.log
+/var/log/ufw.log
+/var/log/mail.err {
+    size 50M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    nodelaycompress
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate
+    endscript
+}

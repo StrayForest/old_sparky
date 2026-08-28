@@ -664,6 +664,43 @@ def _ready_check_state_response_from_cache(
 def tournament_with_counts_stmt(
     tournament_page=None,
 ) -> Select[tuple[Tournament, str, str | None, str | None, int, int]]:
+    # List pages need one grouped aggregate for the bounded page.  Single
+    # tournament routes, however, already constrain the outer query to one
+    # row (or one invite target).  Correlated counts keep those hot reads
+    # indexed to the current tournament instead of repeatedly aggregating
+    # every participant/assignment row in the database.
+    if tournament_page is None:
+        participant_count = (
+            select(func.count(TournamentParticipant.id))
+            .where(
+                TournamentParticipant.tournament_id == Tournament.id,
+                TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
+            )
+            .correlate(Tournament)
+            .scalar_subquery()
+        )
+        locked_roster_count = (
+            select(func.count(TournamentDeadlockAssignmentRun.id))
+            .where(
+                TournamentDeadlockAssignmentRun.tournament_id == Tournament.id,
+                TournamentDeadlockAssignmentRun.status == "locked",
+            )
+            .correlate(Tournament)
+            .scalar_subquery()
+        )
+        return (
+            select(
+                Tournament,
+                User.display_name.label("organizer_display_name"),
+                PlayerProfile.avatar_url.label("organizer_avatar_url"),
+                PlayerProfile.avatar_asset_id.label("organizer_avatar_asset_id"),
+                participant_count.label("participant_count"),
+                locked_roster_count.label("locked_roster_count"),
+            )
+            .join(User, User.id == Tournament.organizer_user_id)
+            .outerjoin(PlayerProfile, PlayerProfile.user_id == User.id)
+        )
+
     participant_counts_stmt = select(
         TournamentParticipant.tournament_id.label("tournament_id"),
         func.count(TournamentParticipant.id).label("participant_count"),

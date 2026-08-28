@@ -1,0 +1,19 @@
+[Unit]
+Description=Rotate Old Sparky platform logs by bounded size
+Documentation=man:logrotate(8)
+RequiresMountsFor=/var/log
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/sbin/logrotate /etc/logrotate.conf
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+TimeoutStartSec=5min

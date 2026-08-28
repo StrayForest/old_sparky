@@ -35,6 +35,7 @@ class RuntimeIsolationTests(unittest.TestCase):
     def test_worker_env_excludes_auth_and_delivery_secrets(self) -> None:
         values = {
             "PLATFORM_ENVIRONMENT": "PLATFORM_ENVIRONMENT=production",
+            "PLATFORM_WORKER_LOG_LEVEL": "PLATFORM_WORKER_LOG_LEVEL=WARNING",
             "PLATFORM_DATABASE_URL": "PLATFORM_DATABASE_URL=postgresql://worker",
             "PLATFORM_REDIS_URL": "PLATFORM_REDIS_URL=redis://worker",
             "PLATFORM_CELERY_BROKER_URL": "PLATFORM_CELERY_BROKER_URL=redis://broker",
@@ -50,6 +51,7 @@ class RuntimeIsolationTests(unittest.TestCase):
         self.assertIn("PLATFORM_DATABASE_URL=", rendered)
         self.assertIn("PLATFORM_R2_SECRET_ACCESS_KEY=", rendered)
         self.assertIn("PLATFORM_OPENAI_API_KEY=", rendered)
+        self.assertIn("PLATFORM_WORKER_LOG_LEVEL=", rendered)
 
     def test_systemd_units_use_distinct_identities_and_envs(self) -> None:
         expected = {

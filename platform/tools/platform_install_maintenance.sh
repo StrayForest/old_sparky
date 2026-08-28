@@ -4,8 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SYSTEMD_SRC_DIR="$ROOT_DIR/deploy/systemd"
 SYSTEMD_DEST_DIR="${PLATFORM_SYSTEMD_DIR:-/etc/systemd/system}"
-JOURNALD_SRC="$ROOT_DIR/deploy/journald/60-deadlock-platform-retention.conf"
-JOURNALD_DEST_DIR="${PLATFORM_JOURNALD_DIR:-/etc/systemd/journald.conf.d}"
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -21,20 +19,22 @@ install -m 0644 "$SYSTEMD_SRC_DIR/deadlock-offsite-backup.service" \
   "$SYSTEMD_DEST_DIR/deadlock-offsite-backup.service"
 install -m 0644 "$SYSTEMD_SRC_DIR/deadlock-offsite-backup.timer" \
   "$SYSTEMD_DEST_DIR/deadlock-offsite-backup.timer"
-install -d -m 0755 "$JOURNALD_DEST_DIR"
-install -m 0644 "$JOURNALD_SRC" \
-  "$JOURNALD_DEST_DIR/60-deadlock-platform-retention.conf"
+install -m 0644 "$SYSTEMD_SRC_DIR/deadlock-logrotate.service" \
+  "$SYSTEMD_DEST_DIR/deadlock-logrotate.service"
+install -m 0644 "$SYSTEMD_SRC_DIR/deadlock-logrotate.timer" \
+  "$SYSTEMD_DEST_DIR/deadlock-logrotate.timer"
+
+"$ROOT_DIR/tools/platform_install_logging.sh"
 
 if [[ -f "$APP_DIR/shared/.env.platform" ]]; then
   chmod 0600 "$APP_DIR/shared/.env.platform"
 fi
 
 systemctl daemon-reload
-systemctl enable --now deadlock-maintenance.timer
-systemctl restart systemd-journald
+systemctl enable --now deadlock-maintenance.timer deadlock-logrotate.timer
 journalctl --rotate
 journalctl --vacuum-time=30d
-journalctl --vacuum-size=512M
+journalctl --vacuum-size=256M
 
 cat <<EOF
 Platform maintenance installed.
@@ -42,7 +42,7 @@ Platform maintenance installed.
 Timer:
   deadlock-maintenance.timer
 Journal policy:
-  $JOURNALD_DEST_DIR/60-deadlock-platform-retention.conf
+  /etc/systemd/journald.conf.d/60-deadlock-platform-retention.conf
 
 Run and inspect now:
   systemctl start deadlock-maintenance.service

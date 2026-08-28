@@ -1,0 +1,20 @@
+# Platform owns this package path so high-volume request logs are checked by
+# the platform logrotate timer every 15 minutes, not only once per day.
+/var/log/nginx/*.log {
+    size 50M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    nodelaycompress
+    create 0640 www-data adm
+    sharedscripts
+    prerotate
+        if [ -d /etc/logrotate.d/httpd-prerotate ]; then \
+            run-parts /etc/logrotate.d/httpd-prerotate; \
+        fi
+    endscript
+    postrotate
+        /usr/sbin/nginx -s reopen >/dev/null 2>&1 || true
+    endscript
+}

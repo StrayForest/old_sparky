@@ -75,6 +75,28 @@ class ProductionQaContractTests(unittest.TestCase):
         self.assertNotEqual(initial[2], changed[2])
         self.assertEqual(len(initial[2]["slots"]), 6)
 
+    def test_read_mix_models_manual_page_refreshes_without_background_refresh(self) -> None:
+        qa = ProductionQa(
+            origin="http://127.0.0.1",
+            report_path=Path("/tmp/platform-production-qa-read-mix-test.json"),
+            http_timeout=1.0,
+            keep_data=True,
+            mode="read-mix",
+            scale_users=20,
+            scale_site_mix_users=20,
+            scale_bracket_view_users=20,
+        )
+
+        self.assertEqual(qa.scale_users, 20)
+        self.assertEqual(qa.scale_site_mix_users, 20)
+        self.assertEqual(qa.scale_bracket_view_users, 20)
+        self.assertTrue(qa.marker.startswith("preprod"))
+
+        source = Path(ProductionQa.run_scale_site_mix.__code__.co_filename).read_text()
+        self.assertIn("manual_workspace_refresh", source)
+        self.assertIn("manual_bracket_refresh", source)
+        self.assertIn("If-None-Match", source)
+
     def test_preprod_progress_snapshot_bounds_large_identity_lists(self) -> None:
         qa = ProductionQa(
             origin="http://127.0.0.1",

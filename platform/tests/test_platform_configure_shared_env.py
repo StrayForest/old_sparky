@@ -74,6 +74,9 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
             configure.PUBLIC_BASELINE["PLATFORM_DB_CONNECTION_BUDGET"],
             "44",
         )
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_GUNICORN_ACCESS_LOG"], "false")
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_WORKER_LOG_LEVEL"], "WARNING")
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_PERF_LOG_MUTATIONS"], "false")
 
     def test_atomic_write_preserves_private_owner_group_and_mode(self) -> None:
         with TemporaryDirectory() as directory:

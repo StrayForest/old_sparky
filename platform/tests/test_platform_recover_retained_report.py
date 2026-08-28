@@ -65,6 +65,31 @@ class RetainedWriteBurstReportRecoveryTests(unittest.TestCase):
         self.assertEqual(summary["rows"][0]["result"]["marker"], "preprod260824120000abcd")
         self.assertEqual(summary["write_burst"]["selection"], "all")
 
+    def test_read_mix_recovery_has_one_tournament(self) -> None:
+        user_ids = [str(uuid4())]
+        tournament_ids = [str(uuid4())]
+        report = {
+            "user_ids": user_ids,
+            "tournament_ids": tournament_ids,
+            "mode": "read-mix",
+            "read_mix": {"manual_workspace_refresh": True},
+            "performance": {},
+        }
+
+        summary = recovery.build_recovered_summary(
+            report,
+            marker="preprod260824120000abcd",
+            report_path=Path(
+                "/opt/oldsparky/platform/shared/production-retained-matrix/"
+                "gha-32767006384/read-mix/read-mix.json"
+            ),
+            load_run_id="32767006384",
+            control_email="aleksei.lisitsin1@gmail.com",
+        )
+
+        self.assertEqual(summary["mode"], "read-mix")
+        self.assertEqual(summary["planned_tournaments"], 1)
+
     def test_uuid_validation_rejects_duplicates_and_noncanonical_values(self) -> None:
         duplicate = str(uuid4())
         with self.assertRaisesRegex(RuntimeError, "duplicate"):

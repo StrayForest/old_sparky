@@ -13,6 +13,8 @@ CURRENT_UNITS=(
   deadlock-web.service
   deadlock-maintenance.service
   deadlock-maintenance.timer
+  deadlock-logrotate.service
+  deadlock-logrotate.timer
   deadlock-offsite-backup.service
   deadlock-offsite-backup.timer
   deadlock-cloudflare-ips.service
@@ -50,6 +52,10 @@ for unit_name in "${CURRENT_UNITS[@]}"; do
   install -o root -g root -m 0644 "$SYSTEMD_SRC_DIR/$unit_name" "$SYSTEMD_DEST_DIR/$unit_name"
 done
 
+if [[ "$SYSTEMD_DEST_DIR" == "/etc/systemd/system" ]]; then
+  "$ROOT_DIR/tools/platform_install_logging.sh"
+fi
+
 "$ROOT_DIR/tools/platform_prepare_service_user.sh" \
   --app-dir "$APP_DIR" \
   --apply
@@ -59,6 +65,7 @@ if [[ "$ENABLE_SYSTEMD_UNITS" == "1" ]]; then
   systemctl enable deadlock-api.service deadlock-worker.service deadlock-web.service
   systemctl enable --now \
     deadlock-maintenance.timer \
+    deadlock-logrotate.timer \
     deadlock-cloudflare-ips.timer \
     deadlock-health-monitor.timer
 fi

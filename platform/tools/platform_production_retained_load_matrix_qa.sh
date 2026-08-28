@@ -35,7 +35,7 @@ flock -n 9 || {
   exit 1
 }
 if (( $# < 5 || $# > 9 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|write-burst] [write-burst-profile write-burst-users-per-tournament write-burst-time-scale]" >&2
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|read-mix|write-burst] [write-burst-profile write-burst-users-per-tournament write-burst-time-scale]" >&2
   exit 2
 fi
 
@@ -51,6 +51,7 @@ write_burst_time_scale=1.0
 
 case "$profile" in
   matrix) ;;
+  read-mix) ;;
   write-burst)
     write_burst_profile="${7:-all}"
     write_burst_users_per_tournament="${8:-50}"
@@ -69,7 +70,7 @@ case "$profile" in
     }
     ;;
   *)
-    echo "Profile must be matrix or write-burst." >&2
+    echo "Profile must be matrix, read-mix or write-burst." >&2
     exit 1
     ;;
 esac
@@ -301,6 +302,82 @@ if [[ "$profile" == "matrix" ]]; then
     --output-root "$run_root"
   qa_status="$?"
   set -e
+elif [[ "$profile" == "read-mix" ]]; then
+  read_mix_root="$run_root/read-mix"
+  install -d -o root -g root -m 0700 "$read_mix_root"
+  read_mix_report="$read_mix_root/read-mix.json"
+  read_mix_summary="$read_mix_root/matrix-summary.json"
+  read_mix_users=10000
+  read_mix_concurrency="$concurrency"
+  set +e
+  run_monitored "$log_path" \
+  "$QA_PYTHON" "$TOOLS_DIR/platform_production_qa.py" \
+    --env-file "$RUNTIME_ROOT/shared/.env.platform" \
+    --mode read-mix \
+    --keep-data \
+    --origin "$EXPECTED_ORIGIN" \
+    --scale-users "$read_mix_users" \
+    --scale-site-mix-users "$read_mix_users" \
+    --scale-bracket-view-users "$read_mix_users" \
+    --scale-teams 2 \
+    --concurrency "$read_mix_concurrency" \
+    --http-max-connections "$HTTP_MAX_CONNECTIONS" \
+    --http-timeout 30 \
+    --collect-performance \
+    --report-path "$read_mix_report"
+  qa_status="$?"
+  set -e
+  "$SYSTEM_PYTHON" -I - "$read_mix_report" "$read_mix_summary" "$target_sha" "$run_id" "$control_email" "$qa_status" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+report_path, summary_path, target_sha, run_id, control_email, status = sys.argv[1:]
+try:
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    report = {}
+marker = str(report.get("marker") or "")
+user_ids = report.get("user_ids") if isinstance(report.get("user_ids"), list) else []
+tournament_ids = report.get("tournament_ids") if isinstance(report.get("tournament_ids"), list) else []
+passed = int(status) == 0 and report.get("passed") is True
+performance = report.get("performance") if isinstance(report.get("performance"), dict) else {}
+http_client = performance.get("http_client") if isinstance(performance.get("http_client"), dict) else {}
+http_overall = http_client.get("overall") if isinstance(http_client.get("overall"), dict) else {}
+bottleneck = performance.get("bottleneck_summary") if isinstance(performance.get("bottleneck_summary"), dict) else {}
+read_mix = report.get("read_mix") if isinstance(report.get("read_mix"), dict) else {}
+summary = {
+    "mode": "read-mix",
+    "target_sha": target_sha,
+    "github_run_id": int(run_id),
+    "control_email": control_email.strip().lower(),
+    "planned_tournaments": 1,
+    "completed_tournaments": len(tournament_ids),
+    "planned_users": int(report.get("requested_users") or 0),
+    "completed_users": len(user_ids),
+    "passed": passed,
+    "read_mix": read_mix,
+    "performance_summary": {
+        "worst_http_p95_ms": http_overall.get("p95_ms"),
+        "worst_http_p99_ms": http_overall.get("p99_ms"),
+        "bottleneck_classes": bottleneck.get("likely_bottleneck_classes", []),
+        "resource_flags": bottleneck.get("resource_flags", {}),
+    },
+    "rows": [{
+        "synthetic_users": len(user_ids),
+        "report_path": report_path,
+        "result": {
+            "passed": passed,
+            "marker": marker,
+            "report_path": report_path,
+        },
+    }],
+}
+Path(summary_path).write_text(
+    json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+    encoding="utf-8",
+)
+PY
 elif [[ "$profile" == "write-burst" ]]; then
   write_burst_root="$run_root/write-burst"
   install -d -o root -g root -m 0700 "$write_burst_root"

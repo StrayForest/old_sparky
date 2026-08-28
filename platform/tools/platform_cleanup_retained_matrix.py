@@ -75,7 +75,7 @@ def _tournament_description_matches(
     mode: str,
 ) -> bool:
     description_text = str(description or "")
-    if mode == "scale":
+    if mode in {"scale", "read-mix"}:
         return description_text == f"Large preprod QA tournament {marker}."
     patterns = (WRITE_BURST_TOURNAMENT_DESCRIPTION_PATTERN,)
     for pattern in patterns:
@@ -173,9 +173,9 @@ def load_matrix_manifest(
     if control_email != expected_control_email.strip().lower():
         raise ValueError("matrix control email does not match the cleanup input")
     mode = str(payload.get("mode") or "scale")
-    if mode not in {"scale", "write-burst"}:
+    if mode not in {"scale", "read-mix", "write-burst"}:
         raise ValueError("matrix mode is not supported")
-    if mode == "write-burst" and len(rows) != 1:
+    if mode in {"read-mix", "write-burst"} and len(rows) != 1:
         raise ValueError(f"{mode} manifest must contain exactly one row")
 
     markers: set[str] = set()
@@ -217,9 +217,11 @@ def load_matrix_manifest(
             field=f"{marker}.tournament_ids",
             allow_empty=True,
         )
-        if mode == "scale" and len(row_tournaments) > 1:
+        if mode in {"scale", "read-mix"} and len(row_tournaments) > 1:
             raise ValueError("a matrix row may own at most one tournament")
-        max_tournaments = 64 if mode == "write-burst" else MAX_MATRIX_ROWS
+        max_tournaments = (
+            64 if mode == "write-burst" else 1 if mode == "read-mix" else MAX_MATRIX_ROWS
+        )
         if mode == "write-burst" and not 0 <= len(row_tournaments) <= max_tournaments:
             raise ValueError(f"{mode} manifest has an invalid tournament count")
         if int(row.get("synthetic_users", len(row_users))) != len(row_users):
@@ -242,7 +244,9 @@ def load_matrix_manifest(
     if not user_ids:
         raise ValueError("matrix manifest contains no synthetic users")
     expected_completed_tournaments = (
-        len(rows) if mode == "scale" else sum(len(row["tournament_ids"]) for row in manifests)
+        len(rows)
+        if mode == "scale"
+        else sum(len(row["tournament_ids"]) for row in manifests)
     )
     if payload.get("completed_tournaments") != expected_completed_tournaments:
         raise ValueError("matrix completed tournament count does not match its rows")
@@ -296,10 +300,17 @@ def _merge_recovered_marker_tournaments(
         if str(candidate.organizer_user_id) not in user_ids:
             raise RuntimeError("retained-load cleanup found a tournament owned outside the exact inventory")
         recovered_ids.add(str(candidate.id))
-    max_tournaments = 64 if mode == "write-burst" else MAX_MATRIX_ROWS
-    if len(recovered_ids) > max_tournaments:
+    max_tournaments = (
+        64
+        if mode == "write-burst"
+        else 1
+        if mode == "read-mix"
+        else MAX_MATRIX_ROWS
+    )
+    merged_ids = declared_ids | recovered_ids
+    if len(merged_ids) > max_tournaments:
         raise RuntimeError("retained-load cleanup found too many marker-owned tournaments")
-    row["tournament_ids"] = sorted(declared_ids | recovered_ids)
+    row["tournament_ids"] = sorted(merged_ids)
     return recovered_ids - declared_ids
 
 
@@ -317,10 +328,19 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     control_email = str(manifest["control_email"])
     async with session_factory()() as db_session:
         recovered_tournament_ids: dict[str, set[str]] = {}
-        if manifest["mode"] == "write-burst":
+        if manifest["mode"] in {"read-mix", "write-burst"}:
             for row in manifest["rows"]:
                 marker = row["marker"]
-                marker_prefix = f"Write burst profile {marker} "
+                description_filter = (
+                    f"Large preprod QA tournament {marker}."
+                    if manifest["mode"] == "read-mix"
+                    else f"Write burst profile {marker} "
+                )
+                description_clause = (
+                    Tournament.description == description_filter
+                    if manifest["mode"] == "read-mix"
+                    else Tournament.description.like(f"{description_filter}%")
+                )
                 candidates = list(
                     (
                         await db_session.execute(
@@ -328,7 +348,7 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
                                 Tournament.id,
                                 Tournament.description,
                                 Tournament.organizer_user_id,
-                            ).where(Tournament.description.like(f"{marker_prefix}%"))
+                            ).where(description_clause)
                         )
                     ).all()
                 )

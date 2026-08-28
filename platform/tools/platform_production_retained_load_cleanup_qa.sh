@@ -157,7 +157,7 @@ if (( ${#summaries[@]} != 1 )); then
   fi
   profile_count=0
   recovery_profile=""
-  for candidate_profile in write-burst; do
+  for candidate_profile in read-mix write-burst; do
     if [[ -d "$run_root/$candidate_profile" ]]; then
       profile_count=$((profile_count + 1))
       recovery_profile="$candidate_profile"

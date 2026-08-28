@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Recover an interrupted retained write-burst report from its durable QA row.
+"""Recover an interrupted retained load report from its durable QA row.
 
 The production retained-load supervisor updates ``PreprodTestRun.report`` after
 each material setup phase.  If the GitHub SSH client is canceled, the final
 JSON files may never be copied to the run directory even though the database
 still has the exact fixture identity.  This helper reconstructs only the
-write-burst report and compact summary for one exact ``gha-<run-id>`` root;
+read-mix or write-burst report and compact summary for one exact ``gha-<run-id>`` root;
 the normal exact cleanup validator remains the deletion authority.
 """
 
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-email", required=True)
     parser.add_argument(
         "--mode",
-        choices=("write-burst",),
+        choices=("read-mix", "write-burst"),
         default="write-burst",
     )
     return parser.parse_args()
@@ -170,7 +170,11 @@ def build_recovered_summary(
     mode = str(report.get("mode") or "write-burst")
     write_burst = report.get("write_burst") if isinstance(report.get("write_burst"), dict) else {}
     selection = str(write_burst.get("selection") or "all")
-    planned_tournaments = {"all": 26, "single-join": 3, "single-ready": 3, "multi-staggered": 20}.get(selection, 0)
+    planned_tournaments = (
+        1
+        if mode == "read-mix"
+        else {"all": 26, "single-join": 3, "single-ready": 3, "multi-staggered": 20}.get(selection, 0)
+    )
     planned_users = int(report.get("requested_users") or 10000)
     return {
         "mode": mode,
@@ -189,6 +193,7 @@ def build_recovered_summary(
             "users_per_tournament": write_burst.get("users_per_tournament"),
             "time_scale": write_burst.get("time_scale"),
         } if write_burst else None,
+        "read_mix": report.get("read_mix") if mode == "read-mix" else None,
         "performance_summary": {
             "worst_http_p95_ms": http_overall.get("p95_ms"),
             "worst_http_p99_ms": http_overall.get("p99_ms"),

@@ -52,7 +52,9 @@ Maintenance keeps:
 | Playwright results | 7 days |
 | live-QA runtime caches | protect current/previous source commits; keep exactly the newest additional fallback |
 | maintenance reports | newest 30 |
-| systemd journal | 30 days, 512 MiB, preserve 5 GiB free |
+| systemd journal | 30 days, 256 MiB, 32 MiB files, preserve 5 GiB free |
+| Nginx/system text logs | rotate at 50 MiB, keep 7 compressed files |
+| failed-login `btmp` | rotate at 16 MiB, keep 2 uncompressed files |
 
 It never deletes shared env/runtimes, upload staging, current/previous releases,
 live-QA caches for the current/previous source commits, business rows or
@@ -63,6 +65,26 @@ and user identity to be idle, accepts only root-owned non-symlink
 contract, and always retains at least the newest valid unprotected fallback.
 The keep count is a hard cap for unprotected caches, not an age window.
 Maintenance fails below 5 GiB free or above 85% disk use.
+
+Application services write structured JSON to journald. Nginx remains the
+request-log owner, so the production Gunicorn access stream is disabled to
+avoid duplicate records; warnings, exceptions and slow/contended request
+records remain available. The worker baseline is `WARNING`, while the API
+keeps `INFO` for lifecycle diagnostics. Journald is not forwarded into the
+duplicate syslog stream. UFW records remain in `ufw.log`, and the platform
+logrotate timer checks Nginx, rsyslog and `btmp` files every 15 minutes. These
+limits are operational bounds, not a reason to suppress 5xx or slow-request
+diagnostics.
+
+This policy follows the documented size/retention controls in
+[systemd-journald](https://www.freedesktop.org/software/systemd/man/252/journald.conf.html)
+and [logrotate](https://man7.org/linux/man-pages/man8/logrotate.8.html),
+uses Nginx's supported
+[log-reopen operation](https://nginx.org/en/docs/control.html), and keeps
+structured application records aligned with the
+[OpenTelemetry log data model](https://opentelemetry.io/docs/specs/otel/logs/data-model/).
+The practical rule is to retain actionable, structured events and never log
+secrets, following the [AWS logging best practices](https://docs.aws.amazon.com/prescriptive-guidance/latest/logging-monitoring-for-application-owners/logging-best-practices.html).
 
 Apply mode holds locks in the fixed order: platform release operation, source
 build output, then live-QA machine lock. This keeps release pointers stable
@@ -165,6 +187,22 @@ worker lifecycle. Use
 `tools/platform_production_qa.py --collect-performance` and
 `tools/platform_performance_audit.py`; detailed JSON stays under shared storage.
 
+The production load profiles are separated by failure mode:
+
+- `read-mix` provisions marked users, exercises authenticated catalog and
+  tournament workspace reads, then repeats the workspace request as a
+  conditional manual reload. It creates no background traffic.
+- `write-burst` provisions eligible participants and measures human-shaped and
+  aggressive Ready vote POSTs, including idempotency and concurrency behavior.
+- `matrix` remains the retained workflow/data-volume profile and is not a
+  simultaneous page-read benchmark.
+
+Use a small smoke run first, then an average/human-shaped run, stress or
+breakpoint runs only in an approved low-traffic window, and a separate soak
+run when connection or memory leaks are suspected. Keep functional success
+and performance thresholds separate in the report; a functionally correct run
+may still fail its latency/resource gate.
+
 Do not increase Gunicorn/Celery workers, add PgBouncer, install exporters or
 introduce a cache/schema rewrite without retained evidence. If both VPS cores
 remain saturated after unnecessary work is removed, classify a capacity limit
@@ -221,7 +259,7 @@ gh workflow run platform-retained-load-matrix.yml \
   --ref dev \
   -f confirmation=RUN-RETAINED-LOAD-MATRIX \
   -f control_email=<existing-preprod-account-email> \
-  -f concurrency=80
+  -f concurrency=16
 gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
@@ -263,7 +301,7 @@ secrets. Start the reviewed `dev` workflow manually:
 gh workflow run platform-production-retained-load-matrix.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
-  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=80 \
+  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=16 \
   -f profile=matrix
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
@@ -276,7 +314,7 @@ control account:
 gh workflow run platform-production-retained-load-matrix.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
-  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=80 \
+  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=16 \
   -f profile=write-burst -f write_burst_profile=all \
   -f write_burst_users_per_tournament=500 -f write_burst_time_scale=1.0
 gh run watch <write-burst-load-run-id> --repo StrayForest/old_sparky --exit-status
@@ -298,6 +336,12 @@ duplicate/idempotency behavior. Run a human-shaped spread first, then a
 separate aggressive burst; clean the exact run before another production load.
 The browser timer itself must produce zero Ready Check requests before
 `starts_at`, at `starts_at`, and at `ends_at`.
+
+The separate `read-mix` profile is the read-side capacity test; it reports the
+304 ratio and manual-refresh latency for both the tournament page and bracket
+page without adding a background refresh loop. Its bracket fixture is
+intentionally empty; the retained matrix remains the workflow/data-volume
+profile for large serialized brackets.
 
 The production retained-load workflow exposes this mode directly. For the
 10,000-user mixed baseline, use `profile=write-burst`,

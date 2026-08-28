@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--http-timeout", type=float, default=180.0)
     parser.add_argument(
         "--mode",
-        choices=("targeted", "scale", "write-burst"),
+        choices=("targeted", "scale", "read-mix", "write-burst"),
         default="targeted",
     )
     parser.add_argument("--scale-users", type=int, default=10_000)
@@ -1691,7 +1691,7 @@ class ProductionQa:
         control_participant_state: str | None = None,
     ) -> None:
         timestamp = datetime.now(UTC).strftime("%y%m%d%H%M%S")
-        prefix = "preprod" if mode in {"scale", "write-burst"} else "qa"
+        prefix = "preprod" if mode in {"scale", "read-mix", "write-burst"} else "qa"
         self.marker = f"{prefix}{timestamp}{secrets.token_hex(2)}"
         self.origin = origin.rstrip("/")
         self.api_origin = f"{self.origin}/api/v1"
@@ -1800,7 +1800,7 @@ class ProductionQa:
             "request_origin": self.request_origin,
             "mode": mode,
             "report_path": str(report_path),
-            "requested_users": self.scale_users if mode in {"scale", "write-burst"} else None,
+            "requested_users": self.scale_users if mode in {"scale", "read-mix", "write-burst"} else None,
             "http_timeout_seconds": self.http_timeout,
             "profile_journey": self.profile_journey,
             "scenarios": self.scenarios,
@@ -3743,12 +3743,15 @@ class ProductionQa:
         *,
         include_auto_assignment: bool,
         include_bracket: bool,
+        manual_refresh: bool = False,
         bracket_user_limit: int | None = None,
     ) -> None:
         if not users:
             return
         api_client = await self.new_client()
         bracket_user_limit = len(users) if bracket_user_limit is None else bracket_user_limit
+        workspace_etags: dict[str, str] = {}
+        bracket_etags: dict[str, str] = {}
 
         async def browse(user: dict[str, Any]) -> None:
             await self.request_as(api_client, user, "GET", "/auth/session", expected=200)
@@ -3776,13 +3779,17 @@ class ProductionQa:
                 f"/tournaments/{self.tournament_slug}",
                 expected=200,
             )
-            await self.request_as(
+            _, _, workspace_headers = await self.request_as(
                 api_client,
                 user,
                 "GET",
-                f"/tournaments/{self.tournament_slug}/workspace?participants_limit=0&participants_offset=0&workspace_view=detail",
+                f"/tournaments/{self.tournament_slug}/workspace?participants_limit=0&participants_offset=0&workspace_view=detail&include_current_user=false",
                 expected=200,
+                return_response_meta=True,
             )
+            etag = workspace_headers.get("etag")
+            if etag:
+                workspace_etags[str(user["id"])] = etag
             if include_auto_assignment:
                 await self.request_as(
                     api_client,
@@ -3792,27 +3799,72 @@ class ProductionQa:
                     expected=200,
                 )
             if include_bracket:
+                _, _, bracket_headers = await self.request_as(
+                    api_client,
+                    user,
+                    "GET",
+                    f"/tournaments/{self.tournament_slug}/workspace?participants_limit=0&participants_offset=0&workspace_view=bracket&include_current_user=false",
+                    expected=200,
+                    return_response_meta=True,
+                )
+                bracket_etag = bracket_headers.get("etag")
+                if bracket_etag:
+                    bracket_etags[str(user["id"])] = bracket_etag
+
+        await self.bounded_each(users[: self.scale_site_mix_users], browse)
+        if manual_refresh and workspace_etags:
+            async def refresh_workspace(user: dict[str, Any]) -> None:
+                etag = workspace_etags.get(str(user["id"]))
+                if not etag:
+                    return
                 await self.request_as(
                     api_client,
                     user,
                     "GET",
-                    f"/tournaments/{self.tournament_slug}/bracket?teams_view=summary",
-                    expected=200,
+                    f"/tournaments/{self.tournament_slug}/workspace?participants_limit=0&participants_offset=0&workspace_view=detail&include_current_user=false",
+                    expected=(200, 304),
+                    extra_headers={"If-None-Match": etag},
                 )
 
-        await self.bounded_each(users[: self.scale_site_mix_users], browse)
+            with self.phase("manual_workspace_refresh"):
+                await self.bounded_each(users[: self.scale_site_mix_users], refresh_workspace)
         if include_bracket and bracket_user_limit > self.scale_site_mix_users:
             remaining = users[self.scale_site_mix_users : bracket_user_limit]
             async def view_bracket(user: dict[str, Any]) -> None:
+                _, _, bracket_headers = await self.request_as(
+                    api_client,
+                    user,
+                    "GET",
+                    f"/tournaments/{self.tournament_slug}/workspace?participants_limit=0&participants_offset=0&workspace_view=bracket&include_current_user=false",
+                    expected=200,
+                    return_response_meta=True,
+                )
+                bracket_etag = bracket_headers.get("etag")
+                if bracket_etag:
+                    bracket_etags[str(user["id"])] = bracket_etag
+
+            await self.bounded_each(remaining, view_bracket)
+        if manual_refresh and bracket_etags:
+            async def refresh_bracket(user: dict[str, Any]) -> None:
+                etag = bracket_etags.get(str(user["id"]))
+                if not etag:
+                    return
                 await self.request_as(
                     api_client,
                     user,
                     "GET",
-                    f"/tournaments/{self.tournament_slug}/bracket?teams_view=summary",
-                    expected=200,
+                    f"/tournaments/{self.tournament_slug}/workspace?participants_limit=0&participants_offset=0&workspace_view=bracket&include_current_user=false",
+                    expected=(200, 304),
+                    extra_headers={"If-None-Match": etag},
                 )
 
-            await self.bounded_each(remaining, view_bracket)
+            bracket_users = [
+                user
+                for user in users[:bracket_user_limit]
+                if str(user["id"]) in bracket_etags
+            ]
+            with self.phase("manual_bracket_refresh"):
+                await self.bounded_each(bracket_users, refresh_bracket)
 
     async def join_scale_participant(
         self,
@@ -4029,7 +4081,11 @@ class ProductionQa:
                     await self.run_scale_site_mix(
                         users,
                         include_auto_assignment=False,
-                        include_bracket=False,
+                        include_bracket=(
+                            self.mode == "read-mix" and self.scale_bracket_view_users > 0
+                        ),
+                        manual_refresh=self.mode == "read-mix",
+                        bracket_user_limit=self.scale_bracket_view_users,
                     )
                 self.report["public_site_mix_seconds"] = round(
                     time.monotonic() - site_mix_started,
@@ -4043,6 +4099,35 @@ class ProductionQa:
                         "seconds": self.report["public_site_mix_seconds"],
                     },
                 )
+                if self.mode == "read-mix":
+                    self.report["read_mix"] = {
+                        "users": self.scale_site_mix_users,
+                        "manual_workspace_refresh": True,
+                        "manual_bracket_refresh": self.scale_bracket_view_users > 0,
+                        "bracket_view_users": self.scale_bracket_view_users,
+                        "network_traffic_before_transition": "none",
+                        "bracket_refresh": "manual_only",
+                    }
+                    self.report["duration_seconds"] = round(time.monotonic() - started, 4)
+                    self.scenario(
+                        "read_mix_complete",
+                        True,
+                        {
+                            "users": self.scale_site_mix_users,
+                            "manual_workspace_refresh": True,
+                            "seconds": self.report["duration_seconds"],
+                        },
+                    )
+                    await self.record_preprod_run(
+                        status="passed",
+                        created_users=len(users),
+                        tournaments_created=1,
+                        active_participants=0,
+                        teams_count=0,
+                        matches_count=0,
+                        finished_at=datetime.now(UTC),
+                    )
+                    return self.report
             elif self.scale_site_mix_users > 0:
                 self.report["public_site_mix_skipped"] = {
                     "users": self.scale_site_mix_users,
@@ -5212,6 +5297,7 @@ def cli_report_summary(report: dict[str, Any]) -> dict[str, Any]:
         "requested_users": report.get("requested_users"),
         "tournament_visibility": report.get("tournament_visibility"),
         "profile_journey": report.get("profile_journey"),
+        "read_mix": report.get("read_mix"),
         "teams": len(report.get("strength_ranking") or []),
         "matches": len(report.get("match_path") or []) or report.get("matches_count"),
         "duration_seconds": report.get("duration_seconds"),
@@ -5286,7 +5372,7 @@ async def async_main() -> int:
         control_participant_state=args.control_participant_state,
     )
     try:
-        if args.mode == "scale":
+        if args.mode in {"scale", "read-mix"}:
             report = await qa.run_scale()
         elif args.mode == "write-burst":
             report = await qa.run_write_burst_profile()

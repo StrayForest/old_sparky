@@ -103,6 +103,12 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn('rm -f -- "$unit_path"', installer)
         self.assertIn("systemctl disable", installer)
 
+    def test_production_logging_avoids_duplicate_access_and_worker_info_streams(self) -> None:
+        api_runner = self.read_tool("platform_run_api.sh")
+        worker_runner = self.read_tool("platform_run_worker.sh")
+        self.assertIn("PLATFORM_GUNICORN_ACCESS_LOG", api_runner)
+        self.assertIn("PLATFORM_WORKER_LOG_LEVEL", worker_runner)
+
     def test_operator_rollback_cannot_complete_without_restart_and_smoke(self) -> None:
         rollback = self.read_tool("platform_release_rollback.sh")
         self.assertIn("Production rollback requires restart, readiness and smoke", rollback)

@@ -12,10 +12,12 @@ platform_require_python
 cd "$PLATFORM_ROOT_DIR"
 export PYTHONPATH="$PLATFORM_ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
+worker_log_level="${PLATFORM_WORKER_LOG_LEVEL:-INFO}"
+
 exec "$PLATFORM_PYTHON_BIN" -m celery \
   -A apps.platform_worker.worker:celery_app worker \
   --beat \
   --queues deadlock-platform-high,deadlock-platform-default,deadlock-platform-low \
   --concurrency "${PLATFORM_WORKER_CONCURRENCY:-2}" \
   --schedule "$PLATFORM_SHARED_DIR/worker-state/celerybeat-schedule" \
-  --loglevel INFO
+  --loglevel "$worker_log_level"

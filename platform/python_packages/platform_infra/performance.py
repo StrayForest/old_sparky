@@ -213,7 +213,8 @@ class RequestPerformanceMiddleware:
         route = scope.get("route")
         route_path = getattr(route, "path", None) or metrics.path
         should_log = (
-            (
+            status_code >= 500
+            or (
                 settings.platform_perf_log_mutations
                 and metrics.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
             )
@@ -225,7 +226,8 @@ class RequestPerformanceMiddleware:
         if not should_log:
             return
 
-        logger.info(
+        log_method = logger.warning if status_code >= 500 else logger.info
+        log_method(
             "request_perf request_id=%s method=%s path=%s route=%s status=%s "
             "total_ms=%.2f sql_ms=%.2f sql_count=%s max_sql_ms=%.2f "
             "compute_ms=%.2f compute_blocks=%s response_bytes=%s qa_phase=%s "
