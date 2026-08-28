@@ -157,9 +157,11 @@ def allocate_user_counts(
         for index, item in enumerate(plan)
         if item["control_state"] == "assigned"
     )
-    assigned_users = (
-        int(plan[assigned_index]["teams"]) * DEADLOCK_PLAYERS_PER_TEAM - 1
-    )
+    # The control account may already have an active commitment and therefore
+    # may be excluded from the globally available captain candidates.  Reserve
+    # a complete synthetic roster so the 64-team scenario still has 448
+    # candidates even when the control account cannot be assigned.
+    assigned_users = int(plan[assigned_index]["teams"]) * DEADLOCK_PLAYERS_PER_TEAM
     remaining_indexes = [index for index in range(len(plan)) if index != assigned_index]
     remaining_total = target_total - assigned_users
     if remaining_total < len(remaining_indexes) * 14:

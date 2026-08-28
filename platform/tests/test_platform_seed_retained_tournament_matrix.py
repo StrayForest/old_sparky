@@ -23,10 +23,10 @@ class RetainedTournamentMatrixTests(unittest.TestCase):
         self.assertEqual(len(plan), 20)
         counts = allocate_user_counts(plan, users_per_tournament=500)
         self.assertEqual(sum(counts), 10_000)
-        self.assertEqual(counts[15], 447)
+        self.assertEqual(counts[15], 448)
         self.assertEqual(min(counts), 56)
         self.assertEqual(max(counts), 528)
-        self.assertEqual(counts[15] + 1, 64 * 7)
+        self.assertEqual(counts[15], 64 * 7)
         self.assertTrue(
             all(
                 count <= INVITE_MAX_USERS
