@@ -133,6 +133,26 @@ if (( ${#summaries[@]} != 1 )); then
       exit 1
     fi
     rm -rf -- "$run_root"
+    partial_export_uid="${SUDO_UID:-0}"
+    partial_export_gid="${SUDO_GID:-0}"
+    [[ "$partial_export_uid" =~ ^[0-9]+$ && "$partial_export_gid" =~ ^[0-9]+$ ]] || {
+      echo "Unable to determine the SSH caller identity for partial cleanup export." >&2
+      exit 1
+    }
+    partial_export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
+    rm -rf -- "$partial_export_dir"
+    install -d -o root -g root -m 0700 "$partial_export_dir"
+    printf '%s\n' "No distributed fixture inventory was published; removed exact partial run root: $run_root" \
+      > "$partial_export_dir/cleanup.log"
+    printf '%s\n' '{"ok":true,"markers":0,"users_deleted":0,"tournaments_deleted":0,"control_account_preserved":true,"partial_run_root_removed":true}' \
+      > "$partial_export_dir/cleanup-summary.json"
+    chown -R "$partial_export_uid:$partial_export_gid" "$partial_export_dir"
+    chmod 0700 "$partial_export_dir"
+    chmod 0600 "$partial_export_dir/cleanup.log" "$partial_export_dir/cleanup-summary.json"
+    printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=%s\n' "$partial_export_dir"
+    printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$partial_export_dir/cleanup-summary.json"
+    printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXIT_CODE=0\n'
+    printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1\n'
     echo "No distributed fixture inventory was published; removed the exact partial run root."
     exit 0
   fi
