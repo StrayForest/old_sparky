@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -120,6 +121,8 @@ def build_durable_manifest(
 
 
 async def clean_orphan(args: argparse.Namespace) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise RuntimeError("retained orphan cleanup must run as root")
     if args.confirm != CONFIRMATION:
         raise RuntimeError(f"cleanup requires --confirm {CONFIRMATION}")
     if not re.fullmatch(r"[0-9]+", args.load_run_id):
