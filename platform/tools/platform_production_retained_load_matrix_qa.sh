@@ -35,7 +35,7 @@ flock -n 9 || {
   exit 1
 }
 if (( $# < 5 || $# > 9 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|read-mix|write-burst] [write-burst-profile write-burst-users-per-tournament write-burst-time-scale]" >&2
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|read-mix|write-burst|external-vote] [profile arguments]" >&2
   exit 2
 fi
 
@@ -48,6 +48,8 @@ profile="${6:-matrix}"
 write_burst_profile=all
 write_burst_users_per_tournament=50
 write_burst_time_scale=1.0
+external_vote_tournament_count=1
+external_vote_users_per_tournament=500
 
 case "$profile" in
   matrix) ;;
@@ -69,8 +71,20 @@ case "$profile" in
       exit 1
     }
     ;;
+  external-vote)
+    external_vote_tournament_count="${7:-1}"
+    external_vote_users_per_tournament="${8:-500}"
+    [[ "$external_vote_tournament_count" =~ ^[1-9][0-9]?$ ]] && (( external_vote_tournament_count <= 20 )) || {
+      echo "External vote tournament count must be between 1 and 20." >&2
+      exit 1
+    }
+    [[ "$external_vote_users_per_tournament" =~ ^[1-9][0-9]{1,2}$ ]] && (( external_vote_users_per_tournament >= 14 && external_vote_users_per_tournament <= 500 )) || {
+      echo "External vote users per tournament must be between 14 and 500." >&2
+      exit 1
+    }
+    ;;
   *)
-    echo "Profile must be matrix, read-mix or write-burst." >&2
+    echo "Profile must be matrix, read-mix, write-burst or external-vote." >&2
     exit 1
     ;;
 esac
@@ -476,6 +490,151 @@ Path(summary_path).write_text(
     encoding="utf-8",
 )
 PY
+elif [[ "$profile" == "external-vote" ]]; then
+  external_vote_root="$run_root/external-vote"
+  install -d -o root -g root -m 0700 "$external_vote_root"
+  external_vote_report="$external_vote_root/external-vote.json"
+  external_vote_manifest="$external_vote_root/manifest.json"
+  external_vote_summary="$external_vote_root/matrix-summary.json"
+  external_vote_complete="$export_dir/complete"
+  external_vote_ready="$export_dir/ready"
+  external_vote_observer_output="$external_vote_root/server-observability.json"
+  external_vote_observer_log="$external_vote_root/server-observer.log"
+
+  set +e
+  timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
+    "$QA_PYTHON" "$TOOLS_DIR/platform_prepare_external_vote_fixture.py" \
+      --env-file "$RUNTIME_ROOT/shared/.env.platform" \
+      --origin "$EXPECTED_ORIGIN" \
+      --local-origin "http://127.0.0.1" \
+      --report-path "$external_vote_report" \
+      --manifest-path "$external_vote_manifest" \
+      --tournament-count "$external_vote_tournament_count" \
+      --users-per-tournament "$external_vote_users_per_tournament" \
+      --concurrency "$concurrency" \
+      --http-timeout 30 \
+      > "$run_root/qa-command.log" 2>&1
+  qa_status="$?"
+  set -e
+  cp "$run_root/qa-command.log" "$log_path"
+
+  "$SYSTEM_PYTHON" -I - "$external_vote_report" "$external_vote_summary" \
+    "$target_sha" "$run_id" "$control_email" "$qa_status" \
+    "$external_vote_tournament_count" "$external_vote_users_per_tournament" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+(
+    report_path,
+    summary_path,
+    target_sha,
+    run_id,
+    control_email,
+    status,
+    tournament_count,
+    users_per_tournament,
+) = sys.argv[1:]
+try:
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    report = {}
+marker = str(report.get("marker") or "")
+user_ids = report.get("user_ids") if isinstance(report.get("user_ids"), list) else []
+tournament_ids = report.get("tournament_ids") if isinstance(report.get("tournament_ids"), list) else []
+passed = int(status) == 0 and report.get("passed") is True
+summary = {
+    "mode": "write-burst",
+    "target_sha": target_sha,
+    "github_run_id": int(run_id),
+    "control_email": control_email.strip().lower(),
+    "planned_tournaments": int(tournament_count),
+    "completed_tournaments": len(tournament_ids),
+    "planned_users": int(tournament_count) * int(users_per_tournament),
+    "completed_users": len(user_ids),
+    "passed": passed,
+    "external_vote_fixture": {
+        "tournament_count": int(tournament_count),
+        "users_per_tournament": int(users_per_tournament),
+        "measurement_runs_on_external_runner": True,
+    },
+    "rows": [{
+        "synthetic_users": len(user_ids),
+        "report_path": report_path,
+        "result": {
+            "passed": passed,
+            "marker": marker,
+            "report_path": report_path,
+            "tournament_slug": (report.get("tournament_slugs") or [None])[0],
+        },
+    }],
+}
+Path(summary_path).write_text(
+    json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+    encoding="utf-8",
+)
+PY
+
+  if [[ "$qa_status" == "0" && -s "$external_vote_manifest" ]]; then
+    # The manifest is temporary session credential material.  It is exported
+    # only to the SSH caller's private directory and is never in the report or
+    # the Actions artifact.
+    install -o "$export_uid" -g "$export_gid" -m 0600 \
+      "$external_vote_manifest" "$export_dir/manifest.json"
+    rm -f -- "$external_vote_complete"
+    rm -f -- "$external_vote_ready"
+
+    set +e
+    timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
+      "$QA_PYTHON" "$TOOLS_DIR/platform_external_load_observer.py" \
+        --env-file "$RUNTIME_ROOT/shared/.env.platform" \
+        --output "$external_vote_observer_output" \
+        --stop-file "$external_vote_complete" \
+        --interval 1 \
+        --max-runtime 10_800 \
+        > "$external_vote_observer_log" 2>&1 &
+    observer_pid="$!"
+    set -e
+    sleep 1
+    kill -0 "$observer_pid" 2>/dev/null || {
+      echo "External-load observer failed to start." >&2
+      qa_status=1
+    }
+    if [[ "$qa_status" == "0" ]]; then
+      : > "$external_vote_ready"
+    fi
+    printf 'PRODUCTION_EXTERNAL_LOAD_READY=%s\n' "$export_dir/manifest.json"
+    observer_deadline=$(( $(date +%s) + 10_800 ))
+    while [[ ! -e "$external_vote_complete" ]]; do
+      if ! kill -0 "$observer_pid" 2>/dev/null; then
+        wait "$observer_pid" 2>/dev/null || true
+        echo "External-load observer exited before the load completed." >&2
+        qa_status=1
+        break
+      fi
+      if (( $(date +%s) >= observer_deadline )); then
+        echo "External load completion barrier timed out." >&2
+        qa_status=1
+        break
+      fi
+      sleep 1
+    done
+    if [[ ! -e "$external_vote_complete" ]]; then
+      : > "$external_vote_complete"
+    fi
+    wait "$observer_pid" 2>/dev/null || observer_status="$?"
+    observer_status="${observer_status:-0}"
+    if [[ "$observer_status" != "0" ]]; then
+      qa_status=1
+    fi
+    if [[ -s "$external_vote_observer_output" ]]; then
+      cp "$external_vote_observer_output" "$server_observability_log"
+    else
+      cp "$external_vote_observer_log" "$server_observability_log"
+    fi
+    # No credential-bearing manifest should survive the measurement barrier.
+    rm -f -- "$external_vote_manifest" "$export_dir/manifest.json" "$external_vote_ready"
+  fi
 fi
 
 shopt -s nullglob

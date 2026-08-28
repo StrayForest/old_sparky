@@ -62,8 +62,14 @@ authoritative result.
 The current load-test gate is request-based: `read-mix` measures authenticated
 catalog/tournament reads plus a conditional manual workspace reload, while
 `write-burst` measures Ready vote POSTs. No background tournament transport is
-part of the production flow. Production service logs are kept in journald,
-Nginx owns the edge access log, and size-based rotation bounds text log files.
+part of the production flow. Public capacity measurements use the external
+runner workflow `platform-production-external-load.yml`: deterministic fixture
+setup is performed on the origin, the HTTP measurement runs outside the VPS,
+and a bounded origin observer records API/PG/Redis/system pressure. The older
+retained-load workflow remains useful for origin-local workflow diagnostics but
+must not be treated as a clean public capacity result because its generator
+shares the VPS. Production service logs are kept in journald, Nginx owns the
+edge access log, and size-based rotation bounds text log files.
 
 ## Production invariants
 

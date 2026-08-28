@@ -285,6 +285,40 @@ by the marked pre-production cleanup procedure after manual inspection. Never
 put a real account password, session token or live production origin in the
 command or a report.
 
+### Live production external load
+
+For public capacity testing use the external-runner workflow, not a generator
+running beside the API on the VPS. The workflow keeps fixture preparation and
+exact cleanup on the origin, while the measured HTTP client runs on a
+GitHub-hosted runner outside Cloudflare's origin network. It supports the
+current `ready-vote` and `read-mix` request-driven profiles and collects a
+parallel origin observer report. Temporary session/CSRF credentials are never
+published as an artifact.
+
+```bash
+gh workflow run platform-production-external-load.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
+  -f control_email=<existing-production-account-email> \
+  -f mode=ready-vote -f tournament_count=1 \
+  -f users_per_tournament=500 -f setup_concurrency=20 \
+  -f load_concurrency=128 -f spread_seconds=30 -f duplicate_count=100
+gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+The 30-second spread models human arrivals; run a separate zero- or
+short-spread aggressive test for safety margin. Record client p50/p95/p99,
+status/error/timeout counts, response-contract checks, API CPU/RSS, Redis,
+PostgreSQL connections and pool waits, Nginx sockets, and cleanup verification.
+If the workflow is canceled, perform the exact retained-load abort/cleanup
+procedure with the same run ID before another load. The temporary manifest
+must not be copied to Actions artifacts.
+
+The older retained-load workflow below remains available for origin-local
+setup/data-volume diagnostics. Its generator shares the production VPS, so
+its CPU and latency must not be presented as a public Cloudflare capacity
+result.
+
 ### Live production retained load
 
 Use this only in a low-traffic maintenance window. It runs on the single live

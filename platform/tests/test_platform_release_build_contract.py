@@ -244,6 +244,31 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("timeout --signal=TERM --kill-after=30s", load_supervisor)
         self.assertIn('HTTP_MAX_CONNECTIONS="${PLATFORM_QA_HTTP_MAX_CONNECTIONS:-512}"', load_supervisor)
 
+    def test_external_public_load_keeps_measurement_outside_origin(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-external-load.yml"
+        ).read_text()
+        external_client = (
+            REPO_ROOT / "platform/tools/platform_external_load.py"
+        ).read_text()
+        fixture = (
+            REPO_ROOT / "platform/tools/platform_prepare_external_vote_fixture.py"
+        ).read_text()
+        observer = (
+            REPO_ROOT / "platform/tools/platform_external_load_observer.py"
+        ).read_text()
+
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("RUN-PRODUCTION-EXTERNAL-LOAD", workflow)
+        self.assertIn("external-vote", workflow)
+        self.assertIn("platform_external_load.py", workflow)
+        self.assertIn("platform_external_load_observer.py", workflow)
+        self.assertIn("platform_production_retained_load_cleanup_qa.sh", workflow)
+        self.assertNotIn("manifest.json\n", workflow.split("Publish external load evidence", 1)[1])
+        self.assertIn("ThreadPoolExecutor", external_client)
+        self.assertIn("external_ready_vote", fixture)
+        self.assertIn("SystemSampler", observer)
+
     def test_browser_qa_does_not_silently_fallback_to_production_env(self) -> None:
         qa_source = (REPO_ROOT / "platform/tools/platform_production_qa.py").read_text()
 

@@ -61,8 +61,8 @@
     {
       "id": "retained-load-production",
       "owner": "production-performance-operator",
-      "command": "platform-production-retained-load-matrix.yml, platform-production-retained-load-abort.yml and platform-production-retained-load-cleanup.yml through SSH",
-      "environment": "https://old-sparky.com; one production VPS; exact retained fixture cleanup",
+      "command": "platform-production-retained-load-matrix.yml, platform-production-external-load.yml, platform-production-retained-load-abort.yml and platform-production-retained-load-cleanup.yml through SSH",
+      "environment": "https://old-sparky.com; external GitHub runner plus one production origin; exact retained fixture cleanup",
       "deterministic": false
     }
   ]

@@ -1,0 +1,380 @@
+name: Platform production external load
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RUN-PRODUCTION-EXTERNAL-LOAD to create a temporary production fixture"
+        required: true
+        type: string
+      control_email:
+        description: "Existing account preserved by exact cleanup"
+        required: true
+        default: "aleksei.lisitsin1@gmail.com"
+        type: string
+      mode:
+        description: "Current request-driven user journey to measure externally"
+        required: true
+        default: "ready-vote"
+        type: choice
+        options:
+          - ready-vote
+          - read-mix
+      tournament_count:
+        description: "Ready Check tournaments (1-20)"
+        required: true
+        default: "1"
+        type: string
+      users_per_tournament:
+        description: "Eligible users per tournament (14-500)"
+        required: true
+        default: "500"
+        type: string
+      setup_concurrency:
+        description: "Origin-side fixture setup concurrency (1-256)"
+        required: true
+        default: "20"
+        type: string
+      load_concurrency:
+        description: "External runner request concurrency (1-512)"
+        required: true
+        default: "128"
+        type: string
+      spread_seconds:
+        description: "Opening spread; 30 is human-shaped, 0 is aggressive"
+        required: true
+        default: "30"
+        type: string
+      duplicate_count:
+        description: "Idempotency replay sample for ready-vote mode"
+        required: true
+        default: "100"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-external-load
+  cancel-in-progress: false
+
+jobs:
+  external-load:
+    name: External public load with exact cleanup
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      QA_CONFIRMATION: ${{ inputs.confirmation }}
+      CONTROL_EMAIL: ${{ inputs.control_email }}
+      LOAD_MODE: ${{ inputs.mode }}
+      TOURNAMENT_COUNT: ${{ inputs.tournament_count }}
+      USERS_PER_TOURNAMENT: ${{ inputs.users_per_tournament }}
+      SETUP_CONCURRENCY: ${{ inputs.setup_concurrency }}
+      LOAD_CONCURRENCY: ${{ inputs.load_concurrency }}
+      SPREAD_SECONDS: ${{ inputs.spread_seconds }}
+      DUPLICATE_COUNT: ${{ inputs.duplicate_count }}
+      TARGET_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Checkout reviewed load client
+        uses: actions/checkout@v6
+
+      - name: Validate explicit external production load
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "External production load must run from dev." >&2; exit 1; }
+          test "$QA_CONFIRMATION" = "RUN-PRODUCTION-EXTERNAL-LOAD" \
+            || { echo "Refusing external production load without exact confirmation." >&2; exit 1; }
+          test "$LOAD_MODE" = "ready-vote" || test "$LOAD_MODE" = "read-mix" \
+            || { echo "Unsupported external load mode." >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
+          /usr/bin/python3 - \
+            "$CONTROL_EMAIL" "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
+            "$SETUP_CONCURRENCY" "$LOAD_CONCURRENCY" "$SPREAD_SECONDS" "$DUPLICATE_COUNT" <<'PY'
+          import re
+          import sys
+
+          email, tournament_count, users_per, setup_concurrency, load_concurrency, spread, duplicate = sys.argv[1:]
+          if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email):
+              raise SystemExit("control_email is invalid")
+          if not re.fullmatch(r"[1-9][0-9]?", tournament_count) or not 1 <= int(tournament_count) <= 20:
+              raise SystemExit("tournament_count must be between 1 and 20")
+          if not re.fullmatch(r"[1-9][0-9]{1,2}", users_per) or not 14 <= int(users_per) <= 500:
+              raise SystemExit("users_per_tournament must be between 14 and 500")
+          if int(tournament_count) * int(users_per) > 10_000:
+              raise SystemExit("external fixture exceeds 10000 users")
+          if not re.fullmatch(r"[1-9][0-9]{0,2}", setup_concurrency) or not 1 <= int(setup_concurrency) <= 256:
+              raise SystemExit("setup_concurrency must be between 1 and 256")
+          if not re.fullmatch(r"[1-9][0-9]{0,2}", load_concurrency) or not 1 <= int(load_concurrency) <= 512:
+              raise SystemExit("load_concurrency must be between 1 and 512")
+          try:
+              spread_value = float(spread)
+          except ValueError:
+              raise SystemExit("spread_seconds must be numeric") from None
+          if not 0 <= spread_value <= 3600:
+              raise SystemExit("spread_seconds must be between 0 and 3600")
+          if not re.fullmatch(r"[0-9]+", duplicate) or not 0 <= int(duplicate) <= int(tournament_count) * int(users_per):
+              raise SystemExit("duplicate_count is outside the fixture size")
+          PY
+
+      - name: Configure production SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-external-load-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key." >&2; exit 1; }
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
+            || { echo "Expected exactly one production ED25519 host key." >&2; exit 1; }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" \
+            || { echo "Production SSH host fingerprint mismatch." >&2; exit 1; }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Prepare fixture and run external HTTP load
+        id: external-run
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -u
+          artifact_dir="$RUNNER_TEMP/platform-external-load-artifacts"
+          install -d -m 700 "$artifact_dir"
+          remote_log="$artifact_dir/remote-supervisor.log"
+          export_dir="/tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID"
+          manifest_path="$artifact_dir/manifest.json"
+          ready_path="$export_dir/ready"
+          client_report="$artifact_dir/external-load.json"
+          remote_status=1
+          load_status=1
+          manifest_ready=0
+          remote_pid=""
+
+          cleanup_local() {
+            rm -f -- "$manifest_path"
+          }
+          trap cleanup_local EXIT
+
+          set +e
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- \
+              "$QA_CONFIRMATION" "$TARGET_SHA" "$CONTROL_EMAIL" "$SETUP_CONCURRENCY" \
+              "$GITHUB_RUN_ID" external-vote "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
+            > "$remote_log" 2>&1 <<'REMOTE' &
+          set -Eeuo pipefail
+          sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_matrix_qa.sh "$@"
+          REMOTE
+          remote_pid="$!"
+          set -e
+
+          for _ in $(seq 1 900); do
+            if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST:$ready_path" "$artifact_dir/ready" \
+              >/dev/null 2>&1; then
+              if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+                -i "$SSH_DIR/id_ed25519" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/manifest.json" "$manifest_path" \
+                >/dev/null 2>&1; then
+                manifest_ready=1
+                break
+              fi
+            fi
+            if ! kill -0 "$remote_pid" 2>/dev/null; then
+              wait "$remote_pid" 2>/dev/null || true
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$manifest_ready" == "1" ]]; then
+            chmod 600 "$manifest_path"
+            set +e
+            python3 platform/tools/platform_external_load.py \
+              --manifest "$manifest_path" \
+              --report-path "$client_report" \
+              --mode "$LOAD_MODE" \
+              --spread-seconds "$SPREAD_SECONDS" \
+              --concurrency "$LOAD_CONCURRENCY" \
+              --timeout 30 \
+              --duplicate-count "$DUPLICATE_COUNT" \
+              --p95-budget-ms 1000 \
+              --p99-budget-ms 2000
+            load_status="$?"
+            set -e
+            ssh \
+              -F "$SSH_DIR/config" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              "test -d '$export_dir' && touch '$export_dir/complete'" \
+              >/dev/null 2>&1 || true
+          fi
+
+          if [[ -n "$remote_pid" ]]; then
+            set +e
+            wait "$remote_pid"
+            remote_status="$?"
+            set -e
+          fi
+          cp "$remote_log" "$RUNNER_TEMP/platform-external-load-remote.log" 2>/dev/null || true
+
+          for file in matrix-summary.json matrix.log server-observability.log; do
+            if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/$file" "$artifact_dir/$file" \
+              >/dev/null 2>&1; then
+              :
+            fi
+          done
+          echo "remote_status=$remote_status" >> "$GITHUB_OUTPUT"
+          echo "load_status=$load_status" >> "$GITHUB_OUTPUT"
+          echo "manifest_ready=$manifest_ready" >> "$GITHUB_OUTPUT"
+          # The final gate below owns the failure status so exact cleanup still runs.
+          exit 0
+
+      - name: Exact cleanup of external fixture
+        id: cleanup
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -u
+          cleanup_status=1
+          cleanup_log="$RUNNER_TEMP/platform-external-load-cleanup.log"
+          cleanup_summary="$RUNNER_TEMP/platform-external-load-cleanup.json"
+          set +e
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$TARGET_SHA" "$GITHUB_RUN_ID" "$CONTROL_EMAIL" "$GITHUB_RUN_ID" \
+            > "$cleanup_log" 2>&1 <<'REMOTE'
+          set -Eeuo pipefail
+          target_sha="$1"
+          load_run_id="$2"
+          control_email="$3"
+          cleanup_run_id="$4"
+          if test -e "/opt/oldsparky/platform/shared/production-retained-matrix/gha-$load_run_id"; then
+            sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_cleanup_qa.sh \
+              DELETE-PRODUCTION-RETAINED-LOAD "$target_sha" "$load_run_id" "$control_email" "$cleanup_run_id"
+          else
+            echo '{"ok":true,"fixture_absent":true}'
+          fi
+          REMOTE
+          cleanup_status="$?"
+          set -e
+          if [[ "$cleanup_status" == "0" ]]; then
+            export_dir="/tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID"
+            scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/cleanup-summary.json" "$cleanup_summary" \
+              >/dev/null 2>&1 || true
+            ssh \
+              -F "$SSH_DIR/config" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              "rm -f -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/complete /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/ready /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix-summary.json /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/server-observability.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/qa-command.log && rmdir -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID 2>/dev/null || true" \
+              >/dev/null 2>&1 || true
+            ssh \
+              -F "$SSH_DIR/config" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -i "$SSH_DIR/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              "rm -f -- /tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID/cleanup-summary.json /tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID/cleanup.log && rmdir -- /tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID 2>/dev/null || true" \
+              >/dev/null 2>&1 || true
+          fi
+          echo "cleanup_status=$cleanup_status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Publish external load evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: platform-production-external-load-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/platform-external-load-artifacts/external-load.json
+            ${{ runner.temp }}/platform-external-load-artifacts/matrix-summary.json
+            ${{ runner.temp }}/platform-external-load-artifacts/matrix.log
+            ${{ runner.temp }}/platform-external-load-artifacts/server-observability.log
+            ${{ runner.temp }}/platform-external-load-remote.log
+            ${{ runner.temp }}/platform-external-load-cleanup.json
+            ${{ runner.temp }}/platform-external-load-cleanup.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write external load summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - "$RUNNER_TEMP/platform-external-load-artifacts/external-load.json" \
+            >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          print("### Production external load")
+          print()
+          if not path.exists():
+              print("External client report was not produced.")
+          else:
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              overall = payload.get("overall") or {}
+              latency = overall.get("latency") or {}
+              acceptance = payload.get("acceptance") or {}
+              print(f"- Mode: **{payload.get('mode')}**")
+              print(f"- Fixture: {payload.get('users')} users / {payload.get('tournaments')} tournaments")
+              print(f"- Requests: {overall.get('requests')}; errors: {overall.get('errors')}")
+              print(f"- p50/p95/p99: {latency.get('p50_ms')} / {latency.get('p95_ms')} / {latency.get('p99_ms')} ms")
+              print(f"- Contract: **{'passed' if acceptance.get('contract_ok') else 'failed'}**; latency gate: **{'passed' if acceptance.get('passed') else 'failed'}**")
+          PY
+
+      - name: Enforce external load and cleanup gates
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.external-run.outputs.manifest_ready }}" = "1" \
+            || { echo "External fixture never reached the barrier." >&2; exit 1; }
+          test "${{ steps.external-run.outputs.remote_status }}" = "0" \
+            || { echo "Origin external-load supervisor failed." >&2; exit 1; }
+          test "${{ steps.external-run.outputs.load_status }}" = "0" \
+            || { echo "External load acceptance failed." >&2; exit 1; }
+          test "${{ steps.cleanup.outputs.cleanup_status }}" = "0" \
+            || { echo "Exact external-load cleanup failed." >&2; exit 1; }

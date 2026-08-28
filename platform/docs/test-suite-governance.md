@@ -145,6 +145,57 @@ operational identifiers. After manual inspection, use the marked
 pre-production cleanup procedure; do not delete the retained data
 automatically from the workflow.
 
+### External public production load
+
+Public capacity results must use the external runner workflow
+`platform-production-external-load.yml`. It prepares a marked Ready Check
+fixture on the origin, exports temporary session material only to the private
+temporary directory of the GitHub-hosted runner, runs the measured HTTP phase
+outside the VPS, and removes that material after the completion barrier. The
+manifest is never uploaded as an artifact. The origin-side observer records
+CPU/RSS, Nginx/API sockets, PostgreSQL connections and waits, Redis pressure
+and Celery backlog during the external phase.
+
+The workflow supports the current request-driven journeys:
+
+- `ready-vote`: one authoritative Ready vote per eligible synthetic user,
+  bounded idempotency replays and one state read per tournament for persisted
+  correctness;
+- `read-mix`: authenticated workspace/tournament/profile/catalog reads with a
+  fixed route mix, with no background refresh loop.
+
+Use a 30-second spread for the human-shaped profile and a separate zero- or
+short-spread run for an aggressive safety-margin profile. A successful result
+requires the expected request count, zero unexpected statuses/timeouts, correct
+vote/state contracts, and the configured latency budget. The old
+`platform-production-retained-load-matrix.yml` workflow remains an
+origin-local diagnostic for setup/data-volume behavior; because its generator
+runs on the same VPS, its latency and CPU are not a public capacity gate.
+
+Run only from the reviewed `dev` ref in a low-traffic window:
+
+```bash
+gh workflow run platform-production-external-load.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
+  -f control_email=<existing-production-account-email> \
+  -f mode=ready-vote -f tournament_count=1 \
+  -f users_per_tournament=500 -f setup_concurrency=20 \
+  -f load_concurrency=128 -f spread_seconds=30 -f duplicate_count=100
+gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+The workflow performs exact cleanup in its final step. If the runner is
+canceled before that step, use the existing exact retained-load cleanup/abort
+workflow with the same load run ID before starting another run. Do not expose
+the manifest, cookies or CSRF material in an artifact or log.
+
+At each run record attempted/completed requests, p50/p95/p99, status and
+timeout counts, Cloudflare diagnostic headers, server observer pressure,
+PostgreSQL pool waits/query pressure, and cleanup counts. Repeat the same
+fixture size with `read-mix` separately; do not combine its read latency with
+vote-write latency.
+
 ### Retained production load and exact cleanup
 
 The live matrix is a manual operator gate. It creates approximately 10,000
@@ -171,7 +222,9 @@ The workflow supports `profile=matrix`, `profile=read-mix` and
 data-volume/workflow run. The read-mix profile is the simultaneous current
 page-read benchmark. The write-burst profile uses the server-known Ready
 Check window and measures vote writes; it does not create background
-tournament traffic.
+tournament traffic. These profiles execute their generator on the production
+VPS and are therefore origin-local diagnostics, not the public capacity gate;
+use the external workflow above for public Cloudflare measurements.
 
 The detailed reports remain on the VPS under
 `/opt/oldsparky/platform/shared/production-retained-matrix/gha-<load-run-id>/`
