@@ -707,6 +707,7 @@ async def prepare_ready_check_fixture(
     agenda_client: httpx.AsyncClient,
     sse_capacity_token: str | None,
     agenda_open_rate_per_second: float = READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND,
+    issue_agenda: bool = True,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -856,12 +857,13 @@ async def prepare_ready_check_fixture(
         state_tickets[str(user["id"])] = state_ticket
         sse_open_at_by_user_id[str(user["id"])] = admission_open_epoch
 
-    with qa.phase("ready_check_admission_tickets"):
-        await qa.bounded_each_at_rate(
-            users,
-            issue_user_tickets,
-            rate_per_second=agenda_open_rate_per_second,
-        )
+    if issue_agenda:
+        with qa.phase("ready_check_admission_tickets"):
+            await qa.bounded_each_at_rate(
+                users,
+                issue_user_tickets,
+                rate_per_second=agenda_open_rate_per_second,
+            )
 
     qa.report["sse_fixture"] = {
         "profile": "global-ready-check-cohort",
@@ -871,9 +873,10 @@ async def prepare_ready_check_fixture(
         "agenda_requests": len(sse_tickets),
         "state_endpoint": "/ready-check/state",
         "scheduled_streams": len(sse_open_at_by_user_id),
-        "admission_open_at_min": min(sse_open_at_by_user_id.values()),
-        "admission_open_at_max": max(sse_open_at_by_user_id.values()),
+        "admission_open_at_min": min(sse_open_at_by_user_id.values(), default=None),
+        "admission_open_at_max": max(sse_open_at_by_user_id.values(), default=None),
         "agenda_open_rate_per_second": agenda_open_rate_per_second,
+        "agenda_deferred": not issue_agenda,
         "fixture_origin": str(fixture_client.base_url),
         "agenda_origin": str(agenda_client.base_url),
     }

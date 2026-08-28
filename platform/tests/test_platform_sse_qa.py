@@ -518,7 +518,8 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("platform_recover_retained_browser_report.py", cleanup)
         self.assertIn('--mode "$recovery_profile"', cleanup)
         self.assertIn('chmod 0700 -- "$run_root"', cleanup)
-        self.assertIn("if SCRIPT_PATH in args and run_id in args:", abort)
+        self.assertIn("any(path in args for path in SCRIPT_PATHS)", abort)
+        self.assertIn("platform_production_distributed_ready_check_qa.sh", abort)
         self.assertIn("ABORT_EVIDENCE_EXPORT=", abort)
         self.assertIn("server-observability.log", abort)
 

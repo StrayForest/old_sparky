@@ -14,7 +14,10 @@ import subprocess
 import time
 
 
-SCRIPT_PATH = "/root/old_sparky/platform/tools/platform_production_retained_load_matrix_qa.sh"
+SCRIPT_PATHS = {
+    "/root/old_sparky/platform/tools/platform_production_retained_load_matrix_qa.sh",
+    "/root/old_sparky/platform/tools/platform_production_distributed_ready_check_qa.sh",
+}
 LOCK_PATH = "/run/lock/oldsparky-retained-load-matrix.lock"
 CONFIRMATION = "ABORT-PRODUCTION-RETAINED-LOAD"
 TRUSTED_REPO_ROOT = "/root/old_sparky"
@@ -51,7 +54,7 @@ def exact_roots(run_id: str) -> set[int]:
     roots: set[int] = set()
     for pid in all_process_ids():
         args = cmdline(pid)
-        if SCRIPT_PATH in args and run_id in args:
+        if any(path in args for path in SCRIPT_PATHS) and run_id in args:
             roots.add(pid)
     return roots
 
@@ -144,6 +147,13 @@ def export_abort_evidence(run_id: str, snapshot: str) -> Path:
     for name in evidence_names:
         source = run_root / name
         destination = export_dir / name
+        if source.is_file() and not source.is_symlink():
+            shutil.copy2(source, destination)
+            os.chmod(destination, 0o600)
+    distributed_root = run_root / "distributed"
+    for name in ("control.json", "event-triggered.json", "distributed-report.json", "matrix-summary.json"):
+        source = distributed_root / name
+        destination = export_dir / f"distributed-{name}"
         if source.is_file() and not source.is_symlink():
             shutil.copy2(source, destination)
             os.chmod(destination, 0o600)
