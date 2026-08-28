@@ -119,6 +119,23 @@ shopt -s nullglob
 summaries=("$run_root"/*/matrix-summary.json)
 shopt -u nullglob
 if (( ${#summaries[@]} != 1 )); then
+  # A coordinator can fail before publishing its cleanup inventory (for
+  # example during argument validation).  Treat that exact, root-owned run
+  # directory as a safe no-op after confirming no fixture/control evidence
+  # exists.  A published control or report always follows the manifest path
+  # below and still requires the full identity-checked cleanup.
+  if [[ ! -e "$run_root/distributed/control.json" \
+    && ! -e "$run_root/distributed/event-triggered.json" \
+    && ! -e "$run_root/distributed/distributed-report.json" \
+    && ! -e "$run_root/distributed/matrix-summary.json" ]]; then
+    if find "$run_root" -type l -print -quit | grep -q .; then
+      echo "The selected partial retained load run contains an unexpected symlink." >&2
+      exit 1
+    fi
+    rm -rf -- "$run_root"
+    echo "No distributed fixture inventory was published; removed the exact partial run root."
+    exit 0
+  fi
   profile_count=0
   recovery_profile=""
   for candidate_profile in browser-polling sse combined; do

@@ -102,7 +102,7 @@ def is_cloudflare_5xx(response: httpx.Response) -> bool:
     )
 
 
-def validate_numeric(value: str, *, name: str, minimum: int = 0, maximum: int = 10**9) -> int:
+def validate_numeric(value: str, *, name: str, minimum: int = 0, maximum: int = 10**12) -> int:
     if not re.fullmatch(r"[0-9]+", value):
         raise ValueError(f"{name} must be numeric")
     parsed = int(value)

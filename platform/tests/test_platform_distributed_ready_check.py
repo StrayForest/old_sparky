@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from tools.platform_distributed_ready_check_sse import aggregate_shard_markers, latency_stats
+from tools.platform_distributed_ready_check_sse import (
+    aggregate_shard_markers,
+    latency_stats,
+    validate_numeric,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +45,9 @@ class DistributedReadyCheckHarnessTests(unittest.TestCase):
             latency_stats([1.0, 2.0, 3.0, 4.0]),
             {"count": 4, "p50": 2.5, "p95": 3.85, "p99": 3.97, "max": 4.0},
         )
+
+    def test_accepts_current_github_run_id_range(self) -> None:
+        self.assertEqual(validate_numeric("33159181256", name="run_id"), 33159181256)
 
     def test_workflow_keeps_external_shards_and_production_cap_guarded(self) -> None:
         workflow = (
