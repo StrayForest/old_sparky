@@ -4913,7 +4913,11 @@ async def vote_deadlock_ready_check(
             if starts_at is not None
             else None
         )
-        logger.info(
+        # Successful votes are represented by the authoritative response and
+        # request metrics. Keep the per-vote diagnostic available for focused
+        # debugging without turning a normal burst into thousands of INFO
+        # journal records.
+        logger.debug(
             "ready_vote outcome=%s tournament=%s user=%s relative_ms=%s",
             outcome,
             tournament.slug,
