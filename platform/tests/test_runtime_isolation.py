@@ -72,7 +72,7 @@ class RuntimeIsolationTests(unittest.TestCase):
                 unit,
             )
 
-    def test_api_unit_has_descriptor_budget_for_long_lived_streams(self) -> None:
+    def test_api_unit_has_descriptor_budget(self) -> None:
         unit = (PLATFORM_ROOT / "deploy/systemd/deadlock-api.service").read_text()
         self.assertIn("LimitNOFILE=65535\n", unit)
 

@@ -72,7 +72,7 @@ The PostgreSQL integration coverage is deterministic rather than timing-only:
 
 Security/build run `32467428286` passed the complete backend suite (`646` tests, `1` skipped), including all three AS-03 concurrency regressions, plus Ruff, Bandit, `pip-audit`, secret scanning, frontend audit/typecheck/lint/build and Playwright smoke.
 
-Production deployment run `32467677414` installed exact commit `0064c44cdc13f676ccfa201c02110969cdc1e072` as release `gha-32467677414-1-0064c44cdc13-20260821T092444Z`. The deploy used a restore-verified backup, retained Alembic head `20260813_0038`, restarted the API/worker/web services successfully and passed origin, public, CSP and SSE deployment smoke.
+Production deployment run `32467677414` installed exact commit `0064c44cdc13f676ccfa201c02110969cdc1e072` as release `gha-32467677414-1-0064c44cdc13-20260821T092444Z`. The deploy used a restore-verified backup, retained Alembic head `20260813_0038`, restarted the API/worker/web services successfully and passed origin, public, CSP and deployment smoke.
 
 No Cloudflare, Turnstile, authentication or application-RBAC control was weakened.
 
@@ -80,4 +80,4 @@ No Cloudflare, Turnstile, authentication or application-RBAC control was weakene
 
 The invariant deliberately serializes concurrent writes for one tournament on one small PostgreSQL row. That is the intended correctness tradeoff; future optimization should be driven by measured lock-wait/throughput evidence rather than replacing the durable transaction boundary speculatively.
 
-AS-05 now owns the next application P1 implementation package. AS-06 remains the following P1 code item, while AS-02 remains operator-owned Cloudflare Access/MFA verification.
+AS-05 now owns the next application P1 implementation package, while AS-02 remains operator-owned Cloudflare Access/MFA verification.

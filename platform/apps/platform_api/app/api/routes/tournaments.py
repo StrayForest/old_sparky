@@ -6222,7 +6222,7 @@ async def get_tournament_workspace(
 ) -> TournamentWorkspaceResponse | Response:
     # The schedule and this timestamp travel in one authoritative response.
     # The browser derives elapsed time from this anchor with performance.now()
-    # and never needs a Ready Check transport just to cross a known boundary.
+    # and never needs an extra request just to cross a known boundary.
     public_snapshot_candidate = bool(
         workspace_view == "detail"
         and participants_limit == 0

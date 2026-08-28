@@ -1039,11 +1039,10 @@ class SystemSampler:
                 "nginx_connections": read_tcp_connection_counts(80),
                 "api_connections": read_tcp_connection_counts(self._api_port),
                 "postgres_connections": read_tcp_connection_counts(5432),
-                # Keep this beside the existing socket counters so a load run
-                # can distinguish Redis fan-out/limiter pressure from
-                # PostgreSQL pool pressure without issuing extra Redis commands
-                # per sample. The baseline owns one Pub/Sub client per stream;
-                # the relay candidate intentionally does not.
+                # Keep Redis socket pressure beside the existing counters so a
+                # load run can distinguish cache/queue pressure from
+                # PostgreSQL pool pressure without issuing extra Redis
+                # commands per sample.
                 "redis_connections": read_tcp_connection_counts(6379),
                 "gunicorn": gunicorn_counts(processes),
                 "postgres_cpu_percent": round(postgres_cpu_percent, 2),

@@ -10,15 +10,14 @@ For the production baseline and immediate engineering target, read [`CURRENT.md`
 
 ### AS-18 — Hot-path capacity and backpressure
 
-**In progress.** Participant slots, idempotent join, non-locking ordinary
-ready votes, conditional ETag reads, bounded pools and priority queues are
-implemented in the reviewed branch. The implementation plan and destructive-data reset gate are
-recorded in [`archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md`](archive/as-18-hot-path-capacity-backpressure-plan-2026-08-24.md).
-The package covers join capacity slots, compact conditional workflow reads,
-bounded API/worker pools, Celery priority/backpressure and retained load
-evidence. Existing 32-shard ready votes and PostgreSQL workflow authority
-remain in force. Ready Check and bracket realtime transports are retired;
-passive grid changes are visible after manual reload.
+**Resolved.** Participant slots, idempotent join, non-locking ordinary ready
+votes, conditional ETag reads, bounded pools and priority queues are
+implemented in the reviewed branch. The package covers join capacity slots,
+compact conditional workflow reads, bounded API/worker pools, Celery
+priority/backpressure and retained load evidence. Existing 32-shard ready
+votes and PostgreSQL workflow authority remain in force. Ready Check uses the
+server-known timing contract, and passive grid changes are visible after
+manual reload.
 
 ### AS-17 — End-to-end release transaction and recovery
 
@@ -54,7 +53,6 @@ AS-03 tournament invite/capacity concurrency is resolved and archived with imple
 
 AS-05 public/private data-boundary work is resolved and archived with audit, public-contract tests and production-deployment evidence in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md).
 
-AS-06 SSE connection pressure is resolved and archived with layered application/Nginx limits, lease-release/crash-expiry regression coverage and production-deployment evidence in [`archive/as-06-sse-connection-pressure.md`](archive/as-06-sse-connection-pressure.md).
 
 AS-07 R2/CDN runtime media cleanup is resolved and archived with migration inventory/reconciliation evidence, regression coverage, CI verification and production deployment in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Physical removal of runtime-inert legacy URL columns and migration-only helpers remains a separate post-grace cleanup.
 

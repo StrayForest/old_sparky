@@ -133,16 +133,15 @@ grace period and explicit approval.
 
 ## Request-driven tournament updates
 
-Ready Check and the bracket grid use no SSE and no automatic polling. The
-tournament page receives its schedule and initial bracket in the ordinary HTTP
-workspace response. Ready Check transitions are local timer updates; the grid
-shows passive bracket changes after a manual page reload. Explicit bracket
-mutations may refetch the authoritative response needed to display the result.
+Ready Check and the bracket grid are request-driven. The tournament page
+receives its schedule and initial bracket in the ordinary HTTP workspace
+response. Ready Check transitions are local timer updates; the grid shows
+passive bracket changes after a manual page reload. Explicit bracket mutations
+may refetch the authoritative response needed to display the result.
 
 When investigating stale tournament data, inspect the ordinary API request
-latency/status logs and ask the user to reload the page. Do not restore or
-increase retired stream, lease, admission or polling settings. Historical SSE
-measurements remain in the AS-19/AS-20 documents for audit context only.
+latency/status logs and ask the user to reload the page. There is no background
+tournament update mechanism to restore or tune.
 
 Approved load generators may be listed in the exact-address setting
 `PLATFORM_LOAD_TEST_SOURCE_IPS`. The allowlist skips only per-source/IP
@@ -195,8 +194,8 @@ browser smoke run.
 
 The retained matrix is a 10,000-account data-volume test with bounded mutation
 concurrency. The separate `write-burst` profile measures real Ready Check vote
-POST contention after the server-known window; it creates no waiting-client
-transport. The `matrix` profile exercises the ordinary tournament workflow and
+POST contention after the server-known window; it creates no background request
+load while users wait. The `matrix` profile exercises the ordinary tournament workflow and
 manual/request-driven reads.
 
 The control account is passed at runtime and is never modified. The matrix
@@ -283,9 +282,9 @@ gh run watch <write-burst-load-run-id> --repo StrayForest/old_sparky --exit-stat
 The `write-burst` profile measures real Ready Check vote POST contention after
 the server-known window. It reports accepted/rejected votes, response latency,
 database pool wait, lock pressure, API/PostgreSQL CPU and connections, and
-duplicate/idempotency behavior. It creates no Ready Check SSE or polling
-traffic. Clean the exact load run with the same cleanup workflow before
-starting another production load.
+duplicate/idempotency behavior. It exercises only vote POSTs; the timer phase
+is entirely local. Clean the exact load run with the same cleanup workflow
+before starting another production load.
 
 Ready Check load testing uses the `write-burst` mode of
 `platform_production_qa.py`. The test creates marked

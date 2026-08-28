@@ -31,7 +31,7 @@ The remediation review covered:
 - OpenAPI response schemas and existing profile/participant regression tests;
 - the public privacy policy language for email and Steam identity.
 
-Adjacent findings were deliberately kept separate: tournament-scoped authenticated profile access was not converted into an anonymous public surface, worker exception exposure remains AS-11, and SSE connection pressure remains AS-06.
+Adjacent findings remain separately owned: tournament-scoped authenticated profile access was not converted into an anonymous public surface, and worker exception exposure remains AS-11.
 
 ## Decision
 
@@ -64,10 +64,10 @@ Security/build run `32470064442` passed the full supported contour for commit `4
 - frontend npm audit, typecheck, lint and production build;
 - Playwright web smoke.
 
-Production deployment run `32470310856` checked out exact commit `43f2dcf48dc94d60b5a6e5ff505b69113bf3e730`, built and checksum-verified immutable release `gha-32470310856-1-43f2dcf48dc9-20260821T095754Z`, installed it successfully and kept Alembic at `20260813_0038`. API, worker, web and Nginx were active after restart; origin and public deployment smoke, CSP checks and SSE smoke passed.
+Production deployment run `32470310856` checked out exact commit `43f2dcf48dc94d60b5a6e5ff505b69113bf3e730`, built and checksum-verified immutable release `gha-32470310856-1-43f2dcf48dc9-20260821T095754Z`, installed it successfully and kept Alembic at `20260813_0038`. API, worker, web and Nginx were active after restart; origin and public deployment smoke, CSP checks and deployment smoke passed.
 
 No Cloudflare, Turnstile, CSP, application RBAC or authentication control was weakened.
 
 ## Remaining scope
 
-AS-06 is the next repository-owned P1 implementation target and owns bounded SSE connection pressure, disconnect/timeout release and regression coverage. AS-02 remains operator-owned Cloudflare Access/MFA verification. AS-11 separately owns public worker exception text.
+AS-02 remains operator-owned Cloudflare Access/MFA verification. AS-11 separately owns public worker exception text.

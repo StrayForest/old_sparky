@@ -38,8 +38,9 @@ The retained matrix's 10,000 users are persisted scale-fixture accounts, not
 10,000 simultaneous request workers. Its `matrix` profile exercises ordinary
 tournament workflow writes and request-driven reads. Its `write-burst` profile
 measures Ready Check vote POST contention after the server-known window. The
-current product has no Ready Check or bracket SSE/polling profile; historical
-transport results remain in the archived AS-19/AS-20 records only.
+current product uses the ordinary workspace response and the write-burst
+vote profile; no background tournament-update profile is part of the test
+suite.
 
 The production retained-load group is a deliberate exception to the normal
 release gate: it is never scheduled, never part of ordinary CI, and never runs
@@ -57,6 +58,20 @@ Run deterministic checks through the GitHub security workflow on the reviewed
 `dev` ref:
 
 ```bash
+gh workflow run platform-live-launch.yml \
+  -f base_url=https://old-sparky.com \
+  -f provision=false
+```
+
+## Adding or moving a test
+
+1. State the production behavior and failure path the test protects.
+2. Assign one group in the test manifest/CI command; do not add a grep
+   exclusion to hide a failing deterministic test.
+3. For workflow, permission, migration or concurrency behavior, assert the
+   persisted final state and the negative path, not only the HTTP response.
+4. Update this document only when the runner contract changes. Record detailed
+   implementation evidence in an archive document after release.
 gh workflow run platform-security.yml \
   --repo StrayForest/old_sparky \
   --ref dev
@@ -141,13 +156,7 @@ gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 The workflow supports `profile=matrix` and `profile=write-burst`. The matrix
 profile is the ordinary retained data-volume/workflow run. The write-burst
 profile uses the server-known Ready Check window and measures vote writes; it
-does not create persistent client connections or polling traffic. The former
-browser-polling, `sse` and `combined` profiles are retired and are not current
-release gates.
-
-The historical Ready Check SSE staircase and compatibility-bracket transport
-measurements remain linked only as audit evidence. They must not be presented
-as current product behavior or a Ready Check capacity target.
+does not create background tournament traffic.
 
 The detailed reports remain on the VPS under
 `/opt/oldsparky/platform/shared/production-retained-matrix/gha-<load-run-id>/`
@@ -218,17 +227,3 @@ gh workflow run platform-live-launch.yml \
 After that one-time provisioning, run the public gate without provisioning:
 
 ```bash
-gh workflow run platform-live-launch.yml \
-  -f base_url=https://old-sparky.com \
-  -f provision=false
-```
-
-## Adding or moving a test
-
-1. State the production behavior and failure path the test protects.
-2. Assign one group in the test manifest/CI command; do not add a grep
-   exclusion to hide a failing deterministic test.
-3. For workflow, permission, migration or concurrency behavior, assert the
-   persisted final state and the negative path, not only the HTTP response.
-4. Update this document only when the runner contract changes. Record detailed
-   implementation evidence in an archive document after release.

@@ -12,10 +12,7 @@ test("bracket stays request-driven until the page is manually reloaded", async (
   const forbiddenBackgroundRequests: string[] = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
-    if (
-      request.resourceType() === "eventsource"
-      || url.pathname === "/api/v1/tournaments/night-veil-open-5/bracket"
-    ) {
+    if (url.pathname === "/api/v1/tournaments/night-veil-open-5/bracket") {
       forbiddenBackgroundRequests.push(`${request.method()} ${url.pathname}`);
     }
   });

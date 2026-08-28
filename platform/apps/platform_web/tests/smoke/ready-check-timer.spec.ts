@@ -6,8 +6,9 @@ const sessionCookie = {
   url: "http://127.0.0.1:3100",
 };
 
-function isRetiredReadyCheckTransport(pathname: string) {
-  return pathname.startsWith("/api/v1/ready-check/");
+function isReadyCheckRequest(pathname: string) {
+  return pathname.endsWith("/deadlock/ready-check")
+    || pathname.endsWith("/deadlock/ready-check/vote");
 }
 
 async function preparePage(page: Page, time: string, mode: string) {
@@ -25,7 +26,7 @@ async function preparePage(page: Page, time: string, mode: string) {
 function trackReadyCheckRequests(page: Page) {
   const requests: string[] = [];
   page.on("request", (request) => {
-    if (isRetiredReadyCheckTransport(new URL(request.url()).pathname)) {
+    if (isReadyCheckRequest(new URL(request.url()).pathname)) {
       requests.push(request.url());
     }
   });
@@ -70,7 +71,7 @@ test("crosses the exact starts_at boundary locally", async ({ page }) => {
   expect(requests).toHaveLength(0);
 });
 
-test("loads after starts_at with an active button and no Ready Check transport", async ({ page }) => {
+test("loads after starts_at with an active button and no Ready Check request", async ({ page }) => {
   await preparePage(page, "2026-06-07T15:30:20Z", "ready-check-timer-after-smoke");
   const requests = trackReadyCheckRequests(page);
 

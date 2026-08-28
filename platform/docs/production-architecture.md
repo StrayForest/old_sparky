@@ -19,18 +19,16 @@
   bounded free-slot inventory and allocates sparse slot rows on demand above
   the inventory window, so a large advertised capacity never materializes
   millions of rows.
-- Ready Check uses no realtime transport. The tournament workspace sends
+- Ready Check is time-based. The tournament workspace sends
   `ready_check_starts_at`, `ready_check_ends_at` and a UTC `server_time` anchor;
   the browser derives a server-relative monotonic timer and changes the button
   locally at the two boundaries. The vote POST remains server-authoritative
   and validates the schedule, participant, eligibility and workflow state;
-  delayed automation cannot reject a valid in-window vote. No Ready Check
-  leases, admission pool, polling fallback, ticket/proof or Cloudflare
-  capacity configuration exists. The bracket grid is also request-driven: the
-  initial workspace contains the full bracket, passive changes appear after a
-  manual page reload, and explicit bracket mutations may refetch their
-  authoritative response. Redis remains available to unrelated platform
-  services. See [the realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
+  delayed automation cannot reject a valid in-window vote. The bracket grid is
+  also request-driven: the initial workspace contains the full bracket, passive
+  changes appear after a manual page reload, and explicit bracket mutations may
+  refetch their authoritative response. Redis remains available to unrelated
+  platform services. See [the timing and bracket boundary ADR](adr/ready-check-and-bracket-boundary.md).
 - Public media rendering is one-way `R2 -> CDN -> browser`; the API does not proxy media object bytes or fall back to local-disk reads.
 
 ## Request and data flow
@@ -118,12 +116,10 @@ Daily maintenance restore-verifies DB backups before pruning known artifacts. Of
 ## Capacity boundary
 
 The current VPS has two CPU cores and about 3.7 GiB RAM. Ready Check and the
-bracket grid have no persistent connection or polling boundary: waiting users
-create no Ready Check network traffic, and the `starts_at`/`ends_at` transition
-creates no request. The replacement production QA is a short Ready vote burst
-that measures POST latency, accepted/rejected reasons, duplicate/idempotency
-behavior, database pool wait and locks, and API/PostgreSQL CPU and
-connections. Historical SSE/browser-polling measurements are retained only
-as audit evidence.
+bracket grid are request-driven: waiting users create no Ready Check network
+traffic, and the `starts_at`/`ends_at` transition creates no request. The
+replacement production QA is a short Ready vote burst that measures POST
+latency, accepted/rejected reasons, duplicate/idempotency behavior, database
+pool wait and locks, and API/PostgreSQL CPU and connections.
 
 Additional workers, exporters, transforms, poolers or nodes require retained CPU/RSS/queue/DB evidence against the operations targets.

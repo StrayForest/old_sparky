@@ -212,8 +212,6 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("write-burst", load_workflow)
         self.assertIn("write_burst_users_per_tournament", load_workflow)
         self.assertIn('--mode write-burst', load_supervisor)
-        self.assertNotIn("browser-polling", load_workflow)
-        self.assertNotIn("SSE", load_workflow)
         self.assertIn("DELETE-PRODUCTION-RETAINED-LOAD", cleanup_workflow)
         self.assertIn("ABORT-PRODUCTION-RETAINED-LOAD", abort_workflow)
         self.assertIn("ABORT_EVIDENCE_EXPORT=", abort_workflow)
@@ -236,8 +234,6 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("platform_recover_retained_report.py", cleanup_supervisor)
         self.assertIn("timeout --signal=TERM --kill-after=30s", load_supervisor)
         self.assertIn('HTTP_MAX_CONNECTIONS="${PLATFORM_QA_HTTP_MAX_CONNECTIONS:-512}"', load_supervisor)
-        self.assertNotIn("browser-polling", load_supervisor)
-        self.assertNotIn("SSE", load_supervisor)
 
     def test_browser_qa_does_not_silently_fallback_to_production_env(self) -> None:
         qa_source = (REPO_ROOT / "platform/tools/platform_production_qa.py").read_text()

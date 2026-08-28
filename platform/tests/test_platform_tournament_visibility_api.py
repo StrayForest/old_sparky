@@ -372,17 +372,17 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
             (default_organizer_workspace, lean_organizer_workspace),
         )
         for default_workspace, lean_workspace in workspace_pairs:
-            default_workspace_without_ticket = {
+            default_workspace_without_server_time = {
                 **default_workspace,
             }
-            lean_workspace_without_ticket = {
+            lean_workspace_without_server_time = {
                 **lean_workspace,
             }
-            default_workspace_without_ticket.pop("server_time", None)
-            lean_workspace_without_ticket.pop("server_time", None)
+            default_workspace_without_server_time.pop("server_time", None)
+            lean_workspace_without_server_time.pop("server_time", None)
             self.assertEqual(
-                lean_workspace_without_ticket,
-                {**default_workspace_without_ticket, "current_user": None},
+                lean_workspace_without_server_time,
+                {**default_workspace_without_server_time, "current_user": None},
             )
             self.assertEqual(
                 lean_workspace["tournament"],
@@ -393,8 +393,8 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
                 default_workspace["tournament"]["current_user_participant_status"],
             )
             self.assertEqual(
-                lean_workspace_without_ticket["bracket"],
-                default_workspace_without_ticket["bracket"],
+                lean_workspace_without_server_time["bracket"],
+                default_workspace_without_server_time["bracket"],
             )
             if lean_workspace["bracket"] is not None:
                 self.assertEqual(

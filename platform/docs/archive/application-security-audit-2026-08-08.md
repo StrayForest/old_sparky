@@ -27,7 +27,6 @@ policy, but remain tracked remediation work.
 | AS-03 | Medium / P1 | High | Invite-use and participant-capacity checks are not serialised | Open |
 | AS-04 | Medium / P1 | High | Inactive participants can satisfy private-workspace access checks | Open |
 | AS-05 | Medium / P1 | High | Contact and moderation fields cross the documented public-data boundary | Open |
-| AS-06 | Medium / P1 | High | Public SSE has no per-IP/global connection cap | Open |
 | AS-07 | Medium / P2 | High | Legacy upload/R2 read paths retain originals and buffer entire objects | Open; removal requires backup/approval |
 | AS-08 | Medium / P2 | High | Unknown public patch IDs can trigger synchronous external refresh work | Open |
 | AS-09 | Medium / P2 | Medium | Login protection has no account-wide counter across source IPs | Open |
@@ -48,7 +47,7 @@ exposure control and must never grant an application role.
 |---|---|---|---|---|---|---|
 | Public home, patches, public profiles and public tournament summary | Read | Read | Read | Read | Read | Read |
 | Invite-only tournament summary | No, unless explicitly public metadata | With valid invite/access | Read | Read | Read | Read |
-| Roster, bracket, matches and SSE | Public tournaments: read; invite-only: no | No unless joined | Read | Own tournament: read/manage | Read/manage | Read/manage |
+| Roster, bracket and matches | Public tournaments: read; invite-only: no | No unless joined | Read | Own tournament: read/manage | Read/manage | Read/manage |
 | Own account/profile/media/session | No | Own records only | Own records only | Own records only | Own records only | Own records only |
 | Join/leave, ready and captain workflow | No | Subject to workflow eligibility | Own participant actions | Participant actions plus own-tournament management | App rules plus admin operations | App rules plus admin operations |
 | Tournament configuration, invites, moderation, bracket/results | No | No | No | Own tournament only | Administrative scope | Administrative scope |
@@ -149,7 +148,7 @@ inactive-participant exception to the intended matrix is AS-04.
   `joined_participant_for_user` correctly excludes inactive states at `:1589`.
   Participant existence is treated as authorization in
   `ensure_tournament_workspace_visible` at `:983` and used by participant,
-  match, bracket and SSE reads around `:4559`, `:4925`, and `:4976`.
+  match and bracket reads around `:4559`, `:4925`, and `:4976`.
 - Impact: a former participant can continue reading private roster, match,
   bracket and event data.
 - Reproduction: join an invite-only tournament, change the participant to an
@@ -182,26 +181,6 @@ inactive-participant exception to the intended matrix is AS-04.
 - Recommendation: separate public contact opt-in from account email; default it
   to null; return a public participant DTO without moderation fields; migrate
   or obtain explicit consent for existing values; align the privacy notice.
-- Status: **Open**.
-
-### AS-06 — Unbounded public SSE connections
-
-- Severity / priority / confidence: **Medium / P1 / High**
-- CWE / OWASP: CWE-770 / A04 Insecure Design
-- Preconditions: an attacker can open many connections to a public tournament.
-- Evidence: public tournaments allow unauthenticated SSE at
-  `apps/platform_api/app/api/routes/tournaments.py:4976`; every stream creates
-  its own Redis client/pubsub in
-  `apps/platform_api/app/services/bracket_events.py:36`; Nginx keeps the
-  connection for one hour without `limit_conn` in
-  `deploy/nginx/deadlock-platform.conf:102`.
-- Impact: file descriptors, API workers and Redis connections can be exhausted,
-  reducing availability for normal traffic.
-- Reproduction: in pre-production only, ramp idle SSE connections from one
-  source IP and observe Nginx active connections, process FDs and Redis clients.
-- Recommendation: add per-IP and global connection caps at edge/origin, bound
-  stream lifetime and reconnect jitter, expose metrics, and consider one
-  process-level subscription with application fan-out.
 - Status: **Open**.
 
 ### AS-07 — Legacy upload and R2 read contour
@@ -377,11 +356,11 @@ inactive-participant exception to the intended matrix is AS-04.
   it in every affected location. Installer and smoke tests cover the pair.
 - Impact: clickjacking, MIME-sniffing and referrer protections were absent and
   CSP reports were never collected.
-- Reproduction: assert headers on HTML, auth, API, SSE, `_next/static`, assets
+- Reproduction: assert headers on HTML, auth, API, `_next/static`, assets
   and 404 responses through both origin/SNI and public contours.
 - Recommendation: the owner has superseded the former seven-day gate with a
   fail-closed, same-window sequence: nonce-capable Report-Only candidate; full
-  release and performance QA; automated tournament/bracket/SSE QA with 14
+  release and performance QA; automated tournament/bracket QA with 14
   short-lived root-created sessions handed only to a dedicated sandboxed
   non-root runner and exact cleanup; separate human auth and
   production Turnstile QA in ordinary Chrome with its own exact cleanup; at
@@ -391,11 +370,11 @@ inactive-participant exception to the intended matrix is AS-04.
   adding origins or unsafe sources.
 - Status: **Baseline finding resolved and verified live; nonce CSP enforcement
   active with explicitly waived acceptance evidence**. HTML, auth, API,
-  SSE, new Next static, cache-busted local assets and 404 responses carry the
+  new Next static, cache-busted local assets and 404 responses carry the
   shared policy. An older immutable Cloudflare asset `HIT` retains its
   pre-release metadata until dashboard purge/revalidation; this is tracked
   separately as edge-cache operational work. The owner waived the manual
-  auth/Turnstile gate, repeated enforcement browser/SSE gate and 30-minute and
+  auth/Turnstile gate, repeated enforcement browser gate and 30-minute and
   24-hour observation windows; none is recorded as passed.
 
 ### AS-16 — Public support recipient exposed to address harvesters
@@ -479,8 +458,8 @@ The following are negative findings, not permanent guarantees:
 
 ## Remediation order and release policy
 
-1. **Next narrow security release:** AS-01, AS-02, AS-03, AS-04, AS-05 and
-   AS-06, with concurrency and full role-matrix regression tests.
+1. **Next narrow security release:** AS-01, AS-02, AS-03, AS-04 and
+   AS-05, with concurrency and full role-matrix regression tests.
 2. **Subsequent bounded hardening:** AS-07 through AS-13, separated where data
    deletion, network policy or product/privacy decisions require approval.
 3. **Operational now:** verify AS-14 in Cloudflare and purge/revalidate stale
@@ -500,7 +479,7 @@ The following are negative findings, not permanent guarantees:
 - npm audit, TypeScript, ESLint, Next production build and affected Playwright
   smoke coverage.
 - Origin/SNI and public Cloudflare assertions for headers on HTML, auth, API,
-  SSE, Next static, local assets and 404 responses.
+  Next static, local assets and 404 responses.
 - The immutable release, restore-verified backup, Alembic head, service
   restart, preflight, expanded deploy smoke and public desktop/mobile/WebKit
   Playwright launch suite passed on 2026-08-08.
@@ -510,15 +489,15 @@ The following are negative findings, not permanent guarantees:
 - Fail-closed Report-Only candidate checks for the exact directive allowlist,
   one fresh 128-bit nonce per document, no CSP on non-documents, no nonce HTML
   caching and bounded/sanitized report delivery.
-- Complete release and performance QA plus automated tournament/bracket/SSE QA
+- Complete release and performance QA plus automated tournament/bracket QA
   through 14 short-lived root-created sessions handed only to the dedicated
   sandboxed non-root runner, followed by automatic exact-ID cleanup.
-- Candidate public Chromium/WebKit and automated tournament/bracket/SSE gates
+- Candidate public Chromium/WebKit and automated tournament/bracket gates
   passed with exact-ID cleanup. The manual registration/verification/login/
   logout/password lifecycle and production Turnstile gate was not run.
 - The enforcement artifact used the accepted candidate as its byte-identical
   dependency baseline and passed origin/SNI and public exact-mode smoke. The
-  repeated enforcement browser/SSE gate and 30-minute/24-hour observation were
+  repeated enforcement browser gate and 30-minute/24-hour observation were
   not run.
 - No `unsafe-inline`, `unsafe-eval` or new origin may be added merely to silence
   a report.

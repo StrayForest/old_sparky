@@ -310,9 +310,8 @@ through the normal session endpoint before using it.
 
 This contour covers tournament creation and joining, ready/assignment flow,
 bracket progression and the associated CSP/browser gate. Ready Check uses its
-server-known local timer and the bracket is request-driven; the contour opens
-no realtime connection or polling loop. It
-does not exercise registration, verification, login, password reset/change or
+server-known local timer, while passive bracket changes appear after a manual
+reload. It does not exercise registration, verification, login, password reset/change or
 Turnstile and therefore is not evidence for those controls. Its only auth
 mutation is bounded teardown logout for the short-lived fixture sessions.
 
