@@ -316,7 +316,6 @@ export type PlatformTournamentDeadlockReadyVote = {
 export type PlatformTournamentDeadlockReadyCheckState = {
   active_round: PlatformTournamentDeadlockReadyRound | null;
   latest_round: PlatformTournamentDeadlockReadyRound | null;
-  next_poll_after_ms?: number | null;
   state_version?: number | null;
 };
 

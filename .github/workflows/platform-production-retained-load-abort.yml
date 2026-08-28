@@ -124,10 +124,6 @@ jobs:
             copy_if_present qa-command.log
             copy_if_present server-observability.log
             copy_if_present matrix-summary.json
-            copy_if_present distributed-control.json
-            copy_if_present distributed-event-triggered.json
-            copy_if_present distributed-distributed-report.json
-            copy_if_present distributed-matrix-summary.json
           fi
           exit "$remote_status"
 

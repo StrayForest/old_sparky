@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,20 +10,14 @@ from uuid import uuid4
 import httpx
 
 from tools.platform_cleanup_retained_matrix import load_matrix_manifest
-from tools.platform_production_qa import response_diagnostics
 from tools.platform_sse_qa import (
     SSE_EVENT_TYPE,
     SSE_HOLD_MAX_SECONDS,
-    READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND,
     NormalApiMetrics,
     SseMetrics,
     _close_sse_stream_context,
     combined_profile_timeout_seconds,
-    consume_sse_connection,
     max_sse_open_timeout_seconds,
-    plateau_probe_count,
-    ready_check_fixture_schedule,
-    sse_open_delay_seconds,
     summary,
 )
 
@@ -33,51 +26,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class PlatformSseQaTests(unittest.TestCase):
-    def test_unexpected_response_diagnostics_keep_edge_headers_and_redact_secrets(self) -> None:
-        response = httpx.Response(
-            503,
-            headers={
-                "server": "cloudflare",
-                "cf-ray": "ray-test-SIN",
-                "cf-cache-status": "BYPASS",
-                "retry-after": "30",
-                "x-debug-token": "must-not-leak",
-                "set-cookie": "session=secret",
-            },
-            content=b"<html>Rate Limited</html>",
-        )
-
-        diagnostics = response_diagnostics(
-            response,
-            method="POST",
-            path="/deadlock/ready-check/start?ticket=secret",
-        )
-
-        self.assertEqual(diagnostics["status"], 503)
-        self.assertEqual(diagnostics["headers"]["cf-ray"], "ray-test-SIN")
-        self.assertEqual(diagnostics["headers"]["retry-after"], "30")
-        self.assertEqual(diagnostics["headers"]["x-debug-token"], "<redacted>")
-        self.assertEqual(diagnostics["headers"]["set-cookie"], "<redacted>")
-        self.assertNotIn("secret", diagnostics["path"])
-        self.assertEqual(diagnostics["body"], "<html>Rate Limited</html>")
-
-    def test_ready_check_fixture_window_covers_paced_agenda_setup(self) -> None:
-        now = datetime(2026, 1, 1, tzinfo=UTC)
-        schedule = ready_check_fixture_schedule(
-            now=now,
-            user_count=10_000,
-            agenda_open_rate_per_second=READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND,
-        )
-
-        self.assertEqual(
-            schedule["ready_check_starts_at"] - now,
-            timedelta(seconds=1_000),
-        )
-        self.assertGreater(
-            schedule["ready_check_starts_at"],
-            now + timedelta(seconds=10_000 / READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND),
-        )
-
     def test_normal_api_metrics_keep_kind_and_latency_accounting(self) -> None:
         metrics = NormalApiMetrics()
         metrics.record_success(status_code=200, elapsed_ms=12.0, kind="workspace")
@@ -111,7 +59,6 @@ class PlatformSseQaTests(unittest.TestCase):
         metrics.response_status(429)
         metrics.response_status(429)
         metrics.mark("events", 3)
-        metrics.mark("resyncs", 2)
         metrics.connect_latencies.extend([1.0, 2.0])
         metrics.event_latencies.extend([3.0, 5.0, 7.0])
 
@@ -125,7 +72,6 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(result["response_statuses"], {"429": 2})
         self.assertEqual(result["response_error_samples"], [])
         self.assertEqual(result["events"], 3)
-        self.assertEqual(result["resyncs"], 2)
         self.assertEqual(result["connected_percent"], 50.0)
         self.assertEqual(result["connect_latency_ms"]["p95"], 1.95)
         self.assertAlmostEqual(result["event_delivery_latency_ms"]["p99"], 6.96)
@@ -153,8 +99,6 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(samples[0]["body"], '{"detail":"pool timeout"}')
         self.assertEqual(samples[0]["cf_ray"], "abc123-SIN")
         self.assertEqual(samples[0]["cf_cache_status"], "DYNAMIC")
-        self.assertEqual(samples[0]["headers"]["cf-ray"], "abc123-SIN")
-        self.assertIn("captured_at", samples[0])
 
     def test_open_timeout_is_reported_as_polling_fallback_signal(self) -> None:
         metrics = SseMetrics()
@@ -172,110 +116,11 @@ class PlatformSseQaTests(unittest.TestCase):
         self.assertEqual(max_sse_open_timeout_seconds("http://localhost:8010"), 60.0)
         self.assertEqual(max_sse_open_timeout_seconds("https://old-sparky.com"), 60.0)
 
-    def test_ready_check_open_delay_honors_signed_admission_slot(self) -> None:
-        self.assertEqual(
-            sse_open_delay_seconds(
-                index=0,
-                open_rate_per_second=25,
-                scheduled_open_at=130.0,
-                now_epoch=100.0,
-            ),
-            30.0,
-        )
-        self.assertEqual(
-            sse_open_delay_seconds(
-                index=100,
-                open_rate_per_second=25,
-                scheduled_open_at=101.0,
-                now_epoch=100.0,
-            ),
-            4.0,
-        )
-
     def test_qa_hold_can_prove_stream_lifetime_beyond_old_rotation_boundary(self) -> None:
         self.assertGreater(SSE_HOLD_MAX_SECONDS, 600.0)
 
-    def test_explicit_capacity_plateau_always_gets_n_plus_ten_probe(self) -> None:
-        self.assertEqual(
-            plateau_probe_count(capacity_limit=3_000, connection_count=3_000),
-            10,
-        )
-        self.assertEqual(
-            plateau_probe_count(capacity_limit=15_000, connection_count=15_000),
-            10,
-        )
-        self.assertEqual(
-            plateau_probe_count(capacity_limit=3_000, connection_count=2_999),
-            0,
-        )
-        self.assertEqual(
-            plateau_probe_count(capacity_limit=0, connection_count=3_000),
-            0,
-        )
-
 
 class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
-    async def test_initial_sse_open_timeout_fails_closed_without_retry_loop(self) -> None:
-        class SlowContext:
-            async def __aenter__(self):
-                await asyncio.sleep(10)
-                return httpx.Response(200)
-
-            async def __aexit__(self, *_args) -> None:
-                return None
-
-        class SlowClient:
-            def stream(self, *_args, **_kwargs):
-                return SlowContext()
-
-        class Qa:
-            api_origin = "https://old-sparky.com"
-            request_origin = "https://old-sparky.com"
-            session_cookie_name = "platform_session"
-            current_phase = "test"
-            session_tokens_by_user_id = {"user-1": "session-token"}
-
-        metrics = SseMetrics()
-        attempts_finished = asyncio.Event()
-        attempt_count = 0
-
-        async def mark_attempt_finished() -> None:
-            nonlocal attempt_count
-            attempt_count += 1
-            attempts_finished.set()
-
-        async def hold_deadline_after_barrier(*_args):
-            raise AssertionError("initial timeout must not enter the hold phase")
-
-        started = asyncio.get_running_loop().time()
-        await consume_sse_connection(
-            Qa(),
-            SlowClient(),
-            metrics,
-            user={"id": "user-1"},
-            tournament_slug="unused",
-            sse_ticket=None,
-            sse_ticket_by_user_id=None,
-            sse_scope="bracket",
-            duration_seconds=1.0,
-            reconnect_cycles=3,
-            open_gate=asyncio.Semaphore(1),
-            open_timeout_seconds=0.01,
-            open_delay_seconds=0.0,
-            sse_capacity_token=None,
-            all_attempts_done=asyncio.Event(),
-            mark_attempt_finished=mark_attempt_finished,
-            hold_deadline_after_barrier=hold_deadline_after_barrier,
-            raw_sse_transport=False,
-        )
-
-        self.assertLess(asyncio.get_running_loop().time() - started, 1.0)
-        self.assertTrue(attempts_finished.is_set())
-        self.assertEqual(attempt_count, 1)
-        self.assertEqual(metrics.counters["connection_attempts"], 1)
-        self.assertEqual(metrics.counters["open_timeouts"], 1)
-        self.assertEqual(metrics.counters["fallback_polling_eligible"], 1)
-
     async def test_timed_out_http_context_close_is_bounded(self) -> None:
         class SlowContext:
             async def __aexit__(self, *_args) -> None:
@@ -447,21 +292,12 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(profile, workflow)
         self.assertIn("platform_sse_qa.py", supervisor)
         self.assertIn('sse_setup_concurrency=20', supervisor)
-        self.assertIn('sse_setup_concurrency=4', supervisor)
-        self.assertIn('if [[ "$sse_scope" == "ready-check" ]]', supervisor)
         self.assertIn('--concurrency "$sse_setup_concurrency"', supervisor)
         self.assertIn('--http-timeout 10', supervisor)
         self.assertIn('--request-origin "$EXPECTED_ORIGIN"', supervisor)
-        self.assertIn('--fixture-origin "$fixture_origin"', supervisor)
-        self.assertIn('sse_fixture_origin_mode=public', supervisor)
-        self.assertIn('sse_fixture_origin_mode', workflow)
         self.assertIn('--sse-open-timeout "$sse_open_timeout"', supervisor)
         self.assertIn('--sse-open-rate "$sse_open_rate"', supervisor)
-        self.assertIn('--sse-capacity-limit "$sse_capacity_limit"', supervisor)
         self.assertIn('--sse-admission-mode "$sse_admission_mode"', supervisor)
-        self.assertIn('--sse-scope "$sse_scope"', supervisor)
-        self.assertIn('sse_scope=ready-check', supervisor)
-        self.assertIn('sse_scope', workflow)
         self.assertIn("sse_duration <= 900", supervisor)
         self.assertIn('sse_origin="http://127.0.0.1:8010"', supervisor)
         self.assertIn('--control-email "$control_email"', supervisor)
@@ -473,15 +309,6 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('mode="sse"', sse_source)
         self.assertIn('default="ticket"', sse_source)
         self.assertIn('issue_public_sse_admission_ticket', sse_source)
-        self.assertIn('prepare_ready_check_fixture', sse_source)
-        self.assertIn('agenda_client=public_client', sse_source)
-        self.assertIn('fixture_origin = args.fixture_origin or args.origin', sse_source)
-        self.assertIn('bounded_each_at_rate', sse_source)
-        self.assertIn('READY_CHECK_AGENDA_OPEN_RATE_PER_SECOND = 25.0', sse_source)
-        self.assertIn('"/ready-check/events"', sse_source)
-        self.assertIn('"/ready-check/state"', sse_source)
-        self.assertIn('probe_ready_check_overflow', sse_source)
-        self.assertIn('"ready-check-ticket"', sse_source)
         self.assertIn('scale_users=requested_users', sse_source)
         self.assertIn('"max_subscribers_reported"', sse_source)
         self.assertIn('"publisher": sse.get("publisher")', sse_source)
@@ -493,9 +320,6 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SSE_RECONNECT_MAX_BACKOFF_SECONDS", sse_source)
         self.assertIn("secrets.randbelow(1_000_000)", sse_source)
         self.assertIn("fallback_polling_eligible", sse_source)
-        self.assertIn('"resyncs": metrics.get("resyncs")', sse_source)
-        self.assertIn("plateau_probe", sse_source)
-        self.assertIn("SSE_QA_GLOBAL_LIMIT_MAX", sse_source)
         self.assertIn("fatal_traceback", sse_source)
         self.assertIn("SSE_HOLD_MAX_SECONDS = 900.0", sse_source)
         self.assertIn("performance_collection_error", sse_source)
@@ -518,8 +342,7 @@ class PlatformSseQaAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("platform_recover_retained_browser_report.py", cleanup)
         self.assertIn('--mode "$recovery_profile"', cleanup)
         self.assertIn('chmod 0700 -- "$run_root"', cleanup)
-        self.assertIn("any(path in args for path in SCRIPT_PATHS)", abort)
-        self.assertIn("platform_production_distributed_ready_check_qa.sh", abort)
+        self.assertIn("if any(path in args for path in SCRIPT_PATHS) and run_id in args:", abort)
         self.assertIn("ABORT_EVIDENCE_EXPORT=", abort)
         self.assertIn("server-observability.log", abort)
 

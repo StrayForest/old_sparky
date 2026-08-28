@@ -124,10 +124,9 @@ if (( ${#summaries[@]} != 1 )); then
   # directory as a safe no-op after confirming no fixture/control evidence
   # exists.  A published control or report always follows the manifest path
   # below and still requires the full identity-checked cleanup.
-  if [[ ! -e "$run_root/distributed/control.json" \
-    && ! -e "$run_root/distributed/event-triggered.json" \
-    && ! -e "$run_root/distributed/distributed-report.json" \
-    && ! -e "$run_root/distributed/matrix-summary.json" ]]; then
+  if [[ ! -e "$run_root/control.json" \
+    && ! -e "$run_root/event-triggered.json" \
+    && ! -e "$run_root/matrix-summary.json" ]]; then
     if find "$run_root" -type l -print -quit | grep -q .; then
       echo "The selected partial retained load run contains an unexpected symlink." >&2
       exit 1
@@ -142,7 +141,7 @@ if (( ${#summaries[@]} != 1 )); then
     partial_export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
     rm -rf -- "$partial_export_dir"
     install -d -o root -g root -m 0700 "$partial_export_dir"
-    printf '%s\n' "No distributed fixture inventory was published; removed exact partial run root: $run_root" \
+    printf '%s\n' "No fixture inventory was published; removed exact partial run root: $run_root" \
       > "$partial_export_dir/cleanup.log"
     printf '%s\n' '{"ok":true,"markers":0,"users_deleted":0,"tournaments_deleted":0,"control_account_preserved":true,"partial_run_root_removed":true}' \
       > "$partial_export_dir/cleanup-summary.json"
@@ -153,12 +152,12 @@ if (( ${#summaries[@]} != 1 )); then
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$partial_export_dir/cleanup-summary.json"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXIT_CODE=0\n'
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1\n'
-    echo "No distributed fixture inventory was published; removed the exact partial run root."
+    echo "No fixture inventory was published; removed the exact partial run root."
     exit 0
   fi
   profile_count=0
   recovery_profile=""
-  for candidate_profile in browser-polling sse combined; do
+  for candidate_profile in browser-polling write-burst sse combined; do
     if [[ -d "$run_root/$candidate_profile" ]]; then
       profile_count=$((profile_count + 1))
       recovery_profile="$candidate_profile"

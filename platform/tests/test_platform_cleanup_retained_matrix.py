@@ -78,42 +78,29 @@ class RetainedMatrixManifestTests(unittest.TestCase):
                 user_ids={candidate.organizer_user_id},
             )
 
-    def test_ready_check_timeout_recovery_requires_exact_marker_description(self) -> None:
+    def test_write_burst_timeout_recovery_requires_marker_and_synthetic_owner(self) -> None:
         marker = "preprod260824120000abcd"
         user_id = str(uuid4())
+        row = {"marker": marker, "tournament_ids": []}
         candidate = type(
             "Candidate",
             (),
             {
                 "id": str(uuid4()),
-                "description": f"Ready Check SSE profile {marker}.",
+                "description": f"Write burst profile {marker} ready_5s.",
                 "organizer_user_id": user_id,
             },
         )()
-        row = {"marker": marker, "tournament_ids": []}
 
-        recovered = cleanup._merge_recovered_browser_tournaments(
+        recovered = cleanup._merge_recovered_marker_tournaments(
             row,
             [candidate],
             user_ids={user_id},
+            mode="write-burst",
         )
 
         self.assertEqual(recovered, {candidate.id})
         self.assertEqual(row["tournament_ids"], [candidate.id])
-        self.assertTrue(
-            cleanup._tournament_description_matches(
-                candidate.description,
-                marker=marker,
-                mode="sse",
-            )
-        )
-        self.assertFalse(
-            cleanup._tournament_description_matches(
-                f"Ready Check SSE profile {marker} unexpected.",
-                marker=marker,
-                mode="sse",
-            )
-        )
 
     def _write_manifest(self, root: Path, report_path: Path) -> Path:
         marker = "preprod260824120000abcd"

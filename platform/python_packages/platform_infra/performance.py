@@ -15,7 +15,6 @@ from python_packages.platform_infra.config import get_settings
 
 logger = logging.getLogger("platform.performance")
 QA_PHASE_RE = re.compile(r"^(?:write|browser|scale|qa)_[a-z0-9_]{1,63}$")
-READY_CHECK_AGENDA_PATH = "/api/v1/ready-check/agenda"
 
 
 @dataclass(slots=True)
@@ -213,23 +212,15 @@ class RequestPerformanceMiddleware:
         sql_ms = metrics.sql_time_seconds * 1000
         route = scope.get("route")
         route_path = getattr(route, "path", None) or metrics.path
-        is_ready_check_agenda = (
-            metrics.path == READY_CHECK_AGENDA_PATH
-            or route_path == READY_CHECK_AGENDA_PATH
-            or str(route_path).endswith("/ready-check/agenda")
-        )
         should_log = (
-            is_ready_check_agenda
-            or (
-                (
-                    settings.platform_perf_log_mutations
-                    and metrics.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
-                )
-                or total_ms >= settings.platform_perf_slow_request_ms
-                or sql_ms >= settings.platform_perf_slow_db_ms
-                or metrics.sql_query_count >= settings.platform_perf_sql_count_threshold
-                or metrics.pool_checkout_wait_seconds >= 0.1
+            (
+                settings.platform_perf_log_mutations
+                and metrics.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
             )
+            or total_ms >= settings.platform_perf_slow_request_ms
+            or sql_ms >= settings.platform_perf_slow_db_ms
+            or metrics.sql_query_count >= settings.platform_perf_sql_count_threshold
+            or metrics.pool_checkout_wait_seconds >= 0.1
         )
         if not should_log:
             return

@@ -41,9 +41,9 @@ ORGANIZER_MODERATED_PARTICIPANT_STATUSES = frozenset(
 )
 PARTICIPANT_RESTORATION_STATUSES = frozenset({"registration_open", "registration_closed"})
 SOLO_TOURNAMENT_FORMAT = "solo"
-# Ready Check admission proofs are bounded to this supported workflow window.
-# The admission layer adds a small clock-skew allowance and the browser can
-# refresh a multi-check stream proof before its bounded horizon expires.
+# Ready Check timestamps are bounded to this supported workflow window. The
+# browser receives the schedule in the page payload and the server validates
+# the same window when a vote is submitted.
 READY_CHECK_MAX_DURATION_SECONDS = 24 * 60 * 60
 
 

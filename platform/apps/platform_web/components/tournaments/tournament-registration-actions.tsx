@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useReadyCheckAgendaRefresh, useReadyCheckState } from "@/components/ready-check/ready-check-provider";
+import { currentReadyCheckRound, useReadyCheckPhase } from "@/components/ready-check/ready-check-timer";
 import { useI18n } from "@/components/i18n-provider";
 import { leaveTournament, registerForTournament, setTournamentReadyCheckChoice } from "@/lib/platform-api";
 import { isActiveParticipantStatus } from "@/lib/tournament-model";
@@ -30,17 +30,17 @@ export function TournamentRegistrationActions({
   onReadyChoiceChange
 }: TournamentRegistrationActionsProps) {
   const { t } = useI18n();
-  const liveReadyCheckState = useReadyCheckState(tournament.slug);
-  const refreshReadyCheckAgenda = useReadyCheckAgendaRefresh();
   const initialRegistration = useMemo(
     () => currentUserRegistration(tournament, actorUserId),
     [actorUserId, tournament]
   );
   const initialReadyCheckChoice = useMemo(
-    () => tournament.readyCheckState?.active_round?.current_user_choice
-      ?? tournament.readyCheckState?.latest_round?.current_user_choice
+    () => currentReadyCheckRound(
+      tournament.readyCheckState,
+      tournament.schedule?.checkInStartsAt,
+    )?.current_user_choice
       ?? (initialRegistration?.checkInStatus === "checked_in" || initialRegistration?.status === "checked_in" ? "yes" : null),
-    [initialRegistration, tournament.readyCheckState]
+    [initialRegistration, tournament.readyCheckState, tournament.schedule?.checkInStartsAt]
   );
   const [state, setState] = useState<StepState>({
     registration: initialRegistration,
@@ -50,21 +50,17 @@ export function TournamentRegistrationActions({
     errorStep: null,
     removedRegistrationId: null
   });
-  const confirmationEndsAtMs = timestampMs(tournament.schedule?.checkInEndsAt);
-  const [nowMs, setNowMs] = useState<number | null>(null);
+  const readyCheckPhase = useReadyCheckPhase(
+    tournament.serverTime,
+    tournament.schedule?.checkInStartsAt,
+    tournament.schedule?.checkInEndsAt,
+  );
+  const [readyCheckTimerMounted, setReadyCheckTimerMounted] = useState(false);
 
   useEffect(() => {
-    setNowMs(Date.now());
-    if (confirmationEndsAtMs === null) {
-      return;
-    }
-    const delay = confirmationEndsAtMs - Date.now();
-    if (delay <= 0) {
-      return;
-    }
-    const timeoutId = window.setTimeout(() => setNowMs(Date.now()), delay + 25);
-    return () => window.clearTimeout(timeoutId);
-  }, [confirmationEndsAtMs]);
+    setReadyCheckTimerMounted(true);
+    return () => setReadyCheckTimerMounted(false);
+  }, []);
 
   useEffect(() => {
     setState((current) => {
@@ -99,18 +95,16 @@ export function TournamentRegistrationActions({
   }, [initialReadyCheckChoice, initialRegistration]);
 
   const registered = Boolean(state.registration);
-  const readyCheckActive = liveReadyCheckState
-    ? liveReadyCheckState.status === "active"
-    : tournament.readyCheckState?.active_round?.status === "active";
+  const readyCheckActive = readyCheckPhase === "active";
+  const currentRound = currentReadyCheckRound(
+    tournament.readyCheckState,
+    tournament.schedule?.checkInStartsAt,
+  );
   const readyCheckClosed = Boolean(
-    liveReadyCheckState?.status === "closed"
+    readyCheckPhase === "finished"
     || (
-    (nowMs !== null && confirmationEndsAtMs !== null && nowMs >= confirmationEndsAtMs)
-    || (
-      !readyCheckActive
-      && tournament.readyCheckState?.latest_round
-      && tournament.readyCheckState.latest_round.status !== "active"
-    )
+      currentRound
+      && currentRound.status !== "active"
     )
   );
   const checkedIn = state.readyCheckChoice === "yes";
@@ -176,7 +170,6 @@ export function TournamentRegistrationActions({
           removedRegistrationId: null
         });
     if (result) {
-      refreshReadyCheckAgenda();
       onRegistrationChange?.(result, previous);
     }
   }
@@ -215,7 +208,6 @@ export function TournamentRegistrationActions({
           removedRegistrationId: null
         });
     if (result) {
-      refreshReadyCheckAgenda();
       onRegistrationChange?.(null, previous);
     }
   }
@@ -284,7 +276,12 @@ export function TournamentRegistrationActions({
         </div>
       </div>
       <div className="arrow" />
-      <div className={`step ${checkedIn ? "done" : canToggleReady ? "active" : ""}`}>
+      <div
+        className={`step ${checkedIn ? "done" : canToggleReady ? "active" : ""}`}
+        data-testid="ready-check-step"
+        data-ready-check-phase={readyCheckPhase}
+        data-ready-check-timer-mounted={readyCheckTimerMounted ? "true" : undefined}
+      >
         {readyIsStatus ? (
           <div className="status-action">{readyActionLabel({
             checkedIn,
@@ -446,12 +443,4 @@ function scheduleLabel(tournament: TournamentDetail, field: "registrationClosesA
 
 function approximateScheduleLabel(tournament: TournamentDetail, field: "teamsFormAt"): string {
   return scheduleLabel(tournament, field).replace(" в ", " в ~");
-}
-
-function timestampMs(value: string | null | undefined): number | null {
-  if (!value) {
-    return null;
-  }
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) ? timestamp : null;
 }

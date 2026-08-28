@@ -82,6 +82,7 @@ type ApiRegistration = {
 
 type ApiTournamentWorkspace = {
   tournament: ApiTournamentDetail;
+  server_time: string;
   current_user?: PlatformUser | null;
   current_user_active_commitment?: {
     id: string;
@@ -274,28 +275,6 @@ export type TournamentCreatePayload = {
 export type TournamentInviteCodeAvailability = {
   code: string;
   available: boolean;
-};
-
-export type ReadyCheckAgendaItem = {
-  tournamentId: string;
-  slug: string;
-  readyCheckStartsAt: string;
-  readyCheckEndsAt: string;
-  admissionOpenAt: string;
-  admissionPriority: string;
-  admissionMode: "scheduled_sse" | "late_sse" | "polling";
-  stateTicket: string;
-};
-
-export type ReadyCheckAgenda = {
-  checks: ReadyCheckAgendaItem[];
-  sseTicket: string | null;
-  sseTicketExpiresAt: string | null;
-};
-
-export type ReadyCheckStateProbe = {
-  revision: number;
-  status: "waiting" | "active" | "closed";
 };
 
 const serverApiBaseUrl = process.env.PLATFORM_API_BASE_URL
@@ -768,6 +747,7 @@ export async function getTournamentWorkspace(
       registrations,
       workspace.bracket ? mapBracket(workspace.bracket) : null,
       {
+        serverTime: workspace.server_time,
         readyCheckState: workspace.ready_check ?? null,
         deadlockAssignment: assignmentState?.published_run ?? assignmentState?.latest_run ?? null,
         activeCommitment: activeCommitment
@@ -1084,128 +1064,6 @@ export async function setTournamentReadyCheckChoice(
   return await response.json() as PlatformTournamentDeadlockReadyVote;
 }
 
-export async function getTournamentReadyCheckState(
-  slug: string,
-  requestHeaders: HeadersInit = {}
-): Promise<PlatformTournamentDeadlockReadyCheckState | null> {
-  const headers = new Headers(requestHeaders);
-  headers.set("accept", "application/json");
-  try {
-    const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/deadlock/ready-check`, {
-      headers,
-      credentials: "include",
-      cache: "no-store"
-    });
-    if (!response.ok) {
-      return null;
-    }
-    return await response.json() as PlatformTournamentDeadlockReadyCheckState;
-  } catch {
-    return null;
-  }
-}
-
-export async function getReadyCheckAgenda(
-  signal?: AbortSignal,
-): Promise<ReadyCheckAgenda | null> {
-  try {
-    const response = await platformFetch(`${apiBaseUrl}/ready-check/agenda`, {
-      headers: { accept: "application/json" },
-      credentials: "include",
-      cache: "no-store",
-      signal,
-    });
-    if (!response.ok) {
-      return null;
-    }
-    const payload = await response.json() as {
-      checks?: Array<{
-        tournament_id?: string;
-        slug?: string;
-        ready_check_starts_at?: string;
-        ready_check_ends_at?: string;
-        admission_open_at?: string;
-        admission_priority?: string;
-        admission_mode?: string;
-        state_ticket?: string;
-      }>;
-      sse_ticket?: string | null;
-      sse_ticket_expires_at?: string | null;
-    };
-    const checks = (payload.checks ?? []).flatMap((item) => {
-      const admissionMode = item.admission_mode;
-      if (
-        !item.tournament_id
-        || !item.slug
-        || !item.ready_check_starts_at
-        || !item.ready_check_ends_at
-        || !item.admission_open_at
-        || !item.state_ticket
-        || !["scheduled_sse", "late_sse", "polling"].includes(admissionMode ?? "")
-      ) {
-        return [];
-      }
-      return [{
-        tournamentId: item.tournament_id,
-        slug: item.slug,
-        readyCheckStartsAt: item.ready_check_starts_at,
-        readyCheckEndsAt: item.ready_check_ends_at,
-        admissionOpenAt: item.admission_open_at,
-        admissionPriority: item.admission_priority ?? "scheduled",
-        admissionMode: admissionMode as ReadyCheckAgendaItem["admissionMode"],
-        stateTicket: item.state_ticket,
-      }];
-    });
-    return {
-      checks,
-      sseTicket: typeof payload.sse_ticket === "string" ? payload.sse_ticket : null,
-      sseTicketExpiresAt: typeof payload.sse_ticket_expires_at === "string"
-        ? payload.sse_ticket_expires_at
-        : null,
-    };
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw error;
-    }
-    return null;
-  }
-}
-
-export async function getReadyCheckStateProbe(
-  slug: string,
-  ticket: string,
-  signal?: AbortSignal,
-): Promise<ReadyCheckStateProbe | null> {
-  try {
-    const params = new URLSearchParams({ slug, ticket });
-    const response = await platformFetch(`${apiBaseUrl}/ready-check/state?${params.toString()}`, {
-      headers: { accept: "application/json" },
-      credentials: "include",
-      cache: "no-store",
-      signal,
-    });
-    if (!response.ok) {
-      return null;
-    }
-    const payload = await response.json() as { revision?: number; status?: string };
-    if (
-      !Number.isFinite(payload.revision)
-      || !["waiting", "active", "closed"].includes(payload.status ?? "")
-    ) {
-      return null;
-    }
-    return {
-      revision: Number(payload.revision),
-      status: payload.status as ReadyCheckStateProbe["status"],
-    };
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw error;
-    }
-    return null;
-  }
-}
-
 export async function getTournamentAutoAssignmentState(
   slug: string,
   requestHeaders: HeadersInit = {}
@@ -1386,16 +1244,18 @@ function mapTournamentDetail(
   registrations: Registration[],
   bracket: Bracket | null = null,
   workflow: {
+    serverTime: string;
     readyCheckState?: PlatformTournamentDeadlockReadyCheckState | null;
     deadlockAssignment?: PlatformTournamentDeadlockAutoAssignmentState["published_run"] | null;
     activeCommitment?: TournamentDetail["activeCommitment"];
-  } = {}
+  }
 ): TournamentDetail {
   const mappedBracket = bracket ?? emptyBracket(item.id, mapStatus(item.status));
   const teams = mappedBracket.teams;
 
   return {
     ...mapTournamentSummary(item),
+    serverTime: workflow.serverTime,
     description: item.description ?? "",
     visibility: normalizeVisibility(item.visibility),
     bracketType: "single_elimination",

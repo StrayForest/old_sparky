@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-27
+- Last reviewed: 2026-08-28
 
 ## Invariants
 
@@ -19,18 +19,17 @@
   bounded free-slot inventory and allocates sparse slot rows on demand above
   the inventory window, so a large advertised capacity never materializes
   millions of rows.
-- Ready Check SSE uses one layered global admission pool across tournaments:
-  Redis-backed application leases bind global, source and authenticated-user
-  concurrency, while Nginx retains an independent coarse source/global
-  connection ceiling. The root-mounted provider creates a critical stream only
-  for the visible matching tournament-detail route; unrelated pages and hidden
-  tabs consume no Ready Check stream. Ready Check admits at most one stream per
-  authenticated user in its own Redis namespace; the compatibility bracket
-  contour retains its separate four-per-user namespace and limit. The browser
-  uses no bracket SSE; bracket pages use a Redis-backed revision probe and
-  fetch the full bracket only after a revision change. Production Nginx routes
-  Ready Check SSE with buffering disabled so relay frames reach the browser
-  incrementally. See [the realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
+- Ready Check uses no realtime transport. The tournament workspace sends
+  `ready_check_starts_at`, `ready_check_ends_at` and a UTC `server_time` anchor;
+  the browser derives a server-relative monotonic timer and changes the button
+  locally at the two boundaries. The vote POST remains server-authoritative
+  and validates the schedule, participant, eligibility and workflow state;
+  delayed automation cannot reject a valid in-window vote. No Ready Check
+  leases, admission pool, polling fallback, ticket/proof or Cloudflare
+  capacity configuration exists. Generic/bracket SSE and Redis admission
+  remain available for bracket features, while the current bracket web view
+  uses a revision/status probe and fetches the full bracket after a revision
+  change. See [the realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
 - Public media rendering is one-way `R2 -> CDN -> browser`; the API does not proxy media object bytes or fall back to local-disk reads.
 
 ## Request and data flow
@@ -50,12 +49,12 @@ Browser
 Browser -> cdn.old-sparky.com -> Cloudflare cache -> public R2 variants
 ```
 
-The platform connects directly to PostgreSQL with explicit API, worker and SSE
-pool limits: the measured 10k browser-polling baseline reserves `2 x (16 + 0)`
-API connections, `2 x (2 + 0)` worker connections and `2 x 4` separate SSE
-authorization-pool connections within a 44-connection budget. This is a
-bounded increase, not unlimited overflow; add a database pooler only from new
-measured scaling evidence. High-volume optional-authenticated reads validate
+The platform connects directly to PostgreSQL with explicit API, worker and
+bracket-stream pool limits: the measured 10k browser-polling baseline reserves
+`2 x (16 + 0)` API connections, `2 x (2 + 0)` worker connections and `2 x 4`
+separate bracket-stream authorization-pool connections within a 44-connection
+budget. This is a bounded increase, not unlimited overflow; add a database
+pooler only from new measured scaling evidence. High-volume optional-authenticated reads validate
 the session in their request transaction but do not perform a second
 `last_seen_at` write transaction; that metadata is not an authorization
 decision and must not double the connection demand of a read burst.
@@ -94,15 +93,13 @@ FastAPI exposes no `/api/v1/uploads/*` media-serving route and has no uploads `S
 - Cookie mutations require application CSRF controls even behind Cloudflare.
 - Anonymous public response DTOs are explicit schema allowlists: account/contact email and Steam authentication identity do not cross the public-profile boundary, while participant moderation note, moderator identity and moderation timestamps are restricted to the organizer-management DTO.
 - Invite-only tournament workspace reads (`workspace`, roster, matches, bracket and bracket SSE admission) require active participant membership or explicit organizer/admin authority; retained `withdrawn`/`disqualified` participant rows are historical and grant no workspace access.
-- Ready Check SSE admission state is ephemeral Redis state. Admission fails
-  closed when that state cannot be consulted; normal termination releases the
-  lease immediately, and bounded lease expiry recovers capacity after abnormal
-  process/client termination. Ready Check and compatibility bracket user
-  leases use separate Redis namespaces. The signed Ready Check state probe
-  performs one Redis lookup and returns only revision/status. Ready Check
-  proofs end at the workflow boundary with a bounded maximum, and the agenda
-  exposes request-performance telemetry for duration, SQL/query pressure and
-  PostgreSQL pool wait.
+- Ready Check timing is carried by the authenticated/eligible tournament
+  workspace response and is not an authorization grant. The browser timer is
+  presentation-only; the vote transaction checks server time and all durable
+  eligibility/workflow rules, and the worker may remain responsible for
+  timeout/no-show and later workflow side effects. The explicit Ready Check
+  state read remains available for workspace, organizer/admin and recovery
+  flows, but it is not polled to discover a known timestamp.
 - R2, DB, mail, session and Turnstile secrets are backend-only and are not present in the web runtime environment.
 - The public media bucket and private backup bucket/tokens are separate.
 
@@ -122,22 +119,13 @@ Daily maintenance restore-verifies DB backups before pruning known artifacts. Of
 
 ## Capacity boundary
 
-The current VPS has two CPU cores and about 3.7 GiB RAM. Ready Check SSE
-application admission is currently capped at 3,000 streams globally, 32 per
-source address and 1 per authenticated user; the compatibility bracket SSE
-contour retains 4 per authenticated user. Nginx retains independent
-physical 10,240 source/global ceilings. The 10,000 value is a hard staged-load
-target only, not a production cap. Ready Check opens are dynamically spread
-using the measured safe 25 opens/sec rate, simultaneous demand and a bounded
-preparation window; late arrivals are admitted immediately when Redis capacity
-exists. Streams remain open only for checks inside their current admission
-windows, so a distant future check does not hold a global slot. After a Ready
-Check event the browser closes the critical stream, and overflow users use the
-tiny revision/status probe only from `T` onward. A healthy Ready Check stream
-suppresses that fallback probe; opening has a bounded handshake timeout and
-full-jitter recovery. Bracket pages use the same style of one-Redis-key
-revision probe, then fetch the full bracket only after a higher revision.
-These values are capacity safeguards, not product entitlements; change them
-only from retained public-path load/resource evidence.
+The current VPS has two CPU cores and about 3.7 GiB RAM. Ready Check has no
+connection or capacity boundary: waiting users create no Ready Check network
+traffic, and the `starts_at`/`ends_at` transition creates no request. The
+replacement production QA is a short Ready vote burst that measures POST
+latency, accepted/rejected reasons, duplicate/idempotency behavior, database
+pool wait and locks, and API/PostgreSQL CPU and connections. Generic bracket
+SSE retains its independent application/source/user ceilings and Nginx
+physical ceilings; change those only from retained public-path evidence.
 
 Additional workers, exporters, transforms, poolers or nodes require retained CPU/RSS/queue/DB evidence against the operations targets.

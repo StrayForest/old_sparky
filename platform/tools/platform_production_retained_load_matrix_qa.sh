@@ -34,8 +34,8 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# < 5 || $# > 22 )) || [[ "$1" != "$CONFIRMATION" ]]; then
-  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|sse|combined] [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-open-rate sse-capacity-limit sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local] [ticket|legacy] [bracket|ready-check] [public|origin-local fixture-origin]]" >&2
+if (( $# < 5 || $# > 19 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+  echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|browser-polling|write-burst|sse|combined] [write-burst-profile write-burst-users-per-tournament write-burst-time-scale] or [sse-connections sse-duration sse-open-concurrency sse-open-timeout sse-open-rate sse-reconnect-cycles sse-users-per-tournament sse-event-count sse-event-interval combined-polling-duration combined-polling-open-stagger [public|origin-local] [ticket|legacy]]" >&2
   exit 2
 fi
 
@@ -49,7 +49,6 @@ profile="${6:-matrix}"
 # receives an older positional invocation.  The script runs with nounset and
 # must still export a truthful summary rather than fail after the workload.
 sse_open_rate=0
-sse_capacity_limit=0
 sse_reconnect_cycles=0
 sse_users_per_tournament=500
 sse_event_count=3
@@ -58,84 +57,65 @@ combined_polling_duration=30
 combined_polling_open_stagger=300
 sse_origin_mode=public
 sse_admission_mode=ticket
-sse_scope=bracket
-sse_fixture_origin_mode=public
-# The controlled high-cap contour is explicitly invoked with
-# sse_scope=ready-check; the default remains the compatibility bracket scope.
+write_burst_profile=all
+write_burst_users_per_tournament=50
+write_burst_time_scale=1.0
 
 case "$profile" in
   matrix|browser-polling) ;;
+  write-burst)
+    write_burst_profile="${7:-all}"
+    write_burst_users_per_tournament="${8:-50}"
+    write_burst_time_scale="${9:-1.0}"
+    [[ "$write_burst_profile" == "all" || "$write_burst_profile" == "single-join" || "$write_burst_profile" == "single-ready" || "$write_burst_profile" == "multi-staggered" ]] || {
+      echo "Write-burst profile must be all, single-join, single-ready or multi-staggered." >&2
+      exit 1
+    }
+    [[ "$write_burst_users_per_tournament" =~ ^[1-9][0-9]{1,2}$ ]] && (( write_burst_users_per_tournament >= 14 && write_burst_users_per_tournament <= 500 )) || {
+      echo "Write-burst users per tournament must be between 14 and 500." >&2
+      exit 1
+    }
+    [[ "$write_burst_time_scale" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($write_burst_time_scale >= 0.01 && $write_burst_time_scale <= 10)}") == 1 )) || {
+      echo "Write-burst time scale must be between 0.01 and 10." >&2
+      exit 1
+    }
+    ;;
   sse|combined)
     sse_connections="${7:-128}"
     sse_duration="${8:-60}"
     sse_open_concurrency="${9:-256}"
     sse_open_timeout="${10:-5}"
-    if (( $# <= 18 )); then
-      # Accept the pre-capacity positional form for one release so an older
-      # operator workflow cannot shift reconnect/origin controls silently.
-      sse_reconnect_cycles="${11:-0}"
-      sse_users_per_tournament="${12:-500}"
-      sse_event_count="${13:-3}"
-      sse_event_interval="${14:-1}"
-      combined_polling_duration="${15:-30}"
-      combined_polling_open_stagger="${16:-300}"
-      sse_origin_mode="${17:-public}"
-      sse_admission_mode="${18:-ticket}"
-      sse_scope="${19:-bracket}"
-    else
-      sse_open_rate="${11:-0}"
-      sse_capacity_limit="${12:-0}"
-      sse_reconnect_cycles="${13:-0}"
-      sse_users_per_tournament="${14:-500}"
-      sse_event_count="${15:-3}"
-      sse_event_interval="${16:-1}"
-      combined_polling_duration="${17:-30}"
-      combined_polling_open_stagger="${18:-300}"
-      sse_origin_mode="${19:-public}"
-      sse_admission_mode="${20:-ticket}"
-      sse_scope="${21:-bracket}"
-      sse_fixture_origin_mode="${22:-public}"
-    fi
-    if [[ "$sse_scope" == "ready-check" && $# -lt 22 ]]; then
-      # Older direct invocations of the Ready Check profile get the safe
-      # split-transport default instead of sending fixture/control bursts
-      # through the public Cloudflare contour.
-      sse_fixture_origin_mode=origin-local
-    fi
+    sse_open_rate="${11:-0}"
+    sse_reconnect_cycles="${12:-0}"
+    sse_users_per_tournament="${13:-500}"
+    sse_event_count="${14:-3}"
+    sse_event_interval="${15:-1}"
+    combined_polling_duration="${16:-30}"
+    combined_polling_open_stagger="${17:-300}"
+    sse_origin_mode="${18:-public}"
+    sse_admission_mode="${19:-ticket}"
     [[ "$sse_admission_mode" == "ticket" || "$sse_admission_mode" == "legacy" ]] || {
       echo "SSE admission mode must be ticket or legacy." >&2
       exit 1
     }
-    [[ "$sse_scope" == "bracket" || "$sse_scope" == "ready-check" ]] || {
-      echo "SSE scope must be bracket or ready-check." >&2
-      exit 1
-    }
-    if [[ "$sse_scope" == "ready-check" && ( "$profile" != "sse" || "$sse_admission_mode" != "ticket" ) ]]; then
-      echo "Ready Check scope requires the ticketed SSE-only profile." >&2
-      exit 1
-    fi
     [[ "$sse_origin_mode" == "public" || "$sse_origin_mode" == "origin-local" ]] || {
       echo "SSE origin mode must be public or origin-local." >&2
-      exit 1
-    }
-    [[ "$sse_fixture_origin_mode" == "public" || "$sse_fixture_origin_mode" == "origin-local" ]] || {
-      echo "SSE fixture origin mode must be public or origin-local." >&2
       exit 1
     }
     if [[ "$sse_origin_mode" == "origin-local" && "$profile" != "sse" ]]; then
       echo "origin-local is only supported for the SSE-only profile." >&2
       exit 1
     fi
-    [[ "$sse_connections" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_connections <= 30000 )) || {
-      echo "SSE connections must be an integer from 1 to 30000." >&2
+    [[ "$sse_connections" =~ ^[1-9][0-9]{0,3}$ ]] && (( sse_connections <= 3000 )) || {
+      echo "SSE connections must be an integer from 1 to 3000." >&2
       exit 1
     }
     [[ "$sse_duration" =~ ^[0-9]+([.][0-9]+)?$ ]] && (( $(awk "BEGIN {print ($sse_duration >= 1 && $sse_duration <= 900)}") == 1 )) || {
       echo "SSE duration must be between 1 and 900 seconds." >&2
       exit 1
     }
-    [[ "$sse_open_concurrency" =~ ^[1-9][0-9]{0,4}$ ]] && (( sse_open_concurrency <= 30000 )) || {
-      echo "SSE open concurrency must be an integer from 1 to 30000." >&2
+    [[ "$sse_open_concurrency" =~ ^[1-9][0-9]{0,3}$ ]] && (( sse_open_concurrency <= 3000 )) || {
+      echo "SSE open concurrency must be an integer from 1 to 3000." >&2
       exit 1
     }
     # Public 60s is a diagnostic ceiling only; the browser's own fallback
@@ -149,18 +129,6 @@ case "$profile" in
       echo "SSE open rate must be between 0 and 1000 new SSE/sec." >&2
       exit 1
     }
-    [[ "$sse_capacity_limit" =~ ^[0-9]+$ ]] && (( sse_capacity_limit <= 30000 )) || {
-      echo "SSE capacity limit must be an integer from 0 to 30000." >&2
-      exit 1
-    }
-    if (( sse_capacity_limit > 3000 )) && {
-      [[ "$profile" != "sse" || "$sse_admission_mode" != "ticket" ]] || {
-        [[ "$sse_scope" != "ready-check" ]]
-      }
-    }; then
-      echo "High SSE capacity mode requires the ticketed Ready Check scope." >&2
-      exit 1
-    fi
     [[ "$sse_reconnect_cycles" =~ ^[0-9]{1,2}$ ]] && (( sse_reconnect_cycles <= 10 )) || {
       echo "SSE reconnect cycles must be an integer from 0 to 10." >&2
       exit 1
@@ -187,7 +155,7 @@ case "$profile" in
     }
     ;;
   *)
-    echo "Profile must be matrix, browser-polling, sse or combined." >&2
+    echo "Profile must be matrix, browser-polling, write-burst, sse or combined." >&2
     exit 1
     ;;
 esac
@@ -503,8 +471,107 @@ Path(summary_path).write_text(
     encoding="utf-8",
 )
 PY
+elif [[ "$profile" == "write-burst" ]]; then
+  write_burst_root="$run_root/write-burst"
+  install -d -o root -g root -m 0700 "$write_burst_root"
+  write_burst_report="$write_burst_root/write-burst.json"
+  write_burst_summary="$write_burst_root/matrix-summary.json"
+  write_burst_setup_concurrency=20
+  set +e
+  run_monitored "$log_path" \
+  "$QA_PYTHON" "$TOOLS_DIR/platform_production_qa.py" \
+    --env-file "$RUNTIME_ROOT/shared/.env.platform" \
+    --mode write-burst \
+    --keep-data \
+    --origin "$EXPECTED_ORIGIN" \
+    --concurrency "$write_burst_setup_concurrency" \
+    --http-max-connections "$HTTP_MAX_CONNECTIONS" \
+    --http-timeout 10 \
+    --write-burst-profile "$write_burst_profile" \
+    --write-burst-users-per-tournament "$write_burst_users_per_tournament" \
+    --write-burst-time-scale "$write_burst_time_scale" \
+    --collect-performance \
+    --report-path "$write_burst_report"
+  qa_status="$?"
+  set -e
+  "$SYSTEM_PYTHON" -I - "$write_burst_report" "$write_burst_summary" "$target_sha" "$run_id" "$control_email" "$qa_status" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+report_path, summary_path, target_sha, run_id, control_email, status = sys.argv[1:]
+try:
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    report = {}
+marker = str(report.get("marker") or "")
+user_ids = report.get("user_ids") if isinstance(report.get("user_ids"), list) else []
+tournament_ids = report.get("tournament_ids") if isinstance(report.get("tournament_ids"), list) else []
+write_burst = report.get("write_burst") if isinstance(report.get("write_burst"), dict) else {}
+selection = str(write_burst.get("selection") or "all")
+planned_tournaments = {
+    "all": 26,
+    "single-join": 3,
+    "single-ready": 3,
+    "multi-staggered": 20,
+}.get(selection, 0)
+planned_users = int(report.get("requested_users") or 0)
+passed = int(status) == 0 and report.get("passed") is True
+performance = report.get("performance") if isinstance(report.get("performance"), dict) else {}
+http_client = performance.get("http_client") if isinstance(performance.get("http_client"), dict) else {}
+http_overall = http_client.get("overall") if isinstance(http_client.get("overall"), dict) else {}
+bottleneck = performance.get("bottleneck_summary") if isinstance(performance.get("bottleneck_summary"), dict) else {}
+summary = {
+    "mode": "write-burst",
+    "target_sha": target_sha,
+    "github_run_id": int(run_id),
+    "control_email": control_email.strip().lower(),
+    "planned_tournaments": planned_tournaments,
+    "completed_tournaments": len(tournament_ids),
+    "planned_users": planned_users,
+    "completed_users": len(user_ids),
+    "passed": passed,
+    "write_burst": {
+        "profile": write_burst.get("profile"),
+        "selection": selection,
+        "users_per_tournament": write_burst.get("users_per_tournament"),
+        "time_scale": write_burst.get("time_scale"),
+        "profiles": [
+            {
+                "name": row.get("name"),
+                "mutations": row.get("mutations"),
+                "p95_ms": (row.get("http") or {}).get("overall", {}).get("p95_ms"),
+                "p99_ms": (row.get("http") or {}).get("overall", {}).get("p99_ms"),
+            }
+            for row in write_burst.get("profiles") or []
+            if isinstance(row, dict)
+        ],
+        "acceptance": write_burst.get("acceptance"),
+    },
+    "performance_summary": {
+        "worst_http_p95_ms": http_overall.get("p95_ms"),
+        "worst_http_p99_ms": http_overall.get("p99_ms"),
+        "bottleneck_classes": bottleneck.get("likely_bottleneck_classes", []),
+        "resource_flags": bottleneck.get("resource_flags", {}),
+    },
+    "rows": [{
+        "synthetic_users": len(user_ids),
+        "report_path": report_path,
+        "result": {
+            "passed": passed,
+            "marker": marker,
+            "report_path": report_path,
+        },
+    }],
+}
+Path(summary_path).write_text(
+    json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+    encoding="utf-8",
+)
+PY
 else
-  # A persistent SSE probe needs one client-side descriptor per live stream
+  # A persistent compatibility-bracket SSE probe needs one client-side
+  # descriptor per live stream
   # plus setup/API/Redis descriptors.  The default shell soft limit on some
   # production images is 1024, which makes a 1k probe fail inside the load
   # generator with Errno 24 before the origin has a chance to respond.
@@ -529,10 +596,6 @@ else
   if [[ "$sse_origin_mode" == "origin-local" ]]; then
     sse_origin="http://127.0.0.1:8010"
   fi
-  fixture_origin="$EXPECTED_ORIGIN"
-  if [[ "$sse_scope" == "ready-check" && "$sse_fixture_origin_mode" == "origin-local" ]]; then
-    fixture_origin="http://127.0.0.1:8010"
-  fi
   # Fixture creation performs authenticated CSRF/session reads. Keep that
   # setup below the API pool budget; SSE opening pressure is controlled
   # independently by --sse-open-concurrency below.
@@ -541,21 +604,13 @@ else
   # load generator's own queue instead of the public origin. The API pool
   # remains bounded server-side; this only lets the public client contour
   # expose origin saturation when many tabs become ready together.
-  if [[ "$sse_scope" == "ready-check" ]]; then
-    # Sparse participant allocation is deliberately contention-sensitive.
-    # Keep fixture joins below the retry-free conflict threshold; measured
-    # SSE opening remains controlled independently by --sse-open-concurrency.
-    sse_setup_concurrency=4
-  else
-    sse_setup_concurrency=20
-  fi
+  sse_setup_concurrency=20
   set +e
   run_monitored "$log_path" \
   "$QA_PYTHON" "$TOOLS_DIR/platform_sse_qa.py" \
     --env-file "$RUNTIME_ROOT/shared/.env.platform" \
     --origin "$sse_origin" \
     --request-origin "$EXPECTED_ORIGIN" \
-    --fixture-origin "$fixture_origin" \
     --mode "$profile" \
     --control-email "$control_email" \
     --target-sha "$target_sha" \
@@ -566,14 +621,12 @@ else
     --sse-open-concurrency "$sse_open_concurrency" \
     --sse-open-timeout "$sse_open_timeout" \
     --sse-open-rate "$sse_open_rate" \
-    --sse-capacity-limit "$sse_capacity_limit" \
     --sse-reconnect-cycles "$sse_reconnect_cycles" \
     --sse-event-count "$sse_event_count" \
     --sse-event-interval "$sse_event_interval" \
     --combined-polling-duration "$combined_polling_duration" \
     --combined-polling-open-stagger "$combined_polling_open_stagger" \
     --sse-admission-mode "$sse_admission_mode" \
-    --sse-scope "$sse_scope" \
     --concurrency "$sse_setup_concurrency" \
     --http-max-connections "$HTTP_MAX_CONNECTIONS" \
     --http-timeout 10 \

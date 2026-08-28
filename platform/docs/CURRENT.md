@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-27
+- Last reviewed: 2026-08-28
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -23,7 +23,7 @@ Read this file for the current production baseline and next engineering priority
 - Tournament invite claims/revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Last invite use and last participant slot cannot be consumed twice, and restoring a retained inactive participant rechecks capacity before making the row active again.
 - Anonymous public profile contracts omit account/contact email and Steam authentication identity. Public tournament participant/workspace contracts omit moderation note, moderator identity and moderation timestamps; organizer management uses a separate response DTO that retains those fields.
 - Public tournament automation errors are persistence-sanitized before commit: `automation_last_error` can contain only the stable generic retry message, while restricted logs retain only tournament/failure metadata and a one-way error fingerprint. Migration `20260821_0039` rewrites historical non-null values to the same safe message.
-- Ready Check is now the only current product realtime flow: `/tournaments` has no realtime client; one global pool is capped at production `3,000` (`32/source`, `1/user` for Ready Check; the compatibility bracket contour remains `4/user`) while `10,000` is only a staged Cloudflare-load target. Its agenda dynamically spreads opens at the measured safe `25`/sec rate with proportional simultaneous-tournament quotas; late SSE is limited to the pre-`T` page-arrival path, while post-`T` initial HTTP state remains authoritative and overflow uses the signed HMAC + one-Redis-key `revision/status` probe. The root-mounted provider creates a stream only on the visible matching tournament-detail route; hidden tabs stop, navigation away releases, visible polling is about `1.5s`, and healthy SSE suppresses fallback polling. A bounded relay sequence gap emits `resync` and triggers an authoritative user-state probe rather than silently losing an event. Streams stay open only inside a current admission window, so distant future checks do not occupy the pool. Proofs end at the Ready Check boundary with a bounded 24-hour workflow window; long multi-check agendas refresh their stream proof before its bounded horizon. The browser uses a bounded SSE handshake and full-jitter recovery, and agenda refreshes are tied to authentication, registration mutations, visibility restoration and proof renewal rather than pathname transitions. Agenda request telemetry reports duration, SQL pressure and pool wait. Bracket pages use the same probe and fetch the full bracket only after a revision change. See the [realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
+- Ready Check uses a deterministic timer contract, not realtime transport: the tournament workspace carries `starts_at`, `ends_at`, eligible/current-user state and a UTC `server_time` anchor; the browser uses elapsed monotonic time to activate and expire the button locally with zero Ready Check requests. The vote POST revalidates server time, eligibility and workflow state under the durable concurrency rules, and a delayed automation worker cannot reject a valid in-window vote. There are no Ready Check SSE, polling, leases, admission slots, proofs or capacity overrides. `/tournaments` remains request-driven. Generic/bracket SSE and Redis infrastructure remain separate and unchanged; bracket pages use a revision probe and fetch the full bracket after a revision change. See the [realtime boundary ADR](adr/ready-check-and-bracket-realtime-boundary.md).
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
@@ -85,7 +85,16 @@ users and 20 tournaments, left zero fixture users/tournaments/sessions/audit
   opening stagger; F2 was selected by zero errors first, then p95/p99, CPU and
   pool wait rather than raw throughput.
 
-The current SSE harness follow-up isolates transport from fixture workflow
+The current Ready Check work is the timer migration described in the baseline:
+functional and release verification must prove the initial workspace timing
+contract, local boundary transitions, authoritative delayed-worker vote path,
+expiration, idempotency and zero Ready Check transport traffic. The replacement
+load gate is a short Ready vote burst; the old Ready Check SSE staircase is
+retired.
+
+## Historical transport evidence (not current Ready Check architecture)
+
+The historical SSE harness follow-up isolated transport from fixture workflow
 latency. SSE and combined profiles use the requested synthetic-user count and
 one public tournament on a single Redis hot key; they do not run the full
 ready-check/assignment fixture first. Setup is bounded at 90 seconds. The
@@ -133,7 +142,8 @@ It was reverted from the follow-up candidate.
 The next candidate skips the published-assignment lookup only for
 `registration_open` detail workspaces. The domain guard makes assignment
 staging unavailable before `registration_closed`; all access checks,
-participant state, ETags, response fields and SSE admission remain unchanged.
+  participant state, ETags, response fields and generic bracket SSE admission
+  remain unchanged.
 The H2 live run `32979781513` (cleanup `32980077832`) reduced workspace SQL
 from 6.0 to 5.0 queries/request and average DB time from 246ms to 201ms, but
 did not yet lower the full server contour: workspace p95 was 909ms and API
@@ -165,7 +175,7 @@ synthetic users, tournaments, sessions and audit rows. H4 is the current
 component-level winner, not a full combined-capacity pass; the remaining
 ceiling is API CPU and the bounded mixed workload still does not complete.
 
-AS-19 — SSE capacity and combined-load measurement is in progress. The reviewed
+AS-19 — Historical SSE capacity and combined-load measurement. The reviewed
 runner adds separate SSE-only and polling+SSE profiles with exact
 cleanup/recovery support. Public tests send no source-bucket bypass: Cloudflare,
 Nginx, Redis admission and application caps remain active. Failed runs export
@@ -411,7 +421,7 @@ database guards and applies migration `20260822_0040`. Exact commit
 `gha-32574455599-1-87525bab34c4-20260822T125945Z`; closure evidence is in
 [`archive/as-15-deadlock-workflow-integrity.md`](archive/as-15-deadlock-workflow-integrity.md).
 
-### AS-20 legacy SSE persistence, opening and mixed boundary — final measured contour, 2026-08-27
+### Historical AS-20 legacy SSE persistence, opening and mixed boundary — final measured contour, 2026-08-27
 
 The measured package for this legacy SSE contour was
 `b86ec1e6937184e5de698ad4e9258a9df4a0d792`.
@@ -479,13 +489,12 @@ injection were not performed because the repository has no safe external-edge
 fault injector; the client-side mass-disconnect test covers the same fallback
 and jittered recovery contract without mutating Cloudflare state.
 
-Final legacy boundary: origin-only `20,000` established SSE is the
+Historical legacy boundary: origin-only `20,000` established SSE is the
 physical/lab point; public `3,000` with `25/s` gradual opening is the
-customer-facing protected point; and mixed `2,400` is the highest current
-functional contour, not a low-latency production recommendation. Those results
-do not claim capacity for the new short-lived Ready Check profile: its public
-`10,000` target remains unverified until the staged Cloudflare run repeats the
-measurement with event-triggered release and overflow state probes.
+former customer-facing protected point; and mixed `2,400` is a historical
+functional contour, not a current Ready Check recommendation. These records
+describe the former Ready Check experiment and generic transport measurements;
+they are not a current Ready Check capacity target or production release gate.
 
 AS-17 — End-to-end release transaction and recovery is resolved and deployed.
 The release receipt now has an explicit Nginx uncertainty boundary, idempotent
@@ -518,14 +527,13 @@ against the current web/api/worker identities and units.
 - Invite use and participant capacity are transaction-scoped PostgreSQL invariants: invite claim/revoke locks the stable tournament and invite rows in tournament-to-invite order; ordinary joins claim durable free slots without locking the tournament row, while lifecycle/restore mutations retain the tournament-row boundary and recheck capacity. Authentication last-seen touches use an isolated database transaction and must never commit or release locks owned by a mutation request.
 - Resource-creating API retries use durable actor/scope `Idempotency-Key` records. A repeated key with the same payload resolves to the originally created tournament/invite; reusing a key with a different payload is rejected.
 - Player-commitment reconciliation is a tournament workflow writer: it locks every affected Tournament row in deterministic id order before reading lifecycle state or releasing commitments. Automation failure-state persistence reacquires the same Tournament lock after any rollback.
-- Every Deadlock ready-check start/close, captain, assignment generation,
-  roster publish and roster-lock write path — API, automation and worker alike
-  — locks its tournament row before checking lifecycle state. Ordinary ready
-  votes are the deliberate exception: they upsert the unique vote row and its
-  32-way counter shard without taking the tournament-row lock; a deferred
-  database guard rejects votes recorded after round closure or without active
-  participation, while preserving a vote timestamped before the close commit.
-  Redis may coalesce work but never replaces this durable transaction boundary.
+- Every Deadlock ready-check start/close, captain, assignment generation, roster
+  publish and roster-lock write path — API, automation and worker alike — locks
+  its tournament row before checking lifecycle state. Ordinary ready votes are
+  the deliberate exception: they upsert the unique vote row and its 32-way counter
+  shard without taking the tournament-row lock; a deferred guard rejects
+  post-close or ineligible votes while preserving a vote timestamped before the
+  close commit. Redis may coalesce work but never replaces this durable boundary.
 - Participant capacity is represented by durable per-tournament slots. Join
   claims a free slot with `FOR UPDATE SKIP LOCKED`; inactive retained rows and
   deletes release capacity, while the unique `(tournament_id, user_id)` index
@@ -535,32 +543,24 @@ against the current web/api/worker identities and units.
 - Bracket/workspace reads expose revision-derived private ETags and accept
   `If-None-Match`; unchanged reads return `304`. Active browser views poll at
   the existing short interval, hidden/passive/terminal views back off or stop,
-  and SSE remains admission-limited.
-- API and worker SQLAlchemy pools are explicit and bounded: the measured
-  10k-polling baseline is API `2 x (16 + 0)` and worker `2 x (2 + 0)` within
-  the ordinary 44-connection budget. Ticketed SSE admission does not consume
-  PostgreSQL at open; unticketed legacy admission and periodic private
-  revalidation use the bounded stream database pool. The separate SSE
-  authorization pool was removed. Redis admission uses the bounded `512`
-  connection pool with a `2s` wait and remains fail-closed.
-  Celery uses high/default/low queues, prefetch one and late acks;
-  backlog/retry pressure is part of the load evidence. The current mixed
-  3,000-SSE plus 10,000-polling contour completed without pool checkout,
-  lock or backend-wait errors; its remaining origin pressure was API CPU and
-  memory, not SSE admission or Redis/PostgreSQL saturation. Any future
-  increase must remeasure the ordinary workspace workload and the roughly
-  1GB API memory boundary without weakening the bounded pools or fail-closed
-  admission.
+  and generic bracket SSE remains admission-limited.
+- API and worker SQLAlchemy pools are explicit and bounded: the measured 10k
+  polling baseline is API `2 x (16 + 0)` and worker `2 x (2 + 0)` within the
+  ordinary 44-connection budget. Generic bracket SSE ticket admission/private
+  revalidation use the bounded stream DB pool; Redis admission uses bounded
+  `512` connections with a `2s` wait and remains fail-closed. Celery uses
+  high/default/low queues, prefetch one and late acks; backlog/retry pressure is
+  evidence. Historical mixed SSE/polling results remain transport evidence; any
+  future bracket increase must remeasure ordinary workload and roughly 1GB API
+  memory without weakening bounded pools or fail-closed admission.
 - The final 20×500 browser-polling gate keeps fixture state bounded to at most
   32 participants per tournament and uses four setup lanes plus one shared
-  request semaphore. Its production runner retains 10,000 virtual tabs but
-  uses HTTP40, a 300-second opening stagger and a 30-second mixed
-  active/passive polling window. Its five-minute auto-assignment wait is
-  fail-fast; the write-burst profile owns join/ready-vote contention
-  measurements.
-- Ready-check votes must be committed only while their round is active and the
-  voter remains an eligible active participant. A close or exclusion cannot
-  leave a post-close or ineligible vote in persistence.
+  request semaphore. Its production runner retains 10,000 virtual tabs with
+  HTTP40, a 300-second opening stagger and a 30-second mixed active/passive
+  polling window; its five-minute auto-assignment wait is fail-fast. The
+  write-burst profile owns join/ready-vote contention measurements.
+- Ready-check votes must be committed only while their round is active and the voter remains an eligible active participant; a close or exclusion
+  cannot leave a post-close or ineligible vote in persistence.
 - The database is the final concurrency guard for cardinal workflow state:
   active ready-checks and the selected captain/assignment/roster state must not
   have ambiguous concurrent rows even if a future writer bypasses a service.

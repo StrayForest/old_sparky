@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-email", required=True)
     parser.add_argument(
         "--mode",
-        choices=("browser-polling", "sse", "combined"),
+        choices=("browser-polling", "write-burst", "sse", "combined"),
         default="browser-polling",
     )
     return parser.parse_args()
@@ -169,6 +169,14 @@ def build_recovered_summary(
     http_overall = http_client.get("overall") if isinstance(http_client.get("overall"), dict) else {}
     bottleneck = performance.get("bottleneck_summary") if isinstance(performance.get("bottleneck_summary"), dict) else {}
     mode = str(report.get("mode") or "browser-polling")
+    write_burst = report.get("write_burst") if isinstance(report.get("write_burst"), dict) else {}
+    selection = str(write_burst.get("selection") or "all")
+    planned_tournaments = (
+        {"all": 26, "single-join": 3, "single-ready": 3, "multi-staggered": 20}.get(selection, 0)
+        if mode == "write-burst"
+        else 20
+    )
+    planned_users = int(report.get("requested_users") or 10000)
     sse = report.get("sse") if isinstance(report.get("sse"), dict) else {}
     sse_metrics = sse.get("metrics") if isinstance(sse.get("metrics"), dict) else {}
     return {
@@ -176,9 +184,9 @@ def build_recovered_summary(
         "target_sha": "recovered-from-durable-run",
         "github_run_id": int(load_run_id),
         "control_email": control_email,
-        "planned_tournaments": 20,
+        "planned_tournaments": planned_tournaments,
         "completed_tournaments": len(tournament_ids),
-        "planned_users": 10000,
+        "planned_users": planned_users,
         "completed_users": len(user_ids),
         "passed": False,
         "recovered": True,
@@ -199,6 +207,12 @@ def build_recovered_summary(
             "errors": sse_metrics.get("errors"),
             "events": sse_metrics.get("events"),
         } if sse else None,
+        "write_burst": {
+            "profile": write_burst.get("profile"),
+            "selection": selection,
+            "users_per_tournament": write_burst.get("users_per_tournament"),
+            "time_scale": write_burst.get("time_scale"),
+        } if write_burst else None,
         "performance_summary": {
             "worst_http_p95_ms": http_overall.get("p95_ms"),
             "worst_http_p99_ms": http_overall.get("p99_ms"),

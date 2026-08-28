@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-08-24
+- Last reviewed: 2026-08-28
 
 ## Runtime checks
 
@@ -291,37 +291,34 @@ The `browser-polling` profile creates 20 marked tournaments and 10,000
 synthetic users, opens 10,000 active virtual tabs over the bounded ramp, sends
 conditional revision reads and reports `304 Not Modified`, deduplication,
 response latency, pool wait, database/lock pressure and Celery backlog. It is a
-bounded polling test, not a request to raise the 10,000-user SSE ceiling.
+bounded compatibility-bracket polling test and does not create Ready Check
+transport traffic.
 Clean the exact browser load run with the same cleanup workflow before starting
 another production load.
 
-The same workflow also exposes `profile=sse`. Set `sse_scope=ready-check` and
-`sse_admission_mode=ticket` for the current product flow; the harness creates
-one authenticated/eligible cohort, obtains the per-user agenda proofs during
-setup, opens `/ready-check/events`, starts the round after the admission
-barrier, and probes `/ready-check/state` once only for streams rejected by the
-global lease. The public staircase is 3,000, 5,000, 7,500 and 10,000 established
-streams through Cloudflare. For the 5,000/7,500/10,000 stages, pass that stage
-as `sse_capacity_limit`; the workflow supplies a short-lived signed QA override
-only for `profile=sse`, `sse_scope=ready-check`, and ticket admission. The
-default `sse_capacity_limit=0` still exercises the production cap of 3,000 and
-the cheap Ready Check overflow fallback. `503`, other unexpected responses,
-missing active state from an overflow probe, client errors or resource
-saturation are not. A matching `sse_scope=bracket` run is compatibility
-coverage for the retired bracket stream, not evidence for the Ready Check
-capacity claim; bracket high-cap overrides remain loopback-only. Follow the
-ordered protocol in
-[`as-19-sse-capacity-benchmark.md`](as-19-sse-capacity-benchmark.md).
+The same workflow exposes `profile=sse` only for the compatibility bracket
+transport. It measures the bracket SSE endpoint through the selected public or
+origin-local contour and retains the generic bracket admission, lease,
+revalidation and event-delivery checks. It is not a Ready Check test and must
+not be interpreted as a Ready Check capacity target. Historical Ready Check
+SSE benchmark plans and results remain linked from the documentation index for
+audit context only.
 
-For a Ready Check run, keep `sse_origin_mode=public` so `/ready-check/events`
-is measured through Cloudflare and keep `sse_fixture_origin_mode=origin-local`
-so user creation, joins and the organizer's `ready-check/start` control call do
-not create an unpaced public setup burst. The harness still sends every
-`/ready-check/agenda` request through the public origin at 25 requests per
-second. The report records the three transports separately and preserves
-bounded, secret-safe diagnostics for every unexpected HTTP response, including
-Cloudflare correlation headers and a short response body. This split is a
-measurement control; it does not bypass Cloudflare for the SSE stream.
+Ready Check load testing uses the `write-burst` mode of
+`platform_production_qa.py`, not the SSE profile. The test creates marked
+eligible participants, uses the real Ready Check vote endpoint after its
+server-known window, and reports accepted/rejected votes, response p50/p95/p99,
+database pool wait, lock pressure, API/PostgreSQL CPU and connections, and
+duplicate/idempotency behavior. Run a human-shaped spread first, then a
+separate aggressive burst; clean the exact run before another production load.
+The browser timer itself must produce zero Ready Check requests before
+`starts_at`, at `starts_at`, and at `ends_at`.
+
+The production retained-load workflow exposes this mode directly. For the
+10,000-user mixed baseline, use `profile=write-burst`,
+`write_burst_profile=all`, `write_burst_users_per_tournament=500` and
+`write_burst_time_scale=1.0`; the exact cleanup workflow also supports an
+interrupted write-burst recovery.
 
 The measured pool baseline is a reviewed runtime configuration, not a load-test
 CLI override. During the planned production configuration window, apply only

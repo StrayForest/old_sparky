@@ -144,7 +144,7 @@ timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
     --github-run-id "$run_id" --users-per-tournament 32 \
     --sse-connections "$SSE_CONNECTIONS" --sse-duration "$SSE_DURATION" \
     --sse-open-concurrency 32 --sse-open-timeout "$SSE_OPEN_TIMEOUT" \
-    --sse-open-rate "$SSE_OPEN_RATE" --sse-capacity-limit 0 \
+    --sse-open-rate "$SSE_OPEN_RATE" \
     --sse-reconnect-cycles 1 --sse-event-count 2 --sse-event-interval 1 \
     --sse-admission-mode ticket --concurrency 8 --http-max-connections 128 \
     --http-timeout 10 --ready-file "$ready_file" \

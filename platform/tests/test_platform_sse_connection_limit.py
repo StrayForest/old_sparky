@@ -17,32 +17,6 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
     def test_global_cap_leaves_headroom_below_observed_edge_queue(self) -> None:
         self.assertEqual(sse.SSE_GLOBAL_LIMIT, 3_000)
 
-    def test_ready_check_has_separate_production_cap_and_explicit_hard_target(self) -> None:
-        self.assertEqual(sse.READY_CHECK_SSE_GLOBAL_LIMIT, 3_000)
-        self.assertEqual(sse.READY_CHECK_SSE_HARD_TARGET, 10_000)
-        self.assertEqual(sse.READY_CHECK_SSE_USER_LIMIT, 1)
-        settings = SimpleNamespace()
-        self.assertEqual(
-            sse._global_limit_for_path(
-                {"path": "/api/v1/ready-check/events"},
-                settings,
-            ),
-            sse.READY_CHECK_SSE_GLOBAL_LIMIT,
-        )
-        self.assertEqual(
-            sse._global_limit_for_path(
-                {"path": "/api/v1/tournaments/cup/bracket/events"},
-                settings,
-            ),
-            sse.SSE_GLOBAL_LIMIT,
-        )
-        self.assertNotEqual(sse._ready_check_global_key(), sse._global_key())
-        key_settings = SimpleNamespace(platform_secret_key="test-sse-user-namespace")
-        self.assertNotEqual(
-            sse._ready_check_user_key(key_settings, "user-1"),
-            sse._user_key(key_settings, "user-1"),
-        )
-
     async def asyncSetUp(self) -> None:
         self.settings = get_settings()
         if self.settings.platform_environment.strip().lower() != "test":
@@ -60,8 +34,6 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
                 key
                 async for key in cache.scan_iter(match=f"{sse.SSE_KEY_PREFIX}:*")
             ]
-            async for key in cache.scan_iter(match=f"{sse.READY_CHECK_SSE_KEY_PREFIX}:*"):
-                keys.append(key)
             if keys:
                 await cache.delete(*keys)
         finally:
@@ -181,61 +153,6 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await asyncio.gather(*(lease.release() for lease in leases))
 
-    def test_signed_qa_capacity_proof_is_bounded_and_tamper_evident(self) -> None:
-        now = 1_700_000_000
-        token = sse.sse_load_test_capacity_token(
-            self.settings,
-            15_000,
-            now_epoch=now,
-        )
-        scope = {
-            "type": "http",
-            "method": "GET",
-            "path": "/api/v1/ready-check/events",
-            "headers": [
-                (
-                    sse.SSE_LOAD_TEST_CAPACITY_HEADER.encode("ascii"),
-                    token.encode("ascii"),
-                )
-            ],
-        }
-
-        with patch.object(sse.time, "time", return_value=now):
-            self.assertEqual(sse._qa_global_limit(scope, self.settings), 15_000)
-
-        scope["path"] = "/api/v1/ready-check/agenda"
-        with patch.object(sse.time, "time", return_value=now):
-            self.assertEqual(sse._qa_global_limit(scope, self.settings), 15_000)
-
-        scope["path"] = "/api/v1/tournaments/test/bracket/events"
-        with patch.object(sse.time, "time", return_value=now):
-            self.assertIsNone(sse._qa_global_limit(scope, self.settings))
-
-        scope["path"] = "/api/v1/ready-check/events"
-        with patch.object(
-            sse.time,
-            "time",
-            return_value=now + sse.SSE_LOAD_TEST_CAPACITY_TTL_SECONDS,
-        ):
-            self.assertIsNone(sse._qa_global_limit(scope, self.settings))
-
-        tampered = token.replace("15000:", "30000:", 1)
-        scope["headers"] = [
-            (
-                sse.SSE_LOAD_TEST_CAPACITY_HEADER.encode("ascii"),
-                tampered.encode("ascii"),
-            )
-        ]
-        with patch.object(sse.time, "time", return_value=now):
-            self.assertIsNone(sse._qa_global_limit(scope, self.settings))
-
-        with self.assertRaises(ValueError):
-            sse.sse_load_test_capacity_token(
-                self.settings,
-                sse.SSE_QA_GLOBAL_LIMIT_MAX + 1,
-                now_epoch=now,
-            )
-
     async def test_user_limit_spans_distinct_source_addresses(self) -> None:
         leases = [
             await sse.reserve_sse_connection(
@@ -254,79 +171,6 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(context.exception.scope, "user")
         finally:
             await asyncio.gather(*(lease.release() for lease in leases))
-
-    async def test_ready_check_user_limit_allows_one_stream_per_user(self) -> None:
-        leases = [
-            await sse.reserve_sse_connection(
-                f"203.0.113.{45 + index}",
-                settings=self.settings,
-                global_limit=10,
-                source_limit=10,
-            )
-            for index in range(2)
-        ]
-        try:
-            await leases[0].add_user_scope(
-                "ready-check-user",
-                user_limit=sse.READY_CHECK_SSE_USER_LIMIT,
-            )
-            with self.assertRaises(sse.SseConnectionLimitExceeded) as context:
-                await leases[1].add_user_scope(
-                    "ready-check-user",
-                    user_limit=sse.READY_CHECK_SSE_USER_LIMIT,
-                )
-            self.assertEqual(context.exception.scope, "user")
-
-            await leases[0].release()
-            await leases[1].add_user_scope(
-                "ready-check-user",
-                user_limit=sse.READY_CHECK_SSE_USER_LIMIT,
-            )
-        finally:
-            await leases[1].release()
-
-    async def test_ready_check_user_namespace_is_independent_from_legacy_bracket(self) -> None:
-        bracket = await sse.reserve_sse_connection(
-            "203.0.113.48",
-            settings=self.settings,
-            global_limit=10,
-            source_limit=10,
-            global_key=sse._global_key(),
-        )
-        ready_check = await sse.reserve_sse_connection(
-            "203.0.113.49",
-            settings=self.settings,
-            global_limit=10,
-            source_limit=10,
-            global_key=sse._ready_check_global_key(),
-        )
-        second_ready_check = await sse.reserve_sse_connection(
-            "203.0.113.50",
-            settings=self.settings,
-            global_limit=10,
-            source_limit=10,
-            global_key=sse._ready_check_global_key(),
-        )
-        try:
-            await bracket.add_user_scope("shared-user", user_limit=sse.SSE_USER_LIMIT)
-            await ready_check.add_user_scope(
-                "shared-user",
-                user_limit=sse.READY_CHECK_SSE_USER_LIMIT,
-                user_scope="ready_check",
-            )
-            with self.assertRaises(sse.SseConnectionLimitExceeded) as context:
-                await second_ready_check.add_user_scope(
-                    "shared-user",
-                    user_limit=sse.READY_CHECK_SSE_USER_LIMIT,
-                    user_scope="ready_check",
-                )
-            self.assertEqual(context.exception.scope, "user")
-        finally:
-            await asyncio.gather(
-                bracket.release(),
-                ready_check.release(),
-                second_ready_check.release(),
-            )
 
     async def test_release_immediately_returns_source_capacity(self) -> None:
         first = await sse.reserve_sse_connection(
@@ -392,47 +236,6 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(lease.last_renewed_epoch, 130)
 
-    async def test_ready_check_occupancy_matches_open_leases_after_renewal(self) -> None:
-        now = int(__import__("time").time())
-        leases = [
-            await sse.reserve_sse_connection(
-                f"203.0.113.{60 + index}",
-                settings=self.settings,
-                global_limit=3,
-                source_limit=3,
-                bypass_source_limit=True,
-                global_key=sse._ready_check_global_key(),
-                now_epoch=now,
-            )
-            for index in range(2)
-        ]
-        try:
-            self.assertEqual(
-                await sse.current_ready_check_sse_connection_count(now_epoch=now),
-                2,
-            )
-            await asyncio.gather(
-                *(
-                    lease.renew(now_epoch=now + sse.SSE_LEASE_SECONDS + 1)
-                    for lease in leases
-                )
-            )
-            self.assertEqual(
-                await sse.current_ready_check_sse_connection_count(
-                    now_epoch=now + sse.SSE_LEASE_SECONDS + 1,
-                ),
-                2,
-            )
-            await leases[0].release()
-            self.assertEqual(
-                await sse.current_ready_check_sse_connection_count(
-                    now_epoch=now + sse.SSE_LEASE_SECONDS + 1,
-                ),
-                1,
-            )
-        finally:
-            await leases[1].release()
-
     async def test_authenticated_user_scope_uses_route_auth_result(self) -> None:
         scope = {
             "type": "http",
@@ -455,10 +258,7 @@ class PlatformSseConnectionLimitTests(unittest.IsolatedAsyncioTestCase):
                 auth_session=auth_session,
             )
 
-        add_user_scope.assert_awaited_once_with(
-            "user-1",
-            user_limit=sse.SSE_USER_LIMIT,
-        )
+        add_user_scope.assert_awaited_once_with("user-1")
 
 
 class PlatformSseConnectionReleaseTests(unittest.IsolatedAsyncioTestCase):
@@ -530,59 +330,6 @@ class PlatformSseConnectionMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_messages[0]["status"], 429)
         lease.release.assert_awaited_once_with()
 
-    async def test_signed_qa_capacity_limit_is_passed_without_bypassing_global_admission(
-        self,
-    ) -> None:
-        settings = get_settings()
-        lease = MagicMock(spec=sse.SseConnectionLease)
-        lease.release = AsyncMock()
-
-        async def app(_scope, _receive, _send):
-            return None
-
-        async def receive():
-            return {"type": "http.disconnect"}
-
-        async def send(_message):
-            return None
-
-        now = 1_700_000_000
-        token = sse.sse_load_test_capacity_token(settings, 15_000, now_epoch=now)
-        scope = {
-            "type": "http",
-            "method": "GET",
-            "path": "/api/v1/ready-check/events",
-            "headers": [
-                (
-                    sse.SSE_LOAD_TEST_CAPACITY_HEADER.encode("ascii"),
-                    token.encode("ascii"),
-                )
-            ],
-            "client": ("127.0.0.1", 443),
-        }
-        middleware = sse.SseConnectionLimitMiddleware(
-            app,
-            settings_factory=lambda: settings,
-        )
-        with (
-            patch.object(sse.time, "time", return_value=now),
-            patch.object(
-                sse,
-                "reserve_sse_connection",
-                new=AsyncMock(return_value=lease),
-            ) as reserve,
-        ):
-            await middleware(scope, receive, send)
-
-        reserve.assert_awaited_once_with(
-            "127.0.0.1",
-            settings=settings,
-            global_limit=15_000,
-            bypass_source_limit=False,
-            global_key=sse._ready_check_global_key(),
-        )
-        lease.release.assert_awaited_once_with()
-
 
 class PlatformSseNginxGuardTests(unittest.TestCase):
     def test_nginx_has_coarse_per_ip_and_global_sse_caps(self) -> None:
@@ -607,12 +354,6 @@ class PlatformSseNginxGuardTests(unittest.TestCase):
         self.assertIn('"request_completion":"$request_completion"', nginx)
         self.assertIn('"connection_requests":$connection_requests', nginx)
         self.assertIn("proxy_read_timeout 60s;", nginx)
-        ready_check_location = nginx.split('location = /api/v1/ready-check/events {', 1)[1].split(
-            "    location = /api/v1/security/csp-report {", 1
-        )[0]
-        self.assertIn("proxy_buffering off;", ready_check_location)
-        self.assertIn('add_header X-Accel-Buffering "no" always;', ready_check_location)
-        self.assertIn('add_header Cache-Control "no-store" always;', ready_check_location)
 
 
 if __name__ == "__main__":

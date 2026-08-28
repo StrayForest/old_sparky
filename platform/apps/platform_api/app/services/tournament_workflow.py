@@ -32,6 +32,7 @@ from python_packages.platform_domain.deadlock import (
     evaluate_auto_assignment_run_freshness,
     prepare_captain_round_entries,
     transition_auto_assignment_run_status,
+    prepare_ready_check_start,
 )
 from python_packages.platform_domain.tournaments import (
     ExistingBracketMatchState,
@@ -71,6 +72,61 @@ class TournamentStatusTransitionError(TournamentWorkflowError):
 
 class TournamentCompletionError(TournamentWorkflowError):
     """The bracket is not complete enough for a terminal completion."""
+
+
+class ReadyCheckVoteWindowError(TournamentWorkflowError):
+    """A Ready Check vote is outside its server-authoritative time window."""
+
+    def __init__(self, message: str, *, relative_ms: int | None = None) -> None:
+        super().__init__(message)
+        self.relative_ms = relative_ms
+
+
+def ensure_ready_check_vote_window(
+    *,
+    starts_at: datetime | None,
+    ends_at: datetime | None,
+    now: datetime,
+) -> tuple[datetime, datetime]:
+    """Validate a Ready Check vote using only the server-authoritative clock."""
+
+    if starts_at is None or ends_at is None:
+        raise ReadyCheckVoteWindowError(
+            "This tournament has no scheduled Ready Check window."
+        )
+    normalized_starts_at = starts_at.astimezone(UTC)
+    normalized_ends_at = ends_at.astimezone(UTC)
+    current_time = now.astimezone(UTC)
+    if normalized_ends_at <= normalized_starts_at:
+        raise ReadyCheckVoteWindowError(
+            "This tournament has an invalid Ready Check window."
+        )
+    if current_time < normalized_starts_at:
+        raise ReadyCheckVoteWindowError(
+            "Ready Check has not started yet.",
+            relative_ms=round((current_time - normalized_starts_at).total_seconds() * 1000),
+        )
+    if current_time >= normalized_ends_at:
+        raise ReadyCheckVoteWindowError(
+            "Ready Check has ended.",
+            relative_ms=round((current_time - normalized_starts_at).total_seconds() * 1000),
+        )
+    return normalized_starts_at, normalized_ends_at
+
+
+def mark_ready_check_started(tournament: Tournament, *, now: datetime) -> None:
+    """Record that this scheduled Ready Check has entered workflow processing."""
+
+    if tournament.automation_ready_check_started_at is None:
+        tournament.automation_ready_check_started_at = now.astimezone(UTC)
+
+
+def mark_ready_check_closed(tournament: Tournament, *, now: datetime) -> None:
+    """Make an explicit or side-effect close terminal for the current schedule."""
+
+    mark_ready_check_started(tournament, now=now)
+    if tournament.automation_ready_check_closed_at is None:
+        tournament.automation_ready_check_closed_at = now.astimezone(UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +345,8 @@ async def transition_tournament_status(
         expected_status=expected_status,
         audit_payload=audit_payload,
     )
+
+
 @dataclass(frozen=True, slots=True)
 class DeadlockAutoAssignmentInputs:
     captain_round: TournamentDeadlockCaptainRound
@@ -297,17 +355,11 @@ class DeadlockAutoAssignmentInputs:
     dream_slot_rows: tuple[dict[str, Any], ...]
     input_fingerprint: dict[str, list[dict[str, Any]]]
 
+
 @dataclass(frozen=True, slots=True)
 class ReadyRoundStateSnapshot:
     response: TournamentDeadlockReadyRoundResponse
     choices_by_user_id: dict[str, str]
-
-@dataclass(frozen=True, slots=True)
-class ReadyVotePreflight:
-    active_round: TournamentDeadlockReadyRound | None
-    has_participant: bool
-    has_deadlock_profile: bool
-    has_locked_roster: bool
 
 @dataclass(frozen=True, slots=True)
 class ReadyVoteRoutePreflight:
@@ -317,6 +369,7 @@ class ReadyVoteRoutePreflight:
     has_deadlock_profile: bool
     has_locked_roster: bool
 
+
 @dataclass(frozen=True, slots=True)
 class ReadyCheckReadPreflight:
     tournament: Tournament
@@ -324,22 +377,158 @@ class ReadyCheckReadPreflight:
     latest_round: TournamentDeadlockReadyRound | None
     has_participant: bool
 
+
+async def prepare_deadlock_ready_vote(
+    db_session: AsyncSession,
+    *,
+    slug: str,
+    user_id: str,
+    choice: str,
+    now: datetime,
+) -> ReadyVoteRoutePreflight:
+    """Authorize a vote against the schedule and materialize its round.
+
+    The automation worker may create the round first, but it is deliberately
+    not part of the vote critical path. The locked tournament row serializes
+    this lazy creation with worker/admin transitions, while ``starts_at`` and
+    ``ends_at`` remain the only Ready Check time boundary.
+    """
+
+    current_time = now.astimezone(UTC)
+    tournament = await db_session.scalar(
+        select(Tournament)
+        .where(Tournament.slug == slug)
+        .with_for_update()
+    )
+    if tournament is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+
+    ensure_ready_check_vote_window(
+        starts_at=tournament.ready_check_starts_at,
+        ends_at=tournament.ready_check_ends_at,
+        now=current_time,
+    )
+    if tournament.automation_ready_check_closed_at is not None:
+        raise ReadyCheckVoteWindowError("Deadlock ready-check is no longer active.")
+
+    participant_exists, profile_exists, locked_roster_exists = _ready_vote_preflight_columns(
+        tournament_id=tournament.id,
+        user_id=user_id,
+    )
+    flags = (
+        await db_session.execute(
+            select(
+                participant_exists.label("has_participant"),
+                profile_exists.label("has_deadlock_profile"),
+                locked_roster_exists.label("has_locked_roster"),
+            )
+        )
+    ).one()
+    has_participant = bool(flags.has_participant)
+    has_deadlock_profile = bool(flags.has_deadlock_profile)
+    has_locked_roster = bool(flags.has_locked_roster)
+
+    if not is_solo_tournament_format(tournament.format_slug):
+        raise ReadyCheckVoteWindowError(
+            "Deadlock workflow is available only for solo tournaments."
+        )
+    if not has_participant:
+        return ReadyVoteRoutePreflight(
+            tournament=tournament,
+            active_round=None,
+            has_participant=False,
+            has_deadlock_profile=has_deadlock_profile,
+            has_locked_roster=has_locked_roster,
+        )
+    if choice == "yes" and not has_deadlock_profile:
+        raise ReadyCheckVoteWindowError(
+            "Complete your Deadlock profile before confirming ready status."
+        )
+
+    if tournament.status == "registration_open":
+        registration_closes_at = tournament.registration_closes_at
+        if registration_closes_at is None or current_time < registration_closes_at.astimezone(UTC):
+            raise ReadyCheckVoteWindowError("Registration is still open for this tournament.")
+        await transition_locked_tournament_status(
+            db_session,
+            tournament=tournament,
+            next_status="registration_closed",
+            now=current_time,
+            actor_user_id=None,
+            audit_action="tournament.automation.registration.close_for_ready_vote",
+            expected_status="registration_open",
+        )
+
+    ensure_deadlock_roster_staging_allowed(
+        format_slug=tournament.format_slug,
+        tournament_status=tournament.status,
+        has_locked_deadlock_roster=has_locked_roster,
+        action_name="Deadlock ready-check voting",
+    )
+
+    active_round = await deadlock_ready_round_for_tournament(
+        db_session,
+        tournament_id=tournament.id,
+        active_only=True,
+    )
+    if active_round is None and has_participant:
+        participant_user_ids = [
+            str(participant_user_id)
+            for participant_user_id in (
+                await db_session.scalars(
+                    select(TournamentParticipant.user_id).where(
+                        TournamentParticipant.tournament_id == tournament.id,
+                        TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
+                    )
+                )
+            ).all()
+        ]
+        decision = prepare_ready_check_start(
+            participant_user_ids,
+            has_active_round=False,
+        )
+        if not decision.should_create_round:
+            raise ReadyCheckVoteWindowError("No participants are available for Ready Check.")
+        active_round = TournamentDeadlockReadyRound(
+            tournament_id=tournament.id,
+            status="active",
+            eligible_user_ids=list(decision.user_ids),
+            initiated_by_user_id=None,
+        )
+        db_session.add(active_round)
+        await db_session.flush()
+        await write_audit_log(
+            db_session,
+            actor_user_id=user_id,
+            action="tournament.deadlock.ready_check.lazy_start",
+            subject_type="tournament_deadlock_ready_round",
+            subject_id=str(active_round.id),
+            payload={
+                "tournament_slug": tournament.slug,
+                "eligible_participant_count": len(decision.user_ids),
+                "trigger": "ready_vote",
+            },
+        )
+
+    # A vote can be the first request to observe an already-open schedule.
+    # Record that workflow processing has started even when the background
+    # worker has not run yet, so its later close/no-show side effects still
+    # have a durable lifecycle marker to continue from.
+    if active_round is not None:
+        mark_ready_check_started(tournament, now=current_time)
+
+    return ReadyVoteRoutePreflight(
+        tournament=tournament,
+        active_round=active_round,
+        has_participant=has_participant,
+        has_deadlock_profile=has_deadlock_profile,
+        has_locked_roster=has_locked_roster,
+    )
+
+
 def participant_status_is_inactive(participant_status: str) -> bool:
     return participant_status in INACTIVE_PARTICIPANT_STATUSES
 
-def ready_vote_requires_automation(
-    tournament: Tournament,
-    active_round: TournamentDeadlockReadyRound | None,
-    *,
-    now: datetime,
-) -> bool:
-    if active_round is None:
-        return True
-    if tournament.ready_check_ends_at is not None and now >= tournament.ready_check_ends_at:
-        return True
-    if tournament.captain_selection_starts_at is not None and now >= tournament.captain_selection_starts_at:
-        return True
-    return False
 
 async def deadlock_ready_round_for_tournament(
     db_session: AsyncSession,
@@ -443,6 +632,7 @@ async def deadlock_ready_check_read_preflight(
         has_participant=bool(row.has_participant),
     )
 
+
 def _ready_vote_preflight_columns(*, tournament_id: str, user_id: str) -> tuple[Any, Any, Any]:
     participant_exists = (
         select(TournamentParticipant.id)
@@ -468,124 +658,6 @@ def _ready_vote_preflight_columns(*, tournament_id: str, user_id: str) -> tuple[
     )
     return participant_exists, profile_exists, locked_roster_exists
 
-async def deadlock_ready_vote_preflight(
-    db_session: AsyncSession,
-    *,
-    tournament_id: str,
-    user_id: str,
-) -> ReadyVotePreflight:
-    participant_exists, profile_exists, locked_roster_exists = _ready_vote_preflight_columns(
-        tournament_id=tournament_id,
-        user_id=user_id,
-    )
-    row = (
-        await db_session.execute(
-            select(
-                TournamentDeadlockReadyRound,
-                participant_exists.label("has_participant"),
-                profile_exists.label("has_deadlock_profile"),
-                locked_roster_exists.label("has_locked_roster"),
-            )
-            .where(
-                TournamentDeadlockReadyRound.tournament_id == tournament_id,
-                TournamentDeadlockReadyRound.status == "active",
-            )
-            .order_by(
-                TournamentDeadlockReadyRound.created_at.desc(),
-                TournamentDeadlockReadyRound.id.desc(),
-            )
-            .limit(1)
-        )
-    ).first()
-    if row is not None:
-        return ReadyVotePreflight(
-            active_round=row[0],
-            has_participant=bool(row.has_participant),
-            has_deadlock_profile=bool(row.has_deadlock_profile),
-            has_locked_roster=bool(row.has_locked_roster),
-        )
-
-    flags = (
-        await db_session.execute(
-            select(
-                participant_exists.label("has_participant"),
-                profile_exists.label("has_deadlock_profile"),
-                locked_roster_exists.label("has_locked_roster"),
-            )
-        )
-    ).one()
-    return ReadyVotePreflight(
-        active_round=None,
-        has_participant=bool(flags.has_participant),
-        has_deadlock_profile=bool(flags.has_deadlock_profile),
-        has_locked_roster=bool(flags.has_locked_roster),
-    )
-
-async def deadlock_ready_vote_route_preflight(
-    db_session: AsyncSession,
-    *,
-    slug: str,
-    user_id: str,
-) -> ReadyVoteRoutePreflight:
-    active_round = aliased(TournamentDeadlockReadyRound)
-    selected_active_round_id = (
-        select(TournamentDeadlockReadyRound.id)
-        .where(
-            TournamentDeadlockReadyRound.tournament_id == Tournament.id,
-            TournamentDeadlockReadyRound.status == "active",
-        )
-        .order_by(
-            TournamentDeadlockReadyRound.created_at.desc(),
-            TournamentDeadlockReadyRound.id.desc(),
-        )
-        .limit(1)
-        .correlate(Tournament)
-        .scalar_subquery()
-    )
-    participant_exists = (
-        select(TournamentParticipant.id)
-        .where(
-            TournamentParticipant.tournament_id == Tournament.id,
-            TournamentParticipant.user_id == user_id,
-            TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
-        )
-        .exists()
-    )
-    profile_exists = (
-        select(DeadlockProfile.user_id)
-        .where(DeadlockProfile.user_id == user_id)
-        .exists()
-    )
-    locked_roster_exists = (
-        select(TournamentDeadlockAssignmentRun.id)
-        .where(
-            TournamentDeadlockAssignmentRun.tournament_id == Tournament.id,
-            TournamentDeadlockAssignmentRun.status == "locked",
-        )
-        .exists()
-    )
-    row = (
-        await db_session.execute(
-            select(
-                Tournament,
-                active_round,
-                participant_exists.label("has_participant"),
-                profile_exists.label("has_deadlock_profile"),
-                locked_roster_exists.label("has_locked_roster"),
-            )
-            .outerjoin(active_round, active_round.id == selected_active_round_id)
-            .where(Tournament.slug == slug)
-        )
-    ).first()
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
-    return ReadyVoteRoutePreflight(
-        tournament=row[0],
-        active_round=row[1],
-        has_participant=bool(row.has_participant),
-        has_deadlock_profile=bool(row.has_deadlock_profile),
-        has_locked_roster=bool(row.has_locked_roster),
-    )
 
 async def upsert_deadlock_ready_vote(
     db_session: AsyncSession,
@@ -810,6 +882,8 @@ async def prune_participant_from_active_ready_round(
     round_row.eligible_user_ids = list(next_state.eligible_user_ids)
     if next_state.status != "active":
         round_row.closed_at = round_row.closed_at or now
+        if active_round is not None:
+            mark_ready_check_closed(tournament, now=now)
     await db_session.execute(
         delete(TournamentDeadlockReadyVote).where(
             TournamentDeadlockReadyVote.round_id == round_row.id,

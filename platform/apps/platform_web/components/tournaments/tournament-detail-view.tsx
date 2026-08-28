@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { TournamentCard } from "@/components/tournaments/tournament-card";
 import { TournamentRegistrationActions } from "@/components/tournaments/tournament-registration-actions";
+import { currentReadyCheckRound } from "@/components/ready-check/ready-check-timer";
 import { useI18n } from "@/components/i18n-provider";
 import { CspImage } from "@/components/media/csp-image";
 import { deadlockRankIconPath, deadlockRankPlaceholderPath } from "@/lib/deadlock";
@@ -21,9 +22,10 @@ export function TournamentDetailView({ tournament, actorUserId }: TournamentDeta
   const { t } = useI18n();
   const [detail, setDetail] = useState<TournamentDetail>(tournament);
   const [selectedOpponentId, setSelectedOpponentId] = useState<string | null>(null);
-  const initialReadyChoice = detail.readyCheckState?.active_round?.current_user_choice
-    ?? detail.readyCheckState?.latest_round?.current_user_choice
-    ?? null;
+  const initialReadyChoice = currentReadyCheckRound(
+    detail.readyCheckState,
+    detail.schedule?.checkInStartsAt,
+  )?.current_user_choice ?? null;
   const [readyChoice, setReadyChoice] = useState<string | null>(initialReadyChoice);
 
   useEffect(() => {

@@ -109,7 +109,6 @@ BROWSER_POLLING_HOT_ROUTES = (
     "GET /tournaments/{slug}",
     "GET /tournaments/{slug}/workspace",
     "GET /tournaments/{slug}/bracket",
-    "GET /tournaments/{slug}/deadlock/ready-check",
 )
 WRITE_BURST_PROFILE_NAME = "write-burst-v1"
 WRITE_BURST_USERS_PER_TOURNAMENT = 50
@@ -1580,22 +1579,8 @@ def summarize_request_perf_logs(
             "pool_checkout_wait_ms": row_metric_stats("pool_wait_ms", row_values),
         }
 
-    agenda_rows = [
-        row
-        for row in rows
-        if str(row.get("path") or "") == "/api/v1/ready-check/agenda"
-        or str(row.get("route") or "").endswith("/ready-check/agenda")
-    ]
-
     return {
         "logged_requests": len(rows),
-        "ready_check_agenda": {
-            "requests": len(agenda_rows),
-            "setup_duration_ms": row_metric_stats("total_ms", agenda_rows),
-            "sql_query_count": row_metric_stats("sql_count", agenda_rows),
-            "sql_time_ms": row_metric_stats("sql_ms", agenda_rows),
-            "pool_wait_ms": row_metric_stats("pool_wait_ms", agenda_rows),
-        },
         "overall": metric_stats(totals),
         "avg_sql_queries_per_request": round(sum(sql_counts) / len(sql_counts), 3) if sql_counts else None,
         "avg_db_time_ms": round(sum(sql_times) / len(sql_times), 3) if sql_times else None,
@@ -3479,10 +3464,7 @@ class ProductionQa:
                 )
                 route = f"/tournaments/{slug}"
                 route_label = "GET /tournaments/{slug}"
-                if category == "ready_check_active" and role == "participant":
-                    route = f"/tournaments/{slug}/deadlock/ready-check"
-                    route_label = "GET /tournaments/{slug}/deadlock/ready-check"
-                elif category == "bracket_active":
+                if category == "bracket_active":
                     if role in {"organizer", "admin"} or user_index % 2 == 0:
                         route = f"/tournaments/{slug}/bracket?teams_view=summary"
                         route_label = "GET /tournaments/{slug}/bracket"
@@ -3618,7 +3600,7 @@ class ProductionQa:
         raw = payload.get("next_poll_after_ms")
         if isinstance(raw, int):
             return raw
-        for key in ("tournament", "bracket", "ready_check"):
+        for key in ("tournament", "bracket"):
             nested = payload.get(key)
             if isinstance(nested, dict) and isinstance(nested.get("next_poll_after_ms"), int):
                 return int(nested["next_poll_after_ms"])
@@ -4586,7 +4568,6 @@ class ProductionQa:
         self,
         users: list[dict[str, Any]],
         *,
-        include_ready_check: bool,
         include_auto_assignment: bool,
         include_bracket: bool,
         bracket_user_limit: int | None = None,
@@ -4629,14 +4610,6 @@ class ProductionQa:
                 f"/tournaments/{self.tournament_slug}/workspace?participants_limit=0&participants_offset=0&workspace_view=detail",
                 expected=200,
             )
-            if include_ready_check:
-                await self.request_as(
-                    api_client,
-                    user,
-                    "GET",
-                    f"/tournaments/{self.tournament_slug}/deadlock/ready-check",
-                    expected=200,
-                )
             if include_auto_assignment:
                 await self.request_as(
                     api_client,
@@ -4978,7 +4951,6 @@ class ProductionQa:
                 with self.phase("public_site_mix"):
                     await self.run_scale_site_mix(
                         users,
-                        include_ready_check=False,
                         include_auto_assignment=False,
                         include_bracket=False,
                     )

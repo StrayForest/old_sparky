@@ -3,10 +3,10 @@ import { createServer } from "node:http";
 const host = process.env.MOCK_PLATFORM_API_HOST ?? "127.0.0.1";
 const port = Number(process.env.MOCK_PLATFORM_API_PORT ?? 3199);
 const now = "2026-06-07T12:00:00Z";
+const defaultReadyCheckServerTime = "2026-06-07T15:35:00Z";
 const mockCsrfToken = `mock.${"c".repeat(64)}`;
 let mockMediaSequence = 0;
 const mockMediaAssets = new Map();
-const proofRefreshAgendaCalls = new Map();
 const deadlockHeroNames = [
   "Abrams", "Apollo", "Bebop", "Billy", "Calico", "Celeste", "The Doorman", "Drifter",
   "Dynamo", "Graves", "Grey Talon", "Haze", "Holliday", "Infernus", "Ivy", "Kelvin",
@@ -313,12 +313,9 @@ function bracketPayload(slug, canManage = false, includeTeams = true) {
   };
 }
 
-function readyPayload(tournament, request) {
-  const suppressInitialActiveState = (request?.headers.cookie ?? "")
-    .includes("ready-check-provider-resync-no-activation-smoke=1")
-    || (request?.headers.cookie ?? "").includes("ready-check-provider-resync-recovery-smoke=1");
+function readyPayload(tournament) {
   return {
-    active_round: tournament?.status === "registration_open" && !suppressInitialActiveState ? {
+    active_round: tournament?.status === "registration_open" ? {
       id: 1,
       tournament_id: tournament.id,
       status: "active",
@@ -332,6 +329,26 @@ function readyPayload(tournament, request) {
     } : null,
     latest_round: null
   };
+}
+
+function serverTimeForRequest(request) {
+  const cookie = request.headers.cookie ?? "";
+  if (cookie.includes("ready-check-timer-before-smoke=1")) {
+    return "2026-06-07T15:29:00Z";
+  }
+  if (cookie.includes("ready-check-timer-at-smoke=1")) {
+    return "2026-06-07T15:29:00Z";
+  }
+  if (cookie.includes("ready-check-timer-after-smoke=1")) {
+    return "2026-06-07T15:30:20Z";
+  }
+  if (cookie.includes("ready-check-timer-expired-smoke=1")) {
+    return "2026-06-07T16:00:00Z";
+  }
+  if (cookie.includes("ready-check-timer-end-boundary-smoke=1")) {
+    return "2026-06-07T15:59:00Z";
+  }
+  return defaultReadyCheckServerTime;
 }
 
 const server = createServer((request, response) => {
@@ -360,134 +377,6 @@ const server = createServer((request, response) => {
       { "cache-control": "no-store" }
     );
     return;
-  }
-  if (path === "/api/v1/ready-check/agenda" && request.method === "GET") {
-    const cookie = request.headers.cookie ?? "";
-    const hasProofRefreshCookie = Boolean(cookie.match(/(?:^|;\s*)ready-check-provider-proof-refresh-smoke=/));
-    const mode = cookie.includes("ready-check-provider-sse-smoke=1")
-      || cookie.includes("ready-check-provider-stalled-smoke=1")
-      || cookie.includes("ready-check-provider-future-gap-smoke=1")
-      || cookie.includes("ready-check-provider-resync-no-activation-smoke=1")
-      || cookie.includes("ready-check-provider-resync-recovery-smoke=1")
-      || hasProofRefreshCookie
-      ? "scheduled_sse"
-      : cookie.includes("ready-check-provider-polling-smoke=1")
-        ? "polling"
-        : null;
-    const futureGap = cookie.includes("ready-check-provider-future-gap-smoke=1");
-    const stalled = cookie.includes("ready-check-provider-stalled-smoke=1");
-    const proofRefreshScope = cookie.match(/(?:^|;\s*)ready-check-provider-proof-refresh-smoke=([^;]+)/)?.[1] ?? "default";
-    const proofRefresh = Boolean(cookie.match(/(?:^|;\s*)ready-check-provider-proof-refresh-smoke=/));
-    if (proofRefresh) {
-      proofRefreshAgendaCalls.set(
-        proofRefreshScope,
-        (proofRefreshAgendaCalls.get(proofRefreshScope) ?? 0) + 1,
-      );
-    }
-    const checks = futureGap ? [
-      {
-        tournament_id: "t_night_veil_5",
-        slug: "night-veil-open-5",
-        ready_check_starts_at: "2026-06-07T15:30:00Z",
-        ready_check_ends_at: "2026-06-07T15:36:00Z",
-        admission_open_at: "2026-06-07T15:29:00Z",
-        admission_priority: "scheduled",
-        admission_mode: mode,
-        state_ticket: "mock-ready-check-state-a"
-      },
-      {
-        tournament_id: "t_citadel",
-        slug: "citadel-clash-3",
-        ready_check_starts_at: "2026-06-07T15:40:00Z",
-        ready_check_ends_at: "2026-06-07T16:00:00Z",
-        admission_open_at: "2026-06-07T15:39:00Z",
-        admission_priority: "scheduled",
-        admission_mode: mode,
-        state_ticket: "mock-ready-check-state-b"
-      }
-    ] : mode ? [{
-      tournament_id: "t_night_veil_5",
-      slug: "night-veil-open-5",
-      ready_check_starts_at: stalled ? "2026-06-07T17:00:00Z" : "2026-06-07T15:30:00Z",
-      ready_check_ends_at: stalled ? "2026-06-07T17:30:00Z" : "2026-06-07T16:00:00Z",
-      admission_open_at: "2026-06-07T15:29:00Z",
-      admission_priority: "scheduled",
-      admission_mode: mode,
-      state_ticket: "mock-ready-check-state"
-    }] : [];
-    json(response, 200, {
-      checks,
-      sse_ticket: mode === "scheduled_sse" ? "mock-ready-check-stream" : null,
-      sse_ticket_expires_at: proofRefresh
-        ? (proofRefreshAgendaCalls.get(proofRefreshScope) ?? 0) > 1
-          ? "2026-06-07T16:45:00Z"
-          : "2026-06-07T15:45:00Z"
-        : null
-    }, { "cache-control": "no-store" });
-    return;
-  }
-  if (path === "/api/v1/ready-check/state" && request.method === "GET") {
-    const cookie = request.headers.cookie ?? "";
-    if (cookie.includes("ready-check-provider-future-gap-smoke=1")) {
-      const slug = url.searchParams.get("slug");
-      json(response, 200, {
-        revision: 1,
-        status: slug === "night-veil-open-5" ? "active" : "waiting"
-      });
-      return;
-    }
-    if (cookie.includes("ready-check-provider-resync-no-activation-smoke=1")) {
-      json(response, 200, { revision: 1, status: "waiting" });
-      return;
-    }
-    if (cookie.includes("ready-check-provider-resync-recovery-smoke=1")) {
-      json(response, 200, { revision: 2, status: "active" });
-      return;
-    }
-    if (cookie.includes("ready-check-provider-")) {
-      json(response, 503, { detail: "Mock Ready Check state unavailable." });
-      return;
-    }
-  }
-  if (path === "/api/v1/ready-check/events" && request.method === "GET") {
-    const cookie = request.headers.cookie ?? "";
-    if (cookie.includes("ready-check-provider-stalled-smoke=1")) {
-      request.on("close", () => response.end());
-      return;
-    }
-    if (
-      cookie.includes("ready-check-provider-sse-smoke=1")
-      || cookie.includes("ready-check-provider-proof-refresh-smoke=")
-    ) {
-      response.writeHead(200, {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-        connection: "keep-alive"
-      });
-      response.write("retry: 5000\nevent: connected\ndata: {}\n\n");
-      request.on("close", () => response.end());
-      return;
-    }
-    if (
-      cookie.includes("ready-check-provider-future-gap-smoke=1")
-      || cookie.includes("ready-check-provider-resync-no-activation-smoke=1")
-      || cookie.includes("ready-check-provider-resync-recovery-smoke=1")
-    ) {
-      response.writeHead(200, {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-        connection: "keep-alive"
-      });
-      request.on("close", () => response.end());
-      response.write("retry: 5000\nevent: connected\ndata: {}\n\n");
-      if (cookie.includes("ready-check-provider-resync")) {
-        response.write("event: resync\ndata: {\"reason\":\"relay_gap\"}\n\n");
-        setTimeout(() => response.end(), 100);
-      } else {
-        response.write("event: ready_check\ndata: {\"tournament_id\":\"t_night_veil_5\",\"revision\":1,\"status\":\"active\"}\n\n");
-      }
-      return;
-    }
   }
   if (path === "/api/v1/auth/password-reset/request" && request.method === "POST") {
     json(response, 202, { accepted: true }, { "cache-control": "no-store" });
@@ -705,13 +594,16 @@ const server = createServer((request, response) => {
         participants_offset: Number(url.searchParams.get("participants_offset") ?? 0),
         participants_has_more: false,
         participants_available: true,
+        server_time: serverTimeForRequest(request),
         bracket: bracketPayload(
           tournament.slug,
           tournament.slug === bracketManagerTournament.slug
             || (request.headers.cookie ?? "").includes("bracket-manager-smoke=1"),
           !(request.headers.cookie ?? "").includes("teams-pending-smoke=1")
         ),
-        ready_check: readyPayload(tournament, request),
+        ready_check: (request.headers.cookie ?? "").includes("ready-check-timer-missing-state-smoke=1")
+          ? null
+          : readyPayload(tournament),
         auto_assignment: { latest_run: null, published_run: null }
       } : { detail: "Tournament not found." }
     );

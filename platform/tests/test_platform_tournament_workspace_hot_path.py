@@ -71,6 +71,7 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
         )
         snapshot_response = tournament_routes.TournamentWorkspaceResponse(
             tournament=tournament_response,
+            server_time=created_at,
         )
         tournament_routes._set_public_workspace_snapshot_cache(
             "public-cup",
@@ -101,6 +102,7 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
+        server_time_before = datetime.now(timezone.utc)
         response = await tournament_routes.get_tournament_workspace(
             "public-cup",
             request,
@@ -112,9 +114,14 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
             auth_session=None,
             db_session=db_session,
         )
+        server_time_after = datetime.now(timezone.utc)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(json.loads(response.body)["tournament"]["participant_count"], 0)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["tournament"]["participant_count"], 0)
+        server_time = datetime.fromisoformat(payload["server_time"].replace("Z", "+00:00"))
+        self.assertGreaterEqual(server_time, server_time_before)
+        self.assertLessEqual(server_time, server_time_after)
         db_session.scalar.assert_awaited_once()
         db_session.execute.assert_not_awaited()
 

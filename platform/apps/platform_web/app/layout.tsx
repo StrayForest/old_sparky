@@ -6,7 +6,6 @@ import { AuthProvider } from "@/components/auth/auth-provider";
 import { I18nProvider } from "@/components/i18n-provider";
 import { SiteFooter } from "@/components/layout/site-footer";
 import { SiteHeader } from "@/components/layout/site-header";
-import { ReadyCheckProvider } from "@/components/ready-check/ready-check-provider";
 import { CspNonceProvider } from "@/components/security/csp-nonce-provider";
 import { CspRouteAnnouncer } from "@/components/security/csp-route-announcer";
 import { getServerCurrentUser, platformSessionCookieName } from "@/lib/server-auth";
@@ -42,13 +41,11 @@ export default async function RootLayout({
         <CspNonceProvider nonce={nonce}>
           <CspRouteAnnouncer />
           <AuthProvider initialStatus={initialAuth.status} initialUser={initialAuth.user}>
-            <ReadyCheckProvider>
-              <I18nProvider>
-                <SiteHeader />
-                {children}
-                <SiteFooter />
-              </I18nProvider>
-            </ReadyCheckProvider>
+            <I18nProvider>
+              <SiteHeader />
+              {children}
+              <SiteFooter />
+            </I18nProvider>
           </AuthProvider>
         </CspNonceProvider>
       </body>

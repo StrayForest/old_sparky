@@ -966,6 +966,142 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tournament.status, "registration_open")
             self.assertIsNone(tournament.automation_ready_check_started_at)
 
+    async def test_ready_vote_works_before_delayed_worker_and_duplicate_tabs_are_idempotent(self) -> None:
+        organizer = await self._register_user(
+            label="delayed-worker-voter",
+            rank="Eternus",
+            subrank=6,
+            captain_priority="yes",
+        )
+        await self._grant_public_creation(str(organizer["user_id"]))
+
+        tournament_payload = self._assert_status(
+            await organizer["client"].post(
+                "/api/v1/tournaments",
+                json={
+                    "name": f"{self.prefix}-delayed-worker",
+                    "description": "Ready vote must not wait for automation.",
+                    "visibility": "public",
+                    "format_slug": "solo",
+                },
+            ),
+            201,
+        )
+        slug = tournament_payload["slug"]
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_open"},
+            ),
+            200,
+        )
+        self._assert_status(
+            await organizer["client"].post(
+                f"/api/v1/tournaments/{slug}/join",
+                json={"entry_type": "solo"},
+            ),
+            201,
+        )
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_closed"},
+            ),
+            200,
+        )
+
+        now = datetime.now(UTC)
+        async with session_factory()() as db_session:
+            tournament = await db_session.scalar(select(Tournament).where(Tournament.slug == slug))
+            self.assertIsNotNone(tournament, f"Tournament {slug} is missing.")
+            tournament_id = str(tournament.id)
+            tournament.ready_check_starts_at = now + timedelta(minutes=1)
+            tournament.ready_check_ends_at = now + timedelta(minutes=10)
+            tournament.automation_ready_check_started_at = None
+            tournament.automation_ready_check_closed_at = None
+            await db_session.commit()
+
+        before_start_response = await organizer["client"].post(
+            f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+            json={"choice": "yes"},
+        )
+        self.assertEqual(before_start_response.status_code, 409, before_start_response.text)
+        self.assertIn("has not started", before_start_response.json()["detail"])
+        async with session_factory()() as db_session:
+            self.assertIsNone(
+                await db_session.scalar(
+                    select(TournamentDeadlockReadyRound.id).where(
+                        TournamentDeadlockReadyRound.tournament_id == tournament_id,
+                    )
+                )
+            )
+            tournament = await db_session.scalar(select(Tournament).where(Tournament.slug == slug))
+            self.assertIsNotNone(tournament, f"Tournament {slug} is missing.")
+            tournament.ready_check_starts_at = now - timedelta(seconds=1)
+            await db_session.commit()
+
+        first_response, second_response = await asyncio.gather(
+            organizer["client"].post(
+                f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                json={"choice": "yes"},
+            ),
+            organizer["client"].post(
+                f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                json={"choice": "yes"},
+            ),
+        )
+        self.assertEqual(
+            sorted((first_response.status_code, second_response.status_code)),
+            [200, 200],
+            {"first": first_response.text, "second": second_response.text},
+        )
+        changed_values = sorted(
+            (
+                bool(first_response.json()["changed"]),
+                bool(second_response.json()["changed"]),
+            )
+        )
+        self.assertEqual(changed_values, [False, True])
+
+        async with session_factory()() as db_session:
+            tournament = await db_session.scalar(select(Tournament).where(Tournament.slug == slug))
+            self.assertIsNotNone(tournament, f"Tournament {slug} is missing.")
+            round_rows = list(
+                (
+                    await db_session.scalars(
+                        select(TournamentDeadlockReadyRound).where(
+                            TournamentDeadlockReadyRound.tournament_id == tournament.id,
+                        )
+                    )
+                ).all()
+            )
+            self.assertEqual(len(round_rows), 1)
+            vote_count = await db_session.scalar(
+                select(func.count(TournamentDeadlockReadyVote.id)).where(
+                    TournamentDeadlockReadyVote.round_id == round_rows[0].id,
+                    TournamentDeadlockReadyVote.user_id == organizer["user_id"],
+                )
+            )
+        self.assertEqual(round_rows[0].status, "active")
+        self.assertEqual(vote_count, 1)
+        self.assertIsNotNone(tournament.automation_ready_check_started_at)
+
+        close_result = await self._advance_deadlock_automation_for_slug(
+            slug,
+            now=now + timedelta(minutes=11),
+        )
+        self.assertEqual(close_result["ready_closed"], 1)
+        async with session_factory()() as db_session:
+            tournament = await db_session.scalar(select(Tournament).where(Tournament.slug == slug))
+            self.assertIsNotNone(tournament, f"Tournament {slug} is missing.")
+            closed_round = await db_session.scalar(
+                select(TournamentDeadlockReadyRound).where(
+                    TournamentDeadlockReadyRound.tournament_id == tournament_id,
+                )
+            )
+        self.assertEqual(closed_round.status, "closed")
+        self.assertIsNotNone(tournament.automation_ready_check_closed_at)
+
     async def test_deadlock_moderation_prunes_active_ready_check_state(self) -> None:
         organizer = await self._register_user(
             label="organizer",
@@ -1121,6 +1257,13 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             await organizer["client"].post(f"/api/v1/tournaments/{slug}/deadlock/ready-check/close"),
             200,
         )
+
+        closed_vote_attempt = await organizer["client"].post(
+            f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+            json={"choice": "yes"},
+        )
+        self.assertEqual(closed_vote_attempt.status_code, 409, closed_vote_attempt.text)
+        self.assertIn("no longer active", closed_vote_attempt.json()["detail"])
 
         preview_payload = self._assert_status(
             await organizer["client"].get(

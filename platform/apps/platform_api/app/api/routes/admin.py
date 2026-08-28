@@ -57,6 +57,7 @@ from python_packages.platform_infra.tournament_names import (
     public_tournament_name_exists,
 )
 from apps.platform_api.app.services.tournament_workflow import (
+    mark_ready_check_closed,
     supersede_published_deadlock_assignment_run_for_tournament,
 )
 from apps.platform_api.app.services.player_commitments import (
@@ -64,7 +65,6 @@ from apps.platform_api.app.services.player_commitments import (
     reactivate_viable_tournament_commitments,
     release_active_commitments,
 )
-from apps.platform_api.app.services.ready_check_events import publish_ready_check_event
 
 router = APIRouter()
 PREPROD_CLEANUP_CHUNK_SIZE = 10_000
@@ -1105,6 +1105,8 @@ async def admin_override_tournament(
     if ready_round_closed_by_override:
         active_ready_round.status = "closed"
         active_ready_round.closed_at = active_ready_round.closed_at or auth_session.now
+        if tournament.status in {"completed", "cancelled"}:
+            mark_ready_check_closed(tournament, now=auth_session.now)
     if (
         tournament.status == original_status
         and tournament.visibility == original_visibility
@@ -1192,14 +1194,6 @@ async def admin_override_tournament(
     await db_session.refresh(tournament)
     if ready_round_closed_by_override and active_ready_round is not None:
         await db_session.refresh(active_ready_round)
-        if original_schedule[2] is not None:
-            await publish_ready_check_event(
-                tournament_id=tournament.id,
-                round_id=active_ready_round.id,
-                status="closed",
-                eligible_user_ids=list(active_ready_round.eligible_user_ids or []),
-                ready_check_starts_at=int(original_schedule[2].timestamp()),
-            )
 
     row = (
         await db_session.execute(

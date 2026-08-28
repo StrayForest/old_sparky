@@ -58,22 +58,6 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
 
         log_info.assert_not_called()
 
-    def test_ready_check_agenda_reads_are_logged_for_latency_and_pool_reporting(self) -> None:
-        middleware = performance.RequestPerformanceMiddleware(app=None)
-        metrics = self.metrics(method="GET")
-        metrics.path = performance.READY_CHECK_AGENDA_PATH
-        with (
-            patch.object(performance, "get_settings", return_value=self.settings()),
-            patch.object(performance.logger, "info") as log_info,
-        ):
-            middleware._log_if_slow(
-                {"route": SimpleNamespace(path="/ready-check/agenda")},
-                metrics,
-                200,
-            )
-
-        log_info.assert_called_once()
-
     def test_qa_phase_header_is_bounded_and_namespaced(self) -> None:
         self.assertEqual(
             performance.qa_phase_from_scope(

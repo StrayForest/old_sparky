@@ -22,7 +22,7 @@ import sys
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, select
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLATFORM_ROOT))
@@ -67,8 +67,9 @@ BROWSER_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
     r"^Browser polling profile (?P<marker>preprod[0-9]{12}[0-9a-f]{4}) "
     r"(?P<category>registration_open|ready_check_active|bracket_active|terminal)\.$"
 )
-READY_CHECK_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
-    r"^Ready Check SSE profile (?P<marker>preprod[0-9]{12}[0-9a-f]{4})\.$"
+WRITE_BURST_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
+    r"^Write burst profile (?P<marker>preprod[0-9]{12}[0-9a-f]{4}) "
+    r"(?P<category>[a-z0-9_-]+)\.$"
 )
 
 
@@ -81,10 +82,12 @@ def _tournament_description_matches(
     description_text = str(description or "")
     if mode == "scale":
         return description_text == f"Large preprod QA tournament {marker}."
-    for pattern in (
-        BROWSER_TOURNAMENT_DESCRIPTION_PATTERN,
-        READY_CHECK_TOURNAMENT_DESCRIPTION_PATTERN,
-    ):
+    patterns = (
+        (WRITE_BURST_TOURNAMENT_DESCRIPTION_PATTERN,)
+        if mode == "write-burst"
+        else (BROWSER_TOURNAMENT_DESCRIPTION_PATTERN,)
+    )
+    for pattern in patterns:
         match = pattern.fullmatch(description_text)
         if match is not None and match.group("marker") == marker:
             return True
@@ -185,9 +188,9 @@ def load_matrix_manifest(
     if control_email != expected_control_email.strip().lower():
         raise ValueError("matrix control email does not match the cleanup input")
     mode = str(payload.get("mode") or "scale")
-    if mode not in {"scale", "browser-polling", "sse", "combined"}:
+    if mode not in {"scale", "browser-polling", "write-burst", "sse", "combined"}:
         raise ValueError("matrix mode is not supported")
-    if mode in {"browser-polling", "sse", "combined"} and len(rows) != 1:
+    if mode in {"browser-polling", "write-burst", "sse", "combined"} and len(rows) != 1:
         raise ValueError(f"{mode} manifest must contain exactly one row")
 
     markers: set[str] = set()
@@ -231,7 +234,8 @@ def load_matrix_manifest(
         )
         if mode == "scale" and len(row_tournaments) > 1:
             raise ValueError("a matrix row may own at most one tournament")
-        if mode in {"browser-polling", "sse", "combined"} and not 0 <= len(row_tournaments) <= MAX_MATRIX_ROWS:
+        max_tournaments = 64 if mode == "write-burst" else MAX_MATRIX_ROWS
+        if mode in {"browser-polling", "write-burst", "sse", "combined"} and not 0 <= len(row_tournaments) <= max_tournaments:
             raise ValueError(f"{mode} manifest has an invalid tournament count")
         if int(row.get("synthetic_users", len(row_users))) != len(row_users):
             raise ValueError("matrix synthetic user count does not match its report")
@@ -279,11 +283,12 @@ async def _count_ids(db_session, model: Any, ids: set[str]) -> int:
     )
 
 
-def _merge_recovered_browser_tournaments(
+def _merge_recovered_marker_tournaments(
     row: dict[str, Any],
     candidate_rows: list[Any],
     *,
     user_ids: set[str],
+    mode: str,
 ) -> set[str]:
     """Recover a create-before-timeout tournament without widening cleanup scope.
 
@@ -300,16 +305,33 @@ def _merge_recovered_browser_tournaments(
         if not _tournament_description_matches(
             description,
             marker=marker,
-            mode="browser-polling",
+            mode=mode,
         ):
-            raise RuntimeError("browser cleanup found an invalid marker-owned tournament")
+            raise RuntimeError("retained-load cleanup found an invalid marker-owned tournament")
         if str(candidate.organizer_user_id) not in user_ids:
-            raise RuntimeError("browser cleanup found a tournament owned outside the exact inventory")
+            raise RuntimeError("retained-load cleanup found a tournament owned outside the exact inventory")
         recovered_ids.add(str(candidate.id))
-    if len(recovered_ids) > MAX_MATRIX_ROWS:
-        raise RuntimeError("browser cleanup found too many marker-owned tournaments")
+    max_tournaments = 64 if mode == "write-burst" else MAX_MATRIX_ROWS
+    if len(recovered_ids) > max_tournaments:
+        raise RuntimeError("retained-load cleanup found too many marker-owned tournaments")
     row["tournament_ids"] = sorted(declared_ids | recovered_ids)
     return recovered_ids - declared_ids
+
+
+def _merge_recovered_browser_tournaments(
+    row: dict[str, Any],
+    candidate_rows: list[Any],
+    *,
+    user_ids: set[str],
+) -> set[str]:
+    """Backward-compatible wrapper for browser-polling recovery tests."""
+
+    return _merge_recovered_marker_tournaments(
+        row,
+        candidate_rows,
+        user_ids=user_ids,
+        mode="browser-polling",
+    )
 
 
 async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -326,11 +348,15 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     control_email = str(manifest["control_email"])
     async with session_factory()() as db_session:
         recovered_tournament_ids: dict[str, set[str]] = {}
-        if manifest["mode"] in {"browser-polling", "sse", "combined"}:
+        if manifest["mode"] in {"browser-polling", "write-burst", "sse", "combined"}:
             for row in manifest["rows"]:
                 marker = row["marker"]
-                marker_prefix = f"Browser polling profile {marker} "
-                ready_check_description = f"Ready Check SSE profile {marker}."
+                is_write_burst = manifest["mode"] == "write-burst"
+                marker_prefix = (
+                    f"Write burst profile {marker} "
+                    if is_write_burst
+                    else f"Browser polling profile {marker} "
+                )
                 candidates = list(
                     (
                         await db_session.execute(
@@ -338,19 +364,15 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
                                 Tournament.id,
                                 Tournament.description,
                                 Tournament.organizer_user_id,
-                            ).where(
-                                or_(
-                                    Tournament.description.like(f"{marker_prefix}%"),
-                                    Tournament.description == ready_check_description,
-                                )
-                            )
+                            ).where(Tournament.description.like(f"{marker_prefix}%"))
                         )
                     ).all()
                 )
-                recovered = _merge_recovered_browser_tournaments(
+                recovered = _merge_recovered_marker_tournaments(
                     row,
                     candidates,
                     user_ids=set(row["user_ids"]),
+                    mode=manifest["mode"],
                 )
                 if recovered:
                     recovered_tournament_ids[row["marker"]] = recovered

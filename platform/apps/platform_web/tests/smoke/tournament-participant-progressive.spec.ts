@@ -263,6 +263,7 @@ function workspacePayload(slug: string, authenticated: boolean, includeCurrentUs
   };
   return {
     tournament,
+    server_time: "2026-07-20T16:10:00Z",
     current_user: currentUser,
     participants: [],
     participants_total: 26,

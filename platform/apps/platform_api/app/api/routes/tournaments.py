@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from hashlib import sha256
+import logging
 import secrets
 import string
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
@@ -88,10 +89,6 @@ from apps.platform_api.app.services.bracket_events import (
     read_bracket_probe_state,
     stream_bracket_events,
 )
-from apps.platform_api.app.services.ready_check_events import (
-    publish_ready_check_event,
-    revoke_ready_check_state,
-)
 from apps.platform_api.app.services.brackets import (
     advance_revision,
     bracket_event_payload,
@@ -138,15 +135,15 @@ from apps.platform_api.app.services.tournament_workflow import (
     deadlock_ready_check_read_preflight,
     deadlock_ready_round_for_tournament,
     deadlock_ready_state_round_for_tournament,
-    deadlock_ready_vote_preflight,
-    deadlock_ready_vote_route_preflight,
     finalize_deadlock_assignment_with_commitments,
     lock_tournament_for_workflow,
+    mark_ready_check_closed,
+    mark_ready_check_started,
+    prepare_deadlock_ready_vote,
     prepare_deadlock_captain_candidate_rows,
     prune_participant_from_active_captain_round,
     prune_participant_from_active_ready_round,
     participant_status_is_inactive,
-    ready_vote_requires_automation,
     serialize_deadlock_ready_round,
     tournament_has_locked_deadlock_roster,
     transition_tournament_status,
@@ -268,6 +265,8 @@ router = APIRouter()
 stream_router = APIRouter()
 probe_router = APIRouter()
 
+logger = logging.getLogger(__name__)
+
 INVITE_CODE_ALPHABET = string.ascii_uppercase + string.digits
 INACTIVE_PARTICIPANT_STATUSES = ("withdrawn", "disqualified")
 DEFAULT_TOURNAMENT_COVER_URL = (
@@ -289,8 +288,7 @@ WORKSPACE_PARTICIPANT_POLL_MS = 15_000
 WORKSPACE_MANAGER_POLL_MS = 20_000
 BRACKET_ACTIVE_POLL_MS = 12_000
 BRACKET_IDLE_POLL_MS = 30_000
-READY_CHECK_ACTIVE_PARTICIPANT_POLL_MS = 5_000
-READY_CHECK_ACTIVE_VIEWER_POLL_MS = 15_000
+MANUAL_READY_CHECK_DURATION = timedelta(minutes=10)
 TERMINAL_TOURNAMENT_STATUSES = frozenset(("completed", "cancelled"))
 
 
@@ -548,25 +546,6 @@ def ready_check_state_version(
         + int(round_response.ready_count) * 1_000
         + int(round_response.declined_count)
     )
-
-
-def ready_check_poll_delay_ms(
-    *,
-    active_round: TournamentDeadlockReadyRoundResponse | None,
-    latest_round: TournamentDeadlockReadyRoundResponse | None,
-    has_participant_context: bool = True,
-) -> int:
-    if active_round is not None:
-        return (
-            READY_CHECK_ACTIVE_PARTICIPANT_POLL_MS
-            if has_participant_context
-            else READY_CHECK_ACTIVE_VIEWER_POLL_MS
-        )
-    if latest_round is not None and latest_round.status == "closed":
-        return POLLING_DISABLED_MS
-    return POLLING_DISABLED_MS
-
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -833,7 +812,6 @@ def _ready_check_state_response_from_cache(
     entry: ReadyCheckStateCacheEntry,
     *,
     current_user_id: str,
-    has_participant_context: bool = True,
 ) -> TournamentDeadlockReadyCheckStateResponse:
     active_round = _ready_round_snapshot_for_user(
         entry.active_round,
@@ -846,11 +824,6 @@ def _ready_check_state_response_from_cache(
     return TournamentDeadlockReadyCheckStateResponse(
         active_round=active_round,
         latest_round=latest_round,
-        next_poll_after_ms=ready_check_poll_delay_ms(
-            active_round=active_round,
-            latest_round=latest_round,
-            has_participant_context=has_participant_context,
-        ),
         state_version=ready_check_state_version(active_round, latest_round),
     )
 
@@ -2463,7 +2436,6 @@ async def build_deadlock_ready_check_state_response(
     active_round: TournamentDeadlockReadyRound | None = None,
     latest_round: TournamentDeadlockReadyRound | None = None,
     rounds_loaded: bool = False,
-    has_participant_context: bool = True,
 ) -> TournamentDeadlockReadyCheckStateResponse:
     loaded_rounds = rounds_loaded
     loaded_active_round = active_round
@@ -2487,7 +2459,6 @@ async def build_deadlock_ready_check_state_response(
             return _ready_check_state_response_from_cache(
                 cached_state,
                 current_user_id=current_user_id,
-                has_participant_context=has_participant_context,
             )
 
     if cache_revision > 0:
@@ -2497,7 +2468,6 @@ async def build_deadlock_ready_check_state_response(
                 return _ready_check_state_response_from_cache(
                     cached_state,
                     current_user_id=current_user_id,
-                    has_participant_context=has_participant_context,
                 )
             active_round, latest_round = await load_ready_rounds()
             if (
@@ -2517,7 +2487,6 @@ async def build_deadlock_ready_check_state_response(
                 return _ready_check_state_response_from_cache(
                     cached_state,
                     current_user_id=current_user_id,
-                    has_participant_context=has_participant_context,
                 )
     else:
         active_round, latest_round = await load_ready_rounds()
@@ -2544,11 +2513,6 @@ async def build_deadlock_ready_check_state_response(
     return TournamentDeadlockReadyCheckStateResponse(
         active_round=active_response,
         latest_round=latest_response,
-        next_poll_after_ms=ready_check_poll_delay_ms(
-            active_round=active_response,
-            latest_round=latest_response,
-            has_participant_context=has_participant_context,
-        ),
         state_version=ready_check_state_version(active_response, latest_response),
     )
 
@@ -3696,12 +3660,11 @@ async def organizer_remove_participant(
     participant.moderation_note = "Removed by organizer."
     participant.moderated_at = auth_session.now
     participant.moderated_by_user_id = auth_session.user.id
-    ready_round_projection = None
     if (
         is_solo_tournament_format(tournament.format_slug)
         and not participant_status_is_inactive(previous_status)
     ):
-        ready_round_projection = await prune_participant_from_active_ready_round(
+        await prune_participant_from_active_ready_round(
             db_session,
             tournament=tournament,
             user_id=participant.user_id,
@@ -3741,21 +3704,6 @@ async def organizer_remove_participant(
     )
     await db_session.commit()
     invalidate_tournament_runtime_caches(tournament.id)
-    if ready_round_projection is not None and tournament.ready_check_starts_at is not None:
-        await db_session.refresh(ready_round_projection)
-        await publish_ready_check_event(
-            tournament_id=tournament.id,
-            round_id=ready_round_projection.id,
-            status=ready_round_projection.status,
-            eligible_user_ids=list(ready_round_projection.eligible_user_ids or []),
-            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
-        )
-    if tournament.ready_check_starts_at is not None:
-        await revoke_ready_check_state(
-            tournament_id=tournament.id,
-            user_id=participant.user_id,
-            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
-        )
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
 
@@ -3841,14 +3789,12 @@ async def organizer_moderate_participant(
     participant.moderation_note = next_note
     participant.moderated_at = auth_session.now
     participant.moderated_by_user_id = auth_session.user.id
-    ready_round_projection = None
-
     if (
         is_solo_tournament_format(tournament.format_slug)
         and participant_status_is_inactive(participant.status)
         and not participant_status_is_inactive(previous_status)
     ):
-        ready_round_projection = await prune_participant_from_active_ready_round(
+        await prune_participant_from_active_ready_round(
             db_session,
             tournament=tournament,
             user_id=participant.user_id,
@@ -3888,21 +3834,6 @@ async def organizer_moderate_participant(
     )
     await db_session.commit()
     invalidate_tournament_runtime_caches(tournament.id)
-    if ready_round_projection is not None and tournament.ready_check_starts_at is not None:
-        await db_session.refresh(ready_round_projection)
-        await publish_ready_check_event(
-            tournament_id=tournament.id,
-            round_id=ready_round_projection.id,
-            status=ready_round_projection.status,
-            eligible_user_ids=list(ready_round_projection.eligible_user_ids or []),
-            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
-        )
-    if participant_status_is_inactive(participant.status) and tournament.ready_check_starts_at is not None:
-        await revoke_ready_check_state(
-            tournament_id=tournament.id,
-            user_id=participant.user_id,
-            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
-        )
     await db_session.refresh(participant)
     return serialize_participant(
         participant,
@@ -5082,7 +5013,6 @@ async def get_deadlock_ready_check_state(
         active_round=preflight.active_round,
         latest_round=preflight.latest_round,
         rounds_loaded=True,
-        has_participant_context=preflight.has_participant,
     )
 
 
@@ -5101,6 +5031,22 @@ async def start_deadlock_ready_check(
     await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
     ensure_tournament_organizer(auth_session, tournament)
+    if tournament.automation_ready_check_closed_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Deadlock ready-check is already closed.",
+        )
+    if tournament.ready_check_starts_at is None and tournament.ready_check_ends_at is None:
+        # The explicit organizer action is the legacy/manual way to start a
+        # round. Give it the same server-known window as a scheduled check so
+        # the page timer and vote authorization still share one clock.
+        tournament.ready_check_starts_at = auth_session.now
+        tournament.ready_check_ends_at = auth_session.now + MANUAL_READY_CHECK_DURATION
+    elif tournament.ready_check_starts_at is None or tournament.ready_check_ends_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ready Check requires both starts_at and ends_at.",
+        )
     try:
         ensure_deadlock_roster_staging_allowed(
             format_slug=tournament.format_slug,
@@ -5148,6 +5094,7 @@ async def start_deadlock_ready_check(
         eligible_user_ids=list(decision.user_ids),
         initiated_by_user_id=auth_session.user.id,
     )
+    mark_ready_check_started(tournament, now=auth_session.now)
     _invalidate_ready_check_state_cache(tournament.id)
     db_session.add(round_row)
     await db_session.flush()
@@ -5164,15 +5111,6 @@ async def start_deadlock_ready_check(
     )
     await db_session.commit()
     await db_session.refresh(round_row)
-    await publish_ready_check_event(
-        tournament_id=tournament.id,
-        round_id=round_row.id,
-        status="active",
-        eligible_user_ids=list(round_row.eligible_user_ids or []),
-        ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp())
-        if tournament.ready_check_starts_at is not None
-        else 0,
-    )
     return await serialize_deadlock_ready_round(
         db_session,
         round_row,
@@ -5188,116 +5126,125 @@ async def vote_deadlock_ready_check(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockReadyVoteResponse:
     current_user_id = auth_session.user.id
-    route_preflight = await deadlock_ready_vote_route_preflight(
-        db_session,
-        slug=slug,
-        user_id=current_user_id,
-    )
-    tournament_id = route_preflight.tournament.id
-    if ready_vote_requires_automation(
-        route_preflight.tournament,
-        route_preflight.active_round,
-        now=auth_session.now,
-    ):
-        from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
-
-        await advance_deadlock_tournament_automation(
-            db_session,
-            tournament=route_preflight.tournament,
-            now=auth_session.now,
-            allow_assignment_generation=False,
-        )
-
-    tournament = route_preflight.tournament
-    preflight = await deadlock_ready_vote_preflight(
-        db_session,
-        tournament_id=tournament_id,
-        user_id=current_user_id,
-    )
-    if ready_vote_requires_automation(tournament, preflight.active_round, now=auth_session.now):
-        # Scheduling transitions remain serialized by the tournament row. A
-        # normal vote itself only writes the vote row and its 32-way counter
-        # shard, so it does not join that hot lock.
-        await db_session.rollback()
-        tournament = await get_tournament_or_404(db_session, slug)
-        await advance_deadlock_tournament_automation(
-            db_session,
-            tournament=tournament,
-            now=auth_session.now,
-            allow_assignment_generation=False,
-        )
-        await db_session.rollback()
-        tournament = await get_tournament_or_404(db_session, slug)
-        preflight = await deadlock_ready_vote_preflight(
-            db_session,
-            tournament_id=tournament.id,
-            user_id=current_user_id,
-        )
-
-    ensure_deadlock_tournament_format(tournament)
+    tournament: Tournament | None = None
     try:
+        preflight = await prepare_deadlock_ready_vote(
+            db_session,
+            slug=slug,
+            user_id=current_user_id,
+            choice=payload.choice,
+            now=auth_session.now,
+        )
+        tournament = preflight.tournament
+        ensure_deadlock_tournament_format(tournament)
         ensure_deadlock_roster_staging_allowed(
             format_slug=tournament.format_slug,
             tournament_status=tournament.status,
             has_locked_deadlock_roster=preflight.has_locked_roster,
             action_name="Deadlock ready-check voting",
         )
-    except TournamentWorkflowError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    if not preflight.has_participant:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only joined participants can vote in deadlock ready-check.",
-        )
-    active_round = preflight.active_round
-    if active_round is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Deadlock ready-check is not active.",
-        )
-
-    if payload.choice == "yes" and not preflight.has_deadlock_profile:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Complete your Deadlock profile before confirming ready status.",
-        )
-
-    eligible_user_ids = {str(user_id) for user_id in list(active_round.eligible_user_ids or [])}
-    if eligible_user_ids and current_user_id not in eligible_user_ids:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not eligible for the active ready-check.",
-        )
-
-    vote_changed = await upsert_deadlock_ready_vote(
-        db_session,
-        round_id=active_round.id,
-        user_id=current_user_id,
-        choice=payload.choice,
-        responded_at=auth_session.now,
-    )
-
-    if vote_changed:
-        _invalidate_ready_check_state_cache(tournament.id)
-        try:
-            await db_session.commit()
-        except IntegrityError as exc:
-            await db_session.rollback()
-            if "ready vote requires an active ready round" not in str(exc):
-                raise
+        if not preflight.has_participant:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only joined participants can vote in deadlock ready-check.",
+            )
+        active_round = preflight.active_round
+        if active_round is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Deadlock ready-check is no longer active.",
-            ) from exc
-    return TournamentDeadlockReadyVoteResponse(
-        round_id=active_round.id,
-        tournament_id=active_round.tournament_id,
-        status=active_round.status,
-        eligible_participant_count=len(list(active_round.eligible_user_ids or [])),
-        current_user_choice=payload.choice,
-        changed=vote_changed,
-        server_received_at=auth_session.now,
-    )
+                detail="Deadlock ready-check is not active.",
+            )
+
+        if payload.choice == "yes" and not preflight.has_deadlock_profile:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Complete your Deadlock profile before confirming ready status.",
+            )
+
+        eligible_user_ids = {str(user_id) for user_id in list(active_round.eligible_user_ids or [])}
+        if eligible_user_ids and current_user_id not in eligible_user_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not eligible for the active ready-check.",
+            )
+
+        existing_choice = await db_session.scalar(
+            select(TournamentDeadlockReadyVote.choice).where(
+                TournamentDeadlockReadyVote.round_id == active_round.id,
+                TournamentDeadlockReadyVote.user_id == current_user_id,
+            )
+        )
+        vote_changed = await upsert_deadlock_ready_vote(
+            db_session,
+            round_id=active_round.id,
+            user_id=current_user_id,
+            choice=payload.choice,
+            responded_at=auth_session.now,
+        )
+
+        if vote_changed:
+            _invalidate_ready_check_state_cache(tournament.id)
+            try:
+                await db_session.commit()
+            except IntegrityError as exc:
+                await db_session.rollback()
+                if "ready vote requires an active ready round" not in str(exc):
+                    raise
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Deadlock ready-check is no longer active.",
+                ) from exc
+
+        outcome = "idempotent" if existing_choice == payload.choice and not vote_changed else "accepted"
+        starts_at = tournament.ready_check_starts_at
+        relative_ms = (
+            round((auth_session.now - starts_at).total_seconds() * 1000)
+            if starts_at is not None
+            else None
+        )
+        logger.info(
+            "ready_vote outcome=%s tournament=%s user=%s relative_ms=%s",
+            outcome,
+            tournament.slug,
+            current_user_id,
+            relative_ms,
+        )
+        return TournamentDeadlockReadyVoteResponse(
+            round_id=active_round.id,
+            tournament_id=active_round.tournament_id,
+            status=active_round.status,
+            eligible_participant_count=len(list(active_round.eligible_user_ids or [])),
+            current_user_choice=payload.choice,
+            changed=vote_changed,
+            server_received_at=auth_session.now,
+        )
+    except TournamentWorkflowError as exc:
+        relative_ms = getattr(exc, "relative_ms", None)
+        if tournament is not None and tournament.ready_check_starts_at is not None:
+            relative_ms = round(
+                (auth_session.now - tournament.ready_check_starts_at).total_seconds() * 1000
+            )
+        logger.info(
+            "ready_vote outcome=rejected tournament=%s reason=%s relative_ms=%s",
+            slug,
+            str(exc)[:160],
+            relative_ms,
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except HTTPException as exc:
+        relative_ms = None
+        if tournament is not None and tournament.ready_check_starts_at is not None:
+            relative_ms = round(
+                (auth_session.now - tournament.ready_check_starts_at).total_seconds() * 1000
+            )
+        logger.info(
+            "ready_vote outcome=rejected tournament=%s status=%s reason=%s relative_ms=%s",
+            slug,
+            exc.status_code,
+            str(exc.detail)[:160],
+            relative_ms,
+        )
+        raise
 
 
 @router.post("/{slug}/deadlock/ready-check/close", response_model=TournamentDeadlockReadyRoundResponse)
@@ -5336,6 +5283,7 @@ async def close_deadlock_ready_check(
 
     active_round.status = "closed"
     active_round.closed_at = auth_session.now
+    mark_ready_check_closed(tournament, now=auth_session.now)
     _invalidate_ready_check_state_cache(tournament.id)
     await write_audit_log(
         db_session,
@@ -5347,15 +5295,6 @@ async def close_deadlock_ready_check(
     )
     await db_session.commit()
     await db_session.refresh(active_round)
-    await publish_ready_check_event(
-        tournament_id=tournament.id,
-        round_id=active_round.id,
-        status="closed",
-        eligible_user_ids=list(active_round.eligible_user_ids or []),
-        ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp())
-        if tournament.ready_check_starts_at is not None
-        else 0,
-    )
     return await serialize_deadlock_ready_round(
         db_session,
         active_round,
@@ -6404,9 +6343,8 @@ async def leave_tournament(
         db_session,
         participant_id=participant.id,
     )
-    ready_round_projection = None
     if is_solo_tournament_format(tournament.format_slug):
-        ready_round_projection = await prune_participant_from_active_ready_round(
+        await prune_participant_from_active_ready_round(
             db_session,
             tournament=tournament,
             user_id=participant.user_id,
@@ -6436,21 +6374,6 @@ async def leave_tournament(
     )
     await db_session.commit()
     invalidate_tournament_runtime_caches(tournament.id)
-    if ready_round_projection is not None and tournament.ready_check_starts_at is not None:
-        await db_session.refresh(ready_round_projection)
-        await publish_ready_check_event(
-            tournament_id=tournament.id,
-            round_id=ready_round_projection.id,
-            status=ready_round_projection.status,
-            eligible_user_ids=list(ready_round_projection.eligible_user_ids or []),
-            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
-        )
-    if tournament.ready_check_starts_at is not None:
-        await revoke_ready_check_state(
-            tournament_id=tournament.id,
-            user_id=auth_session.user.id,
-            ready_check_starts_at=int(tournament.ready_check_starts_at.timestamp()),
-        )
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
 
@@ -6621,6 +6544,9 @@ async def get_tournament_workspace(
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentWorkspaceResponse | Response:
+    # The schedule and this timestamp travel in one authoritative response.
+    # The browser derives elapsed time from this anchor with performance.now()
+    # and never needs a Ready Check transport just to cross a known boundary.
     public_snapshot_candidate = bool(
         workspace_view == "detail"
         and participants_limit == 0
@@ -6659,8 +6585,10 @@ async def get_tournament_workspace(
                         and not current_user_is_organizer
                         and not auth_session_has_admin_role(auth_session)
                     ):
+                        server_time = datetime.now(UTC)
                         workspace_response = snapshot.response.model_copy(
                             update={
+                                "server_time": server_time,
                                 "tournament": snapshot.response.tournament.model_copy(
                                     update={
                                         "current_user_has_invite_access": invite_access is not None,
@@ -6765,8 +6693,10 @@ async def get_tournament_workspace(
         current_user_has_invite_access=invite_access is not None,
     )
     if not workspace_visible:
+        server_time = datetime.now(UTC)
         workspace_response = TournamentWorkspaceResponse(
             tournament=tournament_response,
+            server_time=server_time,
             current_user=current_user,
             current_user_active_commitment=active_commitment,
             participants=[],
@@ -6877,7 +6807,6 @@ async def get_tournament_workspace(
             tournament_id=tournament.id,
             current_user_id=auth_session.user.id,
             tournament_bracket_revision=tournament.bracket_revision,
-            has_participant_context=participant_record is not None,
         )
     if current_user_is_organizer and is_solo_format and workspace_view != "bracket_summary":
         auto_assignment = await build_deadlock_auto_assignment_state_response(
@@ -6890,8 +6819,10 @@ async def get_tournament_workspace(
             assignment_runs_loaded=assignment_runs_loaded,
         )
 
+    server_time = datetime.now(UTC)
     workspace_response = TournamentWorkspaceResponse(
         tournament=tournament_response,
+        server_time=server_time,
         current_user=current_user,
         current_user_active_commitment=active_commitment,
         participants=participants,

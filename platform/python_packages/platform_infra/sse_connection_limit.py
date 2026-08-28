@@ -8,7 +8,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Callable, Literal
+from typing import Callable
 
 from fastapi import Depends
 from redis.asyncio import BlockingConnectionPool, Redis
@@ -28,20 +28,14 @@ from python_packages.platform_infra.security import (
 
 logger = logging.getLogger(__name__)
 
-SSE_PATH_RE = re.compile(
-    r"^(?:/api/v1/tournaments/[^/]+/bracket/events|/api/v1/ready-check/events)$"
-)
+SSE_PATH_RE = re.compile(r"^/api/v1/tournaments/[^/]+/bracket/events$")
 # Cloudflare's public edge starts returning Error 1200 while the origin is
 # still below its own CPU/DB ceilings. Keep a deliberate local headroom so
 # excess viewers receive an immediate, controlled 429 and can fall back to
 # revision polling instead of waiting in the edge queue.
 SSE_GLOBAL_LIMIT = 3_000
-READY_CHECK_SSE_GLOBAL_LIMIT = 3_000
-READY_CHECK_SSE_HARD_TARGET = 10_000
-SSE_QA_GLOBAL_LIMIT_MAX = 30_000
 SSE_SOURCE_LIMIT = 32
 SSE_USER_LIMIT = 4
-READY_CHECK_SSE_USER_LIMIT = 1
 SSE_KEEPALIVE_SECONDS = 15
 SSE_RECONNECT_MIN_MS = 5_000
 SSE_RECONNECT_JITTER_MS = 7_000
@@ -50,16 +44,8 @@ SSE_LEASE_SECONDS = 120
 SSE_LEASE_RENEW_INTERVAL_SECONDS = 30
 SSE_KEY_EXPIRY_GRACE_SECONDS = 60
 SSE_KEY_PREFIX = "platform:sse-limit:v1"
-READY_CHECK_SSE_KEY_PREFIX = "platform:ready-check-sse-limit:v1"
-SseUserScope = Literal["legacy", "ready_check"]
 SSE_LOAD_TEST_BYPASS_HEADER = "x-platform-qa-sse-bypass"
 SSE_LOAD_TEST_BYPASS_CONTEXT = b"platform-sse-load-test-v1"
-SSE_LOAD_TEST_CAPACITY_HEADER = "x-platform-qa-sse-capacity"
-SSE_LOAD_TEST_CAPACITY_CONTEXT = b"platform-sse-capacity-v1"
-# A paced 30,000-stream diagnostic at 25 opens/sec takes about 20 minutes.
-# Keep the proof short-lived while leaving enough time for the deliberately
-# bounded QA window to finish opening; it is never used by browser clients.
-SSE_LOAD_TEST_CAPACITY_TTL_SECONDS = 1_800
 # A burst of signed-ticket opens still performs one atomic global lease in
 # Redis. Keep this pool large enough to absorb the bounded 3,000-connection
 # application ceiling without turning pool checkout into a false 503, while
@@ -161,31 +147,6 @@ def sse_load_test_bypass_token(settings: PlatformSettings) -> str:
     ).hexdigest()
 
 
-def _capacity_signature(settings: PlatformSettings, payload: str) -> str:
-    return hmac.new(
-        settings.platform_secret_key.encode("utf-8"),
-        b".".join((SSE_LOAD_TEST_CAPACITY_CONTEXT, payload.encode("ascii"))),
-        sha256,
-    ).hexdigest()
-
-
-def sse_load_test_capacity_token(
-    settings: PlatformSettings,
-    global_limit: int,
-    *,
-    now_epoch: int | None = None,
-) -> str:
-    """Issue a short-lived signed global-cap proof for an approved QA run."""
-
-    if not 1 <= global_limit <= SSE_QA_GLOBAL_LIMIT_MAX:
-        raise ValueError(
-            f"QA SSE global limit must be between 1 and {SSE_QA_GLOBAL_LIMIT_MAX}."
-        )
-    now = int(time.time()) if now_epoch is None else now_epoch
-    payload = f"{global_limit}:{now + SSE_LOAD_TEST_CAPACITY_TTL_SECONDS}"
-    return f"{payload}:{_capacity_signature(settings, payload)}"
-
-
 def _has_sse_load_test_bypass(scope: Scope, settings: PlatformSettings) -> bool:
     request = Request(scope)
     supplied = request.headers.get(SSE_LOAD_TEST_BYPASS_HEADER, "")
@@ -194,47 +155,8 @@ def _has_sse_load_test_bypass(scope: Scope, settings: PlatformSettings) -> bool:
     return hmac.compare_digest(supplied, sse_load_test_bypass_token(settings))
 
 
-def _qa_global_limit(scope: Scope, settings: PlatformSettings) -> int | None:
-    # Capacity proofs are deliberately scoped to the Ready Check contour. A
-    # valid proof must not be reusable to raise the compatibility bracket
-    # contour, even if a caller supplies the header outside the QA wrapper.
-    if str(scope.get("path", "")) not in {
-        "/api/v1/ready-check/agenda",
-        "/api/v1/ready-check/events",
-    }:
-        return None
-    request = Request(scope)
-    parts = request.headers.get(SSE_LOAD_TEST_CAPACITY_HEADER, "").split(":")
-    if len(parts) != 3:
-        return None
-    raw_limit, raw_expires_at, supplied_signature = parts
-    if not raw_limit.isdecimal() or not raw_expires_at.isdecimal():
-        return None
-    global_limit = int(raw_limit)
-    expires_at = int(raw_expires_at)
-    if not 1 <= global_limit <= SSE_QA_GLOBAL_LIMIT_MAX:
-        return None
-    now = int(time.time())
-    if expires_at <= now or expires_at > now + SSE_LOAD_TEST_CAPACITY_TTL_SECONDS:
-        return None
-    payload = f"{global_limit}:{expires_at}"
-    if not hmac.compare_digest(supplied_signature, _capacity_signature(settings, payload)):
-        return None
-    return global_limit
-
-
-def qa_sse_capacity_limit(request: Request) -> int | None:
-    """Return an operator-signed QA capacity override for this request."""
-
-    return _qa_global_limit(request.scope, get_settings())
-
-
 def _global_key() -> str:
     return f"{SSE_KEY_PREFIX}:global"
-
-
-def _ready_check_global_key() -> str:
-    return f"{READY_CHECK_SSE_KEY_PREFIX}:global"
 
 
 def _source_key(settings: PlatformSettings, source_address: str) -> str:
@@ -243,22 +165,6 @@ def _source_key(settings: PlatformSettings, source_address: str) -> str:
 
 def _user_key(settings: PlatformSettings, user_id: str) -> str:
     return f"{SSE_KEY_PREFIX}:user:{_fingerprint(settings, f'user:{user_id}')}"
-
-
-def _ready_check_user_key(settings: PlatformSettings, user_id: str) -> str:
-    return f"{READY_CHECK_SSE_KEY_PREFIX}:user:{_fingerprint(settings, f'user:{user_id}')}"
-
-
-def _user_key_for_scope(
-    settings: PlatformSettings,
-    user_id: str,
-    user_scope: SseUserScope,
-) -> str:
-    if user_scope == "legacy":
-        return _user_key(settings, user_id)
-    if user_scope == "ready_check":
-        return _ready_check_user_key(settings, user_id)
-    raise ValueError(f"Unsupported SSE user scope: {user_scope}")
 
 
 def _limiter_client() -> Redis:
@@ -380,13 +286,12 @@ class SseConnectionLease:
         user_id: str,
         *,
         user_limit: int = SSE_USER_LIMIT,
-        user_scope: SseUserScope = "legacy",
         lease_seconds: int | None = None,
         now_epoch: int | None = None,
     ) -> None:
         if self.released:
             raise RuntimeError("Cannot extend a released SSE connection lease.")
-        key = _user_key_for_scope(self.settings, user_id, user_scope)
+        key = _user_key(self.settings, user_id)
         if key in self.keys:
             return
         now = int(time.time()) if now_epoch is None else now_epoch
@@ -467,43 +372,11 @@ async def reserve_sse_connection(
     )
 
 
-async def current_ready_check_sse_connection_count(
-    *,
-    now_epoch: int | None = None,
-) -> int:
-    """Return the bounded Ready Check pool count for admission planning."""
-
-    now = int(time.time()) if now_epoch is None else now_epoch
-    cache = _limiter_client()
-    try:
-        await cache.zremrangebyscore(_ready_check_global_key(), "-inf", now)
-        return int(await cache.zcard(_ready_check_global_key()))
-    except RedisError:
-        # Planning is advisory. The atomic lease remains fail-closed when the
-        # actual stream attempts to open, so a stale/unknown count cannot grant
-        # capacity.
-        logger.warning("Failed to read Ready Check SSE occupancy for planning.", exc_info=True)
-        return 0
-
-
 def _source_address(scope: Scope) -> str:
     client = scope.get("client")
     if client is None or not client[0]:
         return "unknown"
     return str(client[0])
-
-
-def _global_limit_for_path(scope: Scope, settings: PlatformSettings) -> int:
-    path = str(scope.get("path", ""))
-    if path == "/api/v1/ready-check/events":
-        return READY_CHECK_SSE_GLOBAL_LIMIT
-    return SSE_GLOBAL_LIMIT
-
-
-def _global_key_for_path(scope: Scope) -> str:
-    if str(scope.get("path", "")) == "/api/v1/ready-check/events":
-        return _ready_check_global_key()
-    return _global_key()
 
 
 class SseConnectionLimitMiddleware:
@@ -533,7 +406,7 @@ class SseConnectionLimitMiddleware:
         source_address = _source_address(scope)
         source_fingerprint = _fingerprint(settings, f"source:{source_address}")
         bypass_source_limit = _has_sse_load_test_bypass(scope, settings)
-        global_limit = _qa_global_limit(scope, settings) or _global_limit_for_path(scope, settings)
+        global_limit = SSE_GLOBAL_LIMIT
         lease: SseConnectionLease | None = None
         try:
             reservation_kwargs = {
@@ -541,8 +414,6 @@ class SseConnectionLimitMiddleware:
                 "global_limit": global_limit,
                 "bypass_source_limit": bypass_source_limit,
             }
-            if str(scope.get("path", "")) == "/api/v1/ready-check/events":
-                reservation_kwargs["global_key"] = _global_key_for_path(scope)
             lease = await reserve_sse_connection(source_address, **reservation_kwargs)
         except SseConnectionLimitExceeded as exc:
             if lease is not None:
@@ -631,18 +502,13 @@ async def add_sse_authenticated_user_scope(
     user_id: str,
     *,
     user_limit: int = SSE_USER_LIMIT,
-    user_scope: SseUserScope = "legacy",
 ) -> None:
     """Add the authenticated-user lease after stream authorization."""
 
     lease = request.scope.get(SSE_CONNECTION_LEASE_SCOPE)
     if not isinstance(lease, SseConnectionLease):
         raise RuntimeError("SSE connection lease is missing from the request scope.")
-    if user_scope == "legacy":
+    if user_limit == SSE_USER_LIMIT:
+        await lease.add_user_scope(user_id)
+    else:
         await lease.add_user_scope(user_id, user_limit=user_limit)
-        return
-    await lease.add_user_scope(
-        user_id,
-        user_limit=user_limit,
-        user_scope=user_scope,
-    )

@@ -11,7 +11,6 @@ from apps.platform_api.app.api.routes import (
     media,
     profile_workspace,
     profiles,
-    ready_check,
     registration,
     security_reports,
     stats,
@@ -41,13 +40,6 @@ api_router.include_router(users.router, prefix="/users", tags=["users"])
 api_router.include_router(profiles.router, prefix="/profiles", tags=["profiles"])
 api_router.include_router(profile_workspace.router, prefix="/profiles", tags=["profiles"])
 api_router.include_router(media.router, prefix="/media", tags=["media"])
-api_router.include_router(ready_check.router, prefix="/ready-check", tags=["ready-check"])
-api_router.include_router(
-    ready_check.stream_router,
-    prefix="/ready-check",
-    tags=["ready-check"],
-)
-
 tournament_dependencies = [
     Depends(ensure_private_tournament_read_membership_is_active),
     Depends(serialize_tournament_write_invariants),

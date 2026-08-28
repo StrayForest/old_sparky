@@ -647,30 +647,7 @@ class TournamentDeadlockReadyRoundResponse(BaseModel):
 class TournamentDeadlockReadyCheckStateResponse(BaseModel):
     active_round: TournamentDeadlockReadyRoundResponse | None = None
     latest_round: TournamentDeadlockReadyRoundResponse | None = None
-    next_poll_after_ms: int | None = None
     state_version: int | None = None
-
-
-class ReadyCheckAgendaItemResponse(BaseModel):
-    tournament_id: str
-    slug: str
-    ready_check_starts_at: datetime
-    ready_check_ends_at: datetime
-    admission_open_at: datetime
-    admission_priority: str
-    admission_mode: Literal["scheduled_sse", "late_sse", "polling"]
-    state_ticket: str
-
-
-class ReadyCheckAgendaResponse(BaseModel):
-    checks: list[ReadyCheckAgendaItemResponse] = Field(default_factory=list)
-    sse_ticket: str | None = None
-    sse_ticket_expires_at: datetime | None = None
-
-
-class ReadyCheckStateProbeResponse(BaseModel):
-    revision: int = 0
-    status: Literal["waiting", "active", "closed"] = "waiting"
 
 
 class TournamentDeadlockCaptainPreviewCandidateResponse(BaseModel):
@@ -857,6 +834,9 @@ class PlayerTournamentCommitmentResponse(BaseModel):
 
 class TournamentWorkspaceResponse(BaseModel):
     tournament: TournamentResponse
+    # Captured by the same HTTP response that carries the schedule. The web
+    # client uses it as the origin of a monotonic, server-relative timer.
+    server_time: datetime
     current_user: UserResponse | None = None
     current_user_active_commitment: PlayerTournamentCommitmentResponse | None = None
     participants: list[TournamentParticipantResponse] = Field(default_factory=list)

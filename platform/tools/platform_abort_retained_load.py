@@ -16,7 +16,6 @@ import time
 
 SCRIPT_PATHS = {
     "/root/old_sparky/platform/tools/platform_production_retained_load_matrix_qa.sh",
-    "/root/old_sparky/platform/tools/platform_production_distributed_ready_check_qa.sh",
 }
 LOCK_PATH = "/run/lock/oldsparky-retained-load-matrix.lock"
 CONFIRMATION = "ABORT-PRODUCTION-RETAINED-LOAD"
@@ -150,14 +149,6 @@ def export_abort_evidence(run_id: str, snapshot: str) -> Path:
         if source.is_file() and not source.is_symlink():
             shutil.copy2(source, destination)
             os.chmod(destination, 0o600)
-    distributed_root = run_root / "distributed"
-    for name in ("control.json", "event-triggered.json", "distributed-report.json", "matrix-summary.json"):
-        source = distributed_root / name
-        destination = export_dir / f"distributed-{name}"
-        if source.is_file() and not source.is_symlink():
-            shutil.copy2(source, destination)
-            os.chmod(destination, 0o600)
-
     caller_uid = int(os.environ.get("SUDO_UID", "0"))
     caller_gid = int(os.environ.get("SUDO_GID", "0"))
     os.chown(export_dir, caller_uid, caller_gid)
