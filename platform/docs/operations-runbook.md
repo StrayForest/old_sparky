@@ -200,7 +200,10 @@ manual/request-driven reads.
 
 The control account is passed at runtime and is never modified. The matrix
 places it in registered-only, ready-check and exactly one assignment-control
-run so the operator can inspect the retained tournaments manually:
+run so the operator can inspect the retained tournaments manually. The
+assignment-control run validates the full assignment workflow; the allocator
+may legitimately leave the specific control account outside the selected
+team slots when candidates exceed capacity:
 
 ```bash
 cd /root/old_sparky/platform
