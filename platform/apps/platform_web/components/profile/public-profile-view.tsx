@@ -27,7 +27,13 @@ const contactCopyLabels: Record<string, string> = {
   "Регион": "Скопировать регион"
 };
 
-export function PublicProfileView({ profile }: { profile: PlayerProfile }) {
+export function PublicProfileView({
+  profile,
+  showIdentity = true,
+}: {
+  profile: PlayerProfile;
+  showIdentity?: boolean;
+}) {
   const [copiedContact, setCopiedContact] = useState<string | null>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -57,34 +63,36 @@ export function PublicProfileView({ profile }: { profile: PlayerProfile }) {
 
   return (
     <div className="public-profile-view">
-      <section className="panel public-profile-summary">
-        <PreparedMedia
-          alt=""
-          className="public-profile-banner"
-          descriptor={profile.bannerMedia}
-          fallbackUrl={profile.bannerUrl}
-          sizes="(max-width: 820px) 100vw, 1200px"
-        />
-        <div className="public-profile-identity">
-          <div className={profile.avatarUrl || profile.avatarMedia?.status === "ready" ? "public-profile-avatar has-image" : "public-profile-avatar profile-avatar-empty"}>
-            {profile.avatarUrl || profile.avatarMedia?.status === "ready" ? (
-              <PreparedMedia
-                alt=""
-                descriptor={profile.avatarMedia}
-                fallbackUrl={profile.avatarUrl}
-                height={112}
-                sizes="112px"
-                width={112}
-              />
-            ) : <UserRound aria-hidden="true" />}
+      {showIdentity ? (
+        <section className="panel public-profile-summary">
+          <PreparedMedia
+            alt=""
+            className="public-profile-banner"
+            descriptor={profile.bannerMedia}
+            fallbackUrl={profile.bannerUrl}
+            sizes="(max-width: 820px) 100vw, 1200px"
+          />
+          <div className="public-profile-identity">
+            <div className={profile.avatarUrl || profile.avatarMedia?.status === "ready" ? "public-profile-avatar has-image" : "public-profile-avatar profile-avatar-empty"}>
+              {profile.avatarUrl || profile.avatarMedia?.status === "ready" ? (
+                <PreparedMedia
+                  alt=""
+                  descriptor={profile.avatarMedia}
+                  fallbackUrl={profile.avatarUrl}
+                  height={112}
+                  sizes="112px"
+                  width={112}
+                />
+              ) : <UserRound aria-hidden="true" />}
+            </div>
+            <div className="public-profile-name-wrap">
+              <span>Участник турнира</span>
+              <h2>{profile.displayName}</h2>
+              {profile.teamName ? <p>{profile.teamName}</p> : null}
+            </div>
           </div>
-          <div className="public-profile-name-wrap">
-            <span>Участник турнира</span>
-            <h2>{profile.displayName}</h2>
-            {profile.teamName ? <p>{profile.teamName}</p> : null}
-          </div>
-        </div>
-      </section>
+        </section>
+      ) : null}
 
       <div className="public-profile-grid">
         <section className="panel public-profile-section public-profile-overview">

@@ -234,7 +234,7 @@ export function ProfileEditor({
           title="Данные профиля"
           text="Управляйте отображением профиля, контактами и безопасностью аккаунта."
         />
-        <PublicProfileView profile={summaryProfile} />
+        <PublicProfileView profile={summaryProfile} showIdentity={false} />
         <AccountProfileTab
           initialProfile={profile}
           onPreview={previewAccount}
