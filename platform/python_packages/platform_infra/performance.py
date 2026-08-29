@@ -228,6 +228,7 @@ class RequestPerformanceMiddleware:
             or (
                 settings.platform_perf_log_mutations
                 and metrics.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+                and not is_ready_vote_route
             )
             or total_ms >= settings.platform_perf_slow_request_ms
             or sql_ms >= settings.platform_perf_slow_db_ms

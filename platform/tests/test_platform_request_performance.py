@@ -80,7 +80,7 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         metrics.path = "/api/v1/tournaments/demo/deadlock/ready-check/vote"
         metrics.pool_checkout_wait_seconds = 0.2
         with (
-            patch.object(performance, "get_settings", return_value=self.settings(log_mutations=False)),
+            patch.object(performance, "get_settings", return_value=self.settings()),
             patch.object(performance.logger, "info") as log_info,
         ):
             middleware._log_if_slow(
