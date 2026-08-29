@@ -58,6 +58,15 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(len(users), 2)
         self.assertEqual(users[0].tournament_slug, "qa-tournament")
 
+    def test_manifest_accepts_production_host_cookie_names(self) -> None:
+        payload = manifest_payload()
+        payload["session_cookie_name"] = "__Host-deadlock_platform_session"
+        payload["csrf_cookie_name"] = "__Host-deadlock_platform_session_csrf"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            load_manifest(path)
+
     def test_manifest_rejects_duplicate_session_material(self) -> None:
         payload = manifest_payload()
         users = payload["users"]

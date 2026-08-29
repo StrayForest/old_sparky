@@ -616,7 +616,7 @@ PY
       : > "$external_vote_ready"
     fi
     printf 'PRODUCTION_EXTERNAL_LOAD_READY=%s\n' "$export_dir/manifest.json"
-    observer_deadline=$(( $(date +%s) + 10_800 ))
+    observer_deadline=$(( $(date +%s) + 10800 ))
     while [[ ! -e "$external_vote_complete" ]]; do
       if ! kill -0 "$observer_pid" 2>/dev/null; then
         wait "$observer_pid" 2>/dev/null || true
