@@ -14,7 +14,6 @@ import {
   hasPreparedOrLegacyMedia,
   ProfileBanner,
 } from "@/components/profile/editor/profile-editor-shared";
-import { PublicProfileView } from "@/components/profile/public-profile-view";
 import { TournamentProfileTab } from "@/components/profile/editor/tournament-profile-tab";
 import {
   parseProfileTab,
@@ -234,7 +233,6 @@ export function ProfileEditor({
           title="Данные профиля"
           text="Управляйте отображением профиля, контактами и безопасностью аккаунта."
         />
-        <PublicProfileView profile={summaryProfile} showIdentity={false} />
         <AccountProfileTab
           initialProfile={profile}
           onPreview={previewAccount}

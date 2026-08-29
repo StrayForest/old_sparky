@@ -27,13 +27,7 @@ const contactCopyLabels: Record<string, string> = {
   "Регион": "Скопировать регион"
 };
 
-export function PublicProfileView({
-  profile,
-  showIdentity = true,
-}: {
-  profile: PlayerProfile;
-  showIdentity?: boolean;
-}) {
+export function PublicProfileView({ profile }: { profile: PlayerProfile }) {
   const [copiedContact, setCopiedContact] = useState<string | null>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -63,8 +57,7 @@ export function PublicProfileView({
 
   return (
     <div className="public-profile-view">
-      {showIdentity ? (
-        <section className="panel public-profile-summary">
+      <section className="panel public-profile-summary">
           <PreparedMedia
             alt=""
             className="public-profile-banner"
@@ -91,8 +84,7 @@ export function PublicProfileView({
               {profile.teamName ? <p>{profile.teamName}</p> : null}
             </div>
           </div>
-        </section>
-      ) : null}
+      </section>
 
       <div className="public-profile-grid">
         <section className="panel public-profile-section public-profile-overview">
