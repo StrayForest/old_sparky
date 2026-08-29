@@ -50,6 +50,11 @@ on:
         required: true
         default: "100"
         type: string
+      manual_refresh_count:
+        description: "Workspace users that perform one conditional manual reload in read-mix"
+        required: true
+        default: "0"
+        type: string
 
 permissions:
   contents: read
@@ -77,6 +82,7 @@ jobs:
       LOAD_CONCURRENCY: ${{ inputs.load_concurrency }}
       SPREAD_SECONDS: ${{ inputs.spread_seconds }}
       DUPLICATE_COUNT: ${{ inputs.duplicate_count }}
+      MANUAL_REFRESH_COUNT: ${{ inputs.manual_refresh_count }}
       TARGET_SHA: ${{ github.sha }}
 
     steps:
@@ -98,11 +104,22 @@ jobs:
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
           /usr/bin/python3 - \
             "$CONTROL_EMAIL" "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
-            "$SETUP_CONCURRENCY" "$LOAD_CONCURRENCY" "$SPREAD_SECONDS" "$DUPLICATE_COUNT" <<'PY'
+            "$SETUP_CONCURRENCY" "$LOAD_CONCURRENCY" "$SPREAD_SECONDS" \
+            "$DUPLICATE_COUNT" "$MANUAL_REFRESH_COUNT" "$LOAD_MODE" <<'PY'
           import re
           import sys
 
-          email, tournament_count, users_per, setup_concurrency, load_concurrency, spread, duplicate = sys.argv[1:]
+          (
+              email,
+              tournament_count,
+              users_per,
+              setup_concurrency,
+              load_concurrency,
+              spread,
+              duplicate,
+              manual_refresh,
+              mode,
+          ) = sys.argv[1:]
           if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email):
               raise SystemExit("control_email is invalid")
           if not re.fullmatch(r"[1-9][0-9]?", tournament_count) or not 1 <= int(tournament_count) <= 20:
@@ -123,6 +140,14 @@ jobs:
               raise SystemExit("spread_seconds must be between 0 and 3600")
           if not re.fullmatch(r"[0-9]+", duplicate) or not 0 <= int(duplicate) <= int(tournament_count) * int(users_per):
               raise SystemExit("duplicate_count is outside the fixture size")
+          total_users = int(tournament_count) * int(users_per)
+          if not re.fullmatch(r"[0-9]+", manual_refresh):
+              raise SystemExit("manual_refresh_count must be a non-negative integer")
+          workspace_users = sum(index % 10 < 5 for index in range(total_users))
+          if not 0 <= int(manual_refresh) <= workspace_users:
+              raise SystemExit("manual_refresh_count exceeds the workspace read cohort")
+          if mode == "ready-vote" and int(manual_refresh) != 0:
+              raise SystemExit("manual_refresh_count is only valid for read-mix")
           PY
 
       - name: Configure production SSH
@@ -224,6 +249,7 @@ jobs:
               --concurrency "$LOAD_CONCURRENCY" \
               --timeout 30 \
               --duplicate-count "$DUPLICATE_COUNT" \
+              --manual-refresh-count "$MANUAL_REFRESH_COUNT" \
               --p95-budget-ms 1000 \
               --p99-budget-ms 2000
             load_status="$?"

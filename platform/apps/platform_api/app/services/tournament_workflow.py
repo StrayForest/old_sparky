@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import case, delete, exists, func, literal, select
+from sqlalchemy import and_, case, delete, exists, func, literal, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -397,12 +397,16 @@ async def prepare_deadlock_ready_vote(
     """
 
     current_time = now.astimezone(UTC)
-    tournament = await db_session.scalar(
-        select(Tournament)
-        .where(Tournament.slug == slug)
+    snapshot = await ready_vote_preflight_snapshot(
+        db_session,
+        slug=slug,
+        user_id=user_id,
     )
-    if tournament is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+    tournament = snapshot.tournament
+    active_round = snapshot.active_round
+    has_participant = snapshot.has_participant
+    has_deadlock_profile = snapshot.has_deadlock_profile
+    has_locked_roster = snapshot.has_locked_roster
 
     ensure_ready_check_vote_window(
         starts_at=tournament.ready_check_starts_at,
@@ -411,12 +415,6 @@ async def prepare_deadlock_ready_vote(
     )
     if tournament.automation_ready_check_closed_at is not None:
         raise ReadyCheckVoteWindowError("Deadlock ready-check is no longer active.")
-
-    has_participant, has_deadlock_profile, has_locked_roster = await ready_vote_preflight_flags(
-        db_session,
-        tournament_id=tournament.id,
-        user_id=user_id,
-    )
 
     if not is_solo_tournament_format(tournament.format_slug):
         raise ReadyCheckVoteWindowError(
@@ -487,11 +485,17 @@ async def prepare_deadlock_ready_vote(
         action_name="Deadlock ready-check voting",
     )
 
-    active_round = await deadlock_ready_round_for_tournament(
-        db_session,
-        tournament_id=tournament.id,
-        active_only=True,
-    )
+    if tournament_is_locked:
+        # The registration transition above may have raced with the worker's
+        # round materialization.  Re-read the active round after the lock,
+        # preserving the old lock/transition ordering for this uncommon path.
+        active_round = None
+    if active_round is None:
+        active_round = await deadlock_ready_round_for_tournament(
+            db_session,
+            tournament_id=tournament.id,
+            active_only=True,
+        )
     round_was_created = False
     if active_round is None and has_participant:
         if not tournament_is_locked:
@@ -715,7 +719,7 @@ async def deadlock_ready_check_read_preflight(
     )
 
 
-def _ready_vote_preflight_columns(*, tournament_id: str, user_id: str) -> tuple[Any, Any, Any]:
+def _ready_vote_preflight_columns(*, tournament_id: Any, user_id: str) -> tuple[Any, Any, Any]:
     participant_exists = (
         select(TournamentParticipant.id)
         .where(
@@ -739,6 +743,57 @@ def _ready_vote_preflight_columns(*, tournament_id: str, user_id: str) -> tuple[
         .exists()
     )
     return participant_exists, profile_exists, locked_roster_exists
+
+
+async def ready_vote_preflight_snapshot(
+    db_session: AsyncSession,
+    *,
+    slug: str,
+    user_id: str,
+) -> ReadyVoteRoutePreflight:
+    """Load the common vote authorization snapshot in one DB round-trip.
+
+    The vote endpoint is hot during a Ready Check burst. Tournament,
+    participant/profile/roster flags, and the active round are independent
+    reads, so keeping them in separate sequential queries unnecessarily holds
+    a pool connection longer. The partial unique index on active ready rounds
+    makes the outer join single-row for a tournament.
+    """
+
+    active_round = aliased(TournamentDeadlockReadyRound)
+    participant_exists, profile_exists, locked_roster_exists = _ready_vote_preflight_columns(
+        tournament_id=Tournament.id,
+        user_id=user_id,
+    )
+    row = (
+        await db_session.execute(
+            select(
+                Tournament,
+                participant_exists.label("has_participant"),
+                profile_exists.label("has_deadlock_profile"),
+                locked_roster_exists.label("has_locked_roster"),
+                active_round,
+            )
+            .outerjoin(
+                active_round,
+                and_(
+                    active_round.tournament_id == Tournament.id,
+                    active_round.status == "active",
+                ),
+            )
+            .where(Tournament.slug == slug)
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+    return ReadyVoteRoutePreflight(
+        tournament=row[0],
+        has_participant=bool(row[1]),
+        has_deadlock_profile=bool(row[2]),
+        has_locked_roster=bool(row[3]),
+        active_round=row[4],
+    )
 
 
 async def ready_vote_preflight_flags(

@@ -4,12 +4,15 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from tools.platform_external_load import (
     ExternalLoadError,
     RequestResult,
+    VirtualUser,
     _route_for_read,
     load_manifest,
+    run_load,
     spread_offsets,
     summarize_results,
 )
@@ -41,6 +44,15 @@ def manifest_payload() -> dict[str, object]:
             },
         ],
     }
+
+
+def load_manifest_from_payload(
+    payload: dict[str, object],
+) -> tuple[dict[str, object], list[VirtualUser]]:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "manifest.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return load_manifest(path)
 
 
 class ExternalLoadTests(unittest.TestCase):
@@ -106,6 +118,71 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(summary["requests"], 1)
         self.assertEqual(summary["errors"], 0)
         self.assertNotIn(secret, serialized)
+
+    def test_read_mix_manual_refresh_uses_conditional_workspace_request(self) -> None:
+        payload = manifest_payload()
+        _, users = load_manifest_from_payload(payload)
+        calls: list[dict[str, object]] = []
+
+        def fake_trace(origin: str, timeout: float) -> dict[str, str]:
+            return {"status": "200", "ip": "192.0.2.10", "colo": "TEST"}
+
+        def fake_request(
+            origin: str,
+            user: VirtualUser,
+            *,
+            method: str,
+            path: str,
+            phase: str,
+            timeout: float,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+            json_payload: dict[str, object] | None = None,
+            expected_statuses: frozenset[int] = frozenset({200}),
+            extra_headers: dict[str, str] | None = None,
+        ) -> RequestResult:
+            calls.append(
+                {
+                    "phase": phase,
+                    "path": path,
+                    "expected_statuses": expected_statuses,
+                    "extra_headers": extra_headers,
+                }
+            )
+            is_refresh = extra_headers is not None
+            return RequestResult(
+                phase=phase,
+                method=method,
+                path=path,
+                status=304 if is_refresh else 200,
+                elapsed_ms=10.0,
+                ok=(304 if is_refresh else 200) in expected_statuses,
+                response_bytes=0,
+                response_etag='"workspace-etag"',
+            )
+
+        with patch("tools.platform_external_load._trace", side_effect=fake_trace):
+            with patch("tools.platform_external_load._request", side_effect=fake_request):
+                report = run_load(
+                    payload,
+                    users,
+                    mode="read-mix",
+                    spread_seconds=0,
+                    concurrency=1,
+                    timeout=1,
+                    duplicate_count=0,
+                    manual_refresh_count=1,
+                    p95_budget_ms=1000,
+                    p99_budget_ms=2000,
+                )
+
+        self.assertTrue(report["acceptance"]["passed"])
+        self.assertEqual(report["phases"]["read_mix"]["requests"], 2)
+        self.assertEqual(report["phases"]["manual_refresh"]["requests"], 1)
+        self.assertEqual(report["phases"]["manual_refresh"]["status_counts"], {"304": 1})
+        refresh_call = next(call for call in calls if call["phase"] == "manual_workspace_refresh")
+        self.assertEqual(refresh_call["expected_statuses"], frozenset({200, 304}))
+        self.assertEqual(refresh_call["extra_headers"], {"If-None-Match": '"workspace-etag"'})
 
 
 if __name__ == "__main__":

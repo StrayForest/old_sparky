@@ -56,6 +56,7 @@ class RequestResult:
     ok: bool
     response_bytes: int
     cf_ray: str | None = None
+    response_etag: str | None = None
     error_kind: str | None = None
     response_json: Any = None
 
@@ -224,6 +225,7 @@ def _request(
     csrf_cookie_name: str,
     json_payload: dict[str, Any] | None = None,
     expected_statuses: frozenset[int] = frozenset({200}),
+    extra_headers: dict[str, str] | None = None,
 ) -> RequestResult:
     body = None
     headers = {
@@ -237,6 +239,8 @@ def _request(
         "X-CSRF-Token": user.csrf_token,
         "X-Platform-QA-Phase": phase,
     }
+    if extra_headers:
+        headers.update(extra_headers)
     if json_payload is not None:
         body = json.dumps(json_payload, separators=(",", ":")).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -250,6 +254,7 @@ def _request(
     status = 0
     response_bytes = 0
     cf_ray: str | None = None
+    response_etag: str | None = None
     error_kind: str | None = None
     response_json: Any = None
     try:
@@ -258,6 +263,7 @@ def _request(
         with urlopen(request, timeout=timeout) as response:  # nosec B310
             status = int(response.status)
             cf_ray = response.headers.get("cf-ray", "")[:128] or None
+            response_etag = response.headers.get("etag", "")[:512] or None
             raw_body = response.read(RESPONSE_BODY_LIMIT)
             response_bytes = len(raw_body)
             if raw_body:
@@ -286,6 +292,7 @@ def _request(
         ok=ok,
         response_bytes=response_bytes,
         cf_ray=cf_ray,
+        response_etag=response_etag,
         error_kind=error_kind,
         response_json=response_json,
     )
@@ -414,9 +421,17 @@ def run_load(
     concurrency: int,
     timeout: float,
     duplicate_count: int,
+    manual_refresh_count: int,
     p95_budget_ms: float,
     p99_budget_ms: float,
 ) -> dict[str, Any]:
+    if manual_refresh_count < 0:
+        raise ExternalLoadError("manual_refresh_count must not be negative")
+    if mode == "ready-vote" and manual_refresh_count:
+        raise ExternalLoadError("manual_refresh_count is only valid for read-mix")
+    workspace_users = sum(index % 10 < 5 for index in range(len(users)))
+    if manual_refresh_count > workspace_users:
+        raise ExternalLoadError("manual_refresh_count exceeds the workspace read cohort")
     origin = str(manifest["origin"]).rstrip("/")
     session_cookie_name = str(manifest["session_cookie_name"])
     csrf_cookie_name = str(manifest["csrf_cookie_name"])
@@ -514,10 +529,11 @@ def run_load(
         )
     else:
         user_indexes = {user.user_id: index for index, user in enumerate(users)}
+        initial_workspace_etags: dict[str, str] = {}
 
         def read_builder(origin_value: str, user: VirtualUser, phase: str, request_timeout: float) -> RequestResult:
             index = user_indexes[user.user_id]
-            return _request(
+            result = _request(
                 origin_value,
                 user,
                 method="GET",
@@ -527,6 +543,9 @@ def run_load(
                 session_cookie_name=session_cookie_name,
                 csrf_cookie_name=csrf_cookie_name,
             )
+            if index % 10 < 5 and result.response_etag:
+                initial_workspace_etags[user.user_id] = result.response_etag
+            return result
 
         read_results = run_phase(
             origin,
@@ -539,9 +558,68 @@ def run_load(
         )
         phase_results["read_mix"] = summarize_results(read_results)
         all_results.extend(read_results)
+        refresh_users = [
+            user
+            for user in users
+            if user_indexes[user.user_id] % 10 < 5
+        ][:manual_refresh_count]
+        refresh_results: list[RequestResult] = []
+        if manual_refresh_count:
+            def refresh_builder(
+                origin_value: str,
+                user: VirtualUser,
+                phase: str,
+                request_timeout: float,
+            ) -> RequestResult:
+                etag = initial_workspace_etags.get(user.user_id)
+                if not etag:
+                    result = RequestResult(
+                        phase=phase,
+                        method="GET",
+                        path=_route_for_read(user_indexes[user.user_id], user.tournament_slug),
+                        status=0,
+                        elapsed_ms=0.0,
+                        ok=False,
+                        response_bytes=0,
+                        error_kind="missing_initial_etag",
+                    )
+                    return result
+                return _request(
+                    origin_value,
+                    user,
+                    method="GET",
+                    path=_route_for_read(user_indexes[user.user_id], user.tournament_slug),
+                    phase=phase,
+                    timeout=request_timeout,
+                    session_cookie_name=session_cookie_name,
+                    csrf_cookie_name=csrf_cookie_name,
+                    expected_statuses=frozenset({200, 304}),
+                    extra_headers={"If-None-Match": etag},
+                )
+
+            refresh_results = run_phase(
+                origin,
+                refresh_users,
+                phase="manual_workspace_refresh",
+                spread_seconds=spread_seconds,
+                concurrency=concurrency,
+                timeout=timeout,
+                request_builder=refresh_builder,
+            )
+            phase_results["manual_refresh"] = summarize_results(refresh_results)
+            all_results.extend(refresh_results)
         contract_ok = (
             phase_results["read_mix"]["requests"] == len(users)
             and phase_results["read_mix"]["errors"] == 0
+            and len(initial_workspace_etags) >= manual_refresh_count
+            and (
+                not manual_refresh_count
+                or (
+                    phase_results["manual_refresh"]["requests"] == manual_refresh_count
+                    and phase_results["manual_refresh"]["errors"] == 0
+                    and all(result.status in {200, 304} for result in refresh_results)
+                )
+            )
         )
 
     overall = summarize_results(all_results)
@@ -572,6 +650,7 @@ def run_load(
         "finished_at": finished_at.isoformat(),
         "wall_seconds": round((finished_at - started_at).total_seconds(), 3),
         "opening_spread_seconds": spread_seconds,
+        "manual_refresh_count": manual_refresh_count,
         "concurrency": concurrency,
         "trace": trace,
         "phases": phase_results,
@@ -589,6 +668,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=128)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--duplicate-count", type=int, default=100)
+    parser.add_argument("--manual-refresh-count", type=int, default=0)
     parser.add_argument("--p95-budget-ms", type=float, default=1000.0)
     parser.add_argument("--p99-budget-ms", type=float, default=2000.0)
     return parser.parse_args()
@@ -606,6 +686,16 @@ def main() -> int:
             raise ExternalLoadError("timeout must be between 0 and 300 seconds")
         manifest, users = load_manifest(args.manifest)
         duplicate_count = max(0, min(args.duplicate_count, len(users)))
+        if args.manual_refresh_count < 0:
+            raise ExternalLoadError("manual-refresh-count must not be negative")
+        if args.mode == "ready-vote" and args.manual_refresh_count:
+            raise ExternalLoadError("manual-refresh-count is only valid for read-mix")
+        workspace_users = sum(index % 10 < 5 for index in range(len(users)))
+        if args.manual_refresh_count > workspace_users:
+            raise ExternalLoadError(
+                "manual-refresh-count exceeds the workspace read cohort"
+            )
+        manual_refresh_count = args.manual_refresh_count if args.mode == "read-mix" else 0
         report = run_load(
             manifest,
             users,
@@ -614,6 +704,7 @@ def main() -> int:
             concurrency=args.concurrency,
             timeout=args.timeout,
             duplicate_count=duplicate_count,
+            manual_refresh_count=manual_refresh_count,
             p95_budget_ms=max(0.0, args.p95_budget_ms),
             p99_budget_ms=max(0.0, args.p99_budget_ms),
         )

@@ -162,7 +162,9 @@ The workflow supports the current request-driven journeys:
   bounded idempotency replays and one state read per tournament for persisted
   correctness;
 - `read-mix`: authenticated workspace/tournament/profile/catalog reads with a
-  fixed route mix, with no background refresh loop.
+  fixed route mix, with no background refresh loop; an optional
+  `manual_refresh_count` re-reads the workspace with the response ETag and
+  `If-None-Match`, modelling an explicit page reload rather than a poller.
 
 Use a 30-second spread for the human-shaped profile and a separate zero- or
 short-spread run for an aggressive safety-margin profile. A successful result
@@ -181,9 +183,16 @@ gh workflow run platform-production-external-load.yml \
   -f control_email=<existing-production-account-email> \
   -f mode=ready-vote -f tournament_count=1 \
   -f users_per_tournament=500 -f setup_concurrency=20 \
-  -f load_concurrency=128 -f spread_seconds=30 -f duplicate_count=100
+  -f load_concurrency=128 -f spread_seconds=30 -f duplicate_count=100 \
+  -f manual_refresh_count=0
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
+
+For a read benchmark that includes explicit manual reloads, use `mode=read-mix`
+and set `manual_refresh_count` to the number of workspace-page users to reload
+(the value cannot exceed the workspace half of the fixed route cohort). The
+reload phase is reported separately and accepts only `200` or a valid
+conditional `304`; it never creates background traffic.
 
 The workflow performs exact cleanup in its final step. If the runner is
 canceled before that step, use the existing exact retained-load cleanup/abort
