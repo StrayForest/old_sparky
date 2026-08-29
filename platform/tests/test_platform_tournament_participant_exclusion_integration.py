@@ -222,7 +222,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
             ),
             200,
         )
-        self.assertEqual(invites_after_retry[0]["use_count"], 1)
+        self.assertEqual(invites_after_retry[0]["use_count"], 0)
 
         rejected_rejoin = await player["client"].post(
             f"/api/v1/tournaments/{slug_a}/join",

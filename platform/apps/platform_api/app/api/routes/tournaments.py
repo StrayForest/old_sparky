@@ -1640,6 +1640,8 @@ async def valid_invite_code_for_tournament(
     tournament: Tournament,
     invite_code: str | None,
 ) -> bool:
+    if tournament.visibility != "invite_only":
+        return False
     normalized = normalize_invite_code(invite_code or "")
     if not normalized:
         return False
