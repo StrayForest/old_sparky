@@ -540,6 +540,7 @@ class TournamentResponse(BaseModel):
     cover_url: str | None = None
     cover_media: MediaDescriptorResponse | None = None
     visibility: str
+    invite_code: str | None = None
     status: str
     format_slug: str
     organizer_user_id: str
@@ -584,6 +585,7 @@ class TournamentStatusUpdateRequest(BaseModel):
 class TournamentParticipantJoinRequest(BaseModel):
     entry_type: str = Field(default="solo", pattern="^solo$")
     team_name: None = None
+    invite_code: str | None = Field(default=None, min_length=6, max_length=64)
 
 
 class TournamentParticipantManageRequest(BaseModel):

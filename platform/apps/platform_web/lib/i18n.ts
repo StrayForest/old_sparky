@@ -696,6 +696,7 @@ const translations: Record<string, string> = {
     "tournament.matchesLabel": "Матчи",
     "tournament.finalLabel": "Финал",
     "tournament.descriptionTitle": "Описание турнира",
+    "tournament.inviteGateCopy": "Введите invite-код, чтобы открыть турнир.",
     "tournament.finalFormat": "Формат финала",
     "tournament.registrationFrozen": "Регистрация и roster inputs заморожены, потому что Deadlock roster уже закрыт.",
     "tournament.registrationLocked": "Изменения регистрации закрыты на текущей стадии турнира.",

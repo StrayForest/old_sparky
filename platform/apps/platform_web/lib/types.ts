@@ -174,6 +174,7 @@ export type TournamentDetail = TournamentSummary & {
   /** UTC timestamp emitted by the workspace response used for local timers. */
   serverTime: string;
   description: string;
+  inviteCode: string | null;
   visibility: "public" | "private" | string;
   bracketType: TournamentFormat;
   matchFormat: string;

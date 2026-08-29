@@ -2891,6 +2891,44 @@ img.rank-icon,
   overflow: hidden;
 }
 
+.description-panel-title {
+  align-items: center;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.description-panel-heading,
+.tournament-invite-code {
+  align-items: center;
+  display: inline-flex;
+  gap: 8px;
+}
+
+.tournament-invite-gate {
+  max-width: 520px;
+  margin: 40px auto;
+}
+
+.tournament-invite-gate h1 {
+  margin: 16px 0 8px;
+}
+
+.tournament-invite-gate form {
+  display: grid;
+  gap: 14px;
+}
+
+.tournament-invite-code {
+  color: #f2eadb;
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  letter-spacing: .08em;
+  margin-left: auto;
+  text-align: right;
+  word-break: break-word;
+}
+
 .description-text {
   line-height: 1.46;
 }

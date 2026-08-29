@@ -182,7 +182,6 @@ from python_packages.platform_domain.tournaments import (
     ensure_organizer_can_moderate_participants,
     ensure_participant_restoration_allowed,
     ensure_match_team_ids_are_locked,
-    ensure_invite_claimable,
     can_self_join_tournament,
     can_self_leave_tournament,
     eliminated_team_id_for_single_elimination,
@@ -759,6 +758,7 @@ def serialize_tournament(
     has_locked_deadlock_roster: bool = False,
     current_user_participant_status: str | None = None,
     current_user_has_invite_access: bool = False,
+    invite_code: str | None = None,
 ) -> TournamentResponse:
     return TournamentResponse(
         id=tournament.id,
@@ -771,6 +771,7 @@ def serialize_tournament(
         ),
         cover_media=cover_media,
         visibility=tournament.visibility,
+        invite_code=invite_code,
         status=tournament.status,
         format_slug=tournament.format_slug,
         organizer_user_id=tournament.organizer_user_id,
@@ -1071,11 +1072,13 @@ def auth_session_has_admin_role(auth_session) -> bool:
 def ensure_tournament_summary_visible(
     tournament: Tournament,
     auth_session,
+    *,
+    has_valid_invite_code: bool = False,
 ) -> None:
     try:
         is_visible = can_view_tournament_summary(
             tournament_visibility=tournament.visibility,
-            has_authenticated_user=auth_session is not None,
+            has_authenticated_user=auth_session is not None or has_valid_invite_code,
         )
     except TournamentWorkflowError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -1800,8 +1803,9 @@ def can_view_tournament_workspace_data(
     *,
     auth_session,
     has_participant_record: bool,
+    has_valid_invite_code: bool = False,
 ) -> bool:
-    if tournament.visibility == "invite_only" and auth_session is None:
+    if tournament.visibility == "invite_only" and auth_session is None and not has_valid_invite_code:
         return False
     try:
         return can_view_tournament_workspace(
@@ -1809,6 +1813,7 @@ def can_view_tournament_workspace_data(
             is_participant=has_participant_record,
             is_organizer=auth_session is not None and tournament.organizer_user_id == auth_session.user.id,
             is_admin=auth_session_has_admin_role(auth_session),
+            has_valid_invite_code=has_valid_invite_code,
         )
     except TournamentWorkflowError:
         return False
@@ -3198,14 +3203,10 @@ async def delete_tournament_banner(
 async def redeem_tournament_invite(
     payload: TournamentInviteClaimRequest,
     request: Request,
-    auth_session=Depends(get_authenticated_session),
+    auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentInviteRedeemResponse:
-    await check_invite_rate_limit(
-        request,
-        user_id=auth_session.user.id,
-        operation="claim",
-    )
+    await check_invite_rate_limit(request, user_id=auth_session.user.id if auth_session else "anonymous", operation="claim")
     code = normalize_invite_code(payload.code)
     row = (
         await db_session.execute(
@@ -3232,57 +3233,33 @@ async def redeem_tournament_invite(
     if invite is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite code was not found.")
 
+    if auth_session is None:
+        now = datetime.now(UTC)
+        if invite.revoked_at is not None or (invite.expires_at is not None and invite.expires_at <= now):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite code was not found.")
+        return TournamentInviteRedeemResponse(
+            tournament=serialize_tournament(
+                tournament,
+                organizer_display_name,
+                int(participant_count),
+                cover_media=await tournament_media_descriptors(
+                    db_session, tournament, organizer_avatar_asset_id=organizer_avatar_asset_id
+                ),
+                has_locked_deadlock_roster=bool(int(locked_roster_count)),
+                current_user_has_invite_access=True,
+                invite_code=invite.code,
+            ),
+            invite=serialize_invite(tournament, invite, now=datetime.now(UTC)),
+        )
+
     participant = await participant_for_user(
         db_session,
         tournament_id=tournament.id,
         user_id=auth_session.user.id,
     )
-    access = await invite_access_for_user(
-        db_session,
-        tournament_id=tournament.id,
-        user_id=auth_session.user.id,
-    )
-    if access is None:
-        try:
-            ensure_invite_claimable(
-                tournament_visibility=tournament.visibility,
-                tournament_status=tournament.status,
-                max_uses=invite.max_uses,
-                use_count=invite.use_count,
-                revoked_at=invite.revoked_at,
-                expires_at=invite.expires_at,
-                now=auth_session.now,
-            )
-        except TournamentWorkflowError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(exc),
-            ) from exc
-        access = TournamentInviteAccess(
-            tournament_id=tournament.id,
-            user_id=auth_session.user.id,
-            invite_id=invite.id,
-            claimed_at=auth_session.now,
-        )
-        db_session.add(access)
-        invite.use_count += 1
-        invite.last_claimed_at = auth_session.now
-        invite.last_claimed_by_user_id = auth_session.user.id
-        await db_session.flush()
-        await write_audit_log(
-            db_session,
-            actor_user_id=auth_session.user.id,
-            action="tournament.invite.access_grant",
-            subject_type="tournament_invite",
-            subject_id=invite.id,
-            payload={
-                "tournament_slug": tournament.slug,
-                "access_id": access.id,
-            },
-        )
-    await db_session.commit()
-    await db_session.refresh(invite)
-    await db_session.refresh(tournament)
+    now = auth_session.now
+    if invite.revoked_at is not None or (invite.expires_at is not None and invite.expires_at <= now):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite code was not found.")
     cover_media, organizer_avatar_media = await tournament_media_descriptors(
         db_session,
         tournament,
@@ -3298,6 +3275,7 @@ async def redeem_tournament_invite(
             has_locked_deadlock_roster=bool(int(locked_roster_count)),
             current_user_participant_status=participant.status if participant is not None else None,
             current_user_has_invite_access=True,
+            invite_code=invite.code,
         ),
         participant=serialize_participant(participant, auth_session.user.display_name)
         if participant is not None
@@ -5920,7 +5898,26 @@ async def join_tournament(
         preflight = refreshed_preflight
     tournament = preflight.tournament
     if tournament.visibility == "invite_only":
-        has_invite_access = tournament.organizer_user_id == auth_session.user.id or preflight.has_invite_access
+        supplied_invite = normalize_invite_code(payload.invite_code or "")
+        supplied_invite_is_valid = False
+        if supplied_invite:
+            invite = await db_session.scalar(
+                select(TournamentInvite).where(
+                    TournamentInvite.tournament_id == tournament.id,
+                    TournamentInvite.code == supplied_invite,
+                )
+            )
+            now = datetime.now(UTC)
+            supplied_invite_is_valid = bool(
+                invite is not None
+                and invite.revoked_at is None
+                and (invite.expires_at is None or invite.expires_at > now)
+            )
+        has_invite_access = (
+            tournament.organizer_user_id == auth_session.user.id
+            or preflight.has_invite_access
+            or supplied_invite_is_valid
+        )
         if not has_invite_access:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -6249,6 +6246,7 @@ async def get_tournament_workspace(
     participants_offset: int = Query(default=0, ge=0),
     workspace_view: Literal["detail", "bracket", "bracket_summary"] = Query(default="bracket"),
     include_current_user: bool = Query(default=True),
+    invite_code: str | None = Query(default=None, min_length=6, max_length=64),
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentWorkspaceResponse | Response:
@@ -6337,7 +6335,29 @@ async def get_tournament_workspace(
         participant_count,
         locked_roster_count,
     ) = row
-    ensure_tournament_summary_visible(tournament, auth_session)
+    normalized_invite_code = normalize_invite_code(invite_code or "")
+    invite_code_record = None
+    has_valid_invite_code = False
+    if normalized_invite_code:
+        invite_code_record = await db_session.scalar(
+            select(TournamentInvite).where(
+                TournamentInvite.tournament_id == tournament.id,
+                TournamentInvite.code == normalized_invite_code,
+            )
+        )
+        has_valid_invite_code = bool(
+            invite_code_record is not None
+            and invite_code_record.revoked_at is None
+            and (
+                invite_code_record.expires_at is None
+                or invite_code_record.expires_at > datetime.now(UTC)
+            )
+        )
+    ensure_tournament_summary_visible(
+        tournament,
+        auth_session,
+        has_valid_invite_code=has_valid_invite_code,
+    )
     cover_media, organizer_avatar_media = await tournament_media_descriptors(
         db_session,
         tournament,
@@ -6372,7 +6392,19 @@ async def get_tournament_workspace(
         tournament,
         auth_session=auth_session,
         has_participant_record=has_participant_record,
+        has_valid_invite_code=has_valid_invite_code,
     )
+    invite_code = None
+    if workspace_visible:
+        invite_code = await db_session.scalar(
+            select(TournamentInvite.code)
+            .where(
+                TournamentInvite.tournament_id == tournament.id,
+                TournamentInvite.revoked_at.is_(None),
+            )
+            .order_by(TournamentInvite.created_at.asc())
+            .limit(1)
+        )
     tournament_response = serialize_tournament(
         tournament,
         organizer_display_name,
@@ -6383,9 +6415,15 @@ async def get_tournament_workspace(
         current_user_participant_status=(
             participant_record.status if participant_record is not None else None
         ),
-        current_user_has_invite_access=invite_access is not None,
+        current_user_has_invite_access=invite_access is not None or has_valid_invite_code,
+        invite_code=invite_code,
     )
     if not workspace_visible:
+        if tournament.visibility == "invite_only":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="A valid invite code or tournament membership is required.",
+            )
         server_time = datetime.now(UTC)
         workspace_response = TournamentWorkspaceResponse(
             tournament=tournament_response,

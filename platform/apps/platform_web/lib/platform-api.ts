@@ -41,6 +41,7 @@ type ApiTournamentListItem = {
   slug: string;
   name: string;
   description?: string | null;
+  invite_code?: string | null;
   cover_url?: string | null;
   cover_media?: PlatformMediaDescriptor | null;
   organizer_user_id: string;
@@ -703,6 +704,7 @@ export async function getTournamentWorkspace(
     participantsLimit?: number;
     workspaceView?: "detail" | "bracket" | "bracket_summary";
     includeCurrentUser?: boolean;
+    inviteCode?: string;
   } = {}
 ): Promise<{ tournament: TournamentDetail; currentUser: PlatformUser | null } | null> {
   const headers = new Headers(requestHeaders);
@@ -715,6 +717,9 @@ export async function getTournamentWorkspace(
   });
   if (options.includeCurrentUser !== undefined) {
     params.set("include_current_user", String(options.includeCurrentUser));
+  }
+  if (options.inviteCode) {
+    params.set("invite_code", options.inviteCode);
   }
 
   const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/workspace?${params.toString()}`, {
@@ -1010,7 +1015,8 @@ export async function deleteTournamentBanner(slug: string): Promise<PlatformMedi
 }
 
 export async function registerForTournament(
-  slug: string
+  slug: string,
+  inviteCode?: string | null
 ): Promise<Registration | null> {
   const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/join`, {
     method: "POST",
@@ -1019,7 +1025,7 @@ export async function registerForTournament(
       "content-type": "application/json"
     },
     credentials: "include",
-    body: JSON.stringify({ entry_type: "solo", team_name: null }),
+    body: JSON.stringify({ entry_type: "solo", team_name: null, invite_code: inviteCode ?? null }),
     cache: "no-store"
   });
   if (!response.ok) {
@@ -1218,6 +1224,7 @@ function mapTournamentDetail(
     ...mapTournamentSummary(item),
     serverTime: workflow.serverTime,
     description: item.description ?? "",
+    inviteCode: item.invite_code ?? null,
     visibility: normalizeVisibility(item.visibility),
     bracketType: "single_elimination",
     matchFormat: item.match_format ?? "bo1",

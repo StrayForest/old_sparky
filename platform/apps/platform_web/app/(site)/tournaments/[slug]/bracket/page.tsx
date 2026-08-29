@@ -12,11 +12,15 @@ export const metadata: Metadata = {
 };
 
 export default async function TournamentBracketPage({
-  params
+  params,
+  searchParams
 }: {
   params: Promise<{ slug: string }>;
+  searchParams?: Promise<{ invite_code?: string }>;
 }) {
   const { slug } = await params;
+  const resolvedSearchParams = await searchParams;
+  const inviteCode = resolvedSearchParams?.invite_code?.trim().toUpperCase() || undefined;
   const cookieHeader = (await cookies()).toString();
   const requestHeaders: HeadersInit = cookieHeader ? { cookie: cookieHeader } : {};
 
@@ -25,11 +29,12 @@ export default async function TournamentBracketPage({
     workspace = await getTournamentWorkspace(slug, requestHeaders, {
       participantsLimit: 0,
       workspaceView: "bracket",
-      includeCurrentUser: false
+      includeCurrentUser: false,
+      inviteCode
     });
   } catch (error) {
-    if (error instanceof PlatformApiError && error.status === 401) {
-      redirect(`/auth/login?returnTo=${encodeURIComponent(`/tournaments/${slug}/bracket`)}`);
+    if (error instanceof PlatformApiError && (error.status === 401 || error.status === 403)) {
+      redirect(`/tournaments/${encodeURIComponent(slug)}${inviteCode ? `?invite_code=${encodeURIComponent(inviteCode)}` : ""}`);
     }
     throw error;
   }

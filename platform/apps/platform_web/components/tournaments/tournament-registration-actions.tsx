@@ -158,7 +158,7 @@ export function TournamentRegistrationActions({
       errorStep: null,
       removedRegistrationId: null
     }));
-    const result = await registerForTournament(tournament.slug).catch(() => null);
+    const result = await registerForTournament(tournament.slug, tournament.inviteCode).catch(() => null);
     setState((current) => result
       ? { ...current, registration: result, saving: null, error: null, errorStep: null, removedRegistrationId: null }
       : {

@@ -1,21 +1,26 @@
 import type { Metadata } from "next";
-import { notFound, redirect } from "next/navigation";
+import { notFound } from "next/navigation";
 import { cookies } from "next/headers";
 import { Hero } from "@/components/layout/hero";
 import { TournamentDetailView } from "@/components/tournaments/tournament-detail-view";
 import { getTournamentWorkspace, PlatformApiError } from "@/lib/platform-api";
 import { getServerCurrentUser, platformSessionCookieName } from "@/lib/server-auth";
+import { TournamentInviteGate } from "@/components/tournaments/tournament-invite-gate";
 
 export const metadata: Metadata = {
   title: "Турнир"
 };
 
 export default async function TournamentDetailPage({
-  params
+  params,
+  searchParams
 }: {
   params: Promise<{ slug: string }>;
+  searchParams?: Promise<{ invite_code?: string }>;
 }) {
   const { slug } = await params;
+  const resolvedSearchParams = await searchParams;
+  const inviteCode = resolvedSearchParams?.invite_code?.trim().toUpperCase() || undefined;
   const requestCookies = await cookies();
   const cookieHeader = requestCookies.toString();
   const requestHeaders: HeadersInit = cookieHeader ? { cookie: cookieHeader } : {};
@@ -30,13 +35,21 @@ export default async function TournamentDetailPage({
       getTournamentWorkspace(slug, requestHeaders, {
         participantsLimit: 0,
         workspaceView: "detail",
-        includeCurrentUser: false
+        includeCurrentUser: false,
+        inviteCode
       }),
       actorUserIdPromise
     ]);
   } catch (error) {
-    if (error instanceof PlatformApiError && error.status === 401) {
-      redirect(`/auth/login?returnTo=${encodeURIComponent(`/tournaments/${slug}`)}`);
+    if (error instanceof PlatformApiError && (error.status === 401 || error.status === 403)) {
+      return (
+        <>
+          <div className="page-noise" aria-hidden="true" />
+          <main className="main">
+            <TournamentInviteGate slug={slug} />
+          </main>
+        </>
+      );
     }
     throw error;
   }

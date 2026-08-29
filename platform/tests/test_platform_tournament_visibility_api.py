@@ -256,6 +256,7 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_workspace_can_skip_current_user_without_changing_visibility(self) -> None:
         organizer = await self._register_user("organizer")
         outsider = await self._register_user("outsider")
+        anonymous = await self._new_client()
         await self._grant_public_creation(str(organizer["user_id"]))
 
         public_tournament = self._assert_status(
@@ -298,17 +299,22 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
             ),
             200,
         )
-        default_private_workspace = self._assert_status(
-            await outsider["client"].get(
-                f"/api/v1/tournaments/{private_tournament['slug']}/workspace",
-                params=workspace_params,
-            ),
-            200,
+        default_private_workspace = await outsider["client"].get(
+            f"/api/v1/tournaments/{private_tournament['slug']}/workspace",
+            params=workspace_params,
         )
+        self.assertEqual(default_private_workspace.status_code, 403, default_private_workspace.text)
         default_organizer_workspace = self._assert_status(
             await organizer["client"].get(
                 f"/api/v1/tournaments/{public_tournament['slug']}/workspace",
                 params=permission_workspace_params,
+            ),
+            200,
+        )
+        organizer_private_workspace = self._assert_status(
+            await organizer["client"].get(
+                f"/api/v1/tournaments/{private_tournament['slug']}/workspace",
+                params={**permission_workspace_params, "workspace_view": "detail"},
             ),
             200,
         )
@@ -321,10 +327,25 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
             200,
         )
         self.assertEqual(default_public_workspace["current_user"], expected_current_user)
-        self.assertEqual(default_private_workspace["current_user"], expected_current_user)
         self.assertEqual(
             default_organizer_workspace["current_user"],
             expected_organizer_current_user,
+        )
+        self.assertRegex(default_public_workspace["tournament"]["invite_code"], r"^[A-Z0-9]{10,24}$")
+        self.assertRegex(organizer_private_workspace["tournament"]["invite_code"], r"^[A-Z0-9]{10,24}$")
+        private_with_code = self._assert_status(
+            await outsider["client"].get(
+                f"/api/v1/tournaments/{private_tournament['slug']}/workspace",
+                params={**workspace_params, "invite_code": organizer_private_workspace["tournament"]["invite_code"]},
+            ),
+            200,
+        )
+        anonymous_with_code = self._assert_status(
+            await anonymous.get(
+                f"/api/v1/tournaments/{private_tournament['slug']}/workspace",
+                params={**workspace_params, "invite_code": organizer_private_workspace["tournament"]["invite_code"]},
+            ),
+            200,
         )
 
         with (
@@ -346,13 +367,6 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 200,
             )
-            lean_private_workspace = self._assert_status(
-                await outsider["client"].get(
-                    f"/api/v1/tournaments/{private_tournament['slug']}/workspace",
-                    params={**workspace_params, "include_current_user": False},
-                ),
-                200,
-            )
             lean_organizer_workspace = self._assert_status(
                 await organizer["client"].get(
                     f"/api/v1/tournaments/{public_tournament['slug']}/workspace",
@@ -368,7 +382,6 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
         serialize_current_user.assert_not_awaited()
         workspace_pairs = (
             (default_public_workspace, lean_public_workspace),
-            (default_private_workspace, lean_private_workspace),
             (default_organizer_workspace, lean_organizer_workspace),
         )
         for default_workspace, lean_workspace in workspace_pairs:
@@ -419,7 +432,8 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(default_public_workspace["participants_available"])
-        self.assertFalse(default_private_workspace["participants_available"])
+        self.assertTrue(private_with_code["participants_available"])
+        self.assertTrue(anonymous_with_code["participants_available"])
         self.assertTrue(default_organizer_workspace["bracket"]["can_manage"])
         self.assertIsNotNone(default_organizer_workspace["ready_check"])
         self.assertIsNotNone(default_organizer_workspace["auto_assignment"])
@@ -476,14 +490,8 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
             "Tournament roster and bracket data are visible only to joined participants, the organizer, or platform admins.",
             blocked_bracket.json()["detail"],
         )
-        scoped_workspace = self._assert_status(
-            await outsider["client"].get(f"/api/v1/tournaments/{slug}/workspace"),
-            200,
-        )
-        self.assertEqual(scoped_workspace["tournament"]["slug"], slug)
-        self.assertFalse(scoped_workspace["participants_available"])
-        self.assertEqual(scoped_workspace["participants_total"], 0)
-        self.assertIsNone(scoped_workspace["bracket"])
+        scoped_workspace = await outsider["client"].get(f"/api/v1/tournaments/{slug}/workspace")
+        self.assertEqual(scoped_workspace.status_code, 403, scoped_workspace.text)
 
         self._assert_status(
             await organizer["client"].patch(

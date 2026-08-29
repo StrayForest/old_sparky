@@ -41,7 +41,7 @@ export function TournamentInviteClaim() {
       })
         .then((result) => {
           if (requestSequence.current === sequence) {
-            router.push(`/tournaments/${result.tournament.slug}`);
+            router.push(`/tournaments/${result.tournament.slug}?invite_code=${encodeURIComponent(normalizedCode)}`);
           }
         })
         .catch((error) => {

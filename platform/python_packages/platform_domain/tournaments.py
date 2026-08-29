@@ -704,11 +704,12 @@ def can_view_tournament_workspace(
     is_participant: bool,
     is_organizer: bool,
     is_admin: bool,
+    has_valid_invite_code: bool = False,
 ) -> bool:
     if tournament_visibility == "public":
         return True
     if tournament_visibility == "invite_only":
-        return is_participant or is_organizer or is_admin
+        return is_participant or is_organizer or is_admin or has_valid_invite_code
     raise TournamentWorkflowError(f"Unknown tournament visibility: {tournament_visibility}.")
 
 

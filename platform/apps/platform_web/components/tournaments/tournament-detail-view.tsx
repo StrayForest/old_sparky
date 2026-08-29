@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { ArrowLeft, Crown, ExternalLink, Info, RefreshCw, Users } from "lucide-react";
+import { ArrowLeft, Crown, ExternalLink, Info, KeyRound, RefreshCw, Users } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { TournamentCard } from "@/components/tournaments/tournament-card";
@@ -82,7 +82,15 @@ export function TournamentDetailView({ tournament, actorUserId }: TournamentDeta
       <section className="top-detail-grid">
         <TournamentCard interactive={false} tournament={detail} />
         <section className="panel panel-pad description-panel">
-          <h2 className="panel-title"><Info size={17} />{t("tournament.descriptionTitle")}</h2>
+          <div className="panel-title description-panel-title">
+            <span className="description-panel-heading"><Info size={17} />{t("tournament.descriptionTitle")}</span>
+            {detail.inviteCode ? (
+              <span className="tournament-invite-code" data-testid="tournament-detail-invite-code">
+                <KeyRound aria-hidden="true" size={16} />
+                <span>{detail.inviteCode}</span>
+              </span>
+            ) : null}
+          </div>
           <p className="description-text tournament-description-text">
             {detail.description || `${detail.title} - турнир Deadlock для игроков платформы.`}
           </p>
@@ -118,7 +126,9 @@ export function TournamentDetailView({ tournament, actorUserId }: TournamentDeta
             aria-disabled={!bracketReady}
             aria-label={t("tournament.openBracketShort")}
             className={bracketReady ? "outline-button bracket-open-link" : "outline-button bracket-open-link disabled-link"}
-            href={`/tournaments/${detail.slug}/bracket`}
+            href={detail.inviteCode
+              ? `/tournaments/${detail.slug}/bracket?invite_code=${encodeURIComponent(detail.inviteCode)}`
+              : `/tournaments/${detail.slug}/bracket`}
             onClick={(event) => {
               if (!bracketReady) {
                 event.preventDefault();
