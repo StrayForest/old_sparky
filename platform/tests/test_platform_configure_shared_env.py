@@ -79,6 +79,13 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_WORKER_LOG_LEVEL"], "WARNING")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_PERF_LOG_MUTATIONS"], "false")
 
+    def test_capacity_profile_preserves_connection_budget(self) -> None:
+        profile = configure.RUNTIME_PROFILES["api-3x16"]
+        self.assertEqual(profile["PLATFORM_API_WORKERS"], "3")
+        self.assertEqual(profile["PLATFORM_DB_POOL_SIZE"], "16")
+        self.assertEqual(profile["PLATFORM_DB_MAX_OVERFLOW"], "0")
+        self.assertEqual(profile["PLATFORM_DB_CONNECTION_BUDGET"], "52")
+
     def test_atomic_write_preserves_private_owner_group_and_mode(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / ".env.platform"

@@ -119,6 +119,18 @@ PUBLIC_BASELINE = {
     "PLATFORM_PERF_SQL_COUNT_THRESHOLD": "25",
     "PLATFORM_PERF_LOG_MUTATIONS": "false",
 }
+RUNTIME_PROFILES = {
+    "baseline": {},
+    # Keep the total API pool budget unchanged while giving a third API
+    # worker a smaller private pool. This is an operator-controlled capacity
+    # experiment for the observed two-core VPS, not the automatic baseline.
+    "api-3x16": {
+        "PLATFORM_API_WORKERS": "3",
+        "PLATFORM_DB_POOL_SIZE": "16",
+        "PLATFORM_DB_MAX_OVERFLOW": "0",
+        "PLATFORM_DB_CONNECTION_BUDGET": "52",
+    },
+}
 PRESERVED_ROLLOUT_FLAGS = frozenset({"PLATFORM_STEAM_LOGIN_ENABLED"})
 ROLLOUT_FLAG_VALUES = frozenset({"true", "false"})
 
@@ -133,6 +145,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--confirm", default="")
+    parser.add_argument(
+        "--profile",
+        choices=tuple(RUNTIME_PROFILES),
+        default="baseline",
+        help="Select a reviewed runtime profile; baseline is the default.",
+    )
     parser.add_argument(
         "--only",
         action="append",
@@ -279,14 +297,16 @@ def sync_runtime_envs(env_file: Path) -> bool:
 
 def main() -> int:
     args = parse_args()
-    selected_keys = PUBLIC_BASELINE
+    selected_profile = dict(PUBLIC_BASELINE)
+    selected_profile.update(RUNTIME_PROFILES[args.profile])
+    selected_keys = selected_profile
     if args.only is not None:
-        unknown_keys = sorted(set(args.only) - PUBLIC_BASELINE.keys())
+        unknown_keys = sorted(set(args.only) - selected_profile.keys())
         if unknown_keys:
             raise RuntimeError(
                 "Unknown or unreviewed baseline key(s): " + ", ".join(unknown_keys)
             )
-        selected_keys = {key: PUBLIC_BASELINE[key] for key in dict.fromkeys(args.only)}
+        selected_keys = {key: selected_profile[key] for key in dict.fromkeys(args.only)}
     lines, _values, metadata = read_env(args.env_file)
     content, changed = merge_baseline(lines, baseline=selected_keys)
     if args.apply:
@@ -307,6 +327,7 @@ def main() -> int:
     report = {
         "ok": True,
         "mode": "apply" if args.apply else "dry-run",
+        "profile": args.profile,
         "mutated": bool(args.apply and changed),
         "changed_keys": changed,
         "changed_count": len(changed),

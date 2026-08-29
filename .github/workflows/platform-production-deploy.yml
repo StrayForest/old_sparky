@@ -11,6 +11,14 @@ on:
         options:
           - preflight
           - deploy
+      runtime_profile:
+        description: "Reviewed API capacity profile to apply after deployment"
+        required: true
+        default: baseline
+        type: choice
+        options:
+          - baseline
+          - api-3x16
 
 permissions:
   actions: read
@@ -37,6 +45,7 @@ jobs:
       PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       TARGET_SHA: ${{ github.sha }}
       DEPLOY_MODE: ${{ inputs.mode }}
+      RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
       RELEASE_SLUG: gha-${{ github.run_id }}-${{ github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -315,13 +324,14 @@ jobs:
             -o ServerAliveCountMax=3 \
             -i ~/.ssh/old_sparky_prod \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$TARGET_SHA' '$release_slug' '$DEPLOY_MODE' '$ARTIFACT_REMOTE_DIR'" <<'REMOTE'
+            "bash -s -- '$TARGET_SHA' '$release_slug' '$DEPLOY_MODE' '$ARTIFACT_REMOTE_DIR' '$RUNTIME_PROFILE'" <<'REMOTE'
           set -Eeuo pipefail
 
           target_sha="$1"
           release_slug="$2"
           deploy_mode="$3"
           artifact_dir="$4"
+          runtime_profile="$5"
 
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
@@ -437,6 +447,41 @@ jobs:
             --edge-origin https://127.0.0.1 \
             --edge-host old-sparky.com \
             --expected-csp-mode enforce
+
+          case "$runtime_profile" in
+            baseline)
+              ;;
+            api-3x16)
+              "$current/tools/platform_configure_shared_env.py" \
+                --apply \
+                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                --profile api-3x16 \
+                --only PLATFORM_API_WORKERS \
+                --only PLATFORM_DB_POOL_SIZE \
+                --only PLATFORM_DB_MAX_OVERFLOW \
+                --only PLATFORM_DB_CONNECTION_BUDGET
+              systemctl restart deadlock-api
+              if ! systemctl is-active --quiet deadlock-api \
+                || ! curl --fail --silent --show-error --max-time 10 \
+                  http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
+                "$current/tools/platform_configure_shared_env.py" \
+                  --apply \
+                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                  --profile baseline \
+                  --only PLATFORM_API_WORKERS \
+                  --only PLATFORM_DB_POOL_SIZE \
+                  --only PLATFORM_DB_MAX_OVERFLOW \
+                  --only PLATFORM_DB_CONNECTION_BUDGET
+                systemctl restart deadlock-api
+                systemctl is-active --quiet deadlock-api \
+                  || fail "API did not recover on baseline runtime profile"
+                fail "runtime profile health check failed; baseline restored"
+              fi
+              ;;
+            *)
+              fail "unsupported runtime profile: $runtime_profile"
+              ;;
+          esac
 
           printf 'Production deployment completed for %s.\n' "$target_sha"
           REMOTE
