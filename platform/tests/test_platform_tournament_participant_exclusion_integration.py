@@ -255,7 +255,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
         joined_b = self._assert_status(
             await player["client"].post(
                 f"/api/v1/tournaments/{slug_b}/join",
-                json={"entry_type": "solo"},
+                json={"entry_type": "solo", "invite_code": invite_b["code"]},
             ),
             201,
         )
