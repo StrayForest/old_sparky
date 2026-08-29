@@ -4826,7 +4826,7 @@ async def vote_deadlock_ready_check(
                 detail="Complete your Deadlock profile before confirming ready status.",
             )
 
-        eligible_user_ids = {str(user_id) for user_id in list(active_round.eligible_user_ids or [])}
+        eligible_user_ids = active_round.eligible_user_ids or []
         if eligible_user_ids and current_user_id not in eligible_user_ids:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

@@ -875,7 +875,6 @@ class TournamentDeadlockReadyVote(TimestampMixin, Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     round_id: Mapped[int] = mapped_column(
         ForeignKey("platform.tournament_deadlock_ready_rounds.id", ondelete="CASCADE"),
-        index=True,
     )
     user_id: Mapped[str] = mapped_column(
         String(36),
