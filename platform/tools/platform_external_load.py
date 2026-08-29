@@ -31,6 +31,7 @@ RESPONSE_BODY_LIMIT = 2 * 1024 * 1024
 ERROR_SAMPLE_LIMIT = 25
 MARKER_RE = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,139}$")
+COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 
 
 class ExternalLoadError(RuntimeError):
@@ -125,6 +126,10 @@ def load_manifest(path: Path) -> tuple[dict[str, Any], list[VirtualUser]]:
     marker = _required_text(payload.get("marker"), field="marker")
     if MARKER_RE.fullmatch(marker) is None:
         raise ExternalLoadError("external load marker is invalid")
+    for field in ("session_cookie_name", "csrf_cookie_name"):
+        cookie_name = _required_text(payload.get(field), field=field)
+        if COOKIE_NAME_RE.fullmatch(cookie_name) is None:
+            raise ExternalLoadError(f"manifest {field} is invalid")
 
     raw_tournaments = payload.get("tournaments")
     if not isinstance(raw_tournaments, list) or not 0 < len(raw_tournaments) <= MAX_TOURNAMENTS:
@@ -215,6 +220,8 @@ def _request(
     path: str,
     phase: str,
     timeout: float,
+    session_cookie_name: str,
+    csrf_cookie_name: str,
     json_payload: dict[str, Any] | None = None,
     expected_statuses: frozenset[int] = frozenset({200}),
 ) -> RequestResult:
@@ -224,8 +231,8 @@ def _request(
         "Origin": origin,
         "User-Agent": "old-sparky-external-load/1",
         "Cookie": (
-            f"platform_session={user.session_token}; "
-            f"platform_session_csrf={user.csrf_token}"
+            f"{session_cookie_name}={user.session_token}; "
+            f"{csrf_cookie_name}={user.csrf_token}"
         ),
         "X-CSRF-Token": user.csrf_token,
         "X-Platform-QA-Phase": phase,
@@ -370,7 +377,15 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
     }
 
 
-def _ready_vote_request(origin: str, user: VirtualUser, phase: str, timeout: float) -> RequestResult:
+def _ready_vote_request(
+    origin: str,
+    user: VirtualUser,
+    phase: str,
+    timeout: float,
+    *,
+    session_cookie_name: str,
+    csrf_cookie_name: str,
+) -> RequestResult:
     return _request(
         origin,
         user,
@@ -378,6 +393,8 @@ def _ready_vote_request(origin: str, user: VirtualUser, phase: str, timeout: flo
         path=f"/tournaments/{user.tournament_slug}/deadlock/ready-check/vote",
         phase=phase,
         timeout=timeout,
+        session_cookie_name=session_cookie_name,
+        csrf_cookie_name=csrf_cookie_name,
         json_payload={"choice": "yes"},
     )
 
@@ -395,12 +412,29 @@ def run_load(
     p99_budget_ms: float,
 ) -> dict[str, Any]:
     origin = str(manifest["origin"]).rstrip("/")
+    session_cookie_name = str(manifest["session_cookie_name"])
+    csrf_cookie_name = str(manifest["csrf_cookie_name"])
     started_at = datetime.now(UTC)
     trace = _trace(origin, timeout=min(timeout, 10.0))
     phase_results: dict[str, dict[str, Any]] = {}
     all_results: list[RequestResult] = []
 
     if mode == "ready-vote":
+        def vote_builder(
+            origin_value: str,
+            user: VirtualUser,
+            phase: str,
+            request_timeout: float,
+        ) -> RequestResult:
+            return _ready_vote_request(
+                origin_value,
+                user,
+                phase,
+                request_timeout,
+                session_cookie_name=session_cookie_name,
+                csrf_cookie_name=csrf_cookie_name,
+            )
+
         primary = run_phase(
             origin,
             users,
@@ -408,7 +442,7 @@ def run_load(
             spread_seconds=spread_seconds,
             concurrency=concurrency,
             timeout=timeout,
-            request_builder=_ready_vote_request,
+            request_builder=vote_builder,
         )
         phase_results["primary"] = summarize_results(primary)
         all_results.extend(primary)
@@ -422,7 +456,7 @@ def run_load(
                 spread_seconds=min(spread_seconds, 5.0),
                 concurrency=concurrency,
                 timeout=timeout,
-                request_builder=_ready_vote_request,
+                request_builder=vote_builder,
             )
             phase_results["duplicate"] = summarize_results(duplicates)
             all_results.extend(duplicates)
@@ -441,6 +475,8 @@ def run_load(
                 path=f"/tournaments/{slug}/deadlock/ready-check",
                 phase="read_external_vote_state",
                 timeout=timeout,
+                session_cookie_name=session_cookie_name,
+                csrf_cookie_name=csrf_cookie_name,
             )
             expected_count = expected_by_slug[slug]
             active_round = (
@@ -482,6 +518,8 @@ def run_load(
                 path=_route_for_read(index, user.tournament_slug),
                 phase=phase,
                 timeout=request_timeout,
+                session_cookie_name=session_cookie_name,
+                csrf_cookie_name=csrf_cookie_name,
             )
 
         read_results = run_phase(

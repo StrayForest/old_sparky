@@ -178,6 +178,8 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 "schema": 1,
                 "purpose": "external_ready_vote",
                 "origin": PUBLIC_ORIGIN,
+                "session_cookie_name": qa.session_cookie_name,
+                "csrf_cookie_name": qa.csrf_cookie_name,
                 "marker": qa.marker,
                 "created_at": datetime.now(UTC).isoformat(),
                 "tournaments": tournament_entries,

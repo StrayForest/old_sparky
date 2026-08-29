@@ -19,6 +19,8 @@ def manifest_payload() -> dict[str, object]:
         "schema": 1,
         "purpose": "external_ready_vote",
         "origin": "https://old-sparky.com",
+        "session_cookie_name": "deadlock_platform_session",
+        "csrf_cookie_name": "deadlock_platform_session_csrf",
         "marker": "preprod26082900000000ab",
         "tournaments": [
             {"id": "tournament-1", "slug": "qa-tournament", "user_count": 2}

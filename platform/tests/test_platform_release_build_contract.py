@@ -254,6 +254,9 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         fixture = (
             REPO_ROOT / "platform/tools/platform_prepare_external_vote_fixture.py"
         ).read_text()
+        supervisor = (
+            REPO_ROOT / "platform/tools/platform_production_retained_load_matrix_qa.sh"
+        ).read_text()
         observer = (
             REPO_ROOT / "platform/tools/platform_external_load_observer.py"
         ).read_text()
@@ -262,11 +265,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("RUN-PRODUCTION-EXTERNAL-LOAD", workflow)
         self.assertIn("external-vote", workflow)
         self.assertIn("platform_external_load.py", workflow)
-        self.assertIn("platform_external_load_observer.py", workflow)
+        self.assertIn("platform_external_load_observer.py", supervisor)
         self.assertIn("platform_production_retained_load_cleanup_qa.sh", workflow)
         self.assertNotIn("manifest.json\n", workflow.split("Publish external load evidence", 1)[1])
         self.assertIn("ThreadPoolExecutor", external_client)
         self.assertIn("external_ready_vote", fixture)
+        self.assertIn("session_cookie_name", fixture)
+        self.assertIn("csrf_cookie_name", fixture)
         self.assertIn("SystemSampler", observer)
 
     def test_browser_qa_does_not_silently_fallback_to_production_env(self) -> None:
