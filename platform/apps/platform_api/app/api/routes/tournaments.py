@@ -204,7 +204,7 @@ from python_packages.platform_domain.tournaments import (
     transition_match_status,
 )
 from python_packages.platform_infra.audit import write_audit_log
-from python_packages.platform_infra.db import get_db_session
+from python_packages.platform_infra.db import get_db_session, ready_vote_db_session
 from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
 from python_packages.platform_infra.media.errors import MediaError
 from python_packages.platform_infra.media.source_store import StagedSource
@@ -228,10 +228,12 @@ from python_packages.platform_infra.models import (
     new_uuid,
 )
 from python_packages.platform_infra.security import (
+    ReadyVoteAuthSnapshot,
     get_authenticated_session,
     get_authenticated_session_for_ready_vote,
     get_optional_authenticated_session,
 )
+from python_packages.platform_infra.performance import record_ready_vote_span
 from python_packages.platform_infra.tournament_names import (
     lock_tournament_name,
     public_tournament_name_exists,
@@ -4787,61 +4789,72 @@ async def start_deadlock_ready_check(
 async def vote_deadlock_ready_check(
     slug: str,
     payload: TournamentDeadlockReadyVoteRequest,
-    auth_session=Depends(get_authenticated_session_for_ready_vote),
-    db_session: AsyncSession = Depends(get_db_session),
+    auth_session: ReadyVoteAuthSnapshot = Depends(get_authenticated_session_for_ready_vote),
 ) -> TournamentDeadlockReadyVoteResponse:
-    current_user_id = auth_session.user.id
-    tournament: Tournament | None = None
+    current_user_id = auth_session.user_id
+    tournament: Any | None = None
     try:
-        preflight = await prepare_deadlock_ready_vote(
-            db_session,
-            slug=slug,
-            user_id=current_user_id,
-            choice=payload.choice,
-            now=auth_session.now,
-        )
-        tournament = preflight.tournament
-        ensure_deadlock_tournament_format(tournament)
-        ensure_deadlock_roster_staging_allowed(
-            format_slug=tournament.format_slug,
-            tournament_status=tournament.status,
-            has_locked_deadlock_roster=preflight.has_locked_roster,
-            action_name="Deadlock ready-check voting",
-        )
-        if not preflight.has_participant:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only joined participants can vote in deadlock ready-check.",
+        async with ready_vote_db_session() as db_session:
+            preflight_started = time.perf_counter()
+            try:
+                preflight = await prepare_deadlock_ready_vote(
+                    db_session,
+                    slug=slug,
+                    user_id=current_user_id,
+                    choice=payload.choice,
+                    now=auth_session.now,
+                )
+            finally:
+                record_ready_vote_span("ready_vote_preflight_ms", time.perf_counter() - preflight_started)
+            tournament = preflight.tournament
+            ensure_deadlock_tournament_format(tournament)
+            ensure_deadlock_roster_staging_allowed(
+                format_slug=tournament.format_slug,
+                tournament_status=tournament.status,
+                has_locked_deadlock_roster=preflight.has_locked_roster,
+                action_name="Deadlock ready-check voting",
             )
-        active_round = preflight.active_round
-        if active_round is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Deadlock ready-check is not active.",
-            )
+            if not preflight.has_participant:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Only joined participants can vote in deadlock ready-check.",
+                )
+            active_round = preflight.active_round
+            if active_round is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Deadlock ready-check is not active.",
+                )
 
-        if payload.choice == "yes" and not preflight.has_deadlock_profile:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Complete your Deadlock profile before confirming ready status.",
-            )
+            if payload.choice == "yes" and not preflight.has_deadlock_profile:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Complete your Deadlock profile before confirming ready status.",
+                )
 
-        if not active_round.user_is_eligible:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You are not eligible for the active ready-check.",
-            )
+            if not active_round.user_is_eligible:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You are not eligible for the active ready-check.",
+                )
 
-        vote_changed = await upsert_deadlock_ready_vote(
-            db_session,
-            round_id=active_round.id,
-            user_id=current_user_id,
-            choice=payload.choice,
-            responded_at=auth_session.now,
-        )
+            upsert_started = time.perf_counter()
+            try:
+                vote_changed = await upsert_deadlock_ready_vote(
+                    db_session,
+                    round_id=active_round.id,
+                    user_id=current_user_id,
+                    choice=payload.choice,
+                    responded_at=auth_session.now,
+                )
+            finally:
+                upsert_elapsed = time.perf_counter() - upsert_started
+            record_ready_vote_span("ready_vote_upsert_ms", upsert_elapsed)
+            # Counter shards are maintained by the same conditional trigger;
+            # their database work is included in the upsert statement.
+            record_ready_vote_span("ready_vote_counter_ms", upsert_elapsed)
 
-        if vote_changed:
-            _invalidate_ready_check_state_cache(tournament.id)
+            commit_started = time.perf_counter()
             try:
                 await db_session.commit()
             except IntegrityError as exc:
@@ -4852,6 +4865,13 @@ async def vote_deadlock_ready_check(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Deadlock ready-check is no longer active.",
                 ) from exc
+            finally:
+                record_ready_vote_span("ready_vote_commit_ms", time.perf_counter() - commit_started)
+
+        if vote_changed:
+            # Invalidate only after durable commit. Identical duplicates are
+            # true no-ops and keep the existing state cache intact.
+            _invalidate_ready_check_state_cache(tournament.id)
 
         # The conditional upsert is the authoritative idempotency check: an
         # unchanged existing choice returns no row, while an insert or changed
@@ -4875,7 +4895,8 @@ async def vote_deadlock_ready_check(
             current_user_id,
             relative_ms,
         )
-        return TournamentDeadlockReadyVoteResponse(
+        response_started = time.perf_counter()
+        response = TournamentDeadlockReadyVoteResponse(
             round_id=active_round.id,
             tournament_id=active_round.tournament_id,
             status=active_round.status,
@@ -4884,6 +4905,8 @@ async def vote_deadlock_ready_check(
             changed=vote_changed,
             server_received_at=auth_session.now,
         )
+        record_ready_vote_span("ready_vote_response_ms", time.perf_counter() - response_started)
+        return response
     except TournamentWorkflowError as exc:
         relative_ms = getattr(exc, "relative_ms", None)
         if tournament is not None and tournament.ready_check_starts_at is not None:

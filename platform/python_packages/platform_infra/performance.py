@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import re
 from time import perf_counter
@@ -33,6 +33,7 @@ class RequestPerformanceMetrics:
     qa_phase: str | None = None
     cf_ray: str | None = None
     client_fingerprint: str | None = None
+    ready_vote_spans: dict[str, float] = field(default_factory=dict)
 
 
 _current_metrics: ContextVar[RequestPerformanceMetrics | None] = ContextVar(
@@ -143,6 +144,12 @@ def record_pool_checkout_wait(elapsed_seconds: float) -> None:
         metrics.pool_checkout_wait_seconds += max(0.0, elapsed_seconds)
 
 
+def record_ready_vote_span(name: str, elapsed_seconds: float) -> None:
+    metrics = _current_metrics.get()
+    if metrics is not None and name.startswith("ready_vote_"):
+        metrics.ready_vote_spans[name] = max(0.0, elapsed_seconds)
+
+
 def reset_request_metrics(token: Token[RequestPerformanceMetrics | None]) -> None:
     _current_metrics.reset(token)
 
@@ -231,7 +238,10 @@ class RequestPerformanceMiddleware:
             "request_perf request_id=%s method=%s path=%s route=%s status=%s "
             "total_ms=%.2f sql_ms=%.2f sql_count=%s max_sql_ms=%.2f "
             "compute_ms=%.2f compute_blocks=%s response_bytes=%s qa_phase=%s "
-            "pool_wait_ms=%.2f cf_ray=%s client=%s",
+            "pool_wait_ms=%.2f ready_vote_auth_ms=%.2f ready_vote_db_checkout_ms=%.2f "
+            "ready_vote_preflight_ms=%.2f ready_vote_upsert_ms=%.2f "
+            "ready_vote_counter_ms=%.2f ready_vote_commit_ms=%.2f "
+            "ready_vote_response_ms=%.2f cf_ray=%s client=%s",
             metrics.request_id,
             metrics.method,
             metrics.path,
@@ -246,6 +256,13 @@ class RequestPerformanceMiddleware:
             metrics.response_bytes,
             metrics.qa_phase or "-",
             metrics.pool_checkout_wait_seconds * 1000,
+            metrics.ready_vote_spans.get("ready_vote_auth_ms", 0.0) * 1000,
+            metrics.ready_vote_spans.get("ready_vote_db_checkout_ms", 0.0) * 1000,
+            metrics.ready_vote_spans.get("ready_vote_preflight_ms", 0.0) * 1000,
+            metrics.ready_vote_spans.get("ready_vote_upsert_ms", 0.0) * 1000,
+            metrics.ready_vote_spans.get("ready_vote_counter_ms", 0.0) * 1000,
+            metrics.ready_vote_spans.get("ready_vote_commit_ms", 0.0) * 1000,
+            metrics.ready_vote_spans.get("ready_vote_response_ms", 0.0) * 1000,
             metrics.cf_ray or "-",
             metrics.client_fingerprint or "-",
         )

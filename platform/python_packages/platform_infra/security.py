@@ -23,6 +23,7 @@ from python_packages.platform_infra.config import PlatformSettings, get_settings
 from python_packages.platform_infra.csrf import clear_csrf_cookie
 from python_packages.platform_infra.db import get_db_session, session_factory
 from python_packages.platform_infra.models import Role, User, UserRole, UserSession
+from python_packages.platform_infra.performance import record_ready_vote_span
 from python_packages.platform_infra.turnstile import (
     normalized_turnstile_mode,
     validate_turnstile_settings,
@@ -215,6 +216,14 @@ class AuthenticatedSession:
     user: User
     session: UserSession
     role_slugs: frozenset[str]
+    now: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyVoteAuthSnapshot:
+    """Detached, minimum authentication result for a Ready Vote request."""
+
+    user_id: str
     now: datetime
 
 
@@ -568,8 +577,7 @@ async def get_authenticated_session(
 
 async def get_authenticated_session_for_ready_vote(
     request: Request,
-    db_session: AsyncSession = Depends(get_db_session),
-) -> AuthenticatedSession:
+) -> ReadyVoteAuthSnapshot:
     """Authenticate the hot Ready vote path without unrelated auth work.
 
     A vote only needs the authenticated user id and the request timestamp. It
@@ -579,12 +587,47 @@ async def get_authenticated_session_for_ready_vote(
     authenticated requests retain the full role load and session touch.
     """
 
-    return await _get_authenticated_session(
-        request,
-        db_session,
-        load_roles=False,
-        touch_session=False,
-    )
+    started = time.perf_counter()
+    try:
+        settings = get_settings()
+        token = request.cookies.get(settings.platform_session_cookie_name)
+        if not token:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+        now = datetime.now(UTC)
+        token_digest = session_token_digest(token)
+        user_predicates = [User.status == "active"]
+        if email_verification_required(settings):
+            user_predicates.append((User.email.is_(None)) | (User.email_verified_at.is_not(None)))
+
+        # This session is deliberately owned here and closed before FastAPI
+        # calls the endpoint. Selecting primitives also avoids ORM identity-map work.
+        async with session_factory()() as auth_db_session:
+            checkout_started = time.perf_counter()
+            try:
+                await auth_db_session.connection()
+            except SQLAlchemyTimeoutError:
+                from python_packages.platform_infra.performance import record_pool_checkout_wait
+                record_pool_checkout_wait(time.perf_counter() - checkout_started)
+                raise
+            from python_packages.platform_infra.performance import record_pool_checkout_wait
+            record_pool_checkout_wait(time.perf_counter() - checkout_started)
+            user_id = await auth_db_session.scalar(
+                select(UserSession.user_id)
+                .join(User, User.id == UserSession.user_id)
+                .where(
+                    UserSession.token_digest == token_digest,
+                    UserSession.invalidated_at.is_(None),
+                    UserSession.expires_at > now,
+                    *user_predicates,
+                )
+                .limit(1)
+            )
+        if user_id is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session is invalid.")
+        return ReadyVoteAuthSnapshot(user_id=str(user_id), now=now)
+    finally:
+        record_ready_vote_span("ready_vote_auth_ms", time.perf_counter() - started)
 
 
 async def _resolve_optional_authenticated_session(

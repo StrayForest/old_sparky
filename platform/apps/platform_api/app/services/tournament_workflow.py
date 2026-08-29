@@ -363,7 +363,7 @@ class ReadyRoundStateSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class ReadyVoteRoutePreflight:
-    tournament: Tournament
+    tournament: Tournament | ReadyVoteTournamentSnapshot
     active_round: ReadyVoteRoundSnapshot | TournamentDeadlockReadyRound | None
     has_participant: bool
     has_deadlock_profile: bool
@@ -379,6 +379,20 @@ class ReadyVoteRoundSnapshot:
     status: str
     eligible_participant_count: int
     user_is_eligible: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyVoteTournamentSnapshot:
+    """Columns required by the ordinary vote path, detached from the ORM."""
+
+    id: str
+    slug: str
+    format_slug: str
+    status: str
+    registration_closes_at: datetime | None
+    ready_check_starts_at: datetime | None
+    ready_check_ends_at: datetime | None
+    automation_ready_check_closed_at: datetime | None
 
 
 def _ready_vote_round_snapshot(
@@ -804,7 +818,14 @@ async def ready_vote_preflight_snapshot(
     row = (
         await db_session.execute(
             select(
-                Tournament,
+                Tournament.id,
+                Tournament.slug,
+                Tournament.format_slug,
+                Tournament.status,
+                Tournament.registration_closes_at,
+                Tournament.ready_check_starts_at,
+                Tournament.ready_check_ends_at,
+                Tournament.automation_ready_check_closed_at,
                 participant_exists.label("has_participant"),
                 profile_exists.label("has_deadlock_profile"),
                 locked_roster_exists.label("has_locked_roster"),
@@ -827,6 +848,16 @@ async def ready_vote_preflight_snapshot(
     ).first()
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+    tournament = ReadyVoteTournamentSnapshot(
+        id=str(row.id),
+        slug=str(row.slug),
+        format_slug=str(row.format_slug),
+        status=str(row.status),
+        registration_closes_at=row.registration_closes_at,
+        ready_check_starts_at=row.ready_check_starts_at,
+        ready_check_ends_at=row.ready_check_ends_at,
+        automation_ready_check_closed_at=row.automation_ready_check_closed_at,
+    )
     round_snapshot = None
     if row.ready_round_id is not None:
         round_snapshot = ReadyVoteRoundSnapshot(
@@ -837,7 +868,7 @@ async def ready_vote_preflight_snapshot(
             user_is_eligible=bool(row.user_is_eligible),
         )
     return ReadyVoteRoutePreflight(
-        tournament=row[0],
+        tournament=tournament,
         has_participant=bool(row[1]),
         has_deadlock_profile=bool(row[2]),
         has_locked_roster=bool(row[3]),

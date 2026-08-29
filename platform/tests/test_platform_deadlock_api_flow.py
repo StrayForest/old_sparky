@@ -1040,21 +1040,24 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             tournament.ready_check_starts_at = now - timedelta(seconds=1)
             await db_session.commit()
 
-        first_response, second_response = await asyncio.gather(
-            organizer["client"].post(
-                f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
-                json={"choice": "yes"},
-            ),
-            organizer["client"].post(
-                f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
-                json={"choice": "yes"},
-            ),
-        )
+        with patch.object(tournament_routes, "_invalidate_ready_check_state_cache") as invalidate_cache:
+            first_response, second_response = await asyncio.gather(
+                organizer["client"].post(
+                    f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                    json={"choice": "yes"},
+                ),
+                organizer["client"].post(
+                    f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                    json={"choice": "yes"},
+                ),
+            )
         self.assertEqual(
             sorted((first_response.status_code, second_response.status_code)),
             [200, 200],
             {"first": first_response.text, "second": second_response.text},
         )
+        self.assertEqual(invalidate_cache.call_count, 1)
+        invalidate_cache.assert_called_once_with(tournament_id)
         changed_values = sorted(
             (
                 bool(first_response.json()["changed"]),

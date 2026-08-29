@@ -173,6 +173,24 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             1,
         )
 
+    def test_request_perf_summary_exposes_ready_vote_spans(self) -> None:
+        summary = summarize_request_perf_logs(
+            [
+                "request_perf request_id=one method=POST path=/api/v1/tournaments/demo/deadlock/ready-check/vote "
+                "route=/{slug}/deadlock/ready-check/vote status=200 total_ms=40.00 sql_ms=20.00 "
+                "sql_count=3 max_sql_ms=10.00 compute_ms=2.00 compute_blocks=1 response_bytes=180 "
+                "pool_wait_ms=3.00 qa_phase=write_ready_burst_5s "
+                "ready_vote_auth_ms=4.00 ready_vote_db_checkout_ms=5.00 "
+                "ready_vote_preflight_ms=6.00 ready_vote_upsert_ms=7.00 "
+                "ready_vote_counter_ms=7.00 ready_vote_commit_ms=2.00 ready_vote_response_ms=0.10",
+            ],
+            tournament_slug="demo",
+        )
+
+        ready_vote = summary["by_route"]["/{slug}/deadlock/ready-check/vote"]["ready_vote"]
+        self.assertEqual(ready_vote["ready_vote_auth_ms"]["avg_ms"], 4.0)
+        self.assertEqual(ready_vote["ready_vote_commit_ms"]["p95_ms"], 2.0)
+
     def test_request_perf_summary_keeps_workspace_pressure_in_route_breakdown(self) -> None:
         summary = summarize_request_perf_logs(
             [

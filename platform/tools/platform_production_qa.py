@@ -79,6 +79,15 @@ UUID_RE = re.compile(
 )
 NUMERIC_PATH_RE = re.compile(r"/\d+(?=/|$)")
 REQUEST_PERF_RE = re.compile(r"\brequest_perf\b(?P<body>.*)$")
+READY_VOTE_PERF_KEYS = (
+    "ready_vote_auth_ms",
+    "ready_vote_db_checkout_ms",
+    "ready_vote_preflight_ms",
+    "ready_vote_upsert_ms",
+    "ready_vote_counter_ms",
+    "ready_vote_commit_ms",
+    "ready_vote_response_ms",
+)
 PROCESS_CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 # Progress checkpoints are written while a retained fixture is being built.
 # Do not serialize the complete 10k-user identity inventory on every batch;
@@ -1287,6 +1296,7 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
         "compute_blocks": int,
         "response_bytes": int,
         "pool_wait_ms": float,
+        **{key: float for key in READY_VOTE_PERF_KEYS},
     }
     for key, caster in numeric_keys.items():
         if key not in values:
@@ -1356,6 +1366,11 @@ def summarize_request_perf_logs(
             )
             for row in row_values
         ]
+        ready_vote_spans = {
+            key: row_metric_stats(key, row_values)
+            for key in READY_VOTE_PERF_KEYS
+            if any(isinstance(row.get(key), (int, float)) for row in row_values)
+        }
         return {
             "requests": len(row_values),
             "total": row_metric_stats("total_ms", row_values),
@@ -1386,6 +1401,7 @@ def summarize_request_perf_logs(
                 [int(row["response_bytes"]) for row in row_values if isinstance(row.get("response_bytes"), (int, float))]
             ),
             "pool_checkout_wait_ms": row_metric_stats("pool_wait_ms", row_values),
+            "ready_vote": ready_vote_spans,
         }
 
     return {
@@ -1398,6 +1414,11 @@ def summarize_request_perf_logs(
         "max_sql_time_ms": round(max(max_sql_times), 3) if max_sql_times else None,
         "response_bytes": byte_stats([int(value) for value in response_bytes]),
         "pool_checkout_wait_ms": metric_stats(pool_wait_times),
+        "ready_vote": {
+            key: row_metric_stats(key, rows)
+            for key in READY_VOTE_PERF_KEYS
+            if any(isinstance(row.get(key), (int, float)) for row in rows)
+        },
         "by_route": {
             route: summarize_route_rows(row_values)
             for route, row_values in sorted(

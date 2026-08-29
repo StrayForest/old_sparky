@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, AsyncGenerator
+from contextlib import asynccontextmanager
 from hashlib import sha256
 import logging
 import os
@@ -23,6 +24,7 @@ from python_packages.platform_infra.config import (
 )
 from python_packages.platform_infra.performance import (
     install_sqlalchemy_query_metrics,
+    record_ready_vote_span,
     record_pool_checkout_wait,
 )
 
@@ -150,4 +152,25 @@ async def get_db_session() -> AsyncIterator[AsyncSession]:
             record_pool_checkout_wait(perf_counter() - checkout_started)
             raise
         record_pool_checkout_wait(perf_counter() - checkout_started)
+        yield db_session
+
+
+@asynccontextmanager
+async def ready_vote_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """Own the short transaction session used by the Ready Vote route.
+
+    Unlike the request dependency this scope is entered only after auth and
+    leaves no session alive while the response is being built or serialized.
+    """
+
+    async with session_factory()() as db_session:
+        checkout_started = perf_counter()
+        try:
+            await db_session.connection()
+        except SQLAlchemyTimeoutError:
+            record_pool_checkout_wait(perf_counter() - checkout_started)
+            raise
+        checkout_elapsed = perf_counter() - checkout_started
+        record_pool_checkout_wait(checkout_elapsed)
+        record_ready_vote_span("ready_vote_db_checkout_ms", checkout_elapsed)
         yield db_session

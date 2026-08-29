@@ -260,9 +260,21 @@ before starting another production load.
 
 The vote endpoint uses a deliberately minimal authenticated-session lookup: it
 validates the session, user status and expiry but does not hydrate role data or
-touch `last_seen` inside the burst. Vote authorization still performs the full
-server-side time, participant, profile, round and workflow checks; ordinary
-authenticated requests retain role hydration and session last-seen updates.
+touch `last_seen` inside the burst. Authentication returns a detached user/time
+snapshot and closes its session before the vote route opens its own short
+transaction. The ordinary preflight selects only the tournament columns needed
+by the vote; ORM tournament hydration remains limited to lazy workflow
+transitions. Vote authorization still performs the full server-side time,
+participant, profile, round and workflow checks; ordinary authenticated requests
+retain role hydration and session last-seen updates.
+
+Ready Vote `request_perf` records low-cardinality spans for auth, vote-session
+checkout, preflight, conditional upsert, trigger-maintained counter work,
+commit and response construction. The conditional upsert returns `changed=false`
+for an identical choice, so it performs no vote-row update, counter delta or
+cache invalidation. These fields are aggregated by route and QA phase by the
+production QA parser; successful requests remain below the normal per-request
+INFO logging path unless the existing mutation/slow-request gate selects them.
 
 Retained users are provisioned with authenticated sessions rather than logging
 in inside the burst. The harness derives the same session-bound CSRF token that
