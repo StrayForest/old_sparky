@@ -452,7 +452,7 @@ jobs:
             baseline)
               ;;
             api-3x16)
-              "$current/tools/platform_configure_shared_env.py" \
+              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
                 --apply \
                 --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
                 --profile api-3x16 \
@@ -464,7 +464,7 @@ jobs:
               if ! systemctl is-active --quiet deadlock-api \
                 || ! curl --fail --silent --show-error --max-time 10 \
                   http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                "$current/tools/platform_configure_shared_env.py" \
+                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
                   --apply \
                   --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
                   --profile baseline \
