@@ -3210,14 +3210,18 @@ async def redeem_tournament_invite(
         now = datetime.now(UTC)
         if invite.revoked_at is not None or (invite.expires_at is not None and invite.expires_at <= now):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite code was not found.")
+        cover_media, organizer_avatar_media = await tournament_media_descriptors(
+            db_session,
+            tournament,
+            organizer_avatar_asset_id=organizer_avatar_asset_id,
+        )
         return TournamentInviteRedeemResponse(
             tournament=serialize_tournament(
                 tournament,
                 organizer_display_name,
                 int(participant_count),
-                cover_media=await tournament_media_descriptors(
-                    db_session, tournament, organizer_avatar_asset_id=organizer_avatar_asset_id
-                ),
+                cover_media=cover_media,
+                organizer_avatar_media=organizer_avatar_media,
                 has_locked_deadlock_roster=bool(int(locked_roster_count)),
                 invite_code=invite.code,
             ),

@@ -1201,6 +1201,26 @@ a.tournament-card:focus-visible {
   border-radius: var(--ui-radius-sm);
 }
 
+.tournament-invite-code {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ui-text-muted);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  padding: 4px 6px;
+  border-radius: var(--ui-radius-sm);
+}
+
+.tournament-invite-code:hover,
+.tournament-invite-code:focus-visible,
+.tournament-invite-code.copied {
+  color: var(--ui-primary-bright);
+  background: rgba(94, 234, 212, .08);
+}
+
 .invite-code-actions .icon-button.copied:disabled {
   color: var(--ui-primary-bright);
   cursor: default;

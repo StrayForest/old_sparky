@@ -508,6 +508,16 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
             201,
         )
 
+        anonymous_invite_result = self._assert_status(
+            await anonymous.post(
+                "/api/v1/tournaments/invites/claim",
+                json={"code": invite_payload["code"], "entry_type": "solo", "team_name": None},
+            ),
+            201,
+        )
+        self.assertEqual(anonymous_invite_result["tournament"]["slug"], slug)
+        self.assertEqual(anonymous_invite_result["tournament"]["invite_code"], invite_payload["code"])
+
         self._assert_status(
             await outsider["client"].post(
                 "/api/v1/tournaments/invites/claim",

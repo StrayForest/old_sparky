@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { ArrowLeft, Crown, ExternalLink, Info, KeyRound, RefreshCw, Users } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { ArrowLeft, Check, Copy, Crown, ExternalLink, Info, KeyRound, RefreshCw, Users } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { TournamentCard } from "@/components/tournaments/tournament-card";
 import { TournamentRegistrationActions } from "@/components/tournaments/tournament-registration-actions";
@@ -11,6 +11,7 @@ import { useI18n } from "@/components/i18n-provider";
 import { CspImage } from "@/components/media/csp-image";
 import { deadlockRankIconPath, deadlockRankPlaceholderPath } from "@/lib/deadlock";
 import { isActiveParticipantStatus } from "@/lib/tournament-model";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import type { Registration, Team, TournamentDetail } from "@/lib/types";
 
 type TournamentDetailViewProps = {
@@ -27,6 +28,8 @@ export function TournamentDetailView({ tournament, actorUserId }: TournamentDeta
     detail.schedule?.checkInStartsAt,
   )?.current_user_choice ?? null;
   const [readyChoice, setReadyChoice] = useState<string | null>(initialReadyChoice);
+  const [inviteCopied, setInviteCopied] = useState(false);
+  const inviteCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     setDetail(tournament);
@@ -35,6 +38,20 @@ export function TournamentDetailView({ tournament, actorUserId }: TournamentDeta
   useEffect(() => {
     setReadyChoice(initialReadyChoice);
   }, [initialReadyChoice]);
+
+  useEffect(() => () => {
+    if (inviteCopyTimerRef.current) clearTimeout(inviteCopyTimerRef.current);
+  }, []);
+
+  async function copyInviteCode() {
+    if (!detail.inviteCode || !await copyTextToClipboard(detail.inviteCode)) return;
+    setInviteCopied(true);
+    if (inviteCopyTimerRef.current) clearTimeout(inviteCopyTimerRef.current);
+    inviteCopyTimerRef.current = setTimeout(() => {
+      setInviteCopied(false);
+      inviteCopyTimerRef.current = null;
+    }, 1600);
+  }
 
   const currentTeam = useMemo(
     () => actorUserId
@@ -85,10 +102,17 @@ export function TournamentDetailView({ tournament, actorUserId }: TournamentDeta
           <div className="panel-title description-panel-title">
             <span className="description-panel-heading"><Info size={17} />{t("tournament.descriptionTitle")}</span>
             {detail.inviteCode ? (
-              <span className="tournament-invite-code" data-testid="tournament-detail-invite-code">
-                <KeyRound aria-hidden="true" size={16} />
+              <button
+                aria-label={inviteCopied ? t("tournament.inviteCopied") : t("tournament.copyInvite")}
+                className={inviteCopied ? "tournament-invite-code copied" : "tournament-invite-code"}
+                data-testid="tournament-detail-invite-code"
+                onClick={() => void copyInviteCode()}
+                type="button"
+              >
+                {inviteCopied ? <Check aria-hidden="true" size={16} /> : <KeyRound aria-hidden="true" size={16} />}
                 <span>{detail.inviteCode}</span>
-              </span>
+                <Copy aria-hidden="true" size={14} />
+              </button>
             ) : null}
           </div>
           <p className="description-text tournament-description-text">
