@@ -171,6 +171,9 @@ jobs:
             printf '%s\n' 'Host *'
             printf '%s\n' '  StrictHostKeyChecking yes'
             printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+            printf '%s\n' '  ControlMaster auto'
+            printf '%s\n' '  ControlPersist 15m'
+            printf '  ControlPath %s/control-%%C\n' "$ssh_dir"
           } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"
           echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
