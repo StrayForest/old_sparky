@@ -86,6 +86,12 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertEqual(profile["PLATFORM_DB_MAX_OVERFLOW"], "0")
         self.assertEqual(profile["PLATFORM_DB_CONNECTION_BUDGET"], "52")
 
+        single_worker = configure.RUNTIME_PROFILES["api-1x48"]
+        self.assertEqual(single_worker["PLATFORM_API_WORKERS"], "1")
+        self.assertEqual(single_worker["PLATFORM_DB_POOL_SIZE"], "48")
+        self.assertEqual(single_worker["PLATFORM_DB_MAX_OVERFLOW"], "0")
+        self.assertEqual(single_worker["PLATFORM_DB_CONNECTION_BUDGET"], "52")
+
     def test_atomic_write_preserves_private_owner_group_and_mode(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / ".env.platform"

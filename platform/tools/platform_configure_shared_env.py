@@ -130,6 +130,15 @@ RUNTIME_PROFILES = {
         "PLATFORM_DB_MAX_OVERFLOW": "0",
         "PLATFORM_DB_CONNECTION_BUDGET": "52",
     },
+    # A single async API worker can keep the two-core host fully occupied
+    # while exposing nearly the whole connection budget to one event loop.
+    # This remains an operator-controlled experiment, not the baseline.
+    "api-1x48": {
+        "PLATFORM_API_WORKERS": "1",
+        "PLATFORM_DB_POOL_SIZE": "48",
+        "PLATFORM_DB_MAX_OVERFLOW": "0",
+        "PLATFORM_DB_CONNECTION_BUDGET": "52",
+    },
 }
 PRESERVED_ROLLOUT_FLAGS = frozenset({"PLATFORM_STEAM_LOGIN_ENABLED"})
 ROLLOUT_FLAG_VALUES = frozenset({"true", "false"})
