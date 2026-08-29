@@ -200,7 +200,11 @@ class PlatformSettings(BaseSettings):
     # Keep PostgreSQL connection count bounded per process. API and Celery
     # processes use separate budgets so background bursts cannot consume the
     # entire database capacity reserved for user requests.
-    platform_db_pool_size: int = Field(default=16, gt=0)
+    # Two API workers at 20 connections each plus the bounded worker pool fit
+    # the default connection budget of 44.  Keep overflow disabled: a fixed
+    # pool makes burst pressure observable without creating unbounded database
+    # fan-out on the two-core production host.
+    platform_db_pool_size: int = Field(default=20, gt=0)
     platform_db_max_overflow: int = Field(default=0, ge=0)
     platform_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
     platform_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
