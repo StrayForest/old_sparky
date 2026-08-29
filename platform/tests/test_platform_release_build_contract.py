@@ -266,6 +266,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("external-vote", workflow)
         self.assertIn("platform_external_load.py", workflow)
         self.assertIn("platform_external_load_observer.py", supervisor)
+        self.assertIn('EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"', supervisor)
+        self.assertIn("External-vote profile requires the dedicated external-load confirmation.", supervisor)
         self.assertIn("platform_production_retained_load_cleanup_qa.sh", workflow)
         self.assertNotIn("manifest.json\n", workflow.split("Publish external load evidence", 1)[1])
         self.assertIn("ThreadPoolExecutor", external_client)

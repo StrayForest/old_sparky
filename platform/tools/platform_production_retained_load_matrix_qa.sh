@@ -11,6 +11,7 @@ RUNTIME_ROOT="/opt/oldsparky/platform"
 OUTPUT_ROOT_BASE="$RUNTIME_ROOT/shared/production-retained-matrix"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 CONFIRMATION="RUN-PRODUCTION-RETAINED-LOAD-MATRIX"
+EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"
 LOCK_PATH="/run/lock/oldsparky-retained-load-matrix.lock"
 EXPECTED_ORIGIN="https://old-sparky.com"
 MAX_RUNTIME="180m"
@@ -34,7 +35,10 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# < 5 || $# > 9 )) || [[ "$1" != "$CONFIRMATION" ]]; then
+if (( $# < 5 || $# > 9 )) || {
+  [[ "$1" != "$CONFIRMATION" ]] &&
+  ! { [[ "${6:-}" == "external-vote" && "$1" == "$EXTERNAL_CONFIRMATION" ]]; }
+}; then
   echo "Usage: $0 $CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> [matrix|read-mix|write-burst|external-vote] [profile arguments]" >&2
   exit 2
 fi
@@ -72,6 +76,10 @@ case "$profile" in
     }
     ;;
   external-vote)
+    [[ "$confirmation" == "$EXTERNAL_CONFIRMATION" ]] || {
+      echo "External-vote profile requires the dedicated external-load confirmation." >&2
+      exit 1
+    }
     external_vote_tournament_count="${7:-1}"
     external_vote_users_per_tournament="${8:-500}"
     [[ "$external_vote_tournament_count" =~ ^[1-9][0-9]?$ ]] && (( external_vote_tournament_count <= 20 )) || {
@@ -89,7 +97,11 @@ case "$profile" in
     ;;
 esac
 
-[[ "$confirmation" == "$CONFIRMATION" ]]
+if [[ "$profile" == "external-vote" ]]; then
+  [[ "$confirmation" == "$EXTERNAL_CONFIRMATION" ]]
+else
+  [[ "$confirmation" == "$CONFIRMATION" ]]
+fi
 [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || {
   echo "Target SHA must be a lowercase 40-character commit SHA." >&2
   exit 1
