@@ -237,11 +237,12 @@ class RequestPerformanceMiddleware:
         log_method(
             "request_perf request_id=%s method=%s path=%s route=%s status=%s "
             "total_ms=%.2f sql_ms=%.2f sql_count=%s max_sql_ms=%.2f "
-            "compute_ms=%.2f compute_blocks=%s response_bytes=%s qa_phase=%s "
-            "pool_wait_ms=%.2f ready_vote_auth_ms=%.2f ready_vote_db_checkout_ms=%.2f "
+            "compute_ms=%.2f compute_blocks=%s "
+            "ready_vote_auth_ms=%.2f ready_vote_db_checkout_ms=%.2f "
             "ready_vote_preflight_ms=%.2f ready_vote_upsert_ms=%.2f "
             "ready_vote_counter_ms=%.2f ready_vote_commit_ms=%.2f "
-            "ready_vote_response_ms=%.2f cf_ray=%s client=%s",
+            "ready_vote_response_ms=%.2f response_bytes=%s qa_phase=%s "
+            "pool_wait_ms=%.2f cf_ray=%s client=%s",
             metrics.request_id,
             metrics.method,
             metrics.path,
@@ -253,9 +254,6 @@ class RequestPerformanceMiddleware:
             metrics.max_sql_time_seconds * 1000,
             metrics.compute_time_seconds * 1000,
             metrics.compute_blocks,
-            metrics.response_bytes,
-            metrics.qa_phase or "-",
-            metrics.pool_checkout_wait_seconds * 1000,
             metrics.ready_vote_spans.get("ready_vote_auth_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_db_checkout_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_preflight_ms", 0.0) * 1000,
@@ -263,6 +261,9 @@ class RequestPerformanceMiddleware:
             metrics.ready_vote_spans.get("ready_vote_counter_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_commit_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_response_ms", 0.0) * 1000,
+            metrics.response_bytes,
+            metrics.qa_phase or "-",
+            metrics.pool_checkout_wait_seconds * 1000,
             metrics.cf_ray or "-",
             metrics.client_fingerprint or "-",
         )

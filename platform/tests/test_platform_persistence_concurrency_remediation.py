@@ -14,6 +14,7 @@ from apps.platform_api.app.api.routes import profiles, tournaments
 from apps.platform_api.app.services import deadlock_automation, player_commitments
 from apps.platform_api.app.services.tournament_workflow import (
     ReadyVoteTournamentSnapshot,
+    ready_vote_preflight_snapshot,
     upsert_deadlock_ready_vote,
 )
 from apps.platform_api.app.services.mutation_idempotency import (
@@ -120,6 +121,35 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hasattr(snapshot, "__dict__"))
         with self.assertRaises(FrozenInstanceError):
             snapshot.status = "completed"
+
+    async def test_ready_vote_preflight_uses_named_projection_flags(self) -> None:
+        row = SimpleNamespace(
+            id="tournament",
+            slug="demo",
+            format_slug="solo",
+            status="registration_closed",
+            registration_closes_at=None,
+            ready_check_starts_at=None,
+            ready_check_ends_at=None,
+            automation_ready_check_closed_at=None,
+            has_participant=True,
+            has_deadlock_profile=False,
+            has_locked_roster=False,
+            ready_round_id=None,
+        )
+        result = SimpleNamespace(first=Mock(return_value=row))
+        db_session = Mock()
+        db_session.execute = AsyncMock(return_value=result)
+
+        preflight = await ready_vote_preflight_snapshot(
+            db_session,
+            slug="demo",
+            user_id="user",
+        )
+
+        self.assertTrue(preflight.has_participant)
+        self.assertFalse(preflight.has_deadlock_profile)
+        self.assertFalse(preflight.has_locked_roster)
 
     async def test_ready_vote_upsert_uses_conditional_noop_conflict_update(self) -> None:
         db_session = Mock()

@@ -869,9 +869,9 @@ async def ready_vote_preflight_snapshot(
         )
     return ReadyVoteRoutePreflight(
         tournament=tournament,
-        has_participant=bool(row[1]),
-        has_deadlock_profile=bool(row[2]),
-        has_locked_roster=bool(row[3]),
+        has_participant=bool(row.has_participant),
+        has_deadlock_profile=bool(row.has_deadlock_profile),
+        has_locked_roster=bool(row.has_locked_roster),
         active_round=round_snapshot,
     )
 
