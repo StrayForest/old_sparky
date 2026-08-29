@@ -24,7 +24,7 @@ from urllib.request import Request, urlopen
 
 EXPECTED_ORIGIN = "https://old-sparky.com"
 MANIFEST_SCHEMA = 1
-MAX_USERS = 10_000
+MAX_USERS = 20_000
 MAX_TOURNAMENTS = 64
 MAX_CONCURRENCY = 512
 RESPONSE_BODY_LIMIT = 2 * 1024 * 1024
