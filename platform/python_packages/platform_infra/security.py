@@ -482,9 +482,12 @@ async def _touch_authenticated_session(
         auth_session.session.last_seen_at = auth_session.now
 
 
-async def get_authenticated_session(
+async def _get_authenticated_session(
     request: Request,
     db_session: AsyncSession = Depends(get_db_session),
+    *,
+    load_roles: bool,
+    touch_session: bool,
 ) -> AuthenticatedSession:
     settings = get_settings()
     token = request.cookies.get(settings.platform_session_cookie_name)
@@ -498,20 +501,34 @@ async def get_authenticated_session(
         user_predicates.append(
             (User.email.is_(None)) | (User.email_verified_at.is_not(None))
         )
-    rows = (
-        await db_session.execute(
-            select(UserSession, User, Role.slug)
-            .join(User, User.id == UserSession.user_id)
-            .outerjoin(UserRole, UserRole.user_id == User.id)
-            .outerjoin(Role, Role.id == UserRole.role_id)
-            .where(
-                UserSession.token_digest == token_digest,
-                UserSession.invalidated_at.is_(None),
-                UserSession.expires_at > now,
-                *user_predicates,
+    if load_roles:
+        rows = (
+            await db_session.execute(
+                select(UserSession, User, Role.slug)
+                .join(User, User.id == UserSession.user_id)
+                .outerjoin(UserRole, UserRole.user_id == User.id)
+                .outerjoin(Role, Role.id == UserRole.role_id)
+                .where(
+                    UserSession.token_digest == token_digest,
+                    UserSession.invalidated_at.is_(None),
+                    UserSession.expires_at > now,
+                    *user_predicates,
+                )
             )
-        )
-    ).all()
+        ).all()
+    else:
+        rows = (
+            await db_session.execute(
+                select(UserSession, User)
+                .join(User, User.id == UserSession.user_id)
+                .where(
+                    UserSession.token_digest == token_digest,
+                    UserSession.invalidated_at.is_(None),
+                    UserSession.expires_at > now,
+                    *user_predicates,
+                )
+            )
+        ).all()
     if not rows:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session is invalid.")
 
@@ -520,11 +537,54 @@ async def get_authenticated_session(
     if user is None or user.status != "active":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session owner is missing.")
 
-    roles = frozenset(str(role_slug) for _, _, role_slug in rows if role_slug)
+    roles = (
+        frozenset(str(role_slug) for _, _, role_slug in rows if role_slug)
+        if load_roles
+        else frozenset()
+    )
     auth_session = AuthenticatedSession(user=user, session=user_session, role_slugs=roles, now=now)
-    await _touch_authenticated_session(auth_session)
-    remember_authenticated_session(token_digest, auth_session)
+    if touch_session:
+        await _touch_authenticated_session(auth_session)
+    # The vote-only path deliberately does not load roles. Never let that
+    # reduced object replace a richer optional-auth cache entry, which could
+    # otherwise make an immediately-following optional request appear to have
+    # no administrative roles.
+    if load_roles:
+        remember_authenticated_session(token_digest, auth_session)
     return auth_session
+
+
+async def get_authenticated_session(
+    request: Request,
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AuthenticatedSession:
+    return await _get_authenticated_session(
+        request,
+        db_session,
+        load_roles=True,
+        touch_session=True,
+    )
+
+
+async def get_authenticated_session_for_ready_vote(
+    request: Request,
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AuthenticatedSession:
+    """Authenticate the hot Ready vote path without unrelated auth work.
+
+    A vote only needs the authenticated user id and the request timestamp. It
+    does not authorize by role, and refreshing session last-seen metadata here
+    would add a second database transaction to a burst that is already
+    bounded by the vote's own authorization and idempotency checks. Ordinary
+    authenticated requests retain the full role load and session touch.
+    """
+
+    return await _get_authenticated_session(
+        request,
+        db_session,
+        load_roles=False,
+        touch_session=False,
+    )
 
 
 async def _resolve_optional_authenticated_session(

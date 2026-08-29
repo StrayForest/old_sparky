@@ -361,6 +361,12 @@ duplicate/idempotency behavior. It exercises only vote POSTs; the timer phase
 is entirely local. Clean the exact load run with the same cleanup workflow
 before starting another production load.
 
+The vote endpoint uses a deliberately minimal authenticated-session lookup: it
+validates the session, user status and expiry but does not hydrate role data or
+touch `last_seen` inside the burst. Vote authorization still performs the full
+server-side time, participant, profile, round and workflow checks; ordinary
+authenticated requests retain role hydration and session last-seen updates.
+
 Retained users are provisioned with authenticated sessions rather than logging
 in inside the burst. The harness derives the same session-bound CSRF token that
 the login response issues, so `/auth/csrf` is not an artificial

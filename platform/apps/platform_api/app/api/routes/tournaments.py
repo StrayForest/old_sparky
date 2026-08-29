@@ -231,6 +231,7 @@ from python_packages.platform_infra.models import (
 )
 from python_packages.platform_infra.security import (
     get_authenticated_session,
+    get_authenticated_session_for_ready_vote,
     get_optional_authenticated_session,
 )
 from python_packages.platform_infra.tournament_names import (
@@ -4835,7 +4836,7 @@ async def start_deadlock_ready_check(
 async def vote_deadlock_ready_check(
     slug: str,
     payload: TournamentDeadlockReadyVoteRequest,
-    auth_session=Depends(get_authenticated_session),
+    auth_session=Depends(get_authenticated_session_for_ready_vote),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockReadyVoteResponse:
     current_user_id = auth_session.user.id
