@@ -881,7 +881,7 @@ class TournamentDeadlockReadyVoteCountShard(TimestampMixin, Base):
     __tablename__ = "tournament_deadlock_ready_vote_count_shards"
     __table_args__ = (
         CheckConstraint("choice IN ('yes', 'no')", name="choice_allowed"),
-        CheckConstraint("shard BETWEEN 0 AND 31", name="shard_in_range"),
+        CheckConstraint("shard BETWEEN 0 AND 127", name="shard_in_range"),
         CheckConstraint("vote_count >= 0", name="vote_count_nonnegative"),
     )
 

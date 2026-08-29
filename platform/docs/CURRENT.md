@@ -82,7 +82,7 @@ edge access log, and size-based rotation bounds text log files.
 - Every Deadlock ready-check start/close, captain, assignment generation, roster
   publish and roster-lock write path — API, automation and worker alike — locks
   its tournament row before checking lifecycle state. Ordinary ready votes are
-  the deliberate exception: they upsert the unique vote row and its 32-way counter
+  the deliberate exception: they upsert the unique vote row and its 128-way counter
   shard without taking the tournament-row lock; a deferred guard rejects
   post-close or ineligible votes while preserving a vote timestamped before the
   close commit. Redis may coalesce work but never replaces this durable boundary.

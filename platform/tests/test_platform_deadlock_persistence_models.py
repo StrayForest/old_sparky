@@ -135,6 +135,9 @@ class DeadlockPersistenceModelTests(unittest.TestCase):
         ready_vote_migration = (migration_root / "20260824_0043_ready_vote_open_round_guard.py").read_text(
             encoding="utf-8"
         )
+        ready_vote_shard_migration = (
+            migration_root / "20260829_0044_ready_vote_counter_shards.py"
+        ).read_text(encoding="utf-8")
         capacity_service = (
             Path(__file__).resolve().parents[1]
             / "apps"
@@ -152,6 +155,9 @@ class DeadlockPersistenceModelTests(unittest.TestCase):
         self.assertIn("NEW.responded_at > ready_round_closed_at", ready_vote_migration)
         self.assertIn("closed_at", ready_vote_migration)
         self.assertIn("trg_tournament_deadlock_ready_votes_open_round", ready_vote_migration)
+        self.assertIn("_set_shard_count(128)", ready_vote_shard_migration)
+        self.assertIn("LOCK TABLE {TABLE_NAME} IN ACCESS EXCLUSIVE MODE", ready_vote_shard_migration)
+        self.assertIn("shard BETWEEN 0 AND {upper_bound}", ready_vote_shard_migration)
 
 
 if __name__ == "__main__":

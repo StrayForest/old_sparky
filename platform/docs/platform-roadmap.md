@@ -14,7 +14,7 @@ For the production baseline and immediate engineering target, read [`CURRENT.md`
 votes, conditional ETag reads, bounded pools and priority queues are
 implemented in the reviewed branch. The package covers join capacity slots,
 compact conditional workflow reads, bounded API/worker pools, Celery
-priority/backpressure and retained load evidence. Existing 32-shard ready
+priority/backpressure and retained load evidence. Existing 128-shard ready
 votes and PostgreSQL workflow authority remain in force. Ready Check uses the
 server-known timing contract, and passive grid changes are visible after
 manual reload.
