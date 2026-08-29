@@ -11,7 +11,6 @@ from python_packages.platform_infra.models import (
     Tournament,
     TournamentInvite,
     TournamentParticipant,
-    User,
 )
 from apps.platform_api.app.services.tournament_participant_capacity import (
     has_free_participant_slot,

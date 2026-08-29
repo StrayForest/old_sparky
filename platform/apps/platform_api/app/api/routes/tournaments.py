@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
-from sqlalchemy import Select, and_, cast, delete, exists, func, or_, select, union
+from sqlalchemy import Select, and_, cast, delete, func, or_, select, union
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1029,8 +1029,8 @@ async def get_invite_or_404(
     tournament_id: str,
     invite_id: str,
 ) -> TournamentInvite:
-    invite_id = await db_session.scalar(
-        select(TournamentInvite.id).where(
+    invite = await db_session.scalar(
+        select(TournamentInvite).where(
             TournamentInvite.id == invite_id,
             TournamentInvite.tournament_id == tournament_id,
         )

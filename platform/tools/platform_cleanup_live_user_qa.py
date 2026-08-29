@@ -351,9 +351,6 @@ async def _validate_tournament_graph_boundary(
 ) -> None:
     if not tournament_ids:
         return
-    invite_ids = select(TournamentInvite.id).where(
-        TournamentInvite.tournament_id.in_(tournament_ids)
-    )
     match_ids = select(TournamentMatch.id).where(
         TournamentMatch.tournament_id.in_(tournament_ids)
     )
