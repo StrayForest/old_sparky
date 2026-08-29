@@ -68,11 +68,12 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertIn("PLATFORM_OPENAI_MODEL=existing-model", content)
 
     def test_load_baseline_matches_measured_10k_profile(self) -> None:
-        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_DB_POOL_SIZE"], "32")
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_DB_POOL_SIZE"], "24")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_DB_MAX_OVERFLOW"], "0")
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_DB_POOL_TIMEOUT_SECONDS"], "10")
         self.assertEqual(
             configure.PUBLIC_BASELINE["PLATFORM_DB_CONNECTION_BUDGET"],
-            "68",
+            "52",
         )
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_GUNICORN_ACCESS_LOG"], "false")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_WORKER_LOG_LEVEL"], "WARNING")

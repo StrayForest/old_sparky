@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+import logging
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from apps.platform_api.app.api.router import api_router
 from apps.platform_api.app.lifespan import platform_lifespan
@@ -9,6 +13,29 @@ from python_packages.platform_infra.config import get_settings, validate_platfor
 from python_packages.platform_infra.csrf import CsrfProtectionMiddleware
 from python_packages.platform_infra.performance import RequestPerformanceMiddleware
 from python_packages.platform_infra.security import validate_auth_security_settings
+
+
+logger = logging.getLogger(__name__)
+
+
+async def handle_database_pool_timeout(
+    request: Request,
+    _exc: SQLAlchemyTimeoutError,
+) -> JSONResponse:
+    """Return a bounded transient response when the DB pool is exhausted."""
+
+    logger.warning(
+        "database_pool_timeout method=%s path=%s retry_after_seconds=1",
+        request.method,
+        request.url.path,
+    )
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "1"},
+        content={
+            "detail": "The platform is temporarily busy. Retry the request shortly."
+        },
+    )
 
 
 def create_app() -> FastAPI:
@@ -24,6 +51,7 @@ def create_app() -> FastAPI:
         redoc_url=None if is_production else "/redoc",
         openapi_url=None if is_production else "/openapi.json",
     )
+    app.add_exception_handler(SQLAlchemyTimeoutError, handle_database_pool_timeout)
     app.add_middleware(RequestPerformanceMiddleware)
     app.add_middleware(CsrfProtectionMiddleware, settings_factory=get_settings)
     if not is_production:

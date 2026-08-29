@@ -7,6 +7,7 @@ import os
 from time import perf_counter
 
 from sqlalchemy import MetaData, event, text
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -140,6 +141,13 @@ async def dispose_engine() -> None:
 async def get_db_session() -> AsyncIterator[AsyncSession]:
     async with session_factory()() as db_session:
         checkout_started = perf_counter()
-        await db_session.connection()
+        try:
+            await db_session.connection()
+        except SQLAlchemyTimeoutError:
+            # Keep the performance record useful even when checkout itself
+            # fails: the API exception handler turns this into a controlled
+            # retryable response, while the middleware records the wait.
+            record_pool_checkout_wait(perf_counter() - checkout_started)
+            raise
         record_pool_checkout_wait(perf_counter() - checkout_started)
         yield db_session

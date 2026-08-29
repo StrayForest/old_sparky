@@ -200,24 +200,24 @@ class PlatformSettings(BaseSettings):
     # Keep PostgreSQL connection count bounded per process. API and Celery
     # processes use separate budgets so background bursts cannot consume the
     # entire database capacity reserved for user requests.
-    # Two API workers at 32 connections each plus the bounded worker pool fit
-    # the default connection budget of 68.  Keep overflow disabled: a fixed
+    # Two API workers at 24 connections each plus the bounded worker pool fit
+    # the default connection budget of 52.  Keep overflow disabled: a fixed
     # pool makes burst pressure observable without creating unbounded database
-    # fan-out on the two-core production host.  The staged increase from 20 to
-    # 24 connections reduced neither the checkout timeout nor the queue enough
-    # for the measured zero-spread safety profile; PostgreSQL and Redis still
-    # had headroom, so this remains a bounded burst cushion rather than
-    # unbounded overflow.
-    platform_db_pool_size: int = Field(default=32, gt=0)
+    # fan-out on the two-core production host.  A staged 32-connection profile
+    # increased database contention, while 24 kept PostgreSQL and Redis below
+    # their measured pressure points.  The API checkout wait is deliberately
+    # bounded separately so overload becomes a retryable response instead of
+    # an unhandled server error.
+    platform_db_pool_size: int = Field(default=24, gt=0)
     platform_db_max_overflow: int = Field(default=0, ge=0)
-    platform_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
+    platform_db_pool_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     platform_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
     platform_worker_db_pool_size: int = Field(default=2, gt=0)
     platform_worker_db_max_overflow: int = Field(default=0, ge=0)
     platform_worker_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)
     platform_worker_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
     platform_worker_concurrency: int = Field(default=2, gt=0)
-    platform_db_connection_budget: int = Field(default=68, gt=0)
+    platform_db_connection_budget: int = Field(default=52, gt=0)
 
 
 @lru_cache(maxsize=1)
