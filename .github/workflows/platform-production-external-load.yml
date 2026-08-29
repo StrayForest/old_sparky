@@ -122,12 +122,12 @@ jobs:
           ) = sys.argv[1:]
           if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email):
               raise SystemExit("control_email is invalid")
-          if not re.fullmatch(r"[1-9][0-9]?", tournament_count) or not 1 <= int(tournament_count) <= 20:
-              raise SystemExit("tournament_count must be between 1 and 20")
+          if not re.fullmatch(r"[1-9][0-9]?", tournament_count) or not 1 <= int(tournament_count) <= 40:
+              raise SystemExit("tournament_count must be between 1 and 40")
           if not re.fullmatch(r"[1-9][0-9]{1,2}", users_per) or not 14 <= int(users_per) <= 500:
               raise SystemExit("users_per_tournament must be between 14 and 500")
-          if int(tournament_count) * int(users_per) > 10_000:
-              raise SystemExit("external fixture exceeds 10000 users")
+          if int(tournament_count) * int(users_per) > 20_000:
+              raise SystemExit("external fixture exceeds 20000 users")
           if not re.fullmatch(r"[1-9][0-9]{0,2}", setup_concurrency) or not 1 <= int(setup_concurrency) <= 256:
               raise SystemExit("setup_concurrency must be between 1 and 256")
           if not re.fullmatch(r"[1-9][0-9]{0,2}", load_concurrency) or not 1 <= int(load_concurrency) <= 512:
