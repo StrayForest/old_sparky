@@ -2957,7 +2957,7 @@ test("Steam-only account is immediately usable and attaches optional email only 
 
   await page.goto("/profile/me?tab=account");
   await expect(page.getByRole("link", { name: "Профиль: SteamPlayer" })).toBeVisible();
-  await expect(page.locator("#profile-panel-account").getByText("76561198999999999", { exact: true })).toBeVisible();
+  await expect(page.locator("#profile-panel-account .account-settings-grid").getByText("76561198999999999", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Привязать Steam" })).toHaveCount(0);
   await expect(page.getByText(/Почта не обязательна для профиля и участия в турнирах/u)).toBeVisible();
 
@@ -4078,7 +4078,7 @@ test("account email changes only after inline code confirmation", async ({ page 
   await page.getByRole("button", { name: "Подтвердить", exact: true }).click();
 
   await expect(
-    page.locator("#profile-panel-account").getByText("pending-new@example.test", { exact: true })
+    page.locator("#profile-panel-account .account-settings-grid").getByText("pending-new@example.test", { exact: true })
   ).toBeVisible();
 
   expect(emailChangePayloads).toEqual([

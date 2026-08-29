@@ -10,7 +10,6 @@ import {
   LogOut,
   Mail,
   MapPin,
-  NotebookPen,
   Save,
   UserRound,
 } from "lucide-react";
@@ -28,7 +27,6 @@ import {
   contactsEqual,
   hasPreparedOrLegacyMedia,
   ProfileActionButtons,
-  ProfileBanner,
   ValidationMessage,
   type SaveState,
 } from "@/components/profile/editor/profile-editor-shared";
@@ -436,11 +434,6 @@ export function AccountProfileTab({
 
   return (
     <section aria-busy={saveState === "saving" || emailBusy}>
-      <ProfileBanner
-        icon={<NotebookPen size={38} />}
-        title="Данные профиля"
-        text="Управляйте отображением профиля, контактами и безопасностью аккаунта."
-      />
       <div className="account-settings-grid">
         <div className="panel account-settings-card">
           <div className="account-avatar-editor">

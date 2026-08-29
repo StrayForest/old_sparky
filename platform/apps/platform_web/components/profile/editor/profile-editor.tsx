@@ -1,11 +1,10 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { UserRound } from "lucide-react";
+import { NotebookPen, UserRound } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { PreparedMedia } from "@/components/media/prepared-media";
 import { ProfileAccessState } from "@/components/profile/profile-access-state";
-import { PublicProfileView } from "@/components/profile/public-profile-view";
 import { AccountProfileTab } from "@/components/profile/editor/account-profile-tab";
 import { CaptainProfileTab } from "@/components/profile/editor/captain-profile-tab";
 import {
@@ -13,7 +12,9 @@ import {
   cloneContacts,
   cloneDreamSlot,
   hasPreparedOrLegacyMedia,
+  ProfileBanner,
 } from "@/components/profile/editor/profile-editor-shared";
+import { PublicProfileView } from "@/components/profile/public-profile-view";
 import { TournamentProfileTab } from "@/components/profile/editor/tournament-profile-tab";
 import {
   parseProfileTab,
@@ -127,7 +128,7 @@ export function ProfileEditor({
 
   return (
     <>
-      {activeTab === "account" ? <PublicProfileView profile={summaryProfile} /> : <section className="panel profile-summary">
+      <section className="panel profile-summary">
         <PreparedMedia
           alt=""
           className="profile-summary-banner"
@@ -183,7 +184,7 @@ export function ProfileEditor({
             />
           </div>
         </div>
-      </section>}
+      </section>
 
       <div className="tabs">
         {profileTabs.map(([id, label]) => (
@@ -228,6 +229,12 @@ export function ProfileEditor({
         hidden={activeTab !== "account"}
         id="profile-panel-account"
       >
+        <ProfileBanner
+          icon={<NotebookPen size={38} />}
+          title="Данные профиля"
+          text="Управляйте отображением профиля, контактами и безопасностью аккаунта."
+        />
+        <PublicProfileView profile={summaryProfile} />
         <AccountProfileTab
           initialProfile={profile}
           onPreview={previewAccount}
