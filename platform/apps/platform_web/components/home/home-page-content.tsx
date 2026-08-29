@@ -177,9 +177,8 @@ export function HomePageContent({ initialContent = null }: { initialContent?: Pl
                 <span aria-hidden="true" className="patch-featured-art">
                   <CspImage
                     alt=""
-                    fetchPriority="high"
                     fill
-                    loading="eager"
+                    loading="lazy"
                     sizes={patchArtwork[0].sizes}
                     src={patchArtwork[0].src}
                     srcSet={patchArtwork[0].srcSet}

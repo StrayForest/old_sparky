@@ -1368,8 +1368,7 @@ test("home uses a balanced hero, numbered workflow, and featured patch hierarchy
   await expect(videos).toHaveCount(4);
   const featuredImage = featuredPatch.locator("img");
   await expect(featuredImage).toHaveAttribute("src", "/assets/preview/patch-featured.webp");
-  await expect(featuredImage).toHaveAttribute("loading", "eager");
-  await expect(featuredImage).toHaveAttribute("fetchpriority", "high");
+  await expect(featuredImage).toHaveAttribute("loading", "lazy");
   await expect(featuredImage).toHaveAttribute("srcset", /patch-featured-768\.webp 768w/u);
   await expect(compactPatches.first().locator("img")).toHaveAttribute("loading", "lazy");
   await expect(compactPatches.first().locator("img")).toHaveAttribute("srcset", /patch-archive-city-320\.webp 320w/u);
