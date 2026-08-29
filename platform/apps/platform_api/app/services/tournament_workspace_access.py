@@ -12,7 +12,9 @@ from python_packages.platform_infra.models import (
     TournamentInvite,
     TournamentParticipant,
 )
-from python_packages.platform_infra.security import get_optional_authenticated_session
+from python_packages.platform_infra.security import (
+    get_optional_authenticated_session_for_tournament_policy,
+)
 
 ACTIVE_PARTICIPANT_STATUSES = frozenset({"registered", "confirmed", "checked_in"})
 
@@ -54,7 +56,7 @@ def auth_session_has_admin_role(auth_session) -> bool:
 
 async def ensure_private_tournament_read_membership_is_active(
     request: Request,
-    auth_session=Depends(get_optional_authenticated_session),
+    auth_session=Depends(get_optional_authenticated_session_for_tournament_policy),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> None:
     """Prevent retained participant rows from acting as private-read membership.

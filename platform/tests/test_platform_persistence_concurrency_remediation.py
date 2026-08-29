@@ -72,6 +72,18 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
             touch_session=False,
         )
 
+    async def test_tournament_policy_auth_skips_ready_vote_route(self) -> None:
+        request = Mock()
+        request.method = "POST"
+        request.scope = {"route": SimpleNamespace(path="/{slug}/deadlock/ready-check/vote")}
+
+        result = await security.get_optional_authenticated_session_for_tournament_policy(
+            request,
+            Mock(),
+        )
+
+        self.assertIsNone(result)
+
     async def test_auth_touch_uses_isolated_session_transaction(self) -> None:
         touch_session = Mock()
         touch_session.execute = AsyncMock(return_value=SimpleNamespace(rowcount=1))

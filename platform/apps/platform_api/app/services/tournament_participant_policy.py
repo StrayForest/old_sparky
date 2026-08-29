@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.models import TournamentInvite, TournamentParticipant
 from python_packages.platform_infra.security import (
-    get_optional_authenticated_session,
+    get_optional_authenticated_session_for_tournament_policy,
 )
 
 
@@ -64,7 +64,7 @@ async def _reject_disqualified_invite_claim(
 
 async def enforce_tournament_participant_policy(
     request: Request,
-    auth_session=Depends(get_optional_authenticated_session),
+    auth_session=Depends(get_optional_authenticated_session_for_tournament_policy),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> None:
     """Reject invite redemption for retained tournament disqualifications."""

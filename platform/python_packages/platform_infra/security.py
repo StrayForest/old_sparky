@@ -675,3 +675,29 @@ async def get_optional_authenticated_session(
         db_session,
         touch_session=False,
     )
+
+
+def _is_ready_vote_route(request: Request) -> bool:
+    route = request.scope.get("route")
+    route_path = str(getattr(route, "path", "") or "")
+    return (
+        request.method.upper() == "POST"
+        and route_path.endswith("/deadlock/ready-check/vote")
+    )
+
+
+async def get_optional_authenticated_session_for_tournament_policy(
+    request: Request,
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AuthenticatedSession | None:
+    """Avoid duplicate optional-auth SQL on the already-authenticated vote path.
+
+    The tournament router policies all return immediately for the Ready vote
+    route. Do not resolve their unrelated optional-auth dependency there; the
+    endpoint's vote-specific dependency remains the sole authoritative session
+    lookup.
+    """
+
+    if _is_ready_vote_route(request):
+        return None
+    return await get_optional_authenticated_session(request, db_session)
