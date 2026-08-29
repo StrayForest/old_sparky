@@ -294,7 +294,13 @@ def _request(
 def _route_for_read(index: int, slug: str) -> str:
     bucket = index % 10
     if bucket < 5:
-        return f"/tournaments/{slug}/workspace?workspace_view=bracket_summary"
+        # Match the current tournament page request exactly: the page loads
+        # the detail shell and the schedule, while participant pagination is
+        # requested separately only by views that actually render it.
+        return (
+            f"/tournaments/{slug}/workspace?participants_limit=0"
+            "&participants_offset=0&workspace_view=detail&include_current_user=false"
+        )
     if bucket < 8:
         return f"/tournaments/{slug}"
     if bucket == 8:

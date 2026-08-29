@@ -8,6 +8,7 @@ import unittest
 from tools.platform_external_load import (
     ExternalLoadError,
     RequestResult,
+    _route_for_read,
     load_manifest,
     spread_offsets,
     summarize_results,
@@ -43,6 +44,15 @@ def manifest_payload() -> dict[str, object]:
 
 
 class ExternalLoadTests(unittest.TestCase):
+    def test_read_mix_uses_the_current_tournament_page_request(self) -> None:
+        route = _route_for_read(0, "qa-tournament")
+
+        self.assertEqual(
+            route,
+            "/tournaments/qa-tournament/workspace?participants_limit=0"
+            "&participants_offset=0&workspace_view=detail&include_current_user=false",
+        )
+
     def test_spread_offsets_are_bounded_and_deterministic(self) -> None:
         self.assertEqual(spread_offsets(5, 10), [0.0, 2.0, 4.0, 6.0, 8.0])
         self.assertEqual(spread_offsets(2, 0), [0.0, 0.0])
