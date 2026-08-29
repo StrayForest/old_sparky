@@ -70,7 +70,7 @@ def tournament_result() -> Mock:
     )
     result = Mock()
     result.all.return_value = [
-        (tournament, "Organizer", "/uploads/organizer.webp", None, 7, 0)
+        (tournament, "Organizer", None, 7, 0)
     ]
     return result
 
