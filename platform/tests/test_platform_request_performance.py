@@ -74,6 +74,23 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         log_info.assert_not_called()
         log_warning.assert_called_once()
 
+    def test_ready_vote_pool_wait_does_not_log_every_successful_vote(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        metrics = self.metrics(method="POST")
+        metrics.path = "/api/v1/tournaments/demo/deadlock/ready-check/vote"
+        metrics.pool_checkout_wait_seconds = 0.2
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings(log_mutations=False)),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            middleware._log_if_slow(
+                {"route": SimpleNamespace(path="/{slug}/deadlock/ready-check/vote")},
+                metrics,
+                200,
+            )
+
+        log_info.assert_not_called()
+
     def test_qa_phase_header_is_bounded_and_namespaced(self) -> None:
         self.assertEqual(
             performance.qa_phase_from_scope(

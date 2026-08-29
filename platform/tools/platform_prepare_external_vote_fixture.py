@@ -134,6 +134,7 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
         )
         tournament_entries: list[dict[str, Any]] = []
         manifest_users: list[dict[str, str]] = []
+        prepared_tournaments: list[dict[str, Any]] = []
         for index, chunk in enumerate(chunks, start=1):
             with qa.phase("external_vote_fixture_setup"):
                 tournament = await qa.prepare_ready_burst_tournament(
@@ -142,7 +143,9 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
                     participants=chunk,
                     label="external_ready",
                     index=index,
+                    start_ready_check=False,
                 )
+            prepared_tournaments.append(tournament)
             slug = str(tournament["slug"])
             tournament_entries.append(
                 {
@@ -160,6 +163,21 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
                         "session_token": qa.session_tokens_by_user_id[user_id],
                         "csrf_token": qa.csrf_tokens_by_user_id[user_id],
                     }
+                )
+
+        # Start every Ready Check only after the complete fixture exists. A
+        # sequential setup of a 20k cohort can otherwise age the first
+        # tournament past its ten-minute manual window before measurement
+        # begins, making the duplicate phase test the timer instead of
+        # idempotency.
+        for tournament in prepared_tournaments:
+            with qa.phase("external_vote_fixture_start"):
+                await qa.request_as(
+                    api_client,
+                    tournament["organizer"],
+                    "POST",
+                    f"/tournaments/{tournament['slug']}/deadlock/ready-check/start",
+                    expected=201,
                 )
 
         qa.report["tournament_ids"] = list(qa.tournament_ids)

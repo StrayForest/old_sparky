@@ -219,6 +219,10 @@ class RequestPerformanceMiddleware:
         sql_ms = metrics.sql_time_seconds * 1000
         route = scope.get("route")
         route_path = getattr(route, "path", None) or metrics.path
+        is_ready_vote_route = (
+            metrics.method.upper() == "POST"
+            and str(route_path).endswith("/deadlock/ready-check/vote")
+        )
         should_log = (
             status_code >= 500
             or (
@@ -228,7 +232,13 @@ class RequestPerformanceMiddleware:
             or total_ms >= settings.platform_perf_slow_request_ms
             or sql_ms >= settings.platform_perf_slow_db_ms
             or metrics.sql_query_count >= settings.platform_perf_sql_count_threshold
-            or metrics.pool_checkout_wait_seconds >= 0.1
+            # Ready Vote is instrumented on every request, but a successful
+            # burst must not turn the pool/scheduling span into one INFO log
+            # per vote. Slow requests and failures still remain observable.
+            or (
+                not is_ready_vote_route
+                and metrics.pool_checkout_wait_seconds >= 0.1
+            )
         )
         if not should_log:
             return

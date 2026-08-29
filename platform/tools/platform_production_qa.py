@@ -3368,6 +3368,7 @@ class ProductionQa:
         participants: list[dict[str, Any]],
         label: str,
         index: int,
+        start_ready_check: bool = True,
     ) -> dict[str, Any]:
         tournament = await self.create_write_burst_tournament(
             api_client,
@@ -3389,13 +3390,14 @@ class ProductionQa:
             expected=200,
             json_payload={"status": "registration_closed"},
         )
-        await self.request_as(
-            api_client,
-            organizer,
-            "POST",
-            f"/tournaments/{slug}/deadlock/ready-check/start",
-            expected=201,
-        )
+        if start_ready_check:
+            await self.request_as(
+                api_client,
+                organizer,
+                "POST",
+                f"/tournaments/{slug}/deadlock/ready-check/start",
+                expected=201,
+            )
         return tournament
 
     async def run_single_ready_bursts(

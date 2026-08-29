@@ -276,6 +276,11 @@ cache invalidation. These fields are aggregated by route and QA phase by the
 production QA parser; successful requests remain below the normal per-request
 INFO logging path unless the existing mutation/slow-request gate selects them.
 
+The external Ready Vote fixture creates and joins every tournament before it
+starts any Ready Check. This keeps the first tournament's ten-minute manual
+window from expiring during sequential 20k setup, so the duplicate phase
+measures idempotency rather than an already-closed round.
+
 Retained users are provisioned with authenticated sessions rather than logging
 in inside the burst. The harness derives the same session-bound CSRF token that
 the login response issues, so `/auth/csrf` is not an artificial
