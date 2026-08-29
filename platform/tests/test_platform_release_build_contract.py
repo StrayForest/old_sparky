@@ -163,27 +163,6 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 workflow = (REPO_ROOT / ".github/workflows" / workflow_name).read_text()
                 self.assertIn("workflow_dispatch:", workflow)
 
-    def test_retained_load_matrix_is_manual_and_preproduction_only(self) -> None:
-        workflow = (
-            REPO_ROOT / ".github/workflows/platform-retained-load-matrix.yml"
-        ).read_text()
-        supervisor = (
-            REPO_ROOT / "platform/tools/platform_retained_load_matrix_qa.sh"
-        ).read_text()
-
-        self.assertIn("workflow_dispatch:", workflow)
-        self.assertNotIn("schedule:", workflow)
-        self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', workflow)
-        self.assertIn("RUN-RETAINED-LOAD-MATRIX", workflow)
-        self.assertIn("actions/upload-artifact@v6", workflow)
-        self.assertIn("GITHUB_STEP_SUMMARY", workflow)
-        self.assertIn("http://127.0.0.1", supervisor)
-        self.assertIn('[[ "$EUID" -ne 0 ]]', supervisor)
-        self.assertIn('flock -n 9', supervisor)
-        self.assertIn('test "$release_sha" = "$target_sha"', supervisor)
-        self.assertIn("canonical production origin", supervisor)
-        self.assertIn("RETAINED_LOAD_MATRIX_EXPORT=", supervisor)
-
     def test_external_public_load_keeps_measurement_outside_origin(self) -> None:
         retired_production_workflow = (
             REPO_ROOT
@@ -217,7 +196,6 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"', supervisor)
         self.assertIn("External-load fixture requires the dedicated external-load confirmation.", supervisor)
         self.assertIn("supports only the external-vote profile.", supervisor)
-        self.assertNotIn("platform_seed_retained_tournament_matrix.py", supervisor)
         self.assertNotIn('--mode read-mix', supervisor)
         self.assertNotIn('--mode write-burst', supervisor)
         self.assertIn("observer_deadline=$(( $(date +%s) + 10800 ))", supervisor)

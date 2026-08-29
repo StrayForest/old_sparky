@@ -30,12 +30,11 @@ class MediaRuntimeCleanupTests(unittest.TestCase):
         )
         self.assertEqual(legacy_paths, [])
 
-    def test_legacy_url_is_never_returned_without_ready_media(self) -> None:
+    def test_no_ready_media_returns_no_url(self) -> None:
         self.assertIsNone(
             compatibility_media_url(
                 None,
                 preferred_variant="avatar-256",
-                legacy_url="/api/v1/uploads/avatars/legacy.webp",
             )
         )
 
@@ -59,7 +58,6 @@ class MediaRuntimeCleanupTests(unittest.TestCase):
             compatibility_media_url(
                 descriptor,
                 preferred_variant="avatar-256",
-                legacy_url="/api/v1/uploads/avatars/legacy.webp",
             ),
             "https://cdn.old-sparky.com/media/avatar.webp",
         )

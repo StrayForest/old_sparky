@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-08-28
+- Last reviewed: 2026-08-29
 
 ## Runtime checks
 
@@ -148,10 +148,12 @@ tools/platform_run_quiet.sh "R2 connectivity" -- \
 ```
 
 Use `--apply --json` only in a planned mutation window. CDN diagnosis uses
-`tools/platform_check_cdn.py <prepared-url> --json`. Legacy-media migration is
-dry-run by default; apply bounded batches only after a fresh verified backup,
-then verify by DB row and targeted HeadObject/CDN requests. Deletion requires a
-grace period and explicit approval.
+`tools/platform_check_cdn.py <prepared-url> --json`. Legacy-media migration and
+reconciliation tooling is dry-run by default; apply bounded batches only after
+a fresh verified backup, then verify by DB row and targeted HeadObject/CDN
+requests. The historical URL fields are not runtime fallbacks; any physical
+deletion requires a completed data/consumer inventory, a reviewed migration,
+and explicit approval.
 
 ## Request-driven tournament updates
 
@@ -194,8 +196,9 @@ The production load profiles are separated by failure mode:
   conditional manual reload. It creates no background traffic.
 - `write-burst` provisions eligible participants and measures human-shaped and
   aggressive Ready vote POSTs, including idempotency and concurrency behavior.
-- `matrix` remains the retained workflow/data-volume profile and is not a
-  simultaneous page-read benchmark.
+- `platform-production-external-load.yml` is the only retained-load measurement
+  workflow; its `ready-vote` and `read-mix` profiles are run separately and are
+  not a simultaneous page-read benchmark.
 
 Use a small smoke run first, then an average/human-shaped run, stress or
 breakpoint runs only in an approved low-traffic window, and a separate soak
@@ -207,83 +210,6 @@ Do not increase Gunicorn/Celery workers, add PgBouncer, install exporters or
 introduce a cache/schema rewrite without retained evidence. If both VPS cores
 remain saturated after unnecessary work is removed, classify a capacity limit
 instead of hiding it with more local workers.
-
-### Manual retained user/tournament load matrix
-
-The operator-owned pre-production matrix is a manual load-test gate. It is not
-the browser smoke suite and must not target the public production origin. The
-default plan runs 20 sequential retained scale runs with approximately 500
-generated users per tournament (10,000 generated users total; the exact
-assignment-control run uses 448 synthetic players plus the control account),
-19 public and 1 invite-only tournament, five tournaments each at 8, 16, 32
-and 64 teams, and 600 teams overall. Every generated account exercises
-ordinary profile writes, Deadlock profile writes,
-captain-profile/dream-slot writes, a changed-and-saved revision of each, and a
-persisted workspace read. Tournament participants then use the real API for
-public registration or invite claim plus registration, ready-check votes,
-captain selection, asynchronous assignment, roster lock and opening-bracket
-creation.
-
-The 10,000 synthetic accounts are provisioned in the pre-production database
-so email delivery, verification and anti-bot controls do not become the test
-subject. Profile saves and all tournament actions are real API requests. The
-matrix itself is started manually by an operator and is a load test, not a
-browser smoke run.
-
-The retained matrix is a 10,000-account data-volume test with bounded mutation
-concurrency. The separate `write-burst` profile measures real Ready Check vote
-POST contention after the server-known window; it creates no background request
-load while users wait. The `matrix` profile exercises the ordinary tournament workflow and
-manual/request-driven reads.
-
-The control account is passed at runtime and is never modified. The matrix
-places it in registered-only, ready-check and exactly one assignment-control
-run so the operator can inspect the retained tournaments manually. The
-assignment-control run validates the full assignment workflow; the allocator
-may legitimately leave the specific control account outside the selected
-team slots when candidates exceed capacity:
-
-```bash
-cd /root/old_sparky/platform
-.venv_platform/bin/python tools/platform_seed_retained_tournament_matrix.py \
-  --origin http://127.0.0.1 \
-  --control-email <existing-account-email>
-```
-
-The same gate can be launched from GitHub Actions so that the result is
-visible in the workflow summary and downloadable as a short-lived artifact:
-
-```bash
-gh workflow run platform-retained-load-matrix.yml \
-  --repo StrayForest/old_sparky \
-  --ref dev \
-  -f confirmation=RUN-RETAINED-LOAD-MATRIX \
-  -f control_email=<existing-preprod-account-email> \
-  -f concurrency=16
-gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
-```
-
-This route still executes the load on the dedicated pre-production host, not
-on the GitHub-hosted runner. The `preproduction` GitHub environment must have
-the four `PREPROD_SSH_*` secrets described in the test-suite governance. The
-workflow is intentionally manual because the matrix retains a large amount of
-fixture data.
-
-The command retains its marked users and tournaments for inspection and writes
-one report per tournament plus `matrix-summary.json` under
-`/opt/oldsparky/platform/shared/preprod-retained-matrix/<batch-id>/`. Performance
-collection is enabled by default and records client phase latency, route-level
-request/SQL data, CPU/RAM/load, PostgreSQL connections/waits, worker lifecycle
-and a compact per-run and matrix-level bottleneck summary. Use `--skip-performance` or
-`--skip-profile-journey` only for a deliberately reduced diagnostic run.
-
-For a GitHub-dispatched run, the same files are nested under
-`/opt/oldsparky/platform/shared/preprod-retained-matrix/gha-<run-id>/<batch-id>/`.
-
-The matrix is destructive to pre-production data volume and must be followed
-by the marked pre-production cleanup procedure after manual inspection. Never
-put a real account password, session token or live production origin in the
-command or a report.
 
 ### Live production external load
 
@@ -357,8 +283,9 @@ The browser timer itself must produce zero Ready Check requests before
 The separate `read-mix` profile is the read-side capacity test; it reports the
 304 ratio and manual-refresh latency for both the tournament page and bracket
 page without adding a background refresh loop. Its bracket fixture is
-intentionally empty; large workflow/data-volume checks belong to the dedicated
-pre-production matrix.
+intentionally empty; workflow/data-volume evidence must be collected through
+the same external production-load workflow and its exact retained-fixture
+cleanup path.
 
 The measured pool baseline is a reviewed runtime configuration, not a load-test
 CLI override. The current two-worker VPS baseline uses API pool size `24`,

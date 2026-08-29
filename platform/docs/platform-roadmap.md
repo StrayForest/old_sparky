@@ -2,7 +2,7 @@
 
 - Status: Active backlog and priority map
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-24
+- Last reviewed: 2026-08-29
 
 For the production baseline and immediate engineering target, read [`CURRENT.md`](CURRENT.md). This file deliberately omits release diaries and detailed audit evidence.
 
@@ -54,7 +54,7 @@ AS-03 tournament invite/capacity concurrency is resolved and archived with imple
 AS-05 public/private data-boundary work is resolved and archived with audit, public-contract tests and production-deployment evidence in [`archive/as-05-public-private-data-boundary.md`](archive/as-05-public-private-data-boundary.md).
 
 
-AS-07 R2/CDN runtime media cleanup is resolved and archived with migration inventory/reconciliation evidence, regression coverage, CI verification and production deployment in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Physical removal of runtime-inert legacy URL columns and migration-only helpers remains a separate post-grace cleanup.
+AS-07 R2/CDN runtime media cleanup is resolved and archived with migration inventory/reconciliation evidence, regression coverage, CI verification and production deployment in [`archive/as-07-r2-cdn-runtime-cleanup.md`](archive/as-07-r2-cdn-runtime-cleanup.md). Runtime call-site plumbing is removed; persisted legacy URL fields and migration-only helpers remain only for compatibility and existing-data reconciliation until a production data/consumer inventory supports a reviewed API/schema migration.
 
 ## P2 — hardening and cleanup
 
@@ -73,7 +73,7 @@ AS-11 public worker-error sanitization is resolved with a persistence-boundary g
 - Production-host release provenance is resolved in the current deployment
   workflow: CI builds and attests the immutable artifact and wheelhouse, while
   the VPS verifies the published digest and source commit before installation.
-- After the media grace period, remove the runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers once no migration/reconciliation path depends on them.
+- After production data and external-consumer inventory confirms that no compatibility or migration path depends on them, remove the persisted legacy media URL fields and migration-only helpers through a reviewed API/schema migration.
 - Continue reducing legacy/duplicate runtime and documentation paths after each replacement is proven.
 
 ## Operational / owner-controlled

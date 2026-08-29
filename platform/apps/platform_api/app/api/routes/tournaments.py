@@ -693,7 +693,6 @@ def tournament_with_counts_stmt(
             select(
                 Tournament,
                 User.display_name.label("organizer_display_name"),
-                PlayerProfile.avatar_url.label("organizer_avatar_url"),
                 PlayerProfile.avatar_asset_id.label("organizer_avatar_asset_id"),
                 participant_count.label("participant_count"),
                 locked_roster_count.label("locked_roster_count"),
@@ -736,7 +735,6 @@ def tournament_with_counts_stmt(
         select(
             Tournament,
             User.display_name.label("organizer_display_name"),
-            PlayerProfile.avatar_url.label("organizer_avatar_url"),
             PlayerProfile.avatar_asset_id.label("organizer_avatar_asset_id"),
             func.coalesce(participant_counts.c.participant_count, 0).label("participant_count"),
             func.coalesce(locked_roster_counts.c.locked_roster_count, 0).label("locked_roster_count"),
@@ -756,7 +754,6 @@ def serialize_tournament(
     organizer_display_name: str,
     participant_count: int,
     *,
-    organizer_avatar_url: str | None = None,
     cover_media: MediaDescriptorResponse | None = None,
     organizer_avatar_media: MediaDescriptorResponse | None = None,
     has_locked_deadlock_roster: bool = False,
@@ -771,7 +768,6 @@ def serialize_tournament(
         cover_url=compatibility_media_url(
             cover_media,
             preferred_variant="banner-1120",
-            legacy_url=tournament.cover_url,
         ),
         cover_media=cover_media,
         visibility=tournament.visibility,
@@ -782,7 +778,6 @@ def serialize_tournament(
         organizer_avatar_url=compatibility_media_url(
             organizer_avatar_media,
             preferred_variant="avatar-256",
-            legacy_url=organizer_avatar_url,
         ),
         organizer_avatar_media=organizer_avatar_media,
         participant_count=participant_count,
@@ -1446,7 +1441,6 @@ async def deadlock_assignment_member_profiles(
                 PlayerProfile.handle,
                 PlayerProfile.display_name,
                 User.display_name,
-                PlayerProfile.avatar_url,
                 PlayerProfile.avatar_asset_id,
             )
             .join(User, User.id == PlayerProfile.user_id)
@@ -1455,7 +1449,7 @@ async def deadlock_assignment_member_profiles(
     ).all()
     media_descriptors = await load_media_descriptors(
         db_session,
-        tuple(row[5] for row in rows),
+        tuple(row[4] for row in rows),
     )
     return {
         str(user_id): TournamentTeamMemberProfile(
@@ -1463,7 +1457,6 @@ async def deadlock_assignment_member_profiles(
             avatar_url=compatibility_media_url(
                 media_descriptors.get(avatar_asset_id) if avatar_asset_id else None,
                 preferred_variant="avatar-256",
-                legacy_url=str(avatar_url) if avatar_url else None,
             ),
         )
         for (
@@ -1471,7 +1464,6 @@ async def deadlock_assignment_member_profiles(
             handle,
             profile_display_name,
             user_display_name,
-            avatar_url,
             avatar_asset_id,
         ) in rows
     }
@@ -2664,7 +2656,7 @@ async def list_tournaments(
         tuple(
             asset_id
             for row in rows
-            for asset_id in (row[0].banner_asset_id, row[3])
+            for asset_id in (row[0].banner_asset_id, row[2])
         ),
     )
     serialized = [
@@ -2672,7 +2664,6 @@ async def list_tournaments(
             tournament,
             organizer_display_name,
             int(participant_count),
-            organizer_avatar_url=organizer_avatar_url,
             cover_media=media_descriptors.get(tournament.banner_asset_id)
             if tournament.banner_asset_id
             else None,
@@ -2684,7 +2675,6 @@ async def list_tournaments(
         for (
             tournament,
             organizer_display_name,
-            organizer_avatar_url,
             organizer_avatar_asset_id,
             participant_count,
             locked_roster_count,
@@ -2842,7 +2832,7 @@ async def list_my_tournaments(
         tuple(
             asset_id
             for row in rows
-            for asset_id in (row[0].banner_asset_id, row[3])
+            for asset_id in (row[0].banner_asset_id, row[2])
         ),
     )
     serialized = [
@@ -2850,7 +2840,6 @@ async def list_my_tournaments(
             tournament,
             organizer_display_name,
             int(participant_count),
-            organizer_avatar_url=organizer_avatar_url,
             cover_media=media_descriptors.get(tournament.banner_asset_id)
             if tournament.banner_asset_id
             else None,
@@ -2864,7 +2853,6 @@ async def list_my_tournaments(
         for (
             tournament,
             organizer_display_name,
-            organizer_avatar_url,
             organizer_avatar_asset_id,
             participant_count,
             locked_roster_count,
@@ -3231,7 +3219,6 @@ async def redeem_tournament_invite(
     (
         tournament,
         organizer_display_name,
-        organizer_avatar_url,
         organizer_avatar_asset_id,
         participant_count,
         locked_roster_count,
@@ -3306,7 +3293,6 @@ async def redeem_tournament_invite(
             tournament,
             organizer_display_name,
             int(participant_count),
-            organizer_avatar_url=organizer_avatar_url,
             cover_media=cover_media,
             organizer_avatar_media=organizer_avatar_media,
             has_locked_deadlock_roster=bool(int(locked_roster_count)),
@@ -6225,12 +6211,10 @@ async def get_tournament_scoped_profile(
             "avatar_url": compatibility_media_url(
                 avatar_media,
                 preferred_variant="avatar-256",
-                legacy_url=profile.avatar_url,
             ),
             "banner_url": compatibility_media_url(
                 banner_media,
                 preferred_variant="banner-1920",
-                legacy_url=profile.banner_url,
             ),
             "avatar_media": avatar_media,
             "banner_media": banner_media,
@@ -6349,7 +6333,6 @@ async def get_tournament_workspace(
     (
         tournament,
         organizer_display_name,
-        organizer_avatar_url,
         organizer_avatar_asset_id,
         participant_count,
         locked_roster_count,
@@ -6394,7 +6377,6 @@ async def get_tournament_workspace(
         tournament,
         organizer_display_name,
         int(participant_count),
-        organizer_avatar_url=organizer_avatar_url,
         cover_media=cover_media,
         organizer_avatar_media=organizer_avatar_media,
         has_locked_deadlock_roster=bool(int(locked_roster_count)),
@@ -6585,7 +6567,6 @@ async def get_tournament(
     (
         tournament,
         organizer_display_name,
-        organizer_avatar_url,
         organizer_avatar_asset_id,
         participant_count,
         locked_roster_count,
@@ -6600,7 +6581,6 @@ async def get_tournament(
         tournament,
         organizer_display_name,
         int(participant_count),
-        organizer_avatar_url=organizer_avatar_url,
         cover_media=cover_media,
         organizer_avatar_media=organizer_avatar_media,
         has_locked_deadlock_roster=bool(int(locked_roster_count)),

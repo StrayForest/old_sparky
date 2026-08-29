@@ -2,7 +2,7 @@
 
 - Status: Active
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-28
+- Last reviewed: 2026-08-29
 
 Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current production state and next engineering priority. Open deeper documents only when the task requires them.
 

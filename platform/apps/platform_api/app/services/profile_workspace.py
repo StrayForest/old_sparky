@@ -68,12 +68,10 @@ def _serialize_profile(
         avatar_url=compatibility_media_url(
             avatar_media,
             preferred_variant="avatar-256",
-            legacy_url=profile.avatar_url,
         ),
         banner_url=compatibility_media_url(
             banner_media,
             preferred_variant="banner-1920",
-            legacy_url=profile.banner_url,
         ),
         avatar_media=avatar_media,
         banner_media=banner_media,

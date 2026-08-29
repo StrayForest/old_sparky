@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-28
+- Last reviewed: 2026-08-29
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -66,8 +66,9 @@ part of the production flow. Public capacity measurements use the external
 runner workflow `platform-production-external-load.yml`: deterministic fixture
 setup is performed on the origin, the HTTP measurement runs outside the VPS,
 and a bounded origin observer records API/PG/Redis/system pressure. The
-pre-production retained matrix remains available only for non-production
-workflow/data-volume diagnostics; it is not a public capacity result.
+external-load workflow is the only supported retained-load measurement path; it
+is a manual operator gate, never ordinary CI, and every run requires exact
+cleanup or abort handling before another run.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
 
@@ -112,7 +113,7 @@ and size-based rotation bounds text log files.
 - Bracket/workspace access must remain authorized by the ordinary request
   boundary. The active grid is request-driven; Redis is not a bracket
   dependency.
-- Public media rendering must remain `R2 -> CDN -> browser`; normal API runtime must not proxy R2 objects, serve legacy upload paths or fall back to local-disk reads. Legacy URL columns and migration helpers may remain only while runtime-inert and migration/grace-period scoped.
+- Public media rendering must remain `R2 -> CDN -> browser`; normal API runtime must not proxy R2 objects, serve legacy upload paths or fall back to local-disk reads. Legacy URL response fields and database columns remain only as compatibility/data-migration fields: runtime serializers ignore their stored values, while migration diagnostics and reconciliation may still use them. Physical removal requires a reviewed API/schema migration after production data and consumer inventory.
 - Unknown public patch IDs must not make the request path wait on external refresh work. Retain per-ID negative caching, cross-worker refresh coalescing and explicit no-redirect/response-size bounds for miss-triggered upstream requests.
 - Password-login protection must retain independent per-IP and account-wide buckets. Account-wide Redis state must use private HMAC fingerprints rather than plaintext identifiers; cooldowns remain bounded and must not extend on blocked requests, and a successful login clears the account failure/cooldown state.
 - Cloudflare Access is defense in depth only: privileged application RBAC remains authoritative after edge authentication/MFA succeeds.
@@ -139,5 +140,5 @@ and size-based rotation bounds text log files.
   exact Cloudflare CIDR parity across UFW/Nginx, and a direct-origin negative
   test. Repository checks do not prove live state.
 - Real-user CSP follow-up and classification of new enforcement reports.
-- Post-grace physical removal of runtime-inert legacy media URL columns/call-site plumbing and migration-only helpers when no longer required.
+- Physical removal of persisted legacy media URL fields and migration-only helpers after production data and external-consumer inventory confirms that no migration or compatibility dependency remains; this requires a reviewed API/schema migration.
 - Non-security feature expansion that does not remove a launch or production blocker. For priorities and backlog, use [`platform-roadmap.md`](platform-roadmap.md); for evidence and details, follow [`README.md`](README.md).

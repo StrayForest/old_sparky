@@ -68,7 +68,6 @@ async def serialize_current_user(
         avatar_url = compatibility_media_url(
             avatar_media,
             preferred_variant="avatar-256",
-            legacy_url=profile.avatar_url,
         )
     return UserResponse(
         id=user.id,

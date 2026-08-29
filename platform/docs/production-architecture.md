@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-28
+- Last reviewed: 2026-08-29
 
 ## Invariants
 
@@ -81,7 +81,7 @@ decision and must not double the connection demand of a read burst.
 
 Uploads stream into bounded private staging. The worker decodes, validates, normalizes and re-encodes WebP variants, writes immutable R2 keys, commits metadata and removes staging. Public R2 contains no new originals. API serialization builds CDN descriptors from committed media rows and makes no render-path S3 read.
 
-FastAPI exposes no `/api/v1/uploads/*` media-serving route and has no uploads `StaticFiles` mount. Normal runtime storage has no object-read API, R2 `get_object()`/`Body.read()` proxy path or R2-to-local-disk read fallback. Historical `avatar_url`, `banner_url` and `cover_url` fields may remain during the grace period, but runtime resolution ignores them; only ready `MediaDescriptor` URLs can reach public serialization. Legacy upload-URL parsing and object mutation helpers are migration/grace-period tooling only and must not become browser delivery paths.
+FastAPI exposes no `/api/v1/uploads/*` media-serving route and has no uploads `StaticFiles` mount. Normal runtime storage has no object-read API, R2 `get_object()`/`Body.read()` proxy path or R2-to-local-disk read fallback. Historical `avatar_url`, `banner_url` and `cover_url` fields remain only as API/data-migration compatibility fields; runtime resolution ignores their stored values, and only ready `MediaDescriptor` URLs can reach public serialization. Legacy upload-URL parsing and object mutation helpers are migration tooling for existing data only and must not become browser delivery paths. Physical field removal requires a reviewed API/schema migration after data and consumer inventory.
 
 ## Trust boundaries
 
