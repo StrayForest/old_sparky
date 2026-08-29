@@ -5,14 +5,7 @@ import json
 import logging
 from typing import Any
 
-from celery import Celery
-
 from apps.platform_api.app.services.home_content_runtime import refresh_home_content
-from apps.platform_api.app.services.patch_translation import PATCH_TRANSLATION_TASK_NAME
-from python_packages.platform_infra.config import get_settings
-
-
-logger = logging.getLogger(__name__)
 
 
 def _summary(payload: dict[str, Any]) -> dict[str, Any]:
@@ -29,45 +22,9 @@ def _summary(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _enqueue_patch_translations(payload: dict[str, Any]) -> int:
-    settings = get_settings()
-    producer = Celery(
-        "deadlock_content_refresh",
-        broker=settings.platform_celery_broker_url,
-    )
-    enqueued = 0
-    seen: set[str] = set()
-    try:
-        for patch in payload.get("patches") or []:
-            if not isinstance(patch, dict):
-                continue
-            patch_id = str(patch.get("id") or "").strip()
-            if not patch_id.isdigit() or patch_id in seen:
-                continue
-            seen.add(patch_id)
-            try:
-                producer.send_task(
-                    PATCH_TRANSLATION_TASK_NAME,
-                    args=[patch_id],
-                    queue="deadlock-platform-low",
-                    expires=1800,
-                )
-                enqueued += 1
-            except Exception:
-                logger.exception(
-                    "Failed to enqueue startup patch translation patch_id=%s.",
-                    patch_id,
-                )
-    finally:
-        producer.close()
-    return enqueued
-
-
 async def _main() -> None:
     payload = await refresh_home_content(force=True)
-    translation_jobs = _enqueue_patch_translations(payload)
     summary = _summary(payload)
-    summary["patch_translations_enqueued"] = translation_jobs
     print(
         "HOME_CONTENT_REFRESH "
         + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))

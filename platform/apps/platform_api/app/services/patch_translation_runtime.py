@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import logging
@@ -10,6 +10,8 @@ from secrets import token_urlsafe
 from typing import Any
 
 import httpx
+from sqlalchemy import select, update
+from sqlalchemy.dialects import postgresql
 
 from apps.platform_api.app.services.patch_translation_config import (
     OPENAI_RESPONSES_URL,
@@ -34,6 +36,8 @@ from apps.platform_api.app.services.patch_translation_terms import (
     validate_prepared_translation,
 )
 from python_packages.platform_infra.config import PlatformSettings, get_settings
+from python_packages.platform_infra.db import session_factory
+from python_packages.platform_infra.models import PatchTranslation, new_uuid
 from python_packages.platform_infra.redis import redis_client
 
 
@@ -57,6 +61,15 @@ if redis.call("get", KEYS[1]) == ARGV[1] then
 end
 return 0
 """
+
+TRANSLATION_STATUS_PENDING = "pending"
+TRANSLATION_STATUS_PROCESSING = "processing"
+TRANSLATION_STATUS_COMPLETED = "completed"
+TRANSLATION_STATUS_FAILED = "failed"
+TRANSLATION_STATUS_SKIPPED = "skipped"
+TRANSLATION_STATUS_SUPERSEDED = "superseded"
+TRANSLATION_ENQUEUE_RETRY_SECONDS = 15 * 60
+TRANSLATION_PROCESSING_TIMEOUT_SECONDS = 15 * 60
 
 
 def _iter_changes(patch: dict[str, Any]):
@@ -189,6 +202,458 @@ def _cache_key(patch_id: str, source_hash: str, model: str) -> str:
 
 def _lock_key(patch_id: str, source_hash: str, model: str) -> str:
     return f"{_LOCK_PREFIX}{_model_token(model)}:{patch_id}:{source_hash}"
+
+
+def translation_source_hash(patch: dict[str, Any]) -> str:
+    return _source_hash(extract_translation_segments(patch))
+
+
+def _translation_identity(
+    patch_id: str,
+    source_hash: str,
+    settings: PlatformSettings,
+) -> dict[str, str]:
+    return {
+        "patch_id": patch_id,
+        "source_hash": source_hash,
+        "locale": PATCH_TRANSLATION_LOCALE,
+        "translation_version": PATCH_TRANSLATION_VERSION,
+        "model": settings.platform_openai_model,
+    }
+
+
+async def _select_translation_record(
+    db_session: Any,
+    *,
+    patch_id: str,
+    source_hash: str,
+    settings: PlatformSettings,
+    for_update: bool = False,
+) -> PatchTranslation | None:
+    statement = select(PatchTranslation).where(
+        PatchTranslation.patch_id == patch_id,
+        PatchTranslation.source_hash == source_hash,
+        PatchTranslation.locale == PATCH_TRANSLATION_LOCALE,
+        PatchTranslation.translation_version == PATCH_TRANSLATION_VERSION,
+        PatchTranslation.model == settings.platform_openai_model,
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    return await db_session.scalar(statement)
+
+
+def _validated_translation_segments(
+    raw_segments: Any,
+    segments: list[dict[str, str]],
+) -> dict[str, str] | None:
+    if not isinstance(raw_segments, list):
+        return None
+    expected_ids = [segment["id"] for segment in segments]
+    if len(raw_segments) != len(expected_ids):
+        return None
+    translated: dict[str, str] = {}
+    for segment in raw_segments:
+        if not isinstance(segment, dict):
+            return None
+        segment_id = segment.get("id")
+        text = segment.get("text")
+        if not isinstance(segment_id, str) or not isinstance(text, str):
+            return None
+        if segment_id in translated:
+            return None
+        translated[segment_id] = text
+    if list(translated) != expected_ids:
+        return None
+    return translated
+
+
+def _translation_cache_payload(
+    *,
+    source_hash: str,
+    model: str,
+    segments: list[dict[str, str]],
+    translated_by_id: dict[str, str],
+    translated_at: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "locale": PATCH_TRANSLATION_LOCALE,
+        "source_hash": source_hash,
+        "translation_version": PATCH_TRANSLATION_VERSION,
+        "model": model,
+        "translated_at": (translated_at or datetime.now(UTC)).isoformat(),
+        "segments": [
+            {"id": segment["id"], "text": translated_by_id[segment["id"]]}
+            for segment in segments
+        ],
+    }
+
+
+async def _read_database_translation(
+    *,
+    patch_id: str,
+    source_hash: str,
+    segments: list[dict[str, str]],
+    settings: PlatformSettings,
+) -> tuple[dict[str, str], datetime | None] | None:
+    try:
+        async with session_factory()() as db_session:
+            record = await _select_translation_record(
+                db_session,
+                patch_id=patch_id,
+                source_hash=source_hash,
+                settings=settings,
+            )
+            if record is None:
+                logger.error(
+                    "patch_translation_database_record_missing patch_id=%s source_hash=%s",
+                    patch_id,
+                    source_hash,
+                )
+                return None
+            if record.status not in {
+                TRANSLATION_STATUS_COMPLETED,
+                TRANSLATION_STATUS_SKIPPED,
+            }:
+                logger.info(
+                    "patch_translation_database_record_not_ready patch_id=%s source_hash=%s status=%s error=%s",
+                    patch_id,
+                    source_hash,
+                    record.status,
+                    record.error_code,
+                )
+                return None
+            raw_segments = record.translated_segments
+            translated = _validated_translation_segments(raw_segments, segments)
+            if translated is None:
+                logger.warning(
+                    "patch_translation_database_payload_invalid patch_id=%s source_hash=%s",
+                    patch_id,
+                    source_hash,
+                )
+                return None
+            return translated, record.translated_at
+    except Exception:
+        logger.warning(
+            "patch_translation_database_read_failed patch_id=%s source_hash=%s",
+            patch_id,
+            source_hash,
+            exc_info=True,
+        )
+        return None
+
+
+async def _write_translation_cache(
+    *,
+    patch_id: str,
+    source_hash: str,
+    model: str,
+    segments: list[dict[str, str]],
+    translated_by_id: dict[str, str],
+    translated_at: datetime | None = None,
+) -> None:
+    cache = redis_client()
+    try:
+        await cache.set(
+            _cache_key(patch_id, source_hash, model),
+            json.dumps(
+                _translation_cache_payload(
+                    source_hash=source_hash,
+                    model=model,
+                    segments=segments,
+                    translated_by_id=translated_by_id,
+                    translated_at=translated_at,
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            ex=PATCH_TRANSLATION_CACHE_TTL_SECONDS,
+        )
+    finally:
+        await cache.aclose()
+
+
+async def _persist_translation_completion(
+    *,
+    patch_id: str,
+    source_hash: str,
+    segments: list[dict[str, str]],
+    translated_by_id: dict[str, str],
+    settings: PlatformSettings,
+    status: str = TRANSLATION_STATUS_COMPLETED,
+) -> None:
+    now = datetime.now(UTC)
+    translated_segments = [
+        {"id": segment["id"], "text": translated_by_id[segment["id"]]}
+        for segment in segments
+    ]
+    values = {
+        "id": new_uuid(),
+        **_translation_identity(patch_id, source_hash, settings),
+        "status": status,
+        "translated_segments": translated_segments,
+        "error_code": None,
+        "translated_at": now,
+        "processing_started_at": None,
+        "updated_at": now,
+    }
+    statement = postgresql.insert(PatchTranslation).values(values)
+    statement = statement.on_conflict_do_update(
+        constraint="uq_patch_translations_identity",
+        set_={
+            "status": status,
+            "translated_segments": translated_segments,
+            "error_code": None,
+            "processing_started_at": None,
+            "translated_at": now,
+            "updated_at": now,
+        },
+    )
+    async with session_factory()() as db_session:
+        await db_session.execute(statement)
+        await db_session.commit()
+
+
+async def _set_translation_failure(
+    *,
+    patch_id: str,
+    source_hash: str | None,
+    error_code: str,
+    status: str = TRANSLATION_STATUS_FAILED,
+    settings: PlatformSettings | None = None,
+) -> bool:
+    if not source_hash:
+        return False
+    settings = settings or get_settings()
+    async with session_factory()() as db_session:
+        record = await _select_translation_record(
+            db_session,
+            patch_id=patch_id,
+            source_hash=source_hash,
+            settings=settings,
+            for_update=True,
+        )
+        if record is None or record.status in {
+            TRANSLATION_STATUS_COMPLETED,
+            TRANSLATION_STATUS_SKIPPED,
+            TRANSLATION_STATUS_SUPERSEDED,
+        }:
+            return False
+        record.status = status
+        record.error_code = error_code[:80]
+        record.processing_started_at = None
+        await db_session.commit()
+    return True
+
+
+async def mark_patch_translation_failed(
+    patch_id: str,
+    source_hash: str | None,
+    error_code: str,
+    *,
+    settings: PlatformSettings | None = None,
+) -> bool:
+    return await _set_translation_failure(
+        patch_id=patch_id,
+        source_hash=source_hash,
+        error_code=error_code,
+        settings=settings,
+    )
+
+
+async def _claim_translation(
+    *,
+    patch_id: str,
+    source_hash: str,
+    settings: PlatformSettings,
+    allow_failed_retry: bool = False,
+) -> tuple[str, str | None]:
+    now = datetime.now(UTC)
+    async with session_factory()() as db_session:
+        record = await _select_translation_record(
+            db_session,
+            patch_id=patch_id,
+            source_hash=source_hash,
+            settings=settings,
+            for_update=True,
+        )
+        if record is None:
+            return "not_registered", None
+        if record.status in {
+            TRANSLATION_STATUS_COMPLETED,
+            TRANSLATION_STATUS_SKIPPED,
+            TRANSLATION_STATUS_SUPERSEDED,
+        }:
+            return record.status, record.error_code
+        if record.status == TRANSLATION_STATUS_FAILED and not allow_failed_retry:
+            return record.status, record.error_code
+        if record.status == TRANSLATION_STATUS_PROCESSING:
+            started_at = record.processing_started_at
+            if started_at is not None and now - started_at < timedelta(
+                seconds=TRANSLATION_PROCESSING_TIMEOUT_SECONDS
+            ):
+                return TRANSLATION_STATUS_PROCESSING, None
+        record.status = TRANSLATION_STATUS_PROCESSING
+        record.attempts += 1
+        record.error_code = None
+        record.processing_started_at = now
+        await db_session.commit()
+    return TRANSLATION_STATUS_PROCESSING, None
+
+
+async def _mark_translation_superseded(
+    *,
+    patch_id: str,
+    source_hash: str,
+    settings: PlatformSettings | None = None,
+) -> bool:
+    return await _set_translation_failure(
+        patch_id=patch_id,
+        source_hash=source_hash,
+        error_code="source_changed",
+        status=TRANSLATION_STATUS_SUPERSEDED,
+        settings=settings,
+    )
+
+
+def _enqueue_translation_task(
+    patch_id: str,
+    source_hash: str,
+    *,
+    model: str,
+) -> str:
+    from apps.platform_worker.worker import patch_translation
+
+    task_id = "patch-translation-" + hashlib.sha256(
+        f"{PATCH_TRANSLATION_VERSION}:{PATCH_TRANSLATION_LOCALE}:{model}:{patch_id}:{source_hash}".encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    task = patch_translation.apply_async(
+        args=[patch_id, source_hash],
+        task_id=task_id,
+    )
+    return str(task.id)
+
+
+async def _clear_translation_enqueue_timestamp(record_id: str) -> None:
+    async with session_factory()() as db_session:
+        await db_session.execute(
+            update(PatchTranslation)
+            .where(
+                PatchTranslation.id == record_id,
+                PatchTranslation.status == TRANSLATION_STATUS_PENDING,
+            )
+            .values(last_enqueued_at=None, updated_at=datetime.now(UTC))
+        )
+        await db_session.commit()
+
+
+async def ensure_patch_translation_records(
+    patch_details: dict[str, dict[str, Any]],
+) -> dict[str, int]:
+    """Register newly observed patch versions and enqueue each at most once."""
+
+    settings = get_settings()
+    entries: list[tuple[str, str, list[dict[str, str]]]] = []
+    for patch_id, patch in patch_details.items():
+        normalized_patch_id = str(patch_id or "").strip()
+        if not normalized_patch_id.isdigit() or not isinstance(patch, dict):
+            continue
+        segments = extract_translation_segments(patch)
+        entries.append(
+            (
+                normalized_patch_id,
+                translation_source_hash(patch),
+                segments,
+            )
+        )
+    if not entries:
+        return {"registered": 0, "enqueued": 0, "enqueue_failures": 0}
+
+    now = datetime.now(UTC)
+    enqueue_candidates: list[tuple[str, str, str]] = []
+    registered = 0
+    async with session_factory()() as db_session:
+        for patch_id, source_hash, segments in entries:
+            status = (
+                TRANSLATION_STATUS_PENDING
+                if segments
+                else TRANSLATION_STATUS_SKIPPED
+            )
+            statement = postgresql.insert(PatchTranslation).values(
+                id=new_uuid(),
+                **_translation_identity(patch_id, source_hash, settings),
+                status=status,
+                translated_segments=[],
+                attempts=0,
+            )
+            result = await db_session.execute(
+                statement.on_conflict_do_nothing(
+                    constraint="uq_patch_translations_identity"
+                )
+            )
+            registered += max(int(result.rowcount or 0), 0)
+
+        for patch_id, source_hash, segments in entries:
+            if not segments:
+                continue
+            record = await _select_translation_record(
+                db_session,
+                patch_id=patch_id,
+                source_hash=source_hash,
+                settings=settings,
+                for_update=True,
+            )
+            if record is None:
+                continue
+            if record.status == TRANSLATION_STATUS_PROCESSING:
+                started_at = record.processing_started_at
+                if started_at is None or now - started_at >= timedelta(
+                    seconds=TRANSLATION_PROCESSING_TIMEOUT_SECONDS
+                ):
+                    record.status = TRANSLATION_STATUS_PENDING
+                    record.processing_started_at = None
+            if record.status != TRANSLATION_STATUS_PENDING:
+                continue
+            if record.last_enqueued_at is not None and now - record.last_enqueued_at < timedelta(
+                seconds=TRANSLATION_ENQUEUE_RETRY_SECONDS
+            ):
+                continue
+            record.last_enqueued_at = now
+            enqueue_candidates.append((str(record.id), patch_id, source_hash))
+        await db_session.commit()
+
+    enqueued = 0
+    enqueue_failures = 0
+    for record_id, patch_id, source_hash in enqueue_candidates:
+        try:
+            _enqueue_translation_task(
+                patch_id,
+                source_hash,
+                model=settings.platform_openai_model,
+            )
+        except Exception:
+            enqueue_failures += 1
+            logger.exception(
+                "Failed to enqueue patch translation patch_id=%s source_hash=%s.",
+                patch_id,
+                source_hash,
+            )
+            try:
+                await _clear_translation_enqueue_timestamp(record_id)
+            except Exception:
+                logger.exception(
+                    "Failed to clear enqueue marker patch_id=%s source_hash=%s.",
+                    patch_id,
+                    source_hash,
+                )
+        else:
+            enqueued += 1
+    return {
+        "registered": registered,
+        "enqueued": enqueued,
+        "enqueue_failures": enqueue_failures,
+    }
 
 
 def _set_path(target: dict[str, Any], path: tuple[Any, ...], value: str) -> None:
@@ -473,14 +938,16 @@ async def get_cached_patch_translation(
         return {}
     if not patch_id:
         return None
+    source_hash = _source_hash(segments)
 
     cache = redis_client()
+    cached: dict[str, Any] | None = None
     try:
         cached = await _read_json(
             cache,
             _cache_key(
                 patch_id,
-                _source_hash(segments),
+                source_hash,
                 settings.platform_openai_model,
             ),
         )
@@ -490,24 +957,56 @@ async def get_cached_patch_translation(
             patch_id,
             exc_info=True,
         )
-        return None
     finally:
-        await cache.aclose()
+        try:
+            await cache.aclose()
+        except Exception:
+            logger.warning(
+                "patch_translation_cache_close_failed patch_id=%s",
+                patch_id,
+                exc_info=True,
+            )
 
-    cached_segments = cached.get("segments") if cached else None
-    if not isinstance(cached_segments, list):
+    cached_matches_identity = bool(
+        cached
+        and cached.get("locale") == PATCH_TRANSLATION_LOCALE
+        and cached.get("source_hash") == source_hash
+        and cached.get("translation_version") == PATCH_TRANSLATION_VERSION
+        and cached.get("model") == settings.platform_openai_model
+    )
+    translated = _validated_translation_segments(
+        cached.get("segments") if cached_matches_identity else None,
+        segments,
+    )
+    if translated is not None:
+        return translated
+
+    database_translation = await _read_database_translation(
+        patch_id=patch_id,
+        source_hash=source_hash,
+        segments=segments,
+        settings=settings,
+    )
+    if database_translation is None:
         return None
-    translated: dict[str, str] = {}
-    for segment in cached_segments:
-        if not isinstance(segment, dict):
-            return None
-        segment_id = segment.get("id")
-        text = segment.get("text")
-        if not isinstance(segment_id, str) or not isinstance(text, str):
-            return None
-        translated[segment_id] = text
-    if list(translated) != [segment["id"] for segment in segments]:
-        return None
+
+    translated, translated_at = database_translation
+    try:
+        await _write_translation_cache(
+            patch_id=patch_id,
+            source_hash=source_hash,
+            model=settings.platform_openai_model,
+            segments=segments,
+            translated_by_id=translated,
+            translated_at=translated_at,
+        )
+    except Exception:
+        logger.warning(
+            "patch_translation_cache_warm_failed patch_id=%s source_hash=%s",
+            patch_id,
+            source_hash,
+            exc_info=True,
+        )
     return translated
 
 
@@ -525,40 +1024,91 @@ async def translate_patch_to_russian(
     catalog: dict[str, Any],
     *,
     settings: PlatformSettings | None = None,
+    expected_source_hash: str | None = None,
+    allow_failed_retry: bool = False,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
     patch_id = str(patch.get("id") or "").strip()
     segments = extract_translation_segments(patch)
-    if not patch_id or not segments:
+    source_hash = _source_hash(segments)
+    if not patch_id:
         return {
             "ok": True,
             "status": "skipped",
             "patch_id": patch_id,
             "reason": "no_translatable_segments",
         }
+    if expected_source_hash and expected_source_hash != source_hash:
+        await _mark_translation_superseded(
+            patch_id=patch_id,
+            source_hash=expected_source_hash,
+            settings=settings,
+        )
+        return {
+            "ok": False,
+            "status": TRANSLATION_STATUS_SUPERSEDED,
+            "patch_id": patch_id,
+            "source_hash": source_hash,
+            "expected_source_hash": expected_source_hash,
+        }
+    if not segments:
+        try:
+            await _persist_translation_completion(
+                patch_id=patch_id,
+                source_hash=source_hash,
+                segments=[],
+                translated_by_id={},
+                settings=settings,
+                status=TRANSLATION_STATUS_SKIPPED,
+            )
+        except Exception:
+            logger.warning(
+                "patch_translation_skip_persist_failed patch_id=%s source_hash=%s",
+                patch_id,
+                source_hash,
+                exc_info=True,
+            )
+        return {
+            "ok": True,
+            "status": TRANSLATION_STATUS_SKIPPED,
+            "patch_id": patch_id,
+            "source_hash": source_hash,
+            "reason": "no_translatable_segments",
+        }
 
-    source_hash = _source_hash(segments)
-    cache_key = _cache_key(patch_id, source_hash, settings.platform_openai_model)
     lock_key = _lock_key(patch_id, source_hash, settings.platform_openai_model)
-    cache = redis_client()
     lock_token = token_urlsafe(24)
     acquired = False
+    cache = None
     try:
-        if await _read_json(cache, cache_key) is not None:
+        cached_translation = await get_cached_patch_translation(
+            patch,
+            settings=settings,
+        )
+        if cached_translation is not None:
+            try:
+                await _persist_translation_completion(
+                    patch_id=patch_id,
+                    source_hash=source_hash,
+                    segments=segments,
+                    translated_by_id=cached_translation,
+                    settings=settings,
+                )
+            except Exception:
+                logger.warning(
+                    "patch_translation_cached_persist_failed patch_id=%s source_hash=%s",
+                    patch_id,
+                    source_hash,
+                    exc_info=True,
+                )
             return {
                 "ok": True,
                 "status": "cached",
                 "patch_id": patch_id,
                 "source_hash": source_hash,
             }
-        if not (settings.platform_openai_api_key or "").strip():
-            return {
-                "ok": False,
-                "status": "skipped",
-                "patch_id": patch_id,
-                "reason": "openai_not_configured",
-            }
 
+        cache = redis_client()
         acquired = bool(
             await cache.set(
                 lock_key,
@@ -574,12 +1124,70 @@ async def translate_patch_to_russian(
                 "patch_id": patch_id,
                 "source_hash": source_hash,
             }
-        if await _read_json(cache, cache_key) is not None:
+
+        cached_translation = await get_cached_patch_translation(
+            patch,
+            settings=settings,
+        )
+        if cached_translation is not None:
+            await _persist_translation_completion(
+                patch_id=patch_id,
+                source_hash=source_hash,
+                segments=segments,
+                translated_by_id=cached_translation,
+                settings=settings,
+            )
             return {
                 "ok": True,
                 "status": "cached",
                 "patch_id": patch_id,
                 "source_hash": source_hash,
+            }
+
+        claim_status, claim_error = await _claim_translation(
+            patch_id=patch_id,
+            source_hash=source_hash,
+            settings=settings,
+            allow_failed_retry=allow_failed_retry,
+        )
+        if claim_status != TRANSLATION_STATUS_PROCESSING:
+            if claim_status in {
+                TRANSLATION_STATUS_COMPLETED,
+                TRANSLATION_STATUS_SKIPPED,
+            }:
+                return {
+                    "ok": True,
+                    "status": "cached",
+                    "patch_id": patch_id,
+                    "source_hash": source_hash,
+                }
+            if claim_status == "not_registered":
+                logger.error(
+                    "patch_translation_task_unregistered patch_id=%s source_hash=%s",
+                    patch_id,
+                    source_hash,
+                )
+            return {
+                "ok": False,
+                "status": claim_status,
+                "patch_id": patch_id,
+                "source_hash": source_hash,
+                "error": claim_error,
+            }
+
+        if not (settings.platform_openai_api_key or "").strip():
+            await _set_translation_failure(
+                patch_id=patch_id,
+                source_hash=source_hash,
+                error_code="openai_not_configured",
+                settings=settings,
+            )
+            return {
+                "ok": False,
+                "status": TRANSLATION_STATUS_FAILED,
+                "patch_id": patch_id,
+                "source_hash": source_hash,
+                "error": "openai_not_configured",
             }
 
         prepared, entity_replacements, fact_replacements = _prepare_segments(
@@ -612,23 +1220,30 @@ async def translate_patch_to_russian(
             if fact_fingerprint(original_by_id[segment_id]) != fact_fingerprint(text):
                 raise ValueError("Translation changed a numeric value or ability tier.")
 
-        payload = {
-            "locale": PATCH_TRANSLATION_LOCALE,
-            "source_hash": source_hash,
-            "translation_version": PATCH_TRANSLATION_VERSION,
-            "model": settings.platform_openai_model,
-            "translated_at": datetime.now(UTC).isoformat(),
-            "glossary_term_count": len(full_glossary),
-            "segments": [
-                {"id": segment["id"], "text": translated[segment["id"]]}
-                for segment in segments
-            ],
-        }
-        await cache.set(
-            cache_key,
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            ex=PATCH_TRANSLATION_CACHE_TTL_SECONDS,
+        translated_at = datetime.now(UTC)
+        await _persist_translation_completion(
+            patch_id=patch_id,
+            source_hash=source_hash,
+            segments=segments,
+            translated_by_id=translated,
+            settings=settings,
         )
+        try:
+            await _write_translation_cache(
+                patch_id=patch_id,
+                source_hash=source_hash,
+                model=settings.platform_openai_model,
+                segments=segments,
+                translated_by_id=translated,
+                translated_at=translated_at,
+            )
+        except Exception:
+            logger.warning(
+                "patch_translation_cache_write_failed patch_id=%s source_hash=%s",
+                patch_id,
+                source_hash,
+                exc_info=True,
+            )
         logger.info(
             "patch_translation_completed patch_id=%s segments=%s glossary_terms=%s model=%s",
             patch_id,
@@ -645,6 +1260,20 @@ async def translate_patch_to_russian(
             "glossary_terms": len(full_glossary),
         }
     except Exception as error:
+        try:
+            await _set_translation_failure(
+                patch_id=patch_id,
+                source_hash=source_hash,
+                error_code=type(error).__name__,
+                settings=settings,
+            )
+        except Exception:
+            logger.warning(
+                "patch_translation_failure_persist_failed patch_id=%s source_hash=%s",
+                patch_id,
+                source_hash,
+                exc_info=True,
+            )
         logger.warning(
             "patch_translation_failed patch_id=%s error=%s",
             patch_id,
@@ -659,7 +1288,7 @@ async def translate_patch_to_russian(
             "error": type(error).__name__,
         }
     finally:
-        if acquired:
+        if acquired and cache is not None:
             try:
                 await cache.eval(
                     _LOCK_RELEASE_SCRIPT,
@@ -673,14 +1302,25 @@ async def translate_patch_to_russian(
                     patch_id,
                     exc_info=True,
                 )
-        await cache.aclose()
+        if cache is not None:
+            try:
+                await cache.aclose()
+            except Exception:
+                logger.warning(
+                    "patch_translation_cache_close_failed patch_id=%s",
+                    patch_id,
+                    exc_info=True,
+                )
 
 
 __all__ = [
     "PATCH_TRANSLATION_TASK_NAME",
     "apply_cached_patch_translation",
+    "ensure_patch_translation_records",
     "extract_translation_segments",
     "get_cached_patch_translation",
+    "mark_patch_translation_failed",
     "merge_translation",
+    "translation_source_hash",
     "translate_patch_to_russian",
 ]

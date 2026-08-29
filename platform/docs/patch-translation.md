@@ -1,14 +1,31 @@
 # Deadlock patch translation
 
-- Status: Active / QA paused
+- Status: Active / DB-first implementation pending CI
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-19
+- Last reviewed: 2026-08-29
 
 This document owns the contract for automatic Russian translation of Deadlock patch-note changes.
 
-## Current checkpoint — 2026-08-19
+## Current implementation — 2026-08-29
 
-Work is intentionally paused here because GitHub Actions limits are exhausted. Do not continue implementation blindly; resume from this checkpoint.
+Translation state is durable in the PostgreSQL `platform.patch_translations`
+table. A record is identified by the patch ID, the hash of the extracted
+English change segments, locale, translation version and model. Redis remains a
+derivative result cache: a patch-detail read checks Redis first, then reads a
+completed translation from PostgreSQL and warms Redis on a miss.
+
+When Steam data is discovered, the application registers the exact source
+version in PostgreSQL before publishing one Celery task for that version. The
+unique identity and row lock prevent repeated home refreshes, startup refreshes
+or patch-detail cache-miss refreshes from creating duplicate tasks. A user read
+never starts OpenAI translation. If a task cannot find its registered database
+record, it fails closed and the condition is logged for diagnosis. Failed
+translations are retained as failed state rather than silently requeued on
+every refresh.
+
+## Historical checkpoint — 2026-08-19
+
+This was the last checkpoint before the DB-first persistence work below; retain it as historical QA context.
 
 ### Confirmed and deployed
 
@@ -165,16 +182,18 @@ For prose, prefer Valve terminology and natural constructions. The model may inf
 
 ## Runtime flow
 
-1. Home-content refresh discovers patch IDs and queues translation jobs.
-2. Worker loads the structured English patch and Deadlock entity catalog.
-3. Only change strings are extracted.
-4. Numeric/tier facts and non-ambiguous protected entity names are placeholder-protected.
-5. Read-only segment context, the ambiguity list and the checked-in canonical glossary are attached to the OpenAI request.
-6. The model semantically maps English wording variants to canonical glossary concepts and disambiguates the three item/mechanic collisions from context.
-7. The model returns the same segment IDs in the same order without dropping source clauses.
-8. Placeholders are restored and Russian numeric/unit notation is normalized.
-9. Numeric values and tiers are compared against the English source.
-10. Successful translations are cached under `PATCH_TRANSLATION_VERSION` and served by the patch API.
+1. Home-content or patch-detail refresh discovers Steam patch details and registers the exact source version in PostgreSQL.
+2. Only a newly registered `pending` version is published to the low-priority translation queue; the database identity prevents repeated tasks.
+3. Worker loads the structured English patch and Deadlock entity catalog, then verifies that the source hash still matches the queued version.
+4. Only change strings are extracted.
+5. Numeric/tier facts and non-ambiguous protected entity names are placeholder-protected.
+6. Read-only segment context, the ambiguity list and the checked-in canonical glossary are attached to the OpenAI request.
+7. The model semantically maps English wording variants to canonical glossary concepts and disambiguates the three item/mechanic collisions from context.
+8. The model returns the same segment IDs in the same order without dropping source clauses.
+9. Placeholders are restored and Russian numeric/unit notation is normalized.
+10. Numeric values and tiers are compared against the English source.
+11. Successful translations are committed to PostgreSQL first, then written to Redis under `PATCH_TRANSLATION_VERSION` and served by the patch API.
+12. A Redis miss falls back to PostgreSQL; a missing database translation does not invoke OpenAI from the user request.
 
 A translation-version bump intentionally invalidates previous translation result cache entries when the translation contract or canonical glossary changes.
 
@@ -220,4 +239,6 @@ Manual/diagnostic comparison is still required when changing prompt/glossary beh
 - `apps/platform_api/app/services/patch_translation_terms.py` — entity/fact protection and Russian notation.
 - `apps/platform_api/app/services/patch_translation_runtime.py` — model input/context, prompt-cache key, request, validation, result cache and merge flow.
 - `apps/platform_worker/worker.py` — background scheduling/execution.
+- `python_packages/platform_infra/models.py` and the corresponding Alembic revision — durable translation state and its identity constraints.
+- `tools/platform_refresh_home_content.py` — operator/startup refresh without a second translation enqueue path.
 - `tests/test_platform_patch_translation*.py` — regression coverage.

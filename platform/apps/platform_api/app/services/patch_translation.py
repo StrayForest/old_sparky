@@ -17,9 +17,12 @@ from apps.platform_api.app.services.patch_translation_glossary import (
 )
 from apps.platform_api.app.services.patch_translation_runtime import (
     apply_cached_patch_translation,
+    ensure_patch_translation_records,
     extract_translation_segments,
     get_cached_patch_translation,
+    mark_patch_translation_failed,
     merge_translation,
+    translation_source_hash,
     translate_patch_to_russian as _translate_patch_to_russian,
 )
 from apps.platform_api.app.services.patch_translation_terms import (
@@ -56,6 +59,7 @@ async def translate_patch_to_russian(
     catalog: dict[str, Any],
     *,
     settings: PlatformSettings | None = None,
+    expected_source_hash: str | None = None,
 ) -> dict[str, Any]:
     """Translate once, then retry one transient OpenAI transport failure."""
 
@@ -72,6 +76,7 @@ async def translate_patch_to_russian(
         patch,
         catalog,
         settings=effective_settings,
+        expected_source_hash=expected_source_hash,
     )
     if result.get("ok") or result.get("error") not in _RETRYABLE_OPENAI_ERRORS:
         return result
@@ -81,12 +86,15 @@ async def translate_patch_to_russian(
         patch,
         catalog,
         settings=effective_settings,
+        expected_source_hash=expected_source_hash,
+        allow_failed_retry=True,
     )
 
 
 __all__ = [
     "CANONICAL_GLOSSARY",
     "ENTITY_MECHANIC_COLLISIONS",
+    "ensure_patch_translation_records",
     "PATCH_TRANSLATION_LOCALE",
     "PATCH_TRANSLATION_TASK_NAME",
     "PATCH_TRANSLATION_VERSION",
@@ -99,9 +107,11 @@ __all__ = [
     "get_cached_patch_translation",
     "get_translation_glossary",
     "localize_russian_notation",
+    "mark_patch_translation_failed",
     "merge_translation",
     "protect_entities",
     "protect_facts",
     "restore_placeholders",
+    "translation_source_hash",
     "translate_patch_to_russian",
 ]

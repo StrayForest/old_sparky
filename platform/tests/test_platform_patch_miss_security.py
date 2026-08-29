@@ -179,6 +179,33 @@ class PlatformPatchMissSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, translated)
         translate.assert_awaited_once_with(detail)
 
+    async def test_patch_miss_refresh_registers_translations_after_cache_publish(self) -> None:
+        raw_detail = {
+            "id": "123",
+            "title": "Patch",
+            "content": "- Map speed reduced",
+        }
+        cache = _Cache()
+        with (
+            patch.object(patch_detail_security, "redis_client", return_value=cache),
+            patch.object(
+                patch_detail_security,
+                "ensure_patch_translation_records",
+                AsyncMock(return_value={"registered": 1, "enqueued": 1, "enqueue_failures": 0}),
+            ) as register,
+        ):
+            await patch_detail_security._publish_patch_refresh(
+                {"123": raw_detail},
+                {"heroes": {}, "items": {}, "ranks": {}, "objectives": {}},
+                publish_catalog=False,
+            )
+
+        register.assert_awaited_once()
+        registered_details = register.await_args.args[0]
+        self.assertIn("123", registered_details)
+        self.assertEqual(registered_details["123"]["id"], "123")
+        self.assertTrue(registered_details["123"]["sections"])
+
     async def test_bounded_client_does_not_follow_redirects(self) -> None:
         requests: list[str] = []
 

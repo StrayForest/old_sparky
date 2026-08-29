@@ -9,7 +9,10 @@ import httpx
 
 from apps.platform_api.app.services import home_content as base
 from apps.platform_api.app.services.patch_detail import structure_patch_detail
-from apps.platform_api.app.services.patch_translation import apply_cached_patch_translation
+from apps.platform_api.app.services.patch_translation import (
+    apply_cached_patch_translation,
+    ensure_patch_translation_records,
+)
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.redis import redis_client
 
@@ -86,6 +89,7 @@ async def _publish_patch_refresh(
     publish_catalog: bool,
 ) -> None:
     cache = redis_client()
+    structured_details: dict[str, dict[str, Any]] = {}
     try:
         async with cache.pipeline(transaction=True) as pipeline:
             if publish_catalog:
@@ -96,6 +100,7 @@ async def _publish_patch_refresh(
                 )
             for patch_id, raw_detail in details.items():
                 structured = structure_patch_detail(raw_detail, catalog)
+                structured_details[patch_id] = structured
                 pipeline.set(
                     base.PATCH_DETAIL_KEY_PREFIX + patch_id,
                     json.dumps(structured, ensure_ascii=False, separators=(",", ":")),
@@ -104,6 +109,20 @@ async def _publish_patch_refresh(
             await pipeline.execute()
     finally:
         await cache.aclose()
+    if structured_details:
+        try:
+            translation_registration = await ensure_patch_translation_records(
+                structured_details
+            )
+            if translation_registration["enqueue_failures"]:
+                logger.error(
+                    "patch_miss_translation_registration_degraded registered=%s enqueued=%s failures=%s",
+                    translation_registration["registered"],
+                    translation_registration["enqueued"],
+                    translation_registration["enqueue_failures"],
+                )
+        except Exception:
+            logger.exception("patch_miss_translation_registration_failed")
 
 
 async def _refresh_patch_cache_after_miss() -> None:

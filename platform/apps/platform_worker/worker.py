@@ -23,6 +23,7 @@ from apps.platform_api.app.services.home_content_runtime import refresh_home_con
 from apps.platform_api.app.services.patch_detail import get_patch_detail_source
 from apps.platform_api.app.services.patch_translation import (
     PATCH_TRANSLATION_TASK_NAME,
+    mark_patch_translation_failed,
     translate_patch_to_russian,
 )
 from apps.platform_api.app.services.player_commitments import reconcile_player_commitments
@@ -303,44 +304,85 @@ def player_commitment_reconciliation() -> dict[str, int | bool]:
     return _run_on_worker_loop(_run_locked_player_commitment_reconciliation())
 
 
-def _enqueue_patch_translation_jobs(payload: dict[str, Any]) -> int:
-    enqueued = 0
-    seen: set[str] = set()
-    for patch in payload.get("patches") or []:
-        if not isinstance(patch, dict):
-            continue
-        patch_id = str(patch.get("id") or "").strip()
-        if not patch_id.isdigit() or patch_id in seen:
-            continue
-        seen.add(patch_id)
-        try:
-            patch_translation.delay(patch_id)
-            enqueued += 1
-        except Exception:
-            logger.exception(
-                "Failed to enqueue patch translation patch_id=%s.",
-                patch_id,
-            )
-    return enqueued
-
-
 @celery_app.task(name="platform.home_content_refresh", ignore_result=True)
 def home_content_refresh() -> dict[str, Any]:
-    payload = _run_on_worker_loop(refresh_home_content(force=True))
-    payload["patch_translations_enqueued"] = _enqueue_patch_translation_jobs(payload)
-    return payload
+    return _run_on_worker_loop(refresh_home_content(force=True))
 
 
-async def _run_patch_translation(patch_id: str) -> dict[str, Any]:
-    source = await get_patch_detail_source(patch_id)
+async def _record_patch_translation_failure(
+    patch_id: str,
+    source_hash: str | None,
+    error_code: str,
+) -> None:
+    try:
+        await mark_patch_translation_failed(patch_id, source_hash, error_code)
+    except Exception:
+        logger.exception(
+            "patch_translation_failure_record_failed patch_id=%s source_hash=%s",
+            patch_id,
+            source_hash,
+        )
+
+
+async def _run_patch_translation(
+    patch_id: str,
+    source_hash: str | None = None,
+) -> dict[str, Any]:
+    try:
+        source = await get_patch_detail_source(patch_id)
+    except Exception as error:  # noqa: BLE001
+        await _record_patch_translation_failure(
+            patch_id,
+            source_hash,
+            type(error).__name__,
+        )
+        logger.warning(
+            "patch_translation_source_load_failed patch_id=%s error=%s",
+            patch_id,
+            type(error).__name__,
+        )
+        return {
+            "ok": False,
+            "status": "failed",
+            "patch_id": patch_id,
+            "error": type(error).__name__,
+        }
     if source is None:
+        await _record_patch_translation_failure(
+            patch_id,
+            source_hash,
+            "source_not_found",
+        )
         return {
             "ok": False,
             "status": "not_found",
             "patch_id": patch_id,
         }
-    catalog = await get_deadlock_asset_catalog()
-    return await translate_patch_to_russian(source, catalog, settings=settings)
+    try:
+        catalog = await get_deadlock_asset_catalog()
+        return await translate_patch_to_russian(
+            source,
+            catalog,
+            settings=settings,
+            expected_source_hash=source_hash,
+        )
+    except Exception as error:  # noqa: BLE001
+        await _record_patch_translation_failure(
+            patch_id,
+            source_hash,
+            type(error).__name__,
+        )
+        logger.warning(
+            "patch_translation_task_failed patch_id=%s error=%s",
+            patch_id,
+            type(error).__name__,
+        )
+        return {
+            "ok": False,
+            "status": "failed",
+            "patch_id": patch_id,
+            "error": type(error).__name__,
+        }
 
 
 @celery_app.task(
@@ -349,8 +391,11 @@ async def _run_patch_translation(patch_id: str) -> dict[str, Any]:
     soft_time_limit=180,
     time_limit=210,
 )
-def patch_translation(patch_id: str) -> dict[str, Any]:
-    return _run_on_worker_loop(_run_patch_translation(patch_id))
+def patch_translation(
+    patch_id: str,
+    source_hash: str | None = None,
+) -> dict[str, Any]:
+    return _run_on_worker_loop(_run_patch_translation(patch_id, source_hash))
 
 
 async def _run_auth_lifecycle_cleanup() -> dict[str, int]:

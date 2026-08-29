@@ -13,6 +13,9 @@ from apps.platform_api.app.services import home_content as base
 from apps.platform_api.app.services.external_content_http import (
     BoundedNoRedirectAsyncClient,
 )
+from apps.platform_api.app.services.patch_translation import (
+    ensure_patch_translation_records,
+)
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.redis import redis_client
 
@@ -156,6 +159,22 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
                     ex=base.PATCH_DETAIL_TTL_SECONDS,
                 )
             await pipeline.execute()
+        if patch_details:
+            try:
+                translation_registration = await ensure_patch_translation_records(
+                    patch_details
+                )
+                if translation_registration["enqueue_failures"]:
+                    logger.error(
+                        "home_content_translation_registration_degraded registered=%s enqueued=%s failures=%s",
+                        translation_registration["registered"],
+                        translation_registration["enqueued"],
+                        translation_registration["enqueue_failures"],
+                    )
+            except Exception:
+                logger.exception(
+                    "home_content_translation_registration_failed"
+                )
         return payload
     finally:
         if acquired:

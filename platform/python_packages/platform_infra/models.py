@@ -385,6 +385,49 @@ class MediaVariant(Base):
     )
 
 
+class PatchTranslation(TimestampMixin, Base):
+    """Durable translation state for one immutable patch source version."""
+
+    __tablename__ = "patch_translations"
+    __table_args__ = (
+        UniqueConstraint(
+            "patch_id",
+            "source_hash",
+            "locale",
+            "translation_version",
+            "model",
+            name="uq_patch_translations_identity",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'completed', 'failed', 'skipped', 'superseded')",
+            name="status_allowed",
+        ),
+        CheckConstraint("length(source_hash) = 64", name="source_hash_length"),
+        CheckConstraint("attempts >= 0", name="attempts_nonnegative"),
+        Index("ix_patch_translations_patch_id_status", "patch_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    patch_id: Mapped[str] = mapped_column(String(32))
+    source_hash: Mapped[str] = mapped_column(String(64))
+    locale: Mapped[str] = mapped_column(String(16))
+    translation_version: Mapped[str] = mapped_column(String(32))
+    model: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    translated_segments: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_enqueued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    processing_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    translated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class PlayerProfile(TimestampMixin, Base):
     __tablename__ = "player_profiles"
 
