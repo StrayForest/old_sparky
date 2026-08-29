@@ -518,7 +518,7 @@ elif [[ "$profile" == "external-vote" ]]; then
     "$QA_PYTHON" "$TOOLS_DIR/platform_prepare_external_vote_fixture.py" \
       --env-file "$RUNTIME_ROOT/shared/.env.platform" \
       --origin "$EXPECTED_ORIGIN" \
-      --local-origin "http://127.0.0.1" \
+      --local-origin "http://127.0.0.1:8010" \
       --report-path "$external_vote_report" \
       --manifest-path "$external_vote_manifest" \
       --tournament-count "$external_vote_tournament_count" \

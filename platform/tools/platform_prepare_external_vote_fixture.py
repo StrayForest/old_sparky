@@ -21,6 +21,7 @@ from platform_production_qa import ProductionQa, QaFailure, dispose_engine, load
 
 
 PUBLIC_ORIGIN = "https://old-sparky.com"
+LOCAL_API_ORIGIN = "http://127.0.0.1:8010"
 MIN_USERS_PER_TOURNAMENT = 14
 MAX_USERS_PER_TOURNAMENT = 500
 MAX_TOURNAMENTS = 20
@@ -60,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--origin", default=PUBLIC_ORIGIN)
-    parser.add_argument("--local-origin", default="http://127.0.0.1")
+    parser.add_argument("--local-origin", default=LOCAL_API_ORIGIN)
     parser.add_argument("--report-path", type=Path, required=True)
     parser.add_argument("--manifest-path", type=Path, required=True)
     parser.add_argument("--tournament-count", type=int, default=1)
@@ -75,6 +76,8 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
         raise QaFailure("external production fixture preparation must run as root")
     if args.origin.rstrip("/") != PUBLIC_ORIGIN:
         raise QaFailure("external fixture preparation requires the canonical public origin")
+    if args.local_origin.rstrip("/") != LOCAL_API_ORIGIN:
+        raise QaFailure("external fixture preparation requires the loopback API origin")
     if not 1 <= args.tournament_count <= MAX_TOURNAMENTS:
         raise QaFailure("tournament-count is outside the supported bound")
     if not MIN_USERS_PER_TOURNAMENT <= args.users_per_tournament <= MAX_USERS_PER_TOURNAMENT:

@@ -272,6 +272,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn("manifest.json\n", workflow.split("Publish external load evidence", 1)[1])
         self.assertIn("ThreadPoolExecutor", external_client)
         self.assertIn("external_ready_vote", fixture)
+        self.assertIn('LOCAL_API_ORIGIN = "http://127.0.0.1:8010"', fixture)
+        self.assertIn('--local-origin "http://127.0.0.1:8010"', supervisor)
         self.assertIn("session_cookie_name", fixture)
         self.assertIn("csrf_cookie_name", fixture)
         self.assertIn("SystemSampler", observer)
