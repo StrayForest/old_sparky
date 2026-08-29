@@ -70,8 +70,8 @@ external_vote_users_per_tournament="$8"
   echo "Run id must be numeric." >&2
   exit 1
 }
-[[ "$external_vote_tournament_count" =~ ^[1-9][0-9]?$ ]] && (( external_vote_tournament_count <= 20 )) || {
-  echo "External vote tournament count must be between 1 and 20." >&2
+[[ "$external_vote_tournament_count" =~ ^[1-9][0-9]?$ ]] && (( external_vote_tournament_count <= 40 )) || {
+  echo "External vote tournament count must be between 1 and 40." >&2
   exit 1
 }
 [[ "$external_vote_users_per_tournament" =~ ^[1-9][0-9]{1,2}$ ]] && (( external_vote_users_per_tournament >= 14 && external_vote_users_per_tournament <= 500 )) || {
