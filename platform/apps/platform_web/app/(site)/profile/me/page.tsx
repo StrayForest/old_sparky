@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { cookies } from "next/headers";
 import { Hero } from "@/components/layout/hero";
 import { ProfileAccessState } from "@/components/profile/profile-access-state";
-import { ProfileEditor } from "@/components/profile/profile-editor";
+import { ProfileEditor } from "@/components/profile/editor/profile-editor";
 import { parseProfileTab } from "@/lib/profile-model";
 import {
   getServerProfileHeroNames,
