@@ -157,6 +157,9 @@ class DeadlockPersistenceModelTests(unittest.TestCase):
         self.assertIn("trg_tournament_deadlock_ready_votes_open_round", ready_vote_migration)
         self.assertIn("_set_shard_count(128)", ready_vote_shard_migration)
         self.assertIn("LOCK TABLE {TABLE_NAME} IN ACCESS EXCLUSIVE MODE", ready_vote_shard_migration)
+        self.assertIn("FROM pg_constraint AS constraint_entry", ready_vote_shard_migration)
+        self.assertIn("cardinality(constraint_entry.conkey) = 1", ready_vote_shard_migration)
+        self.assertIn("ADD CONSTRAINT {SHARD_CONSTRAINT}", ready_vote_shard_migration)
         self.assertIn("shard BETWEEN 0 AND {upper_bound}", ready_vote_shard_migration)
 
 

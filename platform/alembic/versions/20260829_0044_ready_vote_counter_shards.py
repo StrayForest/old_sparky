@@ -108,18 +108,47 @@ def _replace_counter_trigger_function(shard_count: int) -> None:
 def _set_shard_count(shard_count: int) -> None:
     upper_bound = shard_count - 1
     op.execute(f"LOCK TABLE {TABLE_NAME} IN ACCESS EXCLUSIVE MODE")
-    op.drop_constraint(
-        SHARD_CONSTRAINT,
-        "tournament_deadlock_ready_vote_count_shards",
-        type_="check",
-        schema="platform",
+    # 0041 created this check through the SQLAlchemy naming convention.  An
+    # Alembic drop operation can re-apply that convention to the supplied
+    # identifier (and truncate/hash it), so addressing the logical name is not
+    # reliable here.  Locate the single check whose key is the shard column
+    # and drop its actual database name.  This also keeps the migration
+    # reversible for databases created from either migration path.
+    op.execute(
+        f"""
+        DO $$
+        DECLARE
+            existing_constraint text;
+        BEGIN
+            SELECT constraint_entry.conname
+            INTO existing_constraint
+            FROM pg_constraint AS constraint_entry
+            JOIN pg_attribute AS shard_column
+              ON shard_column.attrelid = constraint_entry.conrelid
+             AND shard_column.attnum = constraint_entry.conkey[1]
+            WHERE constraint_entry.conrelid = '{TABLE_NAME}'::regclass
+              AND constraint_entry.contype = 'c'
+              AND cardinality(constraint_entry.conkey) = 1
+              AND shard_column.attname = 'shard'
+            LIMIT 1;
+
+            IF existing_constraint IS NOT NULL THEN
+                EXECUTE format(
+                    'ALTER TABLE {TABLE_NAME} DROP CONSTRAINT %I',
+                    existing_constraint
+                );
+            END IF;
+        END
+        $$;
+        """
     )
     _rebuild_counter_rows(shard_count)
-    op.create_check_constraint(
-        SHARD_CONSTRAINT,
-        "tournament_deadlock_ready_vote_count_shards",
-        f"shard BETWEEN 0 AND {upper_bound}",
-        schema="platform",
+    op.execute(
+        f"""
+        ALTER TABLE {TABLE_NAME}
+        ADD CONSTRAINT {SHARD_CONSTRAINT}
+        CHECK (shard BETWEEN 0 AND {upper_bound})
+        """
     )
     _replace_counter_trigger_function(shard_count)
 
