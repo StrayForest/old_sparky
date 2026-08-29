@@ -396,8 +396,8 @@ The production retained-load workflow exposes this mode directly. For the
 interrupted write-burst recovery.
 
 The measured pool baseline is a reviewed runtime configuration, not a load-test
-CLI override. The current two-worker VPS baseline uses API pool size `20`,
-`max_overflow=0`, worker pool size `2` and a total connection budget of `44`.
+CLI override. The current two-worker VPS baseline uses API pool size `24`,
+`max_overflow=0`, worker pool size `2` and a total connection budget of `52`.
 During the planned production configuration window, apply only the three
 changed connection keys to the root-only canonical env and let the renderer
 refresh scoped service envs:
