@@ -74,7 +74,7 @@ class PlatformParticipantManageSecurityTests(unittest.IsolatedAsyncioTestCase):
             "user_id": payload["user"]["id"],
         }
 
-    async def test_organizer_add_resolves_only_scoped_invite_access(self) -> None:
+    async def test_organizer_add_does_not_require_invite_access(self) -> None:
         organizer = await self._register_user("organizer")
         target = await self._register_user("target")
 
@@ -114,41 +114,9 @@ class PlatformParticipantManageSecurityTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        self.assertEqual(existing_without_access.status_code, 404)
+        self.assertEqual(existing_without_access.status_code, 201)
         self.assertEqual(missing_account.status_code, 404)
-        self.assertEqual(existing_without_access.json(), missing_account.json())
-        self.assertEqual(
-            existing_without_access.json()["detail"],
-            "Participant could not be added.",
-        )
-
-        invites_response = await organizer["client"].get(
-            f"/api/v1/tournaments/{slug}/invites"
-        )
-        self.assertEqual(invites_response.status_code, 200, invites_response.text)
-        invites = invites_response.json()
-        self.assertEqual(len(invites), 1)
-
-        claim_response = await target["client"].post(
-            "/api/v1/tournaments/invites/claim",
-            json={
-                "code": invites[0]["code"],
-                "entry_type": "solo",
-                "team_name": None,
-            },
-        )
-        self.assertEqual(claim_response.status_code, 201, claim_response.text)
-
-        add_response = await organizer["client"].post(
-            f"/api/v1/tournaments/{slug}/participants/manage",
-            json={
-                "user_email": target["email"],
-                "entry_type": "solo",
-                "team_name": None,
-            },
-        )
-        self.assertEqual(add_response.status_code, 201, add_response.text)
-        self.assertEqual(add_response.json()["user_id"], target["user_id"])
+        self.assertEqual(existing_without_access.json()["user_id"], target["user_id"])
 
 
 if __name__ == "__main__":

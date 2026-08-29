@@ -138,7 +138,7 @@ class PlatformTournamentInactiveWorkspaceIntegrationTests(unittest.IsolatedAsync
             self._assert_status(
                 await member["client"].post(
                     f"/api/v1/tournaments/{slug}/join",
-                    json={"entry_type": "solo"},
+                    json={"entry_type": "solo", "invite_code": invite["code"]},
                 ),
                 201,
             )

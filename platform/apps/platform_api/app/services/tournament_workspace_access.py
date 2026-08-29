@@ -79,7 +79,7 @@ async def ensure_private_tournament_read_membership_is_active(
         for char in str(request.query_params.get("invite_code") or "").upper()
         if char.isalnum()
     )
-    now = auth_session.now if auth_session is not None else datetime.now(UTC)
+    now = getattr(auth_session, "now", datetime.now(UTC))
     if invite_code:
         valid_invite = await db_session.scalar(
             select(TournamentInvite.id)

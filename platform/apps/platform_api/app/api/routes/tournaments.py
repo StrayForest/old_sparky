@@ -1630,8 +1630,8 @@ def winner_label_for_match(match: TournamentMatch) -> str | None:
     return None
 
 
-def normalize_invite_code(code: str) -> str:
-    return "".join(char for char in code.upper() if char.isalnum())
+def normalize_invite_code(code: object) -> str:
+    return "".join(char for char in str(code or "").upper() if char.isalnum())
 
 
 async def valid_invite_code_for_tournament(

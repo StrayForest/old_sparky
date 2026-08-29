@@ -153,7 +153,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
         joined = self._assert_status(
             await player["client"].post(
                 f"/api/v1/tournaments/{slug_a}/join",
-                json={"entry_type": "solo"},
+                json={"entry_type": "solo", "invite_code": invite_a["code"]},
             ),
             201,
         )
@@ -226,7 +226,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
 
         rejected_rejoin = await player["client"].post(
             f"/api/v1/tournaments/{slug_a}/join",
-            json={"entry_type": "solo"},
+            json={"entry_type": "solo", "invite_code": invite_a["code"]},
         )
         self.assertEqual(rejected_rejoin.status_code, 409, rejected_rejoin.text)
         self.assertIn("already registered", rejected_rejoin.json()["detail"])
