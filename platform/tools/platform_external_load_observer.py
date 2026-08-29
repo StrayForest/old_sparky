@@ -12,7 +12,12 @@ from pathlib import Path
 import signal
 import time
 
-from platform_production_qa import SystemSampler, load_env_file
+from platform_production_qa import (
+    SystemSampler,
+    collect_api_journal_lines,
+    load_env_file,
+    summarize_request_perf_logs,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +50,7 @@ async def async_main() -> int:
             pass
 
     started_at = datetime.now(UTC)
+    journal_since = started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
     started_monotonic = time.monotonic()
     await sampler.start()
     timed_out = False
@@ -57,14 +63,22 @@ async def async_main() -> int:
     finally:
         await sampler.stop()
 
+    finished_at = datetime.now(UTC)
+    journal_until = finished_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    request_perf_lines = collect_api_journal_lines(journal_since, journal_until)
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": 1,
         "started_at": started_at.isoformat(),
-        "finished_at": datetime.now(UTC).isoformat(),
+        "finished_at": finished_at.isoformat(),
         "stop_file_seen": args.stop_file.exists(),
         "timed_out": timed_out,
         "system": sampler.summary(),
+        "server_request_perf_logs": summarize_request_perf_logs(
+            request_perf_lines,
+            tournament_slug=None,
+        ),
     }
     args.output.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
