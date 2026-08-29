@@ -184,67 +184,14 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("canonical production origin", supervisor)
         self.assertIn("RETAINED_LOAD_MATRIX_EXPORT=", supervisor)
 
-    def test_production_retained_load_has_exact_manual_cleanup_contour(self) -> None:
-        load_workflow = (
-            REPO_ROOT / ".github/workflows/platform-production-retained-load-matrix.yml"
-        ).read_text()
-        cleanup_workflow = (
-            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml"
-        ).read_text()
-        abort_workflow = (
-            REPO_ROOT / ".github/workflows/platform-production-retained-load-abort.yml"
-        ).read_text()
-        load_supervisor = (
-            REPO_ROOT / "platform/tools/platform_production_retained_load_matrix_qa.sh"
-        ).read_text()
-        cleanup_supervisor = (
-            REPO_ROOT / "platform/tools/platform_production_retained_load_cleanup_qa.sh"
-        ).read_text()
-        cleanup_tool = (
-            REPO_ROOT / "platform/tools/platform_cleanup_retained_matrix.py"
-        ).read_text()
-
-        for workflow in (load_workflow, cleanup_workflow, abort_workflow):
-            self.assertIn("workflow_dispatch:", workflow)
-            self.assertNotIn("schedule:", workflow)
-            self.assertIn('test "$GITHUB_REF" = "refs/heads/dev"', workflow)
-            self.assertIn("environment: production", workflow)
-            self.assertIn("actions/upload-artifact@v6", workflow)
-        self.assertIn("RUN-PRODUCTION-RETAINED-LOAD-MATRIX", load_workflow)
-        self.assertIn("write-burst", load_workflow)
-        self.assertIn("read-mix", load_workflow)
-        self.assertIn('--mode read-mix', load_supervisor)
-        self.assertIn("write_burst_users_per_tournament", load_workflow)
-        self.assertIn('--mode write-burst', load_supervisor)
-        self.assertIn("DELETE-PRODUCTION-RETAINED-LOAD", cleanup_workflow)
-        self.assertIn("ABORT-PRODUCTION-RETAINED-LOAD", abort_workflow)
-        self.assertIn("ABORT_EVIDENCE_EXPORT=", abort_workflow)
-        self.assertIn("server-observability.log", abort_workflow)
-        self.assertIn("https://old-sparky.com", load_supervisor)
-        self.assertIn("https://old-sparky.com", cleanup_supervisor)
-        self.assertIn("flock -n 9", load_supervisor)
-        self.assertIn("flock -n 9", cleanup_supervisor)
-        self.assertIn("PRODUCTION_RETAINED_LOAD_MATRIX_EXPORT=", load_supervisor)
-        self.assertIn("server-observability.log", load_supervisor)
-        self.assertIn("server-observability.log", load_workflow)
-        self.assertIn("qa-command.log", load_supervisor)
-        self.assertIn("qa-command.log", load_workflow)
-        matrix_block = load_supervisor.split('if [[ "$profile" == "matrix" ]]', 1)[1].split(
-            'elif [[ "$profile" == "write-burst" ]]', 1
-        )[0]
-        self.assertIn('    --output-root "$run_root"\n  qa_status="$?"', matrix_block)
-        self.assertNotIn('    --output-root "$run_root" \\\n  qa_status="$?"', matrix_block)
-        self.assertIn("PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1", cleanup_supervisor)
-        self.assertIn("control account", cleanup_tool)
-        self.assertIn("_validate_tournament_graph_boundary", cleanup_tool)
-        self.assertIn("platform_cleanup_retained_matrix.py", load_supervisor + cleanup_supervisor)
-        self.assertIn("async def _main()", cleanup_tool)
-        self.assertNotIn("asyncio.run(dispose_engine())", cleanup_tool)
-        self.assertIn("platform_recover_retained_report.py", cleanup_supervisor)
-        self.assertIn("timeout --signal=TERM --kill-after=30s", load_supervisor)
-        self.assertIn('HTTP_MAX_CONNECTIONS="${PLATFORM_QA_HTTP_MAX_CONNECTIONS:-512}"', load_supervisor)
-
     def test_external_public_load_keeps_measurement_outside_origin(self) -> None:
+        retired_production_workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-retained-load-matrix.yml"
+        )
+        self.assertFalse(
+            retired_production_workflow.exists()
+        )
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-external-load.yml"
         ).read_text()
@@ -255,7 +202,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             REPO_ROOT / "platform/tools/platform_prepare_external_vote_fixture.py"
         ).read_text()
         supervisor = (
-            REPO_ROOT / "platform/tools/platform_production_retained_load_matrix_qa.sh"
+            REPO_ROOT / "platform/tools/platform_production_external_fixture_qa.sh"
         ).read_text()
         observer = (
             REPO_ROOT / "platform/tools/platform_external_load_observer.py"
@@ -268,7 +215,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("manual_refresh_count", workflow)
         self.assertIn("platform_external_load_observer.py", supervisor)
         self.assertIn('EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"', supervisor)
-        self.assertIn("External-vote profile requires the dedicated external-load confirmation.", supervisor)
+        self.assertIn("External-load fixture requires the dedicated external-load confirmation.", supervisor)
+        self.assertIn("supports only the external-vote profile.", supervisor)
+        self.assertNotIn("platform_seed_retained_tournament_matrix.py", supervisor)
+        self.assertNotIn('--mode read-mix', supervisor)
+        self.assertNotIn('--mode write-burst', supervisor)
         self.assertIn("observer_deadline=$(( $(date +%s) + 10800 ))", supervisor)
         self.assertIn("ControlMaster auto", workflow)
         self.assertIn("ControlPersist 15m", workflow)

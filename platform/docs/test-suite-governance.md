@@ -21,18 +21,17 @@ The machine-readable group manifest is `platform/tests/test-suite-manifest.json`
 | `live-public` | production operator | `platform_live_browser_qa.sh public` through `platform-live-launch.yml` | canonical production origin, dedicated server QA UID |
 | `live-user-destructive` | production operator | `platform-live-user-qa.yml` dispatches `platform_live_user_qa.sh` over SSH | production server; marked fixture data and mandatory cleanup |
 | `retained-load-preprod` | performance operator | `platform-retained-load-matrix.yml` dispatches `platform_retained_load_matrix_qa.sh` over SSH | dedicated pre-production server; retained fixture data; explicit operator confirmation |
-| `retained-load-production` | production/performance operator | `platform-production-retained-load-matrix.yml` and `platform-production-retained-load-cleanup.yml` over SSH | canonical live origin; retained fixture data; explicit production confirmation and exact cleanup |
+| `external-public-load` | production/performance operator | `platform-production-external-load.yml` with exact retained-load cleanup/abort over SSH | canonical live origin; external GitHub runner plus origin fixture/observer; explicit production confirmation and exact cleanup |
 
 The ordinary CI workflow runs all deterministic backend, migration, web
 hermetic, documentation, typecheck, lint and build checks. Server-side smoke
 and browser journeys are dispatched through GitHub Actions and execute on the
 production server over the controlled SSH wrappers. Live-user and destructive
 journeys remain explicit operator gates and are never silently hidden by a
-grep exclusion. The retained load matrix is also an explicit operator gate,
-but its target is a dedicated pre-production host and its API origin is
-loopback on that host. It must not run on an ordinary GitHub-hosted runner:
-the runner would measure its own CPU/network limits instead of the platform's
-database, workers and host resources.
+grep exclusion. The retained load matrix is an explicit pre-production
+operator gate with a loopback API origin on that dedicated host. Public
+capacity tests use the external GitHub runner contour below, so their generator
+does not consume the production VPS CPU.
 
 The retained matrix's 10,000 users are persisted scale-fixture accounts, not
 10,000 simultaneous request workers. Its `matrix` profile exercises ordinary
@@ -42,15 +41,12 @@ workspace reload. Its `write-burst` profile measures Ready Check vote POST
 contention after the server-known window. The current product has no
 background tournament-update profile.
 
-The production retained-load group is a deliberate exception to the normal
-release gate: it is never scheduled, never part of ordinary CI, and never runs
-on a GitHub-hosted runner. It uses the one production VPS through the canonical
-`https://old-sparky.com` origin, so it measures the live edge, API, worker,
-database and host resources. “There are no existing users” does not make this
-safe to run casually: the test still consumes CPU/RAM/DB/Redis capacity,
-publishes public tournaments, changes caches/metrics/logs and can affect site
-availability while the matrix is active. Use an approved low-traffic window
-and monitor the host during the run.
+The external-public-load group is a deliberate exception to the normal release
+gate: it is never scheduled and never part of ordinary CI. Fixture preparation,
+observation and exact cleanup use the production origin, while the measured
+HTTP generator runs on a GitHub-hosted runner outside the VPS. The application
+still consumes its normal CPU/RAM/DB/Redis capacity while serving the test, so
+use an approved low-traffic window and monitor the host during the run.
 
 ## GitHub execution
 
@@ -169,10 +165,7 @@ The workflow supports the current request-driven journeys:
 Use a 30-second spread for the human-shaped profile and a separate zero- or
 short-spread run for an aggressive safety-margin profile. A successful result
 requires the expected request count, zero unexpected statuses/timeouts, correct
-vote/state contracts, and the configured latency budget. The old
-`platform-production-retained-load-matrix.yml` workflow remains an
-origin-local diagnostic for setup/data-volume behavior; because its generator
-runs on the same VPS, its latency and CPU are not a public capacity gate.
+vote/state contracts, and the configured latency budget.
 
 Run only from the reviewed `dev` ref in a low-traffic window:
 
@@ -195,80 +188,15 @@ reload phase is reported separately and accepts only `200` or a valid
 conditional `304`; it never creates background traffic.
 
 The workflow performs exact cleanup in its final step. If the runner is
-canceled before that step, use the existing exact retained-load cleanup/abort
-workflow with the same load run ID before starting another run. Do not expose
-the manifest, cookies or CSRF material in an artifact or log.
+canceled before that step, use the exact retained-load cleanup/abort workflow
+with the same load run ID before starting another run. Do not expose the
+manifest, cookies or CSRF material in an artifact or log.
 
 At each run record attempted/completed requests, p50/p95/p99, status and
 timeout counts, Cloudflare diagnostic headers, server observer pressure,
 PostgreSQL pool waits/query pressure, and cleanup counts. Repeat the same
 fixture size with `read-mix` separately; do not combine its read latency with
 vote-write latency.
-
-### Retained production load and exact cleanup
-
-The live matrix is a manual operator gate. It creates approximately 10,000
-synthetic `@example.com` users, 20 retained tournaments and 600 teams through
-the real API workflow: profile and captain-profile saves, changed saves,
-public registration, invite-code claim plus registration, ready-check,
-captain round, assignment and bracket creation. The existing control account
-is only joined to selected tournaments; its profile and credentials are not
-changed. The workflow summary prints direct browser links for its registered,
-ready-check and assigned-team cases.
-
-Run it only from `dev` after the reviewed commit has been deployed:
-
-```bash
-gh workflow run platform-production-retained-load-matrix.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
-  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=16
-gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
-```
-
-The workflow supports `profile=matrix`, `profile=read-mix` and
-`profile=write-burst`. The matrix profile is the ordinary retained
-data-volume/workflow run. The read-mix profile is the simultaneous current
-page-read benchmark. The write-burst profile uses the server-known Ready
-Check window and measures vote writes; it does not create background
-tournament traffic. These profiles execute their generator on the production
-VPS and are therefore origin-local diagnostics, not the public capacity gate;
-use the external workflow above for public Cloudflare measurements.
-
-The detailed reports remain on the VPS under
-`/opt/oldsparky/platform/shared/production-retained-matrix/gha-<load-run-id>/`
-until cleanup. The Actions artifact contains only the compact summary and
-bounded logs; it does not expose invite codes.
-
-After opening the summary links and manually checking the site as the control
-account, run the separate exact cleanup workflow with that load workflow's ID:
-
-```bash
-gh workflow run platform-production-retained-load-cleanup.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=DELETE-PRODUCTION-RETAINED-LOAD \
-  -f load_run_id=<load-run-id> \
-  -f control_email=aleksei.lisitsin1@gmail.com
-gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
-```
-
-If a retained production load is canceled while its SSH step is active, run
-`platform-production-retained-load-abort.yml` first with the exact canceled
-load run ID. The load supervisor has a 180-minute remote ceiling and the abort
-workflow terminates only that run's process tree, then verifies the shared
-lock is available. Cleanup can recover a missing browser report from the
-durable `PreprodTestRun.report`; it remains fail-closed and deletes nothing if
-the recovered identity is incomplete or overlaps unrelated data.
-
-Cleanup deletes only the selected run's marked synthetic users and their
-tournaments; tournament participants, invites, ready-check/captain/assignment
-rows, brackets, sessions, audit rows and eligible media metadata are removed
-through the exact graph and database cascades. It preserves the control
-account and all unrelated production data. If any identity, marker, report
-path, ownership or cross-run check fails, cleanup stops before deletion.
-The database keeps only the exact `PreprodTestRun` row marked `cleaned` as an
-operator trace; it contains no live account credentials or active fixture
-rows.
 
 ## Production browser gate
 

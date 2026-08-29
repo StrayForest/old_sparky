@@ -65,11 +65,11 @@ catalog/tournament reads plus a conditional manual workspace reload, while
 part of the production flow. Public capacity measurements use the external
 runner workflow `platform-production-external-load.yml`: deterministic fixture
 setup is performed on the origin, the HTTP measurement runs outside the VPS,
-and a bounded origin observer records API/PG/Redis/system pressure. The older
-retained-load workflow remains useful for origin-local workflow diagnostics but
-must not be treated as a clean public capacity result because its generator
-shares the VPS. Production service logs are kept in journald, Nginx owns the
-edge access log, and size-based rotation bounds text log files.
+and a bounded origin observer records API/PG/Redis/system pressure. The
+pre-production retained matrix remains available only for non-production
+workflow/data-volume diagnostics; it is not a public capacity result.
+Production service logs are kept in journald, Nginx owns the edge access log,
+and size-based rotation bounds text log files.
 
 ## Production invariants
 

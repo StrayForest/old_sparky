@@ -314,45 +314,16 @@ If the workflow is canceled, perform the exact retained-load abort/cleanup
 procedure with the same run ID before another load. The temporary manifest
 must not be copied to Actions artifacts.
 
-The older retained-load workflow below remains available for origin-local
-setup/data-volume diagnostics. Its generator shares the production VPS, so
-its CPU and latency must not be presented as a public Cloudflare capacity
-result.
+The public external-load workflow owns the production capacity test. It keeps
+fixture preparation, observation and exact cleanup on the origin while the
+measured HTTP client runs on a GitHub-hosted runner outside the VPS.
 
-### Live production retained load
+### External fixture cleanup and runtime baseline
 
-Use this only in a low-traffic maintenance window. It runs on the single live
-VPS through `https://old-sparky.com`, retains its synthetic data for browser
-inspection, and therefore can compete with real traffic for VPS CPU/RAM,
-PostgreSQL, Redis, Celery and disk. A lack of existing user accounts does not
-remove those production risks. Do not start it while a release, migration,
-backup restore, live browser gate or another load/cleanup operation is active.
-
-The `production` GitHub environment reuses the existing production SSH
-secrets. Start the reviewed `dev` workflow manually:
-
-```bash
-gh workflow run platform-production-retained-load-matrix.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
-  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=16 \
-  -f profile=matrix
-gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
-```
-
-After the workflow is deployed and the ordinary retained matrix has been
-reviewed, run the Ready Check vote-burst gate with the same confirmation and
-control account:
-
-```bash
-gh workflow run platform-production-retained-load-matrix.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=RUN-PRODUCTION-RETAINED-LOAD-MATRIX \
-  -f control_email=aleksei.lisitsin1@gmail.com -f concurrency=16 \
-  -f profile=write-burst -f write_burst_profile=all \
-  -f write_burst_users_per_tournament=500 -f write_burst_time_scale=1.0
-gh run watch <write-burst-load-run-id> --repo StrayForest/old_sparky --exit-status
-```
+Run the external workflow only in a low-traffic maintenance window. It uses
+the production SSH environment for fixture preparation, observation and exact
+cleanup, while the measured HTTP client runs on a GitHub-hosted runner outside
+the VPS.
 
 The `write-burst` profile measures real Ready Check vote POST contention after
 the server-known window. It reports accepted/rejected votes, response latency,
@@ -386,14 +357,8 @@ The browser timer itself must produce zero Ready Check requests before
 The separate `read-mix` profile is the read-side capacity test; it reports the
 304 ratio and manual-refresh latency for both the tournament page and bracket
 page without adding a background refresh loop. Its bracket fixture is
-intentionally empty; the retained matrix remains the workflow/data-volume
-profile for large serialized brackets.
-
-The production retained-load workflow exposes this mode directly. For the
-10,000-user mixed baseline, use `profile=write-burst`,
-`write_burst_profile=all`, `write_burst_users_per_tournament=500` and
-`write_burst_time_scale=1.0`; the exact cleanup workflow also supports an
-interrupted write-burst recovery.
+intentionally empty; large workflow/data-volume checks belong to the dedicated
+pre-production matrix.
 
 The measured pool baseline is a reviewed runtime configuration, not a load-test
 CLI override. The current two-worker VPS baseline uses API pool size `24`,
@@ -439,10 +404,9 @@ its retained report and one-row summary from the matching durable
 ownership and graph-boundary check before deleting anything. A recovered run
 is never considered a passed load measurement.
 
-If a tournament was committed before its POST timed out at the edge, the
-durable report may contain the synthetic users but no tournament ID. The
-cleanup validator then recovers only the exact write-burst/matrix marker and
-organizer scope recorded for that run. Any malformed marker match or organizer
+If a fixture was committed before the external runner timed out at the edge,
+the cleanup validator recovers only the exact external-load marker and
+ownership scope recorded for that run. Any malformed marker match or ownership
 outside the manifest remains a fail-closed cleanup error; this recovery never
 broadens deletion to a generic historical search.
 
@@ -450,15 +414,7 @@ The cleanup command also disposes its async database engine in the same event
 loop as validation/deletion; cross-loop asyncpg errors in a successful cleanup
 log are treated as a regression and must not be ignored.
 
-The workflow summary includes the worst HTTP p95/p99, bottleneck classes and
-a manual-inspection table with links such as
-`https://old-sparky.com/tournaments/<slug>`. Open those links in a browser,
-log in as `aleksei.lisitsin1@gmail.com`, inspect the public and invite-only
-registrations, ready-check states and the assigned team, then perform the
-manual functional checks before cleanup. The report artifact is compact;
-detailed reports stay on the VPS and may contain operational identifiers.
-
-When inspection is complete, clean only the exact load workflow run:
+When the external load completes, clean only the exact load workflow run:
 
 ```bash
 gh workflow run platform-production-retained-load-cleanup.yml \
@@ -470,14 +426,11 @@ gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
 The cleanup supervisor holds the same host lock as the load, validates the
-selected run's summary and every detailed report against production database
-markers, refuses any overlap with the control account or outside tournament,
-recovers only a create-before-timeout browser tournament under the exact
-marker/organizer rule above, deletes the exact fixture graph, verifies zero remaining fixture users,
-tournaments, sessions and audit rows, and only then removes the VPS report
-directory. A failed cleanup keeps the data and report directory in place for
-operator recovery; do not run broad `platform_cleanup_preprod_runs.py` against
-production.
+selected run's summary and ownership against production markers, deletes only
+the exact fixture graph, verifies zero remaining fixture users, tournaments,
+sessions and audit rows, and only then removes the VPS report directory. A
+failed cleanup keeps the data and report directory in place for operator
+recovery; do not run broad cleanup against production.
 
 ## Alert thresholds
 

@@ -15,7 +15,7 @@ import time
 
 
 SCRIPT_PATHS = {
-    "/root/old_sparky/platform/tools/platform_production_retained_load_matrix_qa.sh",
+    "/root/old_sparky/platform/tools/platform_production_external_fixture_qa.sh",
 }
 LOCK_PATH = "/run/lock/oldsparky-retained-load-matrix.lock"
 CONFIRMATION = "ABORT-PRODUCTION-RETAINED-LOAD"

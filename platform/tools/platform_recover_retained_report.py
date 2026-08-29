@@ -326,7 +326,7 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("generic supervisor summary is not valid JSON") from exc
         if not (
             isinstance(generic, dict)
-            and generic.get("error") == "production_retained_load_matrix_summary_missing_or_ambiguous"
+            and generic.get("error") == "production_external_load_summary_missing_or_ambiguous"
             and str(generic.get("github_run_id")) == args.load_run_id
         ):
             raise RuntimeError("refusing to remove a non-generic root summary")

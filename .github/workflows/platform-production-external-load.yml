@@ -220,7 +220,7 @@ jobs:
               "$GITHUB_RUN_ID" external-vote "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
             > "$remote_log" 2>&1 <<'REMOTE' &
           set -Eeuo pipefail
-          sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_matrix_qa.sh "$@"
+          sudo -n -- /root/old_sparky/platform/tools/platform_production_external_fixture_qa.sh "$@"
           REMOTE
           remote_pid="$!"
           set -e
