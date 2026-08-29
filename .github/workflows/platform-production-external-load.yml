@@ -155,6 +155,7 @@ jobs:
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/production-external-load-ssh"
+          control_path="/tmp/old-sparky-external-load-ssh-$GITHUB_RUN_ID"
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
@@ -173,10 +174,13 @@ jobs:
             printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
             printf '%s\n' '  ControlMaster auto'
             printf '%s\n' '  ControlPersist 15m'
-            printf '  ControlPath %s/control-%%C\n' "$ssh_dir"
+            printf '  ControlPath %s\n' "$control_path"
           } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"
-          echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+          {
+            echo "SSH_DIR=$ssh_dir"
+            echo "SSH_CONTROL_PATH=$control_path"
+          } >> "$GITHUB_ENV"
 
       - name: Prepare fixture and run external HTTP load
         id: external-run
@@ -407,3 +411,8 @@ jobs:
             || { echo "External load acceptance failed." >&2; exit 1; }
           test "${{ steps.cleanup.outputs.cleanup_status }}" = "0" \
             || { echo "Exact external-load cleanup failed." >&2; exit 1; }
+
+      - name: Remove external-load SSH control socket
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f -- "$SSH_CONTROL_PATH"
