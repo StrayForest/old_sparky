@@ -27,7 +27,6 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockReadyVote,
     TournamentDeadlockReadyRound,
     TournamentInvite,
-    TournamentInviteAccess,
     TournamentMatch,
     TournamentParticipant,
     User,
@@ -149,9 +148,6 @@ async def _user_linked_tournament_ids(
         return set()
     statements = (
         select(Tournament.id).where(Tournament.organizer_user_id.in_(user_ids)),
-        select(TournamentInviteAccess.tournament_id).where(
-            TournamentInviteAccess.user_id.in_(user_ids)
-        ),
         select(TournamentParticipant.tournament_id).where(
             or_(
                 TournamentParticipant.user_id.in_(user_ids),
@@ -371,10 +367,6 @@ async def _validate_tournament_graph_boundary(
         TournamentDeadlockAssignmentRun.tournament_id.in_(tournament_ids)
     )
     cross_scope_checks = (
-        select(TournamentInviteAccess.id).where(
-            TournamentInviteAccess.tournament_id.notin_(tournament_ids),
-            TournamentInviteAccess.invite_id.in_(invite_ids),
-        ),
         select(TournamentMatch.id).where(
             TournamentMatch.tournament_id.notin_(tournament_ids),
             or_(
@@ -398,11 +390,6 @@ async def _validate_tournament_graph_boundary(
         select(PlayerTournamentCommitment.id).where(
             PlayerTournamentCommitment.tournament_id.notin_(tournament_ids),
             PlayerTournamentCommitment.assignment_run_id.in_(assignment_run_ids),
-        ),
-        select(TournamentInviteAccess.id).where(
-            TournamentInviteAccess.tournament_id.in_(tournament_ids),
-            TournamentInviteAccess.invite_id.is_not(None),
-            TournamentInviteAccess.invite_id.notin_(invite_ids),
         ),
         select(TournamentMatch.id).where(
             TournamentMatch.tournament_id.in_(tournament_ids),

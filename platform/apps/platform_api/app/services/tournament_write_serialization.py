@@ -10,7 +10,6 @@ from python_packages.platform_infra.invite_rate_limit import check_invite_rate_l
 from python_packages.platform_infra.models import (
     Tournament,
     TournamentInvite,
-    TournamentInviteAccess,
     TournamentParticipant,
     User,
 )
@@ -30,17 +29,6 @@ PARTICIPANT_ADD_NOT_AVAILABLE = "Participant could not be added."
 def _matched_route_path(request: Request) -> str:
     route = request.scope.get("route")
     return str(getattr(route, "path", "") or "")
-
-
-def _normalize_invite_code(code: object) -> str:
-    return "".join(char for char in str(code or "").upper() if char.isalnum())
-
-
-def _is_invite_claim_request(request: Request) -> bool:
-    return (
-        request.method.upper() == "POST"
-        and _matched_route_path(request).endswith("/invites/claim")
-    )
 
 
 def _is_invite_revoke_request(request: Request) -> bool:
@@ -132,35 +120,6 @@ async def _lock_tournament(
     return str(row.id), row.max_participants, str(row.status)
 
 
-async def _lock_invite_claim(
-    request: Request,
-    *,
-    db_session: AsyncSession,
-) -> None:
-    payload = await _request_json_object(request)
-    code = _normalize_invite_code(payload.get("code"))
-    if not code:
-        return
-
-    invite_snapshot = (
-        await db_session.execute(
-            select(TournamentInvite.id, TournamentInvite.tournament_id).where(
-                TournamentInvite.code == code
-            )
-        )
-    ).first()
-    if invite_snapshot is None:
-        return
-
-    tournament_id = str(invite_snapshot.tournament_id)
-    await _lock_tournament(db_session, tournament_id=tournament_id)
-    await db_session.execute(
-        select(TournamentInvite.id)
-        .where(TournamentInvite.id == invite_snapshot.id)
-        .with_for_update()
-    )
-
-
 async def _lock_invite_revoke(
     request: Request,
     *,
@@ -190,37 +149,6 @@ async def _lock_invite_revoke(
         )
         .with_for_update()
     )
-
-
-async def _ensure_scoped_participant_add_target(
-    request: Request,
-    *,
-    tournament_id: str,
-    db_session: AsyncSession,
-) -> None:
-    payload = await _request_json_object(request)
-    user_email = str(payload.get("user_email") or "").strip().lower()
-    if not user_email:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=PARTICIPANT_ADD_NOT_AVAILABLE,
-        )
-
-    target_user_id = await db_session.scalar(
-        select(User.id)
-        .join(
-            TournamentInviteAccess,
-            (TournamentInviteAccess.user_id == User.id)
-            & (TournamentInviteAccess.tournament_id == tournament_id),
-        )
-        .where(User.email == user_email)
-        .limit(1)
-    )
-    if target_user_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=PARTICIPANT_ADD_NOT_AVAILABLE,
-        )
 
 
 async def _enforce_restore_capacity(
@@ -293,12 +221,6 @@ async def _lock_participant_mutation(
     if locked is None:
         return
     tournament_id, max_participants, tournament_status = locked
-    if _is_organizer_participant_add_request(request):
-        await _ensure_scoped_participant_add_target(
-            request,
-            tournament_id=tournament_id,
-            db_session=db_session,
-        )
     if mutation_kind == "moderation":
         await _enforce_restore_capacity(
             request,
@@ -324,10 +246,6 @@ async def serialize_tournament_write_invariants(
     """
 
     if auth_session is None:
-        return
-
-    if _is_invite_claim_request(request):
-        await _lock_invite_claim(request, db_session=db_session)
         return
 
     if _is_invite_revoke_request(request):

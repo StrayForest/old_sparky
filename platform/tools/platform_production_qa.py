@@ -48,7 +48,6 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockReadyRound,
     TournamentDeadlockReadyVote,
     TournamentInvite,
-    TournamentInviteAccess,
     TournamentMatch,
     TournamentParticipant,
     User,
@@ -5130,9 +5129,6 @@ class ProductionQa:
                 model_queries = (
                     select(TournamentInvite.id).where(
                         TournamentInvite.tournament_id.in_(tournament_ids)
-                    ),
-                    select(TournamentInviteAccess.id).where(
-                        TournamentInviteAccess.tournament_id.in_(tournament_ids)
                     ),
                     select(TournamentParticipant.id).where(
                         TournamentParticipant.tournament_id.in_(tournament_ids)

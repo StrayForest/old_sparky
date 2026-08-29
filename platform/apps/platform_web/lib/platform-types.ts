@@ -243,7 +243,6 @@ export type PlatformTournament = {
   allowed_ranks: string[];
   has_locked_deadlock_roster: boolean;
   current_user_participant_status?: string | null;
-  current_user_has_invite_access?: boolean;
   registration_starts_at?: string | null;
   registration_closes_at?: string | null;
   ready_check_starts_at?: string | null;

@@ -14,7 +14,6 @@ from python_packages.platform_infra.models import (
     AuditLog,
     Tournament,
     TournamentInvite,
-    TournamentInviteAccess,
     TournamentParticipant,
     User,
 )
@@ -166,13 +165,14 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
         self,
         player: dict[str, object],
         slug: str,
+        invite_code: str | None = None,
     ) -> httpx.Response:
         return await player["client"].post(
             f"/api/v1/tournaments/{slug}/join",
-            json={"entry_type": "solo"},
+            json={"entry_type": "solo", "invite_code": invite_code},
         )
 
-    async def test_last_invite_use_is_serialized_before_claim_state_is_read(self) -> None:
+    async def test_concurrent_invite_claims_are_read_only(self) -> None:
         organizer = await self._register_user("invite-organizer")
         player_a = await self._register_user("invite-a")
         player_b = await self._register_user("invite-b")
@@ -211,7 +211,7 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
 
         self.assertEqual(
             sorted(response.status_code for response in responses),
-            [201, 409],
+            [201, 201],
             [response.text for response in responses],
         )
 
@@ -220,18 +220,7 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
                 select(TournamentInvite).where(TournamentInvite.id == invite_id)
             )
             self.assertIsNotNone(stored_invite)
-            self.assertEqual(stored_invite.use_count, 1)
-            access_count = int(
-                await db_session.scalar(
-                    select(func.count())
-                    .select_from(TournamentInviteAccess)
-                    .where(
-                        TournamentInviteAccess.tournament_id == tournament["id"]
-                    )
-                )
-                or 0
-            )
-            self.assertEqual(access_count, 1)
+            self.assertEqual(stored_invite.use_count, 0)
 
     async def test_last_participant_slot_serializes_self_join_and_organizer_add(
         self,
@@ -266,7 +255,7 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
             )
 
             tasks = [
-                asyncio.create_task(self._join(self_joiner, slug)),
+                    asyncio.create_task(self._join(self_joiner, slug, invite["code"])),
                 asyncio.create_task(
                     organizer["client"].post(
                         f"/api/v1/tournaments/{slug}/participants/manage",
@@ -318,7 +307,7 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
         slug = tournament["slug"]
 
         self._assert_status(await self._claim_invite(player_a, invite_a["code"]), 201)
-        joined_a = self._assert_status(await self._join(player_a, slug), 201)
+        joined_a = self._assert_status(await self._join(player_a, slug, invite_a["code"]), 201)
         removed = await organizer["client"].delete(
             f"/api/v1/tournaments/{slug}/participants/{joined_a['id']}"
         )
@@ -326,7 +315,7 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
 
         invite_b = await self._create_invite(organizer, slug)
         self._assert_status(await self._claim_invite(player_b, invite_b["code"]), 201)
-        self._assert_status(await self._join(player_b, slug), 201)
+        self._assert_status(await self._join(player_b, slug, invite_b["code"]), 201)
 
         restore = await organizer["client"].patch(
             f"/api/v1/tournaments/{slug}/participants/{joined_a['id']}/moderation",

@@ -552,7 +552,6 @@ class TournamentResponse(BaseModel):
     max_participants: int | None = None
     has_locked_deadlock_roster: bool = False
     current_user_participant_status: str | None = None
-    current_user_has_invite_access: bool = False
     registration_starts_at: datetime | None = None
     registration_closes_at: datetime | None = None
     ready_check_starts_at: datetime | None = None

@@ -702,7 +702,7 @@ const translations: Record<string, string> = {
     "tournament.registrationLocked": "Изменения регистрации закрыты на текущей стадии турнира.",
     "tournament.reportResult": "Отправить результат",
     "tournament.result": "Результат",
-    "tournament.redeemInvite": "Принять invite",
+    "tournament.redeemInvite": "Открыть турнир",
     "tournament.revokeInvite": "Отозвать",
     "tournament.round": "Раунд",
     "tournament.teamScore": "Счет: {team}",

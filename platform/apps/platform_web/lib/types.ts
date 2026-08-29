@@ -53,7 +53,6 @@ export type TournamentSummary = {
   maxParticipants: number | null;
   teamsCount: number;
   currentUserParticipantStatus?: string | null;
-  currentUserHasInviteAccess?: boolean;
   stateVersion?: number | null;
 };
 

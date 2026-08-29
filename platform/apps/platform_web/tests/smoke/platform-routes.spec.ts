@@ -1034,7 +1034,6 @@ test("tournament scope filter loads private organizer and registered tournaments
         allowed_ranks: ["Initiate", "Seeker"],
         max_participants: 16,
         current_user_participant_status: null,
-        current_user_has_invite_access: false,
         starts_at: "2026-06-08T17:00:00Z",
         created_at: new Date().toISOString()
       },
@@ -1052,7 +1051,6 @@ test("tournament scope filter loads private organizer and registered tournaments
         allowed_ranks: ["Phantom"],
         max_participants: 32,
         current_user_participant_status: "registered",
-        current_user_has_invite_access: false,
         starts_at: "2026-06-09T17:00:00Z",
         created_at: new Date().toISOString()
       }
@@ -1111,7 +1109,6 @@ test("tournament list loads nine cards at a time on scroll and centers the count
       allowed_ranks: ["Initiate", "Seeker"],
       max_participants: 16,
       current_user_participant_status: null,
-      current_user_has_invite_access: false,
       starts_at: `2026-06-${String(index + 10).padStart(2, "0")}T17:00:00Z`,
       created_at: new Date().toISOString()
     }));

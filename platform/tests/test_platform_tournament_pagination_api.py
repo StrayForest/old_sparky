@@ -221,14 +221,12 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
         count_sql = compiled_sql(db_session.scalar.await_args.args[0])
         page_sql = compiled_sql(db_session.execute.await_args.args[0])
         self.assertIn("platform.tournament_participants.status", count_sql)
-        self.assertIn("platform.tournament_invite_accesses", count_sql)
         self.assertIn("platform.tournaments.name ILIKE", count_sql)
         self.assertIn("platform.users.display_name ILIKE", count_sql)
         self.assertIn("platform.tournaments.status =", count_sql)
         self.assertIn("CAST(platform.tournaments.allowed_ranks AS JSONB) ?| ARRAY", count_sql)
         self.assertIn("WITH tournament_page AS", page_sql)
         self.assertIn("current_user_participant_status", page_sql)
-        self.assertIn("current_user_has_invite_access", page_sql)
         self.assertIn(
             "ORDER BY tournament_page.starts_at ASC NULLS LAST, "
             "tournament_page.created_at DESC, tournament_page.id DESC",

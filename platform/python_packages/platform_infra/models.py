@@ -600,38 +600,6 @@ Index(
 )
 
 
-class TournamentInviteAccess(TimestampMixin, Base):
-    __tablename__ = "tournament_invite_accesses"
-    __table_args__ = (
-        UniqueConstraint(
-            "tournament_id",
-            "user_id",
-            name="uq_tournament_invite_accesses_tournament_user",
-        ),
-    )
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
-    tournament_id: Mapped[str] = mapped_column(
-        String(36),
-        ForeignKey("platform.tournaments.id", ondelete="CASCADE"),
-        index=True,
-    )
-    user_id: Mapped[str] = mapped_column(
-        String(36),
-        ForeignKey("platform.users.id", ondelete="CASCADE"),
-        index=True,
-    )
-    invite_id: Mapped[str | None] = mapped_column(
-        String(36),
-        ForeignKey("platform.tournament_invites.id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
-    claimed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-
-
 class TournamentParticipant(TimestampMixin, Base):
     __tablename__ = "tournament_participants"
     __table_args__ = (

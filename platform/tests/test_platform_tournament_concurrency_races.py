@@ -21,7 +21,6 @@ from python_packages.platform_infra.models import (
     AuditLog,
     Tournament,
     TournamentInvite,
-    TournamentInviteAccess,
     TournamentParticipant,
     User,
 )
@@ -154,12 +153,7 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
                 select(TournamentInvite).where(TournamentInvite.code == code)
             )
             self.assertIsNotNone(invite)
-            access_count = await db_session.scalar(
-                select(func.count(TournamentInviteAccess.id)).where(
-                    TournamentInviteAccess.invite_id == invite.id
-                )
-            )
-            return int(invite.use_count), int(access_count or 0)
+            return int(invite.use_count), 0
 
     async def _automation_once(self, slug: str, now: datetime):
         async with session_factory()() as db_session:
@@ -173,7 +167,7 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
                 now=now,
             )
 
-    async def test_concurrent_invite_claims_consume_one_use(self) -> None:
+    async def test_concurrent_invite_claims_are_read_only(self) -> None:
         organizer = await self._register_user("invite-organizer")
         first_player = await self._register_user("invite-first")
         second_player = await self._register_user("invite-second")
@@ -198,11 +192,11 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
                 claim(second_player),
             )
 
-        self.assertEqual(sorted((first_response.status_code, second_response.status_code)), [201, 409])
-        self.assertEqual(await self._invite_state(code), (1, 1))
+        self.assertEqual(sorted((first_response.status_code, second_response.status_code)), [201, 201])
+        self.assertEqual(await self._invite_state(code), (0, 0))
         self.assertEqual(await self._participant_count(slug), 0)
 
-    async def test_closed_registration_invite_claim_does_not_grant_access(self) -> None:
+    async def test_closed_registration_invite_claim_is_still_read_only(self) -> None:
         organizer = await self._register_user("closed-invite-organizer")
         player = await self._register_user("closed-invite-player")
         code = f"{self.prefix.replace('-', '')[:16]}C1".upper()
@@ -220,7 +214,7 @@ class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTest
                 json={"code": code, "entry_type": "solo", "team_name": None},
             )
 
-        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(await self._invite_state(code), (0, 0))
 
     async def test_concurrent_self_joins_serialize_capacity_check(self) -> None:

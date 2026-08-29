@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.models import (
     Tournament,
+    TournamentInvite,
     TournamentParticipant,
 )
 from python_packages.platform_infra.security import get_optional_authenticated_session
@@ -71,8 +74,36 @@ async def ensure_private_tournament_read_membership_is_active(
         return
     if auth_session_has_admin_role(auth_session):
         return
+    invite_code = "".join(
+        char
+        for char in str(request.query_params.get("invite_code") or "").upper()
+        if char.isalnum()
+    )
+    now = auth_session.now if auth_session is not None else datetime.now(UTC)
+    if invite_code:
+        valid_invite = await db_session.scalar(
+            select(TournamentInvite.id)
+            .join(Tournament, Tournament.id == TournamentInvite.tournament_id)
+            .where(
+                Tournament.slug == slug,
+                TournamentInvite.code == invite_code,
+                TournamentInvite.revoked_at.is_(None),
+                (TournamentInvite.expires_at.is_(None) | (TournamentInvite.expires_at > now)),
+            )
+        )
+        if valid_invite is not None:
+            return
+
     if auth_session is None:
-        return
+        visibility = await db_session.scalar(
+            select(Tournament.visibility).where(Tournament.slug == slug)
+        )
+        if visibility == "public":
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="A valid invite code is required to view this private tournament.",
+        )
 
     user_id = auth_session.user.id
     row = (

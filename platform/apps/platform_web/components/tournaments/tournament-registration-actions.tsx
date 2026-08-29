@@ -111,7 +111,7 @@ export function TournamentRegistrationActions({
   const teamsFormed = tournament.teams.length > 0;
   const hasRegistrationAccess = Boolean(
     tournament.visibility !== "private"
-    || tournament.currentUserHasInviteAccess
+    || tournament.inviteCode
     || (actorUserId && actorUserId === tournament.organizerUserId)
   );
   const canRegister = Boolean(

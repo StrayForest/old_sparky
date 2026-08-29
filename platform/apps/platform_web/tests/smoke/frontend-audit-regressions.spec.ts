@@ -6,27 +6,25 @@ function source(relativePath: string): string {
   return readFileSync(resolve(process.cwd(), relativePath), "utf8");
 }
 
-test("invite-only server pages convert anonymous workspace access into login flow", () => {
+test("invite-only server pages convert missing workspace proof into invite-code flow", () => {
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
   const bracketPage = source("app/(site)/tournaments/[slug]/bracket/page.tsx");
 
   for (const page of [detailPage, bracketPage]) {
     expect(page).toContain("PlatformApiError");
     expect(page).toContain("error.status === 401");
-    expect(page).toContain("/auth/login?returnTo=");
+    expect(page).toContain("invite_code");
   }
 });
 
-test("private registration is gated by the backend invite capability", () => {
+test("private registration is gated by the invite code carried by the room URL", () => {
   const api = source("lib/platform-api.ts");
-  const types = source("lib/types.ts");
   const actions = source("components/tournaments/tournament-registration-actions.tsx");
 
-  expect(api).toContain("current_user_has_invite_access?: boolean | null");
-  expect(api).toContain("currentUserHasInviteAccess: Boolean(item.current_user_has_invite_access)");
-  expect(types).toContain("currentUserHasInviteAccess?: boolean");
+  expect(api).toContain("invite_code?: string | null");
+  expect(api).toContain("inviteCode: item.invite_code ?? null");
   expect(actions).toContain("const hasRegistrationAccess = Boolean(");
-  expect(actions).toContain("tournament.currentUserHasInviteAccess");
+  expect(actions).toContain("tournament.inviteCode");
   expect(actions).toContain("&& hasRegistrationAccess");
 });
 

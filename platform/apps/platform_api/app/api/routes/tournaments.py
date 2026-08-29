@@ -221,7 +221,6 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockReadyRound,
     TournamentDeadlockReadyVote,
     TournamentInvite,
-    TournamentInviteAccess,
     TournamentMatch,
     TournamentParticipant,
     TournamentParticipantSlot,
@@ -403,7 +402,6 @@ class ParticipantJoinPreflight:
     has_free_participant_slot: bool
     player_rank: str | None
     has_locked_deadlock_roster: bool
-    has_invite_access: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -757,7 +755,6 @@ def serialize_tournament(
     organizer_avatar_media: MediaDescriptorResponse | None = None,
     has_locked_deadlock_roster: bool = False,
     current_user_participant_status: str | None = None,
-    current_user_has_invite_access: bool = False,
     invite_code: str | None = None,
 ) -> TournamentResponse:
     return TournamentResponse(
@@ -786,7 +783,6 @@ def serialize_tournament(
         max_participants=tournament.max_participants,
         has_locked_deadlock_roster=has_locked_deadlock_roster,
         current_user_participant_status=current_user_participant_status,
-        current_user_has_invite_access=current_user_has_invite_access,
         registration_starts_at=tournament.registration_starts_at,
         registration_closes_at=tournament.registration_closes_at,
         ready_check_starts_at=tournament.ready_check_starts_at,
@@ -1096,18 +1092,15 @@ def ensure_tournament_workspace_visible(
     *,
     auth_session,
     has_participant_record: bool,
+    has_valid_invite_code: bool = False,
 ) -> None:
-    if tournament.visibility == "invite_only" and auth_session is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required to view invite-only tournament roster and bracket data.",
-        )
     try:
         is_visible = can_view_tournament_workspace(
             tournament_visibility=tournament.visibility,
             is_participant=has_participant_record,
             is_organizer=auth_session is not None and tournament.organizer_user_id == auth_session.user.id,
             is_admin=auth_session_has_admin_role(auth_session),
+            has_valid_invite_code=has_valid_invite_code,
         )
     except TournamentWorkflowError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -1321,14 +1314,6 @@ async def participant_join_preflight(
         )
         .exists()
     )
-    invite_access = (
-        select(TournamentInviteAccess.id)
-        .where(
-            TournamentInviteAccess.tournament_id == Tournament.id,
-            TournamentInviteAccess.user_id == user_id,
-        )
-        .exists()
-    )
     row = (
         await db_session.execute(
             select(
@@ -1337,7 +1322,6 @@ async def participant_join_preflight(
                 free_slot.label("has_free_participant_slot"),
                 player_rank.label("player_rank"),
                 locked_roster.label("has_locked_deadlock_roster"),
-                invite_access.label("has_invite_access"),
             )
             .where(Tournament.slug == slug)
         )
@@ -1350,7 +1334,6 @@ async def participant_join_preflight(
         has_free_participant_slot=bool(row.has_free_participant_slot),
         player_rank=row.player_rank,
         has_locked_deadlock_roster=bool(row.has_locked_deadlock_roster),
-        has_invite_access=bool(row.has_invite_access),
     )
 
 
@@ -1651,6 +1634,29 @@ def normalize_invite_code(code: str) -> str:
     return "".join(char for char in code.upper() if char.isalnum())
 
 
+async def valid_invite_code_for_tournament(
+    db_session: AsyncSession,
+    *,
+    tournament: Tournament,
+    invite_code: str | None,
+) -> bool:
+    normalized = normalize_invite_code(invite_code or "")
+    if not normalized:
+        return False
+    invite = await db_session.scalar(
+        select(TournamentInvite).where(
+            TournamentInvite.tournament_id == tournament.id,
+            TournamentInvite.code == normalized,
+        )
+    )
+    now = datetime.now(UTC)
+    return bool(
+        invite is not None
+        and invite.revoked_at is None
+        and (invite.expires_at is None or invite.expires_at > now)
+    )
+
+
 def normalized_team_name(entry_type: str, team_name: str | None) -> str | None:
     normalized = (team_name or "").strip() or None
     try:
@@ -1718,36 +1724,17 @@ async def participant_for_user(
     )
 
 
-async def invite_access_for_user(
-    db_session: AsyncSession,
-    *,
-    tournament_id: str,
-    user_id: str,
-) -> TournamentInviteAccess | None:
-    return await db_session.scalar(
-        select(TournamentInviteAccess).where(
-            TournamentInviteAccess.tournament_id == tournament_id,
-            TournamentInviteAccess.user_id == user_id,
-        )
-    )
-
-
 async def workspace_access_for_user(
     db_session: AsyncSession,
     *,
     tournament_id: str,
     user_id: str,
-) -> tuple[
-    TournamentParticipant | None,
-    TournamentInviteAccess | None,
-    PlayerTournamentCommitmentResponse | None,
-]:
+) -> tuple[TournamentParticipant | None, PlayerTournamentCommitmentResponse | None]:
     commitment_tournament = aliased(Tournament)
     row = (
         await db_session.execute(
             select(
                 TournamentParticipant,
-                TournamentInviteAccess,
                 PlayerTournamentCommitment,
                 commitment_tournament.slug,
                 commitment_tournament.name,
@@ -1757,11 +1744,6 @@ async def workspace_access_for_user(
                 TournamentParticipant,
                 (TournamentParticipant.tournament_id == tournament_id)
                 & (TournamentParticipant.user_id == User.id),
-            )
-            .outerjoin(
-                TournamentInviteAccess,
-                (TournamentInviteAccess.tournament_id == tournament_id)
-                & (TournamentInviteAccess.user_id == User.id),
             )
             .outerjoin(
                 PlayerTournamentCommitment,
@@ -1776,17 +1758,16 @@ async def workspace_access_for_user(
         )
     ).first()
     if row is None:
-        return None, None, None
-    commitment = row[2]
+        return None, None
+    commitment = row[1]
     return (
         row[0],
-        row[1],
         (
             PlayerTournamentCommitmentResponse(
                 id=commitment.id,
                 tournament_id=commitment.tournament_id,
-                tournament_slug=str(row[3]),
-                tournament_name=str(row[4]),
+                tournament_slug=str(row[2]),
+                tournament_name=str(row[3]),
                 assignment_run_id=commitment.assignment_run_id,
                 team_id=commitment.team_id,
                 team_name=commitment.team_name,
@@ -2116,6 +2097,7 @@ async def build_tournament_bracket_response(
     tournament: Tournament,
     auth_session,
     has_participant_record: bool | None = None,
+    has_valid_invite_code: bool = False,
     visible_assignment_run: TournamentDeadlockAssignmentRun | None = None,
     assignment_run_loaded: bool = False,
     include_team_members: bool = True,
@@ -2134,6 +2116,7 @@ async def build_tournament_bracket_response(
         tournament,
         auth_session=auth_session,
         has_participant_record=has_participant_record,
+        has_valid_invite_code=has_valid_invite_code,
     )
     can_manage = bool(
         auth_session is not None
@@ -2731,18 +2714,11 @@ async def list_my_tournaments(
         .correlate(Tournament)
         .scalar_subquery()
     )
-    current_user_has_invite_access = exists(
-        select(1).where(
-            TournamentInviteAccess.tournament_id == Tournament.id,
-            TournamentInviteAccess.user_id == auth_session.user.id,
-        )
-    )
     filters = [
         Tournament.format_slug == SOLO_TOURNAMENT_FORMAT,
         or_(
             Tournament.organizer_user_id == auth_session.user.id,
             current_participant_status.is_not(None),
-            current_user_has_invite_access,
         ),
     ]
     if scope_filter == "mine":
@@ -2789,7 +2765,6 @@ async def list_my_tournaments(
             Tournament.created_at.label("created_at"),
             Tournament.starts_at.label("starts_at"),
             current_participant_status.label("current_user_participant_status"),
-            current_user_has_invite_access.label("current_user_has_invite_access"),
         )
         .join(User, User.id == Tournament.organizer_user_id)
         .where(*filters)
@@ -2812,7 +2787,6 @@ async def list_my_tournaments(
 
     stmt = tournament_with_counts_stmt(tournament_page).add_columns(
         tournament_page.c.current_user_participant_status,
-        tournament_page.c.current_user_has_invite_access,
     )
     if date_sort == "nearest":
         stmt = stmt.order_by(
@@ -2853,7 +2827,6 @@ async def list_my_tournaments(
             else None,
             has_locked_deadlock_roster=bool(int(locked_roster_count)),
             current_user_participant_status=current_user_participant_status,
-            current_user_has_invite_access=bool(current_user_has_invite_access),
         )
         for (
             tournament,
@@ -2862,7 +2835,6 @@ async def list_my_tournaments(
             participant_count,
             locked_roster_count,
             current_user_participant_status,
-            current_user_has_invite_access,
         ) in rows
     ]
     set_pagination_headers(
@@ -3246,7 +3218,6 @@ async def redeem_tournament_invite(
                     db_session, tournament, organizer_avatar_asset_id=organizer_avatar_asset_id
                 ),
                 has_locked_deadlock_roster=bool(int(locked_roster_count)),
-                current_user_has_invite_access=True,
                 invite_code=invite.code,
             ),
             invite=serialize_invite(tournament, invite, now=datetime.now(UTC)),
@@ -3274,7 +3245,6 @@ async def redeem_tournament_invite(
             organizer_avatar_media=organizer_avatar_media,
             has_locked_deadlock_roster=bool(int(locked_roster_count)),
             current_user_participant_status=participant.status if participant is not None else None,
-            current_user_has_invite_access=True,
             invite_code=invite.code,
         ),
         participant=serialize_participant(participant, auth_session.user.display_name)
@@ -3335,6 +3305,7 @@ async def list_tournament_participants(
         le=PARTICIPANT_LIST_MAX_LIMIT,
     ),
     offset: int = Query(default=0, ge=0),
+    invite_code: str | None = Query(default=None, min_length=6, max_length=64),
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> list[TournamentParticipantResponse]:
@@ -3352,6 +3323,9 @@ async def list_tournament_participants(
         tournament,
         auth_session=auth_session,
         has_participant_record=has_participant_record,
+        has_valid_invite_code=await valid_invite_code_for_tournament(
+            db_session, tournament=tournament, invite_code=invite_code
+        ),
     )
 
     serialized, total, _ = await tournament_participant_page(
@@ -3804,6 +3778,7 @@ async def revoke_tournament_invite(
 @router.get("/{slug}/matches", response_model=list[TournamentMatchResponse])
 async def list_tournament_matches(
     slug: str,
+    invite_code: str | None = Query(default=None, min_length=6, max_length=64),
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> list[TournamentMatchResponse]:
@@ -3821,6 +3796,9 @@ async def list_tournament_matches(
         tournament,
         auth_session=auth_session,
         has_participant_record=has_participant_record,
+        has_valid_invite_code=await valid_invite_code_for_tournament(
+            db_session, tournament=tournament, invite_code=invite_code
+        ),
     )
     rows = await tournament_matches_in_order(db_session, tournament_id=tournament.id)
     if not rows:
@@ -3844,6 +3822,7 @@ async def get_tournament_bracket(
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
     teams_view: Literal["full", "summary"] = Query(default="full"),
+    invite_code: str | None = Query(default=None, min_length=6, max_length=64),
 ) -> TournamentBracketResponse | Response:
     tournament = await get_tournament_or_404(db_session, slug)
     etag = _representation_etag(
@@ -3871,6 +3850,9 @@ async def get_tournament_bracket(
         tournament=tournament,
         auth_session=auth_session,
         has_participant_record=has_participant_record,
+        has_valid_invite_code=await valid_invite_code_for_tournament(
+            db_session, tournament=tournament, invite_code=invite_code
+        ),
         include_team_members=teams_view == "full",
     )
     return bracket
@@ -5915,13 +5897,12 @@ async def join_tournament(
             )
         has_invite_access = (
             tournament.organizer_user_id == auth_session.user.id
-            or preflight.has_invite_access
             or supplied_invite_is_valid
         )
         if not has_invite_access:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Redeem an invite code in Tournaments before joining this private tournament.",
+                detail="A valid invite code is required to join this private tournament.",
             )
     elif tournament.visibility != "public":
         raise HTTPException(
@@ -6274,10 +6255,9 @@ async def get_tournament_workspace(
                     and current_tournament.updated_at == snapshot.tournament_updated_at
                 ):
                     participant_record: TournamentParticipant | None = None
-                    invite_access: TournamentInviteAccess | None = None
                     active_commitment: PlayerTournamentCommitmentResponse | None = None
                     if auth_session is not None:
-                        participant_record, invite_access, active_commitment = await workspace_access_for_user(
+                        participant_record, active_commitment = await workspace_access_for_user(
                             db_session,
                             tournament_id=current_tournament.id,
                             user_id=auth_session.user.id,
@@ -6295,11 +6275,6 @@ async def get_tournament_workspace(
                         workspace_response = snapshot.response.model_copy(
                             update={
                                 "server_time": server_time,
-                                "tournament": snapshot.response.tournament.model_copy(
-                                    update={
-                                        "current_user_has_invite_access": invite_access is not None,
-                                    }
-                                ),
                                 "current_user_active_commitment": active_commitment,
                             }
                         )
@@ -6365,10 +6340,9 @@ async def get_tournament_workspace(
     )
 
     participant_record: TournamentParticipant | None = None
-    invite_access: TournamentInviteAccess | None = None
     active_commitment: PlayerTournamentCommitmentResponse | None = None
     if auth_session is not None:
-        participant_record, invite_access, active_commitment = await workspace_access_for_user(
+        participant_record, active_commitment = await workspace_access_for_user(
             db_session,
             tournament_id=tournament.id,
             user_id=auth_session.user.id,
@@ -6415,7 +6389,6 @@ async def get_tournament_workspace(
         current_user_participant_status=(
             participant_record.status if participant_record is not None else None
         ),
-        current_user_has_invite_access=invite_access is not None or has_valid_invite_code,
         invite_code=invite_code,
     )
     if not workspace_visible:
@@ -6505,6 +6478,7 @@ async def get_tournament_workspace(
             tournament=tournament,
             auth_session=auth_session,
             has_participant_record=has_participant_record,
+            has_valid_invite_code=has_valid_invite_code,
             visible_assignment_run=visible_assignment_run,
             assignment_run_loaded=assignment_runs_loaded,
         )
@@ -6570,7 +6544,7 @@ async def get_tournament_workspace(
             response=workspace_response.model_copy(
                 update={
                     "tournament": tournament_response.model_copy(
-                        update={"current_user_has_invite_access": False}
+                        update={}
                     ),
                     "current_user": None,
                     "current_user_active_commitment": None,
@@ -6592,6 +6566,7 @@ async def get_tournament_workspace(
 @router.get("/{slug}", response_model=TournamentResponse)
 async def get_tournament(
     slug: str,
+    invite_code: str | None = Query(default=None, min_length=6, max_length=64),
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentResponse:
@@ -6609,7 +6584,13 @@ async def get_tournament(
         participant_count,
         locked_roster_count,
     ) = row
-    ensure_tournament_summary_visible(tournament, auth_session)
+    ensure_tournament_summary_visible(
+        tournament,
+        auth_session,
+        has_valid_invite_code=await valid_invite_code_for_tournament(
+            db_session, tournament=tournament, invite_code=invite_code
+        ),
+    )
     cover_media, organizer_avatar_media = await tournament_media_descriptors(
         db_session,
         tournament,

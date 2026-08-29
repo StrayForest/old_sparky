@@ -42,7 +42,9 @@ exceptions live in the [security audit](application-security-audit.md).
 - Players create private tournaments within the monthly allowance. Public
   creation requires an explicit permission or admin role.
 - Registration is solo and uses current profile data, rank/capacity rules and
-  an invite/access check for private tournaments.
+  the invite code supplied for private tournaments. Entering a code only opens
+  the private tournament workspace; it creates no account, access record or
+  participant row.
 - Public participant and workspace payloads use the public roster DTO and do
   not expose moderation notes, moderator identity or moderation timestamps.
   Organizer-only participant management uses a separate management DTO that

@@ -786,7 +786,7 @@ class PlatformTournamentPolicyApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(supported_slug, mine_slugs)
         self.assertNotIn(legacy_slug, mine_slugs)
 
-    async def test_redeem_invite_adds_private_tournament_to_mine(self) -> None:
+    async def test_redeem_invite_finds_private_tournament_without_persisting_access(self) -> None:
         organizer = await self._register_user("organizer")
         player = await self._register_user("player")
 
@@ -825,10 +825,13 @@ class PlatformTournamentPolicyApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(redeemed["participant"])
 
         mine = self._assert_status(await player["client"].get("/api/v1/tournaments/mine"), 200)
-        self.assertIn(slug, {tournament["slug"] for tournament in mine})
+        self.assertNotIn(slug, {tournament["slug"] for tournament in mine})
 
         participant = self._assert_status(
-            await player["client"].post(f"/api/v1/tournaments/{slug}/join", json={"entry_type": "solo"}),
+            await player["client"].post(
+                f"/api/v1/tournaments/{slug}/join",
+                json={"entry_type": "solo", "invite_code": invites[0]["code"]},
+            ),
             201,
         )
         self.assertEqual(participant["user_id"], player["user_id"])
