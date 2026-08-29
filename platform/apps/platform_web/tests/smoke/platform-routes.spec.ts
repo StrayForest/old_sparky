@@ -563,7 +563,7 @@ test("authenticated player can open a private tournament with an invite code", a
   await page.goto("/tournaments");
   await page.getByLabel("Код приглашения").fill("nightveil");
 
-  await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5$/);
+  await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5\?invite_code=NIGHTVEIL$/);
   expect(claimBody).toMatchObject({ code: "NIGHTVEIL", entry_type: "solo", team_name: null });
 });
 
