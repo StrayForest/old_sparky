@@ -6,6 +6,7 @@ import { Fragment, useEffect, useState } from "react";
 import { useI18n } from "@/components/i18n-provider";
 import { Hero } from "@/components/layout/hero";
 import { CspImage } from "@/components/media/csp-image";
+import { isNewPatch } from "@/lib/home-content-model";
 import {
   platformApiMessage,
   platformApiRequest
@@ -49,26 +50,56 @@ const flowCards = [
 ] as const;
 
 const patchArtwork = [
-  "/assets/preview/patch-featured.webp",
-  "/assets/preview/patch-archive-city.webp",
-  "/assets/preview/patch-archive-transit.webp",
-  "/assets/preview/patch-archive-rift.webp"
+  {
+    src: "/assets/preview/patch-featured.webp",
+    srcSet: [
+      "/assets/preview/patch-featured-768.webp 768w",
+      "/assets/preview/patch-featured-1024.webp 1024w",
+      "/assets/preview/patch-featured-1440.webp 1440w"
+    ].join(", "),
+    sizes: "(max-width: 820px) 100vw, 60vw"
+  },
+  {
+    src: "/assets/preview/patch-archive-city.webp",
+    srcSet: [
+      "/assets/preview/patch-archive-city-320.webp 320w",
+      "/assets/preview/patch-archive-city-480.webp 480w",
+      "/assets/preview/patch-archive-city-768.webp 768w"
+    ].join(", "),
+    sizes: "(max-width: 820px) 100vw, 32vw"
+  },
+  {
+    src: "/assets/preview/patch-archive-transit.webp",
+    srcSet: [
+      "/assets/preview/patch-archive-transit-320.webp 320w",
+      "/assets/preview/patch-archive-transit-480.webp 480w",
+      "/assets/preview/patch-archive-transit-768.webp 768w"
+    ].join(", "),
+    sizes: "(max-width: 820px) 100vw, 32vw"
+  },
+  {
+    src: "/assets/preview/patch-archive-rift.webp",
+    srcSet: [
+      "/assets/preview/patch-archive-rift-320.webp 320w",
+      "/assets/preview/patch-archive-rift-480.webp 480w",
+      "/assets/preview/patch-archive-rift-768.webp 768w"
+    ].join(", "),
+    sizes: "(max-width: 820px) 100vw, 32vw"
+  }
 ] as const;
 
-const NEW_PATCH_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
-
-function isNewPatch(publishedAt: string, now = Date.now()) {
-  const publishedTime = Date.parse(publishedAt);
-  const age = now - publishedTime;
-  return Number.isFinite(publishedTime) && age >= 0 && age < NEW_PATCH_WINDOW_MS;
-}
-
-export function HomePageContent() {
+export function HomePageContent({ initialContent = null }: { initialContent?: PlatformHomeContent | null }) {
   const { t } = useI18n();
-  const [content, setContent] = useState<PlatformHomeContent | null>(null);
+  const [content, setContent] = useState<PlatformHomeContent | null>(initialContent);
   const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
+    if (initialContent) {
+      setContent(initialContent);
+      setLoadError("");
+      return;
+    }
+
     let cancelled = false;
     void platformApiRequest<PlatformHomeContent>("/content/home")
       .then((payload) => {
@@ -84,7 +115,7 @@ export function HomePageContent() {
     return () => {
       cancelled = true;
     };
-  }, [t]);
+  }, [initialContent, t]);
 
   return (
     <>
@@ -144,7 +175,15 @@ export function HomePageContent() {
               <article className="patch-featured">
                 {isNewPatch(content.patches[0].published_at) ? <span className="patch-new-ribbon">NEW</span> : null}
                 <span aria-hidden="true" className="patch-featured-art">
-                  <CspImage fill sizes="(max-width: 820px) 100vw, 60vw" src={patchArtwork[0]} alt="" />
+                  <CspImage
+                    alt=""
+                    fetchPriority="high"
+                    fill
+                    loading="eager"
+                    sizes={patchArtwork[0].sizes}
+                    src={patchArtwork[0].src}
+                    srcSet={patchArtwork[0].srcSet}
+                  />
                 </span>
                 <div className="patch-featured-copy">
                   <h3 className="patch-title">{formatPatchTitle(content.patches[0].title)}</h3>
@@ -159,7 +198,14 @@ export function HomePageContent() {
                 {content.patches.slice(1, 4).map((patch, index) => (
                   <Link className="patch-compact-card" href={`/patches/${patch.id}`} key={patch.id}>
                     <span aria-hidden="true" className="patch-compact-art">
-                      <CspImage fill sizes="(max-width: 820px) 100vw, 32vw" src={patchArtwork[index + 1]} alt="" />
+                      <CspImage
+                        alt=""
+                        fill
+                        loading="lazy"
+                        sizes={patchArtwork[index + 1].sizes}
+                        src={patchArtwork[index + 1].src}
+                        srcSet={patchArtwork[index + 1].srcSet}
+                      />
                     </span>
                     <span className="patch-compact-copy">
                       <strong className="patch-title">{formatPatchTitle(patch.title)}</strong>

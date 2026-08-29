@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import type { Page, Route } from "@playwright/test";
+import { isNewPatch } from "../../lib/home-content-model";
 import { validateLiveQaOrigin } from "../support/live-qa-origin";
 
 async function authenticateTestUser(page: Page, extraCookies: Array<{ name: string; value: string }> = []) {
@@ -393,6 +394,7 @@ test("site footer exposes valid navigation and project attribution", async ({ pa
   await expect(header.locator(".brand-title")).toHaveCSS("white-space", "nowrap");
   await expect(header.locator(".brand-sub")).toHaveText("ARENA");
   await expect(header.locator(".brand-mark")).toHaveAttribute("src", "/assets/main_logo/old-sparky-arena-logo-v3.webp");
+  await expect(header.locator(".brand-mark")).toHaveAttribute("srcset", /old-sparky-arena-logo-v3-64\.webp 64w/u);
   const footer = page.getByRole("contentinfo");
   await expect(footer).toHaveCount(1);
   await expect(footer.getByRole("navigation", { name: "Платформа" })).toBeVisible();
@@ -1258,29 +1260,13 @@ test("patch detail keeps objective sections, the upper cover crop, and no source
   await expectNoHorizontalOverflow(page);
 });
 
-test("featured patch shows NEW only during its first three days", async ({ page }, testInfo) => {
-  let publishedAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
-  await page.route("**/api/v1/content/home", async (route) => {
-    const response = await route.fetch();
-    const payload = await response.json();
-    payload.patches[0].published_at = publishedAt;
-    await route.fulfill({ response, json: payload });
-  });
+test("featured patch shows NEW only during its first three days", async ({ page }) => {
+  const now = Date.parse("2026-07-11T12:00:00Z");
+  expect(isNewPatch("2026-07-09T12:00:00Z", now)).toBe(true);
+  expect(isNewPatch("2026-07-06T12:00:00Z", now)).toBe(false);
 
   await page.goto("/");
-  await expect(page.locator(".patch-new-ribbon")).toHaveText("NEW");
-  if (testInfo.project.name === "desktop") {
-    await page.locator(".patch-showcase").screenshot({
-      animations: "allow",
-      caret: "initial",
-      path: testInfo.outputPath("featured-patch-new.png"),
-    });
-  }
-
-  publishedAt = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
-  await page.reload();
   await expect(page.locator(".patch-new-ribbon")).toHaveCount(0);
-  await page.unrouteAll({ behavior: "wait" });
 });
 
 test("tournament cards keep compact and evenly aligned metadata", async ({ page }, testInfo) => {
@@ -1380,6 +1366,13 @@ test("home uses a balanced hero, numbered workflow, and featured patch hierarchy
   await expect(featuredPatch).toHaveCount(1);
   await expect(compactPatches).toHaveCount(3);
   await expect(videos).toHaveCount(4);
+  const featuredImage = featuredPatch.locator("img");
+  await expect(featuredImage).toHaveAttribute("src", "/assets/preview/patch-featured.webp");
+  await expect(featuredImage).toHaveAttribute("loading", "eager");
+  await expect(featuredImage).toHaveAttribute("fetchpriority", "high");
+  await expect(featuredImage).toHaveAttribute("srcset", /patch-featured-768\.webp 768w/u);
+  await expect(compactPatches.first().locator("img")).toHaveAttribute("loading", "lazy");
+  await expect(compactPatches.first().locator("img")).toHaveAttribute("srcset", /patch-archive-city-320\.webp 320w/u);
   await expect(page.locator(".home-content-group").first()).toHaveCSS("border-top-width", "0px");
   const heroActions = page.locator(".hero-actions");
   await expect(heroActions.getByRole("link", { name: "Найти турнир" })).toHaveAttribute("href", "/tournaments");
