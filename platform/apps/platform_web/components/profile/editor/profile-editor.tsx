@@ -5,6 +5,7 @@ import { UserRound } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { PreparedMedia } from "@/components/media/prepared-media";
 import { ProfileAccessState } from "@/components/profile/profile-access-state";
+import { PublicProfileView } from "@/components/profile/public-profile-view";
 import { AccountProfileTab } from "@/components/profile/editor/account-profile-tab";
 import { CaptainProfileTab } from "@/components/profile/editor/captain-profile-tab";
 import {
@@ -126,7 +127,7 @@ export function ProfileEditor({
 
   return (
     <>
-      <section className="panel profile-summary">
+      {activeTab === "account" ? <PublicProfileView profile={summaryProfile} /> : <section className="panel profile-summary">
         <PreparedMedia
           alt=""
           className="profile-summary-banner"
@@ -182,7 +183,7 @@ export function ProfileEditor({
             />
           </div>
         </div>
-      </section>
+      </section>}
 
       <div className="tabs">
         {profileTabs.map(([id, label]) => (

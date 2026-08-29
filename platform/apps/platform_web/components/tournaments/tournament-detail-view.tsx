@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { ArrowLeft, Check, Copy, Crown, ExternalLink, Info, KeyRound, RefreshCw, Users } from "lucide-react";
+import { ArrowLeft, Check, Crown, ExternalLink, Info, KeyRound, RefreshCw, Users } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { TournamentCard } from "@/components/tournaments/tournament-card";
@@ -111,7 +111,6 @@ export function TournamentDetailView({ tournament, actorUserId }: TournamentDeta
               >
                 {inviteCopied ? <Check aria-hidden="true" size={16} /> : <KeyRound aria-hidden="true" size={16} />}
                 <span>{detail.inviteCode}</span>
-                <Copy aria-hidden="true" size={14} />
               </button>
             ) : null}
           </div>

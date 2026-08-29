@@ -1218,7 +1218,6 @@ a.tournament-card:focus-visible {
 .tournament-invite-code:focus-visible,
 .tournament-invite-code.copied {
   color: var(--ui-primary-bright);
-  background: rgba(94, 234, 212, .08);
 }
 
 .invite-code-actions .icon-button.copied:disabled {
