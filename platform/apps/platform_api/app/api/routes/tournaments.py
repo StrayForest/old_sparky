@@ -4826,8 +4826,7 @@ async def vote_deadlock_ready_check(
                 detail="Complete your Deadlock profile before confirming ready status.",
             )
 
-        eligible_user_ids = active_round.eligible_user_ids or []
-        if eligible_user_ids and current_user_id not in eligible_user_ids:
+        if not active_round.user_is_eligible:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You are not eligible for the active ready-check.",
@@ -4880,7 +4879,7 @@ async def vote_deadlock_ready_check(
             round_id=active_round.id,
             tournament_id=active_round.tournament_id,
             status=active_round.status,
-            eligible_participant_count=len(list(active_round.eligible_user_ids or [])),
+            eligible_participant_count=active_round.eligible_participant_count,
             current_user_choice=payload.choice,
             changed=vote_changed,
             server_received_at=auth_session.now,

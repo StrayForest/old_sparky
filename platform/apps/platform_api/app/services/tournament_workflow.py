@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, case, delete, exists, func, literal, select
+from sqlalchemy import and_, case, cast, delete, exists, func, literal, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -364,10 +364,36 @@ class ReadyRoundStateSnapshot:
 @dataclass(frozen=True, slots=True)
 class ReadyVoteRoutePreflight:
     tournament: Tournament
-    active_round: TournamentDeadlockReadyRound | None
+    active_round: ReadyVoteRoundSnapshot | TournamentDeadlockReadyRound | None
     has_participant: bool
     has_deadlock_profile: bool
     has_locked_roster: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyVoteRoundSnapshot:
+    """Only the round fields needed by the hot vote endpoint."""
+
+    id: int
+    tournament_id: str
+    status: str
+    eligible_participant_count: int
+    user_is_eligible: bool
+
+
+def _ready_vote_round_snapshot(
+    round_row: TournamentDeadlockReadyRound,
+    *,
+    user_id: str,
+) -> ReadyVoteRoundSnapshot:
+    eligible_user_ids = round_row.eligible_user_ids or []
+    return ReadyVoteRoundSnapshot(
+        id=round_row.id,
+        tournament_id=str(round_row.tournament_id),
+        status=str(round_row.status),
+        eligible_participant_count=len(eligible_user_ids),
+        user_is_eligible=not eligible_user_ids or user_id in eligible_user_ids,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,7 +578,7 @@ async def prepare_deadlock_ready_vote(
         if active_round is not None:
             return ReadyVoteRoutePreflight(
                 tournament=tournament,
-                active_round=active_round,
+                active_round=_ready_vote_round_snapshot(active_round, user_id=user_id),
                 has_participant=has_participant,
                 has_deadlock_profile=has_deadlock_profile,
                 has_locked_roster=has_locked_roster,
@@ -605,7 +631,11 @@ async def prepare_deadlock_ready_vote(
 
     return ReadyVoteRoutePreflight(
         tournament=tournament,
-        active_round=active_round,
+        active_round=(
+            _ready_vote_round_snapshot(active_round, user_id=user_id)
+            if isinstance(active_round, TournamentDeadlockReadyRound)
+            else active_round
+        ),
         has_participant=has_participant,
         has_deadlock_profile=has_deadlock_profile,
         has_locked_roster=has_locked_roster,
@@ -765,6 +795,12 @@ async def ready_vote_preflight_snapshot(
         tournament_id=Tournament.id,
         user_id=user_id,
     )
+    eligible_ids_jsonb = cast(active_round.eligible_user_ids, postgresql.JSONB)
+    eligible_count = func.coalesce(func.jsonb_array_length(eligible_ids_jsonb), 0)
+    user_is_eligible = (eligible_count == 0) | func.jsonb_exists(
+        eligible_ids_jsonb,
+        user_id,
+    )
     row = (
         await db_session.execute(
             select(
@@ -772,7 +808,11 @@ async def ready_vote_preflight_snapshot(
                 participant_exists.label("has_participant"),
                 profile_exists.label("has_deadlock_profile"),
                 locked_roster_exists.label("has_locked_roster"),
-                active_round,
+                active_round.id.label("ready_round_id"),
+                active_round.tournament_id.label("ready_round_tournament_id"),
+                active_round.status.label("ready_round_status"),
+                eligible_count.label("eligible_participant_count"),
+                user_is_eligible.label("user_is_eligible"),
             )
             .outerjoin(
                 active_round,
@@ -787,12 +827,21 @@ async def ready_vote_preflight_snapshot(
     ).first()
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+    round_snapshot = None
+    if row.ready_round_id is not None:
+        round_snapshot = ReadyVoteRoundSnapshot(
+            id=int(row.ready_round_id),
+            tournament_id=str(row.ready_round_tournament_id),
+            status=str(row.ready_round_status),
+            eligible_participant_count=int(row.eligible_participant_count or 0),
+            user_is_eligible=bool(row.user_is_eligible),
+        )
     return ReadyVoteRoutePreflight(
         tournament=row[0],
         has_participant=bool(row[1]),
         has_deadlock_profile=bool(row[2]),
         has_locked_roster=bool(row[3]),
-        active_round=row[4],
+        active_round=round_snapshot,
     )
 
 
