@@ -450,6 +450,27 @@ jobs:
 
           case "$runtime_profile" in
             baseline)
+              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+                --apply \
+                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                --profile baseline \
+                --only PLATFORM_API_WORKERS \
+                --only PLATFORM_DB_POOL_SIZE \
+                --only PLATFORM_DB_MAX_OVERFLOW \
+                --only PLATFORM_DB_CONNECTION_BUDGET
+              systemctl restart deadlock-api
+              api_ready=false
+              for _ in $(seq 1 30); do
+                if systemctl is-active --quiet deadlock-api \
+                  && curl --fail --silent --show-error --max-time 2 \
+                    http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
+                  api_ready=true
+                  break
+                fi
+                sleep 1
+              done
+              [[ "$api_ready" == true ]] \
+                || fail "API did not recover on baseline runtime profile"
               ;;
             api-3x16)
               "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
