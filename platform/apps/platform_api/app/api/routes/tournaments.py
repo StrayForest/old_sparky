@@ -1029,8 +1029,8 @@ async def get_invite_or_404(
     tournament_id: str,
     invite_id: str,
 ) -> TournamentInvite:
-    invite = await db_session.scalar(
-        select(TournamentInvite).where(
+    invite_id = await db_session.scalar(
+        select(TournamentInvite.id).where(
             TournamentInvite.id == invite_id,
             TournamentInvite.tournament_id == tournament_id,
         )
@@ -1643,17 +1643,16 @@ async def valid_invite_code_for_tournament(
     normalized = normalize_invite_code(invite_code or "")
     if not normalized:
         return False
-    invite = await db_session.scalar(
-        select(TournamentInvite).where(
+    invite_id = await db_session.scalar(
+        select(TournamentInvite.id).where(
             TournamentInvite.tournament_id == tournament.id,
             TournamentInvite.code == normalized,
+            TournamentInvite.revoked_at.is_(None),
+            (TournamentInvite.expires_at.is_(None) | (TournamentInvite.expires_at > datetime.now(UTC))),
         )
     )
-    now = datetime.now(UTC)
     return bool(
-        invite is not None
-        and invite.revoked_at is None
-        and (invite.expires_at is None or invite.expires_at > now)
+        invite_id is not None
     )
 
 

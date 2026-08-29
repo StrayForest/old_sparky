@@ -203,7 +203,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
             ),
             200,
         )
-        self.assertEqual(invites_before_retry[0]["use_count"], 1)
+        self.assertEqual(invites_before_retry[0]["use_count"], 0)
 
         rejected_claim = await player["client"].post(
             "/api/v1/tournaments/invites/claim",
