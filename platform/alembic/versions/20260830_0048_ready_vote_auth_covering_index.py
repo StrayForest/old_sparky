@@ -15,8 +15,6 @@ The auth and transactional preflight projections therefore remain separate.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from alembic import op
 import sqlalchemy as sa
 
@@ -64,13 +62,23 @@ _INDEX_CATALOG_QUERY = sa.text(
 )
 
 
-@dataclass(frozen=True)
 class IndexCatalogState:
-    is_valid: bool
-    is_ready: bool
-    indexdef: str
-    predicate: str | None
-    include_columns: tuple[str, ...]
+    __slots__ = ("is_valid", "is_ready", "indexdef", "predicate", "include_columns")
+
+    def __init__(
+        self,
+        *,
+        is_valid: bool,
+        is_ready: bool,
+        indexdef: str,
+        predicate: str | None,
+        include_columns: tuple[str, ...],
+    ) -> None:
+        self.is_valid = is_valid
+        self.is_ready = is_ready
+        self.indexdef = indexdef
+        self.predicate = predicate
+        self.include_columns = include_columns
 
 
 def _normalize_catalog_sql(value: str | None) -> str | None:
