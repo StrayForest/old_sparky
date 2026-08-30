@@ -44,15 +44,6 @@ tournament_dependencies = [
     Depends(serialize_tournament_write_invariants),
     Depends(enforce_tournament_participant_policy),
 ]
-# Ready Vote owns its authentication, authorization and transaction boundary.
-# Mount it separately so the generic tournament policy dependency graph is not
-# constructed for every burst request; those policies already intentionally
-# have no behavior on this route.
-api_router.include_router(
-    tournaments.ready_vote_router,
-    prefix="/tournaments",
-    tags=["tournaments"],
-)
 api_router.include_router(
     tournaments.router,
     prefix="/tournaments",

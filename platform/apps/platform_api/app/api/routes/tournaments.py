@@ -131,7 +131,6 @@ from apps.platform_api.app.services.tournament_workflow import (
     lock_tournament_for_workflow,
     mark_ready_check_closed,
     mark_ready_check_started,
-    ready_vote_auth_preflight_snapshot,
     prepare_deadlock_ready_vote,
     prepare_deadlock_captain_candidate_rows,
     prune_participant_from_active_captain_round,
@@ -230,6 +229,7 @@ from python_packages.platform_infra.models import (
 )
 from python_packages.platform_infra.security import (
     ReadyVoteAuthSnapshot,
+    authenticate_ready_vote,
     get_authenticated_session,
     get_optional_authenticated_session,
 )
@@ -241,7 +241,6 @@ from python_packages.platform_infra.tournament_names import (
 from python_packages.platform_infra.slugs import unique_slug_from_name
 
 router = APIRouter()
-ready_vote_router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
@@ -4786,7 +4785,7 @@ async def start_deadlock_ready_check(
     )
 
 
-@ready_vote_router.post("/{slug}/deadlock/ready-check/vote", response_model=TournamentDeadlockReadyVoteResponse)
+@router.post("/{slug}/deadlock/ready-check/vote", response_model=TournamentDeadlockReadyVoteResponse)
 async def vote_deadlock_ready_check(
     slug: str,
     payload: TournamentDeadlockReadyVoteRequest,
@@ -4798,11 +4797,7 @@ async def vote_deadlock_ready_check(
     tournament: Any | None = None
     try:
         async with ready_vote_db_session() as db_session:
-            auth_snapshot, initial_preflight = await ready_vote_auth_preflight_snapshot(
-                request,
-                db_session,
-                slug=slug,
-            )
+            auth_snapshot = await authenticate_ready_vote(request, db_session)
             current_user_id = auth_snapshot.user_id
             vote_now = auth_snapshot.now
             preflight_started = time.perf_counter()
@@ -4813,7 +4808,6 @@ async def vote_deadlock_ready_check(
                     user_id=current_user_id,
                     choice=payload.choice,
                     now=vote_now,
-                    preflight_snapshot=initial_preflight,
                 )
             finally:
                 record_ready_vote_span("ready_vote_preflight_ms", time.perf_counter() - preflight_started)
