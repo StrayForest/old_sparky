@@ -81,6 +81,7 @@ NUMERIC_PATH_RE = re.compile(r"/\d+(?=/|$)")
 REQUEST_PERF_RE = re.compile(r"\brequest_perf\b(?P<body>.*)$")
 READY_VOTE_PERF_KEYS = (
     "ready_vote_auth_ms",
+    "ready_vote_auth_preflight_ms",
     "ready_vote_checkout_count",
     "ready_vote_checkout_ms",
     "ready_vote_preflight_ms",

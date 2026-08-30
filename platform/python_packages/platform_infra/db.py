@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Session
-from starlette.requests import Request
 
 from python_packages.platform_infra.config import (
     PLATFORM_SCHEMA,
@@ -141,27 +140,10 @@ async def dispose_engine() -> None:
         await current_engine.dispose()
 
 
-async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
-    """Yield the request session without pinning a connection on Ready Vote.
-
-    Tournament router policy dependencies are shared by every tournament
-    route.  They are intentionally no-ops for the Ready Vote endpoint, but
-    FastAPI still resolves their session dependency.  Avoid the eager
-    checkout for that endpoint so the policy session remains connection-free;
-    the route-owned Ready Vote scope owns the only required database
-    connection. Other routes retain the eager checkout so pool
-    exhaustion remains a bounded, observable 503.
-    """
+async def get_db_session() -> AsyncIterator[AsyncSession]:
+    """Yield a request session after a bounded, observable pool checkout."""
 
     async with session_factory()() as db_session:
-        route = request.scope.get("route")
-        route_path = str(getattr(route, "path", "") or "")
-        if request.method.upper() == "POST" and route_path.endswith(
-            "/deadlock/ready-check/vote"
-        ):
-            yield db_session
-            return
-
         checkout_started = perf_counter()
         try:
             await db_session.connection()

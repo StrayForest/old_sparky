@@ -267,6 +267,7 @@ class RequestPerformanceMiddleware:
             "compute_ms=%.2f compute_blocks=%s "
             "ready_vote_auth_ms=%.2f ready_vote_checkout_count=%s "
             "ready_vote_checkout_ms=%.2f "
+            "ready_vote_auth_preflight_ms=%.2f "
             "ready_vote_preflight_ms=%.2f ready_vote_upsert_ms=%.2f "
             "ready_vote_commit_ms=%.2f "
             "ready_vote_response_ms=%.2f response_bytes=%s qa_phase=%s "
@@ -285,6 +286,7 @@ class RequestPerformanceMiddleware:
             metrics.ready_vote_spans.get("ready_vote_auth_ms", 0.0) * 1000,
             metrics.ready_vote_checkout_count,
             metrics.ready_vote_checkout_ms,
+            metrics.ready_vote_spans.get("ready_vote_auth_preflight_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_preflight_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_upsert_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_commit_ms", 0.0) * 1000,

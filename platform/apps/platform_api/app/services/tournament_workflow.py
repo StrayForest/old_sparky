@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import time
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -57,10 +58,19 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockReadyVoteCountShard,
     TournamentParticipant,
     User,
+    UserSession,
     TournamentMatch,
     new_uuid,
 )
-from python_packages.platform_infra.performance import measure_compute_block
+from python_packages.platform_infra.performance import (
+    measure_compute_block,
+    record_ready_vote_span,
+)
+from python_packages.platform_infra.security import (
+    ReadyVoteAuthSnapshot,
+    ready_vote_auth_context,
+    ready_vote_auth_predicates,
+)
 
 
 INACTIVE_PARTICIPANT_STATUSES = ("withdrawn", "disqualified")
@@ -425,6 +435,7 @@ async def prepare_deadlock_ready_vote(
     user_id: str,
     choice: str,
     now: datetime,
+    preflight_snapshot: ReadyVoteRoutePreflight | None = None,
 ) -> ReadyVoteRoutePreflight:
     """Authorize a vote against the schedule and materialize its round.
 
@@ -437,11 +448,14 @@ async def prepare_deadlock_ready_vote(
     """
 
     current_time = now.astimezone(UTC)
-    snapshot = await ready_vote_preflight_snapshot(
-        db_session,
-        slug=slug,
-        user_id=user_id,
-    )
+    if preflight_snapshot is None:
+        snapshot = await ready_vote_preflight_snapshot(
+            db_session,
+            slug=slug,
+            user_id=user_id,
+        )
+    else:
+        snapshot = preflight_snapshot
     tournament = snapshot.tournament
     active_round = snapshot.active_round
     has_participant = snapshot.has_participant
@@ -787,6 +801,115 @@ def _ready_vote_preflight_columns(*, tournament_id: Any, user_id: str) -> tuple[
         .exists()
     )
     return participant_exists, profile_exists, locked_roster_exists
+
+
+async def ready_vote_auth_preflight_snapshot(
+    request: Any,
+    db_session: AsyncSession,
+    *,
+    slug: str,
+) -> tuple[ReadyVoteAuthSnapshot, ReadyVoteRoutePreflight]:
+    """Authenticate and read the ordinary vote preflight in one round-trip.
+
+    The session/user predicates remain authoritative and the tournament is a
+    left join so error precedence is unchanged: an invalid session is 401,
+    while a valid session with an unknown tournament is 404.  The mutation
+    upsert and commit remain separate so no authorization read is folded into
+    the conditional write or its lifecycle guard.
+    """
+
+    started = time.perf_counter()
+    context = ready_vote_auth_context(request)
+    active_round = aliased(TournamentDeadlockReadyRound)
+    participant_exists, profile_exists, locked_roster_exists = _ready_vote_preflight_columns(
+        tournament_id=Tournament.id,
+        user_id=UserSession.user_id,
+    )
+    eligible_ids_jsonb = cast(active_round.eligible_user_ids, postgresql.JSONB)
+    eligible_count = func.coalesce(func.jsonb_array_length(eligible_ids_jsonb), 0)
+    user_is_eligible = (eligible_count == 0) | func.jsonb_exists(
+        eligible_ids_jsonb,
+        UserSession.user_id,
+    )
+    row = (
+        await db_session.execute(
+            select(
+                UserSession.user_id.label("auth_user_id"),
+                Tournament.id.label("tournament_id"),
+                Tournament.slug.label("tournament_slug"),
+                Tournament.format_slug.label("tournament_format_slug"),
+                Tournament.status.label("tournament_status"),
+                Tournament.registration_closes_at.label("tournament_registration_closes_at"),
+                Tournament.ready_check_starts_at.label("tournament_ready_check_starts_at"),
+                Tournament.ready_check_ends_at.label("tournament_ready_check_ends_at"),
+                Tournament.automation_ready_check_closed_at.label(
+                    "tournament_automation_ready_check_closed_at"
+                ),
+                participant_exists.label("has_participant"),
+                profile_exists.label("has_deadlock_profile"),
+                locked_roster_exists.label("has_locked_roster"),
+                active_round.id.label("ready_round_id"),
+                active_round.tournament_id.label("ready_round_tournament_id"),
+                active_round.status.label("ready_round_status"),
+                eligible_count.label("eligible_participant_count"),
+                user_is_eligible.label("user_is_eligible"),
+            )
+            .select_from(UserSession)
+            .join(User, User.id == UserSession.user_id)
+            .outerjoin(Tournament, Tournament.slug == slug)
+            .outerjoin(
+                active_round,
+                and_(
+                    active_round.tournament_id == Tournament.id,
+                    active_round.status == "active",
+                ),
+            )
+            .where(*ready_vote_auth_predicates(context))
+            .limit(1)
+        )
+    ).first()
+    elapsed = time.perf_counter() - started
+    record_ready_vote_span("ready_vote_auth_preflight_ms", elapsed)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session is invalid.",
+        )
+    if row.tournament_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Tournament not found.",
+        )
+
+    tournament = ReadyVoteTournamentSnapshot(
+        id=str(row.tournament_id),
+        slug=str(row.tournament_slug),
+        format_slug=str(row.tournament_format_slug),
+        status=str(row.tournament_status),
+        registration_closes_at=row.tournament_registration_closes_at,
+        ready_check_starts_at=row.tournament_ready_check_starts_at,
+        ready_check_ends_at=row.tournament_ready_check_ends_at,
+        automation_ready_check_closed_at=row.tournament_automation_ready_check_closed_at,
+    )
+    round_snapshot = None
+    if row.ready_round_id is not None:
+        round_snapshot = ReadyVoteRoundSnapshot(
+            id=int(row.ready_round_id),
+            tournament_id=str(row.ready_round_tournament_id),
+            status=str(row.ready_round_status),
+            eligible_participant_count=int(row.eligible_participant_count or 0),
+            user_is_eligible=bool(row.user_is_eligible),
+        )
+    return (
+        ReadyVoteAuthSnapshot(user_id=str(row.auth_user_id), now=context.now),
+        ReadyVoteRoutePreflight(
+            tournament=tournament,
+            has_participant=bool(row.has_participant),
+            has_deadlock_profile=bool(row.has_deadlock_profile),
+            has_locked_roster=bool(row.has_locked_roster),
+            active_round=round_snapshot,
+        ),
+    )
 
 
 async def ready_vote_preflight_snapshot(

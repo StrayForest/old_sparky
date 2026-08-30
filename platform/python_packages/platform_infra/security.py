@@ -227,6 +227,50 @@ class ReadyVoteAuthSnapshot:
     now: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ReadyVoteAuthContext:
+    """Validated request inputs shared by the Ready Vote auth projections."""
+
+    token_digest: str
+    now: datetime
+    email_verification_required: bool
+
+
+def ready_vote_auth_context(request: Request) -> ReadyVoteAuthContext:
+    """Resolve the cookie and server clock without touching the database."""
+
+    settings = get_settings()
+    token = request.cookies.get(settings.platform_session_cookie_name)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+        )
+    return ReadyVoteAuthContext(
+        token_digest=session_token_digest(token),
+        now=datetime.now(UTC),
+        email_verification_required=email_verification_required(settings),
+    )
+
+
+def ready_vote_auth_predicates(
+    context: ReadyVoteAuthContext,
+) -> tuple[object, ...]:
+    """Build the authoritative session/user predicates for Ready Vote."""
+
+    predicates: list[object] = [
+        UserSession.token_digest == context.token_digest,
+        UserSession.invalidated_at.is_(None),
+        UserSession.expires_at > context.now,
+        User.status == "active",
+    ]
+    if context.email_verification_required:
+        predicates.append(
+            (User.email.is_(None)) | (User.email_verified_at.is_not(None))
+        )
+    return tuple(predicates)
+
+
 @dataclass(slots=True)
 class CreatedSession:
     token: str
@@ -590,33 +634,19 @@ async def authenticate_ready_vote(
 
     started = time.perf_counter()
     try:
-        settings = get_settings()
-        token = request.cookies.get(settings.platform_session_cookie_name)
-        if not token:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
-
-        now = datetime.now(UTC)
-        token_digest = session_token_digest(token)
-        user_predicates = [User.status == "active"]
-        if email_verification_required(settings):
-            user_predicates.append((User.email.is_(None)) | (User.email_verified_at.is_not(None)))
+        context = ready_vote_auth_context(request)
 
         # Select only the primitive actor id. The route's dedicated session
         # already owns the checkout and transaction boundary.
         user_id = await db_session.scalar(
             select(UserSession.user_id)
             .join(User, User.id == UserSession.user_id)
-            .where(
-                UserSession.token_digest == token_digest,
-                UserSession.invalidated_at.is_(None),
-                UserSession.expires_at > now,
-                *user_predicates,
-            )
+            .where(*ready_vote_auth_predicates(context))
             .limit(1)
         )
         if user_id is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session is invalid.")
-        return ReadyVoteAuthSnapshot(user_id=str(user_id), now=now)
+        return ReadyVoteAuthSnapshot(user_id=str(user_id), now=context.now)
     finally:
         record_ready_vote_span("ready_vote_auth_ms", time.perf_counter() - started)
 
@@ -711,27 +741,10 @@ async def get_optional_authenticated_session(
     )
 
 
-def _is_ready_vote_route(request: Request) -> bool:
-    route = request.scope.get("route")
-    route_path = str(getattr(route, "path", "") or "")
-    return (
-        request.method.upper() == "POST"
-        and route_path.endswith("/deadlock/ready-check/vote")
-    )
-
-
 async def get_optional_authenticated_session_for_tournament_policy(
     request: Request,
     db_session: AsyncSession = Depends(get_db_session),
 ) -> AuthenticatedSession | None:
-    """Avoid duplicate optional-auth SQL on the already-authenticated vote path.
+    """Resolve optional auth for the generic tournament policy dependencies."""
 
-    The tournament router policies all return immediately for the Ready vote
-    route. Do not resolve their unrelated optional-auth dependency there; the
-    endpoint's vote-specific dependency remains the sole authoritative session
-    lookup.
-    """
-
-    if _is_ready_vote_route(request):
-        return None
     return await get_optional_authenticated_session(request, db_session)

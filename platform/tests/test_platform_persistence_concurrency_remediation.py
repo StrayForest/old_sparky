@@ -11,11 +11,13 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
 
+from apps.platform_api.app.api.router import api_router
 from apps.platform_api.app.api.routes import profiles, tournaments
 from apps.platform_api.app.services import deadlock_automation, player_commitments
 from apps.platform_api.app.services.tournament_workflow import (
     ReadyVoteTournamentSnapshot,
     ready_vote_preflight_snapshot,
+    ready_vote_auth_preflight_snapshot,
     upsert_deadlock_ready_vote,
 )
 from apps.platform_api.app.services.mutation_idempotency import (
@@ -153,9 +155,9 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sessions.expires_at", sql)
         self.assertIn("users.status", sql)
         self.assertIn("users.email_verified_at", sql)
-        # Auth stays a primitive session/user projection. Ready Vote
-        # preflight owns the independent tournament lifecycle and eligibility
-        # checks; merging them would be a semantic 3-to-2 query rewrite.
+        # This helper remains a primitive session/user projection for callers
+        # that need standalone auth. The hot route uses the route-specific
+        # combined projection, whose error precedence is tested below.
         self.assertNotIn("tournaments", sql)
         self.assertNotIn("tournament_participants", sql)
         self.assertNotIn("tournament_deadlock", sql)
@@ -195,24 +197,16 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         db_session.rollback.assert_awaited_once()
         self.assertTrue(context.exited)
 
-    async def test_ready_vote_policy_session_does_not_eagerly_checkout(self) -> None:
+    async def test_request_database_session_checks_out_before_yield(self) -> None:
         db_session = Mock()
         db_session.connection = AsyncMock()
         context = _AsyncContext(db_session)
         factory = Mock(return_value=context)
-        request = SimpleNamespace(
-            method="POST",
-            scope={
-                "route": SimpleNamespace(
-                    path="/tournaments/{slug}/deadlock/ready-check/vote"
-                )
-            },
-        )
         with patch("python_packages.platform_infra.db.session_factory", return_value=factory):
-            session_generator = get_db_session(request)
+            session_generator = get_db_session()
             scoped_session = await anext(session_generator)
             self.assertIs(scoped_session, db_session)
-            db_session.connection.assert_not_awaited()
+            db_session.connection.assert_awaited_once()
             await session_generator.aclose()
         self.assertTrue(context.exited)
 
@@ -270,6 +264,91 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(preflight.has_deadlock_profile)
         self.assertFalse(preflight.has_locked_roster)
 
+    async def test_ready_vote_auth_and_preflight_share_one_read_round_trip(self) -> None:
+        request = SimpleNamespace(cookies={"platform_session": "token"})
+        row = SimpleNamespace(
+            auth_user_id="user",
+            tournament_id="tournament",
+            tournament_slug="demo",
+            tournament_format_slug="solo",
+            tournament_status="registration_closed",
+            tournament_registration_closes_at=None,
+            tournament_ready_check_starts_at=None,
+            tournament_ready_check_ends_at=None,
+            tournament_automation_ready_check_closed_at=None,
+            has_participant=True,
+            has_deadlock_profile=True,
+            has_locked_roster=False,
+            ready_round_id=7,
+            ready_round_tournament_id="tournament",
+            ready_round_status="active",
+            eligible_participant_count=1,
+            user_is_eligible=True,
+        )
+        result = SimpleNamespace(first=Mock(return_value=row))
+        db_session = Mock()
+        db_session.execute = AsyncMock(return_value=result)
+        settings = SimpleNamespace(
+            platform_session_cookie_name="platform_session",
+            platform_environment="test",
+            platform_email_verification_required=False,
+        )
+        with patch.object(security, "get_settings", return_value=settings):
+            auth_snapshot, preflight = await ready_vote_auth_preflight_snapshot(
+                request,
+                db_session,
+                slug="demo",
+            )
+
+        self.assertEqual(auth_snapshot.user_id, "user")
+        self.assertEqual(preflight.active_round.id, 7)
+        db_session.execute.assert_awaited_once()
+        statement = db_session.execute.await_args.args[0]
+        sql = str(statement.compile(dialect=postgresql.dialect())).lower()
+        self.assertIn("sessions.token_digest", sql)
+        self.assertIn("tournaments.slug", sql)
+        self.assertIn("tournament_deadlock_ready_rounds", sql)
+
+    async def test_ready_vote_combined_read_preserves_auth_and_not_found_precedence(self) -> None:
+        settings = SimpleNamespace(
+            platform_session_cookie_name="platform_session",
+            platform_environment="test",
+            platform_email_verification_required=False,
+        )
+        request = SimpleNamespace(cookies={"platform_session": "token"})
+        with patch.object(security, "get_settings", return_value=settings):
+            invalid_db = Mock()
+            invalid_db.execute = AsyncMock(return_value=SimpleNamespace(first=Mock(return_value=None)))
+            with self.assertRaises(HTTPException) as invalid:
+                await ready_vote_auth_preflight_snapshot(request, invalid_db, slug="missing")
+            self.assertEqual(invalid.exception.status_code, 401)
+
+            missing_tournament_row = SimpleNamespace(auth_user_id="user", tournament_id=None)
+            missing_db = Mock()
+            missing_db.execute = AsyncMock(
+                return_value=SimpleNamespace(first=Mock(return_value=missing_tournament_row))
+            )
+            with self.assertRaises(HTTPException) as missing:
+                await ready_vote_auth_preflight_snapshot(request, missing_db, slug="missing")
+            self.assertEqual(missing.exception.status_code, 404)
+
+    def test_ready_vote_route_bypasses_generic_tournament_policy_dependencies(self) -> None:
+        included = [
+            entry
+            for entry in api_router.routes
+            if getattr(entry, "original_router", None) is tournaments.ready_vote_router
+        ]
+        self.assertEqual(len(included), 1)
+        self.assertEqual(included[0].include_context.prefix, "/tournaments")
+        self.assertEqual(included[0].include_context.dependencies, [])
+        routes = [
+            route
+            for route in tournaments.ready_vote_router.routes
+            if getattr(route, "path", None) == "/{slug}/deadlock/ready-check/vote"
+        ]
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0].dependant.dependencies, [])
+
     async def test_ready_vote_upsert_uses_conditional_noop_conflict_update(self) -> None:
         db_session = Mock()
         db_session.scalar = AsyncMock(return_value=None)
@@ -286,18 +365,6 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("WHERE", sql)
         self.assertIn("choice", sql)
         self.assertIn("RETURNING", sql)
-
-    async def test_tournament_policy_auth_skips_ready_vote_route(self) -> None:
-        request = Mock()
-        request.method = "POST"
-        request.scope = {"route": SimpleNamespace(path="/{slug}/deadlock/ready-check/vote")}
-
-        result = await security.get_optional_authenticated_session_for_tournament_policy(
-            request,
-            Mock(),
-        )
-
-        self.assertIsNone(result)
 
     async def test_auth_touch_uses_isolated_session_transaction(self) -> None:
         touch_session = Mock()
