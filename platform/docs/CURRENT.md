@@ -45,6 +45,12 @@ AS-18 — hot-path capacity and backpressure implementation is complete.
 Production remains commit- and exact-SHA-gated; detailed load output belongs in
 external retained reports and is not a product architecture contract.
 
+Current status: migration `0048` adds a partial covering index for the
+`UserSession` auth query. Evidence is `EXPLAIN` `Index Only Scan` / `Heap
+Fetches 0` from disposable analysis as engineering evidence; no retained
+15k/20k 2-vCPU load report has been run; the exact-SHA CI/load gate remains
+pending; and p95/p99 targets are unchanged.
+
 The current Ready Check implementation uses the initial workspace timing
 contract: the page receives `starts_at`, `ends_at`, eligible/current-user
 state and a UTC `server_time` anchor. The browser derives a server-relative

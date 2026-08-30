@@ -2,11 +2,11 @@
 
 ## Priority
 
-- The root agent is orchestration-only: delegate all substantive work—including research, project reads, edits, checks, Git/CI and publication—to subagents; then synthesize their results, coordinate dependencies, and report progress and the final outcome. Every subagent, including nested subagents, must run exclusively as `gpt-5.6-luna` with `reasoning_effort=max`; when explicitly overriding the model, set `fork_turns` to `none` or a positive number (never a full-history fork).
+- The agent may perform substantive work directly or delegate bounded subtasks as useful, while preserving the repository's safety and verification requirements.
 - This repository is site-only. Default scope is `platform/`.
 - Read `platform/docs/CURRENT.md` first for current state and priority.
 - Use `platform/docs/README.md` as the task router; open only the relevant owner documents.
-- Optimize Codex limits: targeted reads, bounded output, quiet checks, no unnecessary subagents.
+- Optimize Codex limits: targeted reads, bounded output, and quiet checks.
 
 ## Boundaries
 

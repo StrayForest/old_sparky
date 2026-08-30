@@ -26,7 +26,7 @@ from python_packages.platform_infra.models import (
 
 
 TARGET_REVISION = "20260821_0039"
-HEAD_REVISION = "20260824_0043"
+HEAD_REVISION = "20260830_0048"
 
 
 def _run_alembic(

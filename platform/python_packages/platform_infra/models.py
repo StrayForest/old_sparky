@@ -197,6 +197,14 @@ class UserRole(Base):
 
 class UserSession(Base):
     __tablename__ = "sessions"
+    __table_args__ = (
+        Index(
+            "ix_sessions_ready_vote_auth",
+            "token_digest",
+            postgresql_include=("user_id", "expires_at"),
+            postgresql_where=text("invalidated_at IS NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     user_id: Mapped[str] = mapped_column(

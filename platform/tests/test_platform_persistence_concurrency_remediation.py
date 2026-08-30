@@ -153,6 +153,12 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sessions.expires_at", sql)
         self.assertIn("users.status", sql)
         self.assertIn("users.email_verified_at", sql)
+        # Auth stays a primitive session/user projection. Ready Vote
+        # preflight owns the independent tournament lifecycle and eligibility
+        # checks; merging them would be a semantic 3-to-2 query rewrite.
+        self.assertNotIn("tournaments", sql)
+        self.assertNotIn("tournament_participants", sql)
+        self.assertNotIn("tournament_deadlock", sql)
         self.assertNotIn("roles", sql)
         self.assertNotIn("user_roles", sql)
         self.assertNotIn("last_seen", sql)

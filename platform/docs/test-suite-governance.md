@@ -80,7 +80,7 @@ The migration scenario is destructive to its disposable database. It must not
 be pointed at `platformdb` or a production connection. The scenario creates a
 legacy `private` tournament and an intentionally duplicated active workflow
 row, confirms the first upgrade fails without applying the revision, repairs
-the duplicate, retries the upgrade through `20260824_0043`, and verifies
+the duplicate, retries the upgrade through `20260830_0048`, and verifies
 normalized visibility, participant-capacity slots and the final constraints.
 
 Do not substitute a manually run local test for the GitHub workflow. Local
