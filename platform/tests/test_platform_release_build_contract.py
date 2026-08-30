@@ -85,6 +85,22 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             workflow.index("Mark production deployment pending"),
         )
 
+    def test_baseline_runtime_profile_restores_ready_vote_admission_limits(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text()
+        baseline_start = workflow.index("            baseline)")
+        static_start = workflow.index(
+            "            ready-vote-static-4|", baseline_start
+        )
+        baseline_branch = workflow[baseline_start:static_start]
+        for key in (
+            "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY",
+            "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY",
+            "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY",
+        ):
+            self.assertIn(f"--only {key}", baseline_branch)
+
     def test_production_preflight_requires_edge_parity_before_preflight_exit(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
