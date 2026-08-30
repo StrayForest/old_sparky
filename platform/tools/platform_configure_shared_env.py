@@ -142,6 +142,21 @@ RUNTIME_PROFILES = {
         }
         for limit in (4, 6, 8, 12, 16)
     },
+    # Adaptive-v2 is tuned from the canonical static-8 knee. It keeps the
+    # same workers, database pool and connection budget, starts at eight per
+    # worker, recovers only after sustained healthy samples, and backs off with
+    # CPU, inflight, service-latency and pool-wait hysteresis.
+    "ready-vote-adaptive-v2": {
+        "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY": "4",
+        "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": "8",
+        "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": "12",
+        "PLATFORM_READY_VOTE_ADMISSION_MAX_WAITERS": "0",
+        "PLATFORM_READY_VOTE_ADMISSION_WAIT_TIMEOUT_MS": "0",
+        "PLATFORM_READY_VOTE_ADMISSION_CPU_SAMPLE_INTERVAL_SECONDS": "0.5",
+        "PLATFORM_READY_VOTE_ADMISSION_CPU_EWMA_ALPHA": "0.25",
+        "PLATFORM_READY_VOTE_ADMISSION_RECOVERY_SAMPLES": "16",
+        "PLATFORM_READY_VOTE_ADMISSION_CONTROL_INTERVAL_SECONDS": "0.5",
+    },
     # Keep the total API pool budget unchanged while giving a third API
     # worker a smaller private pool. This is an operator-controlled capacity
     # experiment for the observed two-core VPS, not the automatic baseline.

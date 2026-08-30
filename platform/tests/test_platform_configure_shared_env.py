@@ -125,6 +125,17 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
                 },
             )
 
+    def test_ready_vote_adaptive_v2_preserves_worker_and_database_envelope(self) -> None:
+        profile = configure.RUNTIME_PROFILES["ready-vote-adaptive-v2"]
+        self.assertEqual(profile["PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY"], "4")
+        self.assertEqual(profile["PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY"], "8")
+        self.assertEqual(profile["PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY"], "12")
+        self.assertEqual(profile["PLATFORM_READY_VOTE_ADMISSION_MAX_WAITERS"], "0")
+        self.assertEqual(profile["PLATFORM_READY_VOTE_ADMISSION_WAIT_TIMEOUT_MS"], "0")
+        self.assertNotIn("PLATFORM_API_WORKERS", profile)
+        self.assertNotIn("PLATFORM_DB_POOL_SIZE", profile)
+        self.assertNotIn("PLATFORM_DB_CONNECTION_BUDGET", profile)
+
     def test_atomic_write_preserves_private_owner_group_and_mode(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / ".env.platform"

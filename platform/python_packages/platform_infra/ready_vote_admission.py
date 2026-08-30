@@ -32,6 +32,13 @@ CPU_NORMAL_THRESHOLD_PERCENT = 70.0
 CPU_PRESSURE_THRESHOLD_PERCENT = 80.0
 CPU_SEVERE_THRESHOLD_PERCENT = 90.0
 
+# These ratios are intentionally conservative for the two-worker production
+# host.  They are pressure signals, not a reason to queue low-load traffic:
+# an idle controller does not wait, batch, or use Redis to coordinate votes.
+INFLIGHT_WATCH_RATIO = 0.75
+INFLIGHT_PRESSURE_RATIO = 0.90
+INFLIGHT_SEVERE_RATIO = 1.0
+
 
 @dataclass(frozen=True, slots=True)
 class ReadyVoteAdmissionConfig:
@@ -250,6 +257,7 @@ class ReadyVoteAdmissionController:
                 wait_remaining = deadline - perf_counter()
                 if self.config.max_waiters <= self._waiters or wait_remaining <= 0:
                     self._shed_total += 1
+                    self._recompute_control_locked()
                     self._refresh_capacity_event_locked()
                     wait_ms = (perf_counter() - started_at) * 1000
                     snapshot = self._snapshot_locked()
@@ -394,6 +402,7 @@ class ReadyVoteAdmissionController:
         if now - self._last_control_at < self.config.control_interval_seconds:
             return
         cpu_pressure = self._cpu_pressure or 0.0
+        inflight_ratio = self._inflight / max(1, self._limit)
 
         recent_p90 = 0.0
         if self._recent_latencies_ms:
@@ -401,6 +410,7 @@ class ReadyVoteAdmissionController:
             recent_p90 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.9))]
         severe = (
             cpu_pressure >= CPU_SEVERE_THRESHOLD_PERCENT
+            or inflight_ratio >= INFLIGHT_SEVERE_RATIO
             or self._latency_ewma_ms >= 800
             or recent_p90 >= 900
             or self._pool_wait_ewma_ms >= 50
@@ -408,6 +418,7 @@ class ReadyVoteAdmissionController:
         )
         pressure = (
             cpu_pressure >= CPU_PRESSURE_THRESHOLD_PERCENT
+            or inflight_ratio >= INFLIGHT_PRESSURE_RATIO
             or self._latency_ewma_ms >= 450
             or recent_p90 >= 600
             or self._pool_wait_ewma_ms >= 15
@@ -415,6 +426,7 @@ class ReadyVoteAdmissionController:
         )
         watch = (
             cpu_pressure >= CPU_NORMAL_THRESHOLD_PERCENT
+            or inflight_ratio >= INFLIGHT_WATCH_RATIO
             or self._latency_ewma_ms >= 300
             or recent_p90 >= 400
             or self._pool_wait_ewma_ms >= 5
@@ -445,6 +457,9 @@ class ReadyVoteAdmissionController:
             self._pressure_samples = 0
             self._healthy_samples += 1
             next_state = READY_VOTE_ADMISSION_NORMAL
+            # Recovery is deliberately slow, but it must also happen after
+            # pressure has drained; requiring a busy queue here would leave a
+            # controller stuck at a reduced limit during a quiet period.
             delta = 1 if self._healthy_samples >= self.config.recovery_samples else 0
 
         old_state = self._state

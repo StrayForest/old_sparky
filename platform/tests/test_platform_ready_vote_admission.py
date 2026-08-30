@@ -64,6 +64,21 @@ class ReadyVoteAdmissionControllerTests(unittest.IsolatedAsyncioTestCase):
         assert first is not None
         await first.release(service_ms=20.0, pool_wait_ms=0.0)
 
+    async def test_saturated_inflight_signal_reduces_adaptive_limit(self) -> None:
+        controller = self.controller(
+            min_concurrency=4,
+            initial_concurrency=8,
+            max_concurrency=12,
+        )
+        leases = [await controller.acquire() for _ in range(8)]
+
+        self.assertIsNone(await controller.acquire())
+        self.assertEqual(controller.snapshot().limit, 7)
+
+        for lease in leases:
+            assert lease is not None
+            await lease.release(service_ms=20.0, pool_wait_ms=0.0)
+
     async def test_waiter_budget_is_bounded_and_deadline_is_short(self) -> None:
         controller = self.controller(
             min_concurrency=1,

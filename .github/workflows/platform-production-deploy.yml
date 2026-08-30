@@ -23,6 +23,7 @@ on:
           - ready-vote-static-8
           - ready-vote-static-12
           - ready-vote-static-16
+          - ready-vote-adaptive-v2
           - api-3x16
           - api-1x48
 
@@ -522,6 +523,55 @@ jobs:
                 [[ "$api_ready" == true ]] \
                   || fail "static Ready Vote profile health check failed; baseline restore failed"
                 fail "static Ready Vote profile health check failed; baseline restored"
+              fi
+              ;;
+            ready-vote-adaptive-v2)
+              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+                --apply \
+                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                --profile "$runtime_profile" \
+                --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
+                --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
+                --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY \
+                --only PLATFORM_READY_VOTE_ADMISSION_MAX_WAITERS \
+                --only PLATFORM_READY_VOTE_ADMISSION_WAIT_TIMEOUT_MS \
+                --only PLATFORM_READY_VOTE_ADMISSION_CPU_SAMPLE_INTERVAL_SECONDS \
+                --only PLATFORM_READY_VOTE_ADMISSION_CPU_EWMA_ALPHA \
+                --only PLATFORM_READY_VOTE_ADMISSION_RECOVERY_SAMPLES \
+                --only PLATFORM_READY_VOTE_ADMISSION_CONTROL_INTERVAL_SECONDS
+              systemctl restart deadlock-api
+              api_ready=false
+              for _ in $(seq 1 30); do
+                if systemctl is-active --quiet deadlock-api \
+                  && curl --fail --silent --show-error --max-time 2 \
+                    http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
+                  api_ready=true
+                  break
+                fi
+                sleep 1
+              done
+              if [[ "$api_ready" != true ]]; then
+                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+                  --apply \
+                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                  --profile ready-vote-static-8 \
+                  --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
+                  --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
+                  --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                systemctl restart deadlock-api
+                api_ready=false
+                for _ in $(seq 1 30); do
+                  if systemctl is-active --quiet deadlock-api \
+                    && curl --fail --silent --show-error --max-time 2 \
+                      http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
+                    api_ready=true
+                    break
+                  fi
+                  sleep 1
+                done
+                [[ "$api_ready" == true ]] \
+                  || fail "adaptive-v2 health check failed; static-8 restore failed"
+                fail "adaptive-v2 health check failed; static-8 restored"
               fi
               ;;
             api-3x16)
