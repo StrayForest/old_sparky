@@ -2008,6 +2008,9 @@ test("create tournament form uses organizer defaults and tournament limits", asy
     }).length
   ), firstDateMinimum);
   expect(enabledPastDates).toBe(0);
+  if (firstDateMinimum!.slice(0, 7) !== expectedDate.slice(0, 7)) {
+    await calendar.getByRole("button", { name: "Предыдущий месяц" }).click();
+  }
   const [minimumYear, minimumMonth, minimumDay] = firstDateMinimum!.split("-");
   await calendar.getByRole("button", {
     name: `${minimumDay}.${minimumMonth}.${minimumYear}`
