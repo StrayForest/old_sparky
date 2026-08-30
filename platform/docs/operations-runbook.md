@@ -239,6 +239,38 @@ The public external-load workflow owns the production capacity test. It keeps
 fixture preparation, observation and exact cleanup on the origin while the
 measured HTTP client runs on a GitHub-hosted runner outside the VPS.
 
+### Retained Ready Vote result
+
+The reviewed reference is `ready-vote-static-8`: per worker its admission
+minimum/initial/maximum is exactly `8/8/8`, with the existing two workers and
+the unchanged API pool (`24`, no overflow). The measured canonical ramp on
+`77fd8682` (workflow `33335224474`) passed the strict SLO through 60 logical
+actions/s, first shed at 70, and reached 79.385 actions/s goodput at 80 while
+that final phase failed the strict SLO. Thus report both values: SLO capacity
+`60 actions/s`, maximum observed stable goodput `79.385 actions/s`, and knee
+/ shedding onset `70 actions/s`. Determine the knee from accepted and logical
+latency, inflight/admission and pool wait, shedding/retries, goodput and CPU;
+CPU alone is insufficient.
+
+The same 20–80 ramp with adaptive-v2 (deploy `33337237276`, load workflow
+`33337425315`) had the same SLO capacity but lower maximum goodput
+(`73.528 actions/s`) and severe logical-tail/failure pressure at 80. It was
+not promoted. Restore/static-8 deploy `33337943520` is the final runtime
+reference. The spike run `33338160338` passed normal → burst → normal with
+zero shedding/retries and p99 `431.439 → 238.336 → 181.006 ms`. The stress
+run `33339421320` passed its separate behavior/correctness contract despite
+overload failures; do not apply the normal final-failure SLO to it. The
+optional 20k stress profile remains skipped.
+
+For each retained result, preserve requested and actual offered rate, HTTP
+attempts/statuses, accepted and logical latency percentiles/maxima, goodput,
+shedding, retries/attempts per logical action/final failures, CPU per core,
+API/PG connections, in-flight/admission/wait, pool checkout/wait, auth,
+preflight, upsert and commit timings, PostgreSQL locks/waits, correctness and
+exact cleanup. Full client-population data is authoritative; selected
+`request_perf`/pool timing spans are server diagnostics and may be absent on a
+fast run. Do not infer zero server work from absent spans.
+
 ### External fixture cleanup and runtime baseline
 
 Run the external workflow only in a low-traffic maintenance window. It uses
@@ -288,8 +320,10 @@ the worker is below its current limit; the default admission wait budget is
 contains `code=READY_VOTE_OVERLOADED`, `retryable=true` and a bounded
 `retry_after_ms` hint.
 
-The reviewed two-worker defaults are per worker: minimum `4`, initial `8`,
-maximum `16`. The controller smooths CPU samples every `0.5 s` with EWMA
+The reviewed code defaults are per worker: minimum `4`, initial `8`, maximum
+`16`. Production is currently pinned by the runtime profile to static-8:
+minimum/initial/maximum `8/8/8`. The controller smooths CPU samples every
+`0.5 s` with EWMA
 alpha `0.25`; `70%` is watch, `80%` enters pressure and `90%` is severe.
 Latency, admission wait and DB pool wait are additional signals. Pressure
 reduces the limit quickly, while recovery increases it one slot at a time only

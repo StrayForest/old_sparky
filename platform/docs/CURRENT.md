@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-29
+- Last reviewed: 2026-08-31
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -45,28 +45,34 @@ AS-18 — hot-path capacity and backpressure implementation is complete.
 Production remains commit- and exact-SHA-gated; detailed load output belongs in
 external retained reports and is not a product architecture contract. The
 reviewed Ready Vote path now also has a process-local adaptive admission
-controller per API worker, with per-worker defaults `4/8/16`, bounded/no-waiter
+controller per API worker, with code defaults `4/8/16`, bounded/no-waiter
 overload shedding before DB checkout, and a browser chain of at most two
-jittered retries for the explicit overload response. The corrected canonical
-performance model uses `ready-vote-slo-v2`, `ready-vote-capacity-ramp-v2`,
+jittered retries for the explicit overload response. Production is pinned to
+`ready-vote-static-8` with exact per-worker limits `8/8/8`; workers, pool and
+database budgets are unchanged. The corrected canonical performance model uses
+`ready-vote-slo-v2`, `ready-vote-capacity-ramp-v2`,
 `ready-vote-stress-15k-v2` and `ready-vote-spike-v1`; the optional 20k stress
 profile is retained only for a specific unresolved question.
 
 Current status: migration `0048` adds a partial covering index for the
 `UserSession` auth query. Evidence is `EXPLAIN` `Index Only Scan` / `Heap
-Fetches 0` from disposable analysis as engineering evidence. Full retained
-15k and 20k 2-vCPU Ready Vote runs on `ba377cbe` completed with 200 responses,
-correct duplicate no-op semantics and exact cleanup, but the unchanged
-latency gate remains unmet: 15k p95/p99 was 2373.755/3189.961 ms and 20k was
-2180.498/2719.356 ms. Both cores averaged roughly 92–94% while PostgreSQL
-averaged roughly 22%; server timing identifies pool checkout wait as the main
-remaining bottleneck and still records three SQL statements per normal vote.
-Exact-SHA CI, auto-deploy and production live smoke passed; p95/p99 targets
-are unchanged. The retained aggressive runs are stress evidence: their final
-logical failures are not a normal-traffic SLO result. The supported-load SLO
-remains accepted p50/p90/p95/p99 <= 250/400/600/1000 ms, logical p95/p99 <=
-600/1000 ms, final logical failure <0.5%, and approximately zero normal-load
-shedding.
+Fetches 0` from disposable analysis as engineering evidence. The supported
+load run `33335115575` passed with accepted p50/p90/p95/p99
+`241.711/256.963/264.706/639.338 ms`, zero shedding/retries/final failures,
+and exact cleanup. The static-8 capacity ramp `33335224474` established strict
+SLO capacity at `60 actions/s`, maximum observed stable goodput at
+`79.385 actions/s`, and knee/shedding onset at `70 actions/s`. Adaptive-v2
+was tested at the exact same points (`33337425315`): it had the same strict
+SLO capacity but lower maximum goodput (`73.528 actions/s`) and materially
+worse logical tail/failure pressure at 80, so it was not promoted. Spike
+`33338160338` passed normal → burst → normal with zero shedding/retries; stress
+`33339421320` passed its separate behavior/correctness contract and is not a
+normal final-failure SLO result. The optional 20k stress run was skipped.
+The supported-load SLO remains accepted p50/p90/p95/p99 <= 250/400/600/1000
+ms, logical p95/p99 <= 600/1000 ms, final logical failure <0.5%, and
+approximately zero normal-load shedding. Every run passed exact cleanup; the
+control account remained intact. Profile versions/digests and full tables are
+retained in `platform/performance/README.md`.
 
 The current Ready Check implementation uses the initial workspace timing
 contract: the page receives `starts_at`, `ends_at`, eligible/current-user
