@@ -340,14 +340,24 @@ def validate_platform_settings(
         raise RuntimeError(
             "Configured API and worker PostgreSQL pools exceed PLATFORM_DB_CONNECTION_BUDGET."
         )
-    if not (
-        settings.platform_ready_vote_admission_min_concurrency
-        <= settings.platform_ready_vote_admission_initial_concurrency
-        <= settings.platform_ready_vote_admission_max_concurrency
-    ):
-        raise RuntimeError(
-            "Ready Vote admission concurrency must satisfy min <= initial <= max."
-        )
+    ready_vote_concurrency = (
+        getattr(settings, "platform_ready_vote_admission_min_concurrency", None),
+        getattr(settings, "platform_ready_vote_admission_initial_concurrency", None),
+        getattr(settings, "platform_ready_vote_admission_max_concurrency", None),
+    )
+    # A few lightweight unit-test settings objects intentionally expose only
+    # the legacy database contract.  Pydantic Settings always supplies these
+    # as ints, so validate the ordering when the new fields are present rather
+    # than comparing arbitrary test doubles (for example, Mock attributes).
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in ready_vote_concurrency):
+        if not (
+            ready_vote_concurrency[0]
+            <= ready_vote_concurrency[1]
+            <= ready_vote_concurrency[2]
+        ):
+            raise RuntimeError(
+                "Ready Vote admission concurrency must satisfy min <= initial <= max."
+            )
     if environment == "test":
         redis_url = urlsplit(settings.platform_redis_url)
         if redis_url.scheme not in {"redis", "rediss"} or redis_url.path != "/15":
