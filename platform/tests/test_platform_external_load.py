@@ -275,6 +275,101 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(report["logical"]["final_failures"], 0)
         self.assertGreater(report["logical"]["successful_goodput_actions_per_second"], 0)
 
+    def test_stress_allows_shed_duplicates_but_requires_successful_noops(self) -> None:
+        payload = manifest_payload()
+        _, users = load_manifest_from_payload(payload)
+
+        def fake_trace(origin: str, timeout: float) -> dict[str, str]:
+            return {"status": "200", "ip": "192.0.2.10", "colo": "TEST"}
+
+        def fake_action(
+            origin: str,
+            user: VirtualUser,
+            phase: str,
+            timeout: float,
+            *,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+        ) -> LogicalRequestResult:
+            duplicate = phase.endswith("duplicate")
+            result = RequestResult(
+                phase=phase,
+                method="POST",
+                path=f"/tournaments/{user.tournament_slug}/deadlock/ready-check/vote",
+                status=503 if duplicate else 200,
+                elapsed_ms=12.0,
+                ok=not duplicate,
+                response_bytes=120,
+                response_json=(
+                    {"code": "READY_VOTE_OVERLOADED", "retryable": True}
+                    if duplicate
+                    else {"changed": True}
+                ),
+                error_kind="http_error" if duplicate else None,
+            )
+            return LogicalRequestResult(
+                [result], elapsed_ms=12.0, user_id=user.user_id
+            )
+
+        def fake_state_request(
+            origin: str,
+            user: VirtualUser,
+            *,
+            method: str,
+            path: str,
+            phase: str,
+            timeout: float,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+            json_payload: dict[str, object] | None = None,
+            expected_statuses: frozenset[int] = frozenset({200}),
+            extra_headers: dict[str, str] | None = None,
+        ) -> RequestResult:
+            return RequestResult(
+                phase=phase,
+                method=method,
+                path=path,
+                status=200,
+                elapsed_ms=8.0,
+                ok=True,
+                response_bytes=150,
+                response_json={"active_round": {"ready_count": 2}},
+            )
+
+        with (
+            patch("tools.platform_external_load._trace", side_effect=fake_trace),
+            patch("tools.platform_external_load._ready_vote_action", side_effect=fake_action),
+            patch("tools.platform_external_load._request", side_effect=fake_state_request),
+        ):
+            report = run_load(
+                payload,
+                users,
+                mode="ready-vote",
+                spread_seconds=0,
+                concurrency=1,
+                timeout=1,
+                duplicate_count=1,
+                manual_refresh_count=0,
+                p95_budget_ms=600,
+                p99_budget_ms=1000,
+                scenario_kind="stress",
+                acceptance_contract={
+                    "kind": "stress",
+                    "accepted_request_latency": {
+                        "p50_ms": 1500,
+                        "p90_ms": 3000,
+                        "p95_ms": 5000,
+                        "p99_ms": 8000,
+                    },
+                    "max_shed_percent": 99.9,
+                    "max_retry_amplification_percent": 200,
+                },
+            )
+
+        self.assertTrue(report["acceptance"]["contract_ok"])
+        self.assertFalse(report["acceptance"]["passed"])
+        self.assertEqual(report["phases"]["duplicate"]["logical"]["final_failures"], 1)
+
     def test_read_mix_manual_refresh_uses_conditional_workspace_request(self) -> None:
         payload = manifest_payload()
         _, users = load_manifest_from_payload(payload)

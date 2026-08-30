@@ -840,6 +840,22 @@ def run_load(
         changed_counts = primary_summary.get("changed_counts", {})
         duplicate_changed = duplicate_summary.get("changed_counts", {})
         strict_primary_contract = scenario_kind not in {"stress", "spike"}
+        strict_duplicate_contract = strict_primary_contract
+        duplicate_successes = int(duplicate_summary.get("final_successes", 0))
+        duplicate_failures = int(duplicate_summary.get("final_failures", 0))
+        duplicate_raw = phase_results.get("duplicate", {}).get("raw_http", {})
+        duplicate_correctness = (
+            duplicate_failures == 0
+            and int(duplicate_changed.get("False", 0)) == len(duplicate_users)
+            if strict_duplicate_contract
+            else (
+                # Stress may shed a duplicate with the same bounded 503 as a
+                # primary action. Every duplicate that is accepted must still
+                # be an idempotent noop, and no unexpected status is allowed.
+                int(duplicate_changed.get("False", 0)) == duplicate_successes
+                and int(duplicate_raw.get("unexpected_statuses") or 0) == 0
+            )
+        )
         contract_ok = (
             primary_summary["actions"] == len(primary_users)
             and (
@@ -848,8 +864,8 @@ def run_load(
                 else int(changed_counts.get("True", 0)) == primary_summary["final_successes"]
             )
             and int(changed_counts.get("True", 0)) == primary_summary["final_successes"]
-            and duplicate_summary.get("final_failures", 0) == 0
-            and int(duplicate_changed.get("False", 0)) == len(duplicate_users)
+            and duplicate_correctness
+            and int(phase_results["primary"]["raw_http"].get("unexpected_statuses") or 0) == 0
             and phase_results["state"]["errors"] == 0
         )
     else:
