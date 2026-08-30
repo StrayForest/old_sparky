@@ -57,9 +57,9 @@ A local-only commit is not a completed handoff. Never automatically use `--force
 
 ## GitHub CI/CD is the release authority
 
-- Do not run platform tests, builds or migrations manually from the Codex shell
-  for normal work. These checks are owned by GitHub Actions; a local result is
-  neither required nor sufficient for release authorization.
+- Run deterministic local feedback through the canonical
+  `platform/tools/platform_verify.py` gates when useful. Local results are
+  feedback only and never authorize a release.
 - If a GitHub job fails, use its GitHub Actions logs as the first diagnostic
   source. Run a local reproduction only when explicitly requested or when it
   is necessary to isolate the CI failure, and never treat that reproduction as
@@ -78,6 +78,34 @@ A local-only commit is not a completed handoff. Never automatically use `--force
 - If local and GitHub results differ, treat the GitHub result as authoritative
   for release gating, investigate the environment difference, fix it, push the
   fix and repeat the complete CI gate.
+
+## Test architecture decision tree
+
+When behavior changes, place its protection at the lowest suitable layer:
+
+1. Backend/domain behavior belongs in the auto-discovered
+   `platform/tests/test_*.py` tree. Adding an ordinary backend test never
+   requires a GitHub workflow edit or a filename manifest entry.
+2. Hermetic web/browser behavior belongs in the canonical Playwright suite
+   under `platform/apps/platform_web/tests`. Adding an ordinary scenario never
+   requires a GitHub workflow edit.
+3. A new deterministic execution contour requires a registry entry in
+   `platform/tools/platform_verify.py`, its runner, the verification-contract
+   self-test and a CI job that invokes only the gate ID.
+4. Production smoke/live QA belongs in its repository-owned runner and the
+   appropriate protected production workflow.
+5. A load/performance scenario belongs in a versioned profile under
+   `platform/performance/profiles/`; keep the generator on an external
+   GitHub-hosted runner and keep scenario values out of workflow YAML.
+6. Run focused canonical local gates for feedback when useful. If a safe
+   dependency is unavailable, report `LOCAL GATE BLOCKED` rather than calling
+   a reduced suite a complete pass.
+7. Push the coherent tested change. The exact-SHA GitHub security/build PASS
+   remains the release authority, and production/live/load evidence is valid
+   only through its approved explicit workflow.
+
+Never add an individual ordinary test by editing GitHub workflow YAML. Do not
+silently exclude or retry deterministic failures.
 
 ## Production deployment
 

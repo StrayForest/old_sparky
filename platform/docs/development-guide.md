@@ -59,10 +59,10 @@ All Node commands go through `tools/platform_node.sh` or `tools/platform_web_npm
 10. Commit each coherent verified change/package and push it to the matching GitHub branch before handoff unless explicitly requested otherwise.
 
 The test-group ownership and runner contract is maintained in
-[`test-suite-governance.md`](test-suite-governance.md). CI must use
-`tools/platform_run_tests.sh` for backend tests and `npm run test:hermetic` for
-all deterministic Playwright specs; do not use grep exclusions to define test
-ownership.
+[`test-suite-governance.md`](test-suite-governance.md). Local and CI
+verification use the stable gate IDs exposed by
+`tools/platform_verify.py`; specialized runners are implementation details.
+Do not use grep exclusions to define test ownership.
 
 ## Commit and push safety
 
@@ -96,18 +96,27 @@ A local-only commit is not a completed GitHub handoff.
 
 ## Verification commands
 
-GitHub Actions owns the normal release gate. Use local verification only when explicitly needed for development or CI diagnosis, and keep it isolated from production resources. The standard local commands are:
+GitHub Actions owns the release gate, while canonical local gates are
+recommended for fast feedback. Keep them isolated from production resources.
+The standard local commands are:
 
 ```bash
 cd /root/old_sparky/platform
-tools/platform_run_quiet.sh "platform tests" -- tools/platform_run_tests.sh discover -s tests
-tools/platform_run_quiet.sh "web typecheck" -- tools/platform_web_npm.sh --prefix apps/platform_web run typecheck
-tools/platform_run_quiet.sh "web lint" -- tools/platform_web_npm.sh --prefix apps/platform_web run lint
-tools/platform_run_quiet.sh "web build" -- tools/platform_web_npm.sh --prefix apps/platform_web run build
-.venv_platform/bin/python tools/platform_docs_check.py
+.venv_platform/bin/python tools/platform_verify.py backend
+.venv_platform/bin/python tools/platform_verify.py python-quality
+.venv_platform/bin/python tools/platform_verify.py security
+.venv_platform/bin/python tools/platform_verify.py migration
+.venv_platform/bin/python tools/platform_verify.py docs
+.venv_platform/bin/python tools/platform_verify.py web-quality
+.venv_platform/bin/python tools/platform_verify.py web-hermetic
+.venv_platform/bin/python tools/platform_verify.py verification-contract
 ```
 
-Run Ruff, Bandit, pip-audit, npm audit and `tools/platform_secret_scan.py` for a security or release package when reproducing or extending the corresponding CI checks. Use Playwright at affected desktop/tablet/mobile viewports for meaningful UI changes.
+Use `tools/platform_verify.py backend --focused <unittest-selector>` for
+focused feedback. Raw underlying commands are reserved for debugging the
+canonical runner itself or isolating a CI failure. The complete local
+deterministic aggregate is available as `tools/platform_verify.py ci`; it does
+not run production smoke, live QA or load testing.
 
 For a production-bound `dev` change, final verification is the GitHub chain for the same current-head SHA:
 

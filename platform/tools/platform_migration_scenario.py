@@ -13,7 +13,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 
 from python_packages.platform_infra.config import get_settings, validate_platform_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
@@ -103,6 +103,23 @@ async def _repair_duplicate(tournament_id: str, round_id: int) -> None:
         await db_session.commit()
 
 
+async def _reset_disposable_schema() -> None:
+    """Reset only the explicitly guarded platformdb_test schema.
+
+    The migration history contains an intentionally irreversible revision, so
+    a downgrade-to-base cannot be the scenario reset mechanism.  Recreating
+    the schema keeps the test deterministic without weakening that migration's
+    production rollback contract.
+    """
+
+    async with session_factory()() as db_session:
+        await db_session.execute(text("DROP SCHEMA IF EXISTS platform CASCADE"))
+        await db_session.execute(text("CREATE SCHEMA platform"))
+        await db_session.execute(text("DROP TABLE IF EXISTS public.alembic_version"))
+        await db_session.commit()
+    await dispose_engine()
+
+
 async def _assert_repaired_state(tournament_id: str) -> None:
     async with session_factory()() as db_session:
         tournament = await db_session.scalar(
@@ -140,9 +157,10 @@ async def _main() -> None:
     if settings.platform_environment != "test" or database_name != "platformdb_test":
         raise RuntimeError("Migration scenario requires PLATFORM_ENVIRONMENT=test and platformdb_test")
 
-    # The runner owns a disposable test database. Reset it so local reruns and
-    # CI both exercise the same populated pre-0040 state.
-    _run_alembic("base", expect_success=True, operation="downgrade")
+    # The runner owns a disposable test database. Reset only its application
+    # schema so local reruns and CI both exercise the same populated pre-0040
+    # state, including histories with irreversible downgrade revisions.
+    await _reset_disposable_schema()
     _run_alembic(TARGET_REVISION, expect_success=True)
     tournament_id, _first_round_id, second_round_id = await _seed_legacy_rows()
     try:

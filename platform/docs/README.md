@@ -55,5 +55,5 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 
 ```bash
 cd /root/old_sparky/platform
-.venv_platform/bin/python tools/platform_docs_check.py
+.venv_platform/bin/python tools/platform_verify.py docs
 ```

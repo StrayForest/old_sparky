@@ -123,23 +123,46 @@ jobs:
       - name: Unit and integration tests
         run: >-
           sudo -EH bash -lc 'cd /root/old_sparky/platform &&
-          tools/platform_run_tests.sh discover -s tests'
-      - name: Static and dependency security gates
-        run: |
-          sudo -EH bash -lc '
-            set -euo pipefail
-            cd /root/old_sparky/platform
-            .venv_platform/bin/python -m pip_audit -r requirements-platform.txt
-            .venv_platform/bin/python -m ruff check apps/platform_api apps/platform_worker python_packages tools tests
-            .venv_platform/bin/python -m bandit -q -r apps/platform_api apps/platform_worker python_packages tools -x tests -lll
-            .venv_platform/bin/python tools/platform_secret_scan.py --root ..
-          '
+          .venv_platform/bin/python tools/platform_verify.py backend'
 
-  web:
+  python-quality:
+    name: Python quality
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: platform/apps/platform_web
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install pinned quality dependencies
+        run: |
+          python -m venv platform/.venv_platform
+          platform/.venv_platform/bin/python -m pip install -r platform/requirements-quality.txt
+      - name: Run canonical Python quality gate
+        run: >-
+          cd platform &&
+          .venv_platform/bin/python tools/platform_verify.py python-quality
+
+  security:
+    name: Security gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install pinned security dependencies
+        run: |
+          python -m venv platform/.venv_platform
+          platform/.venv_platform/bin/python -m pip install \
+            -r platform/requirements-platform.txt \
+            -r platform/requirements-quality.txt
+      - name: Run canonical security gate
+        run: >-
+          cd platform &&
+          .venv_platform/bin/python tools/platform_verify.py security
+
+  web-quality:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -147,11 +170,11 @@ jobs:
           node-version: "26.3.1"
           cache: npm
           cache-dependency-path: platform/apps/platform_web/package-lock.json
-      - run: npm ci
-      - run: npm audit --audit-level=high
-      - run: npm run typecheck
-      - run: npm run lint
-      - run: npm run build
+      - name: Install locked web dependencies
+        working-directory: platform/apps/platform_web
+        run: npm ci
+      - name: Run canonical web quality gate
+        run: python3 platform/tools/platform_verify.py web-quality
 
   docs:
     name: Documentation consistency
@@ -159,7 +182,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Check platform documentation
-        run: python3 platform/tools/platform_docs_check.py
+        run: python3 platform/tools/platform_verify.py docs
 
   migration:
     name: Migration scenarios
@@ -196,14 +219,11 @@ jobs:
       - name: Run populated legacy migration scenario
         run: >-
           cd platform &&
-          .venv_platform/bin/python tools/platform_migration_scenario.py
+          .venv_platform/bin/python tools/platform_verify.py migration
 
-  smoke:
+  web-hermetic:
     name: Web hermetic
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: platform/apps/platform_web
     steps:
       - uses: actions/checkout@v6
 
@@ -213,14 +233,17 @@ jobs:
           cache: npm
           cache-dependency-path: platform/apps/platform_web/package-lock.json
 
-      - run: npm ci
+      - name: Install locked web dependencies
+        working-directory: platform/apps/platform_web
+        run: npm ci
 
       - name: Install Playwright Chromium
         timeout-minutes: 12
+        working-directory: platform/apps/platform_web
         run: npx playwright install chromium
 
-      - name: Run all web hermetic tests
-        run: npm run test:hermetic
+      - name: Run canonical web hermetic gate
+        run: python3 platform/tools/platform_verify.py web-hermetic
         env:
           CI: "true"
 
@@ -233,9 +256,17 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  verification-contract:
+    name: Verification contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run canonical verification contract self-test
+        run: python3 platform/tools/platform_verify.py verification-contract
+
   status-final:
     if: ${{ always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
-    needs: [status-start, backend, web, docs, migration, smoke]
+    needs: [status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract]
     runs-on: ubuntu-latest
     steps:
       - name: Report platform security build result
@@ -243,15 +274,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BACKEND_RESULT: ${{ needs.backend.result }}
-          WEB_RESULT: ${{ needs.web.result }}
+          PYTHON_QUALITY_RESULT: ${{ needs['python-quality'].result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          WEB_QUALITY_RESULT: ${{ needs['web-quality'].result }}
+          WEB_HERMETIC_RESULT: ${{ needs['web-hermetic'].result }}
           DOCS_RESULT: ${{ needs.docs.result }}
           MIGRATION_RESULT: ${{ needs.migration.result }}
-          SMOKE_RESULT: ${{ needs.smoke.result }}
+          VERIFICATION_CONTRACT_RESULT: ${{ needs['verification-contract'].result }}
         run: |
           set -euo pipefail
           state=failure
           description="Platform security or build failed"
-          if [[ "$BACKEND_RESULT" == "success" && "$WEB_RESULT" == "success" && "$DOCS_RESULT" == "success" && "$MIGRATION_RESULT" == "success" && "$SMOKE_RESULT" == "success" ]]; then
+          if [[ "$BACKEND_RESULT" == "success" && "$PYTHON_QUALITY_RESULT" == "success" && "$SECURITY_RESULT" == "success" && "$WEB_QUALITY_RESULT" == "success" && "$WEB_HERMETIC_RESULT" == "success" && "$DOCS_RESULT" == "success" && "$MIGRATION_RESULT" == "success" && "$VERIFICATION_CONTRACT_RESULT" == "success" ]]; then
             state=success
             description="Platform security and build passed"
           fi

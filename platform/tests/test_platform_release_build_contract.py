@@ -157,13 +157,23 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('root:root 0600', preflight)
         self.assertIn("directly to PostgreSQL", operations)
 
-    def test_security_workflow_runs_docs_and_reports_all_required_jobs(self) -> None:
+    def test_security_workflow_invokes_all_canonical_required_gates(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-security.yml").read_text()
 
         self.assertIn('".github/workflows/**"', workflow)
         self.assertIn("docs:", workflow)
-        self.assertIn("platform_docs_check.py", workflow)
-        self.assertIn("docs, migration, smoke", workflow)
+        self.assertIn("platform_verify.py docs", workflow)
+        for gate_id in (
+            "backend",
+            "python-quality",
+            "security",
+            "migration",
+            "docs",
+            "web-quality",
+            "web-hermetic",
+            "verification-contract",
+        ):
+            self.assertIn(f"platform_verify.py {gate_id}", workflow)
         self.assertIn("DOCS_RESULT", workflow)
         self.assertIn('github.event_name == \'workflow_dispatch\'', workflow)
 
@@ -206,8 +216,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("RUN-PRODUCTION-EXTERNAL-LOAD", workflow)
         self.assertIn("external-vote", workflow)
-        self.assertIn("platform_external_load.py", workflow)
-        self.assertIn("manual_refresh_count", workflow)
+        self.assertIn("platform_load.py", workflow)
+        self.assertIn("profile_id", workflow)
         self.assertIn("platform_external_load_observer.py", supervisor)
         self.assertIn('EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"', supervisor)
         self.assertIn("External-load fixture requires the dedicated external-load confirmation.", supervisor)
@@ -223,7 +233,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("platform_production_retained_load_cleanup_qa.sh", workflow)
         self.assertNotIn("manifest.json\n", workflow.split("Publish external load evidence", 1)[1])
         self.assertIn("ThreadPoolExecutor", external_client)
-        self.assertIn("manual-refresh-count", external_client)
+        self.assertIn("manual_refresh_count", external_client)
         self.assertIn("If-None-Match", external_client)
         self.assertIn("external_ready_vote", fixture)
         self.assertIn('LOCAL_API_ORIGIN = "http://127.0.0.1:8010"', fixture)

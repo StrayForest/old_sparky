@@ -77,13 +77,14 @@ workspace includes the bracket, passive changes become visible after a manual
 page reload, and explicit organizer mutations may refresh their own
 authoritative result.
 
-The current load-test gate is request-based: `read-mix` measures authenticated
-catalog/tournament reads plus a conditional manual workspace reload, while
-`write-burst` measures Ready vote POSTs. No background tournament transport is
-part of the production flow. Public capacity measurements use the external
-runner workflow `platform-production-external-load.yml`: deterministic fixture
-setup is performed on the origin, the HTTP measurement runs outside the VPS,
-and a bounded origin observer records API/PG/Redis/system pressure. The
+The current load-test gate is request-based and is defined by the reviewed
+profiles under `platform/performance/profiles/`: read profiles measure
+authenticated catalog/tournament reads plus conditional manual workspace
+reloads, while Ready Vote profiles measure vote POSTs. No background tournament
+transport is part of the production flow. Public capacity measurements use the
+external runner workflow `platform-production-external-load.yml`: deterministic
+fixture setup is performed on the origin, the HTTP measurement runs outside the
+VPS, and a bounded origin observer records API/PG/Redis/system pressure. The
 external-load workflow is the only supported retained-load measurement path; it
 is a manual operator gate, never ordinary CI, and every run requires exact
 cleanup or abort handling before another run.
@@ -117,8 +118,8 @@ and size-based rotation bounds text log files.
   mutations may refetch their authoritative response.
 - API and worker SQLAlchemy pools are explicit and bounded within the ordinary
   connection budget. Celery uses high/default/low queues, prefetch one and
-  late acks; backlog/retry pressure is evidence. The write-burst profile owns
-  join/ready-vote contention measurements.
+  late acks; backlog/retry pressure is evidence. The reviewed Ready Vote
+  profiles own join/ready-vote contention measurements.
 - Ready-check votes must be committed only while their round is active and the voter remains an eligible active participant; a close or exclusion
   cannot leave a post-close or ineligible vote in persistence.
 - The database is the final concurrency guard for cardinal workflow state:

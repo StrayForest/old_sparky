@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Run a bounded public load profile without importing application internals.
+"""Implement the bounded public load client used by ``platform_load.py``.
 
 The fixture is prepared on the production host, but this client is intended to
 run on an external runner.  Its manifest contains temporary session material;
-the client deliberately never prints or serializes that material.
+the client deliberately never prints or serializes that material.  This module
+is an implementation detail; canonical scenario values and acceptance budgets
+must come from a versioned profile through ``platform_load.py``.
 """
 
 from __future__ import annotations
@@ -21,6 +23,11 @@ import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+try:
+    from tools.platform_load_acceptance import evaluate_acceptance
+except ModuleNotFoundError:  # Direct execution from platform/tools.
+    from platform_load_acceptance import evaluate_acceptance
 
 
 EXPECTED_ORIGIN = "https://old-sparky.com"
@@ -461,8 +468,16 @@ def _ready_vote_overload(result: RequestResult) -> bool:
     )
 
 
-def _ready_vote_retry_delay_ms(result: RequestResult, retry_index: int) -> float:
-    lower_ms, upper_ms = (150.0, 350.0) if retry_index == 0 else (400.0, 800.0)
+def _ready_vote_retry_delay_ms(
+    result: RequestResult,
+    retry_index: int,
+    retry_policy: dict[str, Any] | None = None,
+) -> float:
+    if retry_policy is None:
+        windows: list[list[int]] = [[150, 350], [400, 800]]
+    else:
+        windows = retry_policy["jitter_windows_ms"]
+    lower_ms, upper_ms = windows[min(retry_index, len(windows) - 1)]
     jittered_ms = random.uniform(lower_ms, upper_ms)
     payload = result.response_json
     server_ms = (
@@ -482,12 +497,14 @@ def _ready_vote_action(
     *,
     session_cookie_name: str,
     csrf_cookie_name: str,
+    retry_policy: dict[str, Any] | None = None,
 ) -> LogicalRequestResult:
-    """Issue at most one initial request plus two explicit overload retries."""
+    """Issue one request plus only the profile's explicit overload retries."""
 
     started_at = time.monotonic()
     attempts: list[RequestResult] = []
-    for retry_index in range(3):
+    max_retries = 2 if retry_policy is None else int(retry_policy["max_retries"])
+    for retry_index in range(max_retries + 1):
         result = _ready_vote_request(
             origin,
             user,
@@ -498,9 +515,11 @@ def _ready_vote_action(
             attempt_number=retry_index + 1,
         )
         attempts.append(result)
-        if not _ready_vote_overload(result) or retry_index >= 2:
+        if not _ready_vote_overload(result) or retry_index >= max_retries:
             break
-        time.sleep(_ready_vote_retry_delay_ms(result, retry_index) / 1000)
+        time.sleep(
+            _ready_vote_retry_delay_ms(result, retry_index, retry_policy) / 1000
+        )
     return LogicalRequestResult(
         attempts=attempts,
         elapsed_ms=(time.monotonic() - started_at) * 1000,
@@ -556,6 +575,8 @@ def run_load(
     manual_refresh_count: int,
     p95_budget_ms: float,
     p99_budget_ms: float,
+    failure_budget_percent: float | None = None,
+    retry_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if manual_refresh_count < 0:
         raise ExternalLoadError("manual_refresh_count must not be negative")
@@ -579,14 +600,13 @@ def run_load(
             phase: str,
             request_timeout: float,
         ) -> LogicalRequestResult:
-            return _ready_vote_action(
-                origin_value,
-                user,
-                phase,
-                request_timeout,
-                session_cookie_name=session_cookie_name,
-                csrf_cookie_name=csrf_cookie_name,
-            )
+            kwargs: dict[str, Any] = {
+                "session_cookie_name": session_cookie_name,
+                "csrf_cookie_name": csrf_cookie_name,
+            }
+            if retry_policy is not None:
+                kwargs["retry_policy"] = retry_policy
+            return _ready_vote_action(origin_value, user, phase, request_timeout, **kwargs)
 
         primary_started_at = time.monotonic()
         primary = run_phase(
@@ -776,34 +796,17 @@ def run_load(
         if mode == "ready-vote"
         else overall
     )
-    latency = logical_summary.get("end_to_end_latency", logical_summary.get("latency", {}))
-    p95_ms = float(latency.get("p95_ms") or 0)
-    p99_ms = float(latency.get("p99_ms") or 0)
-    accepted_latency = logical_summary.get("accepted_request_latency", {})
-    acceptance = {
-        "passed": bool(
-            contract_ok
-            and p95_ms <= p95_budget_ms
-            and p99_ms <= p99_budget_ms
-            and float(logical_summary.get("final_failure_rate_percent") or 0) <= 0.5
+    acceptance = evaluate_acceptance(
+        contract_ok=contract_ok,
+        logical_summary=logical_summary,
+        p95_budget_ms=p95_budget_ms,
+        p99_budget_ms=p99_budget_ms,
+        final_failure_budget_percent=(
+            0.5 if failure_budget_percent is None else failure_budget_percent
         ),
-        "contract_ok": contract_ok,
-        "p95_budget_ms": p95_budget_ms,
-        "p99_budget_ms": p99_budget_ms,
-        "p95_ms": p95_ms,
-        "p99_ms": p99_ms,
-        "accepted_request_p95_ms": float(accepted_latency.get("p95_ms") or 0),
-        "accepted_request_p99_ms": float(accepted_latency.get("p99_ms") or 0),
-        "logical_final_failure_rate_percent": float(
-            logical_summary.get("final_failure_rate_percent") or 0
-        ),
-    }
+    )
     finished_at = datetime.now(UTC)
     wall_seconds = max(0.001, (finished_at - started_at).total_seconds())
-    acceptance["logical_final_failure_budget_percent"] = 0.5
-    acceptance["logical_final_failure_budget_ok"] = (
-        float(logical_summary.get("final_failure_rate_percent") or 0) <= 0.5
-    )
     raw_http_summary = (
         phase_results.get("primary", {}).get("raw_http", overall)
         if mode == "ready-vote"
@@ -833,17 +836,23 @@ def run_load(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run an external public Old Sparky load profile.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Debug-only external client implementation; use platform_load.py "
+            "for canonical profiles."
+        )
+    )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
-    parser.add_argument("--mode", choices=("ready-vote", "read-mix"), default="ready-vote")
-    parser.add_argument("--spread-seconds", type=float, default=30.0)
-    parser.add_argument("--concurrency", type=int, default=128)
-    parser.add_argument("--timeout", type=float, default=30.0)
-    parser.add_argument("--duplicate-count", type=int, default=100)
-    parser.add_argument("--manual-refresh-count", type=int, default=0)
-    parser.add_argument("--p95-budget-ms", type=float, default=600.0)
-    parser.add_argument("--p99-budget-ms", type=float, default=1000.0)
+    parser.add_argument("--mode", choices=("ready-vote", "read-mix"), required=True)
+    parser.add_argument("--spread-seconds", type=float, required=True)
+    parser.add_argument("--concurrency", type=int, required=True)
+    parser.add_argument("--timeout", type=float, required=True)
+    parser.add_argument("--duplicate-count", type=int, required=True)
+    parser.add_argument("--manual-refresh-count", type=int, required=True)
+    parser.add_argument("--p95-budget-ms", type=float, required=True)
+    parser.add_argument("--p99-budget-ms", type=float, required=True)
+    parser.add_argument("--failure-budget-percent", type=float, required=True)
     return parser.parse_args()
 
 
@@ -880,6 +889,7 @@ def main() -> int:
             manual_refresh_count=manual_refresh_count,
             p95_budget_ms=max(0.0, args.p95_budget_ms),
             p99_budget_ms=max(0.0, args.p99_budget_ms),
+            failure_budget_percent=max(0.0, args.failure_budget_percent),
         )
     except Exception as exc:
         report = {

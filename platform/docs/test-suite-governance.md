@@ -1,181 +1,110 @@
 # Platform test-suite governance
 
-- Status: Active procedure
+- Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-29
+- Last reviewed: 2026-08-30
 
-This document is the executable owner contract for the platform test suite. A
-test must belong to exactly one group and each group must have one documented
-runner. The groups describe behavior and environment, not coverage targets.
-The machine-readable group manifest is `platform/tests/test-suite-manifest.json`.
+The executable registry at `platform/tools/platform_verify.py` is the single
+source of truth for verification ownership, commands, environment
+requirements and CI membership. Use `list --json` when tooling needs the
+machine-readable registry. This document explains the architecture and
+placement rules; it does not repeat tool arguments.
 
-## Test groups
+## Verification layers
 
-| Group | Owner | Runner | Environment |
+| Gate ID | Layer and owner | Environment | Normal trigger |
 | --- | --- | --- | --- |
-| `backend-unit` | API/domain owners | `platform-security.yml` / `backend` job (focused selectors when needed) | GitHub runner with test PostgreSQL/Redis |
-| `backend-integration` | API/domain owners | `platform-security.yml` / `backend` job | GitHub runner with test PostgreSQL/Redis |
-| `migration` | persistence owner | `platform-security.yml` / `Migration scenarios` job | GitHub runner with disposable PostgreSQL |
-| `web-hermetic` | web owner | `platform-security.yml` / `Web hermetic` job | GitHub runner with mocked API and Chromium |
-| `server-smoke` | release owner | `platform-production-deploy.yml` / `deploy` mode | production server over GitHub Actions SSH |
-| `live-public` | production operator | `platform_live_browser_qa.sh public` through `platform-live-launch.yml` | canonical production origin, dedicated server QA UID |
-| `live-user-destructive` | production operator | `platform-live-user-qa.yml` dispatches `platform_live_user_qa.sh` over SSH | production server; marked fixture data and mandatory cleanup |
-| `external-public-load` | production/performance operator | `platform-production-external-load.yml` with exact retained-load cleanup/abort over SSH | canonical live origin; external GitHub runner plus origin fixture/observer; explicit production confirmation and exact cleanup |
+| `backend` | unit/integration, backend and domain owners | hermetic test PostgreSQL/Redis | local feedback + CI |
+| `python-quality` | Python quality, backend/tooling owners | pinned quality dependencies | local feedback + CI |
+| `security` | dependency and repository security owners | pinned platform/quality dependencies | local feedback + CI |
+| `migration` | persistence owners | disposable PostgreSQL only | CI |
+| `docs` | platform maintainers | repository checkout | local feedback + CI |
+| `web-quality` | web owners | Node 26.3.1 and locked dependencies | local feedback + CI |
+| `web-hermetic` | web owners | local/mocked API and Chromium | local feedback + CI |
+| `verification-contract` | platform tooling owners | repository checkout | CI |
+| `server-smoke` | release owners | exact deployed SHA | deployment workflow |
+| `live-public` | production operators | canonical public origin and dedicated QA identity | explicit/release workflow |
+| `live-user-destructive` | production operators | marked production fixtures and mandatory cleanup | explicit operator workflow |
+| `external-load` | performance operators | external generator to production origin | explicit operator workflow |
 
-The ordinary CI workflow runs all deterministic backend, migration, web
-hermetic, documentation, typecheck, lint and build checks. Server-side smoke
-and browser journeys are dispatched through GitHub Actions and execute on the
-production server over the controlled SSH wrappers. Live-user and destructive
-journeys remain explicit operator gates and are never silently hidden by a
-grep exclusion. Public capacity tests use the external GitHub runner contour
-below, so their generator does not consume the production VPS CPU.
+The first eight gates are deterministic. `platform_verify.py ci` can execute
+only those gates and never connects to production, creates production
+fixtures, opens a production browser or starts a load generator. The latter
+four remain discoverable governance groups but are workflow-only.
 
-The external-public-load group is a deliberate exception to the normal release
-gate: it is never scheduled and never part of ordinary CI. Fixture preparation,
-observation and exact cleanup use the production origin, while the measured
-HTTP generator runs on a GitHub-hosted runner outside the VPS. The application
-still consumes its normal CPU/RAM/DB/Redis capacity while serving the test, so
-use an approved low-traffic window and monitor the host during the run.
+## Ownership rules
 
-## GitHub execution
+Use the lowest suitable layer in the test pyramid:
 
-Run deterministic checks through the GitHub security workflow on the reviewed
-`dev` ref:
+1. Put domain and API behavior in the auto-discovered `platform/tests/test_*.py`
+   tree. A new ordinary backend test requires no workflow or filename-list
+   edit.
+2. Put important cross-component browser journeys in the existing hermetic
+   Playwright suites under `apps/platform_web/tests`. The package’s hermetic
+   script owns suite discovery; a new ordinary scenario requires no workflow
+   edit.
+3. Add a new deterministic contour to the executable registry, its runner,
+   the verification-contract self-test and the CI job that invokes the gate.
+4. Keep deployment smoke and real-origin QA in their protected production
+   workflows. They are not substitutes for hermetic tests and do not expand
+   into a production regression suite.
+5. Add load, stress, spike, soak or capacity scenarios as versioned profiles
+   under `platform/performance/profiles/`. The profile
+   owns the complete scenario and acceptance contract. The same external-load
+   workflow should orchestrate a new reviewed profile.
 
-```bash
-gh workflow run platform-live-launch.yml \
-  -f base_url=https://old-sparky.com \
-  -f provision=false
-```
+Never add an individual ordinary test by editing GitHub workflow YAML. Do not
+hide deterministic failures with grep exclusions or silent retries. A flaky
+test is explicit test debt with an owner, not a reason to weaken a gate.
 
-## Adding or moving a test
+## Local and GitHub verification
 
-1. State the production behavior and failure path the test protects.
-2. Assign one group in the test manifest/CI command; do not add a grep
-   exclusion to hide a failing deterministic test.
-3. For workflow, permission, migration or concurrency behavior, assert the
-   persisted final state and the negative path, not only the HTTP response.
-4. Update this document only when the runner contract changes. Record detailed
-   implementation evidence in an archive document after release.
-
-## Methodology references
-
-The separation of read, write, stress, spike and soak profiles follows the
-load-testing guidance from [Grafana k6](https://grafana.com/docs/k6/latest/testing-guides/api-load-testing/)
-and its recommendation to use explicit [thresholds](https://grafana.com/docs/k6/latest/using-k6/thresholds/).
-Browser-level coverage stays smaller than protocol-level coverage, following
-the [k6 website load-testing guidance](https://grafana.com/docs/k6/latest/testing-guides/load-testing-websites/).
-Capacity and overload behavior are reviewed using the [Google SRE capacity and
-load-testing guidance](https://sre.google/sre-book/introduction/) and its
-[cascading-failure guidance](https://sre.google/sre-book/addressing-cascading-failures/).
-These references inform the test shape; the VPS measurements and application
-contracts remain the acceptance authority for this repository.
-gh workflow run platform-security.yml \
-  --repo StrayForest/old_sparky \
-  --ref dev
-gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
-```
-
-The migration scenario is destructive to its disposable database. It must not
-be pointed at `platformdb` or a production connection. The scenario creates a
-legacy `private` tournament and an intentionally duplicated active workflow
-row, confirms the first upgrade fails without applying the revision, repairs
-the duplicate, retries the upgrade through `20260830_0048`, and verifies
-normalized visibility, participant-capacity slots and the final constraints.
-
-Do not substitute a manually run local test for the GitHub workflow. Local
-commands are implementation details for explicit CI-failure diagnosis only;
-the GitHub jobs and their aggregate `platform-security-build` status are the
-release authority.
-
-### External public production load
-
-Public capacity results must use the external runner workflow
-`platform-production-external-load.yml`. It prepares a marked Ready Check
-fixture on the origin, exports temporary session material only to the private
-temporary directory of the GitHub-hosted runner, runs the measured HTTP phase
-outside the VPS, and removes that material after the completion barrier. The
-manifest is never uploaded as an artifact. The origin-side observer records
-CPU/RSS, Nginx/API sockets, PostgreSQL connections and waits, Redis pressure
-and Celery backlog during the external phase.
-
-The workflow supports the current request-driven journeys:
-
-- `ready-vote`: one authoritative Ready vote per eligible synthetic user,
-  bounded idempotency replays and one state read per tournament for persisted
-  correctness;
-- `read-mix`: authenticated workspace/tournament/profile/catalog reads with a
-  fixed route mix, with no background refresh loop; an optional
-  `manual_refresh_count` re-reads the workspace with the response ETag and
-  `If-None-Match`, modelling an explicit page reload rather than a poller.
-
-Use a 30-second spread for the human-shaped profile and a separate zero- or
-short-spread run for an aggressive safety-margin profile. A successful result
-requires the expected request count, zero unexpected statuses/timeouts, correct
-vote/state contracts, and the configured latency budget.
-
-Run only from the reviewed `dev` ref in a low-traffic window:
+Local canonical gates provide fast developer feedback. They must use the
+registry, for example:
 
 ```bash
-gh workflow run platform-production-external-load.yml \
-  --repo StrayForest/old_sparky --ref dev \
-  -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
-  -f control_email=<existing-production-account-email> \
-  -f mode=ready-vote -f tournament_count=1 \
-  -f users_per_tournament=500 -f setup_concurrency=20 \
-  -f load_concurrency=128 -f spread_seconds=30 -f duplicate_count=100 \
-  -f manual_refresh_count=0
-gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
+cd platform
+.venv_platform/bin/python tools/platform_verify.py list
+.venv_platform/bin/python tools/platform_verify.py backend --focused tests.test_platform_domain
+.venv_platform/bin/python tools/platform_verify.py python-quality
 ```
 
-For a read benchmark that includes explicit manual reloads, use `mode=read-mix`
-and set `manual_refresh_count` to the number of workspace-page users to reload
-(the value cannot exceed the workspace half of the fixed route cohort). The
-reload phase is reported separately and accepts only `200` or a valid
-conditional `304`; it never creates background traffic.
+`LOCAL GATE BLOCKED` means a required safe dependency such as test PostgreSQL,
+isolated Redis or Chromium is unavailable. A smaller substitute must not be
+reported as a complete-gate pass.
 
-The workflow performs exact cleanup in its final step. If the runner is
-canceled before that step, use the exact retained-load cleanup/abort workflow
-with the same load run ID before starting another run. Do not expose the
-manifest, cookies or CSRF material in an artifact or log.
+GitHub Actions owns runner images, service containers, dependency bootstrap,
+parallelism, caches, artifacts, permissions, environment authorization and
+commit statuses. The security workflow invokes stable gate IDs and retains
+parallel jobs. Its aggregate `platform-security-build=success` status for the
+exact committed SHA remains the release authority; a local pass is neither
+necessary nor sufficient for deployment.
 
-At each run record attempted/completed requests, p50/p95/p99, status and
-timeout counts, Cloudflare diagnostic headers, server observer pressure,
-PostgreSQL pool waits/query pressure, and cleanup counts. Repeat the same
-fixture size with `read-mix` separately; do not combine its read latency with
-vote-write latency.
+## Production and performance boundaries
 
-## Production browser gate
+Deployment smoke runs only after immutable deployment activation and checks
+that the exact SHA started and critical interfaces are alive. Live public and
+destructive user QA are separate operator contours with their own identities,
+confirmation and cleanup rules.
 
-The GitHub workflow does not install Playwright or run production browsers on a
-runner. It connects to the production host with the deployment SSH identity
-and invokes the fixed root supervisor from `/root/old_sparky`:
+The canonical load-profile registry is `platform/performance/`.
+Profiles record fixture shape, logical actions, HTTP attempts, concurrency,
+spread/ramp, retry semantics, expected statuses, correctness, latency budgets,
+resource evidence and cleanup. The external HTTP generator runs on the
+GitHub-hosted runner. The production host performs only bounded fixture,
+observer and exact-cleanup work; it never generates the measured client load.
 
-```bash
-PLATFORM_APP_DIR=/opt/oldsparky/platform \
-PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
-PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com \
-platform/tools/platform_live_browser_qa.sh public
-```
+Every retained result identifies its source SHA, profile ID/version/digest,
+runner, fixture shape, offered logical actions, HTTP attempts and acceptance
+outcome. A performance result is incomplete unless correctness and exact
+cleanup pass. Canceled runs use the matching abort/cleanup workflow keyed by
+the exact run ID.
 
-The supervisor owns the machine lock, runtime cache, Chromium sandbox and
-dedicated `oldsparky-liveqa` UID. The workflow captures its bounded output and
-requires the `LIVE_BROWSER_QA_SUCCESS` marker before publishing the report.
-Direct root Playwright, `--no-sandbox`, arbitrary production URLs and runner-
-side production browser execution are invalid.
+## Contract self-test
 
-If the production host has not yet been provisioned, the first workflow run
-may explicitly create the root-only CSP QA bundle with a fresh marker. This
-mode refuses to replace an existing bundle and does not print generated
-credentials:
-
-```bash
-gh workflow run platform-live-launch.yml \
-  -f base_url=https://old-sparky.com \
-  -f provision=true \
-  -f marker=liveqa-csp-candidate-<unique>
-```
-
-After that one-time provisioning, run the public gate without provisioning:
-
-```bash
+`verification-contract` checks registry/CI membership, workflow gate names,
+direct command duplication, exclusion bypasses, backend discovery, hermetic
+suite registration, production reachability from `ci`, documentation gate
+IDs, load-profile schema/deduplication, workflow-owned load budgets and the
+external-generator topology. Keep it deterministic and small enough to run
+on every CI change.

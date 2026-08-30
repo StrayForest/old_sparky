@@ -175,14 +175,11 @@ accepts individual IPv4/IPv6 addresses only, never a CIDR or wildcard.
 
 ## Performance
 
-Targets under normal non-saturated load:
-
-- ordinary reads/small mutations: p95 below 500 ms;
-- retained workflow load: p95 below 1000 ms;
-- Ready Vote logical action: p95 at or below 600 ms, p99 at or below 1000 ms,
-  and final user-visible failure below 0.5%;
-- browser INP at or below 200 ms;
-- public/detail LCP at or below 2.5 s.
+Canonical load and latency budgets belong to the versioned profiles in
+`platform/performance/profiles/` and are evaluated by
+`platform/tools/platform_load_acceptance.py`. Keep this runbook focused on
+measurement procedure and resource evidence rather than maintaining a second
+threshold inventory.
 
 Measure one user step before tuning. Capture response bytes, status/304 ratio,
 p50/p95/p99, SQL/request, DB and compute time, pool checkout wait,
@@ -191,16 +188,11 @@ worker lifecycle. Use
 `tools/platform_production_qa.py --collect-performance` and
 `tools/platform_performance_audit.py`; detailed JSON stays under shared storage.
 
-The production load profiles are separated by failure mode:
-
-- `read-mix` provisions marked users, exercises authenticated catalog and
-  tournament workspace reads, then repeats the workspace request as a
-  conditional manual reload. It creates no background traffic.
-- `write-burst` provisions eligible participants and measures human-shaped and
-  aggressive Ready vote POSTs, including idempotency and concurrency behavior.
-- `platform-production-external-load.yml` is the only retained-load measurement
-  workflow; its `ready-vote` and `read-mix` profiles are run separately and are
-  not a simultaneous page-read benchmark.
+The reviewed production load profiles are the JSON contracts under
+`platform/performance/profiles/`. They are separated by scenario category and
+are selected by profile ID in `platform-production-external-load.yml`. This
+runbook defines the operator procedure and evidence collection; it does not
+restate profile parameters or acceptance thresholds.
 
 Use a small smoke run first, then an average/human-shaped run, stress or
 breakpoint runs only in an approved low-traffic window, and a separate soak
@@ -228,19 +220,17 @@ gh workflow run platform-production-external-load.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
   -f control_email=<existing-production-account-email> \
-  -f mode=ready-vote -f tournament_count=1 \
-  -f users_per_tournament=500 -f setup_concurrency=20 \
-  -f load_concurrency=128 -f spread_seconds=30 -f duplicate_count=100
+  -f profile_id=ready-vote-human-v1
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The 30-second spread models human arrivals; run a separate zero- or
-short-spread aggressive test for safety margin. Record raw HTTP attempts
-(including 200, `READY_VOTE_OVERLOADED`, other status and timeout counts)
-separately from logical actions (final success/failure, retries per action,
-first-attempt-to-success p50/p95/p99/max and successful goodput). Also record
-accepted-request latency, response-contract checks, API CPU/RSS, Redis,
-PostgreSQL connections and pool waits, Nginx sockets, and cleanup verification.
+The selected versioned profile owns the spread, fixture shape, retry behavior
+and acceptance budgets. Record raw HTTP attempts (including 200,
+`READY_VOTE_OVERLOADED`, other status and timeout counts) separately from
+logical actions (final success/failure, retries per action, first-attempt-to-
+success latency and successful goodput). Also record accepted-request
+latency, response-contract checks, API CPU/RSS, Redis, PostgreSQL connections
+and pool waits, Nginx sockets, and cleanup verification.
 If the workflow is canceled, perform the exact retained-load abort/cleanup
 procedure with the same run ID before another load. The temporary manifest
 must not be copied to Actions artifacts.
@@ -256,8 +246,8 @@ the production SSH environment for fixture preparation, observation and exact
 cleanup, while the measured HTTP client runs on a GitHub-hosted runner outside
 the VPS.
 
-The `write-burst` profile measures real Ready Check vote POST contention after
-the server-known window. It reports accepted/rejected votes, response latency,
+The selected Ready Vote profile measures real vote POST contention after the
+server-known window. It reports accepted/rejected votes, response latency,
 database pool wait, lock pressure, API/PostgreSQL CPU and connections, and
 duplicate/idempotency behavior. It exercises only vote POSTs; the timer phase
 is entirely local. Clean the exact load run with the same cleanup workflow
@@ -330,17 +320,19 @@ the login response issues, so `/auth/csrf` is not an artificial
 first-mutation dependency in the write latency numbers; authentication/CSRF
 endpoint load is covered by the ordinary read/auth profiles.
 
-Ready Check load testing uses the `write-burst` mode of
-`platform_production_qa.py`. The test creates marked
-eligible participants, uses the real Ready Check vote endpoint after its
-server-known window, and reports raw attempts and logical action latency,
-accepted/rejected votes, retries, shedding, database pool wait, admission wait,
-lock pressure, API/PostgreSQL CPU and connections, and duplicate/idempotency
-behavior. Run a human-shaped spread first, then a separate aggressive burst;
-clean the exact run before another production load. Static limit sweeps must
-keep the same 2-vCPU/2-worker/pool envelope and record limits `4`, `6`, `8`,
-`12` and `16` before selecting an adaptive operating region; do not modify
-external concurrency or spread to make a candidate pass.
+Ready Check load testing is dispatched by `platform_load.py` with a reviewed
+`ready-vote-*` profile. The origin-side `platform_production_qa.py` remains a
+fixture/observer implementation detail; it does not own the measured client or
+the canonical acceptance contract. The test creates marked eligible
+participants, uses the real Ready Check vote endpoint after its server-known
+window, and reports raw attempts and logical action latency, accepted/rejected
+votes, retries, shedding, database pool wait, admission wait, lock pressure,
+API/PostgreSQL CPU and connections, and duplicate/idempotency behavior. Run a
+human-shaped profile first, then a separate aggressive profile; clean the exact
+run before another production load. Static limit sweeps must keep the same
+2-vCPU/2-worker/pool envelope and record the operator-selected admission
+limits before selecting an adaptive operating region; do not modify the
+canonical profile to make a candidate pass.
 The reviewed deploy workflow exposes those five points as
 `ready-vote-static-4`, `ready-vote-static-6`, `ready-vote-static-8`,
 `ready-vote-static-12` and `ready-vote-static-16`. Each profile changes only

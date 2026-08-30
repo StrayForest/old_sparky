@@ -12,49 +12,16 @@ on:
         required: true
         default: "aleksei.lisitsin1@gmail.com"
         type: string
-      mode:
-        description: "Current request-driven user journey to measure externally"
+      profile_id:
+        description: "Reviewed canonical load profile ID"
         required: true
-        default: "ready-vote"
+        default: "ready-vote-human-v1"
         type: choice
         options:
-          - ready-vote
-          - read-mix
-      tournament_count:
-        description: "Ready Check tournaments (1-40)"
-        required: true
-        default: "1"
-        type: string
-      users_per_tournament:
-        description: "Eligible users per tournament (14-500)"
-        required: true
-        default: "500"
-        type: string
-      setup_concurrency:
-        description: "Origin-side fixture setup concurrency (1-256)"
-        required: true
-        default: "20"
-        type: string
-      load_concurrency:
-        description: "External runner request concurrency (1-512)"
-        required: true
-        default: "128"
-        type: string
-      spread_seconds:
-        description: "Opening spread; 30 is human-shaped, 0 is aggressive"
-        required: true
-        default: "30"
-        type: string
-      duplicate_count:
-        description: "Idempotency replay sample for ready-vote mode"
-        required: true
-        default: "100"
-        type: string
-      manual_refresh_count:
-        description: "Workspace users that perform one conditional manual reload in read-mix"
-        required: true
-        default: "0"
-        type: string
+          - ready-vote-human-v1
+          - ready-vote-stress-v1
+          - read-mix-human-v1
+          - read-mix-stress-v1
 
 permissions:
   contents: read
@@ -75,15 +42,9 @@ jobs:
       PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       CONTROL_EMAIL: ${{ inputs.control_email }}
-      LOAD_MODE: ${{ inputs.mode }}
-      TOURNAMENT_COUNT: ${{ inputs.tournament_count }}
-      USERS_PER_TOURNAMENT: ${{ inputs.users_per_tournament }}
-      SETUP_CONCURRENCY: ${{ inputs.setup_concurrency }}
-      LOAD_CONCURRENCY: ${{ inputs.load_concurrency }}
-      SPREAD_SECONDS: ${{ inputs.spread_seconds }}
-      DUPLICATE_COUNT: ${{ inputs.duplicate_count }}
-      MANUAL_REFRESH_COUNT: ${{ inputs.manual_refresh_count }}
+      PROFILE_ID: ${{ inputs.profile_id }}
       TARGET_SHA: ${{ github.sha }}
+      SOURCE_GIT_SHA: ${{ github.sha }}
 
     steps:
       - name: Checkout reviewed load client
@@ -97,58 +58,11 @@ jobs:
             || { echo "External production load must run from dev." >&2; exit 1; }
           test "$QA_CONFIRMATION" = "RUN-PRODUCTION-EXTERNAL-LOAD" \
             || { echo "Refusing external production load without exact confirmation." >&2; exit 1; }
-          test "$LOAD_MODE" = "ready-vote" || test "$LOAD_MODE" = "read-mix" \
-            || { echo "Unsupported external load mode." >&2; exit 1; }
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
-          /usr/bin/python3 - \
-            "$CONTROL_EMAIL" "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
-            "$SETUP_CONCURRENCY" "$LOAD_CONCURRENCY" "$SPREAD_SECONDS" \
-            "$DUPLICATE_COUNT" "$MANUAL_REFRESH_COUNT" "$LOAD_MODE" <<'PY'
-          import re
-          import sys
-
-          (
-              email,
-              tournament_count,
-              users_per,
-              setup_concurrency,
-              load_concurrency,
-              spread,
-              duplicate,
-              manual_refresh,
-              mode,
-          ) = sys.argv[1:]
-          if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email):
-              raise SystemExit("control_email is invalid")
-          if not re.fullmatch(r"[1-9][0-9]?", tournament_count) or not 1 <= int(tournament_count) <= 40:
-              raise SystemExit("tournament_count must be between 1 and 40")
-          if not re.fullmatch(r"[1-9][0-9]{1,2}", users_per) or not 14 <= int(users_per) <= 500:
-              raise SystemExit("users_per_tournament must be between 14 and 500")
-          if int(tournament_count) * int(users_per) > 20_000:
-              raise SystemExit("external fixture exceeds 20000 users")
-          if not re.fullmatch(r"[1-9][0-9]{0,2}", setup_concurrency) or not 1 <= int(setup_concurrency) <= 256:
-              raise SystemExit("setup_concurrency must be between 1 and 256")
-          if not re.fullmatch(r"[1-9][0-9]{0,2}", load_concurrency) or not 1 <= int(load_concurrency) <= 512:
-              raise SystemExit("load_concurrency must be between 1 and 512")
-          try:
-              spread_value = float(spread)
-          except ValueError:
-              raise SystemExit("spread_seconds must be numeric") from None
-          if not 0 <= spread_value <= 3600:
-              raise SystemExit("spread_seconds must be between 0 and 3600")
-          if not re.fullmatch(r"[0-9]+", duplicate) or not 0 <= int(duplicate) <= int(tournament_count) * int(users_per):
-              raise SystemExit("duplicate_count is outside the fixture size")
-          total_users = int(tournament_count) * int(users_per)
-          if not re.fullmatch(r"[0-9]+", manual_refresh):
-              raise SystemExit("manual_refresh_count must be a non-negative integer")
-          workspace_users = sum(index % 10 < 5 for index in range(total_users))
-          if not 0 <= int(manual_refresh) <= workspace_users:
-              raise SystemExit("manual_refresh_count exceeds the workspace read cohort")
-          if mode == "ready-vote" and int(manual_refresh) != 0:
-              raise SystemExit("manual_refresh_count is only valid for read-mix")
-          PY
+          /usr/bin/python3 platform/tools/platform_load.py validate --profile "$PROFILE_ID"
+          /usr/bin/python3 platform/tools/platform_load.py export-env --profile "$PROFILE_ID" >> "$GITHUB_ENV"
 
       - name: Configure production SSH
         shell: bash
@@ -248,17 +162,10 @@ jobs:
           if [[ "$manifest_ready" == "1" ]]; then
             chmod 600 "$manifest_path"
             set +e
-            python3 platform/tools/platform_external_load.py \
+            python3 platform/tools/platform_load.py run \
+              --profile "$PROFILE_ID" \
               --manifest "$manifest_path" \
-              --report-path "$client_report" \
-              --mode "$LOAD_MODE" \
-              --spread-seconds "$SPREAD_SECONDS" \
-              --concurrency "$LOAD_CONCURRENCY" \
-              --timeout 30 \
-              --duplicate-count "$DUPLICATE_COUNT" \
-              --manual-refresh-count "$MANUAL_REFRESH_COUNT" \
-              --p95-budget-ms 600 \
-              --p99-budget-ms 1000
+              --report-path "$client_report"
             load_status="$?"
             set -e
             ssh \
@@ -393,6 +300,9 @@ jobs:
               logical = payload.get("logical") or {}
               logical_latency = logical.get("end_to_end_latency") or {}
               acceptance = payload.get("acceptance") or {}
+              contract = payload.get("load_contract") or {}
+              print(f"- Profile: **{contract.get('profile_id')}** v{contract.get('profile_version')}; digest: `{contract.get('profile_digest')}`")
+              print(f"- Source SHA: `{payload.get('source_git_sha')}`; runner: {((payload.get('runner') or {}).get('location'))}")
               print(f"- Mode: **{payload.get('mode')}**")
               print(f"- Fixture: {payload.get('users')} users / {payload.get('tournaments')} tournaments")
               print(f"- Raw HTTP attempts: {overall.get('requests')}; errors: {overall.get('errors')}; overloads: {overall.get('temporary_overload_responses', 0)}")

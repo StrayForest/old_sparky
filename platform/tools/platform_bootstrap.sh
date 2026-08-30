@@ -30,7 +30,7 @@ Next steps:
 3. Prepare an isolated local test runtime before running tests:
    python tools/platform_prepare_test_runtime.py --apply
    tools/platform_run_alembic.sh upgrade head
-   tools/platform_run_tests.sh discover -s tests
+   .venv_platform/bin/python tools/platform_verify.py backend
 4. Start the API:
    platform/tools/platform_run_api.sh
 5. Start the worker:

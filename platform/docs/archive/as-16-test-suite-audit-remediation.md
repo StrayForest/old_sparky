@@ -18,7 +18,7 @@
 
 ## Execution contract
 
-The active procedure is [`../test-suite-governance.md`](../test-suite-governance.md), with the machine-readable group manifest at `platform/tests/test-suite-manifest.json`. It defines one owner and runner for backend, migration, web-hermetic, server-smoke, live-public and destructive live-user contours.
+The active procedure is [`../test-suite-governance.md`](../test-suite-governance.md), with the executable registry at `platform/tools/platform_verify.py`. The current registry defines one owner and runner for deterministic backend, migration, web-hermetic and quality contours plus the protected production contours.
 
 The production browser workflow deliberately does not install Playwright or run a credential-bearing browser on the runner. It passes only the canonical origin to the production SSH supervisor, which owns the lock, Chromium sandbox, runtime cache and dedicated QA identity.
 
