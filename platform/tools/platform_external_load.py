@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import random
 import re
 import time
 from typing import Any
@@ -59,6 +60,23 @@ class RequestResult:
     response_etag: str | None = None
     error_kind: str | None = None
     response_json: Any = None
+    attempt_number: int = 1
+
+
+@dataclass(slots=True)
+class LogicalRequestResult:
+    """One user action, including every temporary-overload retry attempt."""
+
+    attempts: list[RequestResult]
+    elapsed_ms: float
+
+    @property
+    def final(self) -> RequestResult:
+        return self.attempts[-1]
+
+    @property
+    def retry_count(self) -> int:
+        return max(0, len(self.attempts) - 1)
 
 
 def percentile(values: list[float], percent: float) -> float | None:
@@ -226,6 +244,7 @@ def _request(
     json_payload: dict[str, Any] | None = None,
     expected_statuses: frozenset[int] = frozenset({200}),
     extra_headers: dict[str, str] | None = None,
+    attempt_number: int = 1,
 ) -> RequestResult:
     body = None
     headers = {
@@ -277,6 +296,11 @@ def _request(
         with_error_body = exc.read(RESPONSE_BODY_LIMIT)
         response_bytes = len(with_error_body)
         error_kind = "http_error"
+        if with_error_body:
+            try:
+                response_json = json.loads(with_error_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                response_json = None
     except (URLError, TimeoutError, OSError) as exc:
         error_kind = type(exc).__name__
     elapsed_ms = (time.monotonic() - started_at) * 1000
@@ -295,6 +319,7 @@ def _request(
         response_etag=response_etag,
         error_kind=error_kind,
         response_json=response_json,
+        attempt_number=attempt_number,
     )
 
 
@@ -324,12 +349,12 @@ def run_phase(
     concurrency: int,
     timeout: float,
     request_builder,
-) -> list[RequestResult]:
+) -> list[Any]:
     offsets = spread_offsets(len(users), spread_seconds)
     phase_started_at = time.monotonic()
-    results: list[RequestResult] = []
+    results: list[Any] = []
     with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load") as executor:
-        futures: list[Future[RequestResult]] = []
+        futures: list[Future[Any]] = []
         for user, offset in zip(users, offsets, strict=True):
             delay = phase_started_at + offset - time.monotonic()
             if delay > 0:
@@ -345,6 +370,8 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
     by_route: dict[str, list[float]] = defaultdict(list)
     latencies: list[float] = []
     errors = 0
+    temporary_overloads = 0
+    retry_attempts = 0
     error_kinds: Counter[str] = Counter()
     error_samples: list[dict[str, Any]] = []
     changed = Counter()
@@ -353,6 +380,9 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         route = f"{result.method} {result.path.split('?', 1)[0]}"
         by_route[route].append(result.elapsed_ms)
         latencies.append(result.elapsed_ms)
+        retry_attempts += int(result.attempt_number > 1)
+        if _ready_vote_overload(result):
+            temporary_overloads += 1
         if not result.ok:
             errors += 1
             kind = result.error_kind or "unexpected"
@@ -374,6 +404,12 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         "scope": "full_population",
         "requests": len(results),
         "errors": errors,
+        "temporary_overload_responses": temporary_overloads,
+        "temporary_overload_rate_percent": round(
+            temporary_overloads * 100 / max(1, len(results)),
+            4,
+        ),
+        "retry_attempts": retry_attempts,
         "status_counts": dict(sorted(status_counts.items())),
         "error_kinds": dict(sorted(error_kinds.items())),
         "changed_counts": dict(sorted(changed.items())),
@@ -399,6 +435,7 @@ def _ready_vote_request(
     *,
     session_cookie_name: str,
     csrf_cookie_name: str,
+    attempt_number: int = 1,
 ) -> RequestResult:
     return _request(
         origin,
@@ -410,7 +447,101 @@ def _ready_vote_request(
         session_cookie_name=session_cookie_name,
         csrf_cookie_name=csrf_cookie_name,
         json_payload={"choice": "yes"},
+        attempt_number=attempt_number,
     )
+
+
+def _ready_vote_overload(result: RequestResult) -> bool:
+    payload = result.response_json
+    return bool(
+        result.status == 503
+        and isinstance(payload, dict)
+        and payload.get("code") == "READY_VOTE_OVERLOADED"
+        and payload.get("retryable") is True
+    )
+
+
+def _ready_vote_retry_delay_ms(result: RequestResult, retry_index: int) -> float:
+    lower_ms, upper_ms = (150.0, 350.0) if retry_index == 0 else (400.0, 800.0)
+    jittered_ms = random.uniform(lower_ms, upper_ms)
+    payload = result.response_json
+    server_ms = (
+        float(payload.get("retry_after_ms") or 0)
+        if isinstance(payload, dict)
+        and isinstance(payload.get("retry_after_ms"), (int, float))
+        else 0.0
+    )
+    return min(2_000.0, max(jittered_ms, server_ms))
+
+
+def _ready_vote_action(
+    origin: str,
+    user: VirtualUser,
+    phase: str,
+    timeout: float,
+    *,
+    session_cookie_name: str,
+    csrf_cookie_name: str,
+) -> LogicalRequestResult:
+    """Issue at most one initial request plus two explicit overload retries."""
+
+    started_at = time.monotonic()
+    attempts: list[RequestResult] = []
+    for retry_index in range(3):
+        result = _ready_vote_request(
+            origin,
+            user,
+            phase,
+            timeout,
+            session_cookie_name=session_cookie_name,
+            csrf_cookie_name=csrf_cookie_name,
+            attempt_number=retry_index + 1,
+        )
+        attempts.append(result)
+        if not _ready_vote_overload(result) or retry_index >= 2:
+            break
+        time.sleep(_ready_vote_retry_delay_ms(result, retry_index) / 1000)
+    return LogicalRequestResult(
+        attempts=attempts,
+        elapsed_ms=(time.monotonic() - started_at) * 1000,
+    )
+
+
+def _flatten_logical_results(results: list[LogicalRequestResult]) -> list[RequestResult]:
+    return [attempt for result in results for attempt in result.attempts]
+
+
+def summarize_logical_results(results: list[LogicalRequestResult]) -> dict[str, Any]:
+    finals = [result.final for result in results if result.attempts]
+    successful = [result for result in results if result.final.ok]
+    accepted_request_latencies = [result.final.elapsed_ms for result in successful]
+    changed = Counter(
+        str(bool(result.final.response_json.get("changed")))
+        for result in results
+        if isinstance(result.final.response_json, dict)
+        and "changed" in result.final.response_json
+    )
+    return {
+        "scope": "logical_user_actions",
+        "actions": len(results),
+        "final_successes": len(successful),
+        "final_failures": len(results) - len(successful),
+        "final_failure_rate_percent": round(
+            (len(results) - len(successful)) * 100 / max(1, len(results)),
+            4,
+        ),
+        "total_retries": sum(result.retry_count for result in results),
+        "retries_per_action": round(
+            sum(result.retry_count for result in results) / max(1, len(results)),
+            4,
+        ),
+        "final_status_counts": dict(
+            sorted(Counter(str(result.status) for result in finals).items())
+        ),
+        "changed_counts": dict(sorted(changed.items())),
+        "end_to_end_latency": metric_stats([result.elapsed_ms for result in results]),
+        "accepted_request_latency": metric_stats(accepted_request_latencies),
+    }
 
 
 def run_load(
@@ -447,8 +578,8 @@ def run_load(
             user: VirtualUser,
             phase: str,
             request_timeout: float,
-        ) -> RequestResult:
-            return _ready_vote_request(
+        ) -> LogicalRequestResult:
+            return _ready_vote_action(
                 origin_value,
                 user,
                 phase,
@@ -457,6 +588,7 @@ def run_load(
                 csrf_cookie_name=csrf_cookie_name,
             )
 
+        primary_started_at = time.monotonic()
         primary = run_phase(
             origin,
             users,
@@ -466,8 +598,19 @@ def run_load(
             timeout=timeout,
             request_builder=vote_builder,
         )
-        phase_results["primary"] = summarize_results(primary)
-        all_results.extend(primary)
+        primary_attempts = _flatten_logical_results(primary)
+        primary_wall_seconds = max(0.001, time.monotonic() - primary_started_at)
+        primary_logical = summarize_logical_results(primary)
+        primary_logical["wall_seconds"] = round(primary_wall_seconds, 3)
+        primary_logical["successful_goodput_actions_per_second"] = round(
+            float(primary_logical.get("final_successes") or 0) / primary_wall_seconds,
+            3,
+        )
+        phase_results["primary"] = {
+            "raw_http": summarize_results(primary_attempts),
+            "logical": primary_logical,
+        }
+        all_results.extend(primary_attempts)
 
         duplicate_users = users[:duplicate_count]
         if duplicate_users:
@@ -480,8 +623,12 @@ def run_load(
                 timeout=timeout,
                 request_builder=vote_builder,
             )
-            phase_results["duplicate"] = summarize_results(duplicates)
-            all_results.extend(duplicates)
+            duplicate_attempts = _flatten_logical_results(duplicates)
+            phase_results["duplicate"] = {
+                "raw_http": summarize_results(duplicate_attempts),
+                "logical": summarize_logical_results(duplicates),
+            }
+            all_results.extend(duplicate_attempts)
 
         users_by_slug: dict[str, VirtualUser] = {}
         expected_by_slug: Counter[str] = Counter()
@@ -516,15 +663,15 @@ def run_load(
             state_results.append(result)
         phase_results["state"] = summarize_results(state_results)
         all_results.extend(state_results)
-        primary_summary = phase_results["primary"]
-        duplicate_summary = phase_results.get("duplicate", {})
+        primary_summary = phase_results["primary"]["logical"]
+        duplicate_summary = phase_results.get("duplicate", {}).get("logical", {})
         changed_counts = primary_summary.get("changed_counts", {})
         duplicate_changed = duplicate_summary.get("changed_counts", {})
         contract_ok = (
-            primary_summary["requests"] == len(users)
-            and primary_summary["errors"] == 0
+            primary_summary["actions"] == len(users)
+            and primary_summary["final_failures"] == 0
             and int(changed_counts.get("True", 0)) == len(users)
-            and duplicate_summary.get("errors", 0) == 0
+            and duplicate_summary.get("final_failures", 0) == 0
             and int(duplicate_changed.get("False", 0)) == len(duplicate_users)
             and phase_results["state"]["errors"] == 0
         )
@@ -624,22 +771,44 @@ def run_load(
         )
 
     overall = summarize_results(all_results)
-    latency = overall["latency"]
+    logical_summary = (
+        phase_results.get("primary", {}).get("logical", {})
+        if mode == "ready-vote"
+        else overall
+    )
+    latency = logical_summary.get("end_to_end_latency", logical_summary.get("latency", {}))
     p95_ms = float(latency.get("p95_ms") or 0)
     p99_ms = float(latency.get("p99_ms") or 0)
+    accepted_latency = logical_summary.get("accepted_request_latency", {})
     acceptance = {
         "passed": bool(
             contract_ok
             and p95_ms <= p95_budget_ms
             and p99_ms <= p99_budget_ms
+            and float(logical_summary.get("final_failure_rate_percent") or 0) <= 0.5
         ),
         "contract_ok": contract_ok,
         "p95_budget_ms": p95_budget_ms,
         "p99_budget_ms": p99_budget_ms,
         "p95_ms": p95_ms,
         "p99_ms": p99_ms,
+        "accepted_request_p95_ms": float(accepted_latency.get("p95_ms") or 0),
+        "accepted_request_p99_ms": float(accepted_latency.get("p99_ms") or 0),
+        "logical_final_failure_rate_percent": float(
+            logical_summary.get("final_failure_rate_percent") or 0
+        ),
     }
     finished_at = datetime.now(UTC)
+    wall_seconds = max(0.001, (finished_at - started_at).total_seconds())
+    acceptance["logical_final_failure_budget_percent"] = 0.5
+    acceptance["logical_final_failure_budget_ok"] = (
+        float(logical_summary.get("final_failure_rate_percent") or 0) <= 0.5
+    )
+    raw_http_summary = (
+        phase_results.get("primary", {}).get("raw_http", overall)
+        if mode == "ready-vote"
+        else overall
+    )
     return {
         "schema": 1,
         "scope": "full_population",
@@ -650,13 +819,15 @@ def run_load(
         "tournaments": len(manifest["tournaments"]),
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
-        "wall_seconds": round((finished_at - started_at).total_seconds(), 3),
+        "wall_seconds": round(wall_seconds, 3),
         "opening_spread_seconds": spread_seconds,
         "manual_refresh_count": manual_refresh_count,
         "concurrency": concurrency,
         "trace": trace,
         "phases": phase_results,
         "overall": overall,
+        "raw_http": raw_http_summary,
+        "logical": logical_summary if mode == "ready-vote" else None,
         "acceptance": acceptance,
     }
 
@@ -671,8 +842,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--duplicate-count", type=int, default=100)
     parser.add_argument("--manual-refresh-count", type=int, default=0)
-    parser.add_argument("--p95-budget-ms", type=float, default=1000.0)
-    parser.add_argument("--p99-budget-ms", type=float, default=2000.0)
+    parser.add_argument("--p95-budget-ms", type=float, default=600.0)
+    parser.add_argument("--p99-budget-ms", type=float, default=1000.0)
     return parser.parse_args()
 
 
@@ -722,16 +893,25 @@ def main() -> int:
         json.dumps(report, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    raw_http = report.get("raw_http") or report.get("overall") or {}
+    logical = report.get("logical") or {}
     print(
         json.dumps(
             {
                 "mode": report.get("mode"),
                 "passed": report.get("acceptance", {}).get("passed", False),
                 "users": report.get("users"),
-                "requests": (report.get("overall") or {}).get("requests"),
-                "errors": (report.get("overall") or {}).get("errors"),
-                "p95_ms": ((report.get("overall") or {}).get("latency") or {}).get("p95_ms"),
-                "p99_ms": ((report.get("overall") or {}).get("latency") or {}).get("p99_ms"),
+                "raw_http_attempts": raw_http.get("requests"),
+                "raw_http_errors": raw_http.get("errors"),
+                "temporary_overload_responses": raw_http.get(
+                    "temporary_overload_responses",
+                    0,
+                ),
+                "logical_actions": logical.get("actions"),
+                "logical_final_failures": logical.get("final_failures"),
+                "logical_retries": logical.get("total_retries"),
+                "p95_ms": (report.get("acceptance") or {}).get("p95_ms"),
+                "p99_ms": (report.get("acceptance") or {}).get("p99_ms"),
             },
             ensure_ascii=False,
         )

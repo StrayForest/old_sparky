@@ -86,6 +86,23 @@ class PlatformProductionConfigTests(unittest.TestCase):
             )
         )
 
+    def test_ready_vote_admission_limits_have_valid_order(self) -> None:
+        validate_platform_settings(
+            self.production_settings(
+                platform_ready_vote_admission_min_concurrency=4,
+                platform_ready_vote_admission_initial_concurrency=8,
+                platform_ready_vote_admission_max_concurrency=16,
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "min <= initial <= max"):
+            validate_platform_settings(
+                self.production_settings(
+                    platform_ready_vote_admission_min_concurrency=8,
+                    platform_ready_vote_admission_initial_concurrency=4,
+                    platform_ready_vote_admission_max_concurrency=16,
+                )
+            )
+
     def test_load_test_source_allowlist_accepts_exact_ipv4_and_ipv6_only(self) -> None:
         self.assertEqual(
             parse_load_test_source_ips("192.0.2.10, 2001:db8::10"),

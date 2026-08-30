@@ -1,9 +1,15 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { currentReadyCheckRound, useReadyCheckPhase } from "@/components/ready-check/ready-check-timer";
 import { useI18n } from "@/components/i18n-provider";
-import { leaveTournament, registerForTournament, setTournamentReadyCheckChoice } from "@/lib/platform-api";
+import {
+  leaveTournament,
+  PlatformApiError,
+  platformApiMessage,
+  registerForTournament,
+  setTournamentReadyCheckChoice
+} from "@/lib/platform-api";
 import { isActiveParticipantStatus } from "@/lib/tournament-model";
 import type { Registration, TournamentDetail } from "@/lib/types";
 
@@ -50,6 +56,8 @@ export function TournamentRegistrationActions({
     errorStep: null,
     removedRegistrationId: null
   });
+  const readyActionInFlight = useRef(false);
+  const [readyRetryCooldown, setReadyRetryCooldown] = useState(false);
   const readyCheckPhase = useReadyCheckPhase(
     tournament.serverTime,
     tournament.schedule?.checkInStartsAt,
@@ -61,6 +69,14 @@ export function TournamentRegistrationActions({
     setReadyCheckTimerMounted(true);
     return () => setReadyCheckTimerMounted(false);
   }, []);
+
+  useEffect(() => {
+    if (!readyRetryCooldown) {
+      return;
+    }
+    const timeout = window.setTimeout(() => setReadyRetryCooldown(false), 1500);
+    return () => window.clearTimeout(timeout);
+  }, [readyRetryCooldown]);
 
   useEffect(() => {
     setState((current) => {
@@ -213,10 +229,18 @@ export function TournamentRegistrationActions({
   }
 
   async function handleReadyToggle() {
-    if (state.saving || !actorUserId || !registered || !canToggleReady) {
+    if (
+      state.saving
+      || readyActionInFlight.current
+      || readyRetryCooldown
+      || !actorUserId
+      || !registered
+      || !canToggleReady
+    ) {
       return;
     }
 
+    readyActionInFlight.current = true;
     const previousChoice = state.readyCheckChoice;
     const nextChoice = checkedIn ? "no" : "yes";
     setState((current) => ({
@@ -226,24 +250,43 @@ export function TournamentRegistrationActions({
       error: null,
       errorStep: null
     }));
-    const result = await setTournamentReadyCheckChoice(tournament.slug, nextChoice).catch(() => null);
-    setState((current) => result
-      ? {
-          ...current,
-          readyCheckChoice: result.current_user_choice ?? nextChoice,
-          saving: null,
-          error: null,
-          errorStep: null
-        }
-      : {
-          ...current,
-          readyCheckChoice: previousChoice,
-          saving: null,
-          error: t("tournament.readyActionFailed"),
-          errorStep: "ready"
-        });
-    if (result) {
-      onReadyChoiceChange?.(result.current_user_choice ?? nextChoice);
+    try {
+      const result = await setTournamentReadyCheckChoice(tournament.slug, nextChoice);
+      setState((current) => result
+        ? {
+            ...current,
+            readyCheckChoice: result.current_user_choice ?? nextChoice,
+            saving: null,
+            error: null,
+            errorStep: null
+          }
+        : {
+            ...current,
+            readyCheckChoice: previousChoice,
+            saving: null,
+            error: t("tournament.readyActionFailed"),
+            errorStep: "ready"
+          });
+      if (result) {
+        onReadyChoiceChange?.(result.current_user_choice ?? nextChoice);
+      }
+    } catch (error) {
+      const overloaded = error instanceof PlatformApiError
+        && error.status === 503
+        && error.code === "READY_VOTE_OVERLOADED"
+        && error.retryable;
+      setReadyRetryCooldown(overloaded);
+      setState((current) => ({
+        ...current,
+        readyCheckChoice: previousChoice,
+        saving: null,
+        error: overloaded
+          ? t("tournament.readyActionBusy")
+          : platformApiMessage(error, t("tournament.readyActionFailed")),
+        errorStep: "ready"
+      }));
+    } finally {
+      readyActionInFlight.current = false;
     }
   }
 
@@ -287,6 +330,7 @@ export function TournamentRegistrationActions({
             checkedIn,
             canToggleReady,
             readyCheckClosed,
+            busy: readyRetryCooldown,
             saving: state.saving === "ready",
             t
           })}</div>
@@ -295,13 +339,14 @@ export function TournamentRegistrationActions({
             className={checkedIn || canToggleReady ? "primary-action" : "disabled-action"}
             type="button"
             onClick={handleReadyToggle}
-            disabled={!canToggleReady || state.saving === "ready"}
+            disabled={!canToggleReady || state.saving === "ready" || readyRetryCooldown}
             aria-busy={state.saving === "ready"}
           >
             {readyActionLabel({
               checkedIn,
               canToggleReady,
               readyCheckClosed,
+              busy: readyRetryCooldown,
               saving: state.saving === "ready",
               t
             })}
@@ -399,6 +444,7 @@ type ReadyActionLabelInput = {
   checkedIn: boolean;
   canToggleReady: boolean;
   readyCheckClosed: boolean;
+  busy: boolean;
   saving: boolean;
   t: ReturnType<typeof useI18n>["t"];
 };
@@ -407,9 +453,13 @@ function readyActionLabel({
   checkedIn,
   canToggleReady,
   readyCheckClosed,
+  busy,
   saving,
   t
 }: ReadyActionLabelInput): string {
+  if (busy) {
+    return t("tournament.stepReadyBusyAction");
+  }
   if (saving) {
     return checkedIn
       ? t("tournament.stepReadySavingAction")

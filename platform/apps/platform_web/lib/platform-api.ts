@@ -291,12 +291,27 @@ let pendingCsrfTokenRequest: Promise<string | null> | null = null;
 export class PlatformApiError extends Error {
   status: number;
   retryAfterSeconds: number | null;
+  retryAfterMs: number | null;
+  code: string | null;
+  retryable: boolean;
 
-  constructor(message: string, status: number, retryAfterSeconds: number | null = null) {
+  constructor(
+    message: string,
+    status: number,
+    retryAfterSeconds: number | null = null,
+    options: {
+      retryAfterMs?: number | null;
+      code?: string | null;
+      retryable?: boolean;
+    } = {}
+  ) {
     super(message);
     this.name = "PlatformApiError";
     this.status = status;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.retryAfterMs = options.retryAfterMs ?? null;
+    this.code = options.code ?? null;
+    this.retryable = options.retryable ?? false;
   }
 }
 
@@ -505,9 +520,20 @@ export async function platformApiRequest<T>(
 
   if (!response.ok) {
     let detail = response.statusText;
+    let errorCode: string | null = null;
+    let retryable = false;
+    let retryAfterMs: number | null = null;
     try {
-      const payload = await response.json() as { detail?: unknown };
+      const payload = await response.json() as {
+        detail?: unknown;
+        code?: unknown;
+        retryable?: unknown;
+        retry_after_ms?: unknown;
+      };
       detail = apiErrorDetail(payload.detail) || detail;
+      errorCode = typeof payload.code === "string" ? payload.code : null;
+      retryable = payload.retryable === true;
+      retryAfterMs = finiteNonNegativeNumber(payload.retry_after_ms);
     } catch {
       detail = detail || "Platform request failed.";
     }
@@ -515,7 +541,11 @@ export async function platformApiRequest<T>(
     const retryAfterSeconds = retryAfterHeader && /^\d+$/u.test(retryAfterHeader)
       ? Number(retryAfterHeader)
       : null;
-    throw new PlatformApiError(detail, response.status, retryAfterSeconds);
+    throw new PlatformApiError(detail, response.status, retryAfterSeconds, {
+      code: errorCode,
+      retryable,
+      retryAfterMs,
+    });
   }
 
   if (response.status === 204) {
@@ -592,6 +622,12 @@ function apiErrorDetail(detail: unknown): string {
     return typeof message === "string" ? message : "";
   }
   return "";
+}
+
+function finiteNonNegativeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
 }
 
 export function platformApiMessage(error: unknown, fallback: string): string {
@@ -1047,20 +1083,43 @@ export async function setTournamentReadyCheckChoice(
   slug: string,
   choice: "yes" | "no"
 ): Promise<PlatformTournamentDeadlockReadyVote | null> {
-  const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/deadlock/ready-check/vote`, {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/json"
-    },
-    credentials: "include",
-    body: JSON.stringify({ choice }),
-    cache: "no-store"
-  });
-  if (!response.ok) {
-    return null;
+  const maxAutomaticRetries = 2;
+  for (let attempt = 0; attempt <= maxAutomaticRetries; attempt += 1) {
+    try {
+      return await platformApiRequest<PlatformTournamentDeadlockReadyVote>(
+        `/tournaments/${slug}/deadlock/ready-check/vote`,
+        {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({ choice }),
+        }
+      );
+    } catch (error) {
+      const overload = error instanceof PlatformApiError
+        && error.status === 503
+        && error.code === "READY_VOTE_OVERLOADED"
+        && error.retryable;
+      if (!overload || attempt >= maxAutomaticRetries) {
+        throw error;
+      }
+      const delayMs = readyVoteRetryDelayMs(error, attempt);
+      await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+    }
   }
-  return await response.json() as PlatformTournamentDeadlockReadyVote;
+  return null;
+}
+
+function readyVoteRetryDelayMs(error: PlatformApiError, retryIndex: number): number {
+  const lowerMs = retryIndex === 0 ? 150 : 400;
+  const upperMs = retryIndex === 0 ? 350 : 800;
+  const jitteredMs = lowerMs + Math.random() * (upperMs - lowerMs);
+  const serverMs = error.retryAfterMs ?? (
+    error.retryAfterSeconds === null ? 0 : error.retryAfterSeconds * 1000
+  );
+  return Math.min(2000, Math.max(jitteredMs, serverMs));
 }
 
 export async function getTournamentAutoAssignmentState(

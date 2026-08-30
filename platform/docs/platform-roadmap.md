@@ -17,7 +17,9 @@ compact conditional workflow reads, bounded API/worker pools, Celery
 priority/backpressure and retained load evidence. Existing 128-shard ready
 votes and PostgreSQL workflow authority remain in force. Ready Check uses the
 server-known timing contract, and passive grid changes are visible after
-manual reload.
+manual reload. Ready Vote additionally uses a process-local adaptive
+admission boundary and bounded browser retries; production Pareto evidence
+for the unchanged 15k/20k external workloads remains an operator gate.
 
 ### AS-17 — End-to-end release transaction and recovery
 

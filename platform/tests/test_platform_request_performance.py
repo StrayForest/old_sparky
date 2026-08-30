@@ -114,6 +114,18 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         metrics.path = "/api/v1/tournaments/demo/deadlock/ready-check/vote"
         metrics.ready_vote_checkout_count = 1
         metrics.ready_vote_checkout_ms = 6.0
+        metrics.ready_vote_admission_inflight = 3
+        metrics.ready_vote_admission_limit = 4
+        metrics.ready_vote_admission_wait_ms = 25.5
+        metrics.ready_vote_admitted_total = 12
+        metrics.ready_vote_shed_total = 2
+        metrics.ready_vote_controller_state = "pressure"
+        metrics.ready_vote_controller_limit_changes = 3
+        metrics.ready_vote_cpu_pressure = 81.5
+        metrics.ready_vote_pool_wait_ms = 4.0
+        metrics.ready_vote_cpu_monitor_sample_ms = 0.12
+        metrics.ready_vote_cpu_monitor_samples = 20
+        metrics.ready_vote_admission_shed = True
         # Force the slow path to verify the emitted field names and values
         # without relying on process-global log state.
         metrics.sql_time_seconds = 1.0
@@ -130,6 +142,14 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
             rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
         self.assertIn("ready_vote_checkout_count=1", rendered)
         self.assertIn("ready_vote_checkout_ms=6.00", rendered)
+        self.assertIn("ready_vote_admission_inflight=3", rendered)
+        self.assertIn("ready_vote_admission_limit=4", rendered)
+        self.assertIn("ready_vote_admission_wait_ms=25.50", rendered)
+        self.assertIn("ready_vote_controller_state=pressure", rendered)
+        self.assertIn("ready_vote_cpu_pressure=81.50", rendered)
+        self.assertIn("ready_vote_cpu_monitor_sample_ms=0.12", rendered)
+        self.assertIn("ready_vote_cpu_monitor_samples=20", rendered)
+        self.assertIn("ready_vote_admission_shed=True", rendered)
         self.assertNotIn("ready_vote_counter_ms", rendered)
 
     def test_ready_vote_error_log_includes_zero_checkout_metrics(self) -> None:

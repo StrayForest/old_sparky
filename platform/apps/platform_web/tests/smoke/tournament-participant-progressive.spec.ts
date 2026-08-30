@@ -20,6 +20,7 @@ const participantRequests: string[] = [];
 let usersMeRequests = 0;
 let csrfRequests = 0;
 let readyVoteRequests = 0;
+let forcedReadyVoteOverloads = 0;
 let bracketRequests = 0;
 
 let apiServer: Server | null = null;
@@ -94,6 +95,15 @@ test.beforeAll(async () => {
       && request.method === "POST"
     ) {
       readyVoteRequests += 1;
+      if (forcedReadyVoteOverloads > 0) {
+        forcedReadyVoteOverloads -= 1;
+        respondJson(response, 503, {
+          code: "READY_VOTE_OVERLOADED",
+          retryable: true,
+          retry_after_ms: 150
+        }, { "Retry-After": "1" });
+        return;
+      }
       respondJson(response, 200, readyVoteResponse("yes"));
       return;
     }
@@ -114,6 +124,7 @@ test.beforeEach(() => {
   usersMeRequests = 0;
   csrfRequests = 0;
   readyVoteRequests = 0;
+  forcedReadyVoteOverloads = 0;
   bracketRequests = 0;
 });
 
@@ -192,6 +203,33 @@ test("registered detail uses compact workspace state and ready vote avoids full 
   await expect.poll(() => usersMeRequests).toBe(1);
   await expect.poll(() => csrfRequests).toBe(1);
   await expectNoHorizontalOverflow(page);
+});
+
+test("ready vote retries bounded overloads as one logical action", async ({ page }) => {
+  forcedReadyVoteOverloads = 2;
+  await page.clock.install({ time: new Date("2026-07-20T16:10:00Z") });
+  await page.context().addCookies([{
+    name: "deadlock_platform_session",
+    value: "lean-detail-session",
+    url: webBaseUrl
+  }, {
+    name: "lean-detail-smoke",
+    value: "1",
+    url: webBaseUrl
+  }]);
+
+  await page.goto(`/tournaments/${readyTournamentSlug}`);
+  const readyButton = page.getByTestId("ready-check-step").getByRole("button");
+  await readyButton.click();
+  await expect(readyButton).toHaveText("Подтверждение...");
+  await readyButton.dispatchEvent("click");
+  await expect.poll(() => readyVoteRequests).toBe(1);
+  await page.clock.fastForward(500);
+  await expect.poll(() => readyVoteRequests).toBe(2);
+  await page.clock.fastForward(1_000);
+  await expect(page.getByRole("button", { name: "Отменить подтверждение" })).toBeVisible({ timeout: 5_000 });
+  await expect.poll(() => readyVoteRequests).toBe(3);
+  expect(forcedReadyVoteOverloads).toBe(0);
 });
 
 test("bracket page uses the initial workspace and has no background refresh", async ({ page }) => {

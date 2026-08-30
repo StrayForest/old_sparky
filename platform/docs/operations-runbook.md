@@ -179,6 +179,8 @@ Targets under normal non-saturated load:
 
 - ordinary reads/small mutations: p95 below 500 ms;
 - retained workflow load: p95 below 1000 ms;
+- Ready Vote logical action: p95 at or below 600 ms, p99 at or below 1000 ms,
+  and final user-visible failure below 0.5%;
 - browser INP at or below 200 ms;
 - public/detail LCP at or below 2.5 s.
 
@@ -233,8 +235,11 @@ gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
 The 30-second spread models human arrivals; run a separate zero- or
-short-spread aggressive test for safety margin. Record client p50/p95/p99,
-status/error/timeout counts, response-contract checks, API CPU/RSS, Redis,
+short-spread aggressive test for safety margin. Record raw HTTP attempts
+(including 200, `READY_VOTE_OVERLOADED`, other status and timeout counts)
+separately from logical actions (final success/failure, retries per action,
+first-attempt-to-success p50/p95/p99/max and successful goodput). Also record
+accepted-request latency, response-contract checks, API CPU/RSS, Redis,
 PostgreSQL connections and pool waits, Nginx sockets, and cleanup verification.
 If the workflow is canceled, perform the exact retained-load abort/cleanup
 procedure with the same run ID before another load. The temporary manifest
@@ -269,15 +274,44 @@ authorization still performs the full server-side time, participant, profile,
 round and workflow checks; ordinary authenticated requests retain role
 hydration and session last-seen updates.
 
-Ready Vote `request_perf` records low-cardinality spans for auth, the dedicated
-checkout (including `ready_vote_checkout_count` and
+Ready Vote `request_perf` records low-cardinality spans for admission, auth, the
+dedicated checkout (including `ready_vote_checkout_count` and
 `ready_vote_checkout_ms`), preflight, conditional upsert, commit and response
-construction. `ready_vote_upsert_ms` includes the trigger-maintained counter
-work. The conditional upsert returns `changed=false` for an identical choice,
-so it performs no vote-row update, counter delta or cache invalidation. These
-fields are aggregated by route and QA phase by the production QA parser;
-successful requests remain below the normal per-request INFO logging path
-unless the existing slow-request/failure gate selects them.
+construction. Admission fields include the process-local in-flight count and
+limit, bounded admission wait, controller state/limit changes, smoothed CPU,
+admitted/shed totals, pool wait and periodic CPU-monitor sample cost/count.
+`ready_vote_upsert_ms` includes the
+trigger-maintained counter work. The conditional upsert returns `changed=false`
+for an identical choice, so it performs no vote-row update, counter delta or
+cache invalidation. These fields are aggregated by route and QA phase by the
+production QA parser; successful fast requests remain below the normal
+per-request INFO logging path unless the existing slow-request/failure gate
+selects them.
+
+### Ready Vote admission contract
+
+Ready Vote has a process-local controller in each Gunicorn worker. It performs
+no batching and no Redis operation. A request takes a slot immediately while
+the worker is below its current limit; the default admission wait budget is
+`0 ms` with `0` waiters, so excess attempts receive a cheap `503` before
+`ready_vote_db_session()` and perform zero checkout/SQL work. The response body
+contains `code=READY_VOTE_OVERLOADED`, `retryable=true` and a bounded
+`retry_after_ms` hint.
+
+The reviewed two-worker defaults are per worker: minimum `4`, initial `8`,
+maximum `16`. The controller smooths CPU samples every `0.5 s` with EWMA
+alpha `0.25`; `70%` is watch, `80%` enters pressure and `90%` is severe.
+Latency, admission wait and DB pool wait are additional signals. Pressure
+reduces the limit quickly, while recovery increases it one slot at a time only
+after sustained healthy samples. Thus the aggregate effective concurrency is
+the sum of the two independent worker limits and is intentionally not a global
+Redis semaphore.
+
+The browser treats this as one logical action: it enters `Подтверждение...`
+immediately, ignores duplicate activation while pending, retries only the
+explicit overload code at most twice with full bounded jitter, then shows a
+temporary busy message and a short cooldown. Authentication, CSRF, validation,
+eligibility, closed-round and other business errors are never retried.
 
 Performance reports keep full-population HTTP client measurements separate from
 the diagnostic `request_perf` journal sample. The client summary covers every
@@ -299,10 +333,14 @@ endpoint load is covered by the ordinary read/auth profiles.
 Ready Check load testing uses the `write-burst` mode of
 `platform_production_qa.py`. The test creates marked
 eligible participants, uses the real Ready Check vote endpoint after its
-server-known window, and reports accepted/rejected votes, response p50/p95/p99,
-database pool wait, lock pressure, API/PostgreSQL CPU and connections, and
-duplicate/idempotency behavior. Run a human-shaped spread first, then a
-separate aggressive burst; clean the exact run before another production load.
+server-known window, and reports raw attempts and logical action latency,
+accepted/rejected votes, retries, shedding, database pool wait, admission wait,
+lock pressure, API/PostgreSQL CPU and connections, and duplicate/idempotency
+behavior. Run a human-shaped spread first, then a separate aggressive burst;
+clean the exact run before another production load. Static limit sweeps must
+keep the same 2-vCPU/2-worker/pool envelope and record limits `4`, `6`, `8`,
+`12` and `16` before selecting an adaptive operating region; do not modify
+external concurrency or spread to make a candidate pass.
 The browser timer itself must produce zero Ready Check requests before
 `starts_at`, at `starts_at`, and at `ends_at`.
 

@@ -8,12 +8,15 @@ from unittest.mock import patch
 
 from tools.platform_external_load import (
     ExternalLoadError,
+    LogicalRequestResult,
     RequestResult,
     VirtualUser,
     _route_for_read,
+    _ready_vote_action,
     load_manifest,
     run_load,
     spread_offsets,
+    summarize_logical_results,
     summarize_results,
 )
 
@@ -119,6 +122,158 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(summary["requests"], 1)
         self.assertEqual(summary["errors"], 0)
         self.assertNotIn(secret, serialized)
+
+    def test_ready_vote_retries_only_explicit_overload_and_reports_logical_latency(self) -> None:
+        _, users = load_manifest_from_payload(manifest_payload())
+        responses = [
+            RequestResult(
+                phase="write_external_vote",
+                method="POST",
+                path="/tournaments/qa/deadlock/ready-check/vote",
+                status=503,
+                elapsed_ms=12.0,
+                ok=False,
+                response_bytes=88,
+                response_json={
+                    "code": "READY_VOTE_OVERLOADED",
+                    "retryable": True,
+                    "retry_after_ms": 250,
+                },
+            ),
+            RequestResult(
+                phase="write_external_vote",
+                method="POST",
+                path="/tournaments/qa/deadlock/ready-check/vote",
+                status=200,
+                elapsed_ms=18.0,
+                ok=True,
+                response_bytes=120,
+                response_json={"changed": True},
+            ),
+        ]
+
+        with (
+            patch("tools.platform_external_load._ready_vote_request", side_effect=responses),
+            patch("tools.platform_external_load.time.sleep") as sleep,
+            patch("tools.platform_external_load.random.uniform", return_value=200.0),
+        ):
+            logical = _ready_vote_action(
+                "https://old-sparky.com",
+                users[0],
+                "write_external_vote",
+                1.0,
+                session_cookie_name="session",
+                csrf_cookie_name="csrf",
+            )
+
+        self.assertEqual(len(logical.attempts), 2)
+        self.assertEqual(logical.retry_count, 1)
+        sleep.assert_called_once_with(0.25)
+        summary = summarize_logical_results([logical])
+        self.assertEqual(summary["actions"], 1)
+        self.assertEqual(summary["final_successes"], 1)
+        self.assertEqual(summary["total_retries"], 1)
+        self.assertEqual(summary["changed_counts"], {"True": 1})
+
+    def test_logical_summary_keeps_final_failure_rate_separate_from_raw_overloads(self) -> None:
+        overloaded = RequestResult(
+            phase="write_external_vote",
+            method="POST",
+            path="/tournaments/qa/deadlock/ready-check/vote",
+            status=503,
+            elapsed_ms=4.0,
+            ok=False,
+            response_bytes=80,
+            response_json={
+                "code": "READY_VOTE_OVERLOADED",
+                "retryable": True,
+                "retry_after_ms": 250,
+            },
+        )
+        logical = LogicalRequestResult([overloaded], elapsed_ms=4.0)
+
+        raw = summarize_results([overloaded])
+        logical_summary = summarize_logical_results([logical])
+        self.assertEqual(raw["temporary_overload_responses"], 1)
+        self.assertEqual(logical_summary["final_failures"], 1)
+        self.assertEqual(logical_summary["final_failure_rate_percent"], 100.0)
+
+    def test_ready_vote_load_report_separates_primary_http_and_logical_layers(self) -> None:
+        payload = manifest_payload()
+        _, users = load_manifest_from_payload(payload)
+
+        def fake_trace(origin: str, timeout: float) -> dict[str, str]:
+            return {"status": "200", "ip": "192.0.2.10", "colo": "TEST"}
+
+        def fake_action(
+            origin: str,
+            user: VirtualUser,
+            phase: str,
+            timeout: float,
+            *,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+        ) -> LogicalRequestResult:
+            result = RequestResult(
+                phase=phase,
+                method="POST",
+                path=f"/tournaments/{user.tournament_slug}/deadlock/ready-check/vote",
+                status=200,
+                elapsed_ms=12.0,
+                ok=True,
+                response_bytes=120,
+                response_json={"changed": True},
+            )
+            return LogicalRequestResult([result], elapsed_ms=12.0)
+
+        def fake_state_request(
+            origin: str,
+            user: VirtualUser,
+            *,
+            method: str,
+            path: str,
+            phase: str,
+            timeout: float,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+            json_payload: dict[str, object] | None = None,
+            expected_statuses: frozenset[int] = frozenset({200}),
+            extra_headers: dict[str, str] | None = None,
+        ) -> RequestResult:
+            return RequestResult(
+                phase=phase,
+                method=method,
+                path=path,
+                status=200,
+                elapsed_ms=8.0,
+                ok=True,
+                response_bytes=150,
+                response_json={"active_round": {"ready_count": 2}},
+            )
+
+        with (
+            patch("tools.platform_external_load._trace", side_effect=fake_trace),
+            patch("tools.platform_external_load._ready_vote_action", side_effect=fake_action),
+            patch("tools.platform_external_load._request", side_effect=fake_state_request),
+        ):
+            report = run_load(
+                payload,
+                users,
+                mode="ready-vote",
+                spread_seconds=0,
+                concurrency=1,
+                timeout=1,
+                duplicate_count=0,
+                manual_refresh_count=0,
+                p95_budget_ms=600,
+                p99_budget_ms=1000,
+            )
+
+        self.assertTrue(report["acceptance"]["passed"])
+        self.assertEqual(report["raw_http"]["requests"], 2)
+        self.assertEqual(report["logical"]["actions"], 2)
+        self.assertEqual(report["logical"]["final_failures"], 0)
+        self.assertGreater(report["logical"]["successful_goodput_actions_per_second"], 0)
 
     def test_read_mix_manual_refresh_uses_conditional_workspace_request(self) -> None:
         payload = manifest_payload()

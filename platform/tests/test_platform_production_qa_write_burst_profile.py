@@ -183,6 +183,12 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
                 "sql_count=3 max_sql_ms=10.00 compute_ms=2.00 compute_blocks=1 response_bytes=180 "
                 "pool_wait_ms=3.00 qa_phase=write_ready_burst_5s "
                 "ready_vote_auth_ms=4.00 ready_vote_checkout_count=1 ready_vote_checkout_ms=5.00 "
+                "ready_vote_admission_inflight=3 ready_vote_admission_limit=4 "
+                "ready_vote_admission_wait_ms=1.00 ready_vote_admitted_total=12 "
+                "ready_vote_shed_total=2 ready_vote_controller_limit_changes=3 "
+                "ready_vote_controller_state=pressure "
+                "ready_vote_cpu_pressure=81.50 ready_vote_pool_wait_ms=3.00 "
+                "ready_vote_cpu_monitor_sample_ms=0.12 ready_vote_cpu_monitor_samples=20 "
                 "ready_vote_preflight_ms=6.00 ready_vote_upsert_ms=7.00 "
                 "ready_vote_commit_ms=2.00 ready_vote_response_ms=0.10",
             ],
@@ -194,6 +200,14 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
         self.assertEqual(ready_vote["ready_vote_auth_ms"]["avg_ms"], 4.0)
         self.assertEqual(ready_vote["ready_vote_checkout_count"]["avg_ms"], 1.0)
         self.assertEqual(ready_vote["ready_vote_checkout_ms"]["avg_ms"], 5.0)
+        self.assertEqual(ready_vote["ready_vote_admission_limit"]["avg_ms"], 4.0)
+        self.assertEqual(ready_vote["ready_vote_cpu_pressure"]["avg_ms"], 81.5)
+        self.assertEqual(ready_vote["ready_vote_cpu_monitor_samples"]["avg_ms"], 20.0)
+        self.assertEqual(
+            summary["by_route"]["/{slug}/deadlock/ready-check/vote"]
+            ["ready_vote_controller_state_counts"],
+            {"pressure": 1},
+        )
         self.assertEqual(ready_vote["ready_vote_commit_ms"]["p95_ms"], 2.0)
         self.assertNotIn("ready_vote_counter_ms", ready_vote)
         self.assertNotIn("ready_vote_db_checkout_ms", ready_vote)
