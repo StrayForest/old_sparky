@@ -399,7 +399,8 @@ def run_rate_phase(
             if delay > 0:
                 time.sleep(delay)
             submitted_at = time.monotonic()
-            first_submission_at = submitted_at if first_submission_at is None else first_submission_at
+            if first_submission_at is None:
+                first_submission_at = submitted_at
             last_submission_at = submitted_at
             futures.append(executor.submit(request_builder, origin, user, phase, timeout))
         results = [future.result() for future in as_completed(futures)]

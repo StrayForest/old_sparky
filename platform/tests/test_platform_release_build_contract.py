@@ -101,6 +101,15 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         ):
             self.assertIn(f"--only {key}", baseline_branch)
 
+    def test_auto_deploy_preserves_static_eight_runtime_profile(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
+        ).read_text()
+        self.assertIn(
+            '"runtime_profile":"ready-vote-static-8"',
+            workflow,
+        )
+
     def test_production_preflight_requires_edge_parity_before_preflight_exit(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"

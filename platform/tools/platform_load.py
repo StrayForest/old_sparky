@@ -432,10 +432,10 @@ def profile_contract(profile: Mapping[str, Any]) -> dict[str, Any]:
             "duplicate_count": traffic["duplicate_count"],
             "manual_refresh_count": traffic["manual_refresh_count"],
             "retry": traffic["retry"],
-            "phases": traffic.get("phases", []),
+            "phases": traffic.get("phases") or [],
             "planned_logical_actions": sum(
                 int(phase["logical_actions"])
-                for phase in traffic.get("phases", [])
+                for phase in (traffic.get("phases") or [])
             ),
         },
         "acceptance": acceptance,
