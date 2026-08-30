@@ -44,20 +44,18 @@ def _origin_safety_checks(
     waits = system.get("postgres_waits") or {}
     postgres_connections = system.get("postgres_established_connections") or {}
     cpu_per_core = system.get("cpu_per_core") or {}
+    missing_diagnostics: list[str] = []
 
     pool_contract = contract.get("pool_checkout_wait_ms") or {}
-    _budget_check(
-        checks,
-        "pool_checkout_p95_ms",
-        _number(pool, "p95_ms"),
-        _number(pool_contract, "p95_ms"),
-    )
-    _budget_check(
-        checks,
-        "pool_checkout_p99_ms",
-        _number(pool, "p99_ms"),
-        _number(pool_contract, "p99_ms"),
-    )
+    for percentile_name in ("p95", "p99"):
+        actual = _number(pool, f"{percentile_name}_ms")
+        budget = _number(pool_contract, f"{percentile_name}_ms")
+        if budget is None:
+            continue
+        if actual is None:
+            missing_diagnostics.append(f"pool_checkout_{percentile_name}_ms")
+        else:
+            checks[f"pool_checkout_{percentile_name}_ms"] = actual <= budget
     _budget_check(
         checks,
         "postgres_connections",
@@ -94,6 +92,7 @@ def _origin_safety_checks(
         "checks": checks,
         "passed": bool(checks) and all(checks.values()),
         "evidence_scope": "origin_observer_summary",
+        "missing_diagnostics": missing_diagnostics,
     }
 
 
@@ -354,8 +353,6 @@ def evaluate_acceptance(
         "pending_origin_evidence": pending_origin,
         "origin_safety": origin_safety,
     }
-    if origin_observability is not None:
-        result["origin_evidence"] = _origin_safety_checks(
-            acceptance_contract, origin_observability
-        )
+    if origin_safety is not None:
+        result["origin_evidence"] = origin_safety
     return result

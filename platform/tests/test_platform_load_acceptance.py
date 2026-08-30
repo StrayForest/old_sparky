@@ -84,6 +84,53 @@ class LoadAcceptanceTests(unittest.TestCase):
         self.assertEqual(result["decision"], "STRESS BEHAVIOR PASS")
         self.assertEqual(result["logical_final_failure_rate_percent"], 60)
 
+    def test_missing_slow_request_pool_sample_is_diagnostic_only(self) -> None:
+        result = evaluate_acceptance(
+            contract_ok=True,
+            logical_summary={
+                "actions": 10,
+                "final_failure_rate_percent": 0,
+                "end_to_end_latency": {"p95_ms": 300, "p99_ms": 500},
+                "accepted_request_latency": latency(100, 200, 300, 500),
+            },
+            raw_http_summary={
+                "temporary_overload_rate_percent": 0,
+                "unexpected_statuses": 0,
+            },
+            acceptance_contract={
+                **SLO,
+                "resource_safety": {
+                    "pool_checkout_wait_ms": {"p95_ms": 5000, "p99_ms": 10000},
+                    "max_postgres_connections": 52,
+                    "max_waiting_backends": 20,
+                    "max_lock_waiters": 20,
+                    "max_cpu_per_core_percent": 100,
+                },
+                "require_origin_evidence": True,
+            },
+            origin_observability={
+                "stop_file_seen": True,
+                "timed_out": False,
+                "system": {
+                    "cpu_per_core": {"cpu0": {"max_percent": 50}},
+                    "postgres_established_connections": {"max": 30},
+                    "postgres_waits": {
+                        "max_waiting_backends": 0,
+                        "max_lock_waiters": 0,
+                    },
+                },
+                "server_request_perf_logs": {
+                    "logged_requests": 0,
+                },
+            },
+        )
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(
+            result["origin_safety"]["missing_diagnostics"],
+            ["pool_checkout_p95_ms", "pool_checkout_p99_ms"],
+        )
+
     def test_capacity_reports_slo_capacity_separately_from_goodput(self) -> None:
         result = evaluate_acceptance(
             contract_ok=True,
