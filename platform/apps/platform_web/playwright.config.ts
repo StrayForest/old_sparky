@@ -13,18 +13,20 @@ export default defineConfig({
   testDir: "./tests/smoke",
   testIgnore: [
     "live-launch.spec.ts",
+    "live-user-journey.spec.ts",
     "tournament-participant-progressive.spec.ts"
   ],
-  // The participant-progressive flow owns a separate API/server contour and is
-  // run by test:hermetic after this suite. All other deterministic specs run
-  // here without name-based exclusions.
+  // These are the only specialized contours: live QA is operator-only and the
+  // participant-progressive flow owns a separate API/server setup. Ordinary
+  // hermetic specs remain auto-discovered here.
   outputDir: "./test-results",
   timeout: 30_000,
   expect: {
     timeout: 10_000
   },
   fullyParallel: true,
-  retries: process.env.CI ? 2 : 0,
+  // Deterministic CI must expose failures instead of retrying them silently.
+  retries: 0,
   reporter: process.env.CI
     ? [["list"], ["html", { outputFolder: "playwright-report", open: "never" }]]
     : [["list"]],

@@ -19,6 +19,7 @@ on:
         type: choice
         options:
           - ready-vote-human-v1
+          - ready-vote-capacity-15k-v1
           - ready-vote-stress-v1
           - read-mix-human-v1
           - read-mix-stress-v1

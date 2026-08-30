@@ -11,6 +11,7 @@ evaluation.
 | Profile | Category | Scenario |
 | --- | --- | --- |
 | `ready-vote-human-v1` | load | 500-user human-shaped Ready Vote burst |
+| `ready-vote-capacity-15k-v1` | capacity | 15,000-user aggressive Ready Vote burst |
 | `ready-vote-stress-v1` | stress | 20,000-user aggressive Ready Vote burst |
 | `read-mix-human-v1` | load | 500-user human-shaped authenticated reads |
 | `read-mix-stress-v1` | stress | 20,000-user authenticated reads and conditional reloads |

@@ -14,7 +14,14 @@ from tools.platform_load import (
     run_profile,
     validate_profile,
 )
-from tools.platform_verify import CI_GATE_IDS, DETERMINISTIC_GATE_IDS, GATES_BY_ID, registry_payload
+from tools.platform_verify import (
+    CI_GATE_IDS,
+    DETERMINISTIC_GATE_IDS,
+    GATES_BY_ID,
+    VerificationError,
+    dispatch,
+    registry_payload,
+)
 from tools.platform_verify_contract import collect_issues, extract_gate_invocations
 
 
@@ -26,6 +33,10 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertFalse(GATES_BY_ID["external-load"].deterministic)
         self.assertFalse(GATES_BY_ID["external-load"].local_safe)
         self.assertEqual(registry_payload()["ci_gate_ids"], list(CI_GATE_IDS))
+
+    def test_production_contours_are_not_dispatchable_as_local_gates(self) -> None:
+        with self.assertRaises(VerificationError):
+            dispatch("external-load")
 
     def test_backend_and_unknown_workflow_gate_extraction(self) -> None:
         text = """
@@ -46,6 +57,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             set(profiles),
             {
                 "ready-vote-human-v1",
+                "ready-vote-capacity-15k-v1",
                 "ready-vote-stress-v1",
                 "read-mix-human-v1",
                 "read-mix-stress-v1",

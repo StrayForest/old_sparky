@@ -22,7 +22,9 @@ PLATFORM_ROOT = REPO_ROOT / "platform"
 SECURITY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-security.yml"
 GOVERNANCE_DOC = PLATFORM_ROOT / "docs" / "test-suite-governance.md"
 WEB_PACKAGE = PLATFORM_ROOT / "apps" / "platform_web" / "package.json"
+WEB_PLAYWRIGHT_CONFIG = PLATFORM_ROOT / "apps" / "platform_web" / "playwright.config.ts"
 LEGACY_MANIFEST = PLATFORM_ROOT / "tests" / "test-suite-manifest.json"
+EXTERNAL_LOAD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-external-load.yml"
 
 DIRECT_CANONICAL_COMMANDS = (
     "platform_run_tests.sh",
@@ -125,6 +127,29 @@ def collect_issues() -> list[str]:
         if isinstance(hermetic, str) and ".spec." in hermetic:
             issues.append("web hermetic gate names individual spec files")
 
+    try:
+        web_config = WEB_PLAYWRIGHT_CONFIG.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        issues.append(f"web Playwright config is unreadable: {exc}")
+    else:
+        ignore_match = re.search(r"testIgnore:\s*\[(.*?)\]", web_config, re.DOTALL)
+        ignored_specs = (
+            set(re.findall(r'"([^"]+\.spec\.ts)"', ignore_match.group(1)))
+            if ignore_match
+            else set()
+        )
+        expected_ignored_specs = {
+            "live-launch.spec.ts",
+            "live-user-journey.spec.ts",
+            "tournament-participant-progressive.spec.ts",
+        }
+        if ignored_specs != expected_ignored_specs:
+            issues.append(
+                "web hermetic config must isolate only live and participant specialized suites"
+            )
+        if re.search(r"retries:\s*process\.env\.CI", web_config):
+            issues.append("web hermetic deterministic config must not retry CI failures")
+
     if not GOVERNANCE_DOC.is_file():
         issues.append("test-suite-governance.md is missing")
     else:
@@ -158,12 +183,23 @@ def collect_issues() -> list[str]:
         if len(profiles) < 4:
             issues.append("canonical load profile registry must contain the four baseline profiles")
 
-    external_workflow = REPO_ROOT / ".github" / "workflows" / "platform-production-external-load.yml"
-    external_text = external_workflow.read_text(encoding="utf-8")
+    external_text = EXTERNAL_LOAD_WORKFLOW.read_text(encoding="utf-8")
     if "runs-on: ubuntu-latest" not in external_text:
         issues.append("external load workflow must use an external GitHub runner")
     if "platform_load.py" not in external_text:
         issues.append("external load workflow must dispatch platform_load.py")
+    profile_options_match = re.search(
+        r"profile_id:\n(?P<options>.*?)(?:\n\npermissions:)",
+        external_text,
+        re.DOTALL,
+    )
+    profile_options = (
+        set(re.findall(r"^\s+-\s+([a-z0-9-]+-v[0-9]+)\s*$", profile_options_match.group("options"), re.MULTILINE))
+        if profile_options_match
+        else set()
+    )
+    if "profiles" in locals() and profile_options != set(profiles):
+        issues.append("external load workflow profile choices drift from canonical profiles")
     supervisor = (PLATFORM_ROOT / "tools" / "platform_production_external_fixture_qa.sh").read_text(encoding="utf-8")
     if "measured HTTP generator runs on the" not in supervisor:
         issues.append("origin fixture supervisor must document that measurement stays external")
