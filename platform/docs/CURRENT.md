@@ -47,9 +47,15 @@ external retained reports and is not a product architecture contract.
 
 Current status: migration `0048` adds a partial covering index for the
 `UserSession` auth query. Evidence is `EXPLAIN` `Index Only Scan` / `Heap
-Fetches 0` from disposable analysis as engineering evidence; no retained
-15k/20k 2-vCPU load report has been run; the exact-SHA CI/load gate remains
-pending; and p95/p99 targets are unchanged.
+Fetches 0` from disposable analysis as engineering evidence. Full retained
+15k and 20k 2-vCPU Ready Vote runs on `ba377cbe` completed with 200 responses,
+correct duplicate no-op semantics and exact cleanup, but the unchanged
+latency gate remains unmet: 15k p95/p99 was 2373.755/3189.961 ms and 20k was
+2180.498/2719.356 ms. Both cores averaged roughly 92–94% while PostgreSQL
+averaged roughly 22%; server timing identifies pool checkout wait as the main
+remaining bottleneck and still records three SQL statements per normal vote.
+Exact-SHA CI, auto-deploy and production live smoke passed; p95/p99 targets
+are unchanged.
 
 The current Ready Check implementation uses the initial workspace timing
 contract: the page receives `starts_at`, `ends_at`, eligible/current-user
