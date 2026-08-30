@@ -131,6 +131,17 @@ PUBLIC_BASELINE = {
 }
 RUNTIME_PROFILES = {
     "baseline": {},
+    # Static Ready Vote profiles are deliberately limited to the reviewed
+    # sweep points. They keep the 2-worker/2-vCPU and database-pool envelope
+    # unchanged while allowing an operator to measure the admission knee.
+    **{
+        f"ready-vote-static-{limit}": {
+            "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY": str(limit),
+            "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": str(limit),
+            "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": str(limit),
+        }
+        for limit in (4, 6, 8, 12, 16)
+    },
     # Keep the total API pool budget unchanged while giving a third API
     # worker a smaller private pool. This is an operator-controlled capacity
     # experiment for the observed two-core VPS, not the automatic baseline.

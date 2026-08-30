@@ -12,12 +12,17 @@ on:
           - preflight
           - deploy
       runtime_profile:
-        description: "Reviewed API capacity profile to apply after deployment"
+        description: "Reviewed runtime capacity profile to apply after deployment"
         required: true
         default: baseline
         type: choice
         options:
           - baseline
+          - ready-vote-static-4
+          - ready-vote-static-6
+          - ready-vote-static-8
+          - ready-vote-static-12
+          - ready-vote-static-16
           - api-3x16
           - api-1x48
 
@@ -472,6 +477,49 @@ jobs:
               done
               [[ "$api_ready" == true ]] \
                 || fail "API did not recover on baseline runtime profile"
+              ;;
+            ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-static-12|ready-vote-static-16)
+              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+                --apply \
+                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                --profile "$runtime_profile" \
+                --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
+                --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
+                --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+              systemctl restart deadlock-api
+              api_ready=false
+              for _ in $(seq 1 30); do
+                if systemctl is-active --quiet deadlock-api \
+                  && curl --fail --silent --show-error --max-time 2 \
+                    http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
+                  api_ready=true
+                  break
+                fi
+                sleep 1
+              done
+              if [[ "$api_ready" != true ]]; then
+                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+                  --apply \
+                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                  --profile baseline \
+                  --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
+                  --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
+                  --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                systemctl restart deadlock-api
+                api_ready=false
+                for _ in $(seq 1 30); do
+                  if systemctl is-active --quiet deadlock-api \
+                    && curl --fail --silent --show-error --max-time 2 \
+                      http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
+                    api_ready=true
+                    break
+                  fi
+                  sleep 1
+                done
+                [[ "$api_ready" == true ]] \
+                  || fail "static Ready Vote profile health check failed; baseline restore failed"
+                fail "static Ready Vote profile health check failed; baseline restored"
+              fi
               ;;
             api-3x16)
               "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \

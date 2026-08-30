@@ -104,6 +104,27 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertEqual(single_worker["PLATFORM_DB_MAX_OVERFLOW"], "0")
         self.assertEqual(single_worker["PLATFORM_DB_CONNECTION_BUDGET"], "52")
 
+    def test_ready_vote_static_profiles_are_limited_to_reviewed_sweep_points(self) -> None:
+        expected_limits = (4, 6, 8, 12, 16)
+        self.assertEqual(
+            {
+                int(name.rsplit("-", 1)[1])
+                for name in configure.RUNTIME_PROFILES
+                if name.startswith("ready-vote-static-")
+            },
+            set(expected_limits),
+        )
+        for limit in expected_limits:
+            profile = configure.RUNTIME_PROFILES[f"ready-vote-static-{limit}"]
+            self.assertEqual(
+                profile,
+                {
+                    "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY": str(limit),
+                    "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": str(limit),
+                    "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": str(limit),
+                },
+            )
+
     def test_atomic_write_preserves_private_owner_group_and_mode(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / ".env.platform"

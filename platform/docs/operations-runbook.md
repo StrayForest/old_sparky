@@ -341,6 +341,14 @@ clean the exact run before another production load. Static limit sweeps must
 keep the same 2-vCPU/2-worker/pool envelope and record limits `4`, `6`, `8`,
 `12` and `16` before selecting an adaptive operating region; do not modify
 external concurrency or spread to make a candidate pass.
+The reviewed deploy workflow exposes those five points as
+`ready-vote-static-4`, `ready-vote-static-6`, `ready-vote-static-8`,
+`ready-vote-static-12` and `ready-vote-static-16`. Each profile changes only
+the three Ready Vote admission limits and restarts the API after a health
+check; it does not change workers, CPU, PostgreSQL, Redis, pool size or load
+shape. Run the 15k candidate sweep first, restore `baseline` after every
+candidate, and use the same external-load confirmation/cleanup gate. Run the
+20k verification only for the Pareto candidates that remain viable.
 The browser timer itself must produce zero Ready Check requests before
 `starts_at`, at `starts_at`, and at `ends_at`.
 
