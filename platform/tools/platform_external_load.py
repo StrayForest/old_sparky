@@ -16,6 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
+import math
 from pathlib import Path
 import random
 import re
@@ -76,6 +77,7 @@ class LogicalRequestResult:
 
     attempts: list[RequestResult]
     elapsed_ms: float
+    user_id: str | None = None
 
     @property
     def final(self) -> RequestResult:
@@ -105,6 +107,7 @@ def metric_stats(values: list[float]) -> dict[str, Any]:
             "count": 0,
             "avg_ms": None,
             "p50_ms": None,
+            "p90_ms": None,
             "p95_ms": None,
             "p99_ms": None,
             "max_ms": None,
@@ -113,6 +116,7 @@ def metric_stats(values: list[float]) -> dict[str, Any]:
         "count": len(values),
         "avg_ms": round(sum(values) / len(values), 3),
         "p50_ms": round(percentile(values, 50) or 0, 3),
+        "p90_ms": round(percentile(values, 90) or 0, 3),
         "p95_ms": round(percentile(values, 95) or 0, 3),
         "p99_ms": round(percentile(values, 99) or 0, 3),
         "max_ms": round(max(values), 3),
@@ -372,6 +376,42 @@ def run_phase(
     return results
 
 
+def run_rate_phase(
+    origin: str,
+    users: list[VirtualUser],
+    *,
+    phase: str,
+    duration_seconds: float,
+    concurrency: int,
+    timeout: float,
+    request_builder,
+) -> tuple[list[Any], float]:
+    """Run a paced phase and return its submission window separately from drain time."""
+
+    offsets = spread_offsets(len(users), duration_seconds)
+    phase_started_at = time.monotonic()
+    first_submission_at: float | None = None
+    last_submission_at: float | None = None
+    futures: list[Future[Any]] = []
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="external-load") as executor:
+        for user, offset in zip(users, offsets, strict=True):
+            delay = phase_started_at + offset - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            submitted_at = time.monotonic()
+            first_submission_at = submitted_at if first_submission_at is None else first_submission_at
+            last_submission_at = submitted_at
+            futures.append(executor.submit(request_builder, origin, user, phase, timeout))
+        results = [future.result() for future in as_completed(futures)]
+    if first_submission_at is None or last_submission_at is None:
+        submission_window_seconds = 0.001
+    elif len(users) == 1:
+        submission_window_seconds = max(0.001, duration_seconds)
+    else:
+        submission_window_seconds = max(0.001, last_submission_at - first_submission_at)
+    return results, submission_window_seconds
+
+
 def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
     status_counts: Counter[str] = Counter()
     by_route: dict[str, list[float]] = defaultdict(list)
@@ -411,12 +451,18 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         "scope": "full_population",
         "requests": len(results),
         "errors": errors,
+        "successful_responses": len(results) - errors,
+        "final_failure_rate_percent": round(
+            errors * 100 / max(1, len(results)),
+            4,
+        ),
         "temporary_overload_responses": temporary_overloads,
         "temporary_overload_rate_percent": round(
             temporary_overloads * 100 / max(1, len(results)),
             4,
         ),
         "retry_attempts": retry_attempts,
+        "unexpected_statuses": max(0, errors - temporary_overloads),
         "status_counts": dict(sorted(status_counts.items())),
         "error_kinds": dict(sorted(error_kinds.items())),
         "changed_counts": dict(sorted(changed.items())),
@@ -523,6 +569,7 @@ def _ready_vote_action(
     return LogicalRequestResult(
         attempts=attempts,
         elapsed_ms=(time.monotonic() - started_at) * 1000,
+        user_id=user.user_id,
     )
 
 
@@ -550,6 +597,10 @@ def summarize_logical_results(results: list[LogicalRequestResult]) -> dict[str, 
             4,
         ),
         "total_retries": sum(result.retry_count for result in results),
+        "retry_amplification_percent": round(
+            sum(result.retry_count for result in results) * 100 / max(1, len(results)),
+            4,
+        ),
         "retries_per_action": round(
             sum(result.retry_count for result in results) / max(1, len(results)),
             4,
@@ -577,6 +628,9 @@ def run_load(
     p99_budget_ms: float,
     failure_budget_percent: float | None = None,
     retry_policy: dict[str, Any] | None = None,
+    phase_plan: list[dict[str, Any]] | None = None,
+    scenario_kind: str = "slo",
+    acceptance_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if manual_refresh_count < 0:
         raise ExternalLoadError("manual_refresh_count must not be negative")
@@ -609,15 +663,89 @@ def run_load(
             return _ready_vote_action(origin_value, user, phase, request_timeout, **kwargs)
 
         primary_started_at = time.monotonic()
-        primary = run_phase(
-            origin,
-            users,
-            phase="write_external_vote",
-            spread_seconds=spread_seconds,
-            concurrency=concurrency,
-            timeout=timeout,
-            request_builder=vote_builder,
-        )
+        primary: list[LogicalRequestResult] = []
+        primary_users = users
+        if phase_plan:
+            cursor = 0
+            offered_window_seconds = 0.0
+            planned_phases: dict[str, dict[str, Any]] = {}
+            for index, phase in enumerate(phase_plan, start=1):
+                phase_name = str(phase.get("name") or f"phase-{index}")
+                duration_seconds = float(phase.get("duration_seconds") or 0)
+                target_rate = float(
+                    phase.get("target_logical_actions_per_second") or 0
+                )
+                action_count = int(
+                    phase.get("logical_actions")
+                    or math.ceil(target_rate * duration_seconds)
+                )
+                if duration_seconds <= 0 or target_rate <= 0 or action_count <= 0:
+                    raise ExternalLoadError(
+                        f"phase {phase_name!r} must have a positive duration, rate and action count"
+                    )
+                phase_users = users[cursor : cursor + action_count]
+                if len(phase_users) != action_count:
+                    raise ExternalLoadError(
+                        "phase plan requires more unique fixture users than the manifest provides"
+                    )
+                cursor += action_count
+                phase_started_at_utc = datetime.now(UTC)
+                phase_started = time.monotonic()
+                phase_results_for_users, phase_submission_window = run_rate_phase(
+                    origin,
+                    phase_users,
+                    phase=f"write_external_vote_{phase_name}",
+                    duration_seconds=duration_seconds,
+                    concurrency=concurrency,
+                    timeout=timeout,
+                    request_builder=vote_builder,
+                )
+                offered_window_seconds += phase_submission_window
+                phase_attempts = _flatten_logical_results(phase_results_for_users)
+                phase_wall_seconds = max(0.001, time.monotonic() - phase_started)
+                phase_finished_at_utc = datetime.now(UTC)
+                phase_logical = summarize_logical_results(phase_results_for_users)
+                phase_logical["wall_seconds"] = round(phase_wall_seconds, 3)
+                phase_logical["target_logical_actions_per_second"] = target_rate
+                phase_logical["offered_logical_actions_per_second"] = round(
+                    action_count / phase_submission_window, 3
+                )
+                phase_logical["successful_goodput_actions_per_second"] = round(
+                    float(phase_logical.get("final_successes") or 0)
+                    / phase_wall_seconds,
+                    3,
+                )
+                phase_raw = summarize_results(phase_attempts)
+                phase_raw["attempts_per_second"] = round(
+                    float(phase_raw.get("requests") or 0) / phase_submission_window,
+                    3,
+                )
+                planned_phases[phase_name] = {
+                    "target_logical_actions_per_second": target_rate,
+                    "duration_seconds": duration_seconds,
+                    "started_at": phase_started_at_utc.isoformat(),
+                    "finished_at": phase_finished_at_utc.isoformat(),
+                    "offered_window_seconds": round(phase_submission_window, 3),
+                    "raw_http": phase_raw,
+                    "logical": phase_logical,
+                }
+                primary.extend(phase_results_for_users)
+            primary_users = users[:cursor]
+            phase_results["ramp"] = {
+                "phases": planned_phases,
+                "logical_actions": cursor,
+                "offered_window_seconds": round(offered_window_seconds, 3),
+            }
+        else:
+            primary = run_phase(
+                origin,
+                users,
+                phase="write_external_vote",
+                spread_seconds=spread_seconds,
+                concurrency=concurrency,
+                timeout=timeout,
+                request_builder=vote_builder,
+            )
         primary_attempts = _flatten_logical_results(primary)
         primary_wall_seconds = max(0.001, time.monotonic() - primary_started_at)
         primary_logical = summarize_logical_results(primary)
@@ -626,13 +754,28 @@ def run_load(
             float(primary_logical.get("final_successes") or 0) / primary_wall_seconds,
             3,
         )
+        if phase_plan:
+            primary_logical["offered_logical_actions_per_second"] = round(
+                len(primary) / max(0.001, offered_window_seconds),
+                3,
+            )
         phase_results["primary"] = {
             "raw_http": summarize_results(primary_attempts),
             "logical": primary_logical,
         }
         all_results.extend(primary_attempts)
 
-        duplicate_users = users[:duplicate_count]
+        successful_primary_ids = {
+            result.user_id
+            for result in primary
+            if result.attempts and result.final.ok and result.user_id
+        }
+        duplicate_candidates = (
+            [user for user in primary_users if user.user_id in successful_primary_ids]
+            if scenario_kind in {"stress", "spike"}
+            else primary_users
+        )
+        duplicate_users = duplicate_candidates[:duplicate_count]
         if duplicate_users:
             duplicates = run_phase(
                 origin,
@@ -652,9 +795,17 @@ def run_load(
 
         users_by_slug: dict[str, VirtualUser] = {}
         expected_by_slug: Counter[str] = Counter()
-        for user in users:
+        successful_primary_by_slug: Counter[str] = Counter()
+        for result in primary:
+            if result.attempts and result.final.ok:
+                slug = result.final.path.split("/", 3)[2]
+                successful_primary_by_slug[slug] += 1
+        for user in primary_users:
             users_by_slug.setdefault(user.tournament_slug, user)
-            expected_by_slug[user.tournament_slug] += 1
+            expected_by_slug[user.tournament_slug] = successful_primary_by_slug.get(
+                user.tournament_slug,
+                0,
+            )
         state_results: list[RequestResult] = []
         for slug, user in sorted(users_by_slug.items()):
             result = _request(
@@ -687,10 +838,15 @@ def run_load(
         duplicate_summary = phase_results.get("duplicate", {}).get("logical", {})
         changed_counts = primary_summary.get("changed_counts", {})
         duplicate_changed = duplicate_summary.get("changed_counts", {})
+        strict_primary_contract = scenario_kind not in {"stress", "spike"}
         contract_ok = (
-            primary_summary["actions"] == len(users)
-            and primary_summary["final_failures"] == 0
-            and int(changed_counts.get("True", 0)) == len(users)
+            primary_summary["actions"] == len(primary_users)
+            and (
+                primary_summary["final_failures"] == 0
+                if strict_primary_contract
+                else int(changed_counts.get("True", 0)) == primary_summary["final_successes"]
+            )
+            and int(changed_counts.get("True", 0)) == primary_summary["final_successes"]
             and duplicate_summary.get("final_failures", 0) == 0
             and int(duplicate_changed.get("False", 0)) == len(duplicate_users)
             and phase_results["state"]["errors"] == 0
@@ -796,6 +952,22 @@ def run_load(
         if mode == "ready-vote"
         else overall
     )
+    finished_at = datetime.now(UTC)
+    wall_seconds = max(0.001, (finished_at - started_at).total_seconds())
+    raw_http_summary = (
+        phase_results.get("primary", {}).get("raw_http", overall)
+        if mode == "ready-vote"
+        else overall
+    )
+    raw_http_summary["wall_seconds"] = round(wall_seconds, 3)
+    raw_http_summary["requests_per_second"] = round(
+        float(raw_http_summary.get("requests") or 0) / wall_seconds,
+        3,
+    )
+    raw_http_summary["successful_goodput_actions_per_second"] = round(
+        float(raw_http_summary.get("successful_responses") or 0) / wall_seconds,
+        3,
+    )
     acceptance = evaluate_acceptance(
         contract_ok=contract_ok,
         logical_summary=logical_summary,
@@ -804,13 +976,8 @@ def run_load(
         final_failure_budget_percent=(
             0.5 if failure_budget_percent is None else failure_budget_percent
         ),
-    )
-    finished_at = datetime.now(UTC)
-    wall_seconds = max(0.001, (finished_at - started_at).total_seconds())
-    raw_http_summary = (
-        phase_results.get("primary", {}).get("raw_http", overall)
-        if mode == "ready-vote"
-        else overall
+        raw_http_summary=raw_http_summary,
+        acceptance_contract=acceptance_contract,
     )
     return {
         "schema": 1,
@@ -824,8 +991,15 @@ def run_load(
         "finished_at": finished_at.isoformat(),
         "wall_seconds": round(wall_seconds, 3),
         "opening_spread_seconds": spread_seconds,
+        "scenario_kind": scenario_kind,
         "manual_refresh_count": manual_refresh_count,
         "concurrency": concurrency,
+        "offered_logical_actions_per_second": round(
+            float(logical_summary.get("offered_logical_actions_per_second") or 0)
+            if phase_plan
+            else float(logical_summary.get("actions") or 0) / wall_seconds,
+            3,
+        ) if mode == "ready-vote" else None,
         "trace": trace,
         "phases": phase_results,
         "overall": overall,

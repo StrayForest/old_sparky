@@ -67,6 +67,23 @@ async def async_main() -> int:
     journal_until = finished_at.strftime("%Y-%m-%d %H:%M:%S UTC")
     request_perf_lines = collect_api_journal_lines(journal_since, journal_until)
 
+    system_summary = sampler.summary()
+    system_summary["timeline"] = [
+        {
+            "timestamp": sample.get("timestamp"),
+            "cpu_per_core_percent": sample.get("cpu_per_core_percent"),
+            "postgres_cpu_percent": sample.get("postgres_cpu_percent"),
+            "api_connections": sample.get("api_connections"),
+            "postgres_connections": sample.get("postgres_connections"),
+            "redis_connections": sample.get("redis_connections"),
+            "gunicorn": sample.get("gunicorn"),
+            "postgres_waits": sample.get("postgres_waits"),
+            "celery_backlog": sample.get("celery_backlog"),
+            "api_process": (sample.get("processes") or {}).get("deadlock-api"),
+        }
+        for sample in sampler.samples
+    ]
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": 1,
@@ -74,7 +91,7 @@ async def async_main() -> int:
         "finished_at": finished_at.isoformat(),
         "stop_file_seen": args.stop_file.exists(),
         "timed_out": timed_out,
-        "system": sampler.summary(),
+        "system": system_summary,
         "measurement_scope": {
             "http_client": "external_load_runner_report",
             "server_request_perf_logs": "diagnostic_sample",

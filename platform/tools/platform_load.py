@@ -12,6 +12,7 @@ import argparse
 from collections.abc import Mapping
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -22,7 +23,7 @@ from typing import Any, Sequence
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 PROFILE_ROOT = PLATFORM_ROOT / "performance" / "profiles"
-PROFILE_SCHEMA = 1
+PROFILE_SCHEMA = 2
 PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]+$")
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 ALLOWED_MODES = {"ready-vote", "read-mix"}
@@ -72,6 +73,68 @@ def _require_number(
     return number
 
 
+def _validate_latency_budget(value: Any, *, field: str, percentiles: tuple[str, ...]) -> dict[str, Any]:
+    budget = _require_mapping(value, field=field)
+    previous = -1.0
+    for percentile in percentiles:
+        current = _require_number(
+            budget.get(f"{percentile}_ms"),
+            field=f"{field}.{percentile}_ms",
+            minimum=0,
+        )
+        if current < previous:
+            raise LoadProfileError(f"{field} percentiles must be monotonic")
+        previous = current
+    return dict(budget)
+
+
+def _validate_phase_plan(value: Any, *, total_users: int) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise LoadProfileError("traffic.phases must be a non-empty array")
+    phases: list[dict[str, Any]] = []
+    total_actions = 0
+    names: set[str] = set()
+    for index, raw_phase in enumerate(value, start=1):
+        phase = _require_mapping(raw_phase, field=f"traffic.phases[{index}]")
+        name = phase.get("name")
+        if not isinstance(name, str) or not name.strip() or name in names:
+            raise LoadProfileError(f"traffic.phases[{index}].name is invalid or duplicated")
+        duration = _require_number(
+            phase.get("duration_seconds"),
+            field=f"traffic.phases[{index}].duration_seconds",
+            minimum=1,
+            maximum=3_600,
+        )
+        rate = _require_number(
+            phase.get("target_logical_actions_per_second"),
+            field=f"traffic.phases[{index}].target_logical_actions_per_second",
+            minimum=0.1,
+            maximum=512,
+        )
+        planned_actions = phase.get("logical_actions")
+        if planned_actions is None:
+            planned_actions = int(math.ceil(rate * duration))
+        planned_actions = _require_int(
+            planned_actions,
+            field=f"traffic.phases[{index}].logical_actions",
+            minimum=1,
+            maximum=20_000,
+        )
+        if planned_actions > total_users:
+            raise LoadProfileError("a phase requires more users than the fixture provides")
+        names.add(name)
+        total_actions += planned_actions
+        phases.append({
+            "name": name,
+            "duration_seconds": duration,
+            "target_logical_actions_per_second": rate,
+            "logical_actions": planned_actions,
+        })
+    if total_actions > total_users:
+        raise LoadProfileError("traffic.phases require more unique users than the fixture provides")
+    return phases
+
+
 def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and return a plain profile mapping."""
 
@@ -87,8 +150,9 @@ def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
     mode = payload.get("mode")
     if mode not in ALLOWED_MODES:
         raise LoadProfileError(f"profile mode is unsupported: {mode!r}")
-    if not isinstance(payload.get("description"), str) or not payload["description"].strip():
-        raise LoadProfileError("profile description is required")
+    for field in ("purpose", "description"):
+        if not isinstance(payload.get(field), str) or not payload[field].strip():
+            raise LoadProfileError(f"profile {field} is required")
 
     fixture = _require_mapping(payload.get("fixture"), field="fixture")
     tournament_count = _require_int(
@@ -152,6 +216,14 @@ def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
     workspace_users = sum(index % 10 < 5 for index in range(total_users))
     if manual_refresh_count > workspace_users:
         raise LoadProfileError("profile manual refresh count exceeds the workspace cohort")
+    phase_plan = []
+    if traffic.get("phases") is not None:
+        phase_plan = _validate_phase_plan(traffic.get("phases"), total_users=total_users)
+    if category in {"capacity", "spike"} and not phase_plan:
+        raise LoadProfileError(f"{category} profiles must define traffic.phases")
+    planned_actions = sum(int(phase["logical_actions"]) for phase in phase_plan)
+    if duplicate_count > planned_actions and phase_plan:
+        raise LoadProfileError("traffic.duplicate_count exceeds planned primary actions")
 
     retry = _require_mapping(traffic.get("retry"), field="traffic.retry")
     max_retries = _require_int(retry.get("max_retries"), field="traffic.retry.max_retries", minimum=0, maximum=2)
@@ -173,16 +245,97 @@ def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise LoadProfileError("read-mix profiles cannot define retries")
 
     acceptance = _require_mapping(payload.get("acceptance"), field="acceptance")
-    _require_number(acceptance.get("logical_p95_ms"), field="acceptance.logical_p95_ms", minimum=0)
-    _require_number(acceptance.get("logical_p99_ms"), field="acceptance.logical_p99_ms", minimum=0)
-    _require_number(
-        acceptance.get("logical_final_failure_percent"),
-        field="acceptance.logical_final_failure_percent",
-        minimum=0,
-        maximum=100,
+    expected_kind = {
+        "stress": "stress",
+        "capacity": "capacity",
+        "spike": "spike",
+    }.get(category, "slo")
+    if acceptance.get("kind") != expected_kind:
+        raise LoadProfileError(
+            f"profile acceptance.kind must be {expected_kind!r} for category {category!r}"
+        )
+    acceptance_budget = acceptance
+    if expected_kind == "capacity":
+        acceptance_budget = _require_mapping(acceptance.get("slo"), field="acceptance.slo")
+        capacity = _require_mapping(acceptance.get("capacity"), field="acceptance.capacity")
+        target_rates = capacity.get("target_logical_actions_per_second")
+        if (
+            not isinstance(target_rates, list)
+            or len(target_rates) != len(phase_plan)
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in target_rates)
+        ):
+            raise LoadProfileError("acceptance.capacity target rates must match traffic.phases")
+        _require_number(
+            capacity.get("steady_duration_seconds"),
+            field="acceptance.capacity.steady_duration_seconds",
+            minimum=1,
+            maximum=3_600,
+        )
+    _validate_latency_budget(
+        acceptance_budget.get("accepted_request_latency"),
+        field="acceptance.accepted_request_latency",
+        percentiles=("p50", "p90", "p95", "p99"),
     )
-    if float(acceptance["logical_p99_ms"]) < float(acceptance["logical_p95_ms"]):
-        raise LoadProfileError("p99 budget cannot be below p95 budget")
+    _validate_latency_budget(
+        acceptance_budget.get("logical_latency"),
+        field="acceptance.logical_latency",
+        percentiles=("p95", "p99"),
+    )
+    if expected_kind not in {"stress", "spike"}:
+        _require_number(
+            acceptance_budget.get("logical_final_failure_percent"),
+            field="acceptance.logical_final_failure_percent",
+            minimum=0,
+            maximum=100,
+        )
+    for field in ("max_shed_percent", "max_retry_amplification_percent"):
+        _require_number(acceptance_budget.get(field), field=f"acceptance.{field}", minimum=0, maximum=1000)
+    if expected_kind == "slo" and float(acceptance_budget["logical_final_failure_percent"]) > 0.5:
+        raise LoadProfileError("canonical SLO final-failure budget cannot exceed 0.5 percent")
+    if expected_kind in {"stress", "spike"}:
+        _validate_latency_budget(
+            acceptance.get("accepted_request_latency"),
+            field="acceptance.accepted_request_latency",
+            percentiles=("p50", "p90", "p95", "p99"),
+        )
+        for field in (
+            "max_postgres_connections",
+            "max_waiting_backends",
+            "max_lock_waiters",
+            "max_cpu_per_core_percent",
+        ):
+            _require_number(acceptance.get(field), field=f"acceptance.{field}", minimum=0)
+        pool_budget = _validate_latency_budget(
+            acceptance.get("pool_checkout_wait_ms"),
+            field="acceptance.pool_checkout_wait_ms",
+            percentiles=("p95", "p99"),
+        )
+        if float(pool_budget["p99_ms"]) < float(pool_budget["p95_ms"]):
+            raise LoadProfileError("pool checkout p99 budget cannot be below p95")
+    if "require_origin_evidence" in acceptance and not isinstance(
+        acceptance.get("require_origin_evidence"), bool
+    ):
+        raise LoadProfileError("acceptance.require_origin_evidence must be boolean")
+    resource_safety = acceptance.get("resource_safety")
+    if resource_safety is not None:
+        resource = _require_mapping(resource_safety, field="acceptance.resource_safety")
+        for field in (
+            "max_postgres_connections",
+            "max_waiting_backends",
+            "max_lock_waiters",
+            "max_cpu_per_core_percent",
+        ):
+            _require_number(resource.get(field), field=f"acceptance.resource_safety.{field}", minimum=0)
+        _validate_latency_budget(
+            resource.get("pool_checkout_wait_ms"),
+            field="acceptance.resource_safety.pool_checkout_wait_ms",
+            percentiles=("p95", "p99"),
+        )
+    if expected_kind == "spike":
+        recovery = _require_mapping(acceptance.get("recovery"), field="acceptance.recovery")
+        for field in ("burst_phase", "recovery_phase"):
+            if not isinstance(recovery.get(field), str) or not recovery[field].strip():
+                raise LoadProfileError(f"acceptance.recovery.{field} is required")
     statuses = acceptance.get("expected_statuses")
     if (
         not isinstance(statuses, list)
@@ -264,6 +417,8 @@ def profile_contract(profile: Mapping[str, Any]) -> dict[str, Any]:
         "profile_digest": profile_digest(profile),
         "category": profile["category"],
         "mode": profile["mode"],
+        "purpose": profile["purpose"],
+        "description": profile["description"],
         "fixture": {
             "tournament_count": fixture["tournament_count"],
             "users_per_tournament": fixture["users_per_tournament"],
@@ -277,14 +432,13 @@ def profile_contract(profile: Mapping[str, Any]) -> dict[str, Any]:
             "duplicate_count": traffic["duplicate_count"],
             "manual_refresh_count": traffic["manual_refresh_count"],
             "retry": traffic["retry"],
+            "phases": traffic.get("phases", []),
+            "planned_logical_actions": sum(
+                int(phase["logical_actions"])
+                for phase in traffic.get("phases", [])
+            ),
         },
-        "acceptance": {
-            "logical_p95_ms": acceptance["logical_p95_ms"],
-            "logical_p99_ms": acceptance["logical_p99_ms"],
-            "logical_final_failure_percent": acceptance["logical_final_failure_percent"],
-            "expected_statuses": acceptance["expected_statuses"],
-            "unexpected_statuses": acceptance["unexpected_statuses"],
-        },
+        "acceptance": acceptance,
         "correctness": profile["correctness"],
         "execution": profile["execution"],
     }
@@ -353,10 +507,21 @@ def run_profile(profile: Mapping[str, Any], manifest_path: Path, report_path: Pa
         timeout=float(traffic["timeout_seconds"]),
         duplicate_count=int(traffic["duplicate_count"]),
         manual_refresh_count=int(traffic["manual_refresh_count"]),
-        p95_budget_ms=float(acceptance["logical_p95_ms"]),
-        p99_budget_ms=float(acceptance["logical_p99_ms"]),
-        failure_budget_percent=float(acceptance["logical_final_failure_percent"]),
+        p95_budget_ms=float(
+            (acceptance.get("logical_latency") or acceptance.get("slo", {}).get("logical_latency"))["p95_ms"]
+        ),
+        p99_budget_ms=float(
+            (acceptance.get("logical_latency") or acceptance.get("slo", {}).get("logical_latency"))["p99_ms"]
+        ),
+        failure_budget_percent=(
+            float(acceptance["logical_final_failure_percent"])
+            if "logical_final_failure_percent" in acceptance
+            else None
+        ),
         retry_policy=traffic["retry"],
+        phase_plan=traffic.get("phases") or None,
+        scenario_kind=str(acceptance.get("kind") or "slo"),
+        acceptance_contract=acceptance,
     )
     report["source_git_sha"] = _source_git_sha()
     report["load_contract"] = contract
@@ -398,7 +563,75 @@ def run_profile(profile: Mapping[str, Any], manifest_path: Path, report_path: Pa
             ensure_ascii=False,
         )
     )
-    return 0 if report.get("acceptance", {}).get("passed") is True else 1
+    acceptance_result = report.get("acceptance", {})
+    return 0 if (
+        acceptance_result.get("passed") is True
+        or acceptance_result.get("pending_origin_evidence") is True
+    ) else 1
+
+
+def evaluate_report(
+    profile: Mapping[str, Any],
+    report_path: Path,
+    server_observability_path: Path | None,
+) -> int:
+    """Attach origin evidence and make the final profile-owned decision."""
+
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise LoadProfileError("external load report is not valid JSON") from exc
+    if not isinstance(report, dict):
+        raise LoadProfileError("external load report must be an object")
+    origin_observability: dict[str, Any] | None = None
+    if server_observability_path is not None:
+        try:
+            candidate = json.loads(server_observability_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise LoadProfileError("origin observability report is not valid JSON") from exc
+        if not isinstance(candidate, dict):
+            raise LoadProfileError("origin observability report must be an object")
+        origin_observability = candidate
+        report["origin_observability"] = {
+            "schema": candidate.get("schema"),
+            "started_at": candidate.get("started_at"),
+            "finished_at": candidate.get("finished_at"),
+            "stop_file_seen": candidate.get("stop_file_seen"),
+            "timed_out": candidate.get("timed_out"),
+            "system": candidate.get("system"),
+            "server_request_perf_logs": candidate.get("server_request_perf_logs"),
+        }
+    try:
+        from tools.platform_load_acceptance import evaluate_acceptance
+    except ModuleNotFoundError:  # Direct execution from platform/tools.
+        from platform_load_acceptance import evaluate_acceptance
+    acceptance = profile["acceptance"]
+    report["acceptance"] = evaluate_acceptance(
+        contract_ok=bool(
+            (report.get("acceptance") or {}).get("contract_ok", False)
+            or (report.get("contract") or {}).get("ok", False)
+        ),
+        logical_summary=report.get("logical") or report.get("overall") or {},
+        raw_http_summary=report.get("raw_http") or report.get("overall") or {},
+        acceptance_contract=acceptance,
+        origin_observability=origin_observability,
+        phase_summaries=(
+            ((report.get("phases") or {}).get("ramp") or {}).get("phases")
+            if isinstance(report.get("phases"), dict)
+            else None
+        ),
+    )
+    report_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    result = report["acceptance"]
+    print(json.dumps({
+        "profile_id": profile["profile_id"],
+        "decision": result.get("decision"),
+        "passed": result.get("passed", False),
+    }, ensure_ascii=False))
+    return 0 if result.get("passed") is True else 1
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -422,6 +655,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument("--profile", dest="profile_id", required=True)
     run_parser.add_argument("--manifest", type=Path, required=True)
     run_parser.add_argument("--report-path", type=Path, required=True)
+
+    evaluate_parser = subparsers.add_parser("evaluate")
+    evaluate_parser.add_argument("--profile", dest="profile_id", required=True)
+    evaluate_parser.add_argument("--report", type=Path, required=True)
+    evaluate_parser.add_argument("--server-observability", type=Path)
     return parser.parse_args(argv)
 
 
@@ -462,6 +700,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         for key, value in _env_values(profile).items():
             print(f"{key}={value}")
         return 0
+    if args.command == "evaluate":
+        return evaluate_report(profile, args.report, args.server_observability)
     return run_profile(profile, args.manifest, args.report_path)
 
 

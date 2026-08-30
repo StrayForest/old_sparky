@@ -220,17 +220,17 @@ gh workflow run platform-production-external-load.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
   -f control_email=<existing-production-account-email> \
-  -f profile_id=ready-vote-human-v1
+  -f profile_id=ready-vote-slo-v2
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The selected versioned profile owns the spread, fixture shape, retry behavior
-and acceptance budgets. Record raw HTTP attempts (including 200,
+The selected versioned profile owns the spread, fixture shape, retry behavior,
+phase/rate plan and acceptance budgets. Record raw HTTP attempts (including 200,
 `READY_VOTE_OVERLOADED`, other status and timeout counts) separately from
-logical actions (final success/failure, retries per action, first-attempt-to-
-success latency and successful goodput). Also record accepted-request
-latency, response-contract checks, API CPU/RSS, Redis, PostgreSQL connections
-and pool waits, Nginx sockets, and cleanup verification.
+logical actions (final success/failure, retries per action, first-attempt-to-success latency and successful goodput). Also record accepted-request
+p50/p90/p95/p99, logical p50/p90/p95/p99, response-contract checks, API
+CPU/RSS, Redis, PostgreSQL connections, pool waits, Nginx sockets and cleanup
+verification.
 If the workflow is canceled, perform the exact retained-load abort/cleanup
 procedure with the same run ID before another load. The temporary manifest
 must not be copied to Actions artifacts.
@@ -327,9 +327,10 @@ the canonical acceptance contract. The test creates marked eligible
 participants, uses the real Ready Check vote endpoint after its server-known
 window, and reports raw attempts and logical action latency, accepted/rejected
 votes, retries, shedding, database pool wait, admission wait, lock pressure,
-API/PostgreSQL CPU and connections, and duplicate/idempotency behavior. Run a
-human-shaped profile first, then a separate aggressive profile; clean the exact
-run before another production load. Static limit sweeps must keep the same
+API/PostgreSQL CPU and connections, and duplicate/idempotency behavior. Run
+`ready-vote-slo-v2` for supported traffic, then use the separate capacity,
+stress or spike profile required by the question; clean the exact run before
+another production load. Static limit sweeps must keep the same
 2-vCPU/2-worker/pool envelope and record the operator-selected admission
 limits before selecting an adaptive operating region; do not modify the
 canonical profile to make a candidate pass.
@@ -338,9 +339,16 @@ The reviewed deploy workflow exposes those five points as
 `ready-vote-static-12` and `ready-vote-static-16`. Each profile changes only
 the three Ready Vote admission limits and restarts the API after a health
 check; it does not change workers, CPU, PostgreSQL, Redis, pool size or load
-shape. Run the 15k candidate sweep first, restore `baseline` after every
-candidate, and use the same external-load confirmation/cleanup gate. Run the
-20k verification only for the Pareto candidates that remain viable.
+shape. The capacity profile ramps 20, 30, 40, 50, 60, 70 and 80 logical
+actions/s with 30-second steady phases and reports SLO capacity separately
+from maximum stable goodput. CPU alone is not a knee. The 15k candidate is
+`ready-vote-stress-15k-v2`: it is a safety/behavior test, not a final-failure
+SLO, and may conclude `STRESS BEHAVIOR PASS` while the capacity target remains
+unmet. The optional 20k profile is not run unless a specific unresolved
+question requires it. `ready-vote-spike-v1` uses normal → burst → normal
+phases and records pressure entry, peak latency/shedding/goodput, retry
+amplification and recovery. Restore `baseline` after every static candidate
+and use the same external-load confirmation/cleanup gate.
 The browser timer itself must produce zero Ready Check requests before
 `starts_at`, at `starts_at`, and at `ends_at`.
 

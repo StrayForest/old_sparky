@@ -1,8 +1,9 @@
 {
-  "schema": 1,
-  "profile_id": "read-mix-human-v1",
-  "profile_version": 1,
+  "schema": 2,
+  "profile_id": "read-mix-human-v2",
+  "profile_version": 2,
   "category": "load",
+  "purpose": "Measure the supported normal authenticated read experience.",
   "description": "Human-shaped authenticated read mix with no background refresh traffic.",
   "mode": "read-mix",
   "fixture": {
@@ -26,9 +27,12 @@
     }
   },
   "acceptance": {
-    "logical_p95_ms": 600,
-    "logical_p99_ms": 1000,
+    "kind": "slo",
+    "accepted_request_latency": {"p50_ms": 250, "p90_ms": 400, "p95_ms": 600, "p99_ms": 1000},
+    "logical_latency": {"p95_ms": 600, "p99_ms": 1000},
     "logical_final_failure_percent": 0,
+    "max_shed_percent": 0,
+    "max_retry_amplification_percent": 0,
     "expected_statuses": [
       200,
       304

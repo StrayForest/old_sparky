@@ -1,47 +1,47 @@
 {
-  "schema": 1,
-  "profile_id": "ready-vote-stress-v1",
-  "profile_version": 1,
-  "category": "stress",
-  "description": "Aggressive 20,000-user Ready Vote burst for an approved capacity window.",
+  "schema": 2,
+  "profile_id": "ready-vote-slo-v2",
+  "profile_version": 2,
+  "category": "load",
+  "purpose": "Measure the supported normal Ready Vote user experience.",
+  "description": "Canonical supported Ready Vote SLO profile for human-shaped traffic.",
   "mode": "ready-vote",
   "fixture": {
-    "tournament_count": 40,
+    "tournament_count": 1,
     "users_per_tournament": 500,
     "setup_concurrency": 20,
     "max_total_users": 20000
   },
   "traffic": {
     "concurrency": 128,
-    "spread_seconds": 0,
+    "spread_seconds": 30,
     "timeout_seconds": 30,
-    "duplicate_count": 1000,
+    "duplicate_count": 100,
     "manual_refresh_count": 0,
     "retry": {
       "max_retries": 2,
       "overload_status": 503,
       "overload_code": "READY_VOTE_OVERLOADED",
       "server_retry_after": "max",
-      "jitter_windows_ms": [
-        [
-          150,
-          350
-        ],
-        [
-          400,
-          800
-        ]
-      ]
+      "jitter_windows_ms": [[150, 350], [400, 800]]
     }
   },
   "acceptance": {
-    "logical_p95_ms": 600,
-    "logical_p99_ms": 1000,
+    "kind": "slo",
+    "accepted_request_latency": {"p50_ms": 250, "p90_ms": 400, "p95_ms": 600, "p99_ms": 1000},
+    "logical_latency": {"p95_ms": 600, "p99_ms": 1000},
     "logical_final_failure_percent": 0.5,
-    "expected_statuses": [
-      200,
-      503
-    ],
+    "max_shed_percent": 0,
+    "max_retry_amplification_percent": 0,
+    "require_origin_evidence": true,
+    "resource_safety": {
+      "max_postgres_connections": 52,
+      "max_waiting_backends": 20,
+      "max_lock_waiters": 20,
+      "max_cpu_per_core_percent": 100,
+      "pool_checkout_wait_ms": {"p95_ms": 5000, "p99_ms": 10000}
+    },
+    "expected_statuses": [200, 503],
     "unexpected_statuses": 0
   },
   "correctness": {

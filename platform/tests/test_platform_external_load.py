@@ -341,6 +341,99 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(refresh_call["expected_statuses"], frozenset({200, 304}))
         self.assertEqual(refresh_call["extra_headers"], {"If-None-Match": '"workspace-etag"'})
 
+    def test_ready_vote_rate_plan_reports_offered_rate_per_phase(self) -> None:
+        payload = manifest_payload()
+        _, users = load_manifest_from_payload(payload)
+
+        def fake_trace(origin: str, timeout: float) -> dict[str, str]:
+            return {"status": "200", "ip": "192.0.2.10", "colo": "TEST"}
+
+        def fake_action(
+            origin: str,
+            user: VirtualUser,
+            phase: str,
+            timeout: float,
+            *,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+            retry_policy: dict[str, object] | None = None,
+        ) -> LogicalRequestResult:
+            result = RequestResult(
+                phase=phase,
+                method="POST",
+                path=f"/tournaments/{user.tournament_slug}/deadlock/ready-check/vote",
+                status=200,
+                elapsed_ms=10.0,
+                ok=True,
+                response_bytes=120,
+                response_json={"changed": True},
+            )
+            return LogicalRequestResult([result], elapsed_ms=10.0, user_id=user.user_id)
+
+        def fake_state_request(
+            origin: str,
+            user: VirtualUser,
+            *,
+            method: str,
+            path: str,
+            phase: str,
+            timeout: float,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+            json_payload: dict[str, object] | None = None,
+            expected_statuses: frozenset[int] = frozenset({200}),
+            extra_headers: dict[str, str] | None = None,
+        ) -> RequestResult:
+            return RequestResult(
+                phase=phase,
+                method=method,
+                path=path,
+                status=200,
+                elapsed_ms=8.0,
+                ok=True,
+                response_bytes=150,
+                response_json={"active_round": {"ready_count": 2}},
+            )
+
+        with (
+            patch("tools.platform_external_load._trace", side_effect=fake_trace),
+            patch("tools.platform_external_load._ready_vote_action", side_effect=fake_action),
+            patch("tools.platform_external_load._request", side_effect=fake_state_request),
+        ):
+            report = run_load(
+                payload,
+                users,
+                mode="ready-vote",
+                spread_seconds=0,
+                concurrency=1,
+                timeout=1,
+                duplicate_count=0,
+                manual_refresh_count=0,
+                p95_budget_ms=600,
+                p99_budget_ms=1000,
+                phase_plan=[
+                    {"name": "rate-1", "target_logical_actions_per_second": 1, "duration_seconds": 1, "logical_actions": 1},
+                    {"name": "rate-1b", "target_logical_actions_per_second": 1, "duration_seconds": 1, "logical_actions": 1},
+                ],
+                scenario_kind="capacity",
+                acceptance_contract={
+                    "kind": "capacity",
+                    "slo": {
+                        "accepted_request_latency": {"p50_ms": 250, "p90_ms": 400, "p95_ms": 600, "p99_ms": 1000},
+                        "logical_latency": {"p95_ms": 600, "p99_ms": 1000},
+                        "logical_final_failure_percent": 0.5,
+                        "max_shed_percent": 0,
+                        "max_retry_amplification_percent": 0,
+                    },
+                    "capacity": {"target_logical_actions_per_second": [1, 1], "steady_duration_seconds": 1},
+                },
+            )
+
+        phases = report["phases"]["ramp"]["phases"]
+        self.assertEqual(set(phases), {"rate-1", "rate-1b"})
+        self.assertEqual(phases["rate-1"]["logical"]["target_logical_actions_per_second"], 1)
+        self.assertGreater(phases["rate-1"]["raw_http"]["attempts_per_second"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

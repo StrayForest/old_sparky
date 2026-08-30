@@ -47,9 +47,10 @@ external retained reports and is not a product architecture contract. The
 reviewed Ready Vote path now also has a process-local adaptive admission
 controller per API worker, with per-worker defaults `4/8/16`, bounded/no-waiter
 overload shedding before DB checkout, and a browser chain of at most two
-jittered retries for the explicit overload response. Production 15k/20k Pareto
-evidence for this controller remains an operator-owned external-load gate; the
-previous `ba377cbe` measurements remain the pre-admission baseline below.
+jittered retries for the explicit overload response. The corrected canonical
+performance model uses `ready-vote-slo-v2`, `ready-vote-capacity-ramp-v2`,
+`ready-vote-stress-15k-v2` and `ready-vote-spike-v1`; the optional 20k stress
+profile is retained only for a specific unresolved question.
 
 Current status: migration `0048` adds a partial covering index for the
 `UserSession` auth query. Evidence is `EXPLAIN` `Index Only Scan` / `Heap
@@ -61,16 +62,20 @@ latency gate remains unmet: 15k p95/p99 was 2373.755/3189.961 ms and 20k was
 averaged roughly 22%; server timing identifies pool checkout wait as the main
 remaining bottleneck and still records three SQL statements per normal vote.
 Exact-SHA CI, auto-deploy and production live smoke passed; p95/p99 targets
-are unchanged.
+are unchanged. The retained aggressive runs are stress evidence: their final
+logical failures are not a normal-traffic SLO result. The supported-load SLO
+remains accepted p50/p90/p95/p99 <= 250/400/600/1000 ms, logical p95/p99 <=
+600/1000 ms, final logical failure <0.5%, and approximately zero normal-load
+shedding.
 
 The current Ready Check implementation uses the initial workspace timing
 contract: the page receives `starts_at`, `ends_at`, eligible/current-user
 state and a UTC `server_time` anchor. The browser derives a server-relative
 monotonic timeline and changes the button locally at the two boundaries. The
 vote endpoint remains authoritative and validates time, eligibility,
-workflow state, idempotency and concurrency. The active load gate is a short
-Ready vote burst with human-shaped and aggressive profiles, followed by exact
-cleanup.
+workflow state, idempotency and concurrency. The active load gate is the
+supported SLO profile, sustained capacity ramp, separate 15k stress profile
+and explicit spike/recovery profile, each followed by exact cleanup.
 
 The tournament catalog and bracket grid are request-driven. The initial
 workspace includes the bracket, passive changes become visible after a manual

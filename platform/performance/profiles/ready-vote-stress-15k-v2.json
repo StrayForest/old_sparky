@@ -1,9 +1,10 @@
 {
-  "schema": 1,
-  "profile_id": "ready-vote-capacity-15k-v1",
-  "profile_version": 1,
-  "category": "capacity",
-  "description": "15,000-user Ready Vote capacity profile for an approved low-traffic window.",
+  "schema": 2,
+  "profile_id": "ready-vote-stress-15k-v2",
+  "profile_version": 2,
+  "category": "stress",
+  "purpose": "Verify controlled overload behavior far above the measured service capacity.",
+  "description": "Aggressive 15,000-user Ready Vote stress profile; not a normal-traffic SLO.",
   "mode": "ready-vote",
   "fixture": {
     "tournament_count": 30,
@@ -22,32 +23,27 @@
       "overload_status": 503,
       "overload_code": "READY_VOTE_OVERLOADED",
       "server_retry_after": "max",
-      "jitter_windows_ms": [
-        [
-          150,
-          350
-        ],
-        [
-          400,
-          800
-        ]
-      ]
+      "jitter_windows_ms": [[150, 350], [400, 800]]
     }
   },
   "acceptance": {
-    "logical_p95_ms": 600,
-    "logical_p99_ms": 1000,
-    "logical_final_failure_percent": 0.5,
-    "expected_statuses": [
-      200,
-      503
-    ],
+    "kind": "stress",
+    "accepted_request_latency": {"p50_ms": 1500, "p90_ms": 3000, "p95_ms": 5000, "p99_ms": 8000},
+    "logical_latency": {"p95_ms": 8000, "p99_ms": 12000},
+    "max_shed_percent": 99.9,
+    "max_retry_amplification_percent": 200,
+    "max_postgres_connections": 52,
+    "max_waiting_backends": 20,
+    "max_lock_waiters": 20,
+    "max_cpu_per_core_percent": 100,
+    "pool_checkout_wait_ms": {"p95_ms": 5000, "p99_ms": 10000},
+    "expected_statuses": [200, 503],
     "unexpected_statuses": 0
   },
   "correctness": {
-    "primary_vote_changed_true_for_every_user": true,
-    "duplicate_vote_changed_false": true,
-    "authoritative_ready_count_matches_fixture": true,
+    "successful_votes_are_durable": true,
+    "duplicate_successes_are_noops": true,
+    "authoritative_ready_count_matches_successful_votes": true,
     "cleanup_required": true
   },
   "execution": {

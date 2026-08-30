@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "profile_id": "ready-vote-stress-v1",
+  "profile_version": 1,
+  "category": "stress",
+  "description": "Historical 20,000-user instantaneous Ready Vote contract retained for report comparability.",
+  "mode": "ready-vote",
+  "fixture": {"tournament_count": 40, "users_per_tournament": 500, "setup_concurrency": 20, "max_total_users": 20000},
+  "traffic": {"concurrency": 128, "spread_seconds": 0, "timeout_seconds": 30, "duplicate_count": 1000, "manual_refresh_count": 0, "retry": {"max_retries": 2, "overload_status": 503, "overload_code": "READY_VOTE_OVERLOADED", "server_retry_after": "max", "jitter_windows_ms": [[150, 350], [400, 800]]}},
+  "acceptance": {"logical_p95_ms": 600, "logical_p99_ms": 1000, "logical_final_failure_percent": 0.5, "expected_statuses": [200, 503], "unexpected_statuses": 0},
+  "correctness": {"primary_vote_changed_true_for_every_user": true, "duplicate_vote_changed_false": true, "authoritative_ready_count_matches_fixture": true, "cleanup_required": true},
+  "execution": {"generator": "GitHub-hosted external runner", "measured_origin": "https://old-sparky.com", "origin_role": "fixture preparation, lightweight observer and exact cleanup only", "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD", "cleanup_workflow": "platform-production-retained-load-cleanup.yml", "abort_workflow": "platform-production-retained-load-abort.yml"}
+}

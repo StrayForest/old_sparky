@@ -56,19 +56,38 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertEqual(
             set(profiles),
             {
-                "ready-vote-human-v1",
-                "ready-vote-capacity-15k-v1",
-                "ready-vote-stress-v1",
-                "read-mix-human-v1",
-                "read-mix-stress-v1",
+                "ready-vote-slo-v2",
+                "ready-vote-capacity-ramp-v2",
+                "ready-vote-stress-15k-v2",
+                "ready-vote-stress-20k-v2",
+                "ready-vote-spike-v1",
+                "read-mix-human-v2",
+                "read-mix-stress-v2",
             },
         )
-        profile = get_profile("ready-vote-human-v1")
+        profile = get_profile("ready-vote-slo-v2")
         self.assertEqual(profile_digest(profile), profile_digest(profile))
         self.assertEqual(profile["execution"]["generator"], "GitHub-hosted external runner")
+        self.assertEqual(profile["acceptance"]["kind"], "slo")
+        self.assertEqual(
+            profile["acceptance"]["accepted_request_latency"],
+            {"p50_ms": 250, "p90_ms": 400, "p95_ms": 600, "p99_ms": 1000},
+        )
+
+    def test_stress_and_capacity_profiles_have_distinct_semantics(self) -> None:
+        stress = get_profile("ready-vote-stress-15k-v2")
+        capacity = get_profile("ready-vote-capacity-ramp-v2")
+        self.assertEqual(stress["acceptance"]["kind"], "stress")
+        self.assertNotIn("logical_final_failure_percent", stress["acceptance"])
+        self.assertEqual(capacity["acceptance"]["kind"], "capacity")
+        self.assertEqual(len(capacity["traffic"]["phases"]), 7)
+        self.assertEqual(
+            capacity["acceptance"]["capacity"]["target_logical_actions_per_second"],
+            [20, 30, 40, 50, 60, 70, 80],
+        )
 
     def test_load_profile_rejects_missing_cleanup_contract(self) -> None:
-        profile = get_profile("ready-vote-human-v1")
+        profile = get_profile("ready-vote-slo-v2")
         invalid = dict(profile)
         invalid["correctness"] = dict(profile["correctness"])
         invalid["correctness"]["cleanup_required"] = False
@@ -76,7 +95,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             validate_profile(invalid)
 
     def test_profile_dispatcher_records_contract_and_source_sha(self) -> None:
-        profile = get_profile("ready-vote-human-v1")
+        profile = get_profile("ready-vote-slo-v2")
         fake_report = {
             "schema": 1,
             "mode": "ready-vote",
@@ -107,7 +126,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 )
             report = json.loads(report_path.read_text(encoding="utf-8"))
         self.assertEqual(report["source_git_sha"], "a" * 40)
-        self.assertEqual(report["load_contract"]["profile_id"], "ready-vote-human-v1")
+        self.assertEqual(report["load_contract"]["profile_id"], "ready-vote-slo-v2")
         self.assertEqual(report["load_contract"]["http_attempts"], 2)
 
 

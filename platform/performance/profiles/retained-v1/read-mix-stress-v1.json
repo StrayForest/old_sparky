@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "profile_id": "read-mix-stress-v1",
+  "profile_version": 1,
+  "category": "stress",
+  "description": "Historical aggressive authenticated read mix retained for report comparability.",
+  "mode": "read-mix",
+  "fixture": {"tournament_count": 40, "users_per_tournament": 500, "setup_concurrency": 20, "max_total_users": 20000},
+  "traffic": {"concurrency": 128, "spread_seconds": 0, "timeout_seconds": 30, "duplicate_count": 0, "manual_refresh_count": 10000, "retry": {"max_retries": 0, "overload_status": null, "overload_code": null, "server_retry_after": null, "jitter_windows_ms": []}},
+  "acceptance": {"logical_p95_ms": 600, "logical_p99_ms": 1000, "logical_final_failure_percent": 0, "expected_statuses": [200, 304], "unexpected_statuses": 0},
+  "correctness": {"authenticated_route_mix_matches_profile": true, "manual_refresh_uses_conditional_etag": true, "no_background_refresh": true, "cleanup_required": true},
+  "execution": {"generator": "GitHub-hosted external runner", "measured_origin": "https://old-sparky.com", "origin_role": "fixture preparation, lightweight observer and exact cleanup only", "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD", "cleanup_workflow": "platform-production-retained-load-cleanup.yml", "abort_workflow": "platform-production-retained-load-abort.yml"}
+}

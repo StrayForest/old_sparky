@@ -15,14 +15,16 @@ on:
       profile_id:
         description: "Reviewed canonical load profile ID"
         required: true
-        default: "ready-vote-human-v1"
+        default: "ready-vote-slo-v2"
         type: choice
         options:
-          - ready-vote-human-v1
-          - ready-vote-capacity-15k-v1
-          - ready-vote-stress-v1
-          - read-mix-human-v1
-          - read-mix-stress-v1
+          - ready-vote-slo-v2
+          - ready-vote-capacity-ramp-v2
+          - ready-vote-stress-15k-v2
+          - ready-vote-stress-20k-v2
+          - ready-vote-spike-v1
+          - read-mix-human-v2
+          - read-mix-stress-v2
 
 permissions:
   contents: read
@@ -195,6 +197,15 @@ jobs:
               :
             fi
           done
+          if [[ -s "$client_report" && -s "$artifact_dir/server-observability.log" ]]; then
+            set +e
+            python3 platform/tools/platform_load.py evaluate \
+              --profile "$PROFILE_ID" \
+              --report "$client_report" \
+              --server-observability "$artifact_dir/server-observability.log"
+            load_status="$?"
+            set -e
+          fi
           echo "remote_status=$remote_status" >> "$GITHUB_OUTPUT"
           echo "load_status=$load_status" >> "$GITHUB_OUTPUT"
           echo "manifest_ready=$manifest_ready" >> "$GITHUB_OUTPUT"
@@ -312,8 +323,10 @@ jobs:
                   print(f"- Logical actions: {logical.get('actions')}; final success/failure: {logical.get('final_successes')} / {logical.get('final_failures')}; retries/action: {logical.get('retries_per_action')}")
                   print(f"- Logical E2E p50/p95/p99: {logical_latency.get('p50_ms')} / {logical_latency.get('p95_ms')} / {logical_latency.get('p99_ms')} ms")
                   accepted = logical.get('accepted_request_latency') or {}
-                  print(f"- Accepted request p50/p95/p99: {accepted.get('p50_ms')} / {accepted.get('p95_ms')} / {accepted.get('p99_ms')} ms; goodput: {logical.get('successful_goodput_actions_per_second')} actions/s")
-              print(f"- Contract: **{'passed' if acceptance.get('contract_ok') else 'failed'}**; latency gate: **{'passed' if acceptance.get('passed') else 'failed'}**")
+                  print(f"- Accepted request p50/p90/p95/p99: {accepted.get('p50_ms')} / {accepted.get('p90_ms')} / {accepted.get('p95_ms')} / {accepted.get('p99_ms')} ms; goodput: {logical.get('successful_goodput_actions_per_second')} actions/s")
+              print(f"- Decision: **{acceptance.get('decision')}**; contract: **{'passed' if acceptance.get('contract_ok') else 'failed'}**")
+              if acceptance.get('slo_capacity_logical_actions_per_second') is not None:
+                  print(f"- SLO capacity: {acceptance.get('slo_capacity_logical_actions_per_second')} logical actions/s; max stable goodput: {acceptance.get('max_stable_goodput_actions_per_second')} actions/s")
           PY
 
       - name: Enforce external load and cleanup gates
