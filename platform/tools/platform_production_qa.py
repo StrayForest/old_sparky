@@ -81,10 +81,10 @@ NUMERIC_PATH_RE = re.compile(r"/\d+(?=/|$)")
 REQUEST_PERF_RE = re.compile(r"\brequest_perf\b(?P<body>.*)$")
 READY_VOTE_PERF_KEYS = (
     "ready_vote_auth_ms",
-    "ready_vote_db_checkout_ms",
+    "ready_vote_checkout_count",
+    "ready_vote_checkout_ms",
     "ready_vote_preflight_ms",
     "ready_vote_upsert_ms",
-    "ready_vote_counter_ms",
     "ready_vote_commit_ms",
     "ready_vote_response_ms",
 )
@@ -405,6 +405,7 @@ class HttpMetricsRecorder:
         )
         if not samples:
             return {
+                "scope": "full_population",
                 "requests": 0,
                 "requests_per_second": 0,
                 "errors": 0,
@@ -440,6 +441,7 @@ class HttpMetricsRecorder:
             )
         }
         return {
+            "scope": "full_population",
             "requests": len(samples),
             "requests_per_second": round(len(samples) / wall_seconds, 3),
             "wall_seconds": round(wall_seconds, 3),
@@ -1296,7 +1298,12 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
         "compute_blocks": int,
         "response_bytes": int,
         "pool_wait_ms": float,
-        **{key: float for key in READY_VOTE_PERF_KEYS},
+        "ready_vote_checkout_count": int,
+        **{
+            key: float
+            for key in READY_VOTE_PERF_KEYS
+            if key != "ready_vote_checkout_count"
+        },
     }
     for key, caster in numeric_keys.items():
         if key not in values:
@@ -1312,13 +1319,22 @@ def summarize_request_perf_logs(
     tournament_slug: str | None,
     tournament_slugs: list[str] | tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    # ``request_perf`` is intentionally a bounded diagnostic stream: fast
+    # successful Ready Vote requests are normally suppressed by the API
+    # logger. Keep this scope in the parser output so it cannot be mistaken
+    # for the full-population HTTP client measurements.
+    diagnostic_scope = {
+        "kind": "diagnostic_sample",
+        "population": "journal_lines_selected_by_request_perf_logging_policy",
+        "full_population_source": "http_client",
+    }
     rows = [
         row
         for row in (parse_request_perf_line(line) for line in lines)
         if row is not None
     ]
     if not rows:
-        return {"logged_requests": 0}
+        return {"logged_requests": 0, "scope": diagnostic_scope}
     by_route: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_method_route: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_qa_phase: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1406,6 +1422,7 @@ def summarize_request_perf_logs(
 
     return {
         "logged_requests": len(rows),
+        "scope": diagnostic_scope,
         "overall": metric_stats(totals),
         "avg_sql_queries_per_request": round(sum(sql_counts) / len(sql_counts), 3) if sql_counts else None,
         "avg_db_time_ms": round(sum(sql_times) / len(sql_times), 3) if sql_times else None,
@@ -1440,6 +1457,32 @@ def summarize_request_perf_logs(
             for phase, row_values in sorted(by_qa_phase.items())
         },
     }
+
+
+def _attach_server_diagnostic_sample(
+    write_burst_report: dict[str, Any],
+    server_by_phase: Any,
+) -> None:
+    """Attach sampled request_perf data with an explicit nested scope."""
+
+    if not isinstance(server_by_phase, dict):
+        return
+    # The HTTP client summary is the complete QA population; request_perf is
+    # a deliberately sampled journal stream and must not look like a second
+    # full set of measurements when consumed in isolation.
+    write_burst_report["server_by_phase"] = {
+        "scope": "diagnostic_sample",
+        "by_phase": server_by_phase,
+    }
+    for profile in write_burst_report.get("profiles") or []:
+        if not isinstance(profile, dict):
+            continue
+        phase = str(profile.get("phase") or "")
+        profile["server"] = {
+            "scope": "diagnostic_sample",
+            "phase": phase,
+            "summary": server_by_phase.get(phase),
+        }
 
 
 def top_metric_rows(
@@ -1895,18 +1938,23 @@ class ProductionQa:
         )
         write_burst_report = self.report.get("write_burst")
         if self.mode == "write-burst" and isinstance(write_burst_report, dict):
-            server_by_phase = server_request_summary.get("by_qa_phase", {})
-            if isinstance(server_by_phase, dict):
-                write_burst_report["server_by_phase"] = server_by_phase
-                for profile in write_burst_report.get("profiles") or []:
-                    if not isinstance(profile, dict):
-                        continue
-                    phase = str(profile.get("phase") or "")
-                    profile["server"] = server_by_phase.get(phase)
+            _attach_server_diagnostic_sample(
+                write_burst_report,
+                server_request_summary.get("by_qa_phase", {}),
+            )
         self.report["performance"] = {
             "http_client": http_summary,
             "system": system_summary,
             "server_request_perf_logs": server_request_summary,
+            "measurement_scope": {
+                "http_client": "full_population",
+                "server_request_perf_logs": "diagnostic_sample",
+                "note": (
+                    "http_client covers every request issued by the QA phase; "
+                    "request_perf contains only journal lines selected by the "
+                    "API diagnostic logging policy."
+                ),
+            },
             "bottleneck_summary": summarize_bottleneck_evidence(
                 http_summary=http_summary,
                 server_summary=server_request_summary,
@@ -5321,6 +5369,7 @@ def summarize_team_preferences(team: dict[str, Any]) -> dict[str, Any]:
 def cli_report_summary(report: dict[str, Any]) -> dict[str, Any]:
     scenarios = list(report.get("scenarios") or [])
     write_burst = report.get("write_burst") if isinstance(report.get("write_burst"), dict) else {}
+    performance = report.get("performance") if isinstance(report.get("performance"), dict) else {}
     return {
         "marker": report.get("marker"),
         "mode": report.get("mode"),
@@ -5336,6 +5385,7 @@ def cli_report_summary(report: dict[str, Any]) -> dict[str, Any]:
         "matches": len(report.get("match_path") or []) or report.get("matches_count"),
         "duration_seconds": report.get("duration_seconds"),
         "assignment_seconds": report.get("assignment_seconds"),
+        "performance_scope": performance.get("measurement_scope"),
         "fatal_error": report.get("fatal_error"),
         "write_burst": (
             {

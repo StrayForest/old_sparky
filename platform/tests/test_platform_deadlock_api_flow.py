@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 import unittest
 from typing import Any
@@ -10,7 +11,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, event, func, select, update
 
 from apps.platform_api.app.services.tournament_workflow import (
     generate_deadlock_auto_assignment_run_for_tournament,
@@ -18,7 +19,10 @@ from apps.platform_api.app.services.tournament_workflow import (
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
-from python_packages.platform_infra.db import dispose_engine, session_factory
+from python_packages.platform_infra import performance
+from python_packages.platform_infra.config import get_settings
+from python_packages.platform_infra.csrf import csrf_cookie_name, generate_csrf_token
+from python_packages.platform_infra.db import dispose_engine, engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
     PlayerProfile,
@@ -26,8 +30,12 @@ from python_packages.platform_infra.models import (
     Tournament,
     TournamentDeadlockReadyRound,
     TournamentDeadlockReadyVote,
+    TournamentDeadlockReadyVoteCountShard,
+    TournamentParticipant,
+    UserSession,
     User,
 )
+from python_packages.platform_infra.security import session_token_digest
 
 
 class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -153,6 +161,506 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             run_id = str(run_row.id)
             await db_session.commit()
             return run_id
+
+    async def _prepare_ready_vote_fixture(
+        self,
+        *,
+        label: str,
+        extra_participant: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        organizer = await self._register_user(
+            label=f"{label}-organizer",
+            rank="Eternus",
+            subrank=6,
+            captain_priority="yes",
+        )
+        voter = await self._register_user(
+            label=f"{label}-voter",
+            rank="Ascendant",
+            subrank=6,
+        )
+        await self._grant_public_creation(str(organizer["user_id"]))
+        tournament_payload = self._assert_status(
+            await organizer["client"].post(
+                "/api/v1/tournaments",
+                json={
+                    "name": f"{self.prefix}-{label}"[:25],
+                    "description": "Ready vote instrumentation fixture.",
+                    "visibility": "public",
+                    "format_slug": "solo",
+                },
+            ),
+            201,
+        )
+        slug = tournament_payload["slug"]
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_open"},
+            ),
+            200,
+        )
+        participants = (organizer, voter) + (
+            (extra_participant,) if extra_participant is not None else ()
+        )
+        for user in participants:
+            self._assert_status(
+                await user["client"].post(
+                    f"/api/v1/tournaments/{slug}/join",
+                    json={"entry_type": "solo"},
+                ),
+                201,
+            )
+        self._assert_status(
+            await organizer["client"].patch(
+                f"/api/v1/tournaments/{slug}/status",
+                json={"status": "registration_closed"},
+            ),
+            200,
+        )
+        self._assert_status(
+            await organizer["client"].post(
+                f"/api/v1/tournaments/{slug}/deadlock/ready-check/start"
+            ),
+            201,
+        )
+        if extra_participant is not None:
+            async with session_factory()() as db_session:
+                active_round = await db_session.scalar(
+                    select(TournamentDeadlockReadyRound).where(
+                        TournamentDeadlockReadyRound.tournament_id == tournament_payload["id"],
+                        TournamentDeadlockReadyRound.status == "active",
+                    )
+                )
+                self.assertIsNotNone(active_round)
+                assert active_round is not None
+                active_round.eligible_user_ids = [
+                    str(organizer["user_id"]),
+                    str(voter["user_id"]),
+                ]
+                await db_session.commit()
+        return organizer, voter, slug
+
+    async def test_ready_vote_checkout_is_one_for_each_success_and_duplicate(self) -> None:
+        _organizer, voter, slug = await self._prepare_ready_vote_fixture(label="checkout")
+        settings = get_settings()
+        session_token = voter["client"].cookies.get(settings.platform_session_cookie_name)
+        self.assertIsNotNone(session_token)
+        async with session_factory()() as db_session:
+            initial_last_seen_at = await db_session.scalar(
+                select(UserSession.last_seen_at).where(
+                    UserSession.token_digest == session_token_digest(str(session_token)),
+                )
+            )
+        self.assertIsNotNone(initial_last_seen_at)
+        checkout_scope: ContextVar[str | None] = ContextVar(
+            "ready_vote_checkout_probe",
+            default=None,
+        )
+        physical_pool = engine().sync_engine.pool
+        checkout_counts: dict[str, int] = {}
+
+        def count_checkout(_dbapi_connection: object, _connection_record: object, _connection_proxy: object) -> None:
+            metrics = performance.current_request_metrics()
+            request_id = metrics.request_id if metrics is not None else checkout_scope.get()
+            if request_id is not None:
+                checkout_counts[request_id] = checkout_counts.get(request_id, 0) + 1
+
+        captured_metrics: list[performance.RequestPerformanceMetrics] = []
+        original_log = performance.RequestPerformanceMiddleware._log_if_slow
+
+        def capture_metrics(
+            middleware: performance.RequestPerformanceMiddleware,
+            scope: dict[str, Any],
+            metrics: performance.RequestPerformanceMetrics,
+            status_code: int,
+        ) -> None:
+            if str(scope.get("path") or "").endswith("/deadlock/ready-check/vote"):
+                captured_metrics.append(metrics)
+            original_log(middleware, scope, metrics, status_code)
+
+        event.listen(physical_pool, "checkout", count_checkout)
+        try:
+            with patch.object(
+                performance.RequestPerformanceMiddleware,
+                "_log_if_slow",
+                capture_metrics,
+            ):
+                for choice, expected_changed in (
+                    ("yes", True),
+                    ("yes", False),
+                    ("no", True),
+                ):
+                    request_id = f"ready-vote-checkout-{uuid4().hex}"
+                    token = checkout_scope.set(request_id)
+                    try:
+                        response = await voter["client"].post(
+                            f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                            json={"choice": choice},
+                            headers={"X-Request-ID": request_id},
+                        )
+                    finally:
+                        checkout_scope.reset(token)
+                    payload = self._assert_status(response, 200)
+                    self.assertEqual(payload["changed"], expected_changed)
+                    self.assertEqual(checkout_counts.get(request_id, 0), 1)
+                    metrics = next(
+                        item for item in reversed(captured_metrics) if item.request_id == request_id
+                    )
+                    self.assertEqual(metrics.ready_vote_checkout_count, 1)
+                    self.assertGreater(metrics.ready_vote_checkout_ms, 0.0)
+        finally:
+            event.remove(physical_pool, "checkout", count_checkout)
+
+        self.assertEqual(len(captured_metrics), 3)
+        async with session_factory()() as db_session:
+            final_last_seen_at = await db_session.scalar(
+                select(UserSession.last_seen_at).where(
+                    UserSession.token_digest == session_token_digest(str(session_token)),
+                )
+            )
+        self.assertEqual(final_last_seen_at, initial_last_seen_at)
+
+    async def test_ready_vote_auth_and_preflight_failures_never_checkout_more_than_once(self) -> None:
+        ineligible = await self._register_user(
+            label="checkout-errors-ineligible",
+            rank="Ascendant",
+            subrank=6,
+        )
+        organizer, voter, slug = await self._prepare_ready_vote_fixture(
+            label="checkout-errors",
+            extra_participant=ineligible,
+        )
+        outsider = await self._register_user(
+            label="checkout-errors-outsider",
+            rank="Ascendant",
+            subrank=6,
+        )
+        expired = await self._register_user(
+            label="checkout-errors-expired",
+            rank="Ascendant",
+            subrank=6,
+        )
+        invalidated = await self._register_user(
+            label="checkout-errors-invalidated",
+            rank="Ascendant",
+            subrank=6,
+        )
+        inactive = await self._register_user(
+            label="checkout-errors-inactive",
+            rank="Ascendant",
+            subrank=6,
+        )
+        unverified = await self._register_user(
+            label="checkout-errors-unverified",
+            rank="Ascendant",
+            subrank=6,
+        )
+        settings = get_settings()
+        state_now = datetime.now(UTC)
+        async with session_factory()() as db_session:
+            for user, session_values in (
+                (
+                    expired,
+                    {"expires_at": state_now - timedelta(seconds=1)},
+                ),
+                (
+                    invalidated,
+                    {"invalidated_at": state_now},
+                ),
+            ):
+                token = user["client"].cookies.get(settings.platform_session_cookie_name)
+                self.assertIsNotNone(token)
+                await db_session.execute(
+                    update(UserSession)
+                    .where(UserSession.token_digest == session_token_digest(str(token)))
+                    .values(**session_values)
+                )
+            inactive_token = inactive["client"].cookies.get(settings.platform_session_cookie_name)
+            unverified_token = unverified["client"].cookies.get(settings.platform_session_cookie_name)
+            self.assertIsNotNone(inactive_token)
+            self.assertIsNotNone(unverified_token)
+            await db_session.execute(
+                update(User)
+                .where(User.id == inactive["user_id"])
+                .values(status="suspended")
+            )
+            await db_session.execute(
+                update(User)
+                .where(User.id == unverified["user_id"])
+                .values(email_verified_at=None)
+            )
+            await db_session.commit()
+
+        invalid_token_client = await self._new_client()
+        invalid_token = f"invalid-ready-vote-{uuid4().hex}"
+        invalid_csrf_token = generate_csrf_token(invalid_token, settings)
+        invalid_token_client.cookies.set(settings.platform_session_cookie_name, invalid_token)
+        invalid_token_client.cookies.set(csrf_cookie_name(settings), invalid_csrf_token)
+        checkout_scope: ContextVar[str | None] = ContextVar(
+            "ready_vote_error_checkout_probe",
+            default=None,
+        )
+        physical_pool = engine().sync_engine.pool
+        checkout_counts: dict[str, int] = {}
+
+        def count_checkout(_dbapi_connection: object, _connection_record: object, _connection_proxy: object) -> None:
+            metrics = performance.current_request_metrics()
+            request_id = metrics.request_id if metrics is not None else checkout_scope.get()
+            if request_id is not None:
+                checkout_counts[request_id] = checkout_counts.get(request_id, 0) + 1
+
+        event.listen(physical_pool, "checkout", count_checkout)
+
+        async def assert_at_most_one_checkout(
+            client: httpx.AsyncClient,
+            *,
+            expected_status: int,
+        ) -> None:
+            request_id = f"ready-vote-error-{uuid4().hex}"
+            token = checkout_scope.set(request_id)
+            try:
+                headers = {"X-Request-ID": request_id}
+                csrf_token = client.cookies.get(csrf_cookie_name(settings))
+                if csrf_token:
+                    headers["X-CSRF-Token"] = str(csrf_token)
+                    headers["Origin"] = settings.platform_web_origin
+                response = await client.post(
+                    f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                    json={"choice": "yes"},
+                    headers=headers,
+                )
+            finally:
+                checkout_scope.reset(token)
+            self.assertEqual(response.status_code, expected_status, response.text)
+            self.assertLessEqual(checkout_counts.get(request_id, 0), 1)
+
+        try:
+            anonymous = await self._new_client()
+            await assert_at_most_one_checkout(anonymous, expected_status=401)
+            await assert_at_most_one_checkout(invalid_token_client, expected_status=401)
+            await assert_at_most_one_checkout(expired["client"], expected_status=401)
+            await assert_at_most_one_checkout(invalidated["client"], expected_status=401)
+            await assert_at_most_one_checkout(inactive["client"], expected_status=401)
+            verification_settings = settings.model_copy(
+                update={"platform_email_verification_required": True}
+            )
+            with patch(
+                "python_packages.platform_infra.security.get_settings",
+                return_value=verification_settings,
+            ):
+                await assert_at_most_one_checkout(unverified["client"], expected_status=401)
+            await assert_at_most_one_checkout(outsider["client"], expected_status=403)
+            await assert_at_most_one_checkout(ineligible["client"], expected_status=403)
+
+            async with session_factory()() as db_session:
+                tournament = await db_session.scalar(
+                    select(Tournament).where(Tournament.slug == slug)
+                )
+                self.assertIsNotNone(tournament)
+                assert tournament is not None
+                now = datetime.now(UTC)
+                tournament.ready_check_starts_at = now + timedelta(minutes=5)
+                tournament.ready_check_ends_at = now + timedelta(minutes=15)
+                await db_session.commit()
+            await assert_at_most_one_checkout(voter["client"], expected_status=409)
+
+            async with session_factory()() as db_session:
+                tournament = await db_session.scalar(
+                    select(Tournament).where(Tournament.slug == slug)
+                )
+                self.assertIsNotNone(tournament)
+                assert tournament is not None
+                now = datetime.now(UTC)
+                tournament.ready_check_starts_at = now - timedelta(minutes=15)
+                tournament.ready_check_ends_at = now - timedelta(minutes=5)
+                await db_session.commit()
+            await assert_at_most_one_checkout(voter["client"], expected_status=409)
+
+            async with session_factory()() as db_session:
+                tournament = await db_session.scalar(
+                    select(Tournament).where(Tournament.slug == slug)
+                )
+                self.assertIsNotNone(tournament)
+                assert tournament is not None
+                now = datetime.now(UTC)
+                tournament.ready_check_starts_at = now - timedelta(minutes=1)
+                tournament.ready_check_ends_at = now + timedelta(minutes=5)
+                active_round = await db_session.scalar(
+                    select(TournamentDeadlockReadyRound).where(
+                        TournamentDeadlockReadyRound.tournament_id == tournament.id,
+                        TournamentDeadlockReadyRound.status == "active",
+                    )
+                )
+                self.assertIsNotNone(active_round)
+                assert active_round is not None
+                active_round.status = "closed"
+                active_round.closed_at = datetime.now(UTC)
+                tournament.automation_ready_check_closed_at = datetime.now(UTC)
+                await db_session.commit()
+            await assert_at_most_one_checkout(voter["client"], expected_status=409)
+        finally:
+            event.remove(physical_pool, "checkout", count_checkout)
+
+    async def test_ready_vote_withdrawal_race_rolls_back_vote_and_counter(self) -> None:
+        organizer, voter, slug = await self._prepare_ready_vote_fixture(label="withdraw-race")
+        participant_id: str
+        async with session_factory()() as db_session:
+            tournament_id = await db_session.scalar(
+                select(Tournament.id).where(Tournament.slug == slug)
+            )
+            self.assertIsNotNone(tournament_id)
+            participant_value = await db_session.scalar(
+                select(TournamentParticipant.id).where(
+                    TournamentParticipant.tournament_id == tournament_id,
+                    TournamentParticipant.user_id == voter["user_id"],
+                )
+            )
+            self.assertIsNotNone(participant_value)
+            participant_id = str(participant_value)
+
+        vote_at_upsert = asyncio.Event()
+        release_vote = asyncio.Event()
+        original_upsert = tournament_routes.upsert_deadlock_ready_vote
+
+        async def gated_upsert(*args: Any, **kwargs: Any) -> bool:
+            vote_at_upsert.set()
+            await release_vote.wait()
+            return await original_upsert(*args, **kwargs)
+
+        vote_task: asyncio.Task[httpx.Response] | None = None
+        exclusion_task: asyncio.Task[httpx.Response] | None = None
+        vote_response: httpx.Response | None = None
+        try:
+            with patch.object(
+                tournament_routes,
+                "upsert_deadlock_ready_vote",
+                side_effect=gated_upsert,
+            ):
+                vote_task = asyncio.create_task(
+                    voter["client"].post(
+                        f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                        json={"choice": "yes"},
+                    )
+                )
+                await asyncio.wait_for(vote_at_upsert.wait(), timeout=10)
+                exclusion_task = asyncio.create_task(
+                    organizer["client"].patch(
+                        f"/api/v1/tournaments/{slug}/participants/{participant_id}/moderation",
+                        json={
+                            "status": "withdrawn",
+                            "moderation_note": "Withdrawn during ready vote race.",
+                        },
+                    )
+                )
+                exclusion_response = await asyncio.wait_for(exclusion_task, timeout=10)
+                self.assertEqual(exclusion_response.status_code, 200, exclusion_response.text)
+                release_vote.set()
+                vote_response = await asyncio.wait_for(vote_task, timeout=10)
+        finally:
+            release_vote.set()
+            pending_tasks = [
+                task for task in (vote_task, exclusion_task) if task is not None
+            ]
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        self.assertIsNotNone(vote_response)
+        assert vote_response is not None
+        self.assertEqual(vote_response.status_code, 409, vote_response.text)
+        async with session_factory()() as db_session:
+            tournament_id = await db_session.scalar(
+                select(Tournament.id).where(Tournament.slug == slug)
+            )
+            self.assertIsNotNone(tournament_id)
+            round_row = await db_session.scalar(
+                select(TournamentDeadlockReadyRound).where(
+                    TournamentDeadlockReadyRound.tournament_id == tournament_id
+                )
+            )
+            self.assertIsNotNone(round_row)
+            assert round_row is not None
+            vote_count = await db_session.scalar(
+                select(func.count(TournamentDeadlockReadyVote.id)).where(
+                    TournamentDeadlockReadyVote.round_id == round_row.id,
+                    TournamentDeadlockReadyVote.user_id == voter["user_id"],
+                )
+            )
+            shard_count = await db_session.scalar(
+                select(func.coalesce(func.sum(TournamentDeadlockReadyVoteCountShard.vote_count), 0)).where(
+                    TournamentDeadlockReadyVoteCountShard.round_id == round_row.id,
+                )
+            )
+        self.assertEqual(vote_count, 0)
+        self.assertEqual(shard_count, 0)
+
+    async def test_parallel_ready_vote_choices_keep_one_row_and_matching_shards(self) -> None:
+        _organizer, voter, slug = await self._prepare_ready_vote_fixture(label="parallel-vote")
+
+        with patch.object(tournament_routes, "_invalidate_ready_check_state_cache") as invalidate_cache:
+            yes_response, no_response = await asyncio.gather(
+                voter["client"].post(
+                    f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                    json={"choice": "yes"},
+                ),
+                voter["client"].post(
+                    f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                    json={"choice": "no"},
+                ),
+            )
+        self.assertEqual(yes_response.status_code, 200, yes_response.text)
+        self.assertEqual(no_response.status_code, 200, no_response.text)
+        self.assertEqual(
+            sorted(
+                (
+                    bool(yes_response.json()["changed"]),
+                    bool(no_response.json()["changed"]),
+                )
+            ),
+            [True, True],
+        )
+        self.assertEqual(invalidate_cache.call_count, 2)
+
+        async with session_factory()() as db_session:
+            tournament_id = await db_session.scalar(
+                select(Tournament.id).where(Tournament.slug == slug)
+            )
+            self.assertIsNotNone(tournament_id)
+            round_row = await db_session.scalar(
+                select(TournamentDeadlockReadyRound).where(
+                    TournamentDeadlockReadyRound.tournament_id == tournament_id
+                )
+            )
+            self.assertIsNotNone(round_row)
+            assert round_row is not None
+            vote_row = await db_session.scalar(
+                select(TournamentDeadlockReadyVote).where(
+                    TournamentDeadlockReadyVote.round_id == round_row.id,
+                    TournamentDeadlockReadyVote.user_id == voter["user_id"],
+                )
+            )
+            self.assertIsNotNone(vote_row)
+            assert vote_row is not None
+            shard_totals = {
+                choice: await db_session.scalar(
+                    select(func.coalesce(func.sum(TournamentDeadlockReadyVoteCountShard.vote_count), 0)).where(
+                        TournamentDeadlockReadyVoteCountShard.round_id == round_row.id,
+                        TournamentDeadlockReadyVoteCountShard.choice == choice,
+                    )
+                )
+                for choice in ("yes", "no")
+            }
+            vote_count = await db_session.scalar(
+                select(func.count(TournamentDeadlockReadyVote.id)).where(
+                    TournamentDeadlockReadyVote.round_id == round_row.id,
+                    TournamentDeadlockReadyVote.user_id == voter["user_id"],
+                )
+            )
+
+        self.assertEqual(vote_count, 1)
+        self.assertIn(vote_row.choice, {"yes", "no"})
+        self.assertEqual(shard_totals[vote_row.choice], 1)
+        self.assertEqual(shard_totals["yes" if vote_row.choice == "no" else "no"], 0)
 
     async def test_ready_check_start_serializes_concurrent_organizer_requests(self) -> None:
         organizer = await self._register_user(
@@ -1085,8 +1593,15 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
                     TournamentDeadlockReadyVote.user_id == organizer["user_id"],
                 )
             )
+            yes_count = await db_session.scalar(
+                select(func.coalesce(func.sum(TournamentDeadlockReadyVoteCountShard.vote_count), 0)).where(
+                    TournamentDeadlockReadyVoteCountShard.round_id == round_rows[0].id,
+                    TournamentDeadlockReadyVoteCountShard.choice == "yes",
+                )
+            )
         self.assertEqual(round_rows[0].status, "active")
         self.assertEqual(vote_count, 1)
+        self.assertEqual(yes_count, 1)
         self.assertIsNotNone(tournament.automation_ready_check_started_at)
 
         close_result = await self._advance_deadlock_automation_for_slug(
@@ -1687,6 +2202,21 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first_yes_payload["changed"])
         self.assertNotIn("ready_count", first_yes_payload)
         self.assertNotIn("declined_count", first_yes_payload)
+        async with session_factory()() as db_session:
+            first_vote_row = await db_session.scalar(
+                select(TournamentDeadlockReadyVote).where(
+                    TournamentDeadlockReadyVote.round_id == ready_state["active_round"]["id"],
+                    TournamentDeadlockReadyVote.user_id == first_ready_user["user_id"],
+                )
+            )
+            self.assertIsNotNone(first_vote_row)
+            assert first_vote_row is not None
+            first_yes_count = await db_session.scalar(
+                select(func.coalesce(func.sum(TournamentDeadlockReadyVoteCountShard.vote_count), 0)).where(
+                    TournamentDeadlockReadyVoteCountShard.round_id == first_vote_row.round_id,
+                    TournamentDeadlockReadyVoteCountShard.choice == "yes",
+                )
+            )
         ready_state_after_first_yes = self._assert_status(
             await organizer["client"].get(f"/api/v1/tournaments/{slug}/deadlock/ready-check"),
             200,
@@ -1694,15 +2224,38 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ready_state_after_first_yes["active_round"]["ready_count"], 1)
         self.assertEqual(ready_state_after_first_yes["active_round"]["declined_count"], 0)
 
-        repeated_yes_payload = self._assert_status(
-            await first_ready_user["client"].post(
-                f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
-                json={"choice": "yes"},
-            ),
-            200,
-        )
+        with patch.object(tournament_routes, "_invalidate_ready_check_state_cache") as invalidate_cache:
+            repeated_yes_payload = self._assert_status(
+                await first_ready_user["client"].post(
+                    f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                    json={"choice": "yes"},
+                ),
+                200,
+            )
+        invalidate_cache.assert_not_called()
         self.assertEqual(repeated_yes_payload["current_user_choice"], "yes")
         self.assertFalse(repeated_yes_payload["changed"])
+        async with session_factory()() as db_session:
+            repeated_vote_row = await db_session.scalar(
+                select(TournamentDeadlockReadyVote).where(
+                    TournamentDeadlockReadyVote.round_id == first_vote_row.round_id,
+                    TournamentDeadlockReadyVote.user_id == first_ready_user["user_id"],
+                )
+            )
+            repeated_yes_count = await db_session.scalar(
+                select(func.coalesce(func.sum(TournamentDeadlockReadyVoteCountShard.vote_count), 0)).where(
+                    TournamentDeadlockReadyVoteCountShard.round_id == first_vote_row.round_id,
+                    TournamentDeadlockReadyVoteCountShard.choice == "yes",
+                )
+            )
+        self.assertIsNotNone(repeated_vote_row)
+        self.assertEqual(repeated_vote_row.id, first_vote_row.id)
+        self.assertEqual(repeated_vote_row.choice, first_vote_row.choice)
+        self.assertEqual(repeated_vote_row.created_at, first_vote_row.created_at)
+        self.assertEqual(repeated_vote_row.updated_at, first_vote_row.updated_at)
+        self.assertEqual(repeated_vote_row.responded_at, first_vote_row.responded_at)
+        self.assertEqual(first_yes_count, 1)
+        self.assertEqual(repeated_yes_count, 1)
         ready_state_after_repeat = self._assert_status(
             await organizer["client"].get(f"/api/v1/tournaments/{slug}/deadlock/ready-check"),
             200,
@@ -1710,13 +2263,15 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ready_state_after_repeat["active_round"]["ready_count"], 1)
         self.assertEqual(ready_state_after_repeat["active_round"]["declined_count"], 0)
 
-        declined_payload = self._assert_status(
-            await first_ready_user["client"].post(
-                f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
-                json={"choice": "no"},
-            ),
-            200,
-        )
+        with patch.object(tournament_routes, "_invalidate_ready_check_state_cache") as invalidate_cache:
+            declined_payload = self._assert_status(
+                await first_ready_user["client"].post(
+                    f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                    json={"choice": "no"},
+                ),
+                200,
+            )
+        invalidate_cache.assert_called_once_with(tournament_payload["id"])
         self.assertEqual(declined_payload["current_user_choice"], "no")
         self.assertTrue(declined_payload["changed"])
         ready_state_after_decline = self._assert_status(
@@ -1726,13 +2281,15 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ready_state_after_decline["active_round"]["ready_count"], 0)
         self.assertEqual(ready_state_after_decline["active_round"]["declined_count"], 1)
 
-        restored_yes_payload = self._assert_status(
-            await first_ready_user["client"].post(
-                f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
-                json={"choice": "yes"},
-            ),
-            200,
-        )
+        with patch.object(tournament_routes, "_invalidate_ready_check_state_cache") as invalidate_cache:
+            restored_yes_payload = self._assert_status(
+                await first_ready_user["client"].post(
+                    f"/api/v1/tournaments/{slug}/deadlock/ready-check/vote",
+                    json={"choice": "yes"},
+                ),
+                200,
+            )
+        invalidate_cache.assert_called_once_with(tournament_payload["id"])
         self.assertEqual(restored_yes_payload["current_user_choice"], "yes")
         self.assertTrue(restored_yes_payload["changed"])
         ready_state_after_restore = self._assert_status(

@@ -229,8 +229,8 @@ from python_packages.platform_infra.models import (
 )
 from python_packages.platform_infra.security import (
     ReadyVoteAuthSnapshot,
+    authenticate_ready_vote,
     get_authenticated_session,
-    get_authenticated_session_for_ready_vote,
     get_optional_authenticated_session,
 )
 from python_packages.platform_infra.performance import record_ready_vote_span
@@ -4789,12 +4789,17 @@ async def start_deadlock_ready_check(
 async def vote_deadlock_ready_check(
     slug: str,
     payload: TournamentDeadlockReadyVoteRequest,
-    auth_session: ReadyVoteAuthSnapshot = Depends(get_authenticated_session_for_ready_vote),
+    request: Request,
 ) -> TournamentDeadlockReadyVoteResponse:
-    current_user_id = auth_session.user_id
+    auth_snapshot: ReadyVoteAuthSnapshot | None = None
+    current_user_id = "-"
+    vote_now: datetime | None = None
     tournament: Any | None = None
     try:
         async with ready_vote_db_session() as db_session:
+            auth_snapshot = await authenticate_ready_vote(request, db_session)
+            current_user_id = auth_snapshot.user_id
+            vote_now = auth_snapshot.now
             preflight_started = time.perf_counter()
             try:
                 preflight = await prepare_deadlock_ready_vote(
@@ -4802,7 +4807,7 @@ async def vote_deadlock_ready_check(
                     slug=slug,
                     user_id=current_user_id,
                     choice=payload.choice,
-                    now=auth_session.now,
+                    now=vote_now,
                 )
             finally:
                 record_ready_vote_span("ready_vote_preflight_ms", time.perf_counter() - preflight_started)
@@ -4845,25 +4850,35 @@ async def vote_deadlock_ready_check(
                     round_id=active_round.id,
                     user_id=current_user_id,
                     choice=payload.choice,
-                    responded_at=auth_session.now,
+                    responded_at=vote_now,
                 )
             finally:
                 upsert_elapsed = time.perf_counter() - upsert_started
             record_ready_vote_span("ready_vote_upsert_ms", upsert_elapsed)
             # Counter shards are maintained by the same conditional trigger;
-            # their database work is included in the upsert statement.
-            record_ready_vote_span("ready_vote_counter_ms", upsert_elapsed)
+            # their database work is included in this upsert statement.
 
             commit_started = time.perf_counter()
             try:
                 await db_session.commit()
             except IntegrityError as exc:
                 await db_session.rollback()
-                if "ready vote requires an active ready round" not in str(exc):
+                lifecycle_error = str(exc)
+                if not any(
+                    marker in lifecycle_error
+                    for marker in (
+                        "ready vote requires an active ready round",
+                        "active ready vote requires active tournament participation",
+                    )
+                ):
                     raise
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="Deadlock ready-check is no longer active.",
+                    detail=(
+                        "Deadlock ready-check is no longer active."
+                        if "ready vote requires an active ready round" in lifecycle_error
+                        else "You are no longer an active tournament participant."
+                    ),
                 ) from exc
             finally:
                 record_ready_vote_span("ready_vote_commit_ms", time.perf_counter() - commit_started)
@@ -4880,8 +4895,8 @@ async def vote_deadlock_ready_check(
         outcome = "idempotent" if not vote_changed else "accepted"
         starts_at = tournament.ready_check_starts_at
         relative_ms = (
-            round((auth_session.now - starts_at).total_seconds() * 1000)
-            if starts_at is not None
+            round((vote_now - starts_at).total_seconds() * 1000)
+            if starts_at is not None and vote_now is not None
             else None
         )
         # Successful votes are represented by the authoritative response and
@@ -4903,15 +4918,19 @@ async def vote_deadlock_ready_check(
             eligible_participant_count=active_round.eligible_participant_count,
             current_user_choice=payload.choice,
             changed=vote_changed,
-            server_received_at=auth_session.now,
+            server_received_at=vote_now,
         )
         record_ready_vote_span("ready_vote_response_ms", time.perf_counter() - response_started)
         return response
     except TournamentWorkflowError as exc:
         relative_ms = getattr(exc, "relative_ms", None)
-        if tournament is not None and tournament.ready_check_starts_at is not None:
+        if (
+            tournament is not None
+            and tournament.ready_check_starts_at is not None
+            and vote_now is not None
+        ):
             relative_ms = round(
-                (auth_session.now - tournament.ready_check_starts_at).total_seconds() * 1000
+                (vote_now - tournament.ready_check_starts_at).total_seconds() * 1000
             )
         logger.info(
             "ready_vote outcome=rejected tournament=%s reason=%s relative_ms=%s",
@@ -4922,9 +4941,13 @@ async def vote_deadlock_ready_check(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except HTTPException as exc:
         relative_ms = None
-        if tournament is not None and tournament.ready_check_starts_at is not None:
+        if (
+            tournament is not None
+            and tournament.ready_check_starts_at is not None
+            and vote_now is not None
+        ):
             relative_ms = round(
-                (auth_session.now - tournament.ready_check_starts_at).total_seconds() * 1000
+                (vote_now - tournament.ready_check_starts_at).total_seconds() * 1000
             )
         logger.info(
             "ready_vote outcome=rejected tournament=%s status=%s reason=%s relative_ms=%s",

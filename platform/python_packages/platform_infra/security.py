@@ -575,16 +575,17 @@ async def get_authenticated_session(
     )
 
 
-async def get_authenticated_session_for_ready_vote(
+async def authenticate_ready_vote(
     request: Request,
+    db_session: AsyncSession,
 ) -> ReadyVoteAuthSnapshot:
-    """Authenticate the hot Ready vote path without unrelated auth work.
+    """Authenticate Ready Vote using the route-owned transaction session.
 
-    A vote only needs the authenticated user id and the request timestamp. It
-    does not authorize by role, and refreshing session last-seen metadata here
-    would add a second database transaction to a burst that is already
-    bounded by the vote's own authorization and idempotency checks. Ordinary
-    authenticated requests retain the full role load and session touch.
+    Ready Vote authorization needs only a user id and the server timestamp.
+    Keep this projection primitive-only: role hydration, ORM user/session
+    objects and ``last_seen`` telemetry do not belong on the hot path. The
+    caller owns ``db_session`` and therefore keeps this lookup in the same
+    autobegin transaction as vote preflight, upsert and commit.
     """
 
     started = time.perf_counter()
@@ -600,29 +601,19 @@ async def get_authenticated_session_for_ready_vote(
         if email_verification_required(settings):
             user_predicates.append((User.email.is_(None)) | (User.email_verified_at.is_not(None)))
 
-        # This session is deliberately owned here and closed before FastAPI
-        # calls the endpoint. Selecting primitives also avoids ORM identity-map work.
-        async with session_factory()() as auth_db_session:
-            checkout_started = time.perf_counter()
-            try:
-                await auth_db_session.connection()
-            except SQLAlchemyTimeoutError:
-                from python_packages.platform_infra.performance import record_pool_checkout_wait
-                record_pool_checkout_wait(time.perf_counter() - checkout_started)
-                raise
-            from python_packages.platform_infra.performance import record_pool_checkout_wait
-            record_pool_checkout_wait(time.perf_counter() - checkout_started)
-            user_id = await auth_db_session.scalar(
-                select(UserSession.user_id)
-                .join(User, User.id == UserSession.user_id)
-                .where(
-                    UserSession.token_digest == token_digest,
-                    UserSession.invalidated_at.is_(None),
-                    UserSession.expires_at > now,
-                    *user_predicates,
-                )
-                .limit(1)
+        # Select only the primitive actor id. The route's dedicated session
+        # already owns the checkout and transaction boundary.
+        user_id = await db_session.scalar(
+            select(UserSession.user_id)
+            .join(User, User.id == UserSession.user_id)
+            .where(
+                UserSession.token_digest == token_digest,
+                UserSession.invalidated_at.is_(None),
+                UserSession.expires_at > now,
+                *user_predicates,
             )
+            .limit(1)
+        )
         if user_id is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session is invalid.")
         return ReadyVoteAuthSnapshot(user_id=str(user_id), now=now)

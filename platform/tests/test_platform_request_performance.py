@@ -91,6 +91,66 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
 
         log_info.assert_not_called()
 
+    def test_ready_vote_checkout_records_count_and_duration_separately(self) -> None:
+        token = performance.start_request_metrics(
+            "POST",
+            "/api/v1/tournaments/demo/deadlock/ready-check/vote",
+        )
+        try:
+            performance.record_pool_checkout_wait(0.004)
+            performance.record_ready_vote_checkout(0.006)
+            metrics = performance.current_request_metrics()
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertEqual(metrics.ready_vote_checkout_count, 1)
+            self.assertEqual(metrics.ready_vote_checkout_ms, 6.0)
+            self.assertEqual(metrics.pool_checkout_wait_seconds, 0.004)
+        finally:
+            performance.reset_request_metrics(token)
+
+    def test_ready_vote_log_format_exposes_checkout_metrics(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        metrics = self.metrics(method="POST")
+        metrics.path = "/api/v1/tournaments/demo/deadlock/ready-check/vote"
+        metrics.ready_vote_checkout_count = 1
+        metrics.ready_vote_checkout_ms = 6.0
+        # Force the slow path to verify the emitted field names and values
+        # without relying on process-global log state.
+        metrics.sql_time_seconds = 1.0
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings()),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            middleware._log_if_slow(
+                {"route": SimpleNamespace(path="/{slug}/deadlock/ready-check/vote")},
+                metrics,
+                200,
+            )
+            log_info.assert_called_once()
+            rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
+        self.assertIn("ready_vote_checkout_count=1", rendered)
+        self.assertIn("ready_vote_checkout_ms=6.00", rendered)
+        self.assertNotIn("ready_vote_counter_ms", rendered)
+
+    def test_ready_vote_error_log_includes_zero_checkout_metrics(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        metrics = self.metrics(method="POST")
+        metrics.path = "/api/v1/tournaments/demo/deadlock/ready-check/vote"
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings()),
+            patch.object(performance.logger, "warning") as log_warning,
+        ):
+            middleware._log_if_slow(
+                {"route": SimpleNamespace(path="/{slug}/deadlock/ready-check/vote")},
+                metrics,
+                503,
+            )
+
+        log_warning.assert_called_once()
+        rendered = log_warning.call_args.args[0] % log_warning.call_args.args[1:]
+        self.assertIn("ready_vote_checkout_count=0", rendered)
+        self.assertIn("ready_vote_checkout_ms=0.00", rendered)
+
     def test_qa_phase_header_is_bounded_and_namespaced(self) -> None:
         self.assertEqual(
             performance.qa_phase_from_scope(

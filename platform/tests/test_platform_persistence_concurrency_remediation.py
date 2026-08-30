@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, is_dataclass
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
 
 from apps.platform_api.app.api.routes import profiles, tournaments
@@ -62,15 +63,11 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
             touch_session=False,
         )
 
-    async def test_ready_vote_auth_returns_detached_snapshot_and_closes_session(self) -> None:
+    async def test_ready_vote_auth_uses_passed_session_and_returns_detached_snapshot(self) -> None:
         request = Mock()
         request.cookies = {"platform_session": "token"}
         db_session = Mock()
-        db_session.connection = AsyncMock()
-        db_session.commit = AsyncMock()
         db_session.scalar = AsyncMock(return_value="user")
-        context = _AsyncContext(db_session)
-        factory = Mock(return_value=context)
         settings = SimpleNamespace(
             platform_session_cookie_name="platform_session",
             platform_environment="test",
@@ -80,14 +77,87 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
             security,
             "get_settings",
             return_value=settings,
-        ), patch.object(security, "session_factory", return_value=factory):
-            result = await security.get_authenticated_session_for_ready_vote(request)
+        ), patch.object(security, "session_factory") as session_factory:
+            result = await security.authenticate_ready_vote(request, db_session)
 
         self.assertEqual(result.user_id, "user")
         self.assertIsNotNone(result.now)
-        db_session.connection.assert_awaited_once()
         db_session.scalar.assert_awaited_once()
-        self.assertTrue(context.exited)
+        session_factory.assert_not_called()
+
+        self.assertTrue(is_dataclass(result))
+        self.assertFalse(hasattr(result, "__dict__"))
+        with self.assertRaises(FrozenInstanceError):
+            result.user_id = "other-user"
+
+    async def test_ready_vote_auth_invalid_and_unverified_states_are_unauthorized(self) -> None:
+        settings = SimpleNamespace(
+            platform_session_cookie_name="platform_session",
+            platform_environment="test",
+            platform_email_verification_required=False,
+        )
+        for state in (
+            "invalid-token",
+            "expired-session",
+            "invalidated-session",
+            "inactive-user",
+        ):
+            with self.subTest(state=state):
+                request = Mock()
+                request.cookies = {"platform_session": state}
+                db_session = Mock()
+                db_session.scalar = AsyncMock(return_value=None)
+                with (
+                    patch.object(security, "get_settings", return_value=settings),
+                    patch.object(security, "_touch_authenticated_session", new_callable=AsyncMock) as touch,
+                ):
+                    with self.assertRaises(HTTPException) as raised:
+                        await security.authenticate_ready_vote(request, db_session)
+                self.assertEqual(raised.exception.status_code, 401)
+                touch.assert_not_awaited()
+
+        request = Mock()
+        request.cookies = {"platform_session": "unverified-session"}
+        db_session = Mock()
+        db_session.scalar = AsyncMock(return_value=None)
+        verification_settings = SimpleNamespace(
+            platform_session_cookie_name="platform_session",
+            platform_environment="test",
+            platform_email_verification_required=True,
+        )
+        with patch.object(security, "get_settings", return_value=verification_settings):
+            with self.assertRaises(HTTPException) as raised:
+                await security.authenticate_ready_vote(request, db_session)
+        self.assertEqual(raised.exception.status_code, 401)
+
+    async def test_ready_vote_auth_projection_is_primitive_and_verification_aware(self) -> None:
+        request = Mock()
+        request.cookies = {"platform_session": "token"}
+        db_session = Mock()
+        db_session.scalar = AsyncMock(return_value="user")
+        settings = SimpleNamespace(
+            platform_session_cookie_name="platform_session",
+            platform_environment="test",
+            platform_email_verification_required=True,
+        )
+        with (
+            patch.object(security, "get_settings", return_value=settings),
+            patch.object(security, "_touch_authenticated_session", new_callable=AsyncMock) as touch,
+        ):
+            result = await security.authenticate_ready_vote(request, db_session)
+
+        statement = db_session.scalar.await_args.args[0]
+        sql = str(statement.compile(dialect=postgresql.dialect())).lower()
+        self.assertIn("sessions.token_digest", sql)
+        self.assertIn("sessions.invalidated_at", sql)
+        self.assertIn("sessions.expires_at", sql)
+        self.assertIn("users.status", sql)
+        self.assertIn("users.email_verified_at", sql)
+        self.assertNotIn("roles", sql)
+        self.assertNotIn("user_roles", sql)
+        self.assertNotIn("last_seen", sql)
+        touch.assert_not_awaited()
+        self.assertEqual(result.user_id, "user")
 
     async def test_ready_vote_database_scope_releases_session_after_commit_scope(self) -> None:
         db_session = Mock()
@@ -95,11 +165,28 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         db_session.commit = AsyncMock()
         context = _AsyncContext(db_session)
         factory = Mock(return_value=context)
-        with patch("python_packages.platform_infra.db.session_factory", return_value=factory):
+        with (
+            patch("python_packages.platform_infra.db.session_factory", return_value=factory),
+            patch("python_packages.platform_infra.db.record_ready_vote_checkout") as checkout,
+        ):
             async with ready_vote_db_session() as scoped_session:
                 self.assertIs(scoped_session, db_session)
                 db_session.connection.assert_awaited_once()
                 await db_session.commit()
+        self.assertTrue(context.exited)
+        checkout.assert_called_once()
+
+    async def test_ready_vote_database_scope_rolls_back_before_closing_on_error(self) -> None:
+        db_session = Mock()
+        db_session.connection = AsyncMock()
+        db_session.rollback = AsyncMock()
+        context = _AsyncContext(db_session)
+        factory = Mock(return_value=context)
+        with patch("python_packages.platform_infra.db.session_factory", return_value=factory):
+            with self.assertRaisesRegex(RuntimeError, "preflight failed"):
+                async with ready_vote_db_session():
+                    raise RuntimeError("preflight failed")
+        db_session.rollback.assert_awaited_once()
         self.assertTrue(context.exited)
 
     async def test_ready_vote_policy_session_does_not_eagerly_checkout(self) -> None:
@@ -126,7 +213,12 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
     def test_ready_vote_route_has_no_request_scoped_database_dependency(self) -> None:
         parameters = inspect.signature(tournaments.vote_deadlock_ready_check).parameters
         self.assertNotIn("db_session", parameters)
-        self.assertNotIn("db_session", inspect.signature(security.get_authenticated_session_for_ready_vote).parameters)
+        self.assertNotIn("auth_session", parameters)
+        self.assertIn("request", parameters)
+        self.assertEqual(
+            list(inspect.signature(security.authenticate_ready_vote).parameters),
+            ["request", "db_session"],
+        )
 
     def test_ready_vote_tournament_snapshot_is_immutable_and_slot_based(self) -> None:
         snapshot = ReadyVoteTournamentSnapshot(

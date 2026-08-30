@@ -4,6 +4,7 @@ from tools.platform_production_qa import (
     HttpMetricsRecorder,
     HttpSample,
     SystemSampler,
+    _attach_server_diagnostic_sample,
     burst_offsets,
     follow_up_read_counts,
     evaluate_write_burst_profiles,
@@ -112,6 +113,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
 
         summary = recorder.summary(phases={"write_join_burst_10s"})
 
+        self.assertEqual(summary["scope"], "full_population")
         self.assertEqual(summary["requests"], 1)
         self.assertEqual(summary["overall"]["p95_ms"], 100.0)
         self.assertEqual(summary["overall"]["response_bytes"]["max_bytes"], 200)
@@ -180,16 +182,39 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
                 "route=/{slug}/deadlock/ready-check/vote status=200 total_ms=40.00 sql_ms=20.00 "
                 "sql_count=3 max_sql_ms=10.00 compute_ms=2.00 compute_blocks=1 response_bytes=180 "
                 "pool_wait_ms=3.00 qa_phase=write_ready_burst_5s "
-                "ready_vote_auth_ms=4.00 ready_vote_db_checkout_ms=5.00 "
+                "ready_vote_auth_ms=4.00 ready_vote_checkout_count=1 ready_vote_checkout_ms=5.00 "
                 "ready_vote_preflight_ms=6.00 ready_vote_upsert_ms=7.00 "
-                "ready_vote_counter_ms=7.00 ready_vote_commit_ms=2.00 ready_vote_response_ms=0.10",
+                "ready_vote_commit_ms=2.00 ready_vote_response_ms=0.10",
             ],
             tournament_slug="demo",
         )
 
         ready_vote = summary["by_route"]["/{slug}/deadlock/ready-check/vote"]["ready_vote"]
+        self.assertEqual(summary["scope"]["kind"], "diagnostic_sample")
         self.assertEqual(ready_vote["ready_vote_auth_ms"]["avg_ms"], 4.0)
+        self.assertEqual(ready_vote["ready_vote_checkout_count"]["avg_ms"], 1.0)
+        self.assertEqual(ready_vote["ready_vote_checkout_ms"]["avg_ms"], 5.0)
         self.assertEqual(ready_vote["ready_vote_commit_ms"]["p95_ms"], 2.0)
+        self.assertNotIn("ready_vote_counter_ms", ready_vote)
+        self.assertNotIn("ready_vote_db_checkout_ms", ready_vote)
+
+    def test_external_http_summary_marks_full_population(self) -> None:
+        recorder = HttpMetricsRecorder()
+        self.assertEqual(recorder.summary()["scope"], "full_population")
+
+    def test_nested_write_burst_server_reports_require_diagnostic_scope(self) -> None:
+        server_by_phase = {
+            "write_ready_burst_5s": {"requests": 2, "overall": {"count": 2}},
+        }
+        write_burst = {
+            "profiles": [{"phase": "write_ready_burst_5s"}],
+        }
+        _attach_server_diagnostic_sample(write_burst, server_by_phase)
+
+        self.assertEqual(write_burst["server_by_phase"]["scope"], "diagnostic_sample")
+        self.assertEqual(write_burst["server_by_phase"]["by_phase"], server_by_phase)
+        self.assertEqual(write_burst["profiles"][0]["server"]["scope"], "diagnostic_sample")
+        self.assertEqual(write_burst["profiles"][0]["server"]["summary"], server_by_phase["write_ready_burst_5s"])
 
     def test_request_perf_summary_keeps_workspace_pressure_in_route_breakdown(self) -> None:
         summary = summarize_request_perf_logs(

@@ -115,6 +115,7 @@ class ExternalLoadTests(unittest.TestCase):
         )
         summary = summarize_results([result])
         serialized = json.dumps(summary)
+        self.assertEqual(summary["scope"], "full_population")
         self.assertEqual(summary["requests"], 1)
         self.assertEqual(summary["errors"], 0)
         self.assertNotIn(secret, serialized)
@@ -177,6 +178,7 @@ class ExternalLoadTests(unittest.TestCase):
                 )
 
         self.assertTrue(report["acceptance"]["passed"])
+        self.assertEqual(report["scope"], "full_population")
         self.assertEqual(report["phases"]["read_mix"]["requests"], 2)
         self.assertEqual(report["phases"]["manual_refresh"]["requests"], 1)
         self.assertEqual(report["phases"]["manual_refresh"]["status_counts"], {"304": 1})

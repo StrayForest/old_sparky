@@ -371,6 +371,7 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         if isinstance(result.response_json, dict) and "changed" in result.response_json:
             changed[str(bool(result.response_json.get("changed")))] += 1
     return {
+        "scope": "full_population",
         "requests": len(results),
         "errors": errors,
         "status_counts": dict(sorted(status_counts.items())),
@@ -641,6 +642,7 @@ def run_load(
     finished_at = datetime.now(UTC)
     return {
         "schema": 1,
+        "scope": "full_population",
         "mode": mode,
         "origin": origin,
         "fixture_marker": manifest["marker"],

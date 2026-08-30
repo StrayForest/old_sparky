@@ -24,10 +24,13 @@ The browser clock is a presentation aid only. `POST
 /tournaments/{slug}/deadlock/ready-check/vote` validates the authenticated
 participant, schedule boundaries, eligibility, tournament/workflow state,
 duplicate/concurrent writes and the current server time. A delayed automation
-worker cannot make a valid vote at or after `starts_at` fail: the vote path
-locks the tournament row and can materialize the active round itself. The
-worker remains responsible for persistence, no-show/timeout processing and
-later workflow side effects.
+worker cannot make a valid vote at or after `starts_at` fail: an ordinary vote
+on an already active round deliberately does not lock the tournament row.
+Deferred lifecycle guards reject a vote that races a round close or participant
+withdrawal/disqualification. Lazy round creation and lifecycle transition
+paths acquire the tournament/workflow lock and can materialize the active
+round themselves. The worker remains responsible for persistence,
+no-show/timeout processing and later workflow side effects.
 
 ## Client and read contracts
 

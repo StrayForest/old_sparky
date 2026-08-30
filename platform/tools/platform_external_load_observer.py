@@ -75,6 +75,15 @@ async def async_main() -> int:
         "stop_file_seen": args.stop_file.exists(),
         "timed_out": timed_out,
         "system": sampler.summary(),
+        "measurement_scope": {
+            "http_client": "external_load_runner_report",
+            "server_request_perf_logs": "diagnostic_sample",
+            "note": (
+                "This origin-side observer contains only the selected request_perf "
+                "journal lines; full-population HTTP latency is in the external "
+                "load runner report."
+            ),
+        },
         "server_request_perf_logs": summarize_request_perf_logs(
             request_perf_lines,
             tournament_slug=None,

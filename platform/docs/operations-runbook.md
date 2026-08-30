@@ -261,20 +261,29 @@ before starting another production load.
 The vote endpoint uses a deliberately minimal authenticated-session lookup: it
 validates the session, user status and expiry but does not hydrate role data or
 touch `last_seen` inside the burst. Authentication returns a detached user/time
-snapshot and closes its session before the vote route opens its own short
-transaction. The ordinary preflight selects only the tournament columns needed
-by the vote; ORM tournament hydration remains limited to lazy workflow
-transitions. Vote authorization still performs the full server-side time,
-participant, profile, round and workflow checks; ordinary authenticated requests
-retain role hydration and session last-seen updates.
+snapshot through the route-owned short transaction; the auth lookup, ordinary
+preflight, conditional upsert and commit therefore share one session checkout.
+The ordinary preflight selects only the tournament columns needed by the vote;
+ORM tournament hydration remains limited to lazy workflow transitions. Vote
+authorization still performs the full server-side time, participant, profile,
+round and workflow checks; ordinary authenticated requests retain role
+hydration and session last-seen updates.
 
-Ready Vote `request_perf` records low-cardinality spans for auth, vote-session
-checkout, preflight, conditional upsert, trigger-maintained counter work,
-commit and response construction. The conditional upsert returns `changed=false`
-for an identical choice, so it performs no vote-row update, counter delta or
-cache invalidation. These fields are aggregated by route and QA phase by the
-production QA parser; successful requests remain below the normal per-request
-INFO logging path unless the existing mutation/slow-request gate selects them.
+Ready Vote `request_perf` records low-cardinality spans for auth, the dedicated
+checkout (including `ready_vote_checkout_count` and
+`ready_vote_checkout_ms`), preflight, conditional upsert, commit and response
+construction. `ready_vote_upsert_ms` includes the trigger-maintained counter
+work. The conditional upsert returns `changed=false` for an identical choice,
+so it performs no vote-row update, counter delta or cache invalidation. These
+fields are aggregated by route and QA phase by the production QA parser;
+successful requests remain below the normal per-request INFO logging path
+unless the existing slow-request/failure gate selects them.
+
+Performance reports keep full-population HTTP client measurements separate from
+the diagnostic `request_perf` journal sample. The client summary covers every
+request issued by the QA phase; server request metrics include only lines
+selected by the existing slow-request/failure/diagnostic logging policy and
+must not be interpreted as a population count.
 
 The external Ready Vote fixture creates and joins every tournament before it
 starts any Ready Check. This keeps the first tournament's ten-minute manual

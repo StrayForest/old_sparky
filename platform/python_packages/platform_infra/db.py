@@ -25,7 +25,7 @@ from python_packages.platform_infra.config import (
 )
 from python_packages.platform_infra.performance import (
     install_sqlalchemy_query_metrics,
-    record_ready_vote_span,
+    record_ready_vote_checkout,
     record_pool_checkout_wait,
 )
 
@@ -148,8 +148,8 @@ async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
     route.  They are intentionally no-ops for the Ready Vote endpoint, but
     FastAPI still resolves their session dependency.  Avoid the eager
     checkout for that endpoint so the policy session remains connection-free;
-    the route's detached auth and dedicated vote scopes own the only required
-    database connections.  Other routes retain the eager checkout so pool
+    the route-owned Ready Vote scope owns the only required database
+    connection. Other routes retain the eager checkout so pool
     exhaustion remains a bounded, observable 503.
     """
 
@@ -179,8 +179,10 @@ async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
 async def ready_vote_db_session() -> AsyncGenerator[AsyncSession, None]:
     """Own the short transaction session used by the Ready Vote route.
 
-    Unlike the request dependency this scope is entered only after auth and
-    leaves no session alive while the response is being built or serialized.
+    Unlike the request dependency this scope is entered by the route around
+    authentication, preflight, the conditional upsert and commit. It forces
+    exactly one checkout for the normal path and leaves no session alive while
+    the detached response is being built or serialized.
     """
 
     async with session_factory()() as db_session:
@@ -192,5 +194,17 @@ async def ready_vote_db_session() -> AsyncGenerator[AsyncSession, None]:
             raise
         checkout_elapsed = perf_counter() - checkout_started
         record_pool_checkout_wait(checkout_elapsed)
-        record_ready_vote_span("ready_vote_db_checkout_ms", checkout_elapsed)
-        yield db_session
+        record_ready_vote_checkout(checkout_elapsed)
+        try:
+            yield db_session
+        except BaseException:
+            # Auth/preflight failures and commit errors must release any
+            # autobegin transaction before the context closes. This is also
+            # safe after the route has already rolled back an integrity error.
+            try:
+                in_transaction = getattr(db_session, "in_transaction", None)
+                if in_transaction is None or in_transaction():
+                    await db_session.rollback()
+            except Exception:
+                logger.exception("ready_vote_transaction_rollback_failed")
+            raise

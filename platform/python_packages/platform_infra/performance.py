@@ -30,6 +30,12 @@ class RequestPerformanceMetrics:
     compute_time_seconds: float = 0.0
     response_bytes: int = 0
     pool_checkout_wait_seconds: float = 0.0
+    # Ready Vote owns one dedicated session checkout for the complete
+    # auth/preflight/upsert/commit transaction. Keep this separate from the
+    # aggregate pool wait and from generic SQL timing so physical checkout
+    # cardinality is visible in request_perf diagnostics.
+    ready_vote_checkout_count: int = 0
+    ready_vote_checkout_ms: float = 0.0
     qa_phase: str | None = None
     cf_ray: str | None = None
     client_fingerprint: str | None = None
@@ -144,6 +150,16 @@ def record_pool_checkout_wait(elapsed_seconds: float) -> None:
         metrics.pool_checkout_wait_seconds += max(0.0, elapsed_seconds)
 
 
+def record_ready_vote_checkout(elapsed_seconds: float) -> None:
+    """Record the dedicated Ready Vote checkout at its sole owner."""
+
+    metrics = _current_metrics.get()
+    if metrics is None:
+        return
+    metrics.ready_vote_checkout_count += 1
+    metrics.ready_vote_checkout_ms += max(0.0, elapsed_seconds) * 1000
+
+
 def record_ready_vote_span(name: str, elapsed_seconds: float) -> None:
     metrics = _current_metrics.get()
     if metrics is not None and name.startswith("ready_vote_"):
@@ -249,9 +265,10 @@ class RequestPerformanceMiddleware:
             "request_perf request_id=%s method=%s path=%s route=%s status=%s "
             "total_ms=%.2f sql_ms=%.2f sql_count=%s max_sql_ms=%.2f "
             "compute_ms=%.2f compute_blocks=%s "
-            "ready_vote_auth_ms=%.2f ready_vote_db_checkout_ms=%.2f "
+            "ready_vote_auth_ms=%.2f ready_vote_checkout_count=%s "
+            "ready_vote_checkout_ms=%.2f "
             "ready_vote_preflight_ms=%.2f ready_vote_upsert_ms=%.2f "
-            "ready_vote_counter_ms=%.2f ready_vote_commit_ms=%.2f "
+            "ready_vote_commit_ms=%.2f "
             "ready_vote_response_ms=%.2f response_bytes=%s qa_phase=%s "
             "pool_wait_ms=%.2f cf_ray=%s client=%s",
             metrics.request_id,
@@ -266,10 +283,10 @@ class RequestPerformanceMiddleware:
             metrics.compute_time_seconds * 1000,
             metrics.compute_blocks,
             metrics.ready_vote_spans.get("ready_vote_auth_ms", 0.0) * 1000,
-            metrics.ready_vote_spans.get("ready_vote_db_checkout_ms", 0.0) * 1000,
+            metrics.ready_vote_checkout_count,
+            metrics.ready_vote_checkout_ms,
             metrics.ready_vote_spans.get("ready_vote_preflight_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_upsert_ms", 0.0) * 1000,
-            metrics.ready_vote_spans.get("ready_vote_counter_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_commit_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_response_ms", 0.0) * 1000,
             metrics.response_bytes,
