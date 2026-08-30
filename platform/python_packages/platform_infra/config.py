@@ -197,6 +197,26 @@ class PlatformSettings(BaseSettings):
     # and CPU precisely during the bursts we need to measure.
     platform_perf_log_mutations: bool = False
     platform_api_workers: int = Field(default=2, gt=0)
+    # Ready Vote admission is process-local: each API worker has its own
+    # bounded controller, so these limits are per worker rather than global.
+    # The default 0 ms waiter budget sheds before an asyncio queue can grow;
+    # the browser retries only the explicit overload response.
+    platform_ready_vote_admission_enabled: bool = True
+    platform_ready_vote_admission_min_concurrency: int = Field(default=4, ge=1, le=64)
+    platform_ready_vote_admission_initial_concurrency: int = Field(default=8, ge=1, le=64)
+    platform_ready_vote_admission_max_concurrency: int = Field(default=16, ge=1, le=64)
+    platform_ready_vote_admission_max_waiters: int = Field(default=0, ge=0, le=16)
+    platform_ready_vote_admission_wait_timeout_ms: float = Field(default=0.0, ge=0, le=250)
+    platform_ready_vote_admission_cpu_sample_interval_seconds: float = Field(
+        default=0.5, ge=0.1, le=5.0
+    )
+    platform_ready_vote_admission_cpu_ewma_alpha: float = Field(
+        default=0.25, gt=0, le=1.0
+    )
+    platform_ready_vote_admission_recovery_samples: int = Field(default=8, ge=2, le=120)
+    platform_ready_vote_admission_control_interval_seconds: float = Field(
+        default=0.5, ge=0.1, le=5.0
+    )
     # Keep PostgreSQL connection count bounded per process. API and Celery
     # processes use separate budgets so background bursts cannot consume the
     # entire database capacity reserved for user requests.
@@ -319,6 +339,14 @@ def validate_platform_settings(
     ):
         raise RuntimeError(
             "Configured API and worker PostgreSQL pools exceed PLATFORM_DB_CONNECTION_BUDGET."
+        )
+    if not (
+        settings.platform_ready_vote_admission_min_concurrency
+        <= settings.platform_ready_vote_admission_initial_concurrency
+        <= settings.platform_ready_vote_admission_max_concurrency
+    ):
+        raise RuntimeError(
+            "Ready Vote admission concurrency must satisfy min <= initial <= max."
         )
     if environment == "test":
         redis_url = urlsplit(settings.platform_redis_url)

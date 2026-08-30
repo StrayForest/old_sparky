@@ -257,8 +257,8 @@ jobs:
               --timeout 30 \
               --duplicate-count "$DUPLICATE_COUNT" \
               --manual-refresh-count "$MANUAL_REFRESH_COUNT" \
-              --p95-budget-ms 1000 \
-              --p99-budget-ms 2000
+              --p95-budget-ms 600 \
+              --p99-budget-ms 1000
             load_status="$?"
             set -e
             ssh \
@@ -388,13 +388,20 @@ jobs:
               print("External client report was not produced.")
           else:
               payload = json.loads(path.read_text(encoding="utf-8"))
-              overall = payload.get("overall") or {}
+              overall = payload.get("raw_http") or payload.get("overall") or {}
               latency = overall.get("latency") or {}
+              logical = payload.get("logical") or {}
+              logical_latency = logical.get("end_to_end_latency") or {}
               acceptance = payload.get("acceptance") or {}
               print(f"- Mode: **{payload.get('mode')}**")
               print(f"- Fixture: {payload.get('users')} users / {payload.get('tournaments')} tournaments")
-              print(f"- Requests: {overall.get('requests')}; errors: {overall.get('errors')}")
-              print(f"- p50/p95/p99: {latency.get('p50_ms')} / {latency.get('p95_ms')} / {latency.get('p99_ms')} ms")
+              print(f"- Raw HTTP attempts: {overall.get('requests')}; errors: {overall.get('errors')}; overloads: {overall.get('temporary_overload_responses', 0)}")
+              print(f"- Raw attempt p50/p95/p99: {latency.get('p50_ms')} / {latency.get('p95_ms')} / {latency.get('p99_ms')} ms")
+              if logical:
+                  print(f"- Logical actions: {logical.get('actions')}; final success/failure: {logical.get('final_successes')} / {logical.get('final_failures')}; retries/action: {logical.get('retries_per_action')}")
+                  print(f"- Logical E2E p50/p95/p99: {logical_latency.get('p50_ms')} / {logical_latency.get('p95_ms')} / {logical_latency.get('p99_ms')} ms")
+                  accepted = logical.get('accepted_request_latency') or {}
+                  print(f"- Accepted request p50/p95/p99: {accepted.get('p50_ms')} / {accepted.get('p95_ms')} / {accepted.get('p99_ms')} ms; goodput: {logical.get('successful_goodput_actions_per_second')} actions/s")
               print(f"- Contract: **{'passed' if acceptance.get('contract_ok') else 'failed'}**; latency gate: **{'passed' if acceptance.get('passed') else 'failed'}**")
           PY
 

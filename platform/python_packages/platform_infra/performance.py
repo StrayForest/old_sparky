@@ -36,6 +36,18 @@ class RequestPerformanceMetrics:
     # cardinality is visible in request_perf diagnostics.
     ready_vote_checkout_count: int = 0
     ready_vote_checkout_ms: float = 0.0
+    ready_vote_admission_inflight: int = 0
+    ready_vote_admission_limit: int = 0
+    ready_vote_admission_wait_ms: float = 0.0
+    ready_vote_admitted_total: int = 0
+    ready_vote_shed_total: int = 0
+    ready_vote_controller_state: str = "-"
+    ready_vote_controller_limit_changes: int = 0
+    ready_vote_cpu_pressure: float = 0.0
+    ready_vote_pool_wait_ms: float = 0.0
+    ready_vote_cpu_monitor_sample_ms: float = 0.0
+    ready_vote_cpu_monitor_samples: int = 0
+    ready_vote_admission_shed: bool = False
     qa_phase: str | None = None
     cf_ray: str | None = None
     client_fingerprint: str | None = None
@@ -166,6 +178,52 @@ def record_ready_vote_span(name: str, elapsed_seconds: float) -> None:
         metrics.ready_vote_spans[name] = max(0.0, elapsed_seconds)
 
 
+def record_ready_vote_admission_start(
+    *,
+    snapshot: Any,
+    wait_ms: float,
+    admitted: bool,
+) -> None:
+    """Attach the process-local admission decision to the current request."""
+
+    metrics = _current_metrics.get()
+    if metrics is None:
+        return
+    metrics.ready_vote_admission_inflight = int(snapshot.inflight)
+    metrics.ready_vote_admission_limit = int(snapshot.limit)
+    metrics.ready_vote_admission_wait_ms = max(0.0, float(wait_ms))
+    metrics.ready_vote_admitted_total = int(snapshot.admitted_total)
+    metrics.ready_vote_shed_total = int(snapshot.shed_total)
+    metrics.ready_vote_controller_state = str(snapshot.state)
+    metrics.ready_vote_controller_limit_changes = int(snapshot.limit_changes)
+    metrics.ready_vote_cpu_pressure = max(0.0, float(snapshot.cpu_pressure))
+    metrics.ready_vote_cpu_monitor_sample_ms = max(
+        0.0,
+        float(snapshot.cpu_monitor_sample_ms),
+    )
+    metrics.ready_vote_cpu_monitor_samples = int(snapshot.cpu_monitor_samples)
+    metrics.ready_vote_admission_shed = not admitted
+
+
+def record_ready_vote_admission_completion(*, snapshot: Any, pool_wait_ms: float) -> None:
+    """Record completion pressure without changing the request's admission snapshot."""
+
+    metrics = _current_metrics.get()
+    if metrics is None:
+        return
+    metrics.ready_vote_pool_wait_ms = max(0.0, float(pool_wait_ms))
+    # Keep cumulative controller values current for slow-request diagnostics.
+    metrics.ready_vote_admitted_total = int(snapshot.admitted_total)
+    metrics.ready_vote_shed_total = int(snapshot.shed_total)
+    metrics.ready_vote_controller_limit_changes = int(snapshot.limit_changes)
+    metrics.ready_vote_cpu_pressure = max(0.0, float(snapshot.cpu_pressure))
+    metrics.ready_vote_cpu_monitor_sample_ms = max(
+        0.0,
+        float(snapshot.cpu_monitor_sample_ms),
+    )
+    metrics.ready_vote_cpu_monitor_samples = int(snapshot.cpu_monitor_samples)
+
+
 def reset_request_metrics(token: Token[RequestPerformanceMetrics | None]) -> None:
     _current_metrics.reset(token)
 
@@ -256,6 +314,10 @@ class RequestPerformanceMiddleware:
                 not is_ready_vote_route
                 and metrics.pool_checkout_wait_seconds >= 0.1
             )
+            or (
+                is_ready_vote_route
+                and metrics.ready_vote_admission_wait_ms >= 25.0
+            )
         )
         if not should_log:
             return
@@ -269,7 +331,14 @@ class RequestPerformanceMiddleware:
             "ready_vote_checkout_ms=%.2f "
             "ready_vote_preflight_ms=%.2f ready_vote_upsert_ms=%.2f "
             "ready_vote_commit_ms=%.2f "
-            "ready_vote_response_ms=%.2f response_bytes=%s qa_phase=%s "
+            "ready_vote_response_ms=%.2f "
+            "ready_vote_admission_inflight=%s ready_vote_admission_limit=%s "
+            "ready_vote_admission_wait_ms=%.2f ready_vote_admitted_total=%s "
+            "ready_vote_shed_total=%s ready_vote_controller_state=%s "
+            "ready_vote_controller_limit_changes=%s ready_vote_cpu_pressure=%.2f "
+            "ready_vote_admission_shed=%s ready_vote_pool_wait_ms=%.2f "
+            "ready_vote_cpu_monitor_sample_ms=%.2f "
+            "ready_vote_cpu_monitor_samples=%s response_bytes=%s qa_phase=%s "
             "pool_wait_ms=%.2f cf_ray=%s client=%s",
             metrics.request_id,
             metrics.method,
@@ -289,6 +358,18 @@ class RequestPerformanceMiddleware:
             metrics.ready_vote_spans.get("ready_vote_upsert_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_commit_ms", 0.0) * 1000,
             metrics.ready_vote_spans.get("ready_vote_response_ms", 0.0) * 1000,
+            metrics.ready_vote_admission_inflight,
+            metrics.ready_vote_admission_limit,
+            metrics.ready_vote_admission_wait_ms,
+            metrics.ready_vote_admitted_total,
+            metrics.ready_vote_shed_total,
+            metrics.ready_vote_controller_state,
+            metrics.ready_vote_controller_limit_changes,
+            metrics.ready_vote_cpu_pressure,
+            metrics.ready_vote_admission_shed,
+            metrics.ready_vote_pool_wait_ms,
+            metrics.ready_vote_cpu_monitor_sample_ms,
+            metrics.ready_vote_cpu_monitor_samples,
             metrics.response_bytes,
             metrics.qa_phase or "-",
             metrics.pool_checkout_wait_seconds * 1000,

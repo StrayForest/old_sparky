@@ -78,6 +78,18 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_GUNICORN_ACCESS_LOG"], "false")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_WORKER_LOG_LEVEL"], "WARNING")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_PERF_LOG_MUTATIONS"], "false")
+        self.assertEqual(
+            configure.PUBLIC_BASELINE["PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY"],
+            "4",
+        )
+        self.assertEqual(
+            configure.PUBLIC_BASELINE["PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY"],
+            "8",
+        )
+        self.assertEqual(
+            configure.PUBLIC_BASELINE["PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY"],
+            "16",
+        )
 
     def test_capacity_profile_preserves_connection_budget(self) -> None:
         profile = configure.RUNTIME_PROFILES["api-3x16"]

@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import Select, and_, cast, delete, func, or_, select, union
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
@@ -233,7 +234,14 @@ from python_packages.platform_infra.security import (
     get_authenticated_session,
     get_optional_authenticated_session,
 )
-from python_packages.platform_infra.performance import record_ready_vote_span
+from python_packages.platform_infra.performance import (
+    current_request_metrics,
+    record_ready_vote_span,
+)
+from python_packages.platform_infra.ready_vote_admission import (
+    READY_VOTE_ADMISSION_SEVERE,
+    get_ready_vote_admission_controller,
+)
 from python_packages.platform_infra.tournament_names import (
     lock_tournament_name,
     public_tournament_name_exists,
@@ -4791,6 +4799,28 @@ async def vote_deadlock_ready_check(
     payload: TournamentDeadlockReadyVoteRequest,
     request: Request,
 ) -> TournamentDeadlockReadyVoteResponse:
+    admission_controller = get_ready_vote_admission_controller()
+    admission_lease = await admission_controller.acquire()
+    if admission_lease is None:
+        snapshot = admission_controller.snapshot()
+        # Keep the retry contract explicit and bounded. Retry-After is an
+        # integer-second HTTP hint; the JSON millisecond value gives the
+        # browser enough precision to apply jitter without a synchronized
+        # retry wave. No database dependency is entered on this branch.
+        retry_after_ms = 350 if snapshot.state == READY_VOTE_ADMISSION_SEVERE else 250
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={
+                "Cache-Control": "no-store",
+                "Retry-After": "1",
+            },
+            content={
+                "code": "READY_VOTE_OVERLOADED",
+                "retryable": True,
+                "retry_after_ms": retry_after_ms,
+            },
+        )
+
     auth_snapshot: ReadyVoteAuthSnapshot | None = None
     current_user_id = "-"
     vote_now: datetime | None = None
@@ -4957,6 +4987,22 @@ async def vote_deadlock_ready_check(
             relative_ms,
         )
         raise
+    finally:
+        metrics = current_request_metrics()
+        pool_wait_ms = (
+            metrics.pool_checkout_wait_seconds * 1000
+            if metrics is not None
+            else 0.0
+        )
+        # Release admission even when auth, workflow validation, DB checkout,
+        # or the commit is cancelled/fails. Shielding prevents task
+        # cancellation from leaking a process-local slot.
+        await asyncio.shield(
+            admission_lease.release(
+                service_ms=(time.perf_counter() - admission_lease.started_at) * 1000,
+                pool_wait_ms=pool_wait_ms,
+            )
+        )
 
 
 @router.post("/{slug}/deadlock/ready-check/close", response_model=TournamentDeadlockReadyRoundResponse)

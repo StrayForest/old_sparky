@@ -83,6 +83,16 @@ READY_VOTE_PERF_KEYS = (
     "ready_vote_auth_ms",
     "ready_vote_checkout_count",
     "ready_vote_checkout_ms",
+    "ready_vote_admission_inflight",
+    "ready_vote_admission_limit",
+    "ready_vote_admission_wait_ms",
+    "ready_vote_admitted_total",
+    "ready_vote_shed_total",
+    "ready_vote_controller_limit_changes",
+    "ready_vote_cpu_pressure",
+    "ready_vote_pool_wait_ms",
+    "ready_vote_cpu_monitor_sample_ms",
+    "ready_vote_cpu_monitor_samples",
     "ready_vote_preflight_ms",
     "ready_vote_upsert_ms",
     "ready_vote_commit_ms",
@@ -1299,10 +1309,24 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
         "response_bytes": int,
         "pool_wait_ms": float,
         "ready_vote_checkout_count": int,
+        "ready_vote_admission_inflight": int,
+        "ready_vote_admission_limit": int,
+        "ready_vote_admitted_total": int,
+        "ready_vote_shed_total": int,
+        "ready_vote_controller_limit_changes": int,
+        "ready_vote_cpu_monitor_samples": int,
         **{
             key: float
             for key in READY_VOTE_PERF_KEYS
-            if key != "ready_vote_checkout_count"
+            if key not in {
+                "ready_vote_checkout_count",
+                "ready_vote_admission_inflight",
+                "ready_vote_admission_limit",
+                "ready_vote_admitted_total",
+                "ready_vote_shed_total",
+                "ready_vote_controller_limit_changes",
+                "ready_vote_cpu_monitor_samples",
+            }
         },
     }
     for key, caster in numeric_keys.items():
@@ -1354,6 +1378,17 @@ def summarize_request_perf_logs(
     def row_metric_stats(key: str, row_values: list[dict[str, Any]]) -> dict[str, Any]:
         values = [float(row[key]) for row in row_values if isinstance(row.get(key), (int, float))]
         return metric_stats(values)
+
+    def controller_state_counts(row_values: list[dict[str, Any]]) -> dict[str, int]:
+        return dict(
+            sorted(
+                Counter(
+                    str(row["ready_vote_controller_state"])
+                    for row in row_values
+                    if isinstance(row.get("ready_vote_controller_state"), str)
+                ).items()
+            )
+        )
 
     totals = [float(row["total_ms"]) for row in rows if isinstance(row.get("total_ms"), (int, float))]
     sql_counts = [float(row["sql_count"]) for row in rows if isinstance(row.get("sql_count"), (int, float))]
@@ -1418,6 +1453,7 @@ def summarize_request_perf_logs(
             ),
             "pool_checkout_wait_ms": row_metric_stats("pool_wait_ms", row_values),
             "ready_vote": ready_vote_spans,
+            "ready_vote_controller_state_counts": controller_state_counts(row_values),
         }
 
     return {
@@ -1436,6 +1472,7 @@ def summarize_request_perf_logs(
             for key in READY_VOTE_PERF_KEYS
             if any(isinstance(row.get(key), (int, float)) for row in rows)
         },
+        "ready_vote_controller_state_counts": controller_state_counts(rows),
         "by_route": {
             route: summarize_route_rows(row_values)
             for route, row_values in sorted(

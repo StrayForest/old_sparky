@@ -6,6 +6,10 @@ from fastapi import FastAPI
 
 from python_packages.platform_infra.db import dispose_engine, warm_up_engine
 from python_packages.platform_infra.logging import configure_logging
+from python_packages.platform_infra.ready_vote_admission import (
+    start_ready_vote_admission_controller,
+    stop_ready_vote_admission_controller,
+)
 from python_packages.platform_infra.redis import warm_up_redis
 
 
@@ -14,7 +18,9 @@ async def platform_lifespan(_: FastAPI):
     configure_logging()
     await warm_up_engine()
     await warm_up_redis()
+    start_ready_vote_admission_controller()
     try:
         yield
     finally:
+        await stop_ready_vote_admission_controller()
         await dispose_engine()

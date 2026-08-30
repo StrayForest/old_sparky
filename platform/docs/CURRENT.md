@@ -43,7 +43,13 @@ Read this file for the current production baseline and next engineering priority
 
 AS-18 — hot-path capacity and backpressure implementation is complete.
 Production remains commit- and exact-SHA-gated; detailed load output belongs in
-external retained reports and is not a product architecture contract.
+external retained reports and is not a product architecture contract. The
+reviewed Ready Vote path now also has a process-local adaptive admission
+controller per API worker, with per-worker defaults `4/8/16`, bounded/no-waiter
+overload shedding before DB checkout, and a browser chain of at most two
+jittered retries for the explicit overload response. Production 15k/20k Pareto
+evidence for this controller remains an operator-owned external-load gate; the
+previous `ba377cbe` measurements remain the pre-admission baseline below.
 
 Current status: migration `0048` adds a partial covering index for the
 `UserSession` auth query. Evidence is `EXPLAIN` `Index Only Scan` / `Heap
