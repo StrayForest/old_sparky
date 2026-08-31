@@ -14,6 +14,8 @@ Environment=PLATFORM_SHARED_DIR=/opt/oldsparky/platform/shared
 Environment=PLATFORM_ENV_FILE=/opt/oldsparky/platform/shared/env/api.env
 Environment=PLATFORM_PYTHON_BIN=/opt/oldsparky/platform/shared/venv/bin/python
 Environment=PLATFORM_API_WORKERS=2
+RuntimeDirectory=oldsparky-ready-vote-cprofile
+RuntimeDirectoryMode=0700
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=5000
 ExecStart=/opt/oldsparky/platform/current/tools/platform_run_api.sh
