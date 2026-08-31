@@ -353,6 +353,11 @@ class ManualLiveAuthQaIntegrationTests(unittest.IsolatedAsyncioTestCase):
             or "platformdb_test" not in settings.platform_database_url
         ):
             self.skipTest("isolated platform test database is required")
+        # IsolatedAsyncioTestCase gives every test its own event loop, while
+        # the infrastructure module keeps one process-global AsyncEngine.
+        # Dispose any engine left by an earlier test before checking out the
+        # first connection on this loop.
+        await dispose_engine()
         self.temporary = tempfile.TemporaryDirectory()
         self.secret_dir = Path(self.temporary.name)
         self.secret_dir.chmod(0o700)
