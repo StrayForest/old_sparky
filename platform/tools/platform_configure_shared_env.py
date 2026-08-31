@@ -149,7 +149,7 @@ RUNTIME_PROFILES = {
         "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY": "8",
         "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": "8",
         "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": "8",
-        "PLATFORM_READY_VOTE_CPU_PROFILE_DIR": "/tmp/old-sparky-ready-vote-cprofile",
+        "PLATFORM_READY_VOTE_CPU_PROFILE_DIR": "/opt/oldsparky/platform/shared/ready-vote-cprofile",
         "PLATFORM_PERF_SLOW_REQUEST_MS": "0",
         "PLATFORM_PERF_LOG_MUTATIONS": "true",
     },

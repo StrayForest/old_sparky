@@ -57,7 +57,8 @@ def cpu_profile_summary(output_dir: Path | None) -> dict[str, object]:
     if output_dir is None or not output_dir.is_dir():
         return {"enabled": False, "profiles": []}
     profiles: list[dict[str, object]] = []
-    for path in sorted(output_dir.glob("ready-vote-cprofile-*.pstats")):
+    profile_paths = sorted(output_dir.glob("ready-vote-cprofile-*.pstats"))
+    for path in profile_paths:
         try:
             stats = Stats(str(path))
         except (OSError, TypeError, ValueError):
@@ -78,7 +79,23 @@ def cpu_profile_summary(output_dir: Path | None) -> dict[str, object]:
                 }
             )
         profiles.append({"path": str(path), "functions": functions})
-    return {"enabled": True, "profiles": profiles}
+    cleaned_files = 0
+    for path in profile_paths + sorted(output_dir.glob("ready-vote-cprofile-*.txt")):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        cleaned_files += 1
+    try:
+        output_dir.rmdir()
+    except OSError:
+        pass
+    return {
+        "enabled": True,
+        "profiles": profiles,
+        "cleaned_files": cleaned_files,
+        "cleanup_ok": not output_dir.exists(),
+    }
 
 
 async def postgres_statement_snapshot() -> dict[str, object]:
@@ -181,7 +198,7 @@ async def ready_vote_explain_evidence() -> dict[str, object]:
                         LEFT JOIN platform.tournament_deadlock_ready_votes AS v
                           ON v.round_id = r.id
                          AND v.user_id = p.user_id
-                        WHERE run.status = 'running'
+                        WHERE run.status IN ('running', 'passed')
                         ORDER BY t.created_at DESC, r.id DESC
                         LIMIT 1
                         """
@@ -204,7 +221,7 @@ async def ready_vote_explain_evidence() -> dict[str, object]:
 
             async def explain(statement: str, parameters: dict[str, object]) -> object:
                 result = await db_session.execute(
-                    text("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + statement),
+                    text("EXPLAIN (ANALYZE, BUFFERS, WAL, FORMAT JSON) " + statement),
                     parameters,
                 )
                 return result.scalar_one()
