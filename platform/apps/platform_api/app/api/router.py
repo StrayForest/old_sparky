@@ -29,6 +29,13 @@ from apps.platform_api.app.services.tournament_write_serialization import (
 )
 
 api_router = APIRouter()
+# Keep the hottest write route at the front of the application route table.
+# This removes unrelated route matching work before FastAPI reaches Ready Vote.
+api_router.include_router(
+    tournaments.ready_vote_router,
+    prefix="/tournaments",
+    tags=["tournaments"],
+)
 api_router.include_router(health.router, prefix="/health", tags=["health"])
 # Registration owns POST /auth/register while the remaining authentication
 # routes stay in their established module.

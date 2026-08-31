@@ -249,6 +249,7 @@ from python_packages.platform_infra.tournament_names import (
 from python_packages.platform_infra.slugs import unique_slug_from_name
 
 router = APIRouter()
+ready_vote_router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
@@ -4793,7 +4794,7 @@ async def start_deadlock_ready_check(
     )
 
 
-@router.post("/{slug}/deadlock/ready-check/vote", response_model=TournamentDeadlockReadyVoteResponse)
+@ready_vote_router.post("/{slug}/deadlock/ready-check/vote", response_model=TournamentDeadlockReadyVoteResponse)
 async def vote_deadlock_ready_check(
     slug: str,
     payload: TournamentDeadlockReadyVoteRequest,
