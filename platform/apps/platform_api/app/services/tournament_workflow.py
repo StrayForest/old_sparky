@@ -5,7 +5,19 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, case, cast, delete, exists, func, literal, select
+from sqlalchemy import (
+    DateTime,
+    String,
+    and_,
+    bindparam,
+    case,
+    cast,
+    delete,
+    exists,
+    func,
+    literal,
+    select,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -789,6 +801,73 @@ def _ready_vote_preflight_columns(*, tournament_id: Any, user_id: str) -> tuple[
     return participant_exists, profile_exists, locked_roster_exists
 
 
+# The hot path executes the same preflight shape for every vote.  Keep the
+# expression tree immutable and bind only request values at execution time;
+# rebuilding ORM expressions per request showed up in the bounded cProfile
+# sample as SQLAlchemy coercion/cache-key CPU.
+_READY_VOTE_PREFLIGHT_USER_ID = bindparam(
+    "ready_vote_user_id",
+    type_=String(36),
+)
+_READY_VOTE_PREFLIGHT_SLUG = bindparam(
+    "ready_vote_slug",
+    type_=String(255),
+)
+_READY_VOTE_PREFLIGHT_ROUND = aliased(TournamentDeadlockReadyRound)
+(
+    _ready_vote_participant_exists,
+    _ready_vote_profile_exists,
+    _ready_vote_locked_roster_exists,
+) = _ready_vote_preflight_columns(
+    tournament_id=Tournament.id,
+    user_id=_READY_VOTE_PREFLIGHT_USER_ID,
+)
+_ready_vote_eligible_ids_jsonb = cast(
+    _READY_VOTE_PREFLIGHT_ROUND.eligible_user_ids,
+    postgresql.JSONB,
+)
+_ready_vote_eligible_count = func.coalesce(
+    func.jsonb_array_length(_ready_vote_eligible_ids_jsonb),
+    0,
+)
+_ready_vote_user_is_eligible = (
+    (_ready_vote_eligible_count == 0)
+    | func.jsonb_exists(
+        _ready_vote_eligible_ids_jsonb,
+        _READY_VOTE_PREFLIGHT_USER_ID,
+    )
+)
+_READY_VOTE_PREFLIGHT_STATEMENT = (
+    select(
+        Tournament.id,
+        Tournament.slug,
+        Tournament.format_slug,
+        Tournament.status,
+        Tournament.registration_closes_at,
+        Tournament.ready_check_starts_at,
+        Tournament.ready_check_ends_at,
+        Tournament.automation_ready_check_closed_at,
+        _ready_vote_participant_exists.label("has_participant"),
+        _ready_vote_profile_exists.label("has_deadlock_profile"),
+        _ready_vote_locked_roster_exists.label("has_locked_roster"),
+        _READY_VOTE_PREFLIGHT_ROUND.id.label("ready_round_id"),
+        _READY_VOTE_PREFLIGHT_ROUND.tournament_id.label("ready_round_tournament_id"),
+        _READY_VOTE_PREFLIGHT_ROUND.status.label("ready_round_status"),
+        _ready_vote_eligible_count.label("eligible_participant_count"),
+        _ready_vote_user_is_eligible.label("user_is_eligible"),
+    )
+    .outerjoin(
+        _READY_VOTE_PREFLIGHT_ROUND,
+        and_(
+            _READY_VOTE_PREFLIGHT_ROUND.tournament_id == Tournament.id,
+            _READY_VOTE_PREFLIGHT_ROUND.status == "active",
+        ),
+    )
+    .where(Tournament.slug == _READY_VOTE_PREFLIGHT_SLUG)
+    .limit(1)
+)
+
+
 async def ready_vote_preflight_snapshot(
     db_session: AsyncSession,
     *,
@@ -804,46 +883,13 @@ async def ready_vote_preflight_snapshot(
     makes the outer join single-row for a tournament.
     """
 
-    active_round = aliased(TournamentDeadlockReadyRound)
-    participant_exists, profile_exists, locked_roster_exists = _ready_vote_preflight_columns(
-        tournament_id=Tournament.id,
-        user_id=user_id,
-    )
-    eligible_ids_jsonb = cast(active_round.eligible_user_ids, postgresql.JSONB)
-    eligible_count = func.coalesce(func.jsonb_array_length(eligible_ids_jsonb), 0)
-    user_is_eligible = (eligible_count == 0) | func.jsonb_exists(
-        eligible_ids_jsonb,
-        user_id,
-    )
     row = (
         await db_session.execute(
-            select(
-                Tournament.id,
-                Tournament.slug,
-                Tournament.format_slug,
-                Tournament.status,
-                Tournament.registration_closes_at,
-                Tournament.ready_check_starts_at,
-                Tournament.ready_check_ends_at,
-                Tournament.automation_ready_check_closed_at,
-                participant_exists.label("has_participant"),
-                profile_exists.label("has_deadlock_profile"),
-                locked_roster_exists.label("has_locked_roster"),
-                active_round.id.label("ready_round_id"),
-                active_round.tournament_id.label("ready_round_tournament_id"),
-                active_round.status.label("ready_round_status"),
-                eligible_count.label("eligible_participant_count"),
-                user_is_eligible.label("user_is_eligible"),
-            )
-            .outerjoin(
-                active_round,
-                and_(
-                    active_round.tournament_id == Tournament.id,
-                    active_round.status == "active",
-                ),
-            )
-            .where(Tournament.slug == slug)
-            .limit(1)
+            _READY_VOTE_PREFLIGHT_STATEMENT,
+            {
+                "ready_vote_slug": slug,
+                "ready_vote_user_id": user_id,
+            },
         )
     ).first()
     if row is None:
@@ -902,6 +948,38 @@ async def ready_vote_preflight_flags(
     )
 
 
+# Keep the conditional upsert's SQL expression tree shared as well.  Values
+# remain per-request binds, including the UUID for a possible insert.
+_READY_VOTE_UPSERT_ID = bindparam("ready_vote_id", type_=String(36))
+_READY_VOTE_UPSERT_ROUND_ID = bindparam("ready_vote_round_id")
+_READY_VOTE_UPSERT_USER_ID = bindparam("ready_vote_user_id", type_=String(36))
+_READY_VOTE_UPSERT_CHOICE = bindparam("ready_vote_choice", type_=String(10))
+_READY_VOTE_UPSERT_RESPONDED_AT = bindparam(
+    "ready_vote_responded_at",
+    type_=DateTime(timezone=True),
+)
+_READY_VOTE_UPSERT_STATEMENT = (
+    postgresql.insert(TournamentDeadlockReadyVote)
+    .values(
+        id=_READY_VOTE_UPSERT_ID,
+        round_id=_READY_VOTE_UPSERT_ROUND_ID,
+        user_id=_READY_VOTE_UPSERT_USER_ID,
+        choice=_READY_VOTE_UPSERT_CHOICE,
+        responded_at=_READY_VOTE_UPSERT_RESPONDED_AT,
+    )
+    .on_conflict_do_update(
+        constraint="uq_tournament_deadlock_ready_votes_round_user",
+        set_={
+            "choice": _READY_VOTE_UPSERT_CHOICE,
+            "responded_at": _READY_VOTE_UPSERT_RESPONDED_AT,
+            "updated_at": _READY_VOTE_UPSERT_RESPONDED_AT,
+        },
+        where=TournamentDeadlockReadyVote.choice != _READY_VOTE_UPSERT_CHOICE,
+    )
+    .returning(TournamentDeadlockReadyVote.id)
+)
+
+
 async def upsert_deadlock_ready_vote(
     db_session: AsyncSession,
     *,
@@ -910,23 +988,15 @@ async def upsert_deadlock_ready_vote(
     choice: str,
     responded_at: datetime,
 ) -> bool:
-    insert_stmt = postgresql.insert(TournamentDeadlockReadyVote).values(
-        id=new_uuid(),
-        round_id=round_id,
-        user_id=user_id,
-        choice=choice,
-        responded_at=responded_at,
-    )
     changed_vote_id = await db_session.scalar(
-        insert_stmt.on_conflict_do_update(
-            constraint="uq_tournament_deadlock_ready_votes_round_user",
-            set_={
-                "choice": choice,
-                "responded_at": responded_at,
-                "updated_at": responded_at,
-            },
-            where=TournamentDeadlockReadyVote.choice != choice,
-        ).returning(TournamentDeadlockReadyVote.id)
+        _READY_VOTE_UPSERT_STATEMENT,
+        {
+            "ready_vote_id": new_uuid(),
+            "ready_vote_round_id": round_id,
+            "ready_vote_user_id": user_id,
+            "ready_vote_choice": choice,
+            "ready_vote_responded_at": responded_at,
+        },
     )
     return changed_vote_id is not None
 

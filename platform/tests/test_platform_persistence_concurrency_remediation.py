@@ -270,9 +270,44 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(preflight.has_deadlock_profile)
         self.assertFalse(preflight.has_locked_roster)
 
+    async def test_ready_vote_preflight_reuses_immutable_statement_shape(self) -> None:
+        row = SimpleNamespace(
+            id="tournament",
+            slug="demo",
+            format_slug="solo",
+            status="registration_closed",
+            registration_closes_at=None,
+            ready_check_starts_at=None,
+            ready_check_ends_at=None,
+            automation_ready_check_closed_at=None,
+            has_participant=True,
+            has_deadlock_profile=True,
+            has_locked_roster=False,
+            ready_round_id=None,
+        )
+        db_session = Mock()
+        db_session.execute = AsyncMock(
+            return_value=SimpleNamespace(first=Mock(return_value=row))
+        )
+
+        await ready_vote_preflight_snapshot(db_session, slug="one", user_id="user-1")
+        await ready_vote_preflight_snapshot(db_session, slug="two", user_id="user-2")
+
+        first_statement = db_session.execute.await_args_list[0].args[0]
+        second_statement = db_session.execute.await_args_list[1].args[0]
+        self.assertIs(first_statement, second_statement)
+        self.assertEqual(
+            db_session.execute.await_args_list[0].args[1],
+            {"ready_vote_slug": "one", "ready_vote_user_id": "user-1"},
+        )
+        self.assertEqual(
+            db_session.execute.await_args_list[1].args[1],
+            {"ready_vote_slug": "two", "ready_vote_user_id": "user-2"},
+        )
+
     async def test_ready_vote_upsert_uses_conditional_noop_conflict_update(self) -> None:
         db_session = Mock()
-        db_session.scalar = AsyncMock(return_value=None)
+        db_session.scalar = AsyncMock(side_effect=[None, None])
         await upsert_deadlock_ready_vote(
             db_session,
             round_id=7,
@@ -280,12 +315,20 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
             choice="yes",
             responded_at=datetime(2026, 8, 29, tzinfo=UTC),
         )
-        statement = db_session.scalar.await_args.args[0]
+        await upsert_deadlock_ready_vote(
+            db_session,
+            round_id=8,
+            user_id="other-user",
+            choice="no",
+            responded_at=datetime(2026, 8, 29, tzinfo=UTC),
+        )
+        statement = db_session.scalar.await_args_list[0].args[0]
         sql = str(statement.compile(dialect=postgresql.dialect()))
         self.assertIn("ON CONFLICT", sql)
         self.assertIn("WHERE", sql)
         self.assertIn("choice", sql)
         self.assertIn("RETURNING", sql)
+        self.assertIs(statement, db_session.scalar.await_args_list[1].args[0])
 
     async def test_tournament_policy_auth_skips_ready_vote_route(self) -> None:
         request = Mock()
