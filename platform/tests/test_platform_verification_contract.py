@@ -61,6 +61,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 "ready-vote-saturation-ramp-v1",
                 "ready-vote-saturation-ramp-v2",
                 "ready-vote-saturation-ramp-v3",
+                "ready-vote-saturation-ramp-v4",
                 "ready-vote-stress-15k-v2",
                 "ready-vote-stress-20k-v2",
                 "ready-vote-spike-v1",
@@ -103,6 +104,11 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertEqual(
             [phase["target_logical_actions_per_second"] for phase in saturation_v3["traffic"]["phases"]],
             [105, 110, 115, 120],
+        )
+        saturation_v4 = get_profile("ready-vote-saturation-ramp-v4")
+        self.assertEqual(
+            [phase["target_logical_actions_per_second"] for phase in saturation_v4["traffic"]["phases"]],
+            [120, 125, 130, 135],
         )
 
     def test_load_profile_rejects_missing_cleanup_contract(self) -> None:
