@@ -406,6 +406,7 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("WHERE", sql)
         self.assertIn("choice", sql)
         self.assertIn("RETURNING", sql)
+        self.assertIsNotNone(statement._generate_cache_key())
         self.assertIs(statement, db_session.scalar.await_args_list[1].args[0])
 
     async def test_tournament_policy_auth_skips_ready_vote_route(self) -> None:

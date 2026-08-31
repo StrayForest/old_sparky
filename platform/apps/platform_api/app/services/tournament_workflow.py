@@ -17,6 +17,7 @@ from sqlalchemy import (
     func,
     literal,
     select,
+    text,
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
@@ -948,35 +949,36 @@ async def ready_vote_preflight_flags(
     )
 
 
-# Keep the conditional upsert's SQL expression tree shared as well.  Values
-# remain per-request binds, including the UUID for a possible insert.
-_READY_VOTE_UPSERT_ID = bindparam("ready_vote_id", type_=String(36))
-_READY_VOTE_UPSERT_ROUND_ID = bindparam("ready_vote_round_id")
-_READY_VOTE_UPSERT_USER_ID = bindparam("ready_vote_user_id", type_=String(36))
-_READY_VOTE_UPSERT_CHOICE = bindparam("ready_vote_choice", type_=String(10))
-_READY_VOTE_UPSERT_RESPONDED_AT = bindparam(
-    "ready_vote_responded_at",
-    type_=DateTime(timezone=True),
-)
-_READY_VOTE_UPSERT_STATEMENT = (
-    postgresql.insert(TournamentDeadlockReadyVote)
-    .values(
-        id=_READY_VOTE_UPSERT_ID,
-        round_id=_READY_VOTE_UPSERT_ROUND_ID,
-        user_id=_READY_VOTE_UPSERT_USER_ID,
-        choice=_READY_VOTE_UPSERT_CHOICE,
-        responded_at=_READY_VOTE_UPSERT_RESPONDED_AT,
+# PostgreSQL's dialect-specific INSERT ... ON CONFLICT construct opts out of
+# SQLAlchemy's compiler cache.  Keep the exact statement shape as a typed,
+# cacheable TextClause so accepted votes do not rebuild the same INSERT AST on
+# every request.  The endpoint still uses AsyncSession.scalar, preserving one
+# checkout and the caller-owned transaction boundary.
+_READY_VOTE_UPSERT_STATEMENT = text(
+    """
+    INSERT INTO platform.tournament_deadlock_ready_votes
+        (id, round_id, user_id, choice, responded_at)
+    VALUES (
+        :ready_vote_id,
+        :ready_vote_round_id,
+        :ready_vote_user_id,
+        :ready_vote_choice,
+        :ready_vote_responded_at
     )
-    .on_conflict_do_update(
-        constraint="uq_tournament_deadlock_ready_votes_round_user",
-        set_={
-            "choice": _READY_VOTE_UPSERT_CHOICE,
-            "responded_at": _READY_VOTE_UPSERT_RESPONDED_AT,
-            "updated_at": _READY_VOTE_UPSERT_RESPONDED_AT,
-        },
-        where=TournamentDeadlockReadyVote.choice != _READY_VOTE_UPSERT_CHOICE,
-    )
-    .returning(TournamentDeadlockReadyVote.id)
+    ON CONFLICT ON CONSTRAINT uq_tournament_deadlock_ready_votes_round_user
+    DO UPDATE SET
+        choice = :ready_vote_choice,
+        responded_at = :ready_vote_responded_at,
+        updated_at = :ready_vote_responded_at
+    WHERE platform.tournament_deadlock_ready_votes.choice <> :ready_vote_choice
+    RETURNING id
+    """
+).bindparams(
+    bindparam("ready_vote_id", type_=String(36)),
+    bindparam("ready_vote_round_id"),
+    bindparam("ready_vote_user_id", type_=String(36)),
+    bindparam("ready_vote_choice", type_=String(10)),
+    bindparam("ready_vote_responded_at", type_=DateTime(timezone=True)),
 )
 
 
