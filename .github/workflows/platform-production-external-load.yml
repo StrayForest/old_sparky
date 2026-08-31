@@ -22,6 +22,7 @@ on:
           - ready-vote-capacity-ramp-v2
           - ready-vote-saturation-ramp-v1
           - ready-vote-saturation-ramp-v2
+          - ready-vote-saturation-ramp-v3
           - ready-vote-stress-15k-v2
           - ready-vote-stress-20k-v2
           - ready-vote-spike-v1
