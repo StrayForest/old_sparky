@@ -495,6 +495,14 @@ jobs:
                   --only PLATFORM_PERF_SLOW_REQUEST_MS
                   --only PLATFORM_PERF_LOG_MUTATIONS
                 )
+              else
+                # A static profile must also clear one-shot diagnostic
+                # overrides left by a preceding cProfile deployment.
+                ready_vote_profile_args+=(
+                  --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
+                  --only PLATFORM_PERF_SLOW_REQUEST_MS
+                  --only PLATFORM_PERF_LOG_MUTATIONS
+                )
               fi
               "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
                 --apply \
@@ -519,6 +527,12 @@ jobs:
                   --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
                 )
                 if [[ "$runtime_profile" == ready-vote-cprofile ]]; then
+                  restore_ready_vote_profile_args+=(
+                    --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
+                    --only PLATFORM_PERF_SLOW_REQUEST_MS
+                    --only PLATFORM_PERF_LOG_MUTATIONS
+                  )
+                else
                   restore_ready_vote_profile_args+=(
                     --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
                     --only PLATFORM_PERF_SLOW_REQUEST_MS
