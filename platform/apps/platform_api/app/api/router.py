@@ -29,6 +29,11 @@ from apps.platform_api.app.services.tournament_write_serialization import (
 )
 
 api_router = APIRouter()
+api_router.include_router(
+    tournaments.ready_vote_router,
+    prefix="/tournaments",
+    tags=["tournaments"],
+)
 api_router.include_router(health.router, prefix="/health", tags=["health"])
 # Registration owns POST /auth/register while the remaining authentication
 # routes stay in their established module.

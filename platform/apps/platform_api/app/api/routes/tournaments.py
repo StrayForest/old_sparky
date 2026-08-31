@@ -11,7 +11,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+from pydantic import ValidationError
 from sqlalchemy import Select, and_, cast, delete, func, or_, select, union
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
@@ -248,7 +251,72 @@ from python_packages.platform_infra.tournament_names import (
 )
 from python_packages.platform_infra.slugs import unique_slug_from_name
 
+class ReadyVoteFastPathRoute(APIRoute):
+    """Keep FastAPI's contract while avoiding generic dependency solving.
+
+    Ready Vote has no FastAPI dependencies: CSRF is enforced by middleware and
+    authentication, eligibility, and transaction ownership are enforced by the
+    endpoint itself.  The normal FastAPI request handler still walks the
+    dependency graph and constructs a solved-values mapping for this simple
+    two-argument operation.  This route keeps body validation and response
+    filtering equivalent, but calls the already-bound endpoint directly.
+    """
+
+    async def _validated_payload(self, request: Request) -> TournamentDeadlockReadyVoteRequest:
+        body = await request.body()
+        if not body:
+            try:
+                return TournamentDeadlockReadyVoteRequest.model_validate(None)
+            except ValidationError as exc:
+                raise RequestValidationError(
+                    _body_validation_errors(exc),
+                    body=None,
+                ) from exc
+
+        content_type = request.headers.get("content-type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        try:
+            if media_type == "application/json" or media_type.endswith("+json"):
+                return TournamentDeadlockReadyVoteRequest.model_validate_json(body)
+            return TournamentDeadlockReadyVoteRequest.model_validate(body)
+        except ValidationError as exc:
+            raise RequestValidationError(
+                _body_validation_errors(exc),
+                body=body,
+            ) from exc
+
+    def get_route_handler(self):
+        endpoint = self.endpoint
+
+        async def app(request: Request) -> Response:
+            payload = await self._validated_payload(request)
+            raw_response = await endpoint(
+                slug=request.path_params["slug"],
+                payload=payload,
+                request=request,
+            )
+            if isinstance(raw_response, Response):
+                return raw_response
+            response = TournamentDeadlockReadyVoteResponse.model_validate(raw_response)
+            return Response(
+                content=response.model_dump_json(),
+                media_type="application/json",
+            )
+
+        return app
+
+
+def _body_validation_errors(exc: ValidationError) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    for error in exc.errors():
+        normalized = dict(error)
+        normalized["loc"] = ("body", *tuple(normalized.get("loc", ())))
+        errors.append(normalized)
+    return errors
+
+
 router = APIRouter()
+ready_vote_router = APIRouter(route_class=ReadyVoteFastPathRoute)
 
 logger = logging.getLogger(__name__)
 
@@ -4793,7 +4861,7 @@ async def start_deadlock_ready_check(
     )
 
 
-@router.post("/{slug}/deadlock/ready-check/vote", response_model=TournamentDeadlockReadyVoteResponse)
+@ready_vote_router.post("/{slug}/deadlock/ready-check/vote", response_model=TournamentDeadlockReadyVoteResponse)
 async def vote_deadlock_ready_check(
     slug: str,
     payload: TournamentDeadlockReadyVoteRequest,

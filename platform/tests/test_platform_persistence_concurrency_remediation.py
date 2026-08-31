@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.dialects import postgresql
 
 from apps.platform_api.app.api.routes import profiles, tournaments
@@ -225,6 +226,83 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
             list(inspect.signature(security.authenticate_ready_vote).parameters),
             ["request", "db_session"],
         )
+
+    async def test_ready_vote_fast_path_validates_body_and_serializes_response(self) -> None:
+        endpoint = AsyncMock(
+            return_value=tournaments.TournamentDeadlockReadyVoteResponse(
+                round_id=7,
+                tournament_id="tournament",
+                status="active",
+                eligible_participant_count=2,
+                current_user_choice="yes",
+                changed=False,
+                server_received_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+        route = tournaments.ReadyVoteFastPathRoute(
+            "/{slug}/deadlock/ready-check/vote",
+            endpoint,
+            response_model=tournaments.TournamentDeadlockReadyVoteResponse,
+            methods={"POST"},
+        )
+        receive = AsyncMock(
+            side_effect=[
+                {"type": "http.request", "body": b'{"choice":"yes"}', "more_body": False}
+            ]
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/demo/deadlock/ready-check/vote",
+                "headers": [(b"content-type", b"application/json")],
+                "path_params": {"slug": "demo"},
+            },
+            receive,
+        )
+
+        response = await route.get_route_handler()(request)
+
+        endpoint.assert_awaited_once()
+        self.assertEqual(endpoint.await_args.kwargs["slug"], "demo")
+        self.assertEqual(endpoint.await_args.kwargs["payload"].choice, "yes")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.body,
+            b'{"round_id":7,"tournament_id":"tournament","status":"active",'
+            b'"eligible_participant_count":2,"current_user_choice":"yes",'
+            b'"changed":false,"server_received_at":"2026-01-01T00:00:00Z"}',
+        )
+
+    async def test_ready_vote_fast_path_keeps_body_validation_boundary(self) -> None:
+        endpoint = AsyncMock()
+        route = tournaments.ReadyVoteFastPathRoute(
+            "/{slug}/deadlock/ready-check/vote",
+            endpoint,
+            response_model=tournaments.TournamentDeadlockReadyVoteResponse,
+            methods={"POST"},
+        )
+        receive = AsyncMock(
+            side_effect=[
+                {"type": "http.request", "body": b'{"choice":"maybe"}', "more_body": False}
+            ]
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/demo/deadlock/ready-check/vote",
+                "headers": [(b"content-type", b"application/json")],
+                "path_params": {"slug": "demo"},
+            },
+            receive,
+        )
+
+        with self.assertRaises(RequestValidationError) as raised:
+            await route.get_route_handler()(request)
+
+        self.assertEqual(raised.exception.errors()[0]["loc"], ("body", "choice"))
+        endpoint.assert_not_awaited()
 
     def test_ready_vote_tournament_snapshot_is_immutable_and_slot_based(self) -> None:
         snapshot = ReadyVoteTournamentSnapshot(
