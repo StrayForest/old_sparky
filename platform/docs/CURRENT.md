@@ -59,15 +59,20 @@ Current status: migration `0048` adds a partial covering index for the
 Fetches 0` from disposable analysis as engineering evidence. The supported
 load run `33335115575` passed with accepted p50/p90/p95/p99
 `241.711/256.963/264.706/639.338 ms`, zero shedding/retries/final failures,
-and exact cleanup. The static-8 capacity ramp `33335224474` established strict
-SLO capacity at `60 actions/s`, maximum observed stable goodput at
-`79.385 actions/s`, and knee/shedding onset at `70 actions/s`. Adaptive-v2
-was tested at the exact same points (`33337425315`): it had the same strict
-SLO capacity but lower maximum goodput (`73.528 actions/s`) and materially
-worse logical tail/failure pressure at 80, so it was not promoted. Spike
-`33338160338` passed normal → burst → normal with zero shedding/retries; stress
-`33339421320` passed its separate behavior/correctness contract and is not a
-normal final-failure SLO result. The optional 20k stress run was skipped.
+and exact cleanup. The supported-load and earlier adaptive/spike records
+remain historical. The current fast-path baseline is SHA
+`6580f7bf5c02641a8ff607c35bcc050e24b1a50e`, with SLO capacity `70 actions/s`
+and knee approximately `80 actions/s`. Static-8 saturation sweeps
+`33368575458`/`33374294139` established a canonical maximum stable goodput of
+approximately `116 actions/s`, with the goodput plateau beginning in the
+`120–130/s` offered band. The candidate Ready Vote upsert compiler
+optimization is source SHA `68eb3f421049f8135bdf3b72c723dc4d93c8f57f`; its
+A/B runs `33379397589`/`33381896491`/`33385667381` retained SLO capacity
+`70/s`, knee `~80/s` and established a conservative candidate plateau of
+approximately `117/s` goodput in the 120–135/s band with bounded origin
+pressure. Full tables, profile evidence, rejected hypotheses and run links are
+retained in `platform/performance/README.md`. The optional 20k stress profile
+was not run.
 The supported-load SLO remains accepted p50/p90/p95/p99 <= 250/400/600/1000
 ms, logical p95/p99 <= 600/1000 ms, final logical failure <0.5%, and
 approximately zero normal-load shedding. Every run passed exact cleanup; the

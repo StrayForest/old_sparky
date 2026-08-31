@@ -60,6 +60,10 @@ Canonical profile fingerprints used for the retained evidence are:
 | --- | ---: | --- |
 | `ready-vote-slo-v2` | 2 | `c13851df4526bb4e32ddd49b93cf2810cca2da42b19c569a2c2bc7843757543a` |
 | `ready-vote-capacity-ramp-v2` | 2 | `f4956f9f0e282c44ce3adc72eeeb342cce650979336f737e032df47567ea533c` |
+| `ready-vote-saturation-ramp-v1` | 1 | `804c6c5f882fc41ceef6087706e3cd61db7b9c4c1c629773ad2fa32744a6451f` |
+| `ready-vote-saturation-ramp-v2` | 2 | `47452144eb575bd6bee2184710b8d325e43499b921875b94400a7160877a0d54` |
+| `ready-vote-saturation-ramp-v3` | 3 | `d34c2537469daa6be0fdefa065306a7b82db911aaf151ffaba8480fb08d65fd8` |
+| `ready-vote-saturation-ramp-v4` | 4 | `be8a2da8bab1ab966acfc90863c646d011eae36fd19034bbf2df1c91e8622e17` |
 | `ready-vote-stress-15k-v2` | 2 | `a9fb7897fd228a8314ee0e02bef5c11e9149045adaecddd13ee3cc4f022cc8c8` |
 | `ready-vote-spike-v1` | 1 | `6351a06a342b6170bb9f7bb2a280bd4bbbdf34443b90dc5df39698a0a52c6895` |
 
@@ -136,6 +140,115 @@ SLO/spike runs had no selected server pool timing spans, so those spans remain
 diagnostic-only and do not replace the complete client-side population
 metrics. The retry policy remains bounded at two overload retries; no retry
 increase or blind retry was introduced.
+
+## Ready Vote saturation after the final FastAPI fast path (2026-08-31)
+
+This is the controlled follow-up to baseline SHA
+`6580f7bf5c02641a8ff607c35bcc050e24b1a50e`. Both baseline and candidate used
+two API workers, two vCPUs, `ready-vote-static-8`, admission `8/8/8`, the same
+PostgreSQL/Redis/DB-pool budgets and the same GitHub-hosted external runner.
+The 15k stress result is retained as stress evidence only; it is not the
+canonical saturation ceiling.
+
+The baseline rate sweep was split across `ready-vote-saturation-ramp-v1`
+(`33368575458`) and the refinement `ready-vote-saturation-ramp-v4`
+(`33374294139`). The table is the phase evidence used for the envelope:
+
+| Offered target | Actual offered | Goodput | Accepted p95/p99 ms | Logical p95/p99 ms | Shed / retry / final fail | Source |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 80 | 80.033 | 79.392 | 355.358/528.541 | 433.702/1061.840 | 3.583% / 3.500% / 0.208% | v1 |
+| 90 | 90.033 | 89.555 | 255.418/324.256 | 256.458/327.976 | 0.148% / 0.148% / 0% | v1 |
+| 100 | 100.033 | 99.469 | 286.216/360.248 | 302.499/588.383 | 1.153% / 1.167% / 0% | v1 |
+| 110 | 110.033 | 106.289 | 335.207/417.300 | 707.241/1332.903 | 7.034% / 7.273% / 0.273% | v1 |
+| 120 | 120.033 | 115.607 | 339.128/413.136 | 779.391/1547.376 | 11.371% / 11.639% / 1.056% | v1 |
+| 125 | 125.033 | 116.327 | 475.436/583.190 | 1800.244/2003.147 | 28.569% / 34.880% / 3.653% | v4 |
+| 130 | 130.033 | 114.469 | 490.933/610.145 | 1822.401/2019.541 | 30.587% / 35.974% / 5.615% | v4 |
+| 135 | 135.032 | 102.569 | 559.898/651.012 | 1937.233/2083.696 | 55.224% / 83.852% / 17.679% | v4 |
+
+The resulting envelope is: `HEALTHY <=70/s`; `SLO EDGE = 80/s`;
+`CAPACITY KNEE = 90–110/s`; `SATURATION = 120–130/s`; and `OVERLOAD =
+135/s`. Goodput stops materially increasing in the 120–130 band. The
+canonical baseline maximum stable goodput is therefore reported as
+`~116 actions/s`, not as the 15k stress goodput `94.409 actions/s` and not as
+the noisy single-phase maximum. At the saturation band CPU reached
+`~88–89%` per core average (100% maximum), API process CPU was about
+`115%` aggregate, PostgreSQL about `29%` average, connections `42` maximum,
+waiting backends `2`, lock waiters `1`, and peak observed query wait was
+`188.73 ms`. This is CPU/backpressure saturation with bounded database
+pressure, not a PostgreSQL pool ceiling.
+
+The candidate A/B runs were `33379397589` (`capacity-ramp-v2`, 20–80/s),
+`33381896491` (`saturation-ramp-v1`, 80–120/s), `33384057053` and
+`33384821610` (`saturation-ramp-v4`, 120–135/s), and `33385667381`
+(`saturation-ramp-v2`, 120–165/s), all from source SHA
+`68eb3f421049f8135bdf3b72c723dc4d93c8f57f`. Candidate goodput was
+`69.406/79.418` at 70/80/s and `89.507/99.385/109.336/119.120` at
+90/100/110/120/s. The repeated v4 runs produced respectively
+`114.887/115.406/126.900/118.158` and
+`116.476/121.775/127.570/129.097` at 120/125/130/135/s. The v2 sweep
+provided the conservative repeatable plateau: `114.535/117.243/114.502/109.275`
+at 120/135/150/165/s. The isolated 126–129/s v4 observations are retained as
+run evidence but are not called a stable ceiling because the two v4 runs and
+the v2 contour do not reproduce that exact peak.
+
+At 120/s candidate accepted p95/p99 was
+`327.020/409.036 ms`, logical p95/p99 `431.467/815.235 ms`, shedding
+`5.045%`, retries `5.167%`, final failure `0.139%`; CPU averaged
+`75.10%/75.75%` per core, API process CPU `93.27%`, PostgreSQL `29.00%`,
+connections `41`, waiting backends `1`, and lock waiters `0`. The improvement
+is material at the high end but does not move the normal SLO contract: the
+candidate SLO capacity remains `70/s`, and the knee remains approximately
+`80/s`. For the final envelope, maximum stable candidate goodput is reported
+as `~117 actions/s` from the v2 contour; the `119.120/s` v1 and `126–129/s`
+v4 observations are not used to claim a larger stable ceiling. This is a
+small throughput change within the broad run-to-run spread, while the CPU
+compiler cost reduction is directly confirmed by cProfile.
+
+The bounded before profile was `33376398557` on cprofile runtime, with
+profiling overhead excluded from latency conclusions. The ranked CPU evidence
+was:
+
+1. SQLAlchemy PostgreSQL insert compilation/coercion: `coercions.expect`
+   self CPU `3.742045 s`; the dialect `visit_insert` path used `0.481978 s`
+   across `7,232` upsert calls (`~0.067 ms` self CPU per upsert).
+2. Async/runtime transport and middleware: h11/socket/asyncio self CPU was
+   the largest remaining wall-clock group under cProfile, but it is mostly
+   I/O/scheduling and was not treated as an endpoint optimization target.
+3. SQLAlchemy greenlet/session execution: `greenlet_spawn` self CPU
+   `0.719933 s`; `AsyncSession.scalar` and the endpoint service were smaller
+   than the statement compiler target. Response instrumentation measured
+   response handling at about `0.008 ms`.
+
+The only code change was a Ready Vote-specific cacheable SQLAlchemy
+`TextClause` for the conditional upsert. It keeps `AsyncSession.scalar`, one
+DB checkout, one transaction boundary, auth/preflight, conditional upsert,
+commit/rollback, trigger-authoritative counters, and post-commit cache
+invalidation unchanged. The regression test asserts that the shared upsert
+statement has a cache key while retaining the `ON CONFLICT`, conditional
+choice predicate and `RETURNING` contract.
+
+The candidate after-profile was `33380666490`. `visit_insert` was absent from
+both worker profiles; `upsert_deadlock_ready_vote` self CPU was only
+`0.068245 s` aggregate in that diagnostic run. The remaining
+`coercions.expect` self CPU was `2.489327 s`, attributable to the other
+statement shapes (especially preflight/auth), not the removed dialect insert
+compiler. The next bottleneck is therefore the shared request/middleware/
+transport and preflight/session path, with h11 header normalization,
+asyncio/HTTP scheduling, auth and preflight execution visible above the
+endpoint-specific upsert. No primitive Core rewrite was justified: the
+observed DB CPU, connection count and lock/pool pressure were bounded, and
+the response path was negligible.
+
+The first candidate `ready-vote-stress-15k-v2` run (`33382724584`) was not
+called PASS: it had 17 external-runner status-0 network errors. Its server
+statuses remained 200/503 and cleanup passed. The identical rerun
+`33383445876` passed the stress contract: primary goodput `108.032/s`,
+shedding `61.575%`, retry amplification `99.140%`, final logical failure
+`23.480%`, accepted p95/p99 `409.872/552.084 ms`, CPU `93.03%/93.29%` per
+core, PostgreSQL `26.43%`, connections `41`, waiting backends/lock waiters
+`1/1`, and exact cleanup. This is controlled stress evidence, not a normal
+traffic failure-rate target. Both stress runs removed all fixture rows and
+preserved the control account.
 
 ## Canonical commands
 
