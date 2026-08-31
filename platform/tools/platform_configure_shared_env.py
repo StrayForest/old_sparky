@@ -145,7 +145,7 @@ RUNTIME_PROFILES = {
     },
     # Bounded CPU/stage diagnostic only. The observer arms cProfile with
     # signals during one explicit load and the final runtime remains static-8.
-    "ready-vote-static-8-profile": {
+    "ready-vote-cprofile": {
         "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY": "8",
         "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": "8",
         "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": "8",

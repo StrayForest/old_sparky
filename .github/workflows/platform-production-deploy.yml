@@ -21,7 +21,7 @@ on:
           - ready-vote-static-4
           - ready-vote-static-6
           - ready-vote-static-8
-          - ready-vote-static-8-profile
+          - ready-vote-cprofile
           - ready-vote-static-12
           - ready-vote-static-16
           - ready-vote-adaptive-v2
@@ -483,13 +483,13 @@ jobs:
               [[ "$api_ready" == true ]] \
                 || fail "API did not recover on baseline runtime profile"
               ;;
-            ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-static-12|ready-vote-static-16|ready-vote-static-8-profile)
+            ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-static-12|ready-vote-static-16|ready-vote-cprofile)
               ready_vote_profile_args=(
                 --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY
                 --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY
                 --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
               )
-              if [[ "$runtime_profile" == ready-vote-static-8-profile ]]; then
+              if [[ "$runtime_profile" == ready-vote-cprofile ]]; then
                 ready_vote_profile_args+=(
                   --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
                   --only PLATFORM_PERF_SLOW_REQUEST_MS
@@ -518,7 +518,7 @@ jobs:
                   --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY
                   --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
                 )
-                if [[ "$runtime_profile" == ready-vote-static-8-profile ]]; then
+                if [[ "$runtime_profile" == ready-vote-cprofile ]]; then
                   restore_ready_vote_profile_args+=(
                     --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
                     --only PLATFORM_PERF_SLOW_REQUEST_MS
