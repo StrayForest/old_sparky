@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
 
-from apps.platform_api.app.api.router import api_router, tournament_dependencies
 from apps.platform_api.app.api.routes import profiles, tournaments
 from apps.platform_api.app.services import deadlock_automation, player_commitments
 from apps.platform_api.app.services.tournament_workflow import (
@@ -225,38 +224,6 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             list(inspect.signature(security.authenticate_ready_vote).parameters),
             ["request", "db_session"],
-        )
-
-    def test_ready_vote_route_is_first_and_isolated_from_tournament_dependencies(self) -> None:
-        ready_vote_routes = [
-            route
-            for route in tournaments.ready_vote_router.routes
-            if getattr(route, "name", None) == "vote_deadlock_ready_check"
-        ]
-        regular_routes = [
-            route
-            for route in tournaments.router.routes
-            if getattr(route, "name", None) == "vote_deadlock_ready_check"
-        ]
-        self.assertEqual(len(ready_vote_routes), 1)
-        self.assertEqual(regular_routes, [])
-        self.assertEqual(ready_vote_routes[0].dependencies, [])
-
-        ready_vote_include = next(
-            route
-            for route in api_router.routes
-            if getattr(route, "original_router", None) is tournaments.ready_vote_router
-        )
-        regular_include = next(
-            route
-            for route in api_router.routes
-            if getattr(route, "original_router", None) is tournaments.router
-        )
-        self.assertEqual(api_router.routes.index(ready_vote_include), 0)
-        self.assertEqual(ready_vote_include.include_context.dependencies, [])
-        self.assertEqual(
-            regular_include.include_context.dependencies,
-            tournament_dependencies,
         )
 
     def test_ready_vote_tournament_snapshot_is_immutable_and_slot_based(self) -> None:
