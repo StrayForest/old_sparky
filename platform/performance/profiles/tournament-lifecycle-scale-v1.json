@@ -1,0 +1,64 @@
+{
+  "schema": 2,
+  "profile_id": "tournament-lifecycle-scale-v1",
+  "profile_version": 1,
+  "category": "stress",
+  "purpose": "Exercise lifecycle write/read concurrency across many independent tournaments.",
+  "description": "The full 20-tournament, 10,000-user lifecycle with immediate concurrent waves.",
+  "mode": "tournament-lifecycle",
+  "fixture": {
+    "tournament_count": 20,
+    "users_per_tournament": 500,
+    "setup_concurrency": 20,
+    "max_total_users": 10000,
+    "teams_count": 64
+  },
+  "traffic": {
+    "concurrency": 128,
+    "spread_seconds": 0,
+    "timeout_seconds": 180,
+    "duplicate_count": 0,
+    "manual_refresh_count": 0,
+    "retry": {
+      "max_retries": 0,
+      "overload_status": null,
+      "overload_code": null,
+      "server_retry_after": null,
+      "jitter_windows_ms": []
+    }
+  },
+  "lifecycle": {
+    "wave_model": "all tournaments concurrently; one match per tournament per report wave",
+    "match_reports": 1260,
+    "read_storm_users": 10000,
+    "required_terminal_state": "completed"
+  },
+  "acceptance": {
+    "kind": "stress",
+    "accepted_request_latency": {"p50_ms": 1000, "p90_ms": 5000, "p95_ms": 10000, "p99_ms": 30000},
+    "logical_latency": {"p95_ms": 15000, "p99_ms": 45000},
+    "max_shed_percent": 100,
+    "max_retry_amplification_percent": 100,
+    "max_postgres_connections": 80,
+    "max_waiting_backends": 40,
+    "max_lock_waiters": 40,
+    "max_cpu_per_core_percent": 100,
+    "pool_checkout_wait_ms": {"p95_ms": 10000, "p99_ms": 30000},
+    "expected_statuses": [200, 201, 202, 304],
+    "unexpected_statuses": 0
+  },
+  "correctness": {
+    "all_tournaments_complete": true,
+    "all_bracket_matches_reported": true,
+    "conditional_304_checked_separately": true,
+    "cleanup_required": true
+  },
+  "execution": {
+    "generator": "platform_production_qa.py",
+    "measured_origin": "configured QA/preprod origin",
+    "external_runner_forbidden": true,
+    "run_command": "python3 platform/tools/platform_production_qa.py --mode tournament-lifecycle --concurrency 128",
+    "cleanup_workflow": "platform-production-qa cleanup_targeted",
+    "abort_workflow": "platform-production-qa operator abort"
+  }
+}

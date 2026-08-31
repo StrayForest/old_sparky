@@ -1,0 +1,63 @@
+{
+  "schema": 2,
+  "profile_id": "tournament-lifecycle-slo-v1",
+  "profile_version": 1,
+  "category": "load",
+  "purpose": "Measure the complete multi-tournament Deadlock lifecycle through the QA harness.",
+  "description": "20 tournaments with 500 users each from join through completed bracket state.",
+  "mode": "tournament-lifecycle",
+  "fixture": {
+    "tournament_count": 20,
+    "users_per_tournament": 500,
+    "setup_concurrency": 20,
+    "max_total_users": 10000,
+    "teams_count": 64
+  },
+  "traffic": {
+    "concurrency": 80,
+    "spread_seconds": 0,
+    "timeout_seconds": 180,
+    "duplicate_count": 0,
+    "manual_refresh_count": 0,
+    "retry": {
+      "max_retries": 0,
+      "overload_status": null,
+      "overload_code": null,
+      "server_retry_after": null,
+      "jitter_windows_ms": []
+    }
+  },
+  "lifecycle": {
+    "conditional_statuses": [200, 304],
+    "profile_read_phases": ["teammate_profile_reads", "opponent_profile_reads"],
+    "match_report_endpoint": "POST /tournaments/{slug}/matches/{match_id}/report",
+    "required_terminal_state": "completed"
+  },
+  "acceptance": {
+    "kind": "slo",
+    "accepted_request_latency": {"p50_ms": 500, "p90_ms": 2000, "p95_ms": 5000, "p99_ms": 15000},
+    "logical_latency": {"p95_ms": 10000, "p99_ms": 30000},
+    "logical_final_failure_percent": 0.5,
+    "max_shed_percent": 0,
+    "max_retry_amplification_percent": 0,
+    "expected_statuses": [200, 201, 202, 304],
+    "unexpected_statuses": 0
+  },
+  "correctness": {
+    "detail_workspace_query": "workspace_view=detail&participants_limit=0&include_current_user=false",
+    "no_mass_participants_get": true,
+    "normalized_team_state_source": "detail.teams",
+    "initial_bracket_workspace_query": "workspace_view=bracket&participants_limit=0&include_current_user=false",
+    "summary_refresh_query": "GET /tournaments/{slug}/bracket?teams_view=summary",
+    "conditional_304_checked_separately": true,
+    "cleanup_required": true
+  },
+  "execution": {
+    "generator": "platform_production_qa.py",
+    "measured_origin": "configured QA/preprod origin",
+    "external_runner_forbidden": true,
+    "run_command": "python3 platform/tools/platform_production_qa.py --mode tournament-lifecycle",
+    "cleanup_workflow": "platform-production-qa cleanup_targeted",
+    "abort_workflow": "platform-production-qa operator abort"
+  }
+}

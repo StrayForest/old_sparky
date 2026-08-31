@@ -67,6 +67,9 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 "ready-vote-spike-v1",
                 "read-mix-human-v2",
                 "read-mix-stress-v2",
+                "tournament-lifecycle-capacity-v1",
+                "tournament-lifecycle-scale-v1",
+                "tournament-lifecycle-slo-v1",
             },
         )
         profile = get_profile("ready-vote-slo-v2")
@@ -110,6 +113,26 @@ class PlatformVerificationContractTests(unittest.TestCase):
             [phase["target_logical_actions_per_second"] for phase in saturation_v4["traffic"]["phases"]],
             [120, 125, 130, 135],
         )
+
+    def test_tournament_lifecycle_profiles_use_the_local_qa_harness(self) -> None:
+        for profile_id in (
+            "tournament-lifecycle-slo-v1",
+            "tournament-lifecycle-scale-v1",
+            "tournament-lifecycle-capacity-v1",
+        ):
+            profile = get_profile(profile_id)
+            self.assertEqual(profile["mode"], "tournament-lifecycle")
+            self.assertEqual(profile["fixture"]["tournament_count"], 20)
+            self.assertEqual(profile["fixture"]["users_per_tournament"], 500)
+            self.assertEqual(profile["execution"]["generator"], "platform_production_qa.py")
+            self.assertTrue(profile["execution"]["external_runner_forbidden"])
+
+        with self.assertRaisesRegex(LoadProfileError, "external runner"):
+            run_profile(
+                get_profile("tournament-lifecycle-slo-v1"),
+                Path("/tmp/unused-lifecycle-manifest.json"),
+                Path("/tmp/unused-lifecycle-report.json"),
+            )
 
     def test_load_profile_rejects_missing_cleanup_contract(self) -> None:
         profile = get_profile("ready-vote-slo-v2")

@@ -135,6 +135,37 @@ class ProductionQaContractTests(unittest.TestCase):
             "/tournaments/{slug}/bracket",
         )
 
+    def test_tournament_lifecycle_uses_the_current_workspace_and_profile_flow(self) -> None:
+        qa = ProductionQa(
+            origin="http://127.0.0.1",
+            request_origin="https://old-sparky.com",
+            report_path=Path("/tmp/platform-production-qa-lifecycle-test.json"),
+            http_timeout=1.0,
+            keep_data=True,
+            mode="tournament-lifecycle",
+            lifecycle_tournament_count=2,
+            lifecycle_users_per_tournament=28,
+            lifecycle_teams_count=4,
+        )
+
+        self.assertEqual(qa.scale_users, 56)
+        self.assertEqual(qa.lifecycle_teams_count, 4)
+        self.assertTrue(qa.collect_performance)
+        self.assertEqual(qa.request_origin, "https://old-sparky.com")
+
+        source = Path(ProductionQa.run_tournament_lifecycle.__code__.co_filename).read_text()
+        self.assertIn('workspace?participants_limit=0"', source)
+        self.assertIn('&participants_offset=0&workspace_view=detail&include_current_user=false', source)
+        self.assertIn('&participants_offset=0&workspace_view=bracket&include_current_user=false', source)
+        self.assertIn("/profiles/{target_user_id}", source)
+        self.assertIn("/bracket?teams_view=summary", source)
+        self.assertIn("/matches/seed-opening-round", source)
+        self.assertIn("/matches/seed-next-round", source)
+        self.assertIn("/matches/{match['id']}/report", source)
+        self.assertIn('"If-None-Match": etag', source)
+        lifecycle_source = source[source.index("async def run_tournament_lifecycle") :]
+        self.assertNotIn('f"/tournaments/{tournament[\'slug\']}/participants', lifecycle_source)
+
 
 if __name__ == "__main__":
     unittest.main()

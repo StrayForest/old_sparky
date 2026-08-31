@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 import httpx
 from redis.asyncio import Redis, from_url
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import delete, func, select, text
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLATFORM_ROOT))
@@ -50,11 +50,15 @@ from python_packages.platform_infra.models import (
     TournamentInvite,
     TournamentMatch,
     TournamentParticipant,
+    TournamentTeam,
     User,
     UserRole,
     UserSession,
 )
 from python_packages.platform_infra.security import hash_password, new_session_token, session_token_digest
+from apps.platform_api.app.services.tournament_read_models import (
+    delete_tournament_read_models,
+)
 from apps.platform_api.app.services.tournament_participant_capacity import (
     ensure_participant_slot_claimed,
 )
@@ -128,12 +132,17 @@ def parse_args() -> argparse.Namespace:
         description="Run targeted end-to-end production QA for Old Sparky Arena."
     )
     parser.add_argument("--origin", default="http://127.0.0.1")
+    parser.add_argument(
+        "--request-origin",
+        default=None,
+        help="Origin header for the API request contour; defaults to --origin.",
+    )
     parser.add_argument("--env-file", type=Path, default=None)
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
     parser.add_argument("--http-timeout", type=float, default=180.0)
     parser.add_argument(
         "--mode",
-        choices=("targeted", "scale", "read-mix", "write-burst"),
+        choices=("targeted", "scale", "read-mix", "write-burst", "tournament-lifecycle"),
         default="targeted",
     )
     parser.add_argument("--scale-users", type=int, default=10_000)
@@ -149,6 +158,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--system-sample-interval", type=float, default=1.0)
     parser.add_argument("--scale-site-mix-users", type=int, default=None)
     parser.add_argument("--scale-bracket-view-users", type=int, default=None)
+    parser.add_argument(
+        "--lifecycle-tournament-count",
+        type=int,
+        default=20,
+        help="Tournament count for --mode tournament-lifecycle.",
+    )
+    parser.add_argument(
+        "--lifecycle-users-per-tournament",
+        type=int,
+        default=500,
+        help="Users per tournament for --mode tournament-lifecycle.",
+    )
+    parser.add_argument(
+        "--lifecycle-teams-count",
+        type=int,
+        default=64,
+        help="Requested Deadlock team count for --mode tournament-lifecycle.",
+    )
     parser.add_argument(
         "--write-burst-profile",
         choices=("all", "single-join", "single-ready", "multi-staggered"),
@@ -374,6 +401,7 @@ class HttpSample:
     started_at: float
     finished_at: float
     response_bytes: int
+    read_model_events: tuple[str, ...] = ()
 
 
 class HttpMetricsRecorder:
@@ -392,7 +420,13 @@ class HttpMetricsRecorder:
         started_at: float,
         finished_at: float,
         response_bytes: int,
+        read_model_events: str | None = None,
     ) -> None:
+        parsed_read_model_events = tuple(
+            item.strip()
+            for item in str(read_model_events or "").split(",")
+            if item.strip()
+        )
         self.samples.append(
             HttpSample(
                 phase=phase,
@@ -404,8 +438,26 @@ class HttpMetricsRecorder:
                 started_at=started_at,
                 finished_at=finished_at,
                 response_bytes=response_bytes,
+                read_model_events=parsed_read_model_events,
             )
         )
+
+    @staticmethod
+    def _read_model_summary(samples: list[HttpSample]) -> dict[str, Any]:
+        outcomes: Counter[str] = Counter()
+        models: Counter[str] = Counter()
+        for sample in samples:
+            for event in sample.read_model_events:
+                model, separator, outcome = event.partition(":")
+                if not separator:
+                    continue
+                models[model] += 1
+                outcomes[outcome] += 1
+        return {
+            "events": sum(outcomes.values()),
+            "by_outcome": dict(sorted(outcomes.items())),
+            "by_model": dict(sorted(models.items())),
+        }
 
     def summary(self, *, phases: set[str] | None = None) -> dict[str, Any]:
         samples = (
@@ -417,9 +469,13 @@ class HttpMetricsRecorder:
             return {
                 "scope": "full_population",
                 "requests": 0,
+                "successes": 0,
                 "requests_per_second": 0,
+                "throughput_per_second": 0,
+                "goodput_per_second": 0,
                 "errors": 0,
                 "overall": metric_stats([]),
+                "redis_read_models": self._read_model_summary([]),
                 "by_phase": {},
                 "by_route": {},
             }
@@ -427,6 +483,7 @@ class HttpMetricsRecorder:
         started_at = min(sample.started_at for sample in samples)
         finished_at = max(sample.finished_at for sample in samples)
         wall_seconds = max(0.001, finished_at - started_at)
+        successes = sum(1 for sample in samples if sample.ok)
         by_phase: dict[str, list[float]] = defaultdict(list)
         by_route: dict[str, list[float]] = defaultdict(list)
         by_phase_bytes: dict[str, list[int]] = defaultdict(list)
@@ -450,10 +507,31 @@ class HttpMetricsRecorder:
                 reverse=True,
             )
         }
+        phase_rows: dict[str, dict[str, Any]] = {}
+        for phase, values in sorted(by_phase.items()):
+            phase_samples = [sample for sample in samples if sample.phase == phase]
+            phase_started_at = min(sample.started_at for sample in phase_samples)
+            phase_finished_at = max(sample.finished_at for sample in phase_samples)
+            phase_wall_seconds = max(0.001, phase_finished_at - phase_started_at)
+            phase_successes = sum(1 for sample in phase_samples if sample.ok)
+            phase_rows[phase] = {
+                **metric_stats(values),
+                "successes": phase_successes,
+                "errors": len(phase_samples) - phase_successes,
+                "requests_per_second": round(len(phase_samples) / phase_wall_seconds, 3),
+                "throughput_per_second": round(len(phase_samples) / phase_wall_seconds, 3),
+                "goodput_per_second": round(phase_successes / phase_wall_seconds, 3),
+                "wall_seconds": round(phase_wall_seconds, 3),
+                "response_bytes": byte_stats(by_phase_bytes[phase]),
+                "redis_read_models": self._read_model_summary(phase_samples),
+            }
         return {
             "scope": "full_population",
             "requests": len(samples),
+            "successes": successes,
             "requests_per_second": round(len(samples) / wall_seconds, 3),
+            "throughput_per_second": round(len(samples) / wall_seconds, 3),
+            "goodput_per_second": round(successes / wall_seconds, 3),
             "wall_seconds": round(wall_seconds, 3),
             "errors": sum(1 for sample in samples if not sample.ok),
             "status_counts": dict(sorted(status_counts.items())),
@@ -461,13 +539,8 @@ class HttpMetricsRecorder:
                 **metric_stats(elapsed_ms),
                 "response_bytes": byte_stats([sample.response_bytes for sample in samples]),
             },
-            "by_phase": {
-                phase: {
-                    **metric_stats(values),
-                    "response_bytes": byte_stats(by_phase_bytes[phase]),
-                }
-                for phase, values in sorted(by_phase.items())
-            },
+            "redis_read_models": self._read_model_summary(samples),
+            "by_phase": phase_rows,
             "by_route": route_rows,
         }
 
@@ -1308,6 +1381,10 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
         "compute_blocks": int,
         "response_bytes": int,
         "pool_wait_ms": float,
+        "redis_read_model_get_ms": float,
+        "redis_read_model_build_ms": float,
+        "redis_read_model_set_ms": float,
+        "redis_read_model_payload_bytes": int,
         "ready_vote_checkout_count": int,
         "ready_vote_admission_inflight": int,
         "ready_vote_admission_limit": int,
@@ -1390,6 +1467,31 @@ def summarize_request_perf_logs(
             )
         )
 
+    def read_model_summary(row_values: list[dict[str, Any]]) -> dict[str, Any]:
+        models: Counter[str] = Counter()
+        outcomes: Counter[str] = Counter()
+        for row in row_values:
+            for model in str(row.get("redis_read_model_models") or "").split("|"):
+                if model and model != "-":
+                    models[model] += 1
+            for outcome in str(row.get("redis_read_model_outcomes") or "").split("|"):
+                if outcome and outcome != "-":
+                    outcomes[outcome] += 1
+        payload_values = [
+            int(row["redis_read_model_payload_bytes"])
+            for row in row_values
+            if isinstance(row.get("redis_read_model_payload_bytes"), (int, float))
+        ]
+        return {
+            "events": sum(outcomes.values()),
+            "by_model": dict(sorted(models.items())),
+            "by_outcome": dict(sorted(outcomes.items())),
+            "get_ms": row_metric_stats("redis_read_model_get_ms", row_values),
+            "build_ms": row_metric_stats("redis_read_model_build_ms", row_values),
+            "set_ms": row_metric_stats("redis_read_model_set_ms", row_values),
+            "payload_bytes": byte_stats(payload_values),
+        }
+
     totals = [float(row["total_ms"]) for row in rows if isinstance(row.get("total_ms"), (int, float))]
     sql_counts = [float(row["sql_count"]) for row in rows if isinstance(row.get("sql_count"), (int, float))]
     sql_times = [float(row["sql_ms"]) for row in rows if isinstance(row.get("sql_ms"), (int, float))]
@@ -1454,6 +1556,7 @@ def summarize_request_perf_logs(
             "pool_checkout_wait_ms": row_metric_stats("pool_wait_ms", row_values),
             "ready_vote": ready_vote_spans,
             "ready_vote_controller_state_counts": controller_state_counts(row_values),
+            "redis_read_models": read_model_summary(row_values),
         }
 
     return {
@@ -1473,6 +1576,7 @@ def summarize_request_perf_logs(
             if any(isinstance(row.get(key), (int, float)) for row in rows)
         },
         "ready_vote_controller_state_counts": controller_state_counts(rows),
+        "redis_read_models": read_model_summary(rows),
         "by_route": {
             route: summarize_route_rows(row_values)
             for route, row_values in sorted(
@@ -1777,6 +1881,9 @@ class ProductionQa:
         system_sample_interval: float = 1.0,
         scale_site_mix_users: int | None = None,
         scale_bracket_view_users: int | None = None,
+        lifecycle_tournament_count: int = 20,
+        lifecycle_users_per_tournament: int = 500,
+        lifecycle_teams_count: int = 64,
         scale_final_view_profile: str = "current",
         tournament_visibility: str = "public",
         profile_journey: bool = False,
@@ -1791,7 +1898,7 @@ class ProductionQa:
         control_participant_state: str | None = None,
     ) -> None:
         timestamp = datetime.now(UTC).strftime("%y%m%d%H%M%S")
-        prefix = "preprod" if mode in {"scale", "read-mix", "write-burst"} else "qa"
+        prefix = "preprod" if mode in {"scale", "read-mix", "write-burst", "tournament-lifecycle"} else "qa"
         self.marker = f"{prefix}{timestamp}{secrets.token_hex(2)}"
         self.origin = origin.rstrip("/")
         self.api_origin = f"{self.origin}/api/v1"
@@ -1839,6 +1946,27 @@ class ProductionQa:
         self.control_participant_state = control_participant_state
         self.http_timeout = max(1.0, http_timeout)
         self.mode = mode
+        self.lifecycle_tournament_count = max(1, lifecycle_tournament_count)
+        self.lifecycle_users_per_tournament = max(14, lifecycle_users_per_tournament)
+        lifecycle_team_choices = (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+        requested_lifecycle_teams = max(2, lifecycle_teams_count)
+        if requested_lifecycle_teams > 8192:
+            raise ValueError("lifecycle team count cannot exceed 8192")
+        self.lifecycle_teams_count = next(
+            count for count in lifecycle_team_choices if count >= requested_lifecycle_teams
+        )
+        if mode == "tournament-lifecycle":
+            lifecycle_total_users = (
+                self.lifecycle_tournament_count * self.lifecycle_users_per_tournament
+            )
+            if lifecycle_total_users > 20_000:
+                raise ValueError("tournament-lifecycle fixture cannot exceed 20,000 users")
+            if self.lifecycle_users_per_tournament < self.lifecycle_teams_count * 7:
+                raise ValueError(
+                    "tournament-lifecycle requires at least 7 users per requested team"
+                )
+            if self.lifecycle_teams_count > 8192:
+                raise ValueError("lifecycle team count cannot exceed 8192")
         self.write_burst_profile = write_burst_profile
         self.write_burst_users_per_tournament = max(14, write_burst_users_per_tournament)
         self.write_burst_time_scale = max(0.01, write_burst_time_scale)
@@ -1849,6 +1977,8 @@ class ProductionQa:
         )
         if mode == "write-burst":
             self.scale_users = write_burst_users
+        elif mode == "tournament-lifecycle":
+            self.scale_users = self.lifecycle_tournament_count * self.lifecycle_users_per_tournament
         else:
             self.scale_users = max(14, scale_users)
         self.scale_teams = max(2, min(128, scale_teams))
@@ -1859,7 +1989,7 @@ class ProductionQa:
             else http_max_connections
         )
         self.http_max_connections = max(1, min(10_000, requested_http_connections))
-        self.collect_performance = collect_performance
+        self.collect_performance = collect_performance or mode == "tournament-lifecycle"
         self.scale_site_mix_users = (
             self.scale_users
             if scale_site_mix_users is None
@@ -1894,6 +2024,8 @@ class ProductionQa:
         self.tournament_ids: list[str] = []
         self.tournament_slugs: list[str] = []
         self.scenarios: list[dict[str, Any]] = []
+        self.lifecycle_phase_metrics: dict[str, dict[str, Any]] = {}
+        self.lifecycle_timings: dict[str, Any] = {}
         self.report: dict[str, Any] = {
             "marker": self.marker,
             "started_at": datetime.now(UTC).isoformat(),
@@ -1901,12 +2033,17 @@ class ProductionQa:
             "request_origin": self.request_origin,
             "mode": mode,
             "report_path": str(report_path),
-            "requested_users": self.scale_users if mode in {"scale", "read-mix", "write-burst"} else None,
+            "requested_users": self.scale_users if mode in {"scale", "read-mix", "write-burst"} else (
+                self.lifecycle_tournament_count * self.lifecycle_users_per_tournament
+                if mode == "tournament-lifecycle"
+                else None
+            ),
             "http_timeout_seconds": self.http_timeout,
             "profile_journey": self.profile_journey,
             "scenarios": self.scenarios,
             "user_ids": self.user_ids,
             "tournament_ids": [],
+            "tournament_slugs": [],
             "tournament_visibility": self.tournament_visibility,
             "invite_code": None,
             "teams": [],
@@ -1922,6 +2059,14 @@ class ProductionQa:
             "rostered_participant": None,
             "control_participant": None,
             "http_failure_diagnostics": [],
+            "tournament_lifecycle": {
+                "tournament_count": self.lifecycle_tournament_count,
+                "users_per_tournament": self.lifecycle_users_per_tournament,
+                "total_users": self.lifecycle_tournament_count * self.lifecycle_users_per_tournament,
+                "teams_count": self.lifecycle_teams_count,
+                "phases": self.lifecycle_phase_metrics,
+                "timings": self.lifecycle_timings,
+            },
         }
 
     def scenario(
@@ -1952,6 +2097,34 @@ class ProductionQa:
             tournament_slugs=self.tournament_slugs,
         )
 
+    async def run_lifecycle_phase(self, name: str, operation):
+        """Run one lifecycle user step and retain its existing harness metrics."""
+
+        system_sample_start = len(self.system_sampler.samples)
+        started_at = time.monotonic()
+        with self.phase(name):
+            result = await operation()
+        finished_at = time.monotonic()
+        system_sample_end = len(self.system_sampler.samples)
+        if self.collect_performance and system_sample_end == system_sample_start:
+            # Short mutation waves can finish between sampler ticks. Capture a
+            # boundary sample using the same SystemSampler used by all other
+            # QA modes so every lifecycle phase has resource evidence.
+            await self.system_sampler.sample()
+            system_sample_end = len(self.system_sampler.samples)
+        http = self.http_metrics.summary(phases={name})
+        system = self.system_sampler.summary(
+            start=system_sample_start,
+            end=system_sample_end,
+        )
+        phase_report = {
+            "phase_duration_seconds": round(finished_at - started_at, 4),
+            "http": http,
+            "system": system,
+        }
+        self.lifecycle_phase_metrics[name] = phase_report
+        return result
+
     async def start_performance_collection(self) -> None:
         if not self.collect_performance:
             return
@@ -1979,6 +2152,31 @@ class ProductionQa:
                 write_burst_report,
                 server_request_summary.get("by_qa_phase", {}),
             )
+        lifecycle_phases = self.lifecycle_phase_metrics
+        server_by_phase = server_request_summary.get("by_qa_phase", {})
+        if isinstance(lifecycle_phases, dict) and isinstance(server_by_phase, dict):
+            for phase_name, phase_report in lifecycle_phases.items():
+                phase_report["server_request_perf"] = server_by_phase.get(phase_name, {
+                    "scope": "diagnostic_sample",
+                    "requests": 0,
+                })
+                system = phase_report.get("system") or {}
+                processes = system.get("processes") if isinstance(system, dict) else {}
+                api_process = processes.get("deadlock-api", {}) if isinstance(processes, dict) else {}
+                worker_process = processes.get("deadlock-worker", {}) if isinstance(processes, dict) else {}
+                waits = system.get("postgres_waits", {}) if isinstance(system, dict) else {}
+                phase_report["resources"] = {
+                    "api_cpu": api_process,
+                    "worker_cpu": worker_process,
+                    "postgres_cpu": system.get("postgres_cpu_percent", {}),
+                    "memory": system.get("memory", {}),
+                    "db_connections": system.get("postgres_established_connections", {}),
+                    "db_pool_wait": (phase_report["server_request_perf"] or {}).get(
+                        "pool_checkout_wait_ms", {}
+                    ),
+                    "postgres_waits": waits,
+                    "celery_backlog": system.get("celery_backlog", {}),
+                }
         self.report["performance"] = {
             "http_client": http_summary,
             "system": system_summary,
@@ -2016,6 +2214,7 @@ class ProductionQa:
                 "write_burst_time_scale": self.write_burst_time_scale,
                 "load_generator_local": is_local_origin(self.origin),
             },
+            "lifecycle_phases": lifecycle_phases,
         }
 
     async def new_client(self, origin: str | None = None) -> httpx.AsyncClient:
@@ -2045,6 +2244,7 @@ class ProductionQa:
         status_code = 0
         ok = False
         response_bytes = 0
+        read_model_events: str | None = None
         try:
             headers = (
                 {
@@ -2063,6 +2263,7 @@ class ProductionQa:
             status_code = response.status_code
             ok = response.status_code == expected
             response_bytes = len(response.content or b"")
+            read_model_events = response.headers.get("x-platform-read-model")
         finally:
             if self.collect_performance:
                 finished_at = time.monotonic()
@@ -2076,6 +2277,7 @@ class ProductionQa:
                     started_at=started_at,
                     finished_at=finished_at,
                     response_bytes=response_bytes,
+                    read_model_events=read_model_events,
                 )
         if response.status_code != expected:
             diagnostics = response_diagnostics(response, method=method, path=path)
@@ -2102,64 +2304,105 @@ class ProductionQa:
         json_payload: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
         return_response_meta: bool = False,
+        record_ok_statuses: set[int] | None = None,
     ) -> Any:
         token = self.session_tokens_by_user_id[str(user["id"])]
         csrf_token = None
         if method.upper() in UNSAFE_METHODS:
             csrf_token = await self.csrf_token_for_user(client, user)
-        started_at = time.monotonic()
-        status_code = 0
-        ok = False
-        response_bytes = 0
-        try:
-            request_headers = {
-                "Origin": self.request_origin,
-                "Cookie": "; ".join(
-                    filter(
-                        None,
-                        (
-                            f"{self.session_cookie_name}={token}",
-                            f"{self.csrf_cookie_name}={csrf_token}" if csrf_token else None,
-                        ),
-                    )
-                ),
-                **({"X-CSRF-Token": csrf_token} if csrf_token else {}),
-                **(
-                    {"X-Platform-QA-Phase": self.current_phase}
-                    if self.collect_performance
-                    else {}
-                ),
-            }
-            if extra_headers:
-                request_headers.update(extra_headers)
-            response = await client.request(
-                method,
-                path,
-                headers=request_headers,
-                json=json_payload,
-            )
-            status_code = response.status_code
-            expected_statuses = (
-                {expected}
-                if isinstance(expected, int)
-                else set(expected)
-            )
-            ok = response.status_code in expected_statuses
-            response_bytes = len(response.content or b"")
-        finally:
-            if self.collect_performance:
-                finished_at = time.monotonic()
-                self.http_metrics.record(
-                    phase=self.current_phase,
-                    method=method,
-                    path=self.metric_path(path),
-                    status_code=status_code,
-                    elapsed_seconds=finished_at - started_at,
-                    ok=ok,
-                    started_at=started_at,
-                    finished_at=finished_at,
-                    response_bytes=response_bytes,
+        request_headers = {
+            "Origin": self.request_origin,
+            "Cookie": "; ".join(
+                filter(
+                    None,
+                    (
+                        f"{self.session_cookie_name}={token}",
+                        f"{self.csrf_cookie_name}={csrf_token}" if csrf_token else None,
+                    ),
                 )
+            ),
+            **({"X-CSRF-Token": csrf_token} if csrf_token else {}),
+            **(
+                {"X-Platform-QA-Phase": self.current_phase}
+                if self.collect_performance
+                else {}
+            ),
+        }
+        if extra_headers:
+            request_headers.update(extra_headers)
+        retryable_get = self.mode == "tournament-lifecycle" and method.upper() == "GET"
+        # The production API intentionally sheds lifecycle reads on DB pool
+        # timeout with Retry-After: 1. Keep enough bounded budget for a full-
+        # population read wave without replaying mutations: a mutation can
+        # commit before a transient response is returned.
+        retry_limit = 8 if retryable_get else 0
+        response: httpx.Response | None = None
+        for request_attempt in range(retry_limit + 1):
+            started_at = time.monotonic()
+            status_code = 0
+            ok = False
+            response_bytes = 0
+            read_model_events: str | None = None
+            retry_busy = False
+            try:
+                response = await client.request(
+                    method,
+                    path,
+                    headers=request_headers,
+                    json=json_payload,
+                )
+                status_code = response.status_code
+                expected_statuses = (
+                    {expected}
+                    if isinstance(expected, int)
+                    else set(expected)
+                )
+                ok = (
+                    response.status_code in expected_statuses
+                    if record_ok_statuses is None
+                    else response.status_code in record_ok_statuses
+                )
+                response_bytes = len(response.content or b"")
+                read_model_events = response.headers.get("x-platform-read-model")
+                retry_busy = (
+                    retryable_get
+                    and response.status_code == 503
+                    and request_attempt < retry_limit
+                )
+            except httpx.TransportError:
+                if request_attempt >= retry_limit:
+                    raise
+                retry_busy = True
+            finally:
+                if self.collect_performance:
+                    finished_at = time.monotonic()
+                    self.http_metrics.record(
+                        phase=self.current_phase,
+                        method=method,
+                        path=self.metric_path(path),
+                        status_code=status_code,
+                        elapsed_seconds=finished_at - started_at,
+                        ok=ok,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        response_bytes=response_bytes,
+                        read_model_events=read_model_events,
+                    )
+            if retry_busy:
+                retry_after_seconds = 0.25 * (request_attempt + 1)
+                if response is not None:
+                    retry_after_header = response.headers.get("retry-after")
+                    if retry_after_header:
+                        with suppress(ValueError):
+                            retry_after_seconds = max(
+                                retry_after_seconds,
+                                float(retry_after_header),
+                            )
+                await asyncio.sleep(min(5.0, retry_after_seconds))
+                continue
+            break
+        if response is None:
+            raise QaFailure(f"{method} {path}: request returned no response")
         expected_statuses = (
             {expected}
             if isinstance(expected, int)
@@ -2194,6 +2437,7 @@ class ProductionQa:
         started_at = time.monotonic()
         status_code = 0
         response_bytes = 0
+        read_model_events: str | None = None
         try:
             response = await client.get(
                 "/auth/csrf",
@@ -2204,6 +2448,7 @@ class ProductionQa:
             )
             status_code = response.status_code
             response_bytes = len(response.content or b"")
+            read_model_events = response.headers.get("x-platform-read-model")
         finally:
             if self.collect_performance:
                 self.http_metrics.record(
@@ -2216,6 +2461,7 @@ class ProductionQa:
                     started_at=started_at,
                     finished_at=time.monotonic(),
                     response_bytes=response_bytes,
+                    read_model_events=read_model_events,
                 )
         if response.status_code != 200:
             diagnostics = response_diagnostics(
@@ -2438,7 +2684,7 @@ class ProductionQa:
                     origin=self.origin,
                     requested_users=(
                         self.scale_users
-                        if self.mode in {"scale", "write-burst"}
+                        if self.mode in {"scale", "write-burst", "tournament-lifecycle"}
                         else len(self.user_ids)
                     ),
                     report_path=str(self.report_path),
@@ -4730,6 +4976,1033 @@ class ProductionQa:
             await self.record_preprod_run(report_path=str(self.report_path))
         return self.report
 
+    async def run_tournament_lifecycle(self) -> dict[str, Any]:
+        """Exercise the complete multi-tournament Deadlock lifecycle.
+
+        This mode deliberately uses the same API requests as the current web
+        flow. Fixture users and sessions are seeded through the existing QA
+        setup helper; every measured workflow action remains an HTTP request
+        against the real platform API.
+        """
+
+        if self.mode != "tournament-lifecycle":
+            raise QaFailure("run_tournament_lifecycle requires tournament-lifecycle mode")
+
+        async def bounded_map(items: list[dict[str, Any]], task) -> list[Any]:
+            semaphore = asyncio.Semaphore(self.concurrency)
+
+            async def run_one(item: dict[str, Any]) -> Any:
+                async with semaphore:
+                    return await task(item)
+
+            return list(await asyncio.gather(*(run_one(item) for item in items)))
+
+        async def create_tournament(
+            api_client: httpx.AsyncClient,
+            organizer: dict[str, Any],
+            index: int,
+        ) -> dict[str, Any]:
+            created = await self.request_as(
+                api_client,
+                organizer,
+                "POST",
+                "/tournaments",
+                expected=201,
+                json_payload={
+                    "name": f"LC{index + 1:02d}-{self.marker[-12:]}"[:25],
+                    "description": f"Tournament lifecycle QA {self.marker} {index + 1}.",
+                    "visibility": "public",
+                    "format_slug": "solo",
+                    "allowed_ranks": VALID_RANKS,
+                    "max_participants": self.lifecycle_users_per_tournament,
+                    "match_format": "bo3",
+                    "final_format": "bo5",
+                    "teams_count": self.lifecycle_teams_count,
+                },
+            )
+            slug = str(created["slug"])
+            await self.request_as(
+                api_client,
+                organizer,
+                "PATCH",
+                f"/tournaments/{slug}/status",
+                expected=200,
+                json_payload={"status": "registration_open"},
+            )
+            tournament_id = str(created["id"])
+            self.tournament_ids.append(tournament_id)
+            self.tournament_slugs.append(slug)
+            if self.tournament_id is None:
+                self.tournament_id = tournament_id
+                self.tournament_slug = slug
+            self.report["tournament_ids"] = list(dict.fromkeys(self.tournament_ids))
+            self.report["tournament_slugs"] = list(dict.fromkeys(self.tournament_slugs))
+            return {
+                **created,
+                "slug": slug,
+                "organizer": organizer,
+                "index": index,
+            }
+
+        async def read_detail(
+            item: dict[str, Any],
+            *,
+            expected_team_count: int | None = None,
+            expected_status: str | None = None,
+            return_payload: bool = False,
+        ) -> dict[str, Any] | None:
+            tournament = item["tournament"]
+            user = item["user"]
+            payload = await self.request_as(
+                api_client,
+                user,
+                "GET",
+                f"/tournaments/{tournament['slug']}/workspace?participants_limit=0"
+                "&participants_offset=0&workspace_view=detail&include_current_user=false",
+                expected=200,
+            )
+            if payload.get("participants") != []:
+                raise QaFailure(
+                    "tournament lifecycle detail workspace unexpectedly returned participant rows"
+                )
+            if payload.get("participants_limit") != 0:
+                raise QaFailure("tournament lifecycle detail workspace changed participants_limit")
+            if int(payload.get("participants_total") or 0) != self.lifecycle_users_per_tournament:
+                raise QaFailure("tournament lifecycle detail workspace participant total mismatch")
+            if payload.get("current_user") is not None:
+                raise QaFailure("tournament lifecycle detail workspace returned current_user")
+            tournament_payload = payload.get("tournament") or {}
+            if expected_status is not None and tournament_payload.get("status") != expected_status:
+                raise QaFailure(
+                    f"tournament lifecycle detail status mismatch: expected {expected_status}"
+                )
+            bracket = payload.get("bracket") or {}
+            teams = bracket.get("teams") or []
+            if expected_team_count is not None and len(teams) != expected_team_count:
+                raise QaFailure(
+                    "tournament lifecycle detail normalized team state mismatch: "
+                    f"expected {expected_team_count}, got {len(teams)}"
+                )
+            if expected_team_count:
+                member_count = sum(len(team.get("members") or []) for team in teams)
+                expected_member_count = expected_team_count * 7
+                if member_count != expected_member_count:
+                    raise QaFailure(
+                        "tournament lifecycle detail normalized team member count mismatch: "
+                        f"expected {expected_member_count}, got {member_count}"
+                    )
+            return payload if return_payload else None
+
+        async def mass_detail_reads(
+            items: list[dict[str, Any]],
+            *,
+            expected_team_count: int | None = None,
+            expected_status: str | None = None,
+        ) -> dict[str, dict[str, Any]]:
+            first_user_by_slug = {
+                str(slug): users_for_tournament[0]
+                for slug, users_for_tournament in tournament_users.items()
+            }
+
+            async def read_one(item: dict[str, Any]) -> dict[str, Any] | None:
+                is_first = item["user"]["id"] == first_user_by_slug[
+                    str(item["tournament"]["slug"])
+                ].get("id")
+                return await read_detail(
+                    item,
+                    expected_team_count=expected_team_count,
+                    expected_status=expected_status,
+                    return_payload=is_first,
+                )
+
+            payloads = await bounded_map(items, read_one)
+            return {
+                str(item["tournament"]["slug"]): payload
+                for item, payload in zip(items, payloads)
+                if payload is not None
+            }
+
+        async def profile_read(item: dict[str, Any], target_user_id: str) -> None:
+            payload = await self.request_as(
+                api_client,
+                item["user"],
+                "GET",
+                f"/tournaments/{item['tournament']['slug']}/profiles/{target_user_id}",
+                expected=200,
+            )
+            profile = payload.get("profile") if isinstance(payload, dict) else None
+            if not isinstance(profile, dict) or str(profile.get("user_id")) != target_user_id:
+                raise QaFailure("tournament-scoped profile response did not match requested user")
+
+        async def mass_profile_reads(
+            items: list[dict[str, Any]],
+            target_key: str,
+        ) -> None:
+            await bounded_map(
+                items,
+                lambda item: profile_read(item, str(item[target_key])),
+            )
+
+        async def mass_bracket_workspace_reads(
+            items: list[dict[str, Any]],
+            etags: dict[tuple[str, str], str],
+        ) -> dict[str, dict[str, Any]]:
+            first_user_by_slug = {
+                str(slug): users_for_tournament[0]
+                for slug, users_for_tournament in tournament_users.items()
+            }
+
+            async def read_one(item: dict[str, Any]) -> dict[str, Any] | None:
+                payload, status_code, headers = await self.request_as(
+                    api_client,
+                    item["user"],
+                    "GET",
+                    f"/tournaments/{item['tournament']['slug']}/workspace?participants_limit=0"
+                    "&participants_offset=0&workspace_view=bracket&include_current_user=false",
+                    expected=200,
+                    return_response_meta=True,
+                )
+                if status_code != 200 or not isinstance(payload, dict):
+                    raise QaFailure("initial bracket workspace read did not return 200 JSON")
+                bracket = payload.get("bracket") or {}
+                if len(bracket.get("teams") or []) != self.lifecycle_teams_count:
+                    raise QaFailure("initial bracket workspace team count mismatch")
+                if len(bracket.get("matches") or []) != self.lifecycle_teams_count - 1:
+                    raise QaFailure("initial bracket workspace match count mismatch")
+                etag = headers.get("etag") or headers.get("ETag")
+                if not etag:
+                    raise QaFailure("initial bracket workspace response did not include ETag")
+                etags[(str(item["tournament"]["slug"]), str(item["user"]["id"]))] = etag
+                if item["user"]["id"] == first_user_by_slug[
+                    str(item["tournament"]["slug"])
+                ].get("id"):
+                    return payload
+                return None
+
+            payloads = await bounded_map(items, read_one)
+            return {
+                str(item["tournament"]["slug"]): payload
+                for item, payload in zip(items, payloads)
+                if payload is not None
+            }
+
+        async def mass_bracket_workspace_304(
+            items: list[dict[str, Any]],
+            etags: dict[tuple[str, str], str],
+        ) -> None:
+            async def read_one(item: dict[str, Any]) -> None:
+                key = (str(item["tournament"]["slug"]), str(item["user"]["id"]))
+                etag = etags.get(key)
+                if not etag:
+                    raise QaFailure("missing ETag for conditional initial bracket workspace read")
+                payload, status_code, _ = await self.request_as(
+                    api_client,
+                    item["user"],
+                    "GET",
+                    f"/tournaments/{item['tournament']['slug']}/workspace?participants_limit=0"
+                    "&participants_offset=0&workspace_view=bracket&include_current_user=false",
+                    expected=304,
+                    extra_headers={"If-None-Match": etag},
+                    return_response_meta=True,
+                )
+                if status_code != 304 or payload is not None:
+                    raise QaFailure("conditional initial bracket workspace read did not return 304")
+
+            await bounded_map(items, read_one)
+
+        async def mass_summary_reads(
+            items: list[dict[str, Any]],
+            etags: dict[tuple[str, str], str],
+        ) -> None:
+            async def read_one(item: dict[str, Any]) -> None:
+                payload, status_code, headers = await self.request_as(
+                    api_client,
+                    item["user"],
+                    "GET",
+                    f"/tournaments/{item['tournament']['slug']}/bracket?teams_view=summary",
+                    expected=200,
+                    return_response_meta=True,
+                )
+                if status_code != 200 or not isinstance(payload, dict):
+                    raise QaFailure("bracket summary refresh did not return 200 JSON")
+                etag = headers.get("etag") or headers.get("ETag")
+                if not etag:
+                    raise QaFailure("bracket summary refresh response did not include ETag")
+                etags[(str(item["tournament"]["slug"]), str(item["user"]["id"]))] = etag
+
+            await bounded_map(items, read_one)
+
+        async def mass_summary_304(
+            items: list[dict[str, Any]],
+            etags: dict[tuple[str, str], str],
+        ) -> None:
+            async def read_one(item: dict[str, Any]) -> None:
+                key = (str(item["tournament"]["slug"]), str(item["user"]["id"]))
+                etag = etags.get(key)
+                if not etag:
+                    raise QaFailure("missing ETag for conditional bracket summary refresh")
+                payload, status_code, _ = await self.request_as(
+                    api_client,
+                    item["user"],
+                    "GET",
+                    f"/tournaments/{item['tournament']['slug']}/bracket?teams_view=summary",
+                    expected=304,
+                    extra_headers={"If-None-Match": etag},
+                    return_response_meta=True,
+                )
+                if status_code != 304 or payload is not None:
+                    raise QaFailure("conditional bracket summary refresh did not return 304")
+
+            await bounded_map(items, read_one)
+
+        async def queue_and_wait_assignment(tournament: dict[str, Any]) -> dict[str, Any]:
+            organizer = tournament["organizer"]
+            slug = str(tournament["slug"])
+            previous_run_id = None
+            queue_started_at = time.monotonic()
+            queue_started_utc = datetime.now(UTC)
+            job = await self.request_as(
+                api_client,
+                organizer,
+                "POST",
+                f"/tournaments/{slug}/deadlock/auto-assignment/run-async",
+                expected=202,
+            )
+            queued_at = time.monotonic()
+            queued_at_utc = datetime.now(UTC)
+            final_run = await self._poll_auto_assignment_run_as(
+                api_client,
+                organizer,
+                tournament_slug=slug,
+                previous_run_id=previous_run_id,
+                expected_teams=self.lifecycle_teams_count,
+                task_id=str(job["task_id"]),
+            )
+            finished_at = time.monotonic()
+            created_at_raw = final_run.get("created_at")
+            queue_delay_seconds: float | None = None
+            if isinstance(created_at_raw, str):
+                with suppress(ValueError):
+                    created_at = datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+                    queue_delay_seconds = max(
+                        0.0,
+                        (created_at - queued_at_utc).total_seconds(),
+                    )
+            return {
+                "tournament": tournament,
+                "run": final_run,
+                "task_id": str(job["task_id"]),
+                "queue_started_utc": queue_started_utc.isoformat(),
+                "queue_delay_reference_utc": queued_at_utc.isoformat(),
+                "queue_delay_seconds": queue_delay_seconds,
+                "duration_seconds": round(finished_at - queue_started_at, 4),
+                "worker_observed_seconds": round(finished_at - queued_at, 4),
+            }
+
+        async def team_materialization_timings(
+            run_ids_by_slug: dict[str, str],
+        ) -> list[float]:
+            if not run_ids_by_slug:
+                return []
+            async with session_factory()() as db_session:
+                rows = (
+                    await db_session.execute(
+                        select(
+                            TournamentDeadlockAssignmentRun.id,
+                            TournamentDeadlockAssignmentRun.created_at,
+                            func.min(TournamentTeam.created_at),
+                            func.max(TournamentTeam.created_at),
+                        )
+                        .join(
+                            TournamentTeam,
+                            TournamentTeam.source_assignment_run_id
+                            == TournamentDeadlockAssignmentRun.id,
+                        )
+                        .where(
+                            TournamentDeadlockAssignmentRun.id.in_(list(run_ids_by_slug.values()))
+                        )
+                        .group_by(
+                            TournamentDeadlockAssignmentRun.id,
+                            TournamentDeadlockAssignmentRun.created_at,
+                        )
+                    )
+                ).all()
+            durations: list[float] = []
+            for _, run_created_at, first_team_created_at, last_team_created_at in rows:
+                if run_created_at is None or last_team_created_at is None:
+                    continue
+                durations.append(
+                    max(
+                        0.0,
+                        (last_team_created_at - run_created_at).total_seconds(),
+                    )
+                )
+            return durations
+
+        started = time.monotonic()
+        api_client = await self.new_client()
+        try:
+            await self.record_preprod_run(status="running", requested_users=self.scale_users)
+            await self.start_performance_collection()
+            users = await self.run_lifecycle_phase(
+                "lifecycle_fixture_seed",
+                self.bulk_register_scale_users,
+            )
+            self.preseed_csrf_tokens(users)
+            organizer_count = self.lifecycle_tournament_count
+            organizers = users[:organizer_count]
+            self.scenario(
+                "lifecycle_fixture_shape",
+                len(users) == self.lifecycle_tournament_count * self.lifecycle_users_per_tournament,
+                {
+                    "users": len(users),
+                    "tournaments": self.lifecycle_tournament_count,
+                    "users_per_tournament": self.lifecycle_users_per_tournament,
+                },
+            )
+
+            tournament_users: dict[str, list[dict[str, Any]]] = {}
+            await self.run_lifecycle_phase(
+                "lifecycle_setup_permissions",
+                lambda: self.grant_tournament_permissions(organizers, []),
+            )
+            tournaments = await self.run_lifecycle_phase(
+                "lifecycle_tournament_setup",
+                lambda: bounded_map(
+                    [
+                        {"organizer": organizer, "index": index}
+                        for index, organizer in enumerate(organizers)
+                    ],
+                    lambda item: create_tournament(
+                        api_client,
+                        item["organizer"],
+                        int(item["index"]),
+                    ),
+                ),
+            )
+            self.tournament_ids = list(dict.fromkeys(self.tournament_ids))
+            self.tournament_slugs = list(dict.fromkeys(self.tournament_slugs))
+            self.tournament_id = self.tournament_id or str(tournaments[0]["id"])
+            self.tournament_slug = self.tournament_slug or str(tournaments[0]["slug"])
+            self.report["tournament_ids"] = list(self.tournament_ids)
+            self.report["tournament_slugs"] = list(self.tournament_slugs)
+            for index, tournament in enumerate(tournaments):
+                start_index = index * self.lifecycle_users_per_tournament
+                tournament_users[str(tournament["slug"])] = users[
+                    start_index : start_index + self.lifecycle_users_per_tournament
+                ]
+            self.report["created_users"] = len(users)
+            await self.record_preprod_run(
+                created_users=len(users),
+                tournaments_created=len(tournaments),
+            )
+
+            all_items = [
+                {"tournament": tournament, "user": user}
+                for tournament in tournaments
+                for user in tournament_users[str(tournament["slug"])]
+            ]
+
+            await self.run_lifecycle_phase(
+                "mass_join",
+                lambda: bounded_map(
+                    all_items,
+                    lambda item: self.request_as(
+                        api_client,
+                        item["user"],
+                        "POST",
+                        f"/tournaments/{item['tournament']['slug']}/join",
+                        expected=201,
+                        json_payload={"entry_type": "solo"},
+                    ),
+                ),
+            )
+            self.scenario(
+                "lifecycle_mass_join_complete",
+                True,
+                {"requests": len(all_items)},
+            )
+
+            await self.run_lifecycle_phase(
+                "mass_tournament_detail_workspace_reads",
+                lambda: mass_detail_reads(all_items),
+            )
+
+            await self.run_lifecycle_phase(
+                "registration_close",
+                lambda: bounded_map(
+                    tournaments,
+                    lambda tournament: self.request_as(
+                        api_client,
+                        tournament["organizer"],
+                        "PATCH",
+                        f"/tournaments/{tournament['slug']}/status",
+                        expected=200,
+                        json_payload={"status": "registration_closed"},
+                    ),
+                ),
+            )
+
+            async def start_ready_check(tournament: dict[str, Any]) -> Any:
+                return await self.request_as(
+                    api_client,
+                    tournament["organizer"],
+                    "POST",
+                    f"/tournaments/{tournament['slug']}/deadlock/ready-check/start",
+                    expected=201,
+                )
+
+            ready_starts = await self.run_lifecycle_phase(
+                "ready_check_start",
+                lambda: bounded_map(tournaments, start_ready_check),
+            )
+            if any(
+                int(payload.get("eligible_participant_count") or 0)
+                != self.lifecycle_users_per_tournament
+                for payload in ready_starts
+            ):
+                raise QaFailure("ready-check start did not expose all tournament participants")
+
+            await self.run_lifecycle_phase(
+                "mass_ready_check_state_reads",
+                lambda: bounded_map(
+                    all_items,
+                    lambda item: self.request_as(
+                        api_client,
+                        item["user"],
+                        "GET",
+                        f"/tournaments/{item['tournament']['slug']}/deadlock/ready-check",
+                        expected=200,
+                    ),
+                ),
+            )
+
+            async def ready_vote_with_bounded_retry(item: dict[str, Any]) -> Any:
+                for attempt in range(9):
+                    payload, status_code, headers = await self.request_as(
+                        api_client,
+                        item["user"],
+                        "POST",
+                        f"/tournaments/{item['tournament']['slug']}/deadlock/ready-check/vote",
+                        expected=(200, 503),
+                        json_payload={"choice": "yes"},
+                        return_response_meta=True,
+                        record_ok_statuses={200},
+                    )
+                    if status_code == 200:
+                        return payload
+                    if attempt == 8:
+                        raise QaFailure(
+                            "ready vote remained overloaded after the bounded lifecycle retry budget"
+                        )
+                    retry_after_ms = (
+                        int(payload.get("retry_after_ms") or 250)
+                        if isinstance(payload, dict)
+                        else 250
+                    )
+                    retry_after_header = headers.get("retry-after") or headers.get("Retry-After")
+                    if retry_after_header:
+                        with suppress(ValueError):
+                            retry_after_ms = max(
+                                retry_after_ms,
+                                int(float(retry_after_header) * 1000),
+                            )
+                    await asyncio.sleep(min(2.0, max(0.15, retry_after_ms / 1000)))
+                raise AssertionError("unreachable")
+
+            async def mass_ready_votes() -> None:
+                # Start at the reviewed per-worker admission contour. The
+                # controller may raise its limit while the wave is healthy,
+                # but a single isolated QA worker must not begin above its
+                # initial limit and shed every first attempt. The full user
+                # population is still issued and transient 503 attempts stay
+                # visible in the phase metrics.
+                vote_semaphore = asyncio.Semaphore(min(self.concurrency, 8))
+
+                async def run_one(item: dict[str, Any]) -> None:
+                    async with vote_semaphore:
+                        await ready_vote_with_bounded_retry(item)
+
+                await asyncio.gather(*(run_one(item) for item in all_items))
+
+            await self.run_lifecycle_phase("mass_ready_votes", mass_ready_votes)
+
+            async def close_ready_check(tournament: dict[str, Any]) -> Any:
+                return await self.request_as(
+                    api_client,
+                    tournament["organizer"],
+                    "POST",
+                    f"/tournaments/{tournament['slug']}/deadlock/ready-check/close",
+                    expected=200,
+                )
+
+            closed_ready = await self.run_lifecycle_phase(
+                "ready_check_close",
+                lambda: bounded_map(tournaments, close_ready_check),
+            )
+            if any(
+                int(payload.get("ready_count") or 0) != self.lifecycle_users_per_tournament
+                for payload in closed_ready
+            ):
+                raise QaFailure("ready-check close did not retain all ready voters")
+
+            async def start_captain_round(tournament: dict[str, Any]) -> Any:
+                return await self.request_as(
+                    api_client,
+                    tournament["organizer"],
+                    "POST",
+                    f"/tournaments/{tournament['slug']}/deadlock/captain-round/start",
+                    expected=201,
+                    json_payload={"teams_count": self.lifecycle_teams_count},
+                )
+
+            captain_rounds = await self.run_lifecycle_phase(
+                "captain_round_start",
+                lambda: bounded_map(tournaments, start_captain_round),
+            )
+            if any(
+                payload.get("status") != "finalized"
+                or int(payload.get("assigned_count") or 0) != self.lifecycle_teams_count
+                for payload in captain_rounds
+            ):
+                raise QaFailure("captain-round did not finalize the requested team count")
+
+            assignment_results = await self.run_lifecycle_phase(
+                "auto_assignment_wait",
+                lambda: bounded_map(tournaments, queue_and_wait_assignment),
+            )
+            run_by_slug = {
+                str(result["tournament"]["slug"]): result["run"]
+                for result in assignment_results
+            }
+            run_id_by_slug = {
+                slug: str(run["id"])
+                for slug, run in run_by_slug.items()
+            }
+            queue_delays = [
+                float(result["queue_delay_seconds"])
+                for result in assignment_results
+                if result.get("queue_delay_seconds") is not None
+            ]
+            assignment_durations = [float(result["duration_seconds"]) for result in assignment_results]
+            self.lifecycle_timings["auto_assignment_duration"] = {
+                "per_tournament_seconds": assignment_durations,
+                "statistics_ms": metric_stats([value * 1000 for value in assignment_durations]),
+            }
+            self.lifecycle_timings["assignment_queue_delay"] = {
+                "definition": "worker run.created_at minus enqueue request completion; includes queue/start delay",
+                "per_tournament_seconds": queue_delays,
+                "statistics_ms": metric_stats([value * 1000 for value in queue_delays]),
+            }
+            if any(len(result["run"].get("teams") or []) != self.lifecycle_teams_count for result in assignment_results):
+                raise QaFailure("auto-assignment did not generate the requested number of teams")
+
+            async def publish_assignment(tournament: dict[str, Any]) -> dict[str, Any]:
+                slug = str(tournament["slug"])
+                run_id = run_id_by_slug[slug]
+                started_at = time.monotonic()
+                payload = await self.request_as(
+                    api_client,
+                    tournament["organizer"],
+                    "POST",
+                    f"/tournaments/{slug}/deadlock/auto-assignment/{run_id}/publish",
+                    expected=200,
+                )
+                return {"payload": payload, "duration_seconds": time.monotonic() - started_at}
+
+            published = await self.run_lifecycle_phase(
+                "assignment_publish",
+                lambda: bounded_map(tournaments, publish_assignment),
+            )
+            publish_durations = [float(item["duration_seconds"]) for item in published]
+            self.lifecycle_timings["assignment_publish_duration"] = {
+                "per_tournament_seconds": publish_durations,
+                "statistics_ms": metric_stats([value * 1000 for value in publish_durations]),
+            }
+            if any(item["payload"].get("status") != "published" for item in published):
+                raise QaFailure("assignment publish did not return published state")
+
+            async def lock_assignment(tournament: dict[str, Any]) -> dict[str, Any]:
+                slug = str(tournament["slug"])
+                run_id = run_id_by_slug[slug]
+                started_at = time.monotonic()
+                payload = await self.request_as(
+                    api_client,
+                    tournament["organizer"],
+                    "POST",
+                    f"/tournaments/{slug}/deadlock/auto-assignment/{run_id}/lock",
+                    expected=200,
+                )
+                return {"payload": payload, "duration_seconds": time.monotonic() - started_at}
+
+            locked = await self.run_lifecycle_phase(
+                "assignment_lock",
+                lambda: bounded_map(tournaments, lock_assignment),
+            )
+            lock_durations = [float(item["duration_seconds"]) for item in locked]
+            self.lifecycle_timings["assignment_lock_duration"] = {
+                "per_tournament_seconds": lock_durations,
+                "statistics_ms": metric_stats([value * 1000 for value in lock_durations]),
+            }
+            if any(item["payload"].get("status") != "locked" for item in locked):
+                raise QaFailure("assignment lock did not return locked state")
+
+            materialization_durations = await team_materialization_timings(run_id_by_slug)
+            self.lifecycle_timings["team_materialization_duration"] = {
+                "definition": "max materialized team created_at minus assignment run created_at",
+                "per_tournament_seconds": materialization_durations,
+                "statistics_ms": metric_stats([value * 1000 for value in materialization_durations]),
+            }
+
+            detail_payloads = await self.run_lifecycle_phase(
+                "post_assignment_detail_read",
+                lambda: mass_detail_reads(
+                    all_items,
+                    expected_team_count=self.lifecycle_teams_count,
+                ),
+            )
+            self.lifecycle_timings["post_assignment_detail_read"] = {
+                "phase_duration_seconds": self.lifecycle_phase_metrics["post_assignment_detail_read"][
+                    "phase_duration_seconds"
+                ],
+            }
+            if len(detail_payloads) != self.lifecycle_tournament_count:
+                raise QaFailure("post-assignment detail reads did not cover every tournament")
+
+            profile_targets: list[dict[str, Any]] = []
+            for tournament in tournaments:
+                slug = str(tournament["slug"])
+                teams = list((detail_payloads[slug].get("bracket") or {}).get("teams") or [])
+                if len(teams) != self.lifecycle_teams_count:
+                    raise QaFailure("normalized detail teams are missing before profile reads")
+                members_by_team = [
+                    [str(member["user_id"]) for member in team.get("members") or []]
+                    for team in teams
+                ]
+                member_team_index = {
+                    user_id: index
+                    for index, member_ids in enumerate(members_by_team)
+                    for user_id in member_ids
+                }
+                materialized_ids = [user_id for member_ids in members_by_team for user_id in member_ids]
+                if not materialized_ids:
+                    raise QaFailure("normalized detail teams contain no materialized members")
+                users_for_tournament = tournament_users[slug]
+                for user in users_for_tournament:
+                    user_id = str(user["id"])
+                    team_index = member_team_index.get(user_id)
+                    if team_index is not None:
+                        own_team = members_by_team[team_index]
+                        teammate_id = next(member_id for member_id in own_team if member_id != user_id)
+                        opponent_team = members_by_team[(team_index + 1) % len(members_by_team)]
+                    else:
+                        teammate_id = members_by_team[0][0]
+                        opponent_team = members_by_team[1]
+                    profile_targets.append(
+                        {
+                            "tournament": tournament,
+                            "user": user,
+                            "teammate_id": teammate_id,
+                            "opponent_id": opponent_team[0],
+                        }
+                    )
+
+            self.lifecycle_timings["tournament_profile_read"] = {
+                "teammate_phase": "teammate_profile_reads",
+                "opponent_phase": "opponent_profile_reads",
+            }
+            await self.run_lifecycle_phase(
+                "teammate_profile_reads",
+                lambda: mass_profile_reads(profile_targets, "teammate_id"),
+            )
+            await self.run_lifecycle_phase(
+                "opponent_profile_reads",
+                lambda: mass_profile_reads(profile_targets, "opponent_id"),
+            )
+
+            async def seed_opening_round(tournament: dict[str, Any]) -> dict[str, Any]:
+                started_at = time.monotonic()
+                payload = await self.request_as(
+                    api_client,
+                    tournament["organizer"],
+                    "POST",
+                    f"/tournaments/{tournament['slug']}/matches/seed-opening-round",
+                    expected=201,
+                )
+                return {"matches": payload, "duration_seconds": time.monotonic() - started_at}
+
+            seeded = await self.run_lifecycle_phase(
+                "bracket_seed",
+                lambda: bounded_map(tournaments, seed_opening_round),
+            )
+            seed_durations = [float(item["duration_seconds"]) for item in seeded]
+            self.lifecycle_timings["bracket_seed_duration"] = {
+                "per_tournament_seconds": seed_durations,
+                "statistics_ms": metric_stats([value * 1000 for value in seed_durations]),
+            }
+            if any(len(item["matches"]) != self.lifecycle_teams_count // 2 for item in seeded):
+                raise QaFailure("opening-round seed did not create the expected number of matches")
+
+            initial_bracket_payloads: dict[str, dict[str, Any]] = {}
+            initial_bracket_etags: dict[tuple[str, str], str] = {}
+            initial_bracket_payloads = await self.run_lifecycle_phase(
+                "initial_bracket_workspace_read_200",
+                lambda: mass_bracket_workspace_reads(all_items, initial_bracket_etags),
+            )
+            await self.run_lifecycle_phase(
+                "initial_bracket_workspace_read_304",
+                lambda: mass_bracket_workspace_304(all_items, initial_bracket_etags),
+            )
+            self.lifecycle_timings["initial_bracket_workspace_read"] = {
+                "phase_duration_seconds": self.lifecycle_phase_metrics[
+                    "initial_bracket_workspace_read_200"
+                ]["phase_duration_seconds"],
+                "conditional_304_phase_duration_seconds": self.lifecycle_phase_metrics[
+                    "initial_bracket_workspace_read_304"
+                ]["phase_duration_seconds"],
+            }
+
+            await self.run_lifecycle_phase(
+                "tournament_start",
+                lambda: bounded_map(
+                    tournaments,
+                    lambda tournament: self.request_as(
+                        api_client,
+                        tournament["organizer"],
+                        "PATCH",
+                        f"/tournaments/{tournament['slug']}/status",
+                        expected=200,
+                        json_payload={"status": "in_progress"},
+                    ),
+                ),
+            )
+
+            current_matches_by_slug: dict[str, list[dict[str, Any]]] = {}
+            current_revision_by_slug: dict[str, int] = {}
+            for tournament in tournaments:
+                slug = str(tournament["slug"])
+                bracket = initial_bracket_payloads[slug].get("bracket") or {}
+                current_matches_by_slug[slug] = sorted(
+                    [
+                        match
+                        for match in bracket.get("matches") or []
+                        if int(match.get("round_number") or 0) == 1
+                    ],
+                    key=lambda match: int(match.get("match_order") or 0),
+                )
+                current_revision_by_slug[slug] = int(bracket.get("revision") or 0)
+
+            summary_etags: dict[tuple[str, str], str] = {}
+            round_phase_durations: list[float] = []
+            match_phase_durations: list[float] = []
+            completed = False
+            round_number = 1
+            total_rounds = self.lifecycle_teams_count.bit_length() - 1
+            while not completed:
+                report_started = time.monotonic()
+                phase_name = f"match_report_round_{round_number}"
+
+                async def report_match(item: dict[str, Any]) -> Any:
+                    tournament = item["tournament"]
+                    slug = str(tournament["slug"])
+                    match = item["match"]
+                    is_final = round_number == total_rounds
+                    home_score, away_score = (3, 0) if is_final else (2, 0)
+                    return await self.request_as(
+                        api_client,
+                        tournament["organizer"],
+                        "POST",
+                        f"/tournaments/{slug}/matches/{match['id']}/report",
+                        expected=200,
+                        json_payload={
+                            "home_score": home_score,
+                            "away_score": away_score,
+                            "expected_revision": current_revision_by_slug[slug],
+                        },
+                    )
+
+                async def report_round() -> None:
+                    max_matches = max(
+                        len(current_matches_by_slug[str(tournament["slug"])])
+                        for tournament in tournaments
+                    )
+                    for wave_index in range(max_matches):
+                        wave = [
+                            {
+                                "tournament": tournament,
+                                "match": current_matches_by_slug[str(tournament["slug"])][wave_index],
+                            }
+                            for tournament in tournaments
+                            if wave_index < len(current_matches_by_slug[str(tournament["slug"])])
+                        ]
+                        await bounded_map(wave, report_match)
+                        for item in wave:
+                            slug = str(item["tournament"]["slug"])
+                            current_revision_by_slug[slug] += 1
+
+                await self.run_lifecycle_phase(phase_name, report_round)
+                match_phase_durations.append(time.monotonic() - report_started)
+                if round_number < total_rounds:
+                    async def seed_next_round(tournament: dict[str, Any]) -> dict[str, Any]:
+                        started_at = time.monotonic()
+                        payload = await self.request_as(
+                            api_client,
+                            tournament["organizer"],
+                            "POST",
+                            f"/tournaments/{tournament['slug']}/matches/seed-next-round",
+                            expected=201,
+                        )
+                        return {"matches": payload, "duration_seconds": time.monotonic() - started_at}
+
+                    next_round = await self.run_lifecycle_phase(
+                        f"bracket_seed_next_round_{round_number}",
+                        lambda: bounded_map(tournaments, seed_next_round),
+                    )
+                    for tournament, seeded_next in zip(tournaments, next_round):
+                        slug = str(tournament["slug"])
+                        current_matches_by_slug[slug] = sorted(
+                            list(seeded_next["matches"] or []),
+                            key=lambda match: int(match.get("match_order") or 0),
+                        )
+                        # seed-opening-round creates the full graph in the current
+                        # backend flow. seed-next-round returns the existing next
+                        # round in that case and does not advance bracket_revision.
+
+                refresh_started = time.monotonic()
+                await self.run_lifecycle_phase(
+                    f"bracket_summary_refresh_round_{round_number}_200",
+                    lambda: mass_summary_reads(all_items, summary_etags),
+                )
+                await self.run_lifecycle_phase(
+                    f"bracket_summary_refresh_round_{round_number}_304",
+                    lambda: mass_summary_304(all_items, summary_etags),
+                )
+                round_phase_durations.append(time.monotonic() - refresh_started)
+
+                profile_phase_name = f"mixed_bracket_profile_reads_round_{round_number}"
+                await self.run_lifecycle_phase(
+                    profile_phase_name,
+                    lambda: bounded_map(
+                        profile_targets,
+                        lambda item: profile_read(
+                            item,
+                            str(
+                                item["teammate_id"]
+                                if int(item["user"]["profile_index"]) % 2 == 0
+                                else item["opponent_id"]
+                            ),
+                        ),
+                    ),
+                )
+                completed = round_number == total_rounds
+                round_number += 1
+
+            self.lifecycle_timings["match_report"] = {
+                "round_phase_durations_seconds": match_phase_durations,
+                "total_seconds": round(sum(match_phase_durations), 4),
+                "statistics_ms": metric_stats([value * 1000 for value in match_phase_durations]),
+            }
+            self.lifecycle_timings["bracket_summary_refresh"] = {
+                "round_phase_durations_seconds": round_phase_durations,
+                "total_seconds": round(sum(round_phase_durations), 4),
+                "conditional_status": 304,
+            }
+
+            async def completed_state_storm() -> None:
+                await asyncio.gather(
+                    mass_detail_reads(
+                        all_items,
+                        expected_team_count=self.lifecycle_teams_count,
+                        expected_status="completed",
+                    ),
+                    mass_summary_reads(all_items, summary_etags),
+                )
+                await mass_summary_304(all_items, summary_etags)
+                await mass_profile_reads(profile_targets, "opponent_id")
+
+            await self.run_lifecycle_phase(
+                "completed_state_read_storm",
+                completed_state_storm,
+            )
+
+            async with session_factory()() as db_session:
+                completed_count = int(
+                    await db_session.scalar(
+                        select(func.count())
+                        .select_from(Tournament)
+                        .where(
+                            Tournament.id.in_(self.tournament_ids),
+                            Tournament.status == "completed",
+                        )
+                    )
+                    or 0
+                )
+                match_count = int(
+                    await db_session.scalar(
+                        select(func.count())
+                        .select_from(TournamentMatch)
+                        .where(TournamentMatch.tournament_id.in_(self.tournament_ids))
+                    )
+                    or 0
+                )
+            expected_match_count = self.lifecycle_tournament_count * (self.lifecycle_teams_count - 1)
+            self.report["matches_count"] = match_count
+            self.report["teams_count"] = self.lifecycle_tournament_count * self.lifecycle_teams_count
+            self.scenario(
+                "tournament_lifecycle_completed",
+                completed_count == self.lifecycle_tournament_count
+                and match_count == expected_match_count,
+                {
+                    "completed_tournaments": completed_count,
+                    "expected_tournaments": self.lifecycle_tournament_count,
+                    "matches": match_count,
+                    "expected_matches": expected_match_count,
+                },
+            )
+            self.report["duration_seconds"] = round(time.monotonic() - started, 4)
+            await self.record_preprod_run(
+                status="passed",
+                created_users=len(users),
+                tournaments_created=len(tournaments),
+                active_participants=0,
+                teams_count=self.lifecycle_tournament_count * self.lifecycle_teams_count,
+                matches_count=match_count,
+                finished_at=datetime.now(UTC),
+            )
+        except Exception:
+            await self.record_preprod_run(status="failed", finished_at=datetime.now(UTC))
+            raise
+        finally:
+            await self.stop_performance_collection()
+            for client in self.clients:
+                await client.aclose()
+            if not self.keep_data:
+                cleanup = await self.cleanup_targeted()
+                self.report["cleanup"] = cleanup
+                self.scenarios.append(
+                    {
+                        "name": "tournament_lifecycle_cleanup",
+                        "ok": cleanup.get("ok", False),
+                        "detail": cleanup,
+                    }
+                )
+                await self.record_preprod_run(
+                    status="cleaned" if cleanup.get("ok") else "failed",
+                    cleanup_state=cleanup,
+                    finished_at=datetime.now(UTC),
+                )
+            else:
+                self.report["cleanup"] = {"ok": False, "kept": True}
+            self.report["finished_at"] = datetime.now(UTC).isoformat()
+            self.report["passed"] = all(item["ok"] for item in self.scenarios)
+            self.report_path.parent.mkdir(parents=True, exist_ok=True)
+            self.report_path.write_text(
+                json.dumps(self.report, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            await self.record_preprod_run(report_path=str(self.report_path))
+        return self.report
+
     async def run(self) -> dict[str, Any]:
         organizer: dict[str, Any] | None = None
         started = time.monotonic()
@@ -5282,15 +6555,23 @@ class ProductionQa:
                         ).all()
                     )
 
-            if subject_ids or self.user_ids:
-                await db_session.execute(
-                    delete(AuditLog).where(
-                        or_(
-                            AuditLog.subject_id.in_(list(subject_ids)),
-                            AuditLog.actor_user_id.in_(self.user_ids),
-                        )
+            # Keep each asyncpg statement below its 32,767 bind-parameter
+            # limit. Separate deletes preserve the old OR semantics; a log
+            # matching both predicates is deleted by the first statement and
+            # contributes zero rows to the second one.
+            for start in range(0, len(self.user_ids), 10_000):
+                user_chunk = self.user_ids[start : start + 10_000]
+                if user_chunk:
+                    await db_session.execute(
+                        delete(AuditLog).where(AuditLog.actor_user_id.in_(user_chunk))
                     )
-                )
+            subject_values = list(subject_ids)
+            for start in range(0, len(subject_values), 10_000):
+                subject_chunk = subject_values[start : start + 10_000]
+                if subject_chunk:
+                    await db_session.execute(
+                        delete(AuditLog).where(AuditLog.subject_id.in_(subject_chunk))
+                    )
             deleted_tournaments = 0
             if tournament_ids:
                 result = await db_session.execute(
@@ -5304,6 +6585,19 @@ class ProductionQa:
                 )
                 deleted_users = int(result.rowcount or 0)
             await db_session.commit()
+
+            read_models_cleanup_error: str | None = None
+            for tournament_id in tournament_ids:
+                try:
+                    await delete_tournament_read_models(
+                        tournament_id,
+                        ("teams", "workspace_detail", "bracket_summary", "bracket_full"),
+                    )
+                except Exception as exc:
+                    # Redis is a disposable projection. Keep cleanup's
+                    # authoritative DB result successful if Redis is down.
+                    read_models_cleanup_error = type(exc).__name__
+                    break
 
             remaining_tournaments = list(
                 (
@@ -5325,6 +6619,7 @@ class ProductionQa:
                 "users": deleted_users,
                 "remaining_tournaments": remaining_tournaments,
                 "remaining_users": remaining_users,
+                "read_models_cleanup_error": read_models_cleanup_error,
             }
 
 
@@ -5467,6 +6762,7 @@ async def async_main() -> int:
 
     qa = ProductionQa(
         origin=args.origin,
+        request_origin=args.request_origin,
         report_path=args.report_path,
         keep_data=args.keep_data,
         http_timeout=args.http_timeout,
@@ -5479,6 +6775,9 @@ async def async_main() -> int:
         system_sample_interval=args.system_sample_interval,
         scale_site_mix_users=args.scale_site_mix_users,
         scale_bracket_view_users=args.scale_bracket_view_users,
+        lifecycle_tournament_count=args.lifecycle_tournament_count,
+        lifecycle_users_per_tournament=args.lifecycle_users_per_tournament,
+        lifecycle_teams_count=args.lifecycle_teams_count,
         scale_final_view_profile=args.scale_final_view_profile,
         tournament_visibility=args.tournament_visibility,
         profile_journey=args.profile_journey,
@@ -5497,6 +6796,8 @@ async def async_main() -> int:
             report = await qa.run_scale()
         elif args.mode == "write-burst":
             report = await qa.run_write_burst_profile()
+        elif args.mode == "tournament-lifecycle":
+            report = await qa.run_tournament_lifecycle()
         else:
             report = await qa.run()
     except Exception as exc:

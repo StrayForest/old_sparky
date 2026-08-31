@@ -1,0 +1,76 @@
+{
+  "schema": 2,
+  "profile_id": "tournament-lifecycle-capacity-v1",
+  "profile_version": 1,
+  "category": "capacity",
+  "purpose": "Find the lifecycle read/write capacity ceiling while retaining complete workflow correctness.",
+  "description": "Canonical lifecycle capacity contour for the existing QA/performance harness.",
+  "mode": "tournament-lifecycle",
+  "fixture": {
+    "tournament_count": 20,
+    "users_per_tournament": 500,
+    "setup_concurrency": 20,
+    "max_total_users": 10000,
+    "teams_count": 64
+  },
+  "traffic": {
+    "concurrency": 128,
+    "spread_seconds": 0,
+    "timeout_seconds": 180,
+    "duplicate_count": 0,
+    "manual_refresh_count": 0,
+    "phases": [
+      {"name": "lifecycle-capacity-low", "duration_seconds": 1, "target_logical_actions_per_second": 0.1, "logical_actions": 1},
+      {"name": "lifecycle-capacity-mid", "duration_seconds": 1, "target_logical_actions_per_second": 0.1, "logical_actions": 1},
+      {"name": "lifecycle-capacity-high", "duration_seconds": 1, "target_logical_actions_per_second": 0.1, "logical_actions": 1}
+    ],
+    "retry": {
+      "max_retries": 0,
+      "overload_status": null,
+      "overload_code": null,
+      "server_retry_after": null,
+      "jitter_windows_ms": []
+    }
+  },
+  "lifecycle": {
+    "capacity_stages": ["smoke", "scale", "capacity"],
+    "full_workflow_required_at_each_stage": true,
+    "required_terminal_state": "completed"
+  },
+  "acceptance": {
+    "kind": "capacity",
+    "slo": {
+      "accepted_request_latency": {"p50_ms": 1000, "p90_ms": 5000, "p95_ms": 10000, "p99_ms": 30000},
+      "logical_latency": {"p95_ms": 15000, "p99_ms": 45000},
+      "logical_final_failure_percent": 0.5,
+      "max_shed_percent": 0,
+      "max_retry_amplification_percent": 0
+    },
+    "capacity": {
+      "target_logical_actions_per_second": [0.1, 0.1, 0.1],
+      "steady_duration_seconds": 1
+    },
+    "resource_safety": {
+      "max_postgres_connections": 80,
+      "max_waiting_backends": 40,
+      "max_lock_waiters": 40,
+      "max_cpu_per_core_percent": 100,
+      "pool_checkout_wait_ms": {"p95_ms": 10000, "p99_ms": 30000}
+    },
+    "expected_statuses": [200, 201, 202, 304],
+    "unexpected_statuses": 0
+  },
+  "correctness": {
+    "capacity_stages_are_harness_profiles": true,
+    "no_production_external_workflow": true,
+    "cleanup_required": true
+  },
+  "execution": {
+    "generator": "platform_production_qa.py",
+    "measured_origin": "configured QA/preprod origin",
+    "external_runner_forbidden": true,
+    "run_command": "python3 platform/tools/platform_production_qa.py --mode tournament-lifecycle",
+    "cleanup_workflow": "platform-production-qa cleanup_targeted",
+    "abort_workflow": "platform-production-qa operator abort"
+  }
+}

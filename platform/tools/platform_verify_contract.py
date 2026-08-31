@@ -198,7 +198,12 @@ def collect_issues() -> list[str]:
         if profile_options_match
         else set()
     )
-    if "profiles" in locals() and profile_options != set(profiles):
+    external_profile_ids = {
+        profile_id
+        for profile_id, profile in (profiles.items() if "profiles" in locals() else [])
+        if profile.get("execution", {}).get("generator") == "GitHub-hosted external runner"
+    }
+    if "profiles" in locals() and profile_options != external_profile_ids:
         issues.append("external load workflow profile choices drift from canonical profiles")
     supervisor = (PLATFORM_ROOT / "tools" / "platform_production_external_fixture_qa.sh").read_text(encoding="utf-8")
     if "measured HTTP generator runs on the" not in supervisor:

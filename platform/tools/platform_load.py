@@ -26,7 +26,7 @@ PROFILE_ROOT = PLATFORM_ROOT / "performance" / "profiles"
 PROFILE_SCHEMA = 2
 PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]+$")
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-ALLOWED_MODES = {"ready-vote", "read-mix"}
+ALLOWED_MODES = {"ready-vote", "read-mix", "tournament-lifecycle"}
 ALLOWED_CATEGORIES = {"load", "stress", "spike", "soak", "capacity"}
 
 
@@ -349,10 +349,24 @@ def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
     if correctness.get("cleanup_required") is not True:
         raise LoadProfileError("every canonical load profile must require cleanup")
     execution = _require_mapping(payload.get("execution"), field="execution")
-    if execution.get("generator") != "GitHub-hosted external runner":
-        raise LoadProfileError("canonical load generator must run on an external GitHub runner")
-    if execution.get("measured_origin") != "https://old-sparky.com":
-        raise LoadProfileError("canonical load profile must target the canonical public origin")
+    if mode == "tournament-lifecycle":
+        if execution.get("generator") != "platform_production_qa.py":
+            raise LoadProfileError(
+                "tournament-lifecycle profiles must use platform_production_qa.py"
+            )
+        if execution.get("external_runner_forbidden") is not True:
+            raise LoadProfileError(
+                "tournament-lifecycle profiles must forbid the external load runner"
+            )
+        if execution.get("measured_origin") != "configured QA/preprod origin":
+            raise LoadProfileError(
+                "tournament-lifecycle profiles must target the configured QA/preprod origin"
+            )
+    else:
+        if execution.get("generator") != "GitHub-hosted external runner":
+            raise LoadProfileError("canonical load generator must run on an external GitHub runner")
+        if execution.get("measured_origin") != "https://old-sparky.com":
+            raise LoadProfileError("canonical load profile must target the canonical public origin")
     if not isinstance(execution.get("cleanup_workflow"), str) or not isinstance(execution.get("abort_workflow"), str):
         raise LoadProfileError("canonical load profile must name cleanup and abort workflows")
 
@@ -486,6 +500,11 @@ def _source_git_sha() -> str:
 
 
 def run_profile(profile: Mapping[str, Any], manifest_path: Path, report_path: Path) -> int:
+    if profile.get("mode") == "tournament-lifecycle":
+        raise LoadProfileError(
+            "tournament-lifecycle profiles run through platform_production_qa.py; "
+            "the external runner is intentionally unsupported"
+        )
     # Imported lazily so profile listing and contract validation remain free of
     # application/runtime imports.  The module is the external runner client;
     # this process is expected to run on the GitHub-hosted load runner.

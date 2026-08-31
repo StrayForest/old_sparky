@@ -25,11 +25,21 @@ outside the active registry and is not selectable by the production workflow.
 | `ready-vote-spike-v1` | spike | Normal → burst → normal with recovery phases |
 | `read-mix-human-v2` | load | 500-user human-shaped authenticated reads |
 | `read-mix-stress-v2` | stress | 20,000-user authenticated reads and conditional reloads |
+| `tournament-lifecycle-slo-v1` | load/SLO | 20 tournaments × 500 users through completed bracket |
+| `tournament-lifecycle-scale-v1` | stress | Concurrent multi-tournament lifecycle waves |
+| `tournament-lifecycle-capacity-v1` | capacity | Lifecycle capacity contour using the QA harness |
 
 Each profile owns its versioned fixture shape, setup concurrency, offered
 logical actions, HTTP concurrency, spread, timeout, retry policy, expected
 statuses, correctness requirements, latency/failure/resource budgets and exact
 cleanup contour. Its SHA-256 digest is recorded with every retained result.
+
+The tournament-lifecycle profiles are executed only by
+`platform_production_qa.py` against the configured QA/preprod origin. They are
+not dispatchable through the external production load client and do not invoke
+the external 15k/20k workflows. The harness reports each lifecycle phase with
+full HTTP request/success/error/percentile/throughput/goodput/response-byte
+metrics plus the existing system sampler and diagnostic `request_perf` data.
 
 The v2 SLO profile applies the supported-load contract: accepted request
 p50/p90/p95/p99 of 250/400/600/1000 ms, logical p95/p99 of 600/1000 ms,
@@ -251,6 +261,28 @@ traffic failure-rate target. Both stress runs removed all fixture rows and
 preserved the control account.
 
 ## Canonical commands
+
+## Tournament lifecycle read models
+
+The lifecycle QA mode uses the existing API flow and stores only serialized,
+revisioned tournament representations in the shared Redis instance:
+
+- `teams` — normalized `detail.teams` state;
+- `workspace_detail` — the normalized team projection embedded in detail
+  workspace responses;
+- `bracket_summary` and `bracket_full` — the existing bracket response shapes.
+
+PostgreSQL remains authoritative. Successful team/bracket mutations rebuild
+only the affected projections after commit. A Redis hit is served without a
+representation-building PostgreSQL query; a miss or Redis outage builds from
+PostgreSQL and returns the normal response. Redis writes use a revision-aware
+atomic compare-and-set and a long safety TTL; TTL is not a consistency
+mechanism. `request_perf` and the existing QA HTTP recorder expose hit/miss,
+build/write/error/fallback, revision, build/get/set timing and payload bytes.
+
+The lifecycle harness reports `teammate_profile_reads` and
+`opponent_profile_reads` separately, uses the real detail/bracket workspace
+queries, and checks both `200` and conditional `304` bracket refreshes.
 
 ```bash
 cd platform

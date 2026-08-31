@@ -6,10 +6,10 @@ from redis.asyncio import from_url
 from python_packages.platform_infra.config import get_settings
 
 
-def redis_client() -> Redis:
+def redis_client(*, decode_responses: bool = True) -> Redis:
     return from_url(
         get_settings().platform_redis_url,
-        decode_responses=True,
+        decode_responses=decode_responses,
     )
 
 

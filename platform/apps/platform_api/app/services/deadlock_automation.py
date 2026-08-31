@@ -28,6 +28,9 @@ from apps.platform_api.app.services.tournament_workflow import (
     tournament_has_locked_deadlock_roster,
     transition_locked_tournament_status,
 )
+from apps.platform_api.app.services.tournament_read_models import (
+    refresh_tournament_read_models,
+)
 from python_packages.platform_domain.deadlock import (
     AutoAssignmentEngine,
     CaptainRoundState,
@@ -401,6 +404,21 @@ async def run_deadlock_automation_tick(
                 now=current_time,
             )
             await db_session.commit()
+            await refresh_tournament_read_models(
+                tournament_id,
+                (
+                    "teams",
+                    "workspace_detail",
+                    "bracket_summary",
+                    "bracket_full",
+                )
+                if step_result.assignment_generated
+                else (
+                    "workspace_detail",
+                    "bracket_summary",
+                    "bracket_full",
+                ),
+            )
             result = DeadlockAutomationResult(
                 scanned=result.scanned,
                 deferred=result.deferred,
@@ -462,6 +480,21 @@ async def advance_deadlock_tournament_automation(
     if result != DeadlockAutomationResult():
         await db_session.commit()
         await db_session.refresh(tournament)
+        await refresh_tournament_read_models(
+            tournament_id,
+            (
+                "teams",
+                "workspace_detail",
+                "bracket_summary",
+                "bracket_full",
+            )
+            if result.assignment_generated
+            else (
+                "workspace_detail",
+                "bracket_summary",
+                "bracket_full",
+            ),
+        )
     return result
 
 

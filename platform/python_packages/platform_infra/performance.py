@@ -14,7 +14,11 @@ from sqlalchemy import event
 from python_packages.platform_infra.config import get_settings
 
 logger = logging.getLogger("platform.performance")
-QA_PHASE_RE = re.compile(r"^(?:write|browser|scale|qa)_[a-z0-9_]{1,63}$")
+QA_PHASE_RE = re.compile(
+    r"^(?:write|browser|scale|qa|lifecycle|mass|registration|ready|captain|"
+    r"auto|assignment|post|teammate|opponent|bracket|mixed|tournament|"
+    r"completed|match|initial)_[a-z0-9_]{1,63}$"
+)
 
 
 @dataclass(slots=True)
@@ -30,6 +34,7 @@ class RequestPerformanceMetrics:
     compute_time_seconds: float = 0.0
     response_bytes: int = 0
     pool_checkout_wait_seconds: float = 0.0
+    redis_read_model_events: list[dict[str, Any]] = field(default_factory=list)
     # Ready Vote owns one dedicated session checkout for the complete
     # auth/preflight/upsert/commit transaction. Keep this separate from the
     # aggregate pool wait and from generic SQL timing so physical checkout
@@ -162,6 +167,38 @@ def record_pool_checkout_wait(elapsed_seconds: float) -> None:
         metrics.pool_checkout_wait_seconds += max(0.0, elapsed_seconds)
 
 
+def record_redis_read_model_event(
+    *,
+    model: str,
+    outcome: str,
+    get_ms: float = 0.0,
+    build_ms: float = 0.0,
+    set_ms: float = 0.0,
+    payload_bytes: int = 0,
+    revision: int | None = None,
+) -> None:
+    """Attach shared Redis read-model evidence to the current request.
+
+    The event stays on the existing request performance record so lifecycle
+    QA and normal request diagnostics use one metrics pipeline.
+    """
+
+    metrics = _current_metrics.get()
+    if metrics is None:
+        return
+    metrics.redis_read_model_events.append(
+        {
+            "model": str(model),
+            "outcome": str(outcome),
+            "get_ms": round(max(0.0, float(get_ms)), 3),
+            "build_ms": round(max(0.0, float(build_ms)), 3),
+            "set_ms": round(max(0.0, float(set_ms)), 3),
+            "payload_bytes": max(0, int(payload_bytes)),
+            "revision": int(revision) if revision is not None else None,
+        }
+    )
+
+
 def record_ready_vote_checkout(elapsed_seconds: float) -> None:
     """Record the dedicated Ready Vote checkout at its sole owner."""
 
@@ -269,6 +306,16 @@ class RequestPerformanceMiddleware:
             nonlocal status_code
             if message["type"] == "http.response.start":
                 status_code = int(message.get("status") or status_code)
+                if metrics is not None and metrics.redis_read_model_events:
+                    headers = list(message.get("headers") or [])
+                    outcome_header = ",".join(
+                        f"{event['model']}:{event['outcome']}"
+                        for event in metrics.redis_read_model_events
+                    )
+                    headers.append(
+                        (b"x-platform-read-model", outcome_header.encode("ascii"))
+                    )
+                    message = {**message, "headers": headers}
             elif message["type"] == "http.response.body" and metrics is not None:
                 metrics.response_bytes += len(message.get("body") or b"")
             await send(message)
@@ -318,6 +365,10 @@ class RequestPerformanceMiddleware:
                 is_ready_vote_route
                 and metrics.ready_vote_admission_wait_ms >= 25.0
             )
+            or any(
+                event["outcome"] in {"error", "fallback_db"}
+                for event in metrics.redis_read_model_events
+            )
         )
         if not should_log:
             return
@@ -338,7 +389,12 @@ class RequestPerformanceMiddleware:
             "ready_vote_controller_limit_changes=%s ready_vote_cpu_pressure=%.2f "
             "ready_vote_admission_shed=%s ready_vote_pool_wait_ms=%.2f "
             "ready_vote_cpu_monitor_sample_ms=%.2f "
-            "ready_vote_cpu_monitor_samples=%s response_bytes=%s qa_phase=%s "
+            "ready_vote_cpu_monitor_samples=%s "
+            "redis_read_model_models=%s redis_read_model_outcomes=%s "
+            "redis_read_model_get_ms=%.2f redis_read_model_build_ms=%.2f "
+            "redis_read_model_set_ms=%.2f redis_read_model_payload_bytes=%s "
+            "redis_read_model_revisions=%s "
+            "response_bytes=%s qa_phase=%s "
             "pool_wait_ms=%.2f cf_ray=%s client=%s",
             metrics.request_id,
             metrics.method,
@@ -370,6 +426,23 @@ class RequestPerformanceMiddleware:
             metrics.ready_vote_pool_wait_ms,
             metrics.ready_vote_cpu_monitor_sample_ms,
             metrics.ready_vote_cpu_monitor_samples,
+            "|".join(
+                str(event["model"])
+                for event in metrics.redis_read_model_events
+            ) or "-",
+            "|".join(
+                str(event["outcome"])
+                for event in metrics.redis_read_model_events
+            ) or "-",
+            sum(float(event.get("get_ms") or 0) for event in metrics.redis_read_model_events),
+            sum(float(event.get("build_ms") or 0) for event in metrics.redis_read_model_events),
+            sum(float(event.get("set_ms") or 0) for event in metrics.redis_read_model_events),
+            sum(int(event.get("payload_bytes") or 0) for event in metrics.redis_read_model_events),
+            "|".join(
+                str(event["revision"])
+                for event in metrics.redis_read_model_events
+                if event.get("revision") is not None
+            ) or "-",
             metrics.response_bytes,
             metrics.qa_phase or "-",
             metrics.pool_checkout_wait_seconds * 1000,

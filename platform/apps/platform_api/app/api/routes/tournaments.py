@@ -148,6 +148,10 @@ from apps.platform_api.app.services.tournament_workflow import (
 from apps.platform_api.app.services.tournament_runtime_cache import (
     register_tournament_runtime_cache_invalidator,
 )
+from apps.platform_api.app.services.tournament_read_models import (
+    read_model_read_or_build,
+    refresh_tournament_read_models,
+)
 from apps.platform_api.app.services.tournament_teams import (
     load_tournament_team_state,
     materialize_assignment_run_teams,
@@ -333,8 +337,6 @@ DEFAULT_TOURNAMENT_COVER_URL = (
     "/assets/tournament-covers/tournament-cover-template-1-v1.webp"
 )
 PAGINATION_EXPOSE_HEADERS = "X-Total-Count, X-Limit, X-Offset, X-Has-More"
-BRACKET_RESPONSE_CACHE_TTL_SECONDS = 30.0
-BRACKET_RESPONSE_CACHE_MAX_ENTRIES = 128
 READY_CHECK_STATE_CACHE_TTL_SECONDS = 30.0
 READY_CHECK_STATE_CACHE_MAX_ENTRIES = 128
 PARTICIPANT_PAGE_CACHE_TTL_SECONDS = 30.0
@@ -466,14 +468,6 @@ def ready_check_state_version(
 
 
 @dataclass(frozen=True, slots=True)
-class BracketResponseCacheEntry:
-    expires_at: float
-    response: TournamentBracketResponse
-
-
-
-
-@dataclass(frozen=True, slots=True)
 class ReadyCheckStateCacheEntry:
     expires_at: float
     active_round: ReadyRoundStateSnapshot | None
@@ -511,10 +505,6 @@ class PublicWorkspaceSnapshotCacheEntry:
 
 
 
-_bracket_response_cache: dict[
-    tuple[str, int, datetime | None, str, str, str, bool, bool],
-    BracketResponseCacheEntry,
-] = {}
 _ready_check_state_cache: dict[tuple[str, int], ReadyCheckStateCacheEntry] = {}
 _ready_check_state_cache_locks: dict[tuple[str, int], asyncio.Lock] = {}
 _participant_page_cache: dict[
@@ -541,31 +531,6 @@ def _trim_cache(cache: dict[Any, Any], *, max_entries: int, now: float) -> None:
         if oldest_key is None:
             break
         cache.pop(oldest_key, None)
-
-
-def _get_bracket_response_cache(
-    key: tuple[str, int, datetime | None, str, str, str, bool, bool],
-) -> TournamentBracketResponse | None:
-    now = time.monotonic()
-    entry = _bracket_response_cache.get(key)
-    if entry is None:
-        return None
-    if entry.expires_at <= now:
-        _bracket_response_cache.pop(key, None)
-        return None
-    return entry.response
-
-
-def _set_bracket_response_cache(
-    key: tuple[str, int, datetime | None, str, str, str, bool, bool],
-    response: TournamentBracketResponse,
-) -> None:
-    now = time.monotonic()
-    _trim_cache(_bracket_response_cache, max_entries=BRACKET_RESPONSE_CACHE_MAX_ENTRIES, now=now)
-    _bracket_response_cache[key] = BracketResponseCacheEntry(
-        expires_at=now + BRACKET_RESPONSE_CACHE_TTL_SECONDS,
-        response=response,
-    )
 
 
 def _get_ready_check_state_cache(
@@ -693,11 +658,6 @@ def _invalidate_ready_check_state_cache(tournament_id: str) -> None:
 
 def invalidate_tournament_runtime_caches(tournament_id: str) -> None:
     normalized_tournament_id = str(tournament_id)
-    bracket_keys = [
-        key for key in _bracket_response_cache if key[0] == normalized_tournament_id
-    ]
-    for key in bracket_keys:
-        _bracket_response_cache.pop(key, None)
     _invalidate_participant_page_cache(tournament_id)
     _invalidate_ready_check_state_cache(tournament_id)
     snapshot_keys = [
@@ -707,6 +667,27 @@ def invalidate_tournament_runtime_caches(tournament_id: str) -> None:
     ]
     for slug in snapshot_keys:
         _public_workspace_snapshot_cache.pop(slug, None)
+
+
+async def _refresh_tournament_read_models_after_commit(
+    tournament_id: str,
+    *models: Literal["teams", "workspace_detail", "bracket_summary", "bracket_full"],
+) -> None:
+    """Best-effort post-commit projection refresh.
+
+    PostgreSQL remains authoritative. A projection rebuild or Redis outage is
+    observable and recoverable on the next read, but must not turn a committed
+    tournament mutation into a failed API response.
+    """
+
+    try:
+        await refresh_tournament_read_models(tournament_id, models)
+    except Exception:
+        logger.exception(
+            "Post-commit tournament read-model refresh failed tournament_id=%s models=%s",
+            tournament_id,
+            models,
+        )
 
 
 register_tournament_runtime_cache_invalidator(invalidate_tournament_runtime_caches)
@@ -2155,66 +2136,66 @@ async def build_tournament_bracket_response(
             or auth_session_has_admin_role(auth_session)
         )
     )
-    cache_key = (
-        tournament.id,
-        int(tournament.bracket_revision or 0),
-        tournament.updated_at,
-        tournament.status,
-        tournament.match_format,
-        tournament.final_format,
-        can_manage,
-        include_team_members,
-    )
-    cached_response = _get_bracket_response_cache(cache_key)
-    if cached_response is not None:
-        return cached_response
-
-    match_rows = await tournament_matches_in_order(db_session, tournament_id=tournament.id)
-    team_rows, team_member_rows = await load_tournament_team_state(
-        db_session,
-        tournament_id=tournament.id,
-        include_members=include_team_members,
-    )
-    member_profiles = (
-        await deadlock_assignment_member_profiles(db_session, team_member_rows)
-        if include_team_members
-        else {}
-    )
-    teams = serialize_deadlock_bracket_teams(
-        team_rows,
-        team_member_rows,
-        include_members=include_team_members,
-        member_profiles=member_profiles,
-    )
-    total_rounds = max((match.round_number for match in match_rows), default=1)
-    bracket_status = "pending"
-    if match_rows:
-        bracket_status = "ready"
-    elif teams:
-        bracket_status = "teams_ready"
-    response = TournamentBracketResponse(
-        tournament_id=tournament.id,
-        tournament_status=tournament.status,
-        status=bracket_status,
-        revision=int(tournament.bracket_revision or 0),
-        can_manage=can_manage,
-        capabilities=bracket_capabilities(
+    async def build_uncached() -> TournamentBracketResponse:
+        match_rows = await tournament_matches_in_order(
+            db_session,
+            tournament_id=tournament.id,
+        )
+        team_rows, team_member_rows = await load_tournament_team_state(
+            db_session,
+            tournament_id=tournament.id,
+            include_members=include_team_members,
+        )
+        member_profiles = (
+            await deadlock_assignment_member_profiles(db_session, team_member_rows)
+            if include_team_members
+            else {}
+        )
+        teams = serialize_deadlock_bracket_teams(
+            team_rows,
+            team_member_rows,
+            include_members=include_team_members,
+            member_profiles=member_profiles,
+        )
+        total_rounds = max((match.round_number for match in match_rows), default=1)
+        bracket_status = "pending"
+        if match_rows:
+            bracket_status = "ready"
+        elif teams:
+            bracket_status = "teams_ready"
+        return TournamentBracketResponse(
+            tournament_id=tournament.id,
             tournament_status=tournament.status,
+            status=bracket_status,
+            revision=int(tournament.bracket_revision or 0),
             can_manage=can_manage,
-        ),
-        teams=teams,
-        matches=[
-            serialize_bracket_match_projection(
-                match,
-                tournament=tournament,
-                total_rounds=total_rounds,
-            )
-            for match in match_rows
-        ],
-    )
-    if bracket_status == "ready":
-        _set_bracket_response_cache(cache_key, response)
-    return response
+            capabilities=bracket_capabilities(
+                tournament_status=tournament.status,
+                can_manage=can_manage,
+            ),
+            teams=teams,
+            matches=[
+                serialize_bracket_match_projection(
+                    match,
+                    tournament=tournament,
+                    total_rounds=total_rounds,
+                )
+                for match in match_rows
+            ],
+        )
+
+    # Structural bracket data is shared for ordinary viewers. Manager
+    # capabilities remain request-specific and therefore bypass this cache.
+    if not can_manage:
+        read_model = "bracket_full" if include_team_members else "bracket_summary"
+        payload = await read_model_read_or_build(
+            tournament_id=tournament.id,
+            model=read_model,
+            revision=tournament_state_version(tournament),
+            builder=build_uncached,
+        )
+        return TournamentBracketResponse.model_validate_json(payload)
+    return await build_uncached()
 
 
 async def build_tournament_workspace_detail_bracket_response(
@@ -2222,6 +2203,7 @@ async def build_tournament_workspace_detail_bracket_response(
     *,
     tournament: Tournament,
     can_manage: bool,
+    use_read_model_cache: bool = True,
 ) -> TournamentBracketResponse:
     if tournament.status == "registration_open":
         return TournamentBracketResponse(
@@ -2238,39 +2220,50 @@ async def build_tournament_workspace_detail_bracket_response(
             matches=[],
         )
 
-    team_rows, team_member_rows = await load_tournament_team_state(
-        db_session,
-        tournament_id=tournament.id,
-        include_members=True,
-    )
-    member_profiles = await deadlock_assignment_member_profiles(
-        db_session,
-        team_member_rows,
-    )
-    teams = serialize_deadlock_bracket_teams(
-        team_rows,
-        team_member_rows,
-        member_profiles=member_profiles,
-    )
-    bracket_status = "pending"
-    if int(tournament.bracket_revision or 0) > 0:
-        bracket_status = "ready"
-    elif teams:
-        bracket_status = "teams_ready"
+    async def build_uncached() -> TournamentBracketResponse:
+        team_rows, team_member_rows = await load_tournament_team_state(
+            db_session,
+            tournament_id=tournament.id,
+            include_members=True,
+        )
+        member_profiles = await deadlock_assignment_member_profiles(
+            db_session,
+            team_member_rows,
+        )
+        teams = serialize_deadlock_bracket_teams(
+            team_rows,
+            team_member_rows,
+            member_profiles=member_profiles,
+        )
+        bracket_status = "pending"
+        if int(tournament.bracket_revision or 0) > 0:
+            bracket_status = "ready"
+        elif teams:
+            bracket_status = "teams_ready"
 
-    return TournamentBracketResponse(
-        tournament_id=tournament.id,
-        tournament_status=tournament.status,
-        status=bracket_status,
-        revision=int(tournament.bracket_revision or 0),
-        can_manage=can_manage,
-        capabilities=bracket_capabilities(
+        return TournamentBracketResponse(
+            tournament_id=tournament.id,
             tournament_status=tournament.status,
+            status=bracket_status,
+            revision=int(tournament.bracket_revision or 0),
             can_manage=can_manage,
-        ),
-        teams=teams,
-        matches=[],
-    )
+            capabilities=bracket_capabilities(
+                tournament_status=tournament.status,
+                can_manage=can_manage,
+            ),
+            teams=teams,
+            matches=[],
+        )
+
+    if not can_manage and use_read_model_cache:
+        payload = await read_model_read_or_build(
+            tournament_id=tournament.id,
+            model="workspace_detail",
+            revision=tournament_state_version(tournament),
+            builder=build_uncached,
+        )
+        return TournamentBracketResponse.model_validate_json(payload)
+    return await build_uncached()
 
 
 def build_tournament_workspace_bracket_summary_response(
@@ -3315,6 +3308,12 @@ async def update_tournament_status(
     tournament = transition.tournament
     await db_session.commit()
     invalidate_tournament_runtime_caches(tournament.id)
+    await _refresh_tournament_read_models_after_commit(
+        tournament.id,
+        "workspace_detail",
+        "bracket_summary",
+        "bracket_full",
+    )
     await db_session.refresh(tournament)
     cover_media, organizer_avatar_media = await tournament_media_descriptors(
         db_session,
@@ -3982,6 +3981,12 @@ async def seed_deadlock_opening_round_matches(
         },
     )
     await db_session.commit()
+    await _refresh_tournament_read_models_after_commit(
+        tournament.id,
+        "workspace_detail",
+        "bracket_summary",
+        "bracket_full",
+    )
     for match in opening_matches:
         await db_session.refresh(match)
     latest_round_number = max(match.round_number for match in created_matches)
@@ -4139,6 +4144,12 @@ async def seed_next_round_matches(
     )
     advance_revision(tournament)
     await db_session.commit()
+    await _refresh_tournament_read_models_after_commit(
+        tournament.id,
+        "workspace_detail",
+        "bracket_summary",
+        "bracket_full",
+    )
     for match in created_matches:
         await db_session.refresh(match)
     latest_round_number = max(match.round_number for match in created_matches)
@@ -4269,6 +4280,12 @@ async def create_tournament_match(
     )
     advance_revision(tournament)
     await db_session.commit()
+    await _refresh_tournament_read_models_after_commit(
+        tournament.id,
+        "workspace_detail",
+        "bracket_summary",
+        "bracket_full",
+    )
     await db_session.refresh(match)
     response = await serialize_single_match_for_tournament(
         db_session,
@@ -4386,6 +4403,12 @@ async def update_tournament_match_status(
     )
     advance_revision(tournament)
     await db_session.commit()
+    await _refresh_tournament_read_models_after_commit(
+        tournament.id,
+        "workspace_detail",
+        "bracket_summary",
+        "bracket_full",
+    )
     await db_session.refresh(match)
     response = await serialize_single_match_for_tournament(
         db_session,
@@ -4476,6 +4499,12 @@ async def update_tournament_match_schedule(
     )
     advance_revision(tournament)
     await db_session.commit()
+    await _refresh_tournament_read_models_after_commit(
+        tournament.id,
+        "workspace_detail",
+        "bracket_summary",
+        "bracket_full",
+    )
     await db_session.refresh(match)
     response = await serialize_single_match_for_tournament(
         db_session,
@@ -4617,6 +4646,12 @@ async def report_tournament_match(
     )
     advance_revision(tournament)
     await db_session.commit()
+    await _refresh_tournament_read_models_after_commit(
+        tournament.id,
+        "workspace_detail",
+        "bracket_summary",
+        "bracket_full",
+    )
     await db_session.refresh(match)
     response = await serialize_single_match_for_tournament(
         db_session,
@@ -4687,6 +4722,12 @@ async def delete_tournament_match(
     await db_session.delete(match)
     advance_revision(tournament)
     await db_session.commit()
+    await _refresh_tournament_read_models_after_commit(
+        tournament.id,
+        "workspace_detail",
+        "bracket_summary",
+        "bracket_full",
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -5875,6 +5916,13 @@ async def publish_deadlock_auto_assignment_run(
     )
     await db_session.commit()
     invalidate_tournament_runtime_caches(tournament.id)
+    await _refresh_tournament_read_models_after_commit(
+        tournament.id,
+        "teams",
+        "workspace_detail",
+        "bracket_summary",
+        "bracket_full",
+    )
     await db_session.refresh(run_row)
     return serialize_deadlock_auto_assignment_run(run_row, freshness=run_freshness)
 
@@ -5949,6 +5997,13 @@ async def lock_deadlock_auto_assignment_run(
     )
     await db_session.commit()
     invalidate_tournament_runtime_caches(tournament.id)
+    await _refresh_tournament_read_models_after_commit(
+        tournament.id,
+        "teams",
+        "workspace_detail",
+        "bracket_summary",
+        "bracket_full",
+    )
     await db_session.refresh(run_row)
     return serialize_deadlock_auto_assignment_run(run_row)
 
