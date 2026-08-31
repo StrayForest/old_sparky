@@ -1,0 +1,63 @@
+{
+  "schema": 2,
+  "profile_id": "ready-vote-saturation-ramp-v2",
+  "profile_version": 2,
+  "category": "stress",
+  "purpose": "Refine the controlled Ready Vote saturation ceiling after the 80–120 sweep.",
+  "description": "Steady 120–165 logical actions/s rate sweep; saturation evidence, not the supported-traffic SLO.",
+  "mode": "ready-vote",
+  "fixture": {
+    "tournament_count": 40,
+    "users_per_tournament": 500,
+    "setup_concurrency": 20,
+    "max_total_users": 20000
+  },
+  "traffic": {
+    "concurrency": 128,
+    "spread_seconds": 0,
+    "timeout_seconds": 30,
+    "duplicate_count": 0,
+    "manual_refresh_count": 0,
+    "phases": [
+      {"name": "rate-120", "target_logical_actions_per_second": 120, "duration_seconds": 30, "logical_actions": 3600},
+      {"name": "rate-135", "target_logical_actions_per_second": 135, "duration_seconds": 30, "logical_actions": 4050},
+      {"name": "rate-150", "target_logical_actions_per_second": 150, "duration_seconds": 30, "logical_actions": 4500},
+      {"name": "rate-165", "target_logical_actions_per_second": 165, "duration_seconds": 30, "logical_actions": 4950}
+    ],
+    "retry": {
+      "max_retries": 2,
+      "overload_status": 503,
+      "overload_code": "READY_VOTE_OVERLOADED",
+      "server_retry_after": "max",
+      "jitter_windows_ms": [[150, 350], [400, 800]]
+    }
+  },
+  "acceptance": {
+    "kind": "stress",
+    "accepted_request_latency": {"p50_ms": 1500, "p90_ms": 3000, "p95_ms": 5000, "p99_ms": 8000},
+    "logical_latency": {"p95_ms": 8000, "p99_ms": 12000},
+    "max_shed_percent": 99.9,
+    "max_retry_amplification_percent": 200,
+    "max_postgres_connections": 52,
+    "max_waiting_backends": 20,
+    "max_lock_waiters": 20,
+    "max_cpu_per_core_percent": 100,
+    "pool_checkout_wait_ms": {"p95_ms": 5000, "p99_ms": 10000},
+    "expected_statuses": [200, 503],
+    "unexpected_statuses": 0,
+    "require_origin_evidence": true
+  },
+  "correctness": {
+    "successful_votes_are_durable": true,
+    "authoritative_ready_count_matches_successful_votes": true,
+    "cleanup_required": true
+  },
+  "execution": {
+    "generator": "GitHub-hosted external runner",
+    "measured_origin": "https://old-sparky.com",
+    "origin_role": "fixture preparation, lightweight observer and exact cleanup only",
+    "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",
+    "cleanup_workflow": "platform-production-retained-load-cleanup.yml",
+    "abort_workflow": "platform-production-retained-load-abort.yml"
+  }
+}

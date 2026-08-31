@@ -17,6 +17,7 @@ outside the active registry and is not selectable by the production workflow.
 | `ready-vote-slo-v2` | load/SLO | 500-user human-shaped Ready Vote supported-load contract |
 | `ready-vote-capacity-ramp-v2` | capacity | 20–80 logical Ready Vote actions/s, 30s steady phases |
 | `ready-vote-saturation-ramp-v1` | saturation stress | 80–120 logical Ready Vote actions/s, 30s steady phases |
+| `ready-vote-saturation-ramp-v2` | saturation stress | 120–165 logical Ready Vote actions/s, 30s steady phases |
 | `ready-vote-stress-15k-v2` | stress | 15,000-user aggressive Ready Vote behavior test |
 | `ready-vote-stress-20k-v2` | stress | Optional 20,000-user unresolved-question stress test |
 | `ready-vote-spike-v1` | spike | Normal → burst → normal with recovery phases |
