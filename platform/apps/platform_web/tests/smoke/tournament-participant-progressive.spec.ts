@@ -21,6 +21,8 @@ let usersMeRequests = 0;
 let csrfRequests = 0;
 let readyVoteRequests = 0;
 let forcedReadyVoteOverloads = 0;
+let holdFirstReadyVoteResponse = false;
+let releaseHeldReadyVoteResponse: (() => void) | null = null;
 let bracketRequests = 0;
 
 let apiServer: Server | null = null;
@@ -28,7 +30,7 @@ let apiServer: Server | null = null;
 test.setTimeout(60_000);
 
 test.beforeAll(async () => {
-  apiServer = createServer((request, response) => {
+  apiServer = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", `http://${apiHost}:${apiPort}`);
     apiRequests.push(`${request.method ?? "GET"} ${url.pathname}${url.search}`);
     const hasTestCookie = request.headers.cookie?.includes("lean-detail-smoke=1") ?? false;
@@ -97,6 +99,11 @@ test.beforeAll(async () => {
       readyVoteRequests += 1;
       if (forcedReadyVoteOverloads > 0) {
         forcedReadyVoteOverloads -= 1;
+        if (holdFirstReadyVoteResponse) {
+          await new Promise<void>((resolve) => {
+            releaseHeldReadyVoteResponse = resolve;
+          });
+        }
         respondJson(response, 503, {
           code: "READY_VOTE_OVERLOADED",
           retryable: true,
@@ -125,7 +132,15 @@ test.beforeEach(() => {
   csrfRequests = 0;
   readyVoteRequests = 0;
   forcedReadyVoteOverloads = 0;
+  holdFirstReadyVoteResponse = false;
+  releaseHeldReadyVoteResponse = null;
   bracketRequests = 0;
+});
+
+test.afterEach(() => {
+  holdFirstReadyVoteResponse = false;
+  releaseHeldReadyVoteResponse?.();
+  releaseHeldReadyVoteResponse = null;
 });
 
 test.afterAll(async () => {
@@ -207,6 +222,7 @@ test("registered detail uses compact workspace state and ready vote avoids full 
 
 test("ready vote retries bounded overloads as one logical action", async ({ page }) => {
   forcedReadyVoteOverloads = 2;
+  holdFirstReadyVoteResponse = true;
   await page.clock.install({ time: new Date("2026-07-20T16:10:00Z") });
   await page.context().addCookies([{
     name: "deadlock_platform_session",
@@ -221,9 +237,13 @@ test("ready vote retries bounded overloads as one logical action", async ({ page
   await page.goto(`/tournaments/${readyTournamentSlug}`);
   const readyButton = page.getByTestId("ready-check-step").getByRole("button");
   await readyButton.click();
-  await expect(readyButton).toHaveText("Подтверждение...");
+  await expect(readyButton).toHaveAttribute("aria-busy", "true");
   await readyButton.dispatchEvent("click");
   await expect.poll(() => readyVoteRequests).toBe(1);
+  await expect.poll(() => releaseHeldReadyVoteResponse !== null).toBe(true);
+  holdFirstReadyVoteResponse = false;
+  releaseHeldReadyVoteResponse?.();
+  releaseHeldReadyVoteResponse = null;
   await page.clock.fastForward(500);
   await expect.poll(() => readyVoteRequests).toBe(2);
   await page.clock.fastForward(1_000);

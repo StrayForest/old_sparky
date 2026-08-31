@@ -122,7 +122,14 @@ class PlatformDeadlockAutomationSchedulerTests(unittest.IsolatedAsyncioTestCase)
         db_session.rollback = AsyncMock()
 
         advance = AsyncMock(return_value=DeadlockAutomationResult())
-        with patch.object(deadlock_automation, "_advance_tournament", advance):
+        with (
+            patch.object(deadlock_automation, "_advance_tournament", advance),
+            patch.object(
+                deadlock_automation,
+                "refresh_tournament_read_models",
+                new_callable=AsyncMock,
+            ) as refresh_read_models,
+        ):
             result = await run_deadlock_automation_tick(
                 db_session,
                 now=now,
@@ -143,6 +150,7 @@ class PlatformDeadlockAutomationSchedulerTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(result.errors, 0)
         self.assertEqual(db_session.commit.await_count, 3)
         self.assertEqual(db_session.rollback.await_count, 0)
+        self.assertEqual(refresh_read_models.await_count, 3)
 
         statement = db_session.execute.await_args.args[0]
         self.assertIn("LIMIT 3", compiled_sql(statement))
