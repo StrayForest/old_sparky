@@ -21,6 +21,7 @@ on:
           - ready-vote-static-4
           - ready-vote-static-6
           - ready-vote-static-8
+          - ready-vote-static-8-profile
           - ready-vote-static-12
           - ready-vote-static-16
           - ready-vote-adaptive-v2
@@ -482,14 +483,24 @@ jobs:
               [[ "$api_ready" == true ]] \
                 || fail "API did not recover on baseline runtime profile"
               ;;
-            ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-static-12|ready-vote-static-16)
+            ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-static-12|ready-vote-static-16|ready-vote-static-8-profile)
+              ready_vote_profile_args=(
+                --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY
+                --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY
+                --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+              )
+              if [[ "$runtime_profile" == ready-vote-static-8-profile ]]; then
+                ready_vote_profile_args+=(
+                  --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
+                  --only PLATFORM_PERF_SLOW_REQUEST_MS
+                  --only PLATFORM_PERF_LOG_MUTATIONS
+                )
+              fi
               "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
                 --apply \
                 --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
                 --profile "$runtime_profile" \
-                --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
-                --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
-                --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                "${ready_vote_profile_args[@]}"
               systemctl restart deadlock-api
               api_ready=false
               for _ in $(seq 1 30); do
@@ -502,13 +513,23 @@ jobs:
                 sleep 1
               done
               if [[ "$api_ready" != true ]]; then
+                restore_ready_vote_profile_args=(
+                  --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY
+                  --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY
+                  --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                )
+                if [[ "$runtime_profile" == ready-vote-static-8-profile ]]; then
+                  restore_ready_vote_profile_args+=(
+                    --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
+                    --only PLATFORM_PERF_SLOW_REQUEST_MS
+                    --only PLATFORM_PERF_LOG_MUTATIONS
+                  )
+                fi
                 "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
                   --apply \
                   --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
                   --profile baseline \
-                  --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
-                  --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
-                  --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                  "${restore_ready_vote_profile_args[@]}"
                 systemctl restart deadlock-api
                 api_ready=false
                 for _ in $(seq 1 30); do

@@ -128,6 +128,7 @@ PUBLIC_BASELINE = {
     "PLATFORM_PERF_SLOW_DB_MS": "500",
     "PLATFORM_PERF_SQL_COUNT_THRESHOLD": "25",
     "PLATFORM_PERF_LOG_MUTATIONS": "false",
+    "PLATFORM_READY_VOTE_CPU_PROFILE_DIR": "",
 }
 RUNTIME_PROFILES = {
     "baseline": {},
@@ -141,6 +142,16 @@ RUNTIME_PROFILES = {
             "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": str(limit),
         }
         for limit in (4, 6, 8, 12, 16)
+    },
+    # Bounded CPU/stage diagnostic only. The observer arms cProfile with
+    # signals during one explicit load and the final runtime remains static-8.
+    "ready-vote-static-8-profile": {
+        "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY": "8",
+        "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": "8",
+        "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY": "8",
+        "PLATFORM_READY_VOTE_CPU_PROFILE_DIR": "/tmp/old-sparky-ready-vote-cprofile",
+        "PLATFORM_PERF_SLOW_REQUEST_MS": "0",
+        "PLATFORM_PERF_LOG_MUTATIONS": "true",
     },
     # Adaptive-v2 is tuned from the canonical static-8 knee. It keeps the
     # same workers, database pool and connection budget, starts at eight per
