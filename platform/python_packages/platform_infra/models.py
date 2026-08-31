@@ -7,6 +7,8 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
+    Float,
     Index,
     Integer,
     JSON,
@@ -1053,6 +1055,154 @@ class TournamentDeadlockAssignmentRun(TimestampMixin, Base):
     result_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     candidate_pool_user_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     leftover_user_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+
+class TournamentTeam(TimestampMixin, Base):
+    """The current materialized team state for a tournament.
+
+    ``team_key`` is the stable logical identifier emitted by the assignment
+    engine and consumed by the existing bracket/match contract. ``id`` is an
+    internal row identifier and is deliberately not exposed as the bracket
+    team id.
+    """
+
+    __tablename__ = "tournament_teams"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id",
+            "team_key",
+            name="uq_tournament_teams_tournament_team_key",
+        ),
+        UniqueConstraint(
+            "tournament_id",
+            "id",
+            name="uq_tournament_teams_tournament_id_id",
+        ),
+        UniqueConstraint(
+            "source_assignment_run_id",
+            "team_key",
+            name="uq_tournament_teams_source_run_team_key",
+        ),
+        CheckConstraint(
+            "length(btrim(team_key)) > 0",
+            name="team_key_nonempty",
+        ),
+        CheckConstraint(
+            "length(btrim(name)) > 0",
+            name="name_nonempty",
+        ),
+        CheckConstraint(
+            "starter_strength >= 0",
+            name="starter_strength_nonnegative",
+        ),
+        CheckConstraint(
+            "starter_average_strength >= 0",
+            name="starter_average_strength_nonnegative",
+        ),
+        Index(
+            "ix_tournament_teams_tournament_source_run",
+            "tournament_id",
+            "source_assignment_run_id",
+        ),
+        Index(
+            "ix_tournament_teams_tournament_captain",
+            "tournament_id",
+            "captain_user_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tournament_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("platform.tournaments.id", ondelete="CASCADE"),
+    )
+    source_assignment_run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey(
+            "platform.tournament_deadlock_assignment_runs.id",
+            ondelete="CASCADE",
+        ),
+    )
+    team_key: Mapped[str] = mapped_column(String(20))
+    name: Mapped[str] = mapped_column(String(120))
+    captain_user_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("platform.users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    starter_strength: Mapped[float] = mapped_column(Float, default=0.0)
+    starter_average_strength: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class TournamentTeamMember(TimestampMixin, Base):
+    """A current tournament roster member and its stable assignment slot."""
+
+    __tablename__ = "tournament_team_members"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tournament_id", "team_id"],
+            [
+                "platform.tournament_teams.tournament_id",
+                "platform.tournament_teams.id",
+            ],
+            ondelete="CASCADE",
+            name="fk_tournament_team_members_team_tournament",
+        ),
+        UniqueConstraint(
+            "team_id",
+            "slot_number",
+            name="uq_tournament_team_members_team_slot",
+        ),
+        UniqueConstraint(
+            "tournament_id",
+            "user_id",
+            name="uq_tournament_team_members_tournament_user",
+        ),
+        CheckConstraint(
+            "roster_role IN ('captain', 'starter', 'substitute')",
+            name="roster_role_allowed",
+        ),
+        CheckConstraint(
+            "(roster_role = 'captain' AND slot_number = 0) OR "
+            "(roster_role = 'starter' AND slot_number BETWEEN 1 AND 5) OR "
+            "(roster_role = 'substitute' AND slot_number = 6)",
+            name="roster_role_slot_consistent",
+        ),
+        CheckConstraint("strength >= 0", name="strength_nonnegative"),
+        CheckConstraint(
+            "subrank IS NULL OR subrank > 0",
+            name="subrank_positive",
+        ),
+        Index(
+            "uq_tournament_team_members_team_captain",
+            "team_id",
+            unique=True,
+            postgresql_where=text("roster_role = 'captain'"),
+        ),
+        Index(
+            "ix_tournament_team_members_tournament_team_slot",
+            "tournament_id",
+            "team_id",
+            "slot_number",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    tournament_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("platform.tournaments.id", ondelete="CASCADE"),
+    )
+    team_id: Mapped[str] = mapped_column(String(36))
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("platform.users.id", ondelete="CASCADE"),
+    )
+    slot_number: Mapped[int] = mapped_column(Integer)
+    roster_role: Mapped[str] = mapped_column(String(20))
+    assigned_role: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    strength: Mapped[float] = mapped_column(Float, default=0.0)
+    rank: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    subrank: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class PlayerTournamentCommitment(TimestampMixin, Base):

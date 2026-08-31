@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 import os
 from pathlib import Path
 import subprocess
@@ -19,14 +20,18 @@ from python_packages.platform_infra.config import get_settings, validate_platfor
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     Tournament,
+    TournamentDeadlockAssignmentRun,
+    TournamentDeadlockCaptainRound,
     TournamentDeadlockReadyRound,
     TournamentParticipantSlot,
+    TournamentTeam,
+    TournamentTeamMember,
     User,
 )
 
 
 TARGET_REVISION = "20260821_0039"
-HEAD_REVISION = "20260830_0048"
+HEAD_REVISION = "20260831_0049"
 
 
 def _run_alembic(
@@ -86,6 +91,48 @@ async def _seed_legacy_rows() -> tuple[str, int, int]:
             initiated_by_user_id=user_id,
         )
         db_session.add_all([first, second])
+        await db_session.flush()
+        captain_round = TournamentDeadlockCaptainRound(
+            tournament_id=tournament_id,
+            source_ready_round_id=first.id,
+            teams_count=1,
+            status="finalized",
+            initiated_by_user_id=user_id,
+            finalized_at=datetime.now(UTC),
+        )
+        db_session.add(captain_round)
+        await db_session.flush()
+        now = datetime.now(UTC)
+        db_session.add(
+            TournamentDeadlockAssignmentRun(
+                id=str(uuid4()),
+                tournament_id=tournament_id,
+                source_captain_round_id=captain_round.id,
+                source_ready_round_id=first.id,
+                created_by_user_id=user_id,
+                status="locked",
+                published_at=now,
+                published_by_user_id=user_id,
+                locked_at=now,
+                locked_by_user_id=user_id,
+                summary_text="Migration backfill fixture.",
+                result_snapshot={
+                    "teams": [
+                        {
+                            "team_id": "1",
+                            "team_name": "Backfilled Team",
+                            "starter_strength": 1000.0,
+                            "starter_average_strength": 1000.0,
+                            "captain": {"user_id": user_id, "strength": 1000.0},
+                            "starter_slots": [],
+                            "reserve_slot": None,
+                        }
+                    ]
+                },
+                candidate_pool_user_ids=[user_id],
+                leftover_user_ids=[],
+            )
+        )
         await db_session.commit()
         return tournament_id, int(first.id), int(second.id)
 
@@ -148,6 +195,22 @@ async def _assert_repaired_state(tournament_id: str) -> None:
         )
         if slot_count != 16:
             raise RuntimeError(f"expected 16 participant capacity slots, found {slot_count}")
+        team_rows = list(
+            await db_session.scalars(
+                select(TournamentTeam).where(TournamentTeam.tournament_id == tournament_id)
+            )
+        )
+        member_rows = list(
+            await db_session.scalars(
+                select(TournamentTeamMember).where(
+                    TournamentTeamMember.tournament_id == tournament_id
+                )
+            )
+        )
+        if len(team_rows) != 1 or team_rows[0].team_key != "1" or team_rows[0].name != "Backfilled Team":
+            raise RuntimeError("published/locked assignment teams were not backfilled")
+        if len(member_rows) != 1 or member_rows[0].roster_role != "captain":
+            raise RuntimeError("published/locked assignment members were not backfilled")
 
 
 async def _main() -> None:

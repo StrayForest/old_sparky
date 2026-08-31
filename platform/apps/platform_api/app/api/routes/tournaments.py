@@ -8,7 +8,7 @@ import secrets
 import string
 import time
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Iterable, Literal, Sequence
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.exceptions import RequestValidationError
@@ -125,7 +125,7 @@ from apps.platform_api.app.services.tournament_workflow import (
     deadlock_closed_ready_round_for_tournament,
     deadlock_latest_auto_assignment_inputs_for_tournament,
     deadlock_locked_auto_assignment_run_for_tournament,
-    deadlock_published_auto_assignment_run_for_tournament,
+    deadlock_published_auto_assignment_run_for_tournament,  # noqa: F401 - patchable compatibility hook
     supersede_published_deadlock_assignment_run_for_tournament,
     deadlock_ready_candidate_rows_for_round,
     deadlock_ready_check_read_preflight,
@@ -147,6 +147,11 @@ from apps.platform_api.app.services.tournament_workflow import (
 )
 from apps.platform_api.app.services.tournament_runtime_cache import (
     register_tournament_runtime_cache_invalidator,
+)
+from apps.platform_api.app.services.tournament_teams import (
+    load_tournament_team_state,
+    materialize_assignment_run_teams,
+    materialized_tournament_user_ids,
 )
 from apps.platform_api.app.services.tournament_participant_capacity import (
     PARTICIPANT_SLOT_MATERIALIZATION_LIMIT,
@@ -228,6 +233,8 @@ from python_packages.platform_infra.models import (
     TournamentMatch,
     TournamentParticipant,
     TournamentParticipantSlot,
+    TournamentTeam,
+    TournamentTeamMember,
     User,
     new_uuid,
 )
@@ -505,7 +512,7 @@ class PublicWorkspaceSnapshotCacheEntry:
 
 
 _bracket_response_cache: dict[
-    tuple[str, int, str, str, str, bool, bool],
+    tuple[str, int, datetime | None, str, str, str, bool, bool],
     BracketResponseCacheEntry,
 ] = {}
 _ready_check_state_cache: dict[tuple[str, int], ReadyCheckStateCacheEntry] = {}
@@ -537,7 +544,7 @@ def _trim_cache(cache: dict[Any, Any], *, max_entries: int, now: float) -> None:
 
 
 def _get_bracket_response_cache(
-    key: tuple[str, int, str, str, str, bool, bool],
+    key: tuple[str, int, datetime | None, str, str, str, bool, bool],
 ) -> TournamentBracketResponse | None:
     now = time.monotonic()
     entry = _bracket_response_cache.get(key)
@@ -550,7 +557,7 @@ def _get_bracket_response_cache(
 
 
 def _set_bracket_response_cache(
-    key: tuple[str, int, str, str, str, bool, bool],
+    key: tuple[str, int, datetime | None, str, str, str, bool, bool],
     response: TournamentBracketResponse,
 ) -> None:
     now = time.monotonic()
@@ -1434,17 +1441,22 @@ def sort_deadlock_team_id(team_id: str) -> tuple[int, str] | tuple[float, str]:
     return (float("inf"), normalized)
 
 
-def locked_deadlock_team_labels_from_run(
-    run_row: TournamentDeadlockAssignmentRun,
+async def locked_deadlock_team_labels_for_tournament(
+    db_session: AsyncSession,
+    *,
+    tournament_id: str,
+    source_assignment_run_id: str | None = None,
 ) -> list[str]:
-    snapshot = dict(run_row.result_snapshot or {})
-    raw_teams = list(snapshot.get("teams") or [])
-    team_ids = [
-        str(team.get("team_id")).strip()
-        for team in raw_teams
-        if isinstance(team, dict) and team.get("team_id") is not None
-    ]
-    ordered_team_ids = sorted({team_id for team_id in team_ids if team_id}, key=sort_deadlock_team_id)
+    conditions = [TournamentTeam.tournament_id == tournament_id]
+    if source_assignment_run_id is not None:
+        conditions.append(
+            TournamentTeam.source_assignment_run_id == source_assignment_run_id
+        )
+    team_ids = (await db_session.scalars(select(TournamentTeam.team_key).where(*conditions))).all()
+    ordered_team_ids = sorted(
+        {str(team_id).strip() for team_id in team_ids if str(team_id).strip()},
+        key=sort_deadlock_team_id,
+    )
     return [deadlock_match_label_for_team(team_id) for team_id in ordered_team_ids]
 
 
@@ -1465,27 +1477,28 @@ class TournamentTeamMemberProfile:
     avatar_url: str | None
 
 
-def deadlock_assignment_member_user_ids(
+def historical_deadlock_assignment_run_user_ids(
     run_row: TournamentDeadlockAssignmentRun | None,
 ) -> set[str]:
+    """Return users from a solver snapshot for organizer preview/audit only."""
+
     if run_row is None:
         return set()
+    snapshot = dict(run_row.result_snapshot or {})
     user_ids: set[str] = set()
-    for team in list(dict(run_row.result_snapshot or {}).get("teams") or []):
-        if not isinstance(team, dict):
+    for raw_team in list(snapshot.get("teams") or []):
+        if not isinstance(raw_team, dict):
             continue
-        captain = team.get("captain")
-        if isinstance(captain, dict) and captain.get("user_id") is not None:
-            user_ids.add(str(captain["user_id"]))
-        for slot in list(team.get("starter_slots") or []):
-            if not isinstance(slot, dict):
-                continue
-            player = slot.get("assigned_player")
-            if isinstance(player, dict) and player.get("user_id") is not None:
-                user_ids.add(str(player["user_id"]))
-        reserve_slot = team.get("reserve_slot")
+        raw_players: list[Any] = [raw_team.get("captain")]
+        raw_players.extend(
+            slot.get("assigned_player")
+            for slot in list(raw_team.get("starter_slots") or [])
+            if isinstance(slot, dict)
+        )
+        reserve_slot = raw_team.get("reserve_slot")
         if isinstance(reserve_slot, dict):
-            player = reserve_slot.get("assigned_player")
+            raw_players.append(reserve_slot.get("assigned_player"))
+        for player in raw_players:
             if isinstance(player, dict) and player.get("user_id") is not None:
                 user_ids.add(str(player["user_id"]))
     return user_ids
@@ -1493,22 +1506,23 @@ def deadlock_assignment_member_user_ids(
 
 async def deadlock_assignment_member_profiles(
     db_session: AsyncSession,
-    run_row: TournamentDeadlockAssignmentRun | None,
+    members: Iterable[TournamentTeamMember],
 ) -> dict[str, TournamentTeamMemberProfile]:
-    user_ids = deadlock_assignment_member_user_ids(run_row)
+    user_ids = {str(member.user_id) for member in members}
     if not user_ids:
         return {}
     rows = (
         await db_session.execute(
             select(
-                PlayerProfile.user_id,
+                User.id,
                 PlayerProfile.handle,
                 PlayerProfile.display_name,
                 User.display_name,
                 PlayerProfile.avatar_asset_id,
             )
-            .join(User, User.id == PlayerProfile.user_id)
-            .where(PlayerProfile.user_id.in_(user_ids))
+            .select_from(User)
+            .outerjoin(PlayerProfile, PlayerProfile.user_id == User.id)
+            .where(User.id.in_(user_ids))
         )
     ).all()
     media_descriptors = await load_media_descriptors(
@@ -1533,102 +1547,64 @@ async def deadlock_assignment_member_profiles(
     }
 
 
-def serialize_deadlock_assignment_member(
-    player: dict[str, Any] | None,
-    *,
-    member_profiles: dict[str, TournamentTeamMemberProfile],
-    is_captain: bool = False,
-    is_substitute: bool = False,
-) -> TournamentBracketTeamMemberResponse | None:
-    if not isinstance(player, dict) or player.get("user_id") is None:
-        return None
-    user_id = str(player["user_id"])
-    member_profile = member_profiles.get(user_id)
-    rank = str(player.get("rank") or "").strip() or None
-    raw_subrank = player.get("subrank")
-    subrank = int(raw_subrank) if raw_subrank is not None else None
-    return TournamentBracketTeamMemberResponse(
-        user_id=user_id,
-        handle=(
-            member_profile.handle
-            if member_profile is not None
-            else str(player.get("username") or "Unknown")
-        ),
-        avatar_url=member_profile.avatar_url if member_profile is not None else None,
-        rank=rank,
-        subrank=subrank,
-        is_captain=is_captain,
-        is_substitute=is_substitute,
-    )
-
-
 def serialize_deadlock_bracket_teams(
-    run_row: TournamentDeadlockAssignmentRun | None,
+    teams: Sequence[TournamentTeam],
+    team_members: Sequence[TournamentTeamMember],
     *,
     include_members: bool = True,
     member_profiles: dict[str, TournamentTeamMemberProfile] | None = None,
 ) -> list[TournamentBracketTeamResponse]:
-    if run_row is None:
+    if not teams:
         return []
-    snapshot = dict(run_row.result_snapshot or {})
-    raw_teams = [
-        team
-        for team in list(snapshot.get("teams") or [])
-        if isinstance(team, dict) and team.get("team_id") is not None
-    ]
-    strength_order = strength_seed_teams(raw_teams)
-    team_by_id = {str(team["team_id"]).strip(): team for team in raw_teams}
+    strength_order = strength_seed_teams(
+        [
+            {
+                "team_id": team.team_key,
+                "starter_strength": team.starter_strength,
+            }
+            for team in teams
+        ]
+    )
+    team_by_id = {str(team.team_key).strip(): team for team in teams}
     ordered_teams = [team_by_id[seeded.team_id] for seeded in strength_order]
+    members_by_team: dict[str, list[TournamentTeamMember]] = {}
+    for member in team_members:
+        members_by_team.setdefault(str(member.team_id), []).append(member)
     resolved_member_profiles = member_profiles or {}
     serialized_teams: list[TournamentBracketTeamResponse] = []
     for seed, team in enumerate(ordered_teams, start=1):
-        team_id = str(team["team_id"]).strip()
-        captain = team.get("captain")
-        captain_id = (
-            str(captain.get("user_id"))
-            if isinstance(captain, dict) and captain.get("user_id") is not None
-            else None
-        )
+        team_id = str(team.team_key).strip()
+        captain_id = str(team.captain_user_id) if team.captain_user_id else None
         members: list[TournamentBracketTeamMemberResponse] = []
         if include_members:
-            captain_member = serialize_deadlock_assignment_member(
-                captain if isinstance(captain, dict) else None,
-                member_profiles=resolved_member_profiles,
-                is_captain=True,
-            )
-            if captain_member is not None:
-                members.append(captain_member)
-                captain_id = captain_member.user_id
-            for slot in list(team.get("starter_slots") or []):
-                if not isinstance(slot, dict):
-                    continue
-                member = serialize_deadlock_assignment_member(
-                    slot.get("assigned_player") if isinstance(slot.get("assigned_player"), dict) else None,
-                    member_profiles=resolved_member_profiles,
+            for roster_member in members_by_team.get(str(team.id), []):
+                member_profile = resolved_member_profiles.get(str(roster_member.user_id))
+                members.append(
+                    TournamentBracketTeamMemberResponse(
+                        user_id=str(roster_member.user_id),
+                        handle=(
+                            member_profile.handle
+                            if member_profile is not None
+                            else "Unknown"
+                        ),
+                        avatar_url=(
+                            member_profile.avatar_url
+                            if member_profile is not None
+                            else None
+                        ),
+                        rank=roster_member.rank,
+                        subrank=roster_member.subrank,
+                        is_captain=roster_member.roster_role == "captain",
+                        is_substitute=roster_member.roster_role == "substitute",
+                    )
                 )
-                if member is not None:
-                    members.append(member)
-            reserve_slot = team.get("reserve_slot")
-            if isinstance(reserve_slot, dict):
-                reserve_member = serialize_deadlock_assignment_member(
-                    reserve_slot.get("assigned_player")
-                    if isinstance(reserve_slot.get("assigned_player"), dict)
-                    else None,
-                    member_profiles=resolved_member_profiles,
-                    is_substitute=True,
-                )
-                if reserve_member is not None:
-                    members.append(reserve_member)
         serialized_teams.append(
             TournamentBracketTeamResponse(
                 id=team_id,
-                name=str(team.get("team_name") or "").strip() or deadlock_match_label_for_team(team_id),
+                name=team.name,
                 seed=seed,
-                starter_strength=round(float(team.get("starter_strength") or 0.0), 4),
-                starter_average_strength=round(
-                    float(team.get("starter_average_strength") or 0.0),
-                    4,
-                ),
+                starter_strength=round(float(team.starter_strength or 0.0), 4),
+                starter_average_strength=round(float(team.starter_average_strength or 0.0), 4),
                 captain_id=captain_id,
                 members=members,
             )
@@ -1675,29 +1651,6 @@ def serialize_bracket_match_projection(
         ready=bool(team_a_id and team_b_id),
         scheduled_at=match.scheduled_at,
     )
-
-
-def deadlock_assignment_run_user_ids(run_row: TournamentDeadlockAssignmentRun) -> set[str]:
-    snapshot = dict(run_row.result_snapshot or {})
-    user_ids: set[str] = set()
-    for team in list(snapshot.get("teams") or []):
-        if not isinstance(team, dict):
-            continue
-        captain = team.get("captain")
-        if isinstance(captain, dict) and captain.get("user_id") is not None:
-            user_ids.add(str(captain["user_id"]))
-        for slot in list(team.get("starter_slots") or []):
-            if not isinstance(slot, dict):
-                continue
-            player = slot.get("assigned_player")
-            if isinstance(player, dict) and player.get("user_id") is not None:
-                user_ids.add(str(player["user_id"]))
-        reserve_slot = team.get("reserve_slot")
-        if isinstance(reserve_slot, dict):
-            player = reserve_slot.get("assigned_player")
-            if isinstance(player, dict) and player.get("user_id") is not None:
-                user_ids.add(str(player["user_id"]))
-    return user_ids
 
 
 def winner_label_for_match(match: TournamentMatch) -> str | None:
@@ -2177,8 +2130,6 @@ async def build_tournament_bracket_response(
     auth_session,
     has_participant_record: bool | None = None,
     has_valid_invite_code: bool = False,
-    visible_assignment_run: TournamentDeadlockAssignmentRun | None = None,
-    assignment_run_loaded: bool = False,
     include_team_members: bool = True,
 ) -> TournamentBracketResponse:
     if has_participant_record is None:
@@ -2207,6 +2158,7 @@ async def build_tournament_bracket_response(
     cache_key = (
         tournament.id,
         int(tournament.bracket_revision or 0),
+        tournament.updated_at,
         tournament.status,
         tournament.match_format,
         tournament.final_format,
@@ -2217,25 +2169,20 @@ async def build_tournament_bracket_response(
     if cached_response is not None:
         return cached_response
 
-    visible_run = visible_assignment_run
-    if not assignment_run_loaded and is_solo_tournament_format(tournament.format_slug):
-        visible_run = await deadlock_published_auto_assignment_run_for_tournament(
-            db_session,
-            tournament_id=tournament.id,
-        )
-        if visible_run is None and can_manage:
-            visible_run = await deadlock_auto_assignment_run_for_tournament(
-                db_session,
-                tournament_id=tournament.id,
-            )
     match_rows = await tournament_matches_in_order(db_session, tournament_id=tournament.id)
+    team_rows, team_member_rows = await load_tournament_team_state(
+        db_session,
+        tournament_id=tournament.id,
+        include_members=include_team_members,
+    )
     member_profiles = (
-        await deadlock_assignment_member_profiles(db_session, visible_run)
+        await deadlock_assignment_member_profiles(db_session, team_member_rows)
         if include_team_members
         else {}
     )
     teams = serialize_deadlock_bracket_teams(
-        visible_run,
+        team_rows,
+        team_member_rows,
         include_members=include_team_members,
         member_profiles=member_profiles,
     )
@@ -2275,28 +2222,34 @@ async def build_tournament_workspace_detail_bracket_response(
     *,
     tournament: Tournament,
     can_manage: bool,
-    visible_assignment_run: TournamentDeadlockAssignmentRun | None = None,
-    assignment_run_loaded: bool = False,
 ) -> TournamentBracketResponse:
-    visible_run = visible_assignment_run
-    if (
-        not assignment_run_loaded
-        and is_solo_tournament_format(tournament.format_slug)
-        and tournament.status != "registration_open"
-    ):
-        visible_run = await deadlock_published_auto_assignment_run_for_tournament(
-            db_session,
+    if tournament.status == "registration_open":
+        return TournamentBracketResponse(
             tournament_id=tournament.id,
+            tournament_status=tournament.status,
+            status="pending",
+            revision=int(tournament.bracket_revision or 0),
+            can_manage=can_manage,
+            capabilities=bracket_capabilities(
+                tournament_status=tournament.status,
+                can_manage=can_manage,
+            ),
+            teams=[],
+            matches=[],
         )
-        if visible_run is None and can_manage:
-            visible_run = await deadlock_auto_assignment_run_for_tournament(
-                db_session,
-                tournament_id=tournament.id,
-            )
 
-    member_profiles = await deadlock_assignment_member_profiles(db_session, visible_run)
+    team_rows, team_member_rows = await load_tournament_team_state(
+        db_session,
+        tournament_id=tournament.id,
+        include_members=True,
+    )
+    member_profiles = await deadlock_assignment_member_profiles(
+        db_session,
+        team_member_rows,
+    )
     teams = serialize_deadlock_bracket_teams(
-        visible_run,
+        team_rows,
+        team_member_rows,
         member_profiles=member_profiles,
     )
     bracket_status = "pending"
@@ -4257,13 +4210,22 @@ async def create_tournament_match(
         db_session,
         tournament_id=tournament.id,
     )
+    locked_team_labels = (
+        await locked_deadlock_team_labels_for_tournament(
+            db_session,
+            tournament_id=tournament.id,
+            source_assignment_run_id=locked_run.id,
+        )
+        if locked_run is not None
+        else []
+    )
     try:
         home_team_id, away_team_id = ensure_match_team_ids_are_locked(
             home_team_id=deadlock_team_id_from_match_label(home_label),
             away_team_id=deadlock_team_id_from_match_label(away_label),
             locked_team_ids={
                 team_id
-                for label in locked_deadlock_team_labels_from_run(locked_run)
+                for label in locked_team_labels
                 if (team_id := deadlock_team_id_from_match_label(label)) is not None
             }
             if locked_run is not None
@@ -5887,6 +5849,19 @@ async def publish_deadlock_auto_assignment_run(
         run_row.published_at = auth_session.now
         run_row.published_by_user_id = auth_session.user.id
 
+    try:
+        await materialize_assignment_run_teams(
+            db_session,
+            tournament=tournament,
+            run_row=run_row,
+            now=auth_session.now,
+        )
+    except TournamentWorkflowError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"The assignment could not become current team state: {exc}",
+        ) from exc
+
     await write_audit_log(
         db_session,
         actor_user_id=auth_session.user.id,
@@ -5899,6 +5874,7 @@ async def publish_deadlock_auto_assignment_run(
         },
     )
     await db_session.commit()
+    invalidate_tournament_runtime_caches(tournament.id)
     await db_session.refresh(run_row)
     return serialize_deadlock_auto_assignment_run(run_row, freshness=run_freshness)
 
@@ -5972,6 +5948,7 @@ async def lock_deadlock_auto_assignment_run(
         },
     )
     await db_session.commit()
+    invalidate_tournament_runtime_caches(tournament.id)
     await db_session.refresh(run_row)
     return serialize_deadlock_auto_assignment_run(run_row)
 
@@ -6252,23 +6229,35 @@ async def get_tournament_scoped_profile(
             detail="Tournament profiles are visible only to joined participants, the organizer, or platform admins.",
         )
 
-    published_run = await deadlock_published_auto_assignment_run_for_tournament(
+    materialized_teams, _ = await load_tournament_team_state(
+        db_session,
+        tournament_id=tournament.id,
+        include_members=False,
+    )
+    materialized_user_ids = await materialized_tournament_user_ids(
         db_session,
         tournament_id=tournament.id,
     )
-    visible_run = published_run
-    if visible_run is None and (is_organizer or is_admin):
-        visible_run = await deadlock_auto_assignment_run_for_tournament(
-            db_session,
-            tournament_id=tournament.id,
+    if not materialized_teams:
+        # Organizer/admin access to a generated run is a historical solver
+        # preview. Once teams exist, only normalized current membership is
+        # eligible for this endpoint.
+        preview_run = (
+            await deadlock_auto_assignment_run_for_tournament(
+                db_session,
+                tournament_id=tournament.id,
+            )
+            if is_organizer or is_admin
+            else None
         )
-    if visible_run is None:
+        materialized_user_ids = historical_deadlock_assignment_run_user_ids(preview_run)
+    if not materialized_user_ids:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Tournament profiles are available after teams are formed.",
         )
 
-    if user_id not in deadlock_assignment_run_user_ids(visible_run):
+    if user_id not in materialized_user_ids:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Player is not part of the visible tournament roster.",
@@ -6620,9 +6609,6 @@ async def get_tournament_workspace(
             tournament_id=tournament.id,
         )
         assignment_runs_loaded = True
-    visible_assignment_run = assignment_published_run or (
-        assignment_latest_run if current_user_can_manage_bracket else None
-    )
     if workspace_view == "bracket_summary":
         bracket = build_tournament_workspace_bracket_summary_response(
             tournament=tournament,
@@ -6633,8 +6619,6 @@ async def get_tournament_workspace(
             db_session,
             tournament=tournament,
             can_manage=current_user_can_manage_bracket,
-            visible_assignment_run=visible_assignment_run,
-            assignment_run_loaded=assignment_runs_loaded,
         )
     else:
         bracket = await build_tournament_bracket_response(
@@ -6643,8 +6627,6 @@ async def get_tournament_workspace(
             auth_session=auth_session,
             has_participant_record=has_participant_record,
             has_valid_invite_code=has_valid_invite_code,
-            visible_assignment_run=visible_assignment_run,
-            assignment_run_loaded=assignment_runs_loaded,
         )
     ready_check: TournamentDeadlockReadyCheckStateResponse | None = None
     auto_assignment: TournamentDeadlockAutoAssignmentStateResponse | None = None

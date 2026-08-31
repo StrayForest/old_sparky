@@ -11,6 +11,7 @@ from sqlalchemy import delete, select
 
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_api.app.main import create_app
+from apps.platform_api.app.services.tournament_teams import materialize_assignment_run_teams
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
@@ -115,6 +116,16 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
         async with session_factory()() as db_session:
             tournament = await db_session.scalar(select(Tournament).where(Tournament.slug == slug))
             self.assertIsNotNone(tournament, f"Tournament {slug} is missing.")
+            second_captain = await db_session.scalar(
+                select(User).where(User.email == f"{self.prefix}-second-captain@example.com")
+            )
+            if second_captain is None:
+                second_captain = User(
+                    email=f"{self.prefix}-second-captain@example.com",
+                    display_name="Second Captain",
+                )
+                db_session.add(second_captain)
+                await db_session.flush()
             ready_round = TournamentDeadlockReadyRound(
                 tournament_id=tournament.id,
                 status="closed",
@@ -146,6 +157,11 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
                 "roles": ["Carry"],
                 "assigned_role": "Carry",
             }
+            second_captain_snapshot = {
+                **captain_snapshot,
+                "user_id": second_captain.id,
+                "username": "Second Captain",
+            }
             result_snapshot = {
                 "teams": [
                     {
@@ -160,7 +176,7 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
                         "team_id": "2",
                         "starter_strength": 1000.0,
                         "starter_average_strength": 1000.0,
-                        "captain": captain_snapshot,
+                        "captain": second_captain_snapshot,
                         "starter_slots": [],
                         "reserve_slot": None,
                     },
@@ -199,22 +215,28 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
                     "reserve_desired_slots_with_any_match": 0,
                 },
             }
-            db_session.add(
-                TournamentDeadlockAssignmentRun(
-                    tournament_id=tournament.id,
-                    source_captain_round_id=captain_round.id,
-                    source_ready_round_id=ready_round.id,
-                    created_by_user_id=organizer_user_id,
-                    status="locked",
-                    published_at=now,
-                    published_by_user_id=organizer_user_id,
-                    locked_at=now,
-                    locked_by_user_id=organizer_user_id,
-                    summary_text="Test locked Deadlock roster.",
-                    result_snapshot=result_snapshot,
-                    candidate_pool_user_ids=[],
-                    leftover_user_ids=[],
-                )
+            assignment_run = TournamentDeadlockAssignmentRun(
+                tournament_id=tournament.id,
+                source_captain_round_id=captain_round.id,
+                source_ready_round_id=ready_round.id,
+                created_by_user_id=organizer_user_id,
+                status="locked",
+                published_at=now,
+                published_by_user_id=organizer_user_id,
+                locked_at=now,
+                locked_by_user_id=organizer_user_id,
+                summary_text="Test locked Deadlock roster.",
+                result_snapshot=result_snapshot,
+                candidate_pool_user_ids=[],
+                leftover_user_ids=[],
+            )
+            db_session.add(assignment_run)
+            await db_session.flush()
+            await materialize_assignment_run_teams(
+                db_session,
+                tournament=tournament,
+                run_row=assignment_run,
+                now=now,
             )
             await db_session.commit()
 

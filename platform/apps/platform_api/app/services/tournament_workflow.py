@@ -31,6 +31,9 @@ from apps.platform_api.app.services.player_commitments import (
     create_assignment_commitments,
     lock_commitment_users,
 )
+from apps.platform_api.app.services.tournament_teams import (
+    materialize_assignment_run_teams,
+)
 from python_packages.platform_domain.deadlock import (
     AutoAssignmentEngine,
     AutoAssignmentError,
@@ -2053,6 +2056,16 @@ async def finalize_deadlock_assignment_with_commitments(
         ]
         run_row.leftover_user_ids = [str(player.user_id) for player in assignment.leftovers]
         await db_session.flush()
+
+    # Roster locking is the final handoff into commitments and bracket
+    # creation. Materialize in this same transaction so a locked run can
+    # never become authoritative while its normalized team state is missing.
+    await materialize_assignment_run_teams(
+        db_session,
+        tournament=tournament,
+        run_row=run_row,
+        now=now,
+    )
 
     try:
         commitments = await create_assignment_commitments(

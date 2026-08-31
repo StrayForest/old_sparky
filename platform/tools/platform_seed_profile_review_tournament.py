@@ -21,6 +21,7 @@ from python_packages.platform_infra.media.hard_delete import purge_deleted_media
 from apps.platform_api.app.services.tournament_participant_capacity import (
     ensure_participant_slot_claimed,
 )
+from apps.platform_api.app.services.tournament_teams import materialize_assignment_run_teams
 from python_packages.platform_infra.models import (
     DeadlockDreamSlot,
     DeadlockProfile,
@@ -424,6 +425,12 @@ async def seed(operator_email: str) -> dict[str, object]:
         )
         db_session.add(assignment_run)
         await db_session.flush()
+        await materialize_assignment_run_teams(
+            db_session,
+            tournament=tournament,
+            run_row=assignment_run,
+            now=now - timedelta(days=1),
+        )
 
         for team, team_name in zip(teams, TEAM_NAMES, strict=True):
             member_ids = [

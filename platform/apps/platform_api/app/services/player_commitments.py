@@ -7,11 +7,14 @@ from typing import Any, Iterable
 from sqlalchemy import exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.platform_api.app.services.tournament_teams import materialized_roster_members
 from python_packages.platform_infra.models import (
     PlayerTournamentCommitment,
     Tournament,
     TournamentDeadlockAssignmentRun,
     TournamentMatch,
+    TournamentTeam,
+    TournamentTeamMember,
     User,
 )
 
@@ -52,7 +55,16 @@ class PlayerCommitmentConflict(RuntimeError):
         super().__init__("One or more players already have an active tournament commitment.")
 
 
-def assignment_roster_members(run_row: TournamentDeadlockAssignmentRun) -> tuple[AssignmentRosterMember, ...]:
+def historical_assignment_roster_members(
+    run_row: TournamentDeadlockAssignmentRun,
+) -> tuple[AssignmentRosterMember, ...]:
+    """Read a historical assignment snapshot for diagnostics/tests.
+
+    Current commitment and bracket decisions use ``TournamentTeamMember`` via
+    ``materialized_roster_members`` below; this parser is intentionally not a
+    live roster source.
+    """
+
     snapshot = dict(run_row.result_snapshot or {})
     members: dict[str, AssignmentRosterMember] = {}
     for raw_team in list(snapshot.get("teams") or []):
@@ -83,6 +95,11 @@ def assignment_roster_members(run_row: TournamentDeadlockAssignmentRun) -> tuple
                 team_name=team_name,
             )
     return tuple(sorted(members.values(), key=lambda item: item.user_id))
+
+
+# Compatibility for diagnostics/tests that imported the old helper name. It
+# remains explicitly historical and is never used by live commitment reads.
+assignment_roster_members = historical_assignment_roster_members
 
 
 async def lock_commitment_users(db_session: AsyncSession, user_ids: Iterable[str]) -> tuple[str, ...]:
@@ -137,7 +154,18 @@ async def create_assignment_commitments(
     run_row: TournamentDeadlockAssignmentRun,
     activated_at: datetime,
 ) -> tuple[PlayerTournamentCommitment, ...]:
-    roster = assignment_roster_members(run_row)
+    roster = tuple(
+        AssignmentRosterMember(
+            user_id=user_id,
+            team_id=team_key,
+            team_name=team_name,
+        )
+        for user_id, team_key, team_name in await materialized_roster_members(
+            db_session,
+            tournament_id=run_row.tournament_id,
+            assignment_run_id=run_row.id,
+        )
+    )
     conflicts = await active_commitments_by_user(
         db_session,
         [member.user_id for member in roster],
@@ -200,7 +228,17 @@ async def reactivate_team_commitments(
     activated_at: datetime,
 ) -> int:
     team_roster = tuple(
-        member for member in assignment_roster_members(run_row) if member.team_id == str(team_id)
+        AssignmentRosterMember(
+            user_id=user_id,
+            team_id=team_key,
+            team_name=team_name,
+        )
+        for user_id, team_key, team_name in await materialized_roster_members(
+            db_session,
+            tournament_id=run_row.tournament_id,
+            assignment_run_id=run_row.id,
+        )
+        if team_key == str(team_id)
     )
     return await reactivate_roster_members(
         db_session,
@@ -287,9 +325,17 @@ async def reactivate_viable_tournament_commitments(
             )
 
     viable_roster = tuple(
-        member
-        for member in assignment_roster_members(run_row)
-        if member.team_id not in eliminated_team_ids
+        AssignmentRosterMember(
+            user_id=user_id,
+            team_id=team_key,
+            team_name=team_name,
+        )
+        for user_id, team_key, team_name in await materialized_roster_members(
+            db_session,
+            tournament_id=tournament_id,
+            assignment_run_id=run_row.id,
+        )
+        if team_key not in eliminated_team_ids
     )
     return await reactivate_roster_members(
         db_session,
@@ -400,25 +446,33 @@ async def reconcile_player_commitments(
         )
     ).all()
     run_ids = sorted({str(row.assignment_run_id) for row in active_rows})
-    run_rows = []
-    if run_ids:
-        run_rows = (
-            await db_session.scalars(
-                select(TournamentDeadlockAssignmentRun).where(
-                    TournamentDeadlockAssignmentRun.id.in_(run_ids)
-                )
+    run_state = {
+        str(run_id): (str(run_status), set())
+        for run_id, run_status in (
+            await db_session.execute(
+                select(
+                    TournamentDeadlockAssignmentRun.id,
+                    TournamentDeadlockAssignmentRun.status,
+                ).where(TournamentDeadlockAssignmentRun.id.in_(run_ids))
             )
         ).all()
-    run_state = {
-        run_row.id: (
-            run_row.status,
-            {
-                (member.user_id, member.team_id)
-                for member in assignment_roster_members(run_row)
-            },
-        )
-        for run_row in run_rows
     }
+    if run_ids:
+        normalized_roster_rows = (
+            await db_session.execute(
+                select(
+                    TournamentTeam.source_assignment_run_id,
+                    TournamentTeamMember.user_id,
+                    TournamentTeam.team_key,
+                )
+                .join(TournamentTeam, TournamentTeam.id == TournamentTeamMember.team_id)
+                .where(TournamentTeam.source_assignment_run_id.in_(run_ids))
+            )
+        ).all()
+        for assignment_run_id, user_id, team_key in normalized_roster_rows:
+            state = run_state.get(str(assignment_run_id))
+            if state is not None:
+                state[1].add((str(user_id), str(team_key)))
     mismatched_ids: list[str] = []
     for row in active_rows:
         status_and_roster = run_state.get(str(row.assignment_run_id))

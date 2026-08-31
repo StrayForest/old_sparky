@@ -9,6 +9,7 @@ import httpx
 from sqlalchemy import delete, select
 
 from apps.platform_api.app.main import create_app
+from apps.platform_api.app.services.tournament_teams import materialize_assignment_run_teams
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
@@ -133,31 +134,37 @@ class PlatformBracketGraphApiTests(unittest.IsolatedAsyncioTestCase):
             )
             db_session.add(captain_round)
             await db_session.flush()
-            db_session.add(
-                TournamentDeadlockAssignmentRun(
-                    tournament_id=tournament.id,
-                    source_captain_round_id=captain_round.id,
-                    source_ready_round_id=ready_round.id,
-                    created_by_user_id=organizer_user_id,
-                    status="locked",
-                    published_at=now,
-                    published_by_user_id=organizer_user_id,
-                    locked_at=now,
-                    locked_by_user_id=organizer_user_id,
-                    summary_text="Eight-team strength bracket fixture.",
-                    result_snapshot={
-                        "teams": [
-                            {
-                                "team_id": str(index),
-                                "starter_strength": strength,
-                                "starter_average_strength": strength / 6,
-                            }
-                            for index, strength in enumerate(strengths, start=1)
-                        ]
-                    },
-                    candidate_pool_user_ids=[],
-                    leftover_user_ids=[],
-                )
+            assignment_run = TournamentDeadlockAssignmentRun(
+                tournament_id=tournament.id,
+                source_captain_round_id=captain_round.id,
+                source_ready_round_id=ready_round.id,
+                created_by_user_id=organizer_user_id,
+                status="locked",
+                published_at=now,
+                published_by_user_id=organizer_user_id,
+                locked_at=now,
+                locked_by_user_id=organizer_user_id,
+                summary_text="Eight-team strength bracket fixture.",
+                result_snapshot={
+                    "teams": [
+                        {
+                            "team_id": str(index),
+                            "starter_strength": strength,
+                            "starter_average_strength": strength / 6,
+                        }
+                        for index, strength in enumerate(strengths, start=1)
+                    ]
+                },
+                candidate_pool_user_ids=[],
+                leftover_user_ids=[],
+            )
+            db_session.add(assignment_run)
+            await db_session.flush()
+            await materialize_assignment_run_teams(
+                db_session,
+                tournament=tournament,
+                run_row=assignment_run,
+                now=now,
             )
             await db_session.commit()
 

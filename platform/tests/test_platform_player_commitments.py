@@ -17,7 +17,7 @@ from apps.platform_api.app.services.tournament_workflow import (
     transition_tournament_status,
 )
 from apps.platform_api.app.services.player_commitments import (
-    assignment_roster_members,
+    historical_assignment_roster_members,
     reactivate_viable_tournament_commitments,
     reconcile_player_commitments,
     release_active_commitments,
@@ -207,7 +207,7 @@ class PlatformPlayerCommitmentTests(unittest.IsolatedAsyncioTestCase):
                 "rebalanced": rebalanced,
                 "unavailable": unavailable,
                 "roster_user_ids": {
-                    member.user_id for member in assignment_roster_members(run_row)
+                    member.user_id for member in historical_assignment_roster_members(run_row)
                 },
             }
 

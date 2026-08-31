@@ -15,6 +15,7 @@ from python_packages.platform_infra.models import (
     Tournament,
     TournamentDeadlockAssignmentRun,
     TournamentMatch,
+    TournamentTeam,
     new_uuid,
 )
 
@@ -30,28 +31,34 @@ def team_label(team_id: str | None) -> str:
     return f"Team {team_id}" if team_id else "TBD"
 
 
-def locked_team_snapshots(
-    run_row: TournamentDeadlockAssignmentRun,
+async def locked_team_snapshots(
+    db_session: AsyncSession,
+    *,
+    tournament_id: str,
+    source_assignment_run_id: str,
 ) -> tuple[BracketTeamSnapshot, ...]:
-    snapshot = dict(run_row.result_snapshot or {})
-    teams: list[BracketTeamSnapshot] = []
-    for raw_team in list(snapshot.get("teams") or []):
-        if not isinstance(raw_team, dict) or raw_team.get("team_id") is None:
-            continue
-        teams.append(
-            BracketTeamSnapshot(
-                team_id=str(raw_team["team_id"]).strip(),
-                starter_strength=float(raw_team.get("starter_strength") or 0.0),
-                starter_average_strength=float(
-                    raw_team.get("starter_average_strength") or 0.0
-                ),
+    rows = (
+        await db_session.scalars(
+            select(TournamentTeam)
+            .where(
+                TournamentTeam.tournament_id == tournament_id,
+                TournamentTeam.source_assignment_run_id == source_assignment_run_id,
             )
+            .order_by(TournamentTeam.team_key.asc(), TournamentTeam.id.asc())
         )
-    return tuple(teams)
+    ).all()
+    return tuple(
+        BracketTeamSnapshot(
+            team_id=str(team.team_key),
+            starter_strength=float(team.starter_strength or 0.0),
+            starter_average_strength=float(team.starter_average_strength or 0.0),
+        )
+        for team in rows
+    )
 
 
 def automatic_opening_team_ids(
-    run_row: TournamentDeadlockAssignmentRun,
+    locked_teams: tuple[BracketTeamSnapshot, ...],
 ) -> tuple[str, ...]:
     return strength_seed_team_ids(
         [
@@ -59,7 +66,7 @@ def automatic_opening_team_ids(
                 "team_id": team.team_id,
                 "starter_strength": team.starter_strength,
             }
-            for team in locked_team_snapshots(run_row)
+            for team in locked_teams
         ]
     )
 
@@ -101,7 +108,16 @@ async def create_full_bracket_graph(
     tournament: Tournament,
     locked_run: TournamentDeadlockAssignmentRun,
 ) -> tuple[list[TournamentMatch], list[TournamentMatch]]:
-    ordered_team_ids = automatic_opening_team_ids(locked_run)
+    locked_teams = await locked_team_snapshots(
+        db_session,
+        tournament_id=tournament.id,
+        source_assignment_run_id=locked_run.id,
+    )
+    if not locked_teams:
+        raise TournamentWorkflowError(
+            "The locked roster has no materialized tournament teams."
+        )
+    ordered_team_ids = automatic_opening_team_ids(locked_teams)
     total_rounds = bracket_round_count(len(ordered_team_ids))
 
     all_matches: list[TournamentMatch] = []
