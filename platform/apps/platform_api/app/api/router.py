@@ -45,6 +45,11 @@ tournament_dependencies = [
     Depends(enforce_tournament_participant_policy),
 ]
 api_router.include_router(
+    tournaments.ready_vote_router,
+    prefix="/tournaments",
+    tags=["tournaments"],
+)
+api_router.include_router(
     tournaments.router,
     prefix="/tournaments",
     tags=["tournaments"],
