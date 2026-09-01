@@ -2,7 +2,6 @@ import type { Metadata } from "next";
 import { cookies } from "next/headers";
 import { notFound } from "next/navigation";
 import { AdminConsole } from "@/components/admin/admin-console";
-import { AdminUserDeletion } from "@/components/admin/admin-user-deletion";
 import { getServerCurrentUser, platformSessionCookieName } from "@/lib/server-auth";
 
 export const metadata: Metadata = {
@@ -32,7 +31,6 @@ export default async function PlatformOperationsPage() {
       <div className="page-noise" aria-hidden="true" />
       <main className="main admin-main">
         <AdminConsole />
-        <AdminUserDeletion />
       </main>
     </>
   );

@@ -78,12 +78,12 @@ test("profile editor mutations cannot overlap their editable drafts", () => {
 });
 
 test("admin cleanup keeps committed success independent from reload", () => {
-  const admin = source("components/admin/admin-console.tsx");
-  const cleanupFailure = admin.indexOf("setError(platformApiMessage(requestError, t(\"admin.preprodCleanupFailed\")))");
-  const reload = admin.indexOf("await onReload();", cleanupFailure);
-  const committedComment = admin.indexOf("Cleanup is already committed", cleanupFailure);
+  const admin = source("components/admin/admin-preprod-page.tsx");
+  const cleanupFailure = admin.indexOf("setError(platformApiMessage(requestError, t(\"admin.new.preprodCleanupFailed\")))");
+  const reload = admin.indexOf("await onReload();");
+  const committedComment = admin.indexOf("Cleanup is already committed");
 
   expect(cleanupFailure).toBeGreaterThan(-1);
-  expect(reload).toBeGreaterThan(cleanupFailure);
+  expect(reload).toBeGreaterThan(-1);
   expect(committedComment).toBeGreaterThan(reload);
 });

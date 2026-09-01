@@ -19,6 +19,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Deadlock patch translation / Valve glossary contract | [Patch translation](patch-translation.md) |
 | Standing translation regression and warm-up procedure | [Patch translation](patch-translation.md#qa) |
 | UI system and responsive rules | [Visual theme](platform-visual-theme.md) |
+| Admin console structure and metric definitions | [Admin console IA](admin-console-information-architecture.md) |
 | Normal release or rollback | [Deployment runbook](deployment-runbook.md) |
 | Release transaction and recovery | [Release state machine](release-state-machine.md) |
 | Test-suite ownership and CI/live runners | [Test-suite governance](test-suite-governance.md) |

@@ -526,10 +526,7 @@ body {
 
 .panel,
 .info-section,
-.info-anchor-nav,
-.admin-section,
-.admin-inspector,
-.admin-state-panel {
+.info-anchor-nav {
   background:
     linear-gradient(145deg, rgba(16, 23, 40, .96), rgba(8, 13, 25, .95));
   border: 1px solid var(--ui-border);
@@ -564,7 +561,6 @@ body {
 
 .primary-button,
 .primary-action,
-.admin-apply-button,
 .match-controls button:not(:disabled) {
   color: #fff;
   background: linear-gradient(135deg, var(--ui-primary-deep), var(--ui-primary));
@@ -586,9 +582,7 @@ body {
 .limit-button,
 .tz-button,
 .icon-button,
-.reset-area,
-.admin-refresh-button,
-.admin-filter-toggle {
+.reset-area {
   color: var(--ui-text-soft);
   background: rgba(13, 20, 35, .9);
   border: 1px solid var(--ui-border-strong);
@@ -612,8 +606,7 @@ body {
 .segment.active,
 .rank-pill.active,
 .pill.active,
-.date-sort-button.active,
-.admin-filter-toggle.active {
+.date-sort-button.active {
   color: #dcd3ff;
   background: var(--ui-primary-soft);
   border-color: rgba(167, 139, 250, .64);
@@ -627,11 +620,6 @@ body {
 .support-form select,
 .support-form textarea,
 .account-input,
-.admin-search,
-.admin-select-wrap,
-.admin-note-field,
-.admin-form-grid select,
-.admin-schedule-editor input,
 .match-score-controls input {
   color: var(--ui-text);
   background: rgba(7, 12, 23, .88);
@@ -647,9 +635,7 @@ body {
 .support-form input:focus,
 .support-form select:focus,
 .support-form textarea:focus,
-.account-input:focus,
-.admin-search:focus-within,
-.admin-note-field:focus-within {
+.account-input:focus {
   border-color: rgba(167, 139, 250, .72);
   box-shadow: 0 0 0 3px rgba(139, 92, 246, .11);
 }
@@ -2090,11 +2076,7 @@ a.tournament-card:focus-visible {
 .account-settings-card,
 .tournament-profile-panel,
 .stats-card,
-.stats-rank-row,
-.admin-table-panel,
-.admin-form-section,
-.admin-diagnostic,
-.admin-callout {
+.stats-rank-row {
   background: rgba(9, 15, 28, .76);
   border-color: var(--ui-border);
   border-radius: var(--ui-radius-sm);
@@ -3185,28 +3167,6 @@ a.tournament-card:focus-visible {
 .dream-hero.selected {
   border-color: rgba(167, 139, 250, .78);
   box-shadow: 0 0 0 2px rgba(139, 92, 246, .18);
-}
-
-.admin-console-header,
-.admin-tabs,
-.admin-table-panel {
-  background: rgba(8, 13, 25, .92);
-  border-color: var(--ui-border);
-  border-radius: var(--ui-radius-md);
-}
-
-.admin-tabs button.active,
-.admin-table tbody tr.selected {
-  color: #ddd4ff;
-  background: var(--ui-primary-soft);
-  border-color: rgba(167, 139, 250, .5);
-}
-
-.admin-table th,
-.admin-table td,
-.admin-table tbody tr,
-.admin-inspector-head {
-  border-color: var(--ui-border);
 }
 
 .bracket-shell,

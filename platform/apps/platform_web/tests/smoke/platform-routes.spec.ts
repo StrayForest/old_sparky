@@ -982,13 +982,13 @@ test("admin console loads operational data and keeps audited actions explicit", 
   await page.goto("/platform-ops");
   await expect(page.getByTestId("admin-console")).toBeVisible();
   await expect(page.getByTestId("admin-dashboard")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Сводка по платформе" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Операционный центр платформы" })).toBeVisible();
-  await expect(page.getByText("42 всего", { exact: true })).toBeVisible();
-  await expect(page.getByText("87", { exact: true })).toBeVisible();
-  await page.getByRole("tab", { name: "Операции с турнирами" }).click();
+  await expect(page.getByRole("heading", { name: "Состояние продукта" })).toBeVisible();
+  await expect(page.getByText("Активные пользователи", { exact: true })).toBeVisible();
+  await expect(page.getByText("Распределение по рангам", { exact: true })).toBeVisible();
+  await page.getByLabel("Навигация админ-панели").getByRole("button", { name: /Турниры/ }).click();
   await expect(page.getByTestId("admin-tournament-admin-cup")).toBeVisible();
   await page.getByTestId("admin-tournament-admin-cup").click();
+  await page.getByRole("button", { name: "Recovery", exact: true }).click();
 
   const applyOverride = page.getByTestId("admin-apply-override");
   await expect(applyOverride).toBeDisabled();
@@ -997,7 +997,7 @@ test("admin console loads operational data and keeps audited actions explicit", 
   await page.getByTestId("admin-override-note").fill("Resolve disputed bracket state.");
   await expect(applyOverride).toBeEnabled();
   await applyOverride.click();
-  await expect(page.getByText("Override сохранен для Admin Cup.")).toBeVisible();
+  await expect(page.getByText("Изменение сохранено и записано в audit.")).toBeVisible();
   expect(overrideBody).toMatchObject({
     status: "completed",
     visibility: null,
@@ -1023,6 +1023,7 @@ test("admin console loads operational data and keeps audited actions explicit", 
 
   const deleteTournament = page.getByTestId("admin-delete-tournament");
   await expect(deleteTournament).toBeDisabled();
+  await page.getByTestId("admin-tournament-inspector").locator("summary").click();
   await page.getByTestId("admin-delete-tournament-confirmation").fill("Admin Cup");
   await page.getByTestId("admin-delete-tournament-note").fill("Remove obsolete smoke tournament.");
   await expect(deleteTournament).toBeEnabled();
@@ -1033,56 +1034,64 @@ test("admin console loads operational data and keeps audited actions explicit", 
     note: "Remove obsolete smoke tournament."
   });
 
-  await page.getByRole("tab", { name: /Права пользователей/ }).click();
+  await page.getByRole("button", { name: /Пользователи/ }).click();
   await expect(page.getByTestId("admin-user-u_managed")).toBeVisible();
   await page.getByTestId("admin-user-u_managed").click();
   await page.getByTestId("admin-public-credits").fill("2");
   await page.getByTestId("admin-private-credits").fill("4");
-  await page.getByTestId("admin-override-note").fill("Approved expanded tournament capacity.");
+  await page.getByTestId("admin-user-action-note").fill("Approved expanded tournament capacity.");
   await page.getByTestId("admin-save-credits").click();
-  await expect(page.getByText("Доступные турниры сохранены для Managed Player.")).toBeVisible();
+  await expect(page.getByText("Квоты сохранены для Managed Player.")).toBeVisible();
   expect(creditsBody).toMatchObject({
     public_tournament_credits: 2,
     private_tournament_credits: 4,
     note: "Approved expanded tournament capacity."
   });
 
-  await page.getByTestId("admin-override-note").fill("Add another platform administrator.");
+  await page.getByTestId("admin-user-action-note").fill("Add another platform administrator.");
   await page.getByTestId("admin-toggle-admin-role").click();
-  await expect(page.getByText("Роль администратора сохранена для Managed Player.")).toBeVisible();
+  await expect(page.getByText("Роль сохранена для Managed Player.")).toBeVisible();
   expect(roleBody).toMatchObject({
     is_admin: true,
     note: "Add another platform administrator."
   });
 
-  const userDeletion = page.getByTestId("admin-user-deletion-console");
-  await expect(userDeletion).toBeVisible();
-  await userDeletion.getByTestId("admin-delete-user-search").fill("managed");
-  const managedDeletionRow = userDeletion.locator("tbody tr").filter({ hasText: "managed@example.com" });
+  const userManagement = page.getByTestId("admin-users-page");
+  await expect(userManagement).toBeVisible();
+  await userManagement.getByTestId("admin-user-search").fill("managed");
+  const managedDeletionRow = userManagement.locator("tbody tr").filter({ hasText: "managed@example.com" });
   await expect(managedDeletionRow).toBeVisible();
   await managedDeletionRow.click();
-  const deleteUserButton = userDeletion.getByTestId("admin-delete-user");
+  const userInspector = page.getByTestId("admin-user-inspector");
+  await expect(userInspector).toBeVisible();
+  await userInspector.locator("details").evaluate((element) => (element as HTMLDetailsElement).open = true);
+  const deleteUserButton = userInspector.getByTestId("admin-delete-user");
   await expect(deleteUserButton).toBeDisabled();
-  await userDeletion.getByTestId("admin-delete-user-confirmation").fill("managed@example.com");
-  await userDeletion.getByTestId("admin-delete-user-note").fill("Remove the approved smoke user.");
+  await userInspector.getByTestId("admin-delete-user-confirmation").fill("managed@example.com");
+  await userInspector.getByTestId("admin-delete-user-note").fill("Remove the approved smoke user.");
   await expect(deleteUserButton).toBeEnabled();
   await deleteUserButton.click();
   await expect.poll(() => deleteUserBody).toMatchObject({
     confirmation: "managed@example.com",
     note: "Remove the approved smoke user."
   });
-  await expect(userDeletion.getByText("Аккаунт Managed Player удалён из базы данных.")).toBeVisible();
   expect(deleteUserBody).toMatchObject({
     confirmation: "managed@example.com",
     note: "Remove the approved smoke user."
   });
 
-  await page.getByRole("tab", { name: /Preprod QA/ }).click();
-  await expect(page.getByText("Дашборд preprod прогонов")).toBeVisible();
+  await page.getByRole("button", { name: /Аналитика/ }).click();
+  await expect(page.getByTestId("admin-analytics")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Аналитика платформы" })).toBeVisible();
+  await expect(page.getByText("Распределение по рангам", { exact: true })).toBeVisible();
+  await expect(page.getByText("Здоровье workflow", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: /Preprod QA/ }).click();
+  await expect(page.getByRole("heading", { name: "Preprod QA" })).toBeVisible();
   await expect(page.getByTestId("admin-preprod-run-preprod260620120000abcd")).toBeVisible();
 
-  await page.getByRole("tab", { name: /Журнал аудита/ }).click();
-  await expect(page.getByText("Что такое аудит")).toBeVisible();
+  await page.getByRole("button", { name: /Аудит/ }).click();
+  await expect(page.getByRole("heading", { name: "Журнал аудита" })).toBeVisible();
   await expect(
     page.getByTestId("admin-audit-inspector").getByText("Resolve disputed bracket state.", { exact: true })
   ).toBeVisible();

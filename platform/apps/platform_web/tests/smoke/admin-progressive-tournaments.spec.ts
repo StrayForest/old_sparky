@@ -146,11 +146,11 @@ test("admin tournament list progressively loads, retries, and deduplicates pages
   await page.goto("/platform-ops");
 
   await expect(page.getByTestId("admin-console")).toBeVisible();
-  await page.getByRole("tab", { name: "Операции с турнирами" }).click();
-  await expect(page.locator(".admin-table tbody tr")).toHaveCount(25);
-  await expect(page.getByRole("tab", { name: "Операции с турнирами" }).locator("span").last()).toHaveText("25/27");
-  await expect(page.getByText("Записей: 27", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading")).toHaveText("Tournament 01");
+  await page.getByLabel("Навигация админ-панели").getByRole("button", { name: /Турниры/ }).click();
+  await expect(page.locator(".ops-tournament-table tbody tr")).toHaveCount(25);
+  await expect(page.getByLabel("Навигация админ-панели").getByRole("button", { name: /Турниры/ }).locator("small")).toHaveText("27");
+  await expect(page.getByText("Показано 25 из 27", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading", { level: 2 })).toHaveText("Tournament 01");
   await expect.poll(() => requestedOffsets).toEqual([0]);
 
   const loadMore = page.getByTestId("admin-tournaments-load-more");
@@ -158,41 +158,41 @@ test("admin tournament list progressively loads, retries, and deduplicates pages
   await expect(loadMore).toBeDisabled();
   await expect(page.getByTestId("admin-tournaments-page-error")).toBeVisible();
   await expect(page.getByTestId("admin-console")).toBeVisible();
-  await expect(page.locator(".admin-table tbody tr")).toHaveCount(25);
+  await expect(page.locator(".ops-tournament-table tbody tr")).toHaveCount(25);
   await expect.poll(() => requestedOffsets).toEqual([0, 25]);
 
   await page.getByTestId("admin-tournaments-page-retry").click();
 
-  await expect(page.locator(".admin-table tbody tr")).toHaveCount(totalTournaments);
+  await expect(page.locator(".ops-tournament-table tbody tr")).toHaveCount(totalTournaments);
   await expect(page.getByTestId("admin-tournament-tournament-25")).toHaveCount(1);
-  await expect(page.getByRole("tab", { name: "Операции с турнирами" }).locator("span").last()).toHaveText("27/27");
-  await expect(page.getByText("Записей: 27", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading")).toHaveText("Tournament 01");
+  await expect(page.getByLabel("Навигация админ-панели").getByRole("button", { name: /Турниры/ }).locator("small")).toHaveText("27");
+  await expect(page.getByText("Показано 27 из 27", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading", { level: 2 })).toHaveText("Tournament 01");
   await expect(page.getByTestId("admin-tournaments-load-more")).toHaveCount(0);
   await expect(page.getByTestId("admin-tournaments-page-error")).toHaveCount(0);
   await expect.poll(() => requestedOffsets).toEqual([0, 25, 25]);
 
   await page.getByTestId("admin-tournament-tournament-27").click();
-  await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading")).toHaveText("Tournament 27");
+  await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading", { level: 2 })).toHaveText("Tournament 27");
   await page.getByTestId("admin-refresh").click();
 
-  await expect(page.locator(".admin-table tbody tr")).toHaveCount(25);
-  await expect(page.getByRole("tab", { name: "Операции с турнирами" }).locator("span").last()).toHaveText("25/27");
+  await expect(page.locator(".ops-tournament-table tbody tr")).toHaveCount(25);
+  await expect(page.getByLabel("Навигация админ-панели").getByRole("button", { name: /Турниры/ }).locator("small")).toHaveText("27");
   await expect(page.getByTestId("admin-tournaments-load-more")).toBeVisible();
-  await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading")).toHaveText("Tournament 01");
+  await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading", { level: 2 })).toHaveText("Tournament 01");
   await expect.poll(() => requestedOffsets).toEqual([0, 25, 25, 0]);
 
   await page.getByTestId("admin-tournament-tournament-05").click();
   await page.getByTestId("admin-refresh").click();
 
-  await expect(page.locator(".admin-table tbody tr")).toHaveCount(25);
-  await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading")).toHaveText("Tournament 05");
+  await expect(page.locator(".ops-tournament-table tbody tr")).toHaveCount(25);
+  await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading", { level: 2 })).toHaveText("Tournament 05");
   await expect.poll(() => requestedOffsets).toEqual([0, 25, 25, 0, 0]);
 
   await page.getByTestId("admin-tournament-search").fill("Tournament 27");
-  await expect(page.locator(".admin-table tbody tr")).toHaveCount(1);
+  await expect(page.locator(".ops-tournament-table tbody tr")).toHaveCount(1);
   await expect(page.getByTestId("admin-tournament-tournament-27")).toBeVisible();
-  await expect(page.getByText("Записей: 1", { exact: true })).toBeVisible();
+  await expect(page.getByText("Показано 1 из 1", { exact: true })).toBeVisible();
   await page.getByTestId("admin-tournament-status-filter").selectOption("completed");
   await page.getByTestId("admin-tournament-visibility-filter").selectOption("invite_only");
   await page.getByTestId("admin-tournament-attention-filter").click();
