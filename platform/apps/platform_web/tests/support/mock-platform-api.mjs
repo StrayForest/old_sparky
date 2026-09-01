@@ -18,6 +18,7 @@ const deadlockRankNames = [
   "Eternus", "Ascendant", "Phantom", "Oracle", "Emissary", "Ritualist", "Mystic",
   "Sentinel", "Acolyte", "Seeker", "Initiate"
 ];
+const mockGameAssetsEtag = '"mock-game-assets-v1"';
 
 const tournaments = [
   {
@@ -426,6 +427,18 @@ const server = createServer((request, response) => {
     return;
   }
   if (path === "/api/v1/content/game-assets") {
+    if ((request.headers["if-none-match"] ?? "")
+      .split(",")
+      .map((value) => value.trim().replace(/^W\//, ""))
+      .includes(mockGameAssetsEtag)) {
+      response.writeHead(304, {
+        etag: mockGameAssetsEtag,
+        "cache-control": "public, max-age=900, stale-while-revalidate=86400",
+        vary: "Accept-Encoding",
+      });
+      response.end();
+      return;
+    }
     json(response, 200, {
       heroes: deadlockHeroNames.map((name) => ({
         name,
@@ -437,6 +450,10 @@ const server = createServer((request, response) => {
         image_url: `/api/v1/content/game-assets/ranks/${encodeURIComponent(name)}.webp`,
         source_available: true
       }))
+    }, {
+      etag: mockGameAssetsEtag,
+      "cache-control": "public, max-age=900, stale-while-revalidate=86400",
+      vary: "Accept-Encoding",
     });
     return;
   }

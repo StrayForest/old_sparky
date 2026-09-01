@@ -10,6 +10,61 @@ export type AuthSecurityConfigState = {
 };
 
 const fallbackTurnstileSiteKey = process.env.NEXT_PUBLIC_PLATFORM_TURNSTILE_SITE_KEY?.trim() || null;
+const securityConfigCacheTtlMs = 5 * 60 * 1000;
+
+let cachedSecurityConfig: {
+  config: PlatformAuthSecurityConfig;
+  expiresAt: number;
+} | null = null;
+let securityConfigRequest: Promise<PlatformAuthSecurityConfig> | null = null;
+
+function readCachedSecurityConfig(): PlatformAuthSecurityConfig | null {
+  if (!cachedSecurityConfig) {
+    return null;
+  }
+  if (cachedSecurityConfig.expiresAt <= Date.now()) {
+    cachedSecurityConfig = null;
+    return null;
+  }
+  return cachedSecurityConfig.config;
+}
+
+function loadSecurityConfig(force = false): Promise<PlatformAuthSecurityConfig> {
+  if (force) {
+    cachedSecurityConfig = null;
+  }
+  const cached = readCachedSecurityConfig();
+  if (cached) {
+    return Promise.resolve(cached);
+  }
+  if (securityConfigRequest) {
+    return securityConfigRequest;
+  }
+
+  const request = platformApiRequest<PlatformAuthSecurityConfig>("/auth/security-config")
+    .then((payload) => {
+      const config = validateSecurityConfig(payload);
+      cachedSecurityConfig = {
+        config,
+        expiresAt: Date.now() + securityConfigCacheTtlMs,
+      };
+      return config;
+    });
+  securityConfigRequest = request;
+  request.then(
+    () => {
+      if (securityConfigRequest === request) {
+        securityConfigRequest = null;
+      }
+    },
+    () => {
+      if (securityConfigRequest === request) {
+        securityConfigRequest = null;
+      }
+    }
+  );
+  return request;
+}
 
 export function useAuthSecurityConfig(enabled = true) {
   const [attempt, setAttempt] = useState(0);
@@ -24,9 +79,13 @@ export function useAuthSecurityConfig(enabled = true) {
     }
     let active = true;
     const fallback = fallbackSecurityConfig();
-    setState({ config: fallback, status: fallback ? "fallback" : "loading" });
+    const cached = readCachedSecurityConfig();
+    setState({
+      config: cached ?? fallback,
+      status: cached ? "ready" : fallback ? "fallback" : "loading"
+    });
 
-    void platformApiRequest<PlatformAuthSecurityConfig>("/auth/security-config")
+    void loadSecurityConfig(attempt > 0)
       .then((payload) => {
         if (active) {
           setState({ config: validateSecurityConfig(payload), status: "ready" });

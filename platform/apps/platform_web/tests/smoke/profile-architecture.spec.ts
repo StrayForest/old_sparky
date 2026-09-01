@@ -147,6 +147,34 @@ test("stored captain priority is visible after SSR and tab URL stays shareable",
   await expect(page).toHaveURL(/[?&]tab=account(?:&|$)/);
 });
 
+test("profile tabs mount lazily and share the security config request", async ({
+  page,
+}) => {
+  await authenticateTestUser(page);
+  let securityConfigRequests = 0;
+  page.on("request", (request) => {
+    if (
+      request.method() === "GET" &&
+      new URL(request.url()).pathname === "/api/v1/auth/security-config"
+    ) {
+      securityConfigRequests += 1;
+    }
+  });
+
+  await page.goto("/profile/me?tab=tournament");
+  await expect(page.getByTestId("profile-save-account-button")).toHaveCount(0);
+  expect(securityConfigRequests).toBe(0);
+
+  await page.getByRole("button", { name: "Аккаунт", exact: true }).click();
+  await expect(page.getByTestId("profile-save-account-button")).toBeVisible();
+  await expect.poll(() => securityConfigRequests).toBe(1);
+
+  await page.getByRole("button", { name: "Турнирный профиль", exact: true }).click();
+  await page.getByRole("button", { name: "Аккаунт", exact: true }).click();
+  await expect(page.getByTestId("profile-save-account-button")).toBeVisible();
+  expect(securityConfigRequests).toBe(1);
+});
+
 test("atomic captain editor preserves hero picker layout and save semantics", async ({
   page,
 }) => {

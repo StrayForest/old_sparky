@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.platform_api.app.api.profile_schemas import (
     CaptainProfileResponse,
     CaptainProfileUpdateRequest,
+    ProfileBootstrapResponse,
     ProfileWorkspaceResponse,
 )
 from apps.platform_api.app.api.schemas import (
@@ -136,6 +137,22 @@ async def load_profile_workspace(
     *,
     user,
 ) -> ProfileWorkspaceResponse:
+    profile, deadlock_profile, dream_slots = await _load_profile_workspace_parts(
+        db_session,
+        user=user,
+    )
+    return ProfileWorkspaceResponse(
+        profile=profile,
+        deadlock_profile=deadlock_profile,
+        dream_slots=dream_slots,
+    )
+
+
+async def _load_profile_workspace_parts(
+    db_session: AsyncSession,
+    *,
+    user,
+):
     row = (
         await db_session.execute(
             select(PlayerProfile, DeadlockProfile)
@@ -157,19 +174,46 @@ async def load_profile_workspace(
     steam_id = await _verified_steam_id(db_session, user_id=user.id)
     dream_slots = await _list_dream_slots(db_session, user_id=user.id)
 
-    return ProfileWorkspaceResponse(
-        profile=_serialize_profile(
+    return (
+        _serialize_profile(
             profile,
             account_email=user.email,
             avatar_media=avatar_media,
             banner_media=banner_media,
             steam_id=steam_id,
         ),
-        deadlock_profile=(
+        (
             DeadlockProfileResponse.model_validate(deadlock_profile)
             if deadlock_profile is not None
             else None
         ),
+        dream_slots,
+    )
+
+
+async def load_profile_bootstrap(
+    db_session: AsyncSession,
+    *,
+    user,
+    role_slugs: frozenset[str],
+) -> ProfileBootstrapResponse:
+    profile, deadlock_profile, dream_slots = await _load_profile_workspace_parts(
+        db_session,
+        user=user,
+    )
+    return ProfileBootstrapResponse(
+        account={
+            "id": user.id,
+            "email": user.email,
+            "display_name": user.display_name,
+            "status": user.status,
+            "created_at": user.created_at,
+            "roles": sorted(role_slugs),
+            "steam_id": profile.steam_id,
+            "steam_linked": profile.steam_id is not None,
+        },
+        profile=profile,
+        deadlock_profile=deadlock_profile,
         dream_slots=dream_slots,
     )
 

@@ -200,45 +200,42 @@ export function ProfileEditor({
         ))}
       </div>
 
-      <div
-        hidden={activeTab !== "tournament"}
-        id="profile-panel-tournament"
-      >
-        <TournamentProfileTab
-          heroOptions={heroOptions}
-          initialCaptainPreference={captainPreference}
-          initialProfile={profile}
-          onPreview={previewTournament}
-        />
-      </div>
+      {activeTab === "tournament" && (
+        <div id="profile-panel-tournament">
+          <TournamentProfileTab
+            heroOptions={heroOptions}
+            initialCaptainPreference={captainPreference}
+            initialProfile={profile}
+            onPreview={previewTournament}
+          />
+        </div>
+      )}
 
-      <div
-        hidden={activeTab !== "captain"}
-        id="profile-panel-captain"
-      >
-        <CaptainProfileTab
-          heroOptions={heroOptions}
-          initialDreamSlots={dreamSlots}
-          initialTeamName={profile.teamName}
-          onPreview={previewCaptain}
-        />
-      </div>
+      {activeTab === "captain" && (
+        <div id="profile-panel-captain">
+          <CaptainProfileTab
+            heroOptions={heroOptions}
+            initialDreamSlots={dreamSlots}
+            initialTeamName={profile.teamName}
+            onPreview={previewCaptain}
+          />
+        </div>
+      )}
 
-      <div
-        hidden={activeTab !== "account"}
-        id="profile-panel-account"
-      >
-        <ProfileBanner
-          icon={<NotebookPen size={38} />}
-          title="Данные профиля"
-          text="Управляйте отображением профиля, контактами и безопасностью аккаунта."
-        />
-        <AccountProfileTab
-          initialProfile={profile}
-          onPreview={previewAccount}
-          steamAuthStatus={steamAuthStatus}
-        />
-      </div>
+      {activeTab === "account" && (
+        <div id="profile-panel-account">
+          <ProfileBanner
+            icon={<NotebookPen size={38} />}
+            title="Данные профиля"
+            text="Управляйте отображением профиля, контактами и безопасностью аккаунта."
+          />
+          <AccountProfileTab
+            initialProfile={profile}
+            onPreview={previewAccount}
+            steamAuthStatus={steamAuthStatus}
+          />
+        </div>
+      )}
     </>
   );
 }

@@ -37,7 +37,7 @@ function emptyDreamSlots(userId) {
   }));
 }
 
-async function profileWorkspace(request, response) {
+async function profileWorkspace(request, response, { includeAccount = false } = {}) {
   const cookie = request.headers.cookie ?? "";
   const [userResult, profileResult, deadlockResult] = await Promise.all([
     upstreamJson("/api/v1/users/me", cookie),
@@ -59,7 +59,7 @@ async function profileWorkspace(request, response) {
   }
 
   const userId = profileResult.payload.user_id ?? userResult.payload.id ?? "";
-  json(response, 200, {
+  const payload = {
     profile: profileResult.payload,
     deadlock_profile: deadlockResult.status === 200
       ? {
@@ -70,7 +70,20 @@ async function profileWorkspace(request, response) {
         }
       : null,
     dream_slots: emptyDreamSlots(userId),
-  });
+  };
+  if (includeAccount) {
+    payload.account = {
+      id: userResult.payload.id,
+      email: userResult.payload.email ?? null,
+      display_name: userResult.payload.display_name,
+      status: userResult.payload.status,
+      created_at: userResult.payload.created_at,
+      roles: Array.isArray(userResult.payload.roles) ? userResult.payload.roles : [],
+      steam_id: profileResult.payload.steam_id ?? null,
+      steam_linked: Boolean(profileResult.payload.steam_id),
+    };
+  }
+  json(response, 200, payload);
 }
 
 async function captainUpdate(request, response) {
@@ -164,10 +177,12 @@ const server = createServer((request, response) => {
   const path = url.pathname.replace(/\/$/, "") || "/";
 
   if (
-    path === "/api/v1/profiles/me/workspace" &&
+    (path === "/api/v1/profiles/me/workspace" || path === "/api/v1/profiles/me/bootstrap") &&
     request.method === "GET"
   ) {
-    void profileWorkspace(request, response).catch(() => {
+    void profileWorkspace(request, response, {
+      includeAccount: path === "/api/v1/profiles/me/bootstrap",
+    }).catch(() => {
       json(response, 503, { detail: "Profile workspace unavailable." });
     });
     return;

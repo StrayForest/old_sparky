@@ -40,6 +40,15 @@ test("auth and Steam capabilities fail closed without runtime security config", 
   expect(steamIdentity).toContain("security.config?.steam_login_enabled === true");
 });
 
+test("my profile uses the protected bootstrap request without a page auth probe", () => {
+  const page = source("app/(site)/profile/me/page.tsx");
+
+  expect(page).toContain("getServerProfileBootstrap");
+  expect(page).toContain("getServerProfileHeroNames");
+  expect(page).toContain("Promise.all");
+  expect(page).not.toContain("getServerCurrentUser");
+});
+
 test("tournament creation serializes submit and invite-code async state", () => {
   const createForm = source("components/tournaments/create-tournament-form.tsx");
 

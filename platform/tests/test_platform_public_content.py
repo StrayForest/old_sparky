@@ -4,7 +4,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 from pydantic import ValidationError
 from starlette.requests import Request
 
@@ -76,6 +76,53 @@ class _Cache:
 
 
 class PlatformPublicContentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_game_assets_uses_etag_and_returns_not_modified_without_body(self) -> None:
+        catalog = {
+            "heroes": {"abrams": {"name": "Abrams"}},
+            "items": {},
+            "ranks": {},
+            "objectives": {},
+        }
+        with patch.object(
+            content_routes,
+            "get_deadlock_asset_catalog",
+            AsyncMock(return_value=catalog),
+        ):
+            first_response = Response()
+            first = await content_routes.deadlock_game_assets(
+                Request(
+                    {
+                        "type": "http",
+                        "method": "GET",
+                        "path": "/api/v1/content/game-assets",
+                        "headers": [],
+                    }
+                ),
+                first_response,
+            )
+            etag = first_response.headers["etag"]
+            self.assertNotIsInstance(first, Response)
+            self.assertTrue(etag.startswith('"'))
+
+            not_modified = await content_routes.deadlock_game_assets(
+                Request(
+                    {
+                        "type": "http",
+                        "method": "GET",
+                        "path": "/api/v1/content/game-assets",
+                        "headers":[
+                            (b"if-none-match", f"W/{etag}, \"other\"".encode("ascii")),
+                        ],
+                    }
+                ),
+                Response(),
+            )
+
+        self.assertIsInstance(not_modified, Response)
+        self.assertEqual(not_modified.status_code, 304)
+        self.assertEqual(not_modified.body, b"")
+        self.assertEqual(not_modified.headers["etag"], etag)
+
     def test_support_rejects_whitespace_only_message_after_normalization(self) -> None:
         with self.assertRaises(ValidationError):
             SupportMessageRequest(

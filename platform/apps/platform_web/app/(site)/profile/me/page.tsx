@@ -6,12 +6,9 @@ import { ProfileEditor } from "@/components/profile/editor/profile-editor";
 import { parseProfileTab } from "@/lib/profile-model";
 import {
   getServerProfileHeroNames,
-  getServerProfileWorkspace,
+  getServerProfileBootstrap,
 } from "@/lib/server-profile-workspace";
-import {
-  getServerCurrentUser,
-  platformSessionCookieName,
-} from "@/lib/server-auth";
+import { platformSessionCookieName } from "@/lib/server-auth";
 
 export const metadata: Metadata = {
   title: "Мой профиль",
@@ -25,18 +22,16 @@ export default async function MyProfilePage({
   const { steam_auth: steamAuth, tab } = await searchParams;
   const requestCookies = await cookies();
   const cookieHeader = requestCookies.toString();
-  const auth = requestCookies.has(platformSessionCookieName())
-    ? await getServerCurrentUser(cookieHeader)
-    : { status: "anonymous" as const, user: null };
+  const hasSessionCookie = requestCookies.has(platformSessionCookieName());
 
   let workspace = null;
   let heroNames: string[] = [];
   let profileUnavailable = false;
 
-  if (auth.status === "authenticated") {
+  if (hasSessionCookie) {
     try {
       [workspace, heroNames] = await Promise.all([
-        getServerProfileWorkspace(cookieHeader),
+        getServerProfileBootstrap(cookieHeader),
         getServerProfileHeroNames(),
       ]);
     } catch {
@@ -52,7 +47,7 @@ export default async function MyProfilePage({
         subtitle="Турнирные данные, капитанские предпочтения и данные профиля."
       />
       <main className="main">
-        {auth.status === "authenticated" && workspace ? (
+        {workspace ? (
           <ProfileEditor
             captainPreference={workspace.captainPreference}
             dreamSlots={workspace.dreamSlots}
@@ -65,10 +60,7 @@ export default async function MyProfilePage({
                 : undefined
             }
           />
-        ) : auth.status === "anonymous" ||
-          (auth.status === "authenticated" &&
-            !workspace &&
-            !profileUnavailable) ? (
+        ) : !hasSessionCookie || (!profileUnavailable && !workspace) ? (
           <ProfileAccessState state="anonymous" />
         ) : (
           <ProfileAccessState state="unavailable" />

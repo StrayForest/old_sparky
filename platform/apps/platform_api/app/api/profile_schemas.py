@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from datetime import datetime
+
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from apps.platform_api.app.api.schemas import (
     DeadlockDreamSlotBulkItemRequest,
@@ -11,6 +13,26 @@ from apps.platform_api.app.api.schemas import (
 
 
 class ProfileWorkspaceResponse(BaseModel):
+    profile: MyProfileResponse
+    deadlock_profile: DeadlockProfileResponse | None = None
+    dream_slots: list[DeadlockDreamSlotResponse] = Field(default_factory=list, max_length=6)
+
+
+class ProfileBootstrapAccountResponse(BaseModel):
+    """The account identity needed by the profile page bootstrap."""
+
+    id: str
+    email: EmailStr | None
+    display_name: str
+    status: str
+    created_at: datetime
+    roles: list[str] = Field(default_factory=list)
+    steam_id: str | None = None
+    steam_linked: bool = False
+
+
+class ProfileBootstrapResponse(BaseModel):
+    account: ProfileBootstrapAccountResponse
     profile: MyProfileResponse
     deadlock_profile: DeadlockProfileResponse | None = None
     dream_slots: list[DeadlockDreamSlotResponse] = Field(default_factory=list, max_length=6)

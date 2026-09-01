@@ -150,6 +150,15 @@ class PlatformProfileWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["dream_slots"][1]["allowed_roles"], ["Support"])
         self.assertEqual(payload["dream_slots"][1]["desired_heroes"], ["Ivy"])
 
+        bootstrap = await owner.get("/api/v1/profiles/me/bootstrap")
+        self.assertEqual(bootstrap.status_code, 200, bootstrap.text)
+        bootstrap_payload = bootstrap.json()
+        self.assertEqual(bootstrap_payload["account"]["id"], payload["profile"]["user_id"])
+        self.assertEqual(bootstrap_payload["account"]["email"], payload["profile"]["account_email"])
+        self.assertEqual(bootstrap_payload["account"]["roles"], ["authenticated_user", "player"])
+        self.assertEqual(bootstrap_payload["profile"], payload["profile"])
+        self.assertEqual(bootstrap_payload["dream_slots"], payload["dream_slots"])
+
         me = await owner.get("/api/v1/users/me")
         self.assertEqual(me.status_code, 200, me.text)
         async with session_factory()() as db_session:

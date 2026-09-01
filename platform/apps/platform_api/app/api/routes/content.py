@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -45,10 +46,43 @@ async def home_content(response: Response) -> HomeContentResponse:
 
 
 @router.get("/game-assets", response_model=DeadlockGameAssetsResponse)
-async def deadlock_game_assets(response: Response) -> DeadlockGameAssetsResponse:
+async def deadlock_game_assets(
+    request: Request,
+    response: Response,
+) -> DeadlockGameAssetsResponse | Response:
     catalog = await get_deadlock_asset_catalog()
-    response.headers["Cache-Control"] = "public, max-age=900, stale-while-revalidate=86400"
-    return DeadlockGameAssetsResponse.model_validate(public_deadlock_game_assets(catalog))
+    payload = public_deadlock_game_assets(catalog)
+    etag = _game_assets_etag(payload)
+    cache_headers = {
+        "Cache-Control": "public, max-age=900, stale-while-revalidate=86400",
+        "ETag": etag,
+        "Vary": "Accept-Encoding",
+    }
+    if _if_none_match_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=cache_headers)
+    for name, value in cache_headers.items():
+        response.headers[name] = value
+    return DeadlockGameAssetsResponse.model_validate(payload)
+
+
+def _game_assets_etag(payload: dict[str, object]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f'"{hashlib.sha256(encoded).hexdigest()}"'
+
+
+def _if_none_match_matches(value: str | None, etag: str) -> bool:
+    if not value:
+        return False
+    return any(
+        candidate.strip() == "*"
+        or candidate.strip().removeprefix("W/") == etag
+        for candidate in value.split(",")
+    )
 
 
 @router.get("/game-assets/heroes/{hero_name}.png", response_model=None)
