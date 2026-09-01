@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
+import secrets
 from time import perf_counter
 from typing import Any
 
@@ -38,7 +39,11 @@ from python_packages.platform_infra.redis import redis_client
 logger = logging.getLogger(__name__)
 
 PROFILE_READ_MODEL_KEY_PREFIX = "platform:profile:read-model:v1"
+PROFILE_READ_MODEL_LOCK_KEY_PREFIX = "platform:profile:read-model-lock:v1"
 PROFILE_READ_MODEL_SAFETY_TTL_SECONDS = 7 * 24 * 60 * 60
+PROFILE_READ_MODEL_LOCK_TTL_MILLISECONDS = 5_000
+PROFILE_READ_MODEL_LOCK_POLL_INTERVAL_SECONDS = 0.025
+PROFILE_READ_MODEL_LOCK_MAX_WAIT_SECONDS = 0.25
 _REDIS_UNAVAILABLE = (RedisError, OSError, asyncio.TimeoutError)
 
 _SET_IF_NEWER_SCRIPT = """
@@ -61,6 +66,13 @@ end
 return 0
 """
 
+_RELEASE_LOCK_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class ProfileReadModel:
@@ -76,6 +88,10 @@ class ProfileReadModelEnvelope:
 
 def profile_read_model_key(user_id: str) -> str:
     return f"{PROFILE_READ_MODEL_KEY_PREFIX}:{user_id}"
+
+
+def profile_read_model_lock_key(user_id: str) -> str:
+    return f"{PROFILE_READ_MODEL_LOCK_KEY_PREFIX}:{user_id}"
 
 
 def _encode_envelope(*, revision: int, payload: bytes) -> bytes:
@@ -329,6 +345,135 @@ async def write_profile_read_model(
         )
         return False
     finally:
+        await client.aclose()
+
+
+async def _build_and_cache_profile_read_model(user_id: str) -> bytes | None:
+    started_at = perf_counter()
+    record_profile_read_model_event("profile_read_model_db_fallback")
+    model = await build_profile_read_model(user_id)
+    record_profile_read_model_event(
+        "profile_read_model_build",
+        build_ms=(perf_counter() - started_at) * 1000,
+        payload_bytes=len(model.payload) if model is not None else 0,
+        revision=model.revision if model is not None else None,
+    )
+    if model is None:
+        return None
+    await write_profile_read_model(
+        user_id,
+        revision=model.revision,
+        payload=model.payload,
+    )
+    return model.payload
+
+
+async def _wait_for_profile_read_model(
+    client: Any,
+    user_id: str,
+) -> bytes | None:
+    deadline = asyncio.get_running_loop().time() + PROFILE_READ_MODEL_LOCK_MAX_WAIT_SECONDS
+    key = profile_read_model_key(user_id)
+    while True:
+        await asyncio.sleep(PROFILE_READ_MODEL_LOCK_POLL_INTERVAL_SECONDS)
+        raw = await client.get(key)
+        payload = profile_read_model_payload(raw)
+        if payload is not None:
+            record_profile_read_model_event(
+                "profile_read_model_hit",
+                payload_bytes=len(payload),
+                revision=profile_read_model_cached_revision(raw),
+            )
+            return payload
+        if asyncio.get_running_loop().time() >= deadline:
+            return None
+
+
+async def _release_profile_read_model_lock(
+    client: Any,
+    user_id: str,
+    token: str,
+) -> None:
+    try:
+        await client.eval(
+            _RELEASE_LOCK_SCRIPT,
+            1,
+            profile_read_model_lock_key(user_id),
+            token,
+        )
+    except _REDIS_UNAVAILABLE as exc:
+        logger.warning(
+            "Redis profile read-model lock release failed user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
+
+
+async def get_or_build_profile_read_model(user_id: str) -> bytes | None:
+    """Return the profile payload, collapsing concurrent cache fills to one DB read."""
+
+    client = redis_client(decode_responses=False)
+    token = secrets.token_urlsafe(24)
+    lock_acquired = False
+    try:
+        lock_acquired = bool(
+            await client.set(
+                profile_read_model_lock_key(user_id),
+                token,
+                px=PROFILE_READ_MODEL_LOCK_TTL_MILLISECONDS,
+                nx=True,
+            )
+        )
+        if not lock_acquired:
+            payload = await _wait_for_profile_read_model(client, user_id)
+            if payload is not None:
+                return payload
+            lock_acquired = bool(
+                await client.set(
+                    profile_read_model_lock_key(user_id),
+                    token,
+                    px=PROFILE_READ_MODEL_LOCK_TTL_MILLISECONDS,
+                    nx=True,
+                )
+            )
+        if not lock_acquired:
+            raw = await client.get(profile_read_model_key(user_id))
+            payload = profile_read_model_payload(raw)
+            if payload is not None:
+                record_profile_read_model_event(
+                    "profile_read_model_hit",
+                    payload_bytes=len(payload),
+                    revision=profile_read_model_cached_revision(raw),
+                )
+                return payload
+            # Preserve availability if the builder exceeds the bounded wait. The
+            # normal path finishes before this point, so this is not a stampede
+            # mechanism; it is the bounded Redis-failure fallback.
+            return await _build_and_cache_profile_read_model(user_id)
+
+        # A post-lock GET closes the race with a post-commit refresh that won
+        # the write between the route pipeline and lock acquisition.
+        raw = await client.get(profile_read_model_key(user_id))
+        payload = profile_read_model_payload(raw)
+        if payload is not None:
+            record_profile_read_model_event(
+                "profile_read_model_hit",
+                payload_bytes=len(payload),
+                revision=profile_read_model_cached_revision(raw),
+            )
+            return payload
+        return await _build_and_cache_profile_read_model(user_id)
+    except _REDIS_UNAVAILABLE as exc:
+        record_profile_read_model_event("profile_read_model_redis_error")
+        logger.warning(
+            "Redis profile read-model single-flight failed user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
+        return await _build_and_cache_profile_read_model(user_id)
+    finally:
+        if lock_acquired:
+            await _release_profile_read_model_lock(client, user_id, token)
         await client.aclose()
 
 

@@ -149,11 +149,10 @@ from apps.platform_api.app.services.tournament_read_models import (
     refresh_tournament_read_models,
 )
 from apps.platform_api.app.services.profile_read_models import (
-    build_profile_read_model,
+    get_or_build_profile_read_model,
     profile_read_model_cached_revision,
     profile_read_model_key,
     profile_read_model_payload,
-    write_profile_read_model,
 )
 from apps.platform_api.app.services.tournament_profile_access import (
     decode_profile_access_state,
@@ -6329,11 +6328,7 @@ async def get_tournament_scoped_profile(
 
     if profile_payload is None:
         record_profile_read_model_event("profile_read_model_miss")
-        async with session_factory()() as db_session:
-            profile_payload = await _build_and_cache_tournament_profile(
-                user_id,
-                db_session=db_session,
-            )
+        profile_payload = await get_or_build_profile_read_model(user_id)
     else:
         record_profile_read_model_event(
             "profile_read_model_hit",
@@ -6343,30 +6338,6 @@ async def get_tournament_scoped_profile(
     if profile_payload is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
     return Response(content=profile_payload, media_type="application/json")
-
-
-async def _build_and_cache_tournament_profile(
-    user_id: str,
-    *,
-    db_session: AsyncSession,
-) -> bytes | None:
-    started_at = time.perf_counter()
-    record_profile_read_model_event("profile_read_model_db_fallback")
-    model = await build_profile_read_model(user_id, db_session=db_session)
-    record_profile_read_model_event(
-        "profile_read_model_build",
-        build_ms=(time.perf_counter() - started_at) * 1000,
-        payload_bytes=len(model.payload) if model is not None else 0,
-        revision=model.revision if model is not None else None,
-    )
-    if model is None:
-        return None
-    await write_profile_read_model(
-        user_id,
-        revision=model.revision,
-        payload=model.payload,
-    )
-    return model.payload
 
 
 @router.get("/{slug}/workspace", response_model=TournamentWorkspaceResponse)

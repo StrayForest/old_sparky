@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 import json
 from types import SimpleNamespace
@@ -94,6 +95,53 @@ class _CasRedis:
         self.closed = True
 
 
+class _SingleflightRedis:
+    def __init__(self) -> None:
+        self.store: dict[str, bytes | str] = {}
+        self.set_calls: list[tuple[str, str, int, bool]] = []
+        self.closed = False
+
+    async def set(
+        self,
+        key: str,
+        value: str,
+        *,
+        px: int,
+        nx: bool,
+    ) -> bool:
+        self.set_calls.append((key, value, px, nx))
+        if nx and key in self.store:
+            return False
+        self.store[key] = value
+        return True
+
+    async def get(self, key: str) -> bytes | str | None:
+        return self.store.get(key)
+
+    async def eval(self, script: str, key_count: int, *args: object) -> int:
+        self.assert_key_count(key_count)
+        if "current_revision" in script:
+            key, revision, payload, _ttl = args
+            current = profile_read_models._decode_envelope(self.store.get(str(key)))
+            if current is None or current.revision <= int(str(revision)):
+                self.store[str(key)] = payload  # type: ignore[assignment]
+                return 1
+            return 0
+        key, token = args
+        if self.store.get(str(key)) == token:
+            del self.store[str(key)]
+            return 1
+        return 0
+
+    @staticmethod
+    def assert_key_count(key_count: int) -> None:
+        if key_count != 1:
+            raise AssertionError(f"unexpected Redis key count: {key_count}")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _auth_session() -> SimpleNamespace:
@@ -155,30 +203,17 @@ class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
             redis_available=True,
             pipeline_ms=0.3,
         )
-        model = profile_read_models.ProfileReadModel(revision=12, payload=payload)
-
-        def session_factory():
-            def make_session():
-                return _SessionContext()
-
-            return make_session
         with (
             patch.object(
                 tournament_routes,
                 "read_tournament_profile_pipeline",
                 AsyncMock(return_value=pipeline),
             ),
-            patch.object(tournament_routes, "session_factory", side_effect=session_factory),
             patch.object(
                 tournament_routes,
-                "build_profile_read_model",
-                AsyncMock(return_value=model),
-            ) as build,
-            patch.object(
-                tournament_routes,
-                "write_profile_read_model",
-                AsyncMock(return_value=True),
-            ) as write,
+                "get_or_build_profile_read_model",
+                AsyncMock(return_value=payload),
+            ) as get_or_build,
         ):
             response = await tournament_routes.get_tournament_scoped_profile(
                 "night-veil",
@@ -187,8 +222,7 @@ class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(response.body, payload)
-        build.assert_awaited_once()
-        write.assert_awaited_once_with("target-1", revision=12, payload=payload)
+        get_or_build.assert_awaited_once_with("target-1")
 
     async def test_full_cold_route_uses_only_access_and_profile_db_builds(self) -> None:
         payload = b'{"profile":{"user_id":"target-1"},"deadlock_profile":null}'
@@ -208,8 +242,6 @@ class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
             viewer_user_ids=frozenset({"viewer-1"}),
             roster_user_ids=frozenset({"target-1"}),
         )
-        model = profile_read_models.ProfileReadModel(revision=12, payload=payload)
-
         def session_factory():
             def make_session():
                 return _SessionContext()
@@ -227,17 +259,16 @@ class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
                 "refresh_tournament_profile_access_state",
                 AsyncMock(return_value=state),
             ) as refresh_access,
-            patch.object(tournament_routes, "session_factory", side_effect=session_factory) as sessions,
             patch.object(
                 tournament_routes,
-                "build_profile_read_model",
-                AsyncMock(return_value=model),
-            ) as build,
+                "session_factory",
+                side_effect=session_factory,
+            ) as sessions,
             patch.object(
                 tournament_routes,
-                "write_profile_read_model",
-                AsyncMock(return_value=True),
-            ) as write,
+                "get_or_build_profile_read_model",
+                AsyncMock(return_value=payload),
+            ) as get_or_build,
         ):
             response = await tournament_routes.get_tournament_scoped_profile(
                 "night-veil",
@@ -246,10 +277,9 @@ class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(response.body, payload)
-        self.assertEqual(sessions.call_count, 2)
+        self.assertEqual(sessions.call_count, 1)
         refresh_access.assert_awaited_once()
-        build.assert_awaited_once()
-        write.assert_awaited_once_with("target-1", revision=12, payload=payload)
+        get_or_build.assert_awaited_once_with("target-1")
 
     async def test_access_semantics_are_checked_before_profile_build(self) -> None:
         cases = (
@@ -440,6 +470,101 @@ class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
         assert cached is not None
         self.assertEqual(cached.revision, 20)
         self.assertIn(b'"new"', cached.payload)
+
+    async def test_concurrent_profile_misses_share_one_builder(self) -> None:
+        redis = _SingleflightRedis()
+        model = profile_read_models.ProfileReadModel(
+            revision=12,
+            payload=b'{"profile":{"user_id":"user-1"},"deadlock_profile":null}',
+        )
+        build_calls = 0
+
+        async def build(_user_id: str) -> profile_read_models.ProfileReadModel:
+            nonlocal build_calls
+            build_calls += 1
+            await asyncio.sleep(0.04)
+            return model
+
+        with (
+            patch.object(profile_read_models, "redis_client", return_value=redis),
+            patch.object(
+                profile_read_models,
+                "build_profile_read_model",
+                AsyncMock(side_effect=build),
+            ),
+        ):
+            payloads = await asyncio.gather(
+                *(
+                    profile_read_models.get_or_build_profile_read_model("user-1")
+                    for _ in range(10)
+                )
+            )
+
+        self.assertEqual(build_calls, 1)
+        self.assertEqual(payloads, [model.payload] * 10)
+        self.assertEqual(
+            redis.set_calls[0][2:],
+            (
+                profile_read_models.PROFILE_READ_MODEL_LOCK_TTL_MILLISECONDS,
+                True,
+            ),
+        )
+        self.assertNotIn(
+            profile_read_models.profile_read_model_lock_key("user-1"),
+            redis.store,
+        )
+
+    async def test_profile_read_model_unlock_only_deletes_owned_lock(self) -> None:
+        redis = _SingleflightRedis()
+        key = profile_read_models.profile_read_model_lock_key("user-1")
+        await redis.set(
+            key,
+            "owner-token",
+            px=profile_read_models.PROFILE_READ_MODEL_LOCK_TTL_MILLISECONDS,
+            nx=True,
+        )
+
+        await profile_read_models._release_profile_read_model_lock(
+            redis,
+            "user-1",
+            "other-token",
+        )
+        self.assertEqual(redis.store[key], "owner-token")
+        await profile_read_models._release_profile_read_model_lock(
+            redis,
+            "user-1",
+            "owner-token",
+        )
+        self.assertNotIn(key, redis.store)
+
+    async def test_profile_singleflight_uses_one_db_fallback_when_redis_is_unavailable(
+        self,
+    ) -> None:
+        class _UnavailableRedis(_SingleflightRedis):
+            async def set(
+                self,
+                key: str,
+                value: str,
+                *,
+                px: int,
+                nx: bool,
+            ) -> bool:
+                raise ConnectionError("redis unavailable")
+
+        redis = _UnavailableRedis()
+        model = profile_read_models.ProfileReadModel(revision=12, payload=b"{}")
+        with (
+            patch.object(profile_read_models, "redis_client", return_value=redis),
+            patch.object(
+                profile_read_models,
+                "build_profile_read_model",
+                AsyncMock(return_value=model),
+            ) as build,
+        ):
+            payload = await profile_read_models.get_or_build_profile_read_model("user-1")
+
+        self.assertEqual(payload, model.payload)
+        build.assert_awaited_once_with("user-1")
 
 
 if __name__ == "__main__":
