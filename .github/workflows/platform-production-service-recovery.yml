@@ -1,0 +1,143 @@
+name: Platform production service recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RECOVER-DEADLOCK-WEB after reviewing the service failure"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  recover-web:
+    name: Recover deadlock-web
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      RECOVERY_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Validate explicit recovery confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Production service recovery must run from the reviewed dev ref" >&2; exit 1; }
+          test "$RECOVERY_CONFIRMATION" = "RECOVER-DEADLOCK-WEB" \
+            || { echo "Refusing service recovery without exact confirmation" >&2; exit 1; }
+
+      - name: Validate production SSH inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-service-recovery-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
+            || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" || {
+            echo "Production SSH host fingerprint mismatch" >&2
+            exit 1
+          }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Restart and verify deadlock-web
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -F /dev/null \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            'bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          guard="$current/tools/platform_release_lock_exec.sh"
+
+          test "$(id -u)" -eq 0 || { echo "Production service recovery must run as root" >&2; exit 1; }
+          test -L "$current" || { echo "Current release symlink is missing" >&2; exit 1; }
+          test -x "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+
+          /bin/bash "$guard" --app-dir "$runtime" -- /bin/bash -s <<'MUTATION'
+          set -Eeuo pipefail
+
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+
+          test ! -e "$runtime/shared/.release-operation.json" \
+            || { echo "A release transaction is already pending" >&2; exit 75; }
+          systemctl is-active --quiet deadlock-api \
+            || { echo "deadlock-api is not active; refusing web-only recovery" >&2; exit 1; }
+          systemctl is-active --quiet deadlock-worker \
+            || { echo "deadlock-worker is not active; refusing web-only recovery" >&2; exit 1; }
+          systemctl is-active --quiet nginx \
+            || { echo "nginx is not active; refusing web-only recovery" >&2; exit 1; }
+          test -x "$current/tools/platform_run_web.sh" \
+            || { echo "Current web runtime entrypoint is missing" >&2; exit 1; }
+
+          printf 'active_release=%s\n' "$(readlink -f "$current")"
+          printf 'web_state_before=%s\n' "$(systemctl is-active deadlock-web || true)"
+          systemctl show deadlock-web \
+            --property=ActiveState,SubState,Result,ExecMainStatus,NRestarts \
+            --no-pager
+
+          systemctl reset-failed deadlock-web || true
+          systemctl restart deadlock-web
+
+          web_ready=false
+          for _ in $(seq 1 30); do
+            if systemctl is-active --quiet deadlock-web \
+              && curl --fail --silent --show-error --max-time 2 \
+                http://127.0.0.1:3000/ >/dev/null; then
+              web_ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "$web_ready" != true ]]; then
+            echo "deadlock-web did not recover" >&2
+            systemctl show deadlock-web \
+              --property=ActiveState,SubState,Result,ExecMainStatus,NRestarts \
+              --no-pager >&2 || true
+            journalctl -u deadlock-web --since '-10 minutes' --no-pager -n 80 >&2 || true
+            exit 1
+          fi
+
+          printf 'web_state_after=%s\n' "$(systemctl is-active deadlock-web)"
+          printf 'web_health=passed\n'
+          MUTATION
+          REMOTE

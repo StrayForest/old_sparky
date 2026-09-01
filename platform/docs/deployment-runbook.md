@@ -86,6 +86,37 @@ for a normal release. Those commands are implementation details of the
 workflow; direct server execution is limited to an explicitly authorized
 recovery or rollback.
 
+### Service preflight recovery
+
+If the deploy preflight reports that `deadlock-web` is not active, do not
+disable the service check or invoke the release installer directly. Use the
+operator-only service recovery workflow, which takes the release lock, refuses
+to run during a retained release transaction, restarts only `deadlock-web`,
+and verifies the existing active release on port 3000:
+
+```bash
+gh workflow run platform-production-service-recovery.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev \
+  -f confirmation=RECOVER-DEADLOCK-WEB
+```
+
+After the recovery workflow passes, repeat the production deploy for the same
+reviewed `dev` HEAD using the explicit operator fallback, with the reason that
+the automatic deploy was stopped by the service preflight:
+
+```bash
+gh workflow run platform-production-deploy.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev \
+  -f mode=deploy \
+  -f runtime_profile=ready-vote-static-8
+```
+
+The recovery workflow does not change the active release, database, Redis,
+Nginx configuration or application data. If the restart fails, its journal
+output is the diagnostic handoff; do not weaken the preflight gate.
+
 ## Release state, activation and recovery
 
 The workflow's guarded wrapper leaves a durable transaction until migration, restart/readiness,
