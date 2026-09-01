@@ -1,8 +1,12 @@
-# Platform deployment runbook
+# Platform CSP and live QA runbook
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-08-13
+- Last reviewed: 2026-09-01
+
+This is the special CSP/browser/live-user QA path. Normal production release,
+rollback and release-transaction recovery are owned by
+[`deployment-runbook.md`](deployment-runbook.md).
 
 ## Preconditions
 
@@ -198,7 +202,7 @@ PLATFORM_APP_DIR=/opt/oldsparky/platform \
 platform/tools/platform_provision_live_csp_qa.sh \
   --marker liveqa-csp-candidate-<unique> \
   --bundle-path /root/.oldsparky/liveqa/csp-live-qa.json \
-  --primary-email liveqa@auth.old-sparky.com \
+  --primary-email 'REPLACE_WITH_PRIMARY_LIVE_QA_EMAIL' \
   --mailbox-helper /root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py
 ```
 
@@ -232,7 +236,7 @@ The bundle is an exact v1 object:
   "version": 1,
   "marker": "liveqa-csp-candidate-<unique>",
   "created_at": "<recent-UTC-timestamp>",
-  "email": "liveqa@auth.old-sparky.com",
+  "email": "REPLACE_WITH_PRIMARY_LIVE_QA_EMAIL",
   "password": "<generated-primary-password>",
   "mailbox_helper": "/root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py",
   "roster_accounts": [

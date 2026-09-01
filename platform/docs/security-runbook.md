@@ -2,7 +2,7 @@
 
 - Status: Active how-to and policy
 - Owner: Security and production operator
-- Last reviewed: 2026-08-13
+- Last reviewed: 2026-09-01
 
 ## Security invariants
 

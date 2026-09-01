@@ -2,7 +2,7 @@
 
 - Status: Active backlog and priority map
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-29
+- Last reviewed: 2026-09-01
 
 For the production baseline and immediate engineering target, read [`CURRENT.md`](CURRENT.md). This file deliberately omits release diaries and detailed audit evidence.
 
@@ -12,7 +12,7 @@ For the production baseline and immediate engineering target, read [`CURRENT.md`
 
 **Resolved.** Participant slots, idempotent join, non-locking ordinary ready
 votes, conditional ETag reads, bounded pools and priority queues are
-implemented in the reviewed branch. The package covers join capacity slots,
+implemented and deployed. The package covers join capacity slots,
 compact conditional workflow reads, bounded API/worker pools, Celery
 priority/backpressure and retained load evidence. Existing 128-shard ready
 votes and PostgreSQL workflow authority remain in force. Ready Check uses the
@@ -69,9 +69,10 @@ AS-11 public worker-error sanitization is resolved with a persistence-boundary g
 - **AS-12:** code-side fail-closed bind/proxy validation and a read-only
   Cloudflare/Nginx/UFW parity gate are implemented; live listener, UFW, Nginx
   and direct-origin evidence remains required before closure.
-- **AS-13:** CI now creates the actual web/api/worker identities, installs the
-  current systemd units and exercises the runtime env boundary; retain the
-  workflow result as revalidation evidence before closure.
+- **AS-13 closed 2026-09-01:** the exact-SHA security/build workflow passed
+  with the current web/api/worker identities, systemd units, runtime env
+  boundary and isolated test database. Evidence is retained in
+  [`archive/application-security-as-13-2026-09-01.md`](archive/application-security-as-13-2026-09-01.md).
 - Production-host release provenance is resolved in the current deployment
   workflow: CI builds and attests the immutable artifact and wheelhouse, while
   the VPS verifies the published digest and source commit before installation.

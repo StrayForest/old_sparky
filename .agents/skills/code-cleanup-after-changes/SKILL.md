@@ -38,7 +38,8 @@ handoff.
 - Run the smallest relevant type/build/test check:
   - web, from `platform/`: `tools/platform_run_quiet.sh "web build" -- tools/platform_web_npm.sh --prefix apps/platform_web run build`;
   - backend, from `platform/`: `tools/platform_run_quiet.sh "platform tests" -- .venv_platform/bin/python -m unittest discover -s tests`;
-  - tools/skills/docs: syntax or validator checks where available.
+  - tools/skills/docs: `tools/platform_verify.py docs` from `platform/`, plus
+    the system skill creator validator for a newly created skill when available.
 - Treat TypeScript unused imports, failed imports, stale tests, and stale docs
   as cleanup failures, not as separate future work.
 

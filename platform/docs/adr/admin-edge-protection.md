@@ -1,7 +1,8 @@
 # ADR: Admin Edge Protection
 
-- Status: Accepted, activation pending operator setup
+- Status: Accepted, active; operator evidence retained
 - Date: 2026-08-01
+- Last reviewed: 2026-09-01
 
 ## Decision
 
@@ -11,8 +12,9 @@ Cloudflare Access with MFA to the real operations UI at
 identity narrows exposure but never grants an application role.
 
 Public production is already active without the former whole-site Basic Auth.
-Access activation is an operator-controlled dashboard change with an explicit
-break-glass and rollback test; it must not change the public-site Nginx vhost.
+The scoped Access policy is active and its break-glass/rollback procedure is an
+operator-controlled dashboard change; it must not change the public-site Nginx
+vhost.
 
 Use a scoped Cloudflare identity/policy; never request or store a Global API
 Key. Access configuration and recovery ownership stay in the manual Cloudflare

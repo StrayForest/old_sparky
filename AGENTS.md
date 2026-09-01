@@ -2,147 +2,59 @@
 
 ## Priority
 
-- The agent may perform substantive work directly or delegate bounded subtasks as useful, while preserving the repository's safety and verification requirements.
-- This repository is site-only. Default scope is `platform/`.
-- Read `platform/docs/CURRENT.md` first for current state and priority.
-- Use `platform/docs/README.md` as the task router; open only the relevant owner documents.
-- Optimize Codex limits: targeted reads, bounded output, and quiet checks.
+- This is a site-only repository; application work belongs under `platform/`.
+- Read `platform/docs/CURRENT.md`, then use `platform/docs/README.md` to route
+  the task to its owner document. Keep routine context focused.
+- Preserve unrelated dirty files and never commit secrets, `.env*` files,
+  tokens, passwords, cookies, private reports or live personal data.
 
-## Boundaries
+## Scope and architecture
 
-- Active application: `platform/apps`, `platform/python_packages`, `platform/alembic`, `platform/deploy`, `platform/tools`, `platform/tests`.
-- Platform data belongs in `platformdb`, schema `platform`.
-- Never commit secrets, `.env*`, tokens, passwords, cookies, private reports or live operator credentials.
-- Preserve unrelated dirty files; do not revert user changes.
+- Active application areas are `platform/apps`, `platform/python_packages`,
+  `platform/alembic`, `platform/deploy`, `platform/tools` and `platform/tests`.
+- Platform data uses `platformdb`, schema `platform`; never touch the retired
+  legacy bot or `sparkydb` from platform work.
+- Keep routes/handlers thin, domain rules in services, persistence in models/
+  migrations/repositories, and release behavior in `platform/tools`.
+- Use `apply_patch` for manual edits. Prefer `rg` and focused reads; do not
+  scan dependency trees, generated output or session history without a reason.
 
-## Required Skills
+## Instruction and skill hierarchy
 
-- `$openai-knowledge`: OpenAI/Codex/API/model/prompt docs.
-- `$platform-implementation-strategy`: platform API/schema/runtime/permission/workflow changes.
-- `$deadlock-workflow-guardrails`: Deadlock ready/captain/dream-slot/assignment/roster/bracket changes.
-- `$frontend-ux-polish`: meaningful `platform/apps/platform_web` UI work.
-- `$platform-performance-monitoring`: performance monitoring, load-test instrumentation and bottleneck analysis.
-- `$platform-code-change-verification`: after platform code/tests/migrations/build/release changes.
-- `$code-cleanup-after-changes`: after code, UI, API, test, docs, skill or tooling changes.
-- `$platform-launch-qa`: production QA or blocker triage.
-- `$release-handoff-summary`: final handoff for substantive work.
+- Root rules apply globally. More specific `platform/AGENTS.md` and
+  `platform/apps/platform_web/AGENTS.md` add path-specific rules.
+- For docs, AGENTS or skills, use `$platform-documentation-maintenance` and
+  read `platform/docs/documentation-governance.md`.
+- Use `$openai-knowledge` for OpenAI/Codex/API/model/prompt documentation;
+  `$platform-implementation-strategy` before platform API, schema, permission,
+  workflow, runtime, release or cross-module changes;
+  `$deadlock-workflow-guardrails` before Deadlock workflow changes;
+  `$frontend-ux-polish` for meaningful web UI changes;
+  `$platform-performance-monitoring` for performance/observability work;
+  `$platform-launch-qa` for launch or live QA; and `$release-handoff-summary`
+  at the end of substantive work.
+- After any code, docs, skill, test or tooling package, use
+  `$code-cleanup-after-changes` and `$platform-code-change-verification`.
 
-## Context Rules
+## Change and verification rules
 
-- Start with `rg` or focused file reads; avoid full-repo scans unless required.
-- For large docs/logs/reports, read indexes or bounded ranges first and summarize retained evidence instead of dumping raw files.
-- Never recursively search session history, dependency trees, build output or unbounded generated directories.
-- Run tests/builds/lint/release checks through `platform/tools/platform_run_quiet.sh` when live output is unnecessary.
-- Keep quality gates intact while saving context: focused checks first, broader checks only when risk/release scope requires them.
+- Define behavior, owner layer, permissions, data impact, rollback risk and
+  focused tests before changing behavior. Put test placement and gate ownership
+  in `platform/docs/test-suite-governance.md`.
+- Use the canonical registry `platform/tools/platform_verify.py`; run it from
+  `platform/` through the quiet wrapper when normal output is unnecessary.
+- A missing safe dependency is `LOCAL GATE BLOCKED`, not a reduced pass. Do not
+  hide failures with exclusions or silent retries.
 
-## Architecture Rules
+## Production and publication
 
-- Keep routes/handlers thin.
-- Keep domain/workflow rules in domain/services.
-- Keep persistence in models/migrations/repositories.
-- Use `apply_patch` for manual edits when working locally.
-
-## Completion and GitHub Publication
-
-For completed substantive work:
-
-1. run the applicable verification;
-2. remove stale/replaced artifacts;
-3. commit the coherent verified package;
-4. `git fetch origin`;
-5. push the current branch to the matching GitHub branch;
-6. fetch again and verify local `HEAD` equals `origin/<branch>`.
-
-A local-only commit is not a completed handoff. Never automatically use `--force` or `--force-with-lease`; reconcile any divergence first.
-
-## GitHub CI/CD is the release authority
-
-- Run deterministic local feedback through the canonical
-  `platform/tools/platform_verify.py` gates when useful. Local results are
-  feedback only and never authorize a release.
-- If a GitHub job fails, use its GitHub Actions logs as the first diagnostic
-  source. Run a local reproduction only when explicitly requested or when it
-  is necessary to isolate the CI failure, and never treat that reproduction as
-  the release gate.
-- After pushing to `dev`, wait for the GitHub Actions
-  `Platform security and build` workflow for the exact target SHA to finish.
-  Inspect the backend job and every required job; the aggregate
-  `platform-security-build` commit status must be `success`.
-- A successful security/build run caused by a push to the current `dev` HEAD
-  automatically feeds `Platform production auto-deploy`. That workflow must
-  re-check that the tested SHA is still the current `dev` HEAD, require the
-  exact-SHA security status and skip a SHA already marked successfully deployed.
-- Do not manually dispatch production while the security/build workflow is
-  pending, failing or still running. Manual `Platform production deploy` is an
-  operator fallback, not the normal release path.
-- If local and GitHub results differ, treat the GitHub result as authoritative
-  for release gating, investigate the environment difference, fix it, push the
-  fix and repeat the complete CI gate.
-
-## Test architecture decision tree
-
-When behavior changes, place its protection at the lowest suitable layer:
-
-1. Backend/domain behavior belongs in the auto-discovered
-   `platform/tests/test_*.py` tree. Adding an ordinary backend test never
-   requires a GitHub workflow edit or a filename manifest entry.
-2. Hermetic web/browser behavior belongs in the canonical Playwright suite
-   under `platform/apps/platform_web/tests`. Adding an ordinary scenario never
-   requires a GitHub workflow edit.
-3. A new deterministic execution contour requires a registry entry in
-   `platform/tools/platform_verify.py`, its runner, the verification-contract
-   self-test and a CI job that invokes only the gate ID.
-4. Production smoke/live QA belongs in its repository-owned runner and the
-   appropriate protected production workflow.
-5. A load/performance scenario belongs in a versioned profile under
-   `platform/performance/profiles/`; keep the generator on an external
-   GitHub-hosted runner and keep scenario values out of workflow YAML.
-6. Run focused canonical local gates for feedback when useful. If a safe
-   dependency is unavailable, report `LOCAL GATE BLOCKED` rather than calling
-   a reduced suite a complete pass.
-7. Push the coherent tested change. The exact-SHA GitHub security/build PASS
-   remains the release authority, and production/live/load evidence is valid
-   only through its approved explicit workflow.
-
-Never add an individual ordinary test by editing GitHub workflow YAML. Do not
-silently exclude or retry deterministic failures.
-
-## Production deployment
-
-- Normal production releases start automatically after a reviewed commit is
-  pushed to `dev` and the exact-SHA `Platform security and build` push run
-  succeeds. `Platform production auto-deploy` validates that successful run is
-  for the current `dev` HEAD and dispatches `Platform production deploy` with
-  `mode=deploy`.
-- The deploy workflow repeats the fail-closed exact-SHA
-  `platform-security-build=success` check before packaging, SSH or any
-  production release side effect.
-- Watch and report all three GitHub Actions stages for the same target SHA:
-  security/build, auto-deploy and production deploy/live smoke. A successful
-  branch push alone is not a production deployment; a successful current-head
-  security/build run is expected to continue into the automatic deploy chain.
-- Use manual `Platform production deploy` only as an explicitly justified
-  operator fallback or read-only preflight path. Never use it to bypass a
-  pending, failed, missing or stale security/build result.
-- Do not invoke `platform_build_release.sh` or `platform_release_deploy.sh`
-  directly from the Codex shell or production host for a normal release.
-  Direct host commands are reserved for an explicitly authorized recovery or
-  rollback procedure.
-
-## Verification
-
-- Push the reviewed commit to `dev` and wait for the GitHub Actions
-  `Platform security and build` workflow. It owns backend tests, migration
-  scenarios, web build/hermetic checks, smoke checks and the aggregate
-  `platform-security-build` status.
-- After that exact-SHA push run succeeds, verify that
-  `Platform production auto-deploy` accepts the same current `dev` HEAD and
-  dispatches the production workflow. Then wait for the production deployment
-  and live smoke to finish.
-- Use `gh run watch <run-id> --repo StrayForest/old_sparky --exit-status` and
-  inspect failed GitHub Actions jobs before attempting any local reproduction.
-- Release verification and live smoke are performed by the GitHub Actions
-  `Platform production deploy` workflow described in
-  `platform/docs/deployment-runbook.md`.
-
-Done means verified and published to GitHub, or any skipped verification/publication is explicitly named with the reason.
+- GitHub Actions is the release authority. A reviewed push to `dev` must pass
+  exact-SHA `Platform security and build`, then the automatic production
+  chain; do not manually dispatch normal production deployment or call low-
+  level release installers directly. Follow `deployment-runbook.md` for the
+  exceptional recovery/fallback paths.
+- Substantive work is complete only after applicable checks, stale-artifact
+  cleanup, a coherent commit, push to the matching branch, and a post-push
+  fetch proving local `HEAD == origin/<branch>`. Never force-push automatically.
+- If publication or a required external gate is unavailable, name it clearly in
+  the handoff instead of claiming completion.

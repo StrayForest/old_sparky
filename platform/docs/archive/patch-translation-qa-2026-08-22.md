@@ -1,5 +1,9 @@
 # Deadlock patch translation QA — 2026-08-22
 
+Historical checkpoint. The active contract is
+[`patch-translation.md`](../patch-translation.md); this file records the
+`ru-v8` regression package as it existed on 2026-08-22.
+
 The post-deploy workflow for this regression set is a controlled translation
 warm-up. It can create Redis locks/cache entries and call OpenAI on a cache
 miss; the workflow input caps those cache-miss calls. This checkpoint is
@@ -8,14 +12,19 @@ is read-only.
 
 ## Scope
 
-This checkpoint turns the latest four production patches into the standing translation regression set:
+This checkpoint turned four production patches into the standing translation
+regression set:
 
 - `1840944183775204` — `Minor Update - 08-12-2026`;
 - `1839676055886206` — `Matchmaking Update`;
 - `1839041357039193` — `Minor Update - 07-28-2026`;
 - `1836506165584438` — `Minor Update - 07-09-2026`.
 
-The previous `ru-v7` production QA already proved structural correctness for this set while exposing terminology and prose-quality failures. The current `dev` implementation is `ru-v8` and is intended to fix those known failures before any broader translation architecture is added.
+The previous `ru-v7` production QA already proved structural correctness for
+this set while exposing terminology and prose-quality failures. The `dev`
+implementation under test at this checkpoint was `ru-v8` and was intended to
+fix those known failures before any broader translation architecture was
+added.
 
 ## Confirmed `ru-v7` failures
 

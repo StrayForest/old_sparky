@@ -16,7 +16,9 @@ Select the smallest relevant verification set.
   Do not run `platform/.venv_platform/bin/python -m unittest discover -s platform/tests`
   from repo root: it can collide with Python's stdlib `platform` module and
   leave `apps.*` imports unresolved.
-- Migration: `cd platform && tools/platform_run_alembic.sh upgrade head`
+- Migration: from `platform/`, run the canonical populated-database gate:
+  `tools/platform_verify.py migration`. Use the direct Alembic wrapper only
+  for a documented bootstrap or release-transaction investigation.
 - Workflow concurrency: run focused tests with independent database sessions
   for competing starts, vote-versus-close/exclusion, publish/lock-versus-status
   transition, worker-versus-route, and dream-slot replace-all. Assert the
@@ -35,7 +37,10 @@ Select the smallest relevant verification set.
   `platform/tools/platform_run_quiet.sh "release preflight" -- platform/tools/platform_release_preflight.sh --require-previous --require-edge-parity`;
   deploy only through `platform/tools/platform_release_deploy.sh`. A retained
   migration/post-restart state is a recovery outcome, not a passing release.
-- Codex/docs-only: syntax checks only; do not run app tests unless behavior changed.
+- Docs/skills-only: run `tools/platform_verify.py docs`, the verification
+  contract gate when instruction or workflow policy changed, and syntax/
+  metadata checks for edited files. Do not run app tests unless behavior
+  changed.
 
 Successful checks should emit only their final status line. Read the retained
 failure log only after a non-zero exit; do not stream normal build/test output

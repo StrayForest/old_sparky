@@ -32,9 +32,11 @@ waterfalls.
    serialization, and large list payloads as first-class bottlenecks even when
    SQL count is already low.
 5. For tournament pages, keep detail, bracket shell, compact bracket, and full
-   roster bracket profiles separate. Current frontend bracket SSR should use
-   `workspace_view=bracket_summary&participants_limit=0`, then compact
-   `/bracket?teams_view=summary`; full roster reads are diagnostic/admin paths.
+   roster bracket profiles separate. Current frontend SSR requests use
+   `participants_limit=0` with `workspace_view=detail` for the detail page and
+   `workspace_view=bracket` for the bracket page. Client refreshes use
+   `teams_view=summary` by default; full roster reads remain diagnostic/admin
+   paths.
 6. Check write amplification on high-volume mutations. Do not add per-user
    audit-log writes when an authoritative domain table already records the
    same workflow fact.

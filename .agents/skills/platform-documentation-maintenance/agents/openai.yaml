@@ -1,0 +1,4 @@
+interface:
+  display_name: "Platform Documentation Maintenance"
+  short_description: "Keep platform docs and agent guidance current"
+  default_prompt: "Use $platform-documentation-maintenance to audit and update platform docs, AGENTS.md files, and skills."

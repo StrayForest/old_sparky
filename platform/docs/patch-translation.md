@@ -1,12 +1,12 @@
 # Deadlock patch translation
 
-- Status: Active / DB-first implementation pending CI
+- Status: Active / DB-first implementation deployed
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-29
+- Last reviewed: 2026-09-01
 
 This document owns the contract for automatic Russian translation of Deadlock patch-note changes.
 
-## Current implementation — 2026-08-29
+## Current implementation — 2026-09-01
 
 Translation state is durable in the PostgreSQL `platform.patch_translations`
 table. A record is identified by the patch ID, the hash of the extracted
@@ -23,80 +23,12 @@ record, it fails closed and the condition is logged for diagnosis. Failed
 translations are retained as failed state rather than silently requeued on
 every refresh.
 
-## Historical checkpoint — 2026-08-19
-
-This was the last checkpoint before the DB-first persistence work below; retain it as historical QA context.
-
-### Confirmed and deployed
-
-`ru-v7` was deployed successfully and production QA was run once against the four newest patches available at that moment:
-
-- `1840944183775204` — `Minor Update - 08-12-2026`;
-- `1839676055886206` — `Matchmaking Update`;
-- `1839041357039193` — `Minor Update - 07-28-2026`;
-- `1836506165584438` — `Minor Update - 07-09-2026`.
-
-Structural QA passed for all four patches:
-
-- segment IDs/order were preserved;
-- numeric values and `T1`/`T2`/`T3`-style tiers were preserved;
-- structural hero/item/ability labels were unchanged;
-- the checked-in glossary contained 54 terms;
-- no runtime glossary fetch, Redis glossary cache or dynamic glossary discovery remained.
-
-The production QA also exposed terminology/quality problems that structural validation correctly does not hide. Important examples:
-
-- `+10% Bullet Lifesteal` remained `Bullet Lifesteal` in English;
-- `+10% Spirit Lifesteal` remained `Spirit Lifesteal` in English;
-- coordinated `Bullet, Spirit and Melee Lifesteal` was mistranslated as resistance terminology;
-- long `Matchmaking Update` prose showed at least one truncation/omission case, so the prompt must explicitly require every source clause to be represented;
-- some Russian wording is mechanically correct but stylistically awkward and still needs manual regression review.
-
-### Root cause found
-
-The Lifesteal failure is not caused by the 54-term glossary being too small.
-
-`Bullet Lifesteal`, `Spirit Lifesteal` and `Melee Lifesteal` are ambiguous in Deadlock because the same English strings can be both:
-
-1. actual item names, which normally must remain untranslated; and
-2. gameplay stat/mechanic names, which must use the canonical Russian glossary term.
-
-The existing entity-protection stage treated these strings as item names before the model saw them, so mechanic occurrences could become `ENTITY` placeholders and were therefore impossible for the model to translate correctly.
-
-### Already implemented in `dev`, but NOT yet CI-verified or deployed
-
-The next revision is `ru-v8`. The code changes are already committed to `dev`, but GitHub Actions limits stopped us before verification/deployment.
-
-`ru-v8` currently includes:
-
-- the same small 54-term canonical glossary;
-- an explicit three-entry ambiguity set: `Bullet Lifesteal`, `Spirit Lifesteal`, `Melee Lifesteal`;
-- those three strings are no longer blindly hidden as entity placeholders;
-- the model is instructed to use segment context to distinguish item-name usage from mechanic/stat usage;
-- examples in the prompt distinguish `+10% Bullet Lifesteal` as a mechanic from wording such as `same change for Melee Lifesteal` as an item reference;
-- the prompt now explicitly forbids shortening/truncating long segments and requires every source clause to be represented;
-- OpenAI `prompt_cache_key` is set to a stable translation-version key;
-- OpenAI usage logging records input tokens, cached input tokens and output tokens so prompt-cache effectiveness can be measured rather than guessed;
-- `get_translation_glossary()` remains static and no longer performs a pointless `force_refresh` runtime operation;
-- new unit tests were added for the ambiguity set, visibility of ambiguous mechanics to the model, stable prompt cache key and cached-token usage parsing.
-
-Important: these `ru-v8` changes have **not** yet passed CI and have **not** been deployed. Treat `dev` as an unverified checkpoint until Actions are available again.
-
-### Resume sequence after GitHub Actions limits reset
-
-Do this in order:
-
-1. Run normal CI for current `dev` and fix only actual failures.
-2. Deploy `ru-v8` only after CI is green.
-3. Re-run one fail-fast production QA against the four newest patches; do not add a polling loop.
-4. Confirm specifically that numeric/stat uses of `Bullet Lifesteal`, `Spirit Lifesteal` and coordinated `Bullet, Spirit and Melee Lifesteal` are translated into canonical Russian terminology.
-5. Confirm a true item-name reference such as `same change for Melee Lifesteal` remains the English item name.
-6. Re-check the long `Matchmaking Update` segment and verify that no source clause is omitted.
-7. Review `patch_translation_openai_usage` logs across repeated requests and record whether `cached_tokens` is materially greater than zero. Do not build another application-side glossary cache just to imitate provider prompt caching.
-8. Compare EN -> Old Sparky RU -> Valve RU wording where available. If a recurring important mechanic is genuinely missing, add only that canonical term to the checked-in glossary and repeat the same regression set.
-9. Remove/close the temporary production-QA branch/PR used for the one-off `ru-v7` inspection if it is still present. It must never be merged into `dev`.
-
-Do not reintroduce dynamic glossary generation, per-request glossary filtering, a large alias table, or broad Russian prose heuristics unless a concrete regression demonstrates the need.
+The deployed translation version is `ru-v10`, defined in
+`apps/platform_api/app/services/patch_translation_config.py`. It includes the
+durable DB-first state, the reviewed ambiguity handling and the immutable
+numeric/tier validation described below. The four-patch regression procedure
+and its historical evidence live in
+[`archive/patch-translation-qa-2026-08-22.md`](archive/patch-translation-qa-2026-08-22.md).
 
 ## Scope
 
@@ -110,7 +42,10 @@ Only patch **change text** is translated. The translation subsystem must not tra
 
 Those labels remain in the canonical form already used by the site. Protected game entity names that appear inside a change sentence are replaced with placeholders before the model call and restored unchanged afterwards.
 
-The only current exception to blind entity placeholdering is the explicit ambiguity set documented above. Those strings remain visible to the model so it can distinguish an item reference from a gameplay mechanic using sentence and segment context.
+The only current exception to blind entity placeholdering is the explicit
+ambiguity set in `patch_translation_glossary.py`. Those strings remain visible
+to the model so it can distinguish an item reference from a gameplay mechanic
+using sentence and segment context.
 
 ## Source and canonical glossary
 

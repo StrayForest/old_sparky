@@ -115,7 +115,7 @@ jobs:
           MUTATION
           REMOTE
 
-      - name: Verify ru-v8 four-patch translation regression set
+      - name: Verify ru-v10 four-patch translation regression set
         shell: bash
         run: |
           set -euo pipefail

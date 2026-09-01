@@ -3,6 +3,7 @@
 - Status: Accepted
 - Owner: Platform maintainers
 - Date: 2026-08-28
+- Last reviewed: 2026-09-01
 
 ## Decision
 

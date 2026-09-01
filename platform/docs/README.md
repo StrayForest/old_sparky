@@ -2,7 +2,7 @@
 
 - Status: Active
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-29
+- Last reviewed: 2026-09-01
 
 Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current production state and next engineering priority. Open deeper documents only when the task requires them.
 
@@ -14,9 +14,10 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Prioritized backlog | [Roadmap](platform-roadmap.md) |
 | Components, data flow and trust boundaries | [Production architecture](production-architecture.md) |
 | Local setup, verification, commit and push workflow | [Development guide](development-guide.md) |
+| Maintaining docs, AGENTS and skills | [Documentation governance](documentation-governance.md) |
 | Product and workflow contracts | [Product reference](product-reference.md) |
 | Deadlock patch translation / Valve glossary contract | [Patch translation](patch-translation.md) |
-| Latest four-patch translation QA checkpoint | [Patch translation QA — 2026-08-22](patch-translation-qa-2026-08-22.md) |
+| Standing translation regression and warm-up procedure | [Patch translation](patch-translation.md#qa) |
 | UI system and responsive rules | [Visual theme](platform-visual-theme.md) |
 | Normal release or rollback | [Deployment runbook](deployment-runbook.md) |
 | Release transaction and recovery | [Release state machine](release-state-machine.md) |
@@ -47,13 +48,15 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 - Describe current behavior in present tense. Do not append release diaries.
 - Keep one owner for each fact. Link to that owner instead of duplicating it.
 - Put procedures in runbooks, stable facts in reference documents, decisions in ADRs, current state in `CURRENT.md`, and prioritized future work in the roadmap.
+- Keep the instruction hierarchy and skill maintenance rules in [documentation governance](documentation-governance.md).
 - Completed implementation plans belong in `archive/`; they are not active task context.
 - Keep commands copyable and safe by default. Mark mutations and operator gates.
 - Refer to configuration names, never secret values or live personal data.
 - Store detailed test, load and deploy output outside Git; record only the current conclusion and report location.
-- When deleting or renaming a document, update repository links in the same change and run the documentation link check.
+- When deleting or renaming a document, update repository links in the same change and run the documentation and skill consistency check.
 
 ```bash
 cd /root/old_sparky/platform
 .venv_platform/bin/python tools/platform_verify.py docs
+.venv_platform/bin/python tools/platform_verify.py verification-contract
 ```

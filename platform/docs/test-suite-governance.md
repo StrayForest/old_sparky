@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-30
+- Last reviewed: 2026-09-01
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
@@ -18,7 +18,7 @@ placement rules; it does not repeat tool arguments.
 | `python-quality` | Python quality, backend/tooling owners | pinned quality dependencies | local feedback + CI |
 | `security` | dependency and repository security owners | pinned platform/quality dependencies | local feedback + CI |
 | `migration` | persistence owners | disposable PostgreSQL only | CI |
-| `docs` | platform maintainers | repository checkout | local feedback + CI |
+| `docs` | platform maintainers | repository checkout; Markdown docs and project skill metadata | local feedback + CI |
 | `web-quality` | web owners | Node 26.3.1 and locked dependencies | local feedback + CI |
 | `web-hermetic` | web owners | local/mocked API and Chromium | local feedback + CI |
 | `verification-contract` | platform tooling owners | repository checkout | CI |
@@ -102,7 +102,8 @@ the exact run ID.
 
 ## Contract self-test
 
-`verification-contract` checks registry/CI membership, workflow gate names,
+The `docs` gate checks document shape, repository-local links and project skill
+frontmatter/interface metadata. `verification-contract` checks registry/CI membership, workflow gate names,
 direct command duplication, exclusion bypasses, backend discovery, hermetic
 suite registration, production reachability from `ci`, documentation gate
 IDs, load-profile schema/deduplication, workflow-owned load budgets and the

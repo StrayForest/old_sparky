@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-08-29
+- Last reviewed: 2026-09-01
 
 ## Runtime checks
 
@@ -454,7 +454,7 @@ gh workflow run platform-production-retained-load-cleanup.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=DELETE-PRODUCTION-RETAINED-LOAD \
   -f load_run_id=<load-run-id> \
-  -f control_email=aleksei.lisitsin1@gmail.com
+  -f control_email=<designated-control-account>
 gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 

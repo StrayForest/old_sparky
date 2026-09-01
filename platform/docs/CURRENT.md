@@ -13,7 +13,7 @@ Read this file for the current production baseline and next engineering priority
 - Platform database: `platformdb`, schema `platform`.
 - Web, API and worker run under separate locked Unix identities with per-service runtime environments; the web process receives no backend database, session, R2, mail, Turnstile-secret or OpenAI credentials.
 - API and worker share only the dedicated `oldsparky-media` staging group; worker state and web cache remain service-owned.
-- Current deployed product includes secure Steam OpenID login/linking, mobile auth/profile/tournament polish, enforced nonce CSP, tournament lifecycle, deterministic Deadlock assignment, locked rosters, bracket progression, immutable releases and tested rollback.
+- Current deployed product includes secure Steam OpenID login/linking, mobile auth/profile/tournament polish, enforced nonce CSP, tournament lifecycle, deterministic Deadlock assignment, locked rosters, bracket progression, durable patch-translation state, the rebuildable tournament catalog read model with keyset pagination, the admin roster control center, immutable releases and tested rollback.
 - Frontend audit remediation for contract validation, permissions, auth/session states, async draft/search races, retry boundaries, internal navigation and i18n is resolved and deployed in release `frontend-audit-remediation-20260822T204107Z`; evidence is in [`archive/frontend-audit-remediation-2026-08-22.md`](archive/frontend-audit-remediation-2026-08-22.md).
 - Cloudflare Access now protects `/platform-ops*` and `/api/v1/admin*` with an operator-scoped Allow policy and independent MFA; a fresh incognito login verified the identity -> TOTP MFA -> application path while application `admin`/`superadmin` RBAC remains authoritative.
 - Cloudflare is the single visitor-facing HSTS owner. Dashboard verification on 2026-08-21 confirmed HSTS On with six-month `max-age=15552000`, `includeSubDomains` Off and preload Off; Nginx must continue to omit HSTS.
@@ -28,16 +28,17 @@ Read this file for the current production baseline and next engineering priority
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
 - Password-login guessing protection uses independent source-IP and account-wide Redis state. Account identifiers are represented by HMAC fingerprints, shared failures drive adaptive Turnstile and a bounded cooldown, and successful login clears account failure/cooldown state.
-- Production Alembic head before this release is `20260822_0040`; the reviewed
-  branch target adds `20260824_0042` participant slots and `20260824_0043`
-  ready-vote lifecycle guards.
+- Production Alembic head is `20260901_0051`, including the tournament catalog
+  read-model and keyset-pagination revisions. The migration scenario records
+  this as the current head; see the [deployment runbook](deployment-runbook.md)
+  for the exact release-SHA evidence.
 - On 2026-08-24 production was reset only after a restore-verified backup
   (`platformdb-20260824T173357Z.dump`, SHA-256
   `3ee0e6616b4af7964578a02d1df9cbef2855b0559bec8a395d3435cd15c0379d`). The
-  account `aleksei.lisitsin1@gmail.com`, its configured profile/media/access
-  graph and roles were retained; all tournament links, tournaments and other
-  application data were removed. Post-reset verification found one user,
-  zero tournaments and zero participant/workflow/audit rows.
+  designated control account, its configured profile/media/access graph and
+  roles were retained; all tournament links, tournaments and other application
+  data were removed. Post-reset verification found one user, zero tournaments
+  and zero participant/workflow/audit rows.
 
 ## Current engineering priority
 
@@ -54,9 +55,10 @@ database budgets are unchanged. The corrected canonical performance model uses
 `ready-vote-stress-15k-v2` and `ready-vote-spike-v1`; the optional 20k stress
 profile is retained only for a specific unresolved question.
 
-Current status: migration `0048` adds a partial covering index for the
-`UserSession` auth query. Evidence is `EXPLAIN` `Index Only Scan` / `Heap
-Fetches 0` from disposable analysis as engineering evidence. The supported
+Current status: migration `20260901_0051` is the deployed Alembic head. The
+`0048` revision adds a partial covering index for the `UserSession` auth query;
+its `EXPLAIN` `Index Only Scan` / `Heap Fetches 0` result is disposable
+engineering evidence, not a production architecture claim. The supported
 load run `33335115575` passed with accepted p50/p90/p95/p99
 `241.711/256.963/264.706/639.338 ms`, zero shedding/retries/final failures,
 and exact cleanup. The supported-load and earlier adaptive/spike records
@@ -72,12 +74,13 @@ A/B runs `33379397589`/`33381896491`/`33385667381` retained SLO capacity
 approximately `117/s` goodput in the 120–135/s band with bounded origin
 pressure. Full tables, profile evidence, rejected hypotheses and run links are
 retained in `platform/performance/README.md`. The optional 20k stress profile
-was not run.
+was not run. The SHA above is a benchmark baseline for the Ready Vote
+comparison, not the current deployed source.
 The supported-load SLO remains accepted p50/p90/p95/p99 <= 250/400/600/1000
 ms, logical p95/p99 <= 600/1000 ms, final logical failure <0.5%, and
 approximately zero normal-load shedding. Every run passed exact cleanup; the
-control account remained intact. Profile versions/digests and full tables are
-retained in `platform/performance/README.md`.
+designated control account remained intact. Profile versions/digests and full
+tables are retained in `platform/performance/README.md`.
 
 The current Ready Check implementation uses the initial workspace timing
 contract: the page receives `starts_at`, `ends_at`, eligible/current-user

@@ -2,7 +2,7 @@
 
 - Status: Active release design
 - Owner: Production operator and platform maintainers
-- Last reviewed: 2026-08-23
+- Last reviewed: 2026-09-01
 
 This document owns the end-to-end release transaction. The normal production
 path is `tools/platform_release_deploy.sh`; the low-level installer is a
@@ -159,5 +159,6 @@ recorded by the operator.
 - Building on the production host from a source archive is not immutable
   provenance and is not part of the normal workflow. CI now builds and attests
   the immutable artifact and wheelhouse; the VPS verifies the artifact digest
-  and source commit before installation. Fully automatic push deployment
-  remains a separate policy decision.
+  and source commit before installation. A reviewed push to `dev` is now the
+  normal path: successful exact-SHA security/build feeds the automatic
+  production chain. Manual production dispatch remains an operator fallback.

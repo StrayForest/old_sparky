@@ -2,7 +2,7 @@
 
 - Status: Active operator checklist
 - Owner: Cloudflare account owner
-- Last reviewed: 2026-08-21
+- Last reviewed: 2026-09-01
 
 `DONE` requires live/dashboard evidence. `VERIFY` needs dashboard confirmation;
 source code alone is not evidence. Never use a Global API Key.

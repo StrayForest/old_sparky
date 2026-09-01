@@ -1,6 +1,9 @@
 # Admin roster control center
 
-## Status
+- Status: Accepted
+- Owner: Platform API, domain and web maintainers
+- Date: 2026-09-01
+- Last reviewed: 2026-09-01
 
 Accepted for the first admin roster vertical slice.
 

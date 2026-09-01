@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-23
+- Last reviewed: 2026-09-01
 
 ## Scope boundary
 

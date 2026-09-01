@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Incident commander
-- Last reviewed: 2026-08-08
+- Last reviewed: 2026-09-01
 
 ## Severity
 

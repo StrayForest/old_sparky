@@ -20,7 +20,7 @@ All active application code lives under [`platform/`](platform/):
 
 ## Production contour
 
-The active production stack uses Next.js, FastAPI/Gunicorn, Celery, PostgreSQL, Redis, Nginx, Cloudflare and R2/CDN. It includes Steam OpenID authentication, tournament lifecycle management, deterministic Deadlock team assignment, locked rosters, bracket progression, security controls, immutable releases and rollback tooling.
+The active production stack uses Next.js, FastAPI/Gunicorn, Celery, PostgreSQL, Redis, Nginx, Cloudflare and R2/CDN. It includes Steam OpenID authentication, tournament lifecycle management, deterministic Deadlock team assignment, locked rosters, bracket progression, durable patch translation, a rebuildable catalog read model with keyset pagination, an admin roster control center, security controls, immutable releases and rollback tooling.
 
 ## Start here
 
@@ -30,6 +30,9 @@ For engineering work:
 2. read [`platform/AGENTS.md`](platform/AGENTS.md);
 3. read [`platform/docs/CURRENT.md`](platform/docs/CURRENT.md);
 4. use [`platform/docs/README.md`](platform/docs/README.md) to open only the task-specific owner documents.
+
+For documentation, agent guidance or project skills, follow
+[`platform/docs/documentation-governance.md`](platform/docs/documentation-governance.md).
 
 Do not scan the whole repository or documentation tree by default.
 

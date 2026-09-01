@@ -2,7 +2,7 @@
 
 - Status: Active security/correctness tracker
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-23
+- Last reviewed: 2026-09-01
 - Historical point-in-time audits and resolved findings: [`archive/`](archive/)
 
 This document contains only findings that still require action or direct operator verification. Historical evidence is archived so routine security work does not load resolved context.
@@ -12,7 +12,6 @@ This document contains only findings that still require action or direct operato
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
 | AS-12 | Medium / P2 | High | Proxy, Cloudflare-range, UFW and startup validation can drift independently | Open |
-| AS-13 | Low / P2 | Medium | CI fail-closed isolation contour requires revalidation against the current workflow | Open; revalidate before changing |
 
 ## Authorization matrix
 
@@ -37,11 +36,6 @@ non-loopback forwarded-header trust. Preflight can require a read-only parity
 proof across current Cloudflare ranges, the Nginx include and managed UFW
 rules. **Live proof remains open:** listener inspection, exact UFW/Nginx CIDR
 comparison and a direct-origin negative test must be run on the VPS.
-
-### AS-13 — CI isolation contour needs current revalidation
-The security workflow now provisions `oldsparky-web`, `oldsparky-api` and
-`oldsparky-worker`, installs the current systemd/env boundary and keeps the
-test database isolated. **Open pending a successful run and retained evidence.**
 
 ### Additional audit actions
 
@@ -76,7 +70,11 @@ test database isolated. **Open pending a successful run and retained evidence.**
 
 ## Remediation order
 
-1. Complete AS-12 live proof and AS-13 CI evidence.
+1. Complete AS-12 live proof.
+
+AS-13 was closed on 2026-09-01 after the exact-SHA security/build run passed;
+the evidence is retained in
+[`archive/application-security-as-13-2026-09-01.md`](archive/application-security-as-13-2026-09-01.md).
 
 
 Any newly confirmed Critical issue or direct authentication bypass blocks production installation. Do not widen CSP, disable Turnstile, add privileged-route bypasses or weaken application RBAC to simplify testing.

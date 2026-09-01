@@ -25,25 +25,29 @@
 ## Context and completion
 
 - Read `docs/CURRENT.md`, then use `docs/README.md` to select only task-relevant documents.
+- For docs, AGENTS or skills, also read `docs/documentation-governance.md` and
+  use `$platform-documentation-maintenance`.
 - Prefer focused reads and quiet verification output.
 - Completed substantive work must be committed and pushed to the matching GitHub branch; verify local `HEAD` equals `origin/<branch>` after push.
 - Never force-push automatically.
 
 ## Production deployment
 
-- Start normal production releases only through the GitHub Actions `Platform
-  production deploy` workflow from the reviewed `dev` branch:
-  `gh workflow run platform-production-deploy.yml --repo StrayForest/old_sparky --ref dev --field mode=deploy`.
+- Normal production starts with a reviewed push to `dev`. The exact-SHA
+  security/build result feeds `Platform production auto-deploy`, which dispatches
+  `Platform production deploy` after its current-head checks.
 - Wait for the Actions run and include its run ID/URL and live result in the
   handoff. A push to `dev` alone is not a deployment.
-- Do not run `tools/platform_build_release.sh` or
+- Do not manually dispatch production for the normal `dev` path. Do not run
+  `tools/platform_build_release.sh` or
   `tools/platform_release_deploy.sh` directly from an agent shell for a normal
   release; direct server execution is recovery/rollback-only and requires
   explicit operator authorization.
 
 ## Verification
 
-- API/domain: `.venv_platform/bin/python -m unittest discover -s tests` from this directory.
-- Migration: `tools/platform_run_alembic.sh upgrade head`.
-- Web: `cd apps/platform_web && npm run build`.
+- Use `.venv_platform/bin/python tools/platform_verify.py <gate>` from this
+  directory; test placement and gate ownership live in `docs/test-suite-governance.md`.
+- API/domain: `backend`; migration: `migration`; docs/skills: `docs`;
+  web: `web-quality` and, when applicable, `web-hermetic`.
 - Release: follow `docs/deployment-runbook.md` and the current CSP mode documented in `docs/CURRENT.md`.
