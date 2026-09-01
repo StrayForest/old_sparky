@@ -185,6 +185,7 @@ test("document CSP uses one fresh nonce and leaves static responses unscoped", a
     expect(responseHeaders["content-security-policy-report-only"]).toBeUndefined();
     expect(responseHeaders["reporting-endpoints"]).toBeUndefined();
   }
+  await expect(page.getByTestId("bracket-shell")).toBeVisible({ timeout: 20_000 });
   const bracketStyle = page.locator(".bracket-wrap > style");
   await expect(bracketStyle).toHaveCount(1);
   expect(await bracketStyle.evaluate((node) => (node as HTMLStyleElement).nonce)).toBe(documentNonce);
