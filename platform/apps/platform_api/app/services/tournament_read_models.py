@@ -398,7 +398,7 @@ async def refresh_tournament_read_models(
             if tournament is None:
                 await delete_tournament_read_models(tournament_id, selected)
                 return
-            from apps.platform_api.app.api.routes.tournaments import tournament_state_version
+            from apps.platform_api.app.services.tournament_versions import tournament_state_version
 
             revision = tournament_state_version(tournament)
             values = await _build_selected_read_models_from_authoritative_db(

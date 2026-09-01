@@ -5373,6 +5373,226 @@ img.rank-icon,
   overflow-wrap: anywhere;
 }
 
+.admin-roster-panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  background: rgba(3,4,4,.58);
+  border: 1px solid rgba(120,76,26,.42);
+}
+
+.admin-roster-panel-header,
+.admin-roster-panel-header > div,
+.admin-roster-team-head,
+.admin-roster-meta,
+.admin-roster-button-row,
+.admin-roster-override {
+  display: flex;
+  align-items: center;
+}
+
+.admin-roster-panel-header {
+  justify-content: space-between;
+  gap: 10px;
+  color: #e1d4c0;
+  font-size: 12px;
+  font-weight: 850;
+  letter-spacing: .045em;
+  text-transform: uppercase;
+}
+
+.admin-roster-panel-header > div {
+  gap: 7px;
+}
+
+.admin-roster-version,
+.admin-roster-meta,
+.admin-roster-team-head > span,
+.admin-roster-member small,
+.admin-roster-hint,
+.admin-roster-selection-hint {
+  color: #857e73;
+  font-size: 10px;
+}
+
+.admin-roster-meta {
+  flex-wrap: wrap;
+  gap: 7px 12px;
+  line-height: 1.45;
+}
+
+.admin-roster-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.admin-roster-meta code {
+  color: #b9d9e5;
+  font-size: 9px;
+}
+
+.admin-roster-teams,
+.admin-roster-form {
+  display: grid;
+  gap: 9px;
+}
+
+.admin-roster-section-title {
+  color: #cfc2af;
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.admin-roster-team {
+  display: grid;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid rgba(120,76,26,.3);
+}
+
+.admin-roster-team-head {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.admin-roster-team-head strong {
+  min-width: 0;
+  color: #e5dac8;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-roster-members {
+  display: grid;
+  gap: 5px;
+}
+
+.admin-roster-member {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 7px;
+  color: #bdb3a4;
+  background: rgba(255,255,255,.025);
+  border: 1px solid transparent;
+  text-align: left;
+}
+
+.admin-roster-member:hover,
+.admin-roster-member.selected {
+  color: #f0e3cf;
+  background: rgba(214,154,45,.08);
+  border-color: rgba(214,154,45,.38);
+}
+
+.admin-roster-member > span:nth-child(2) {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.admin-roster-member strong,
+.admin-roster-member small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-roster-member strong {
+  font-size: 11px;
+}
+
+.admin-roster-slot {
+  display: grid;
+  width: 21px;
+  height: 21px;
+  place-items: center;
+  color: var(--gold-bright);
+  background: rgba(214,154,45,.11);
+  border: 1px solid rgba(214,154,45,.28);
+  font-size: 9px;
+  font-weight: 850;
+}
+
+.admin-roster-form {
+  padding-top: 4px;
+  border-top: 1px solid rgba(120,76,26,.25);
+}
+
+.admin-roster-form-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) 66px auto;
+  align-items: end;
+  gap: 7px;
+}
+
+.admin-roster-form-grid label {
+  display: grid;
+  gap: 5px;
+  color: #91897d;
+  font-size: 9px;
+  font-weight: 760;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.admin-roster-form-grid select {
+  min-width: 0;
+  width: 100%;
+  color: #cfc5b7;
+  background: rgba(11,12,11,.85);
+  border: 1px solid rgba(120,76,26,.42);
+  font-size: 11px;
+}
+
+.admin-roster-button-row {
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.admin-roster-button-row .secondary-button {
+  min-height: 32px;
+  padding: 0 9px;
+  font-size: 10px;
+}
+
+.admin-roster-reason {
+  margin-top: 1px;
+}
+
+.admin-roster-reason textarea {
+  min-height: 58px;
+  resize: vertical;
+}
+
+.admin-roster-override {
+  gap: 7px;
+  color: #f0b25b;
+  font-size: 10px;
+  font-weight: 760;
+}
+
+.admin-roster-override input {
+  accent-color: var(--gold-bright);
+}
+
+.admin-roster-hint {
+  margin: -5px 0 0;
+  line-height: 1.45;
+}
+
+.admin-roster-selection-hint {
+  min-height: 0;
+  padding: 4px 0;
+}
+
 @media (max-width: 1400px) {
   .admin-toolbar,
   .admin-users-toolbar {
@@ -5461,6 +5681,14 @@ img.rank-icon,
 
   .admin-diagnostics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .admin-roster-form-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .admin-roster-form-grid .secondary-button {
+    min-height: 38px;
   }
 }
 

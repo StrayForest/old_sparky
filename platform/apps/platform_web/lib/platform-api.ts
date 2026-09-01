@@ -33,6 +33,7 @@ import type {
   PlatformStatsOverview,
   PlatformStatsRankBucket,
   PlatformTournamentScopedProfile,
+  PlatformAdminRoster,
   PlatformUser
 } from "@/lib/platform-types";
 
@@ -606,6 +607,40 @@ export async function platformApiPageRequest<T>(
       ? offset + items.length < total
       : hasMoreHeader.toLowerCase() === "true"
   };
+}
+
+export type AdminRosterMutationOperation =
+  | "add-player"
+  | "remove-player"
+  | "move-player"
+  | "replace-player"
+  | "change-captain";
+
+export async function getAdminTournamentRoster(
+  slug: string,
+  signal?: AbortSignal
+): Promise<PlatformAdminRoster> {
+  return platformApiRequest<PlatformAdminRoster>(
+    `/admin/tournaments/${encodeURIComponent(slug)}/roster`,
+    { signal }
+  );
+}
+
+export async function mutateAdminTournamentRoster(
+  slug: string,
+  operation: AdminRosterMutationOperation,
+  payload: Record<string, unknown>
+): Promise<PlatformAdminRoster> {
+  return platformApiRequest<PlatformAdminRoster>(
+    `/admin/tournaments/${encodeURIComponent(slug)}/roster/${operation}`,
+    {
+      method: "POST",
+      headers: {
+        "Idempotency-Key": globalThis.crypto.randomUUID()
+      },
+      body: JSON.stringify(payload)
+    }
+  );
 }
 
 export function platformApiUrl(path: string): string {

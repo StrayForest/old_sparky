@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import and_, case, delete, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -17,6 +17,12 @@ from apps.platform_api.app.api.schemas import (
     AdminPreprodCleanupRequest,
     AdminPreprodCleanupResponse,
     AdminPreprodTestRunResponse,
+    AdminRosterAddPlayerRequest,
+    AdminRosterChangeCaptainRequest,
+    AdminRosterMovePlayerRequest,
+    AdminRosterRemovePlayerRequest,
+    AdminRosterReplacePlayerRequest,
+    AdminRosterResponse,
     AdminTournamentResponse,
     AdminTournamentDeleteRequest,
     AdminTournamentOverrideRequest,
@@ -67,12 +73,28 @@ from apps.platform_api.app.services.player_commitments import (
 )
 from apps.platform_api.app.services.tournament_read_models import (
     delete_tournament_read_models,
+    refresh_tournament_read_models,
 )
 from apps.platform_api.app.services.tournament_catalog_read_models import (
     refresh_tournament_list_read_model_after_commit,
 )
 from apps.platform_api.app.services.tournament_profile_access import (
     delete_tournament_profile_access_state,
+)
+from apps.platform_api.app.services.admin_roster import (
+    AdminRosterError,
+    load_admin_roster_snapshot,
+    mutate_admin_roster,
+    public_roster_snapshot,
+)
+from apps.platform_api.app.services.mutation_idempotency import (
+    bind_mutation_idempotency_resource,
+    mutation_payload_fingerprint,
+    request_idempotency_key,
+    reserve_mutation_idempotency,
+)
+from apps.platform_api.app.services.tournament_runtime_cache import (
+    invalidate_tournament_runtime_caches,
 )
 
 router = APIRouter()
@@ -759,6 +781,213 @@ async def admin_list_tournaments(
         returned=len(serialized),
     )
     return serialized
+
+
+async def _admin_roster_response(
+    db_session: AsyncSession,
+    *,
+    tournament: Tournament,
+    role_slugs: list[str],
+) -> AdminRosterResponse:
+    snapshot = await load_admin_roster_snapshot(
+        db_session,
+        tournament=tournament,
+        role_slugs=role_slugs,
+    )
+    return AdminRosterResponse.model_validate(public_roster_snapshot(snapshot))
+
+
+async def _admin_roster_mutation(
+    request: Request,
+    *,
+    slug: str,
+    payload,
+    operation: str,
+    auth_session,
+    db_session: AsyncSession,
+) -> AdminRosterResponse:
+    ensure_admin_role(auth_session)
+
+    tournament = await db_session.scalar(
+        select(Tournament).where(Tournament.slug == slug)
+    )
+    if tournament is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+
+    payload_data = payload.model_dump(mode="json")
+    reservation = await reserve_mutation_idempotency(
+        db_session,
+        actor_user_id=auth_session.user.id,
+        scope=f"admin.tournament.roster:{tournament.id}:{operation}",
+        key=request_idempotency_key(request),
+        request_fingerprint=mutation_payload_fingerprint(
+            {
+                "tournament_id": tournament.id,
+                "operation": operation,
+                "payload": payload_data,
+            }
+        ),
+    )
+    if reservation is not None and reservation.replay:
+        if reservation.record.resource_id != tournament.id:
+            await db_session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The idempotency reservation has no matching tournament resource.",
+            )
+        return await _admin_roster_response(
+            db_session,
+            tournament=tournament,
+            role_slugs=list(auth_session.role_slugs),
+        )
+
+    try:
+        await mutate_admin_roster(
+            db_session,
+            tournament_id=tournament.id,
+            actor_user_id=auth_session.user.id,
+            role_slugs=auth_session.role_slugs,
+            operation=operation,
+            command=payload.model_dump(
+                exclude={"expected_state_version", "reason", "override"}
+            ),
+            expected_state_version=payload.expected_state_version,
+            reason=payload.reason.strip(),
+            override=payload.override,
+            now=auth_session.now,
+        )
+        bind_mutation_idempotency_resource(reservation, tournament.id)
+        await db_session.commit()
+    except AdminRosterError as exc:
+        await db_session.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        await db_session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The roster changed concurrently or violates a roster invariant.",
+        ) from exc
+
+    invalidate_tournament_runtime_caches(tournament.id)
+    await refresh_tournament_read_models(
+        tournament.id,
+        ("teams", "workspace_detail", "bracket_summary", "bracket_full"),
+    )
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
+    return await _admin_roster_response(
+        db_session,
+        tournament=tournament,
+        role_slugs=list(auth_session.role_slugs),
+    )
+
+
+@router.get("/tournaments/{slug}/roster", response_model=AdminRosterResponse)
+async def admin_get_tournament_roster(
+    slug: str,
+    auth_session=Depends(get_authenticated_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AdminRosterResponse:
+    ensure_admin_role(auth_session)
+    tournament = await db_session.scalar(
+        select(Tournament).where(Tournament.slug == slug)
+    )
+    if tournament is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+    return await _admin_roster_response(
+        db_session,
+        tournament=tournament,
+        role_slugs=list(auth_session.role_slugs),
+    )
+
+
+@router.post("/tournaments/{slug}/roster/add-player", response_model=AdminRosterResponse)
+async def admin_add_tournament_roster_player(
+    request: Request,
+    slug: str,
+    payload: AdminRosterAddPlayerRequest,
+    auth_session=Depends(get_authenticated_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AdminRosterResponse:
+    return await _admin_roster_mutation(
+        request,
+        slug=slug,
+        payload=payload,
+        operation="player_added",
+        auth_session=auth_session,
+        db_session=db_session,
+    )
+
+
+@router.post("/tournaments/{slug}/roster/remove-player", response_model=AdminRosterResponse)
+async def admin_remove_tournament_roster_player(
+    request: Request,
+    slug: str,
+    payload: AdminRosterRemovePlayerRequest,
+    auth_session=Depends(get_authenticated_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AdminRosterResponse:
+    return await _admin_roster_mutation(
+        request,
+        slug=slug,
+        payload=payload,
+        operation="player_removed",
+        auth_session=auth_session,
+        db_session=db_session,
+    )
+
+
+@router.post("/tournaments/{slug}/roster/move-player", response_model=AdminRosterResponse)
+async def admin_move_tournament_roster_player(
+    request: Request,
+    slug: str,
+    payload: AdminRosterMovePlayerRequest,
+    auth_session=Depends(get_authenticated_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AdminRosterResponse:
+    return await _admin_roster_mutation(
+        request,
+        slug=slug,
+        payload=payload,
+        operation="player_moved",
+        auth_session=auth_session,
+        db_session=db_session,
+    )
+
+
+@router.post("/tournaments/{slug}/roster/replace-player", response_model=AdminRosterResponse)
+async def admin_replace_tournament_roster_player(
+    request: Request,
+    slug: str,
+    payload: AdminRosterReplacePlayerRequest,
+    auth_session=Depends(get_authenticated_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AdminRosterResponse:
+    return await _admin_roster_mutation(
+        request,
+        slug=slug,
+        payload=payload,
+        operation="player_replaced",
+        auth_session=auth_session,
+        db_session=db_session,
+    )
+
+
+@router.post("/tournaments/{slug}/roster/change-captain", response_model=AdminRosterResponse)
+async def admin_change_tournament_roster_captain(
+    request: Request,
+    slug: str,
+    payload: AdminRosterChangeCaptainRequest,
+    auth_session=Depends(get_authenticated_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AdminRosterResponse:
+    return await _admin_roster_mutation(
+        request,
+        slug=slug,
+        payload=payload,
+        operation="captain_changed",
+        auth_session=auth_session,
+        db_session=db_session,
+    )
 
 
 @router.delete("/tournaments/{slug}", status_code=status.HTTP_204_NO_CONTENT)

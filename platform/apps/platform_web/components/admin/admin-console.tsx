@@ -21,6 +21,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useI18n } from "@/components/i18n-provider";
+import { AdminRosterPanel } from "@/components/admin/admin-roster";
 import {
   PlatformApiError,
   platformApiMessage,
@@ -966,6 +967,8 @@ function TournamentInspector({
       {tournament.admin_recovery_hint ? (
         <div className="admin-callout info"><SlidersHorizontal size={17} /><span>{tournament.admin_recovery_hint}</span></div>
       ) : null}
+
+      <AdminRosterPanel slug={currentTournament.slug} formatDate={formatDate} />
 
       <div className="admin-form-section">
         <div className="admin-section-title">{t("admin.overrideControls")}</div>

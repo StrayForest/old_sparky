@@ -1178,6 +1178,126 @@ class AdminTournamentDeleteRequest(BaseModel):
     note: str = Field(min_length=3, max_length=1000)
 
 
+class AdminRosterMemberResponse(BaseModel):
+    id: str
+    user_id: str
+    display_name: str
+    handle: str | None = None
+    participant_status: str | None = None
+    slot_number: int
+    roster_role: Literal["captain", "starter", "substitute"]
+    assigned_role: str | None = None
+    strength: float
+    rank: str | None = None
+    subrank: int | None = None
+
+
+class AdminRosterTeamResponse(BaseModel):
+    id: str
+    team_key: str
+    name: str
+    captain_user_id: str | None = None
+    starter_strength: float
+    starter_average_strength: float
+    members: list[AdminRosterMemberResponse] = Field(default_factory=list)
+
+
+class AdminRosterUnassignedParticipantResponse(BaseModel):
+    participant_id: str
+    user_id: str
+    display_name: str
+    handle: str | None = None
+    status: str | None = None
+    rank: str | None = None
+    subrank: int | None = None
+    playtime: str | None = None
+    strength: float | None = None
+
+
+class AdminRosterBracketResponse(BaseModel):
+    exists: bool = False
+    revision: int = 0
+    match_count: int = 0
+    started_count: int = 0
+    completed_count: int = 0
+
+
+class AdminRosterCapabilitiesResponse(BaseModel):
+    can_add_player: bool = False
+    can_remove_player: bool = False
+    can_move_player: bool = False
+    can_replace_player: bool = False
+    can_change_captain: bool = False
+    requires_override: bool = False
+    can_override: bool = False
+    blocked_reason: str | None = None
+
+
+class AdminRosterResponse(BaseModel):
+    tournament_id: str
+    tournament_slug: str
+    tournament_status: Literal[
+        "registration_open",
+        "registration_closed",
+        "in_progress",
+        "completed",
+        "cancelled",
+    ]
+    active_participant_count: int = 0
+    state_version: int
+    source_assignment_run_id: str | None = None
+    source_assignment_status: str | None = None
+    locked: bool = False
+    manually_modified: bool = False
+    last_modified_at: datetime | None = None
+    bracket: AdminRosterBracketResponse = Field(default_factory=AdminRosterBracketResponse)
+    teams: list[AdminRosterTeamResponse] = Field(default_factory=list)
+    unassigned_participants: list[AdminRosterUnassignedParticipantResponse] = Field(
+        default_factory=list
+    )
+    capabilities: AdminRosterCapabilitiesResponse = Field(
+        default_factory=AdminRosterCapabilitiesResponse
+    )
+
+
+class AdminRosterMutationRequest(BaseModel):
+    expected_state_version: int = Field(ge=0)
+    reason: str = Field(min_length=3, max_length=1000)
+    override: bool = False
+
+
+class AdminRosterAddPlayerRequest(AdminRosterMutationRequest):
+    team_key: str = Field(min_length=1, max_length=20)
+    user_id: str = Field(min_length=1, max_length=36)
+    slot_number: int = Field(ge=1, le=6)
+    assigned_role: Literal["Carry", "Semi-Carry", "Support", "Semi-Support"] | None = None
+
+
+class AdminRosterRemovePlayerRequest(AdminRosterMutationRequest):
+    team_key: str = Field(min_length=1, max_length=20)
+    user_id: str = Field(min_length=1, max_length=36)
+
+
+class AdminRosterMovePlayerRequest(AdminRosterMutationRequest):
+    team_key: str = Field(min_length=1, max_length=20)
+    user_id: str = Field(min_length=1, max_length=36)
+    destination_team_key: str = Field(min_length=1, max_length=20)
+    destination_slot: int = Field(ge=1, le=6)
+
+
+class AdminRosterReplacePlayerRequest(AdminRosterMutationRequest):
+    team_key: str = Field(min_length=1, max_length=20)
+    slot_number: int = Field(ge=0, le=6)
+    replacement_user_id: str = Field(min_length=1, max_length=36)
+    assigned_role: Literal["Carry", "Semi-Carry", "Support", "Semi-Support"] | None = None
+
+
+class AdminRosterChangeCaptainRequest(AdminRosterMutationRequest):
+    team_key: str = Field(min_length=1, max_length=20)
+    user_id: str = Field(min_length=1, max_length=36)
+    assigned_role: Literal["Carry", "Semi-Carry", "Support", "Semi-Support"] | None = None
+
+
 class AdminPreprodTestRunResponse(BaseModel):
     marker: str
     status: str

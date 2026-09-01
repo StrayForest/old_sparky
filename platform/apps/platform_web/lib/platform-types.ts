@@ -275,6 +275,74 @@ export type PlatformAdminTournament = PlatformTournament & {
   admin_recovery_hint: string | null;
 };
 
+export type PlatformAdminRosterMember = {
+  id: string;
+  user_id: string;
+  display_name: string;
+  handle: string | null;
+  participant_status: string | null;
+  slot_number: number;
+  roster_role: "captain" | "starter" | "substitute";
+  assigned_role: string | null;
+  strength: number;
+  rank: string | null;
+  subrank: number | null;
+};
+
+export type PlatformAdminRosterTeam = {
+  id: string;
+  team_key: string;
+  name: string;
+  captain_user_id: string | null;
+  starter_strength: number;
+  starter_average_strength: number;
+  members: PlatformAdminRosterMember[];
+};
+
+export type PlatformAdminRosterUnassignedParticipant = {
+  participant_id: string;
+  user_id: string;
+  display_name: string;
+  handle: string | null;
+  status: string | null;
+  rank: string | null;
+  subrank: number | null;
+  playtime: string | null;
+  strength: number | null;
+};
+
+export type PlatformAdminRoster = {
+  tournament_id: string;
+  tournament_slug: string;
+  tournament_status: string;
+  active_participant_count: number;
+  state_version: number;
+  source_assignment_run_id: string | null;
+  source_assignment_status: string | null;
+  locked: boolean;
+  manually_modified: boolean;
+  last_modified_at: string | null;
+  bracket: {
+    exists: boolean;
+    revision: number;
+    match_count: number;
+    started_count: number;
+    completed_count: number;
+  };
+  teams: PlatformAdminRosterTeam[];
+  unassigned_participants: PlatformAdminRosterUnassignedParticipant[];
+  capabilities: {
+    can_add_player: boolean;
+    can_remove_player: boolean;
+    can_move_player: boolean;
+    can_replace_player: boolean;
+    can_change_captain: boolean;
+    requires_override: boolean;
+    can_override: boolean;
+    blocked_reason: string | null;
+  };
+};
+
 export type PlatformTournamentParticipant = {
   id: string;
   tournament_id: string;

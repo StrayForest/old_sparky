@@ -175,6 +175,7 @@ from apps.platform_api.app.services.tournament_teams import (
     load_tournament_team_state,
     materialize_assignment_run_teams,
 )
+from apps.platform_api.app.services.tournament_versions import tournament_state_version
 from apps.platform_api.app.services.tournament_participant_capacity import (
     PARTICIPANT_SLOT_MATERIALIZATION_LIMIT,
     claim_participant_slot,
@@ -387,20 +388,6 @@ def bracket_capabilities(
             can_manage_matches
             and tournament_status in {"registration_closed", "in_progress"}
         ),
-    )
-
-
-def tournament_state_version(
-    tournament: Tournament,
-    *,
-    participant_count: int = 0,
-) -> int:
-    updated_at = tournament.updated_at or tournament.created_at
-    updated_ms = int(updated_at.timestamp() * 1000) if updated_at is not None else 0
-    return (
-        updated_ms
-        + int(tournament.bracket_revision or 0) * 1_000_000
-        + max(0, int(participant_count))
     )
 
 
