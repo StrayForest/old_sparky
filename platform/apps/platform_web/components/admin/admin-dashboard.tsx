@@ -5,7 +5,6 @@ import {
   AlertTriangle,
   BarChart3,
   Bot,
-  CheckCircle2,
   Clock3,
   Gauge,
   GitBranch,
