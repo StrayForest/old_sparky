@@ -19,11 +19,9 @@ function tournament(id: string, name: string, status: string) {
   };
 }
 
-function pagedHeaders(total = 1, limit = 9, offset = 0) {
+function pagedHeaders(limit = 9) {
   return {
-    "X-Total-Count": String(total),
     "X-Limit": String(limit),
-    "X-Offset": String(offset),
     "X-Has-More": "false"
   };
 }

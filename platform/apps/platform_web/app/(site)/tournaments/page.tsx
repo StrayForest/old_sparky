@@ -9,7 +9,10 @@ export const metadata: Metadata = {
 };
 
 export default async function TournamentsPage() {
-  const initialPage = await getTournamentSummaries({ limit: 9, offset: 0 });
+  const initialPage = await getTournamentSummaries(
+    { limit: 9 },
+    { revalidateSeconds: 15 },
+  );
 
   return (
     <>

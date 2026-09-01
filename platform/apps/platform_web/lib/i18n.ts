@@ -902,7 +902,7 @@ const translations: Record<string, string> = {
     "tournaments.inviteClaimFailed": "Не удалось открыть турнир по этому коду.",
     "tournaments.search": "Поиск",
     "tournaments.searchPlaceholder": "Название турнира/организатора",
-    "tournaments.showingCount": "Показано {count} из {total} турниров",
+    "tournaments.showingCount": "Показано {count} турниров",
     "tournaments.signInForMine": "Войди, чтобы увидеть приватные и свои турниры.",
     "tournaments.statusFilter": "Статус",
     "tournaments.dateSort": "Дата начала",

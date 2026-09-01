@@ -88,10 +88,11 @@ workflow state, idempotency and concurrency. The active load gate is the
 supported SLO profile, sustained capacity ramp, separate 15k stress profile
 and explicit spike/recovery profile, each followed by exact cleanup.
 
-The tournament catalog and bracket grid are request-driven. The initial
-workspace includes the bracket, passive changes become visible after a manual
-page reload, and explicit organizer mutations may refresh their own
-authoritative result.
+The tournament catalog and bracket grid are request-driven. The public catalog
+uses cursor/keyset pages with a short edge cache; `/tournaments/mine`
+remains private and uncached. The initial workspace includes the bracket,
+passive changes become visible after a manual page reload, and explicit
+organizer mutations may refresh their own authoritative result.
 
 The current load-test gate is request-based and is defined by the reviewed
 profiles under `platform/performance/profiles/`: read profiles measure

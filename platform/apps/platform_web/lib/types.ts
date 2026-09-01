@@ -58,10 +58,9 @@ export type TournamentSummary = {
 
 export type TournamentPage = {
   items: TournamentSummary[];
-  total: number;
   limit: number;
-  offset: number;
   hasMore: boolean;
+  nextCursor: string | null;
 };
 
 export type TournamentListQuery = {
@@ -71,7 +70,7 @@ export type TournamentListQuery = {
   rank?: string;
   dateSort?: Exclude<TournamentDateSort, "none">;
   limit?: number;
-  offset?: number;
+  cursor?: string;
 };
 
 export type TournamentSchedule = {

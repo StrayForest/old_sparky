@@ -67,8 +67,11 @@ header selection is their only reviewed source delta.
 The proxy matcher owns HTML documents only. API, RSC, Next static, local asset
 and discovery responses have no CSP or Reporting-Endpoints header. Nginx keeps
 document proxy caching off and returns `Cache-Control: private, no-store`; API
-responses are also uncached/no-store. Fingerprinted Next/static and local asset
-responses remain separately owned immutable cache objects and CSP-free.
+responses are also uncached/no-store except the explicitly public, short-TTL
+tournament catalog. Its cursor pages are safe to cache because they do not
+depend on a visitor session; `/tournaments/mine` remains private/no-store.
+Fingerprinted Next/static and local asset responses remain separately owned
+immutable cache objects and CSP-free.
 Cloudflare must not enable Cache Everything on the apex or otherwise cache
 nonce-bearing HTML.
 

@@ -225,7 +225,8 @@ function tournamentPage(url) {
   const ranks = url.searchParams.getAll("rank");
   const dateSort = url.searchParams.get("date_sort");
   const limit = Math.max(1, Number(url.searchParams.get("limit") ?? 9));
-  const offset = Math.max(0, Number(url.searchParams.get("offset") ?? 0));
+  const cursor = url.searchParams.get("cursor");
+  const start = cursor ? Math.max(0, Number(cursor)) : 0;
   let items = tournaments.filter((tournament) => (
     (!status || tournament.status === status)
     && (!search || `${tournament.name} ${tournament.organizer_display_name}`.toLowerCase().includes(search))
@@ -237,7 +238,11 @@ function tournamentPage(url) {
       return dateSort === "nearest" ? order : -order;
     });
   }
-  return { items: items.slice(offset, offset + limit), total: items.length, limit, offset };
+  const pageItems = items.slice(start, start + limit);
+  const nextCursor = start + pageItems.length < items.length
+    ? String(start + pageItems.length)
+    : null;
+  return { items: pageItems, limit, hasMore: nextCursor !== null, nextCursor };
 }
 
 function bracketPayload(slug, canManage = false, includeTeams = true) {
@@ -551,10 +556,9 @@ const server = createServer((request, response) => {
   if ((path === "/api/v1/tournaments" || path === "/api/v1/tournaments/mine") && request.method === "GET") {
     const page = tournamentPage(url);
     json(response, 200, page.items, {
-      "x-total-count": String(page.total),
       "x-limit": String(page.limit),
-      "x-offset": String(page.offset),
-      "x-has-more": String(page.offset + page.items.length < page.total)
+      "x-has-more": String(page.hasMore),
+      ...(page.nextCursor ? { "x-next-cursor": page.nextCursor } : {})
     });
     return;
   }

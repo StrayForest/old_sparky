@@ -18,6 +18,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from python_packages.platform_infra.db import Base
@@ -548,7 +549,7 @@ class Tournament(TimestampMixin, Base):
     visibility: Mapped[str] = mapped_column(String(20), default="public")
     status: Mapped[str] = mapped_column(String(20), default="registration_closed")
     format_slug: Mapped[str] = mapped_column(String(64))
-    allowed_ranks: Mapped[list[str]] = mapped_column(JSON, default=list)
+    allowed_ranks: Mapped[list[str]] = mapped_column(JSONB, default=list)
     max_participants: Mapped[int | None] = mapped_column(Integer, nullable=True)
     registration_starts_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

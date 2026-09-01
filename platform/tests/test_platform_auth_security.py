@@ -165,7 +165,7 @@ class AuthSecurityUnitTests(unittest.IsolatedAsyncioTestCase):
                 return Response(
                     headers={
                         "Access-Control-Expose-Headers": (
-                            "X-Total-Count, X-Limit, X-Offset, X-Has-More"
+                            "X-Total-Count, X-Limit, X-Offset, X-Has-More, X-Next-Cursor"
                         ),
                         "X-Total-Count": "1",
                         "X-Limit": "25",
@@ -208,6 +208,7 @@ class AuthSecurityUnitTests(unittest.IsolatedAsyncioTestCase):
                 "x-limit",
                 "x-offset",
                 "x-has-more",
+                "x-next-cursor",
                 "retry-after",
             },
         )

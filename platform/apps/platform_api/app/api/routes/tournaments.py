@@ -15,17 +15,21 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
-from sqlalchemy import Select, and_, cast, delete, func, or_, select, union
+from sqlalchemy import Select, and_, delete, func, or_, select, tuple_, union
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from apps.platform_api.app.api.pagination import (
+    CursorDecodeError,
     PARTICIPANT_LIST_DEFAULT_LIMIT,
     PARTICIPANT_LIST_MAX_LIMIT,
     TOURNAMENT_LIST_DEFAULT_LIMIT,
     TOURNAMENT_LIST_MAX_LIMIT,
+    decode_cursor,
+    encode_cursor,
+    set_cursor_pagination_headers,
     set_pagination_headers,
 )
 from apps.platform_api.app.api.schemas import (
@@ -347,7 +351,8 @@ INACTIVE_PARTICIPANT_STATUSES = ("withdrawn", "disqualified")
 DEFAULT_TOURNAMENT_COVER_URL = (
     "/assets/tournament-covers/tournament-cover-template-1-v1.webp"
 )
-PAGINATION_EXPOSE_HEADERS = "X-Total-Count, X-Limit, X-Offset, X-Has-More"
+PAGINATION_EXPOSE_HEADERS = "X-Limit, X-Has-More, X-Next-Cursor"
+TOURNAMENT_CURSOR_VERSION = 1
 READY_CHECK_STATE_CACHE_TTL_SECONDS = 30.0
 READY_CHECK_STATE_CACHE_MAX_ENTRIES = 128
 PARTICIPANT_PAGE_CACHE_TTL_SECONDS = 30.0
@@ -2520,6 +2525,154 @@ async def invite_code_is_available(db_session: AsyncSession, code: str) -> bool:
     return existing is None
 
 
+def tournament_cursor_sort(
+    *,
+    participants_sort: str | None = None,
+    date_sort: str | None = None,
+) -> str:
+    if participants_sort in {"asc", "desc"}:
+        return f"participants_{participants_sort}"
+    if date_sort in {"nearest", "farthest"}:
+        return f"starts_{date_sort}"
+    return "created_desc"
+
+
+def _cursor_datetime(payload: dict[str, Any], key: str, *, allow_none: bool = False) -> datetime | None:
+    value = payload.get(key)
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str):
+        raise CursorDecodeError(f"Cursor field {key!r} is invalid.")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise CursorDecodeError(f"Cursor field {key!r} is invalid.") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise CursorDecodeError(f"Cursor field {key!r} must include a timezone.")
+    return parsed
+
+
+def decode_tournament_cursor(cursor: str | None, *, sort_key: str) -> dict[str, Any] | None:
+    if cursor is None:
+        return None
+    try:
+        payload = decode_cursor(cursor)
+        if payload.get("v") != TOURNAMENT_CURSOR_VERSION:
+            raise CursorDecodeError("Cursor version is unsupported.")
+        if payload.get("sort") != sort_key:
+            raise CursorDecodeError("Cursor does not match the requested sort.")
+        cursor_id = payload.get("id")
+        if not isinstance(cursor_id, str) or not cursor_id:
+            raise CursorDecodeError("Cursor id is invalid.")
+        _cursor_datetime(payload, "created_at")
+        if sort_key.startswith("starts_"):
+            _cursor_datetime(payload, "starts_at", allow_none=True)
+        elif sort_key.startswith("participants_"):
+            participant_count = payload.get("participant_count")
+            if isinstance(participant_count, bool) or not isinstance(participant_count, int) or participant_count < 0:
+                raise CursorDecodeError("Cursor participant count is invalid.")
+        return payload
+    except CursorDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid tournament pagination cursor.",
+        ) from exc
+
+
+def encode_tournament_cursor(
+    tournament: Tournament,
+    *,
+    sort_key: str,
+    participant_count: int | None = None,
+) -> str:
+    payload: dict[str, object] = {
+        "v": TOURNAMENT_CURSOR_VERSION,
+        "sort": sort_key,
+        "id": tournament.id,
+        "created_at": tournament.created_at.isoformat(),
+    }
+    if sort_key.startswith("starts_"):
+        payload["starts_at"] = tournament.starts_at.isoformat() if tournament.starts_at else None
+    elif sort_key.startswith("participants_"):
+        if participant_count is None:
+            raise ValueError("Participant count is required for participant cursors.")
+        payload["participant_count"] = participant_count
+    return encode_cursor(payload)
+
+
+def tournament_cursor_filter(
+    cursor: dict[str, Any] | None,
+    *,
+    sort_key: str,
+    participant_count_for_sort=None,
+):
+    if cursor is None:
+        return None
+
+    created_at = _cursor_datetime(cursor, "created_at")
+    assert created_at is not None
+    cursor_id = cursor["id"]
+    created_and_id = tuple_(Tournament.created_at, Tournament.id)
+    cursor_created_and_id = tuple_(created_at, cursor_id)
+    if sort_key == "created_desc":
+        return created_and_id < cursor_created_and_id
+
+    if sort_key.startswith("starts_"):
+        starts_at = _cursor_datetime(cursor, "starts_at", allow_none=True)
+        if starts_at is None:
+            return and_(
+                Tournament.starts_at.is_(None),
+                created_and_id < cursor_created_and_id,
+            )
+        same_position = and_(
+            Tournament.starts_at == starts_at,
+            created_and_id < cursor_created_and_id,
+        )
+        if sort_key == "starts_nearest":
+            return or_(
+                Tournament.starts_at > starts_at,
+                Tournament.starts_at.is_(None),
+                same_position,
+            )
+        return or_(
+            Tournament.starts_at < starts_at,
+            Tournament.starts_at.is_(None),
+            same_position,
+        )
+
+    participant_count = cursor["participant_count"]
+    assert participant_count_for_sort is not None
+    same_position = and_(
+        participant_count_for_sort == participant_count,
+        created_and_id < cursor_created_and_id,
+    )
+    if sort_key == "participants_asc":
+        return or_(participant_count_for_sort > participant_count, same_position)
+    return or_(participant_count_for_sort < participant_count, same_position)
+
+
+def tournament_search_filter(search: str | None):
+    normalized_search = search.strip() if isinstance(search, str) else ""
+    if not normalized_search:
+        return None
+    search_pattern = f"%{normalized_search.lower()}%"
+    return or_(
+        func.lower(Tournament.name).like(search_pattern),
+        func.lower(User.display_name).like(search_pattern),
+    )
+
+
+def tournament_allowed_rank_filter(rank: Sequence[str]):
+    allowed_rank_filter = normalize_tournament_allowed_ranks(rank)
+    if not allowed_rank_filter:
+        return None
+    return or_(
+        Tournament.allowed_ranks.is_(None),
+        func.jsonb_array_length(Tournament.allowed_ranks) == 0,
+        Tournament.allowed_ranks.has_any(postgresql.array(list(allowed_rank_filter))),
+    )
+
+
 @router.get("", response_model=list[TournamentResponse])
 async def list_tournaments(
     response: Response,
@@ -2538,48 +2691,24 @@ async def list_tournaments(
         ge=1,
         le=TOURNAMENT_LIST_MAX_LIMIT,
     ),
-    offset: int = Query(default=0, ge=0),
+    cursor: str | None = Query(default=None, max_length=2048),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> list[TournamentResponse]:
     filters = [
         Tournament.visibility == "public",
         Tournament.format_slug == SOLO_TOURNAMENT_FORMAT,
     ]
-    normalized_search = search.strip() if isinstance(search, str) else ""
-    if normalized_search:
-        search_pattern = f"%{normalized_search}%"
-        filters.append(
-            or_(
-                Tournament.name.ilike(search_pattern),
-                User.display_name.ilike(search_pattern),
-            )
-        )
+    search_filter = tournament_search_filter(search)
+    if search_filter is not None:
+        filters.append(search_filter)
     if open_registration:
         filters.append(Tournament.status == "registration_open")
     if status_filter:
         filters.append(Tournament.status == status_filter)
 
-    allowed_rank_filter = normalize_tournament_allowed_ranks(rank)
-    if allowed_rank_filter:
-        filters.append(
-            or_(
-                Tournament.allowed_ranks.is_(None),
-                func.json_array_length(Tournament.allowed_ranks) == 0,
-                cast(Tournament.allowed_ranks, postgresql.JSONB).has_any(
-                    postgresql.array(list(allowed_rank_filter))
-                ),
-            )
-        )
-
-    total = int(
-        await db_session.scalar(
-            select(func.count())
-            .select_from(Tournament)
-            .join(User, User.id == Tournament.organizer_user_id)
-            .where(*filters)
-        )
-        or 0
-    )
+    rank_filter = tournament_allowed_rank_filter(rank)
+    if rank_filter is not None:
+        filters.append(rank_filter)
 
     participant_count_for_sort = (
         select(func.count(TournamentParticipant.id))
@@ -2599,6 +2728,18 @@ async def list_tournaments(
         .join(User, User.id == Tournament.organizer_user_id)
         .where(*filters)
     )
+    sort_key = tournament_cursor_sort(
+        participants_sort=participants_sort,
+        date_sort=date_sort,
+    )
+    decoded_cursor = decode_tournament_cursor(cursor, sort_key=sort_key)
+    cursor_filter = tournament_cursor_filter(
+        decoded_cursor,
+        sort_key=sort_key,
+        participant_count_for_sort=participant_count_for_sort,
+    )
+    if cursor_filter is not None:
+        page_stmt = page_stmt.where(cursor_filter)
     if participants_sort == "asc":
         page_stmt = page_stmt.add_columns(
             participant_count_for_sort.label("participant_sort_count")
@@ -2629,7 +2770,7 @@ async def list_tournaments(
         )
     else:
         page_stmt = page_stmt.order_by(Tournament.created_at.desc(), Tournament.id.desc())
-    tournament_page = page_stmt.limit(limit).offset(offset).cte("tournament_page")
+    tournament_page = page_stmt.limit(limit + 1).cte("tournament_page")
 
     stmt = tournament_with_counts_stmt(tournament_page)
     if participants_sort == "asc":
@@ -2660,6 +2801,9 @@ async def list_tournaments(
         stmt = stmt.order_by(tournament_page.c.created_at.desc(), tournament_page.c.id.desc())
 
     rows = (await db_session.execute(stmt)).all()
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
     media_descriptors = await load_media_descriptors(
         db_session,
         tuple(
@@ -2689,13 +2833,22 @@ async def list_tournaments(
             locked_roster_count,
         ) in rows
     ]
-    set_pagination_headers(
-        response,
-        total=total,
-        limit=limit,
-        offset=offset,
-        returned=len(serialized),
+    next_cursor = (
+        encode_tournament_cursor(
+            rows[-1][0],
+            sort_key=sort_key,
+            participant_count=int(rows[-1][3]) if sort_key.startswith("participants_") else None,
+        )
+        if has_more and rows
+        else None
     )
+    set_cursor_pagination_headers(
+        response,
+        limit=limit,
+        has_more=has_more,
+        next_cursor=next_cursor,
+    )
+    response.headers["Cache-Control"] = "public, max-age=5, s-maxage=15, stale-while-revalidate=30"
     response.headers["Access-Control-Expose-Headers"] = PAGINATION_EXPOSE_HEADERS
     return serialized
 
@@ -2721,7 +2874,7 @@ async def list_my_tournaments(
         ge=1,
         le=TOURNAMENT_LIST_MAX_LIMIT,
     ),
-    offset: int = Query(default=0, ge=0),
+    cursor: str | None = Query(default=None, max_length=2048),
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> list[TournamentResponse]:
@@ -2747,39 +2900,17 @@ async def list_my_tournaments(
     elif scope_filter == "registered":
         filters.append(current_participant_status.is_not(None))
 
-    normalized_search = (search or "").strip()
-    if normalized_search:
-        search_pattern = f"%{normalized_search}%"
-        filters.append(
-            or_(
-                Tournament.name.ilike(search_pattern),
-                User.display_name.ilike(search_pattern),
-            )
-        )
+    search_filter = tournament_search_filter(search)
+    if search_filter is not None:
+        filters.append(search_filter)
     if status_filter:
         filters.append(Tournament.status == status_filter)
 
-    allowed_rank_filter = normalize_tournament_allowed_ranks(rank)
-    if allowed_rank_filter:
-        filters.append(
-            or_(
-                Tournament.allowed_ranks.is_(None),
-                func.json_array_length(Tournament.allowed_ranks) == 0,
-                cast(Tournament.allowed_ranks, postgresql.JSONB).has_any(
-                    postgresql.array(list(allowed_rank_filter))
-                ),
-            )
-        )
-
-    total = int(
-        await db_session.scalar(
-            select(func.count())
-            .select_from(Tournament)
-            .join(User, User.id == Tournament.organizer_user_id)
-            .where(*filters)
-        )
-        or 0
-    )
+    rank_filter = tournament_allowed_rank_filter(rank)
+    if rank_filter is not None:
+        filters.append(rank_filter)
+    sort_key = tournament_cursor_sort(date_sort=date_sort)
+    decoded_cursor = decode_tournament_cursor(cursor, sort_key=sort_key)
     page_stmt = (
         select(
             Tournament.id.label("id"),
@@ -2790,6 +2921,9 @@ async def list_my_tournaments(
         .join(User, User.id == Tournament.organizer_user_id)
         .where(*filters)
     )
+    cursor_filter = tournament_cursor_filter(decoded_cursor, sort_key=sort_key)
+    if cursor_filter is not None:
+        page_stmt = page_stmt.where(cursor_filter)
     if date_sort == "nearest":
         page_stmt = page_stmt.order_by(
             Tournament.starts_at.asc().nulls_last(),
@@ -2804,7 +2938,7 @@ async def list_my_tournaments(
         )
     else:
         page_stmt = page_stmt.order_by(Tournament.created_at.desc(), Tournament.id.desc())
-    tournament_page = page_stmt.limit(limit).offset(offset).cte("tournament_page")
+    tournament_page = page_stmt.limit(limit + 1).cte("tournament_page")
 
     stmt = tournament_with_counts_stmt(tournament_page).add_columns(
         tournament_page.c.current_user_participant_status,
@@ -2824,9 +2958,10 @@ async def list_my_tournaments(
     else:
         stmt = stmt.order_by(tournament_page.c.created_at.desc(), tournament_page.c.id.desc())
 
-    rows = (
-        await db_session.execute(stmt)
-    ).all()
+    rows = (await db_session.execute(stmt)).all()
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
     media_descriptors = await load_media_descriptors(
         db_session,
         tuple(
@@ -2858,13 +2993,18 @@ async def list_my_tournaments(
             current_user_participant_status,
         ) in rows
     ]
-    set_pagination_headers(
-        response,
-        total=total,
-        limit=limit,
-        offset=offset,
-        returned=len(serialized),
+    next_cursor = (
+        encode_tournament_cursor(rows[-1][0], sort_key=sort_key)
+        if has_more and rows
+        else None
     )
+    set_cursor_pagination_headers(
+        response,
+        limit=limit,
+        has_more=has_more,
+        next_cursor=next_cursor,
+    )
+    response.headers["Cache-Control"] = "private, no-store"
     response.headers["Access-Control-Expose-Headers"] = PAGINATION_EXPOSE_HEADERS
     return serialized
 

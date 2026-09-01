@@ -13,6 +13,7 @@ from apps.platform_api.app.api.pagination import (
     PARTICIPANT_LIST_MAX_LIMIT,
     TOURNAMENT_LIST_DEFAULT_LIMIT,
     TOURNAMENT_LIST_MAX_LIMIT,
+    encode_cursor,
     set_pagination_headers,
 )
 from apps.platform_api.app.api.routes.admin import admin_list_tournaments
@@ -37,7 +38,7 @@ def empty_result() -> Mock:
     return result
 
 
-def tournament_result() -> Mock:
+def tournament_result(row_count: int = 1) -> Mock:
     tournament = Tournament(
         id="tournament-1",
         slug="night-cup",
@@ -69,9 +70,7 @@ def tournament_result() -> Mock:
         created_at=datetime(2026, 6, 13, tzinfo=UTC),
     )
     result = Mock()
-    result.all.return_value = [
-        (tournament, "Organizer", None, 7, 0)
-    ]
+    result.all.return_value = [(tournament, "Organizer", None, 7, 0)] * row_count
     return result
 
 
@@ -98,7 +97,7 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_public_list_filters_and_sorts_before_page_aggregation(self) -> None:
         db_session = Mock()
-        db_session.scalar = AsyncMock(return_value=25)
+        db_session.scalar = AsyncMock()
         db_session.execute = AsyncMock(return_value=tournament_result())
         response = Response()
 
@@ -111,7 +110,7 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
             participants_sort="desc",
             date_sort=None,
             limit=9,
-            offset=9,
+            cursor=None,
             db_session=db_session,
         )
 
@@ -119,26 +118,29 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(payload[0], TournamentResponse)
         self.assertEqual(payload[0].slug, "night-cup")
         self.assertIsNone(payload[0].organizer_avatar_url)
-        self.assertEqual(db_session.scalar.await_count, 1)
+        self.assertEqual(db_session.scalar.await_count, 0)
         self.assertEqual(db_session.execute.await_count, 1)
-        self.assertEqual(response.headers["X-Total-Count"], "25")
         self.assertEqual(response.headers["X-Limit"], "9")
-        self.assertEqual(response.headers["X-Offset"], "9")
-        self.assertEqual(response.headers["X-Has-More"], "true")
+        self.assertEqual(response.headers["X-Has-More"], "false")
+        self.assertEqual(
+            response.headers["Cache-Control"],
+            "public, max-age=5, s-maxage=15, stale-while-revalidate=30",
+        )
+        self.assertNotIn("X-Total-Count", response.headers)
+        self.assertNotIn("X-Offset", response.headers)
         self.assertIn(
-            "X-Total-Count",
+            "X-Next-Cursor",
             response.headers["Access-Control-Expose-Headers"],
         )
 
-        count_sql = compiled_sql(db_session.scalar.await_args.args[0])
         page_sql = compiled_sql(db_session.execute.await_args.args[0])
-        self.assertIn("platform.tournaments.name ILIKE", count_sql)
-        self.assertIn("platform.users.display_name ILIKE", count_sql)
-        self.assertIn("platform.tournaments.status =", count_sql)
-        self.assertIn("CAST(platform.tournaments.allowed_ranks AS JSONB) ?| ARRAY", count_sql)
+        self.assertIn("lower(platform.tournaments.name) LIKE", page_sql)
+        self.assertIn("lower(platform.users.display_name) LIKE", page_sql)
+        self.assertIn("platform.tournaments.status =", page_sql)
+        self.assertIn("platform.tournaments.allowed_ranks ?| ARRAY", page_sql)
         self.assertIn("WITH tournament_page AS", page_sql)
         self.assertIn("LIMIT", page_sql)
-        self.assertIn("OFFSET", page_sql)
+        self.assertNotIn("OFFSET", page_sql)
         self.assertIn("participant_sort_count", page_sql)
         self.assertIn(
             "platform.tournament_participants.tournament_id IN "
@@ -158,7 +160,7 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_public_status_and_date_sort_apply_before_pagination(self) -> None:
         db_session = Mock()
-        db_session.scalar = AsyncMock(return_value=4)
+        db_session.scalar = AsyncMock()
         db_session.execute = AsyncMock(return_value=empty_result())
         response = Response()
 
@@ -171,23 +173,23 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
             participants_sort=None,
             date_sort="farthest",
             limit=2,
-            offset=0,
+            cursor=None,
             db_session=db_session,
         )
 
         self.assertEqual(payload, [])
-        count_sql = compiled_sql(db_session.scalar.await_args.args[0])
         page_sql = compiled_sql(db_session.execute.await_args.args[0])
-        self.assertIn("platform.tournaments.status =", count_sql)
+        self.assertEqual(db_session.scalar.await_count, 0)
+        self.assertIn("platform.tournaments.status =", page_sql)
         self.assertIn(
             "ORDER BY tournament_page.starts_at DESC NULLS LAST, "
             "tournament_page.created_at DESC, tournament_page.id DESC",
             page_sql,
         )
 
-    async def test_mine_uses_one_count_and_one_page_query(self) -> None:
+    async def test_mine_uses_one_page_query(self) -> None:
         db_session = Mock()
-        db_session.scalar = AsyncMock(return_value=6)
+        db_session.scalar = AsyncMock()
         db_session.execute = AsyncMock(return_value=empty_result())
         response = Response()
         auth_session = SimpleNamespace(
@@ -203,29 +205,30 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
             status_filter="registration_open",
             date_sort="nearest",
             limit=2,
-            offset=2,
+            cursor=None,
             auth_session=auth_session,
             db_session=db_session,
         )
 
         self.assertEqual(payload, [])
-        self.assertEqual(db_session.scalar.await_count, 1)
+        self.assertEqual(db_session.scalar.await_count, 0)
         self.assertEqual(db_session.execute.await_count, 1)
         db_session.scalars.assert_not_called()
-        self.assertEqual(response.headers["X-Has-More"], "true")
+        self.assertEqual(response.headers["X-Has-More"], "false")
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
         self.assertIn(
             "X-Has-More",
             response.headers["Access-Control-Expose-Headers"],
         )
 
-        count_sql = compiled_sql(db_session.scalar.await_args.args[0])
         page_sql = compiled_sql(db_session.execute.await_args.args[0])
-        self.assertIn("platform.tournament_participants.status", count_sql)
-        self.assertIn("platform.tournaments.name ILIKE", count_sql)
-        self.assertIn("platform.users.display_name ILIKE", count_sql)
-        self.assertIn("platform.tournaments.status =", count_sql)
-        self.assertIn("CAST(platform.tournaments.allowed_ranks AS JSONB) ?| ARRAY", count_sql)
+        self.assertIn("platform.tournament_participants.status", page_sql)
+        self.assertIn("lower(platform.tournaments.name) LIKE", page_sql)
+        self.assertIn("lower(platform.users.display_name) LIKE", page_sql)
+        self.assertIn("platform.tournaments.status =", page_sql)
+        self.assertIn("platform.tournaments.allowed_ranks ?| ARRAY", page_sql)
         self.assertIn("WITH tournament_page AS", page_sql)
+        self.assertNotIn("OFFSET", page_sql)
         self.assertIn("current_user_participant_status", page_sql)
         self.assertIn(
             "ORDER BY tournament_page.starts_at ASC NULLS LAST, "
@@ -325,6 +328,63 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
             "platform.tournament_participants.id ASC",
             page_sql,
         )
+
+    async def test_public_cursor_filters_after_the_last_created_tournament(self) -> None:
+        db_session = Mock()
+        db_session.execute = AsyncMock(return_value=empty_result())
+        response = Response()
+        cursor = encode_cursor(
+            {
+                "v": 1,
+                "sort": "created_desc",
+                "id": "tournament-1",
+                "created_at": "2026-06-13T00:00:00+00:00",
+            }
+        )
+
+        await list_tournaments(
+            response=response,
+            search=None,
+            rank=[],
+            open_registration=False,
+            status_filter=None,
+            participants_sort=None,
+            date_sort=None,
+            limit=9,
+            cursor=cursor,
+            db_session=db_session,
+        )
+
+        page_sql = compiled_sql(db_session.execute.await_args.args[0])
+        self.assertIn(
+            "(platform.tournaments.created_at, platform.tournaments.id) <",
+            page_sql,
+        )
+        self.assertNotIn("OFFSET", page_sql)
+
+    async def test_public_list_uses_an_extra_row_to_detect_more(self) -> None:
+        db_session = Mock()
+        db_session.scalar = AsyncMock()
+        db_session.execute = AsyncMock(return_value=tournament_result(row_count=2))
+        response = Response()
+
+        payload = await list_tournaments(
+            response=response,
+            search=None,
+            rank=[],
+            open_registration=False,
+            status_filter=None,
+            participants_sort=None,
+            date_sort=None,
+            limit=1,
+            cursor=None,
+            db_session=db_session,
+        )
+
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(response.headers["X-Has-More"], "true")
+        self.assertTrue(response.headers.get("X-Next-Cursor"))
+        self.assertEqual(db_session.scalar.await_count, 0)
 
 
 if __name__ == "__main__":

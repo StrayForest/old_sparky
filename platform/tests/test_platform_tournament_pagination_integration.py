@@ -65,7 +65,6 @@ class PlatformTournamentPaginationIntegrationTests(unittest.IsolatedAsyncioTestC
                     ("search", self.prefix),
                     ("rank", "Oracle"),
                     ("limit", "2"),
-                    ("offset", "0"),
                 ],
             )
             second = await client.get(
@@ -74,7 +73,7 @@ class PlatformTournamentPaginationIntegrationTests(unittest.IsolatedAsyncioTestC
                     ("search", self.prefix),
                     ("rank", "Oracle"),
                     ("limit", "2"),
-                    ("offset", "2"),
+                    ("cursor", first.headers.get("X-Next-Cursor", "")),
                 ],
             )
             invalid = await client.get("/api/v1/tournaments", params={"limit": "101"})
@@ -82,10 +81,10 @@ class PlatformTournamentPaginationIntegrationTests(unittest.IsolatedAsyncioTestC
         self.assertEqual(first.status_code, 200, first.text)
         self.assertEqual(second.status_code, 200, second.text)
         self.assertEqual(invalid.status_code, 422, invalid.text)
-        self.assertEqual(first.headers["X-Total-Count"], "3")
         self.assertEqual(first.headers["X-Has-More"], "true")
-        self.assertEqual(second.headers["X-Total-Count"], "3")
         self.assertEqual(second.headers["X-Has-More"], "false")
+        self.assertNotIn("X-Total-Count", first.headers)
+        self.assertNotIn("X-Offset", second.headers)
 
         first_slugs = [item["slug"] for item in first.json()]
         second_slugs = [item["slug"] for item in second.json()]

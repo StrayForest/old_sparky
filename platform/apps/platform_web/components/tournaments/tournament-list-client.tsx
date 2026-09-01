@@ -50,7 +50,6 @@ export function TournamentListClient({ initialPage }: TournamentListClientProps)
       filters.rank,
       filters.dateSort,
       debouncedSearch,
-      0
     ),
     [debouncedSearch, filters.dateSort, filters.rank, filters.scope, filters.status]
   );
@@ -126,7 +125,7 @@ export function TournamentListClient({ initialPage }: TournamentListClientProps)
     try {
       const nextPage = await requestTournamentPage(
         filters.scope,
-        { ...requestQuery, offset: page.offset + page.limit },
+        { ...requestQuery, cursor: page.nextCursor ?? undefined },
         controller.signal
       );
       if (activeQueryKey.current !== keyAtRequest) {
@@ -153,7 +152,7 @@ export function TournamentListClient({ initialPage }: TournamentListClientProps)
         setIsLoadingMore(false);
       }
     }
-  }, [filters.scope, isLoading, isLoadingMore, page.hasMore, page.limit, page.offset, requestQuery, requestedQueryKey, t]);
+  }, [filters.scope, isLoading, isLoadingMore, page.hasMore, page.nextCursor, requestQuery, requestedQueryKey, t]);
 
   useEffect(() => {
     const sentinel = loadMoreSentinelRef.current;
@@ -178,7 +177,6 @@ export function TournamentListClient({ initialPage }: TournamentListClientProps)
       ? t("tournaments.myEmpty")
       : t("tournaments.empty");
   const visibleItems = page.items;
-  const visibleTotal = page.hasMore ? page.total : visibleItems.length;
   const hasEmptyResults = !isLoading && !pageLoadFailed && visibleItems.length === 0;
 
   return (
@@ -214,7 +212,6 @@ export function TournamentListClient({ initialPage }: TournamentListClientProps)
         <div className="shown-count" data-testid="shown-count">
           {t("tournaments.showingCount", {
             count: pageLoadFailed ? 0 : visibleItems.length,
-            total: pageLoadFailed ? 0 : visibleTotal
           })}
         </div>
         <div
@@ -233,8 +230,7 @@ function buildRequestQuery(
   status: TournamentFiltersValue["status"],
   rank: string,
   dateSort: TournamentFiltersValue["dateSort"],
-  search: string,
-  offset: number
+  search: string
 ): TournamentListQuery {
   return {
     search: search.trim() || undefined,
@@ -242,8 +238,7 @@ function buildRequestQuery(
     status: status === "all" ? undefined : status,
     rank: rank === "all" ? undefined : rank,
     dateSort: dateSort === "none" ? undefined : dateSort,
-    limit: tournamentsPerPage,
-    offset
+    limit: tournamentsPerPage
   };
 }
 

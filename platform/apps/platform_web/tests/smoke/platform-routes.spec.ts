@@ -1018,7 +1018,8 @@ test("tournament scope filter loads private organizer and registered tournaments
     const requestUrl = new URL(route.request().url());
     const scope = requestUrl.searchParams.get("scope");
     const limit = Number(requestUrl.searchParams.get("limit") ?? 9);
-    const offset = Number(requestUrl.searchParams.get("offset") ?? 0);
+    const cursor = requestUrl.searchParams.get("cursor");
+    const start = cursor ? Number(cursor) : 0;
     const allTournaments = [
       {
         id: "t_private_owned",
@@ -1062,15 +1063,16 @@ test("tournament scope filter loads private organizer and registered tournaments
           ? tournament.current_user_participant_status !== null
           : true
     ));
-    const pageItems = filtered.slice(offset, offset + limit);
+    const pageItems = filtered.slice(start, start + limit);
     await route.fulfill({
       status: 200,
       contentType: "application/json",
       headers: {
-        "X-Total-Count": String(filtered.length),
         "X-Limit": String(limit),
-        "X-Offset": String(offset),
-        "X-Has-More": String(offset + pageItems.length < filtered.length)
+        "X-Has-More": String(start + pageItems.length < filtered.length),
+        ...(start + pageItems.length < filtered.length
+          ? { "X-Next-Cursor": String(start + pageItems.length) }
+          : {})
       },
       body: JSON.stringify(pageItems)
     });
@@ -1088,12 +1090,13 @@ test("tournament scope filter loads private organizer and registered tournaments
 });
 
 test("tournament list loads nine cards at a time on scroll and centers the count", async ({ page }) => {
-  const requestedOffsets: number[] = [];
+  const requestedCursors: Array<string | null> = [];
   await page.route("**/api/v1/tournaments/mine?**", async (route) => {
     const requestUrl = new URL(route.request().url());
     const limit = Number(requestUrl.searchParams.get("limit") ?? 9);
-    const offset = Number(requestUrl.searchParams.get("offset") ?? 0);
-    requestedOffsets.push(offset);
+    const cursor = requestUrl.searchParams.get("cursor");
+    const start = cursor ? Number(cursor) : 0;
+    requestedCursors.push(cursor);
     const status = requestUrl.searchParams.get("status");
     const allTournaments = Array.from({ length: 10 }, (_, index) => ({
       id: `t_paged_${index + 1}`,
@@ -1115,15 +1118,15 @@ test("tournament list loads nine cards at a time on scroll and centers the count
     const filtered = status
       ? allTournaments.filter((tournament) => tournament.status === status)
       : allTournaments;
-    const pageItems = filtered.slice(offset, offset + limit);
+    const pageItems = filtered.slice(start, start + limit);
+    const hasMore = start + pageItems.length < filtered.length;
     await route.fulfill({
       status: 200,
       contentType: "application/json",
       headers: {
-        "X-Total-Count": String(filtered.length),
         "X-Limit": String(limit),
-        "X-Offset": String(offset),
-        "X-Has-More": String(offset + pageItems.length < filtered.length)
+        "X-Has-More": String(hasMore),
+        ...(hasMore ? { "X-Next-Cursor": String(start + pageItems.length) } : {})
       },
       body: JSON.stringify(pageItems)
     });
@@ -1135,15 +1138,15 @@ test("tournament list loads nine cards at a time on scroll and centers the count
   await page.getByRole("main").getByTestId("status-filter").selectOption("registration_open");
   await expect(page.getByTestId("tournament-card")).toHaveCount(9);
   await expect(page.getByTestId("tournaments-load-more")).toHaveCount(0);
-  await expect(page.getByTestId("shown-count")).toHaveText("Показано 9 из 9 турниров");
+  await expect(page.getByTestId("shown-count")).toHaveText("Показано 9 турниров");
 
   await page.getByRole("main").getByTestId("status-filter").selectOption("all");
   await expect(page.getByTestId("tournament-card")).toHaveCount(9);
   await page.getByTestId("tournaments-load-sentinel").scrollIntoViewIfNeeded();
   await expect(page.getByTestId("tournament-card")).toHaveCount(10);
   await expect(page.getByTestId("tournaments-load-more")).toHaveCount(0);
-  await expect(page.getByTestId("shown-count")).toHaveText("Показано 10 из 10 турниров");
-  expect(requestedOffsets).toContain(9);
+  await expect(page.getByTestId("shown-count")).toHaveText("Показано 10 турниров");
+  expect(requestedCursors).toContain("9");
   const countBox = await page.getByTestId("shown-count").boundingBox();
   const mainBox = await page.locator("main").boundingBox();
   expect(Math.abs((countBox?.x ?? 0) + (countBox?.width ?? 0) / 2 - ((mainBox?.x ?? 0) + (mainBox?.width ?? 0) / 2))).toBeLessThanOrEqual(1);

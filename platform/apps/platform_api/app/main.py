@@ -74,6 +74,7 @@ def create_app() -> FastAPI:
                 "X-Limit",
                 "X-Offset",
                 "X-Has-More",
+                "X-Next-Cursor",
                 "Retry-After",
             ],
         )

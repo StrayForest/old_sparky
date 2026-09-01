@@ -642,33 +642,33 @@ export function platformApiMessage(error: unknown, fallback: string): string {
 
 type TournamentPageRequestOptions = {
   signal?: AbortSignal;
+  revalidateSeconds?: number;
 };
 
 export async function getTournamentSummaries(
   query: TournamentListQuery = {},
   options: TournamentPageRequestOptions = {}
 ): Promise<TournamentPage> {
-  return requestTournamentPage("/tournaments", query, options.signal);
+  return requestTournamentPage("/tournaments", query, options);
 }
 
 export async function getMyTournamentSummaries(
   query: TournamentListQuery = {},
   options: Pick<TournamentPageRequestOptions, "signal"> = {}
 ): Promise<TournamentPage> {
-  return requestTournamentPage("/tournaments/mine", query, options.signal);
+  return requestTournamentPage("/tournaments/mine", query, options);
 }
 
 async function requestTournamentPage(
   path: string,
   query: TournamentListQuery,
-  signal?: AbortSignal
+  options: TournamentPageRequestOptions = {}
 ): Promise<TournamentPage> {
   const limit = query.limit ?? 9;
-  const offset = query.offset ?? 0;
-  const params = new URLSearchParams({
-    limit: String(limit),
-    offset: String(offset)
-  });
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (query.cursor) {
+    params.set("cursor", query.cursor);
+  }
   const search = query.search?.trim();
   if (search) {
     params.set("search", search);
@@ -689,8 +689,11 @@ async function requestTournamentPage(
   const response = await platformFetch(`${apiBaseUrl}${path}?${params.toString()}`, {
     headers: { accept: "application/json" },
     credentials: "include",
-    cache: "no-store",
-    signal
+    cache: path === "/tournaments" ? "default" : "no-store",
+    signal: options.signal,
+    ...(path === "/tournaments" && options.revalidateSeconds !== undefined
+      ? { next: { revalidate: options.revalidateSeconds } }
+      : {})
   });
 
   if (!response.ok) {
@@ -706,19 +709,17 @@ async function requestTournamentPage(
 
   const payload = await response.json() as ApiTournamentListItem[];
   const items = payload.map(mapTournamentSummary);
-  const total = headerInteger(response.headers, "X-Total-Count") ?? items.length;
   const responseLimit = headerInteger(response.headers, "X-Limit") ?? limit;
-  const responseOffset = headerInteger(response.headers, "X-Offset") ?? offset;
   const hasMoreHeader = response.headers.get("X-Has-More");
+  const nextCursor = response.headers.get("X-Next-Cursor") || null;
 
   return {
     items,
-    total,
     limit: responseLimit,
-    offset: responseOffset,
     hasMore: hasMoreHeader === null
-      ? responseOffset + items.length < total
-      : hasMoreHeader.toLowerCase() === "true"
+      ? nextCursor !== null
+      : hasMoreHeader.toLowerCase() === "true" && nextCursor !== null,
+    nextCursor
   };
 }
 

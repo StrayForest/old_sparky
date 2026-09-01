@@ -8,7 +8,9 @@
 
 The public tournament catalog is request-driven. `/tournaments` issues
 ordinary requests for navigation, filter changes, pagination and explicit user
-actions; it does not create background activity.
+actions; it does not create background activity. Public catalog pages use
+cursor/keyset pagination and a short public edge cache. `/tournaments/mine`
+remains private and is never cached.
 
 Ready Check is time-based. It has a server-known `starts_at` and `ends_at`, so
 the tournament workspace response carries the schedule, the eligible/current-
