@@ -115,6 +115,22 @@ revision, then resume only the same transaction:
 tools/platform_release_deploy.sh --resume --app-dir /opt/oldsparky/platform
 ```
 
+For an install receipt in a non-migration-uncertain phase such as
+`nginx-applied`, an operator may perform the explicit recovery through GitHub
+Actions after reviewing the receipt:
+
+```bash
+gh workflow run platform-production-release-recover.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev \
+  -f confirmation=RECOVER-PENDING-RELEASE
+```
+
+The recovery restores the exact pre-operation release/runtime and verifies
+service readiness before the normal deployment chain is retried. It must not
+be used for `migration-pending` or `migration-failed` without the separate
+database compatibility review and explicit abort/resume decision.
+
 The deploy gate also requires a read-only Cloudflare/Nginx/UFW range-parity
 proof. This repository does not contain live VPS evidence; a release is not
 production-approved until that proof and the direct-origin negative test are
