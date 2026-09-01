@@ -493,13 +493,6 @@ export type PlatformDeadlockDreamSlot = {
 export type PlatformTournamentScopedProfile = {
   profile: PlatformProfile;
   deadlock_profile: PlatformDeadlockProfile | null;
-  dream_slots: PlatformDeadlockDreamSlot[];
-  stats: {
-    tournaments_played: number;
-    tournaments_organized: number;
-    tournaments_won: number;
-    recent_tournaments: string[];
-  };
 };
 
 export type PlatformTournamentInvite = {

@@ -108,7 +108,12 @@ class PlatformMediaWorkerLockTests(unittest.IsolatedAsyncioTestCase):
     async def test_processing_uses_db_asset_id_and_releases_owned_lock(self) -> None:
         client = self._redis_client(acquired=True)
         session = object()
-        result = MediaProcessResult(asset_id="asset-id", status="ready", variants=3)
+        result = MediaProcessResult(
+            asset_id="asset-id",
+            status="ready",
+            variants=3,
+            owner_user_id="user-id",
+        )
         with (
             patch.object(worker, "media_runtime_enabled", return_value=True),
             patch.object(worker, "redis_client", return_value=client),
@@ -123,11 +128,17 @@ class PlatformMediaWorkerLockTests(unittest.IsolatedAsyncioTestCase):
                 "process_media_asset_once",
                 AsyncMock(return_value=result),
             ) as process,
+            patch.object(
+                worker,
+                "refresh_profile_read_model",
+                AsyncMock(),
+            ) as refresh_profile,
         ):
             payload = await worker._run_locked_media_process("asset-id")
 
         self.assertEqual(payload["status"], "ready")
         process.assert_awaited_once_with(session, "asset-id", settings=worker.settings)
+        refresh_profile.assert_awaited_once_with("user-id")
         client.eval.assert_awaited_once_with(
             worker.AUTOMATION_LOCK_RELEASE_SCRIPT,
             1,

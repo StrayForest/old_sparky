@@ -42,7 +42,6 @@ from apps.platform_api.app.api.schemas import (
     TournamentDeadlockReadyRoundResponse,
     TournamentDeadlockReadyVoteRequest,
     TournamentDeadlockReadyVoteResponse,
-    DeadlockDreamSlotResponse,
     DeadlockProfileResponse,
     MediaAcceptedResponse,
     MediaDeleteAcceptedResponse,
@@ -68,10 +67,8 @@ from apps.platform_api.app.api.schemas import (
     TournamentParticipantModerationRequest,
     TournamentParticipantResponse,
     PlayerTournamentCommitmentResponse,
-    TournamentProfileStatsResponse,
     TournamentResponse,
     TournamentScopedProfileResponse,
-    TournamentProfileResponse,
     TournamentStatusUpdateRequest,
     TournamentWorkspaceResponse,
 )
@@ -116,7 +113,6 @@ from apps.platform_api.app.services.tournament_workflow import (
     build_deadlock_ready_round_state_snapshot,
     complete_locked_tournament_after_final_match,
     deadlock_assignment_run_by_id_for_tournament,
-    deadlock_auto_assignment_run_for_tournament,
     deadlock_auto_assignment_run_freshness,
     deadlock_auto_assignment_state_runs_for_tournament,
     deadlock_auto_assignment_stale_detail,
@@ -152,10 +148,21 @@ from apps.platform_api.app.services.tournament_read_models import (
     read_model_read_or_build,
     refresh_tournament_read_models,
 )
+from apps.platform_api.app.services.profile_read_models import (
+    build_profile_read_model,
+    profile_read_model_cached_revision,
+    profile_read_model_key,
+    profile_read_model_payload,
+    write_profile_read_model,
+)
+from apps.platform_api.app.services.tournament_profile_access import (
+    decode_profile_access_state,
+    refresh_tournament_profile_access_state,
+    read_tournament_profile_pipeline,
+)
 from apps.platform_api.app.services.tournament_teams import (
     load_tournament_team_state,
     materialize_assignment_run_teams,
-    materialized_tournament_user_ids,
 )
 from apps.platform_api.app.services.tournament_participant_capacity import (
     PARTICIPANT_SLOT_MATERIALIZATION_LIMIT,
@@ -217,13 +224,16 @@ from python_packages.platform_domain.tournaments import (
     transition_match_status,
 )
 from python_packages.platform_infra.audit import write_audit_log
-from python_packages.platform_infra.db import get_db_session, ready_vote_db_session
+from python_packages.platform_infra.db import (
+    get_db_session,
+    ready_vote_db_session,
+    session_factory,
+)
 from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
 from python_packages.platform_infra.media.errors import MediaError
 from python_packages.platform_infra.media.source_store import StagedSource
 from python_packages.platform_infra.media_rate_limit import check_media_upload_rate_limit
 from python_packages.platform_infra.models import (
-    DeadlockDreamSlot,
     DeadlockProfile,
     PlayerProfile,
     PlayerTournamentCommitment,
@@ -250,7 +260,9 @@ from python_packages.platform_infra.security import (
 )
 from python_packages.platform_infra.performance import (
     current_request_metrics,
+    record_profile_read_model_event,
     record_ready_vote_span,
+    record_tournament_profile_access_event,
 )
 from python_packages.platform_infra.ready_vote_admission import (
     READY_VOTE_ADMISSION_SEVERE,
@@ -687,6 +699,18 @@ async def _refresh_tournament_read_models_after_commit(
             "Post-commit tournament read-model refresh failed tournament_id=%s models=%s",
             tournament_id,
             models,
+        )
+
+
+async def _refresh_tournament_profile_access_after_commit(slug: str) -> None:
+    """Refresh profile authorization state after its DB transaction commits."""
+
+    try:
+        await refresh_tournament_profile_access_state(slug)
+    except Exception:
+        logger.exception(
+            "Post-commit tournament profile access refresh failed slug=%s",
+            slug,
         )
 
 
@@ -1456,33 +1480,6 @@ def deadlock_team_id_from_match_label(label: str | None) -> str | None:
 class TournamentTeamMemberProfile:
     handle: str
     avatar_url: str | None
-
-
-def historical_deadlock_assignment_run_user_ids(
-    run_row: TournamentDeadlockAssignmentRun | None,
-) -> set[str]:
-    """Return users from a solver snapshot for organizer preview/audit only."""
-
-    if run_row is None:
-        return set()
-    snapshot = dict(run_row.result_snapshot or {})
-    user_ids: set[str] = set()
-    for raw_team in list(snapshot.get("teams") or []):
-        if not isinstance(raw_team, dict):
-            continue
-        raw_players: list[Any] = [raw_team.get("captain")]
-        raw_players.extend(
-            slot.get("assigned_player")
-            for slot in list(raw_team.get("starter_slots") or [])
-            if isinstance(slot, dict)
-        )
-        reserve_slot = raw_team.get("reserve_slot")
-        if isinstance(reserve_slot, dict):
-            raw_players.append(reserve_slot.get("assigned_player"))
-        for player in raw_players:
-            if isinstance(player, dict) and player.get("user_id") is not None:
-                user_ids.add(str(player["user_id"]))
-    return user_ids
 
 
 async def deadlock_assignment_member_profiles(
@@ -3447,7 +3444,9 @@ async def organizer_add_participant(
             "entry_type": participant.entry_type,
         },
     )
+    tournament.updated_at = auth_session.now
     await db_session.commit()
+    await _refresh_tournament_profile_access_after_commit(tournament.slug)
     invalidate_tournament_runtime_caches(tournament.id)
     await db_session.refresh(participant)
     return serialize_participant(participant, target_user.display_name)
@@ -3530,7 +3529,9 @@ async def organizer_remove_participant(
             "retained_record": True,
         },
     )
+    tournament.updated_at = auth_session.now
     await db_session.commit()
+    await _refresh_tournament_profile_access_after_commit(tournament.slug)
     invalidate_tournament_runtime_caches(tournament.id)
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
@@ -3660,7 +3661,9 @@ async def organizer_moderate_participant(
             "moderation_note": participant.moderation_note,
         },
     )
+    tournament.updated_at = auth_session.now
     await db_session.commit()
+    await _refresh_tournament_profile_access_after_commit(tournament.slug)
     invalidate_tournament_runtime_caches(tournament.id)
     await db_session.refresh(participant)
     return serialize_participant(
@@ -5915,6 +5918,7 @@ async def publish_deadlock_auto_assignment_run(
         },
     )
     await db_session.commit()
+    await _refresh_tournament_profile_access_after_commit(tournament.slug)
     invalidate_tournament_runtime_caches(tournament.id)
     await _refresh_tournament_read_models_after_commit(
         tournament.id,
@@ -5996,6 +6000,7 @@ async def lock_deadlock_auto_assignment_run(
         },
     )
     await db_session.commit()
+    await _refresh_tournament_profile_access_after_commit(tournament.slug)
     invalidate_tournament_runtime_caches(tournament.id)
     await _refresh_tournament_read_models_after_commit(
         tournament.id,
@@ -6148,7 +6153,9 @@ async def join_tournament(
             ),
         ) from exc
     bind_mutation_idempotency_resource(idempotency, participant.id)
+    tournament.updated_at = auth_session.now
     await db_session.commit()
+    await _refresh_tournament_profile_access_after_commit(tournament.slug)
     invalidate_tournament_runtime_caches(tournament.id)
     return serialize_participant(participant, auth_session.user.display_name)
 
@@ -6256,7 +6263,9 @@ async def leave_tournament(
     await db_session.execute(
         delete(TournamentParticipant).where(TournamentParticipant.id == participant.id)
     )
+    tournament.updated_at = auth_session.now
     await db_session.commit()
+    await _refresh_tournament_profile_access_after_commit(tournament.slug)
     invalidate_tournament_runtime_caches(tournament.id)
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
@@ -6267,159 +6276,97 @@ async def get_tournament_scoped_profile(
     slug: str,
     user_id: str,
     auth_session=Depends(get_authenticated_session),
-    db_session: AsyncSession = Depends(get_db_session),
-) -> TournamentScopedProfileResponse:
-    tournament = await get_tournament_or_404(db_session, slug)
+) -> Response:
     current_user_id = auth_session.user.id
-    is_organizer = tournament.organizer_user_id == current_user_id
-    is_admin = auth_session_has_admin_role(auth_session)
-    participant = await joined_participant_for_user(
-        db_session,
-        tournament_id=tournament.id,
-        user_id=current_user_id,
+    pipeline = await read_tournament_profile_pipeline(
+        slug=slug,
+        current_user_id=current_user_id,
+        target_user_id=user_id,
+        profile_key=profile_read_model_key(user_id),
     )
-    if participant is None and not is_organizer and not is_admin:
+    state = decode_profile_access_state(pipeline.access_raw)
+    profile_payload = profile_read_model_payload(pipeline.profile_raw)
+
+    if state is None:
+        record_tournament_profile_access_event("tournament_profile_access_miss")
+        async with session_factory()() as db_session:
+            state = await refresh_tournament_profile_access_state(
+                slug,
+                db_session=db_session,
+            )
+            if state is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Tournament not found.",
+                )
+            requester_is_viewer = current_user_id in state.viewer_user_ids
+            target_is_roster_member = user_id in state.roster_user_ids
+    else:
+        record_tournament_profile_access_event(
+            "tournament_profile_access_hit",
+            revision=state.revision,
+        )
+        requester_is_viewer = pipeline.requester_is_viewer
+        target_is_roster_member = pipeline.target_is_roster_member
+
+    is_organizer = state.organizer_user_id == current_user_id
+    is_admin = auth_session_has_admin_role(auth_session)
+    if not requester_is_viewer and not is_organizer and not is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Tournament profiles are visible only to joined participants, the organizer, or platform admins.",
         )
-
-    materialized_teams, _ = await load_tournament_team_state(
-        db_session,
-        tournament_id=tournament.id,
-        include_members=False,
-    )
-    materialized_user_ids = await materialized_tournament_user_ids(
-        db_session,
-        tournament_id=tournament.id,
-    )
-    if not materialized_teams:
-        # Organizer/admin access to a generated run is a historical solver
-        # preview. Once teams exist, only normalized current membership is
-        # eligible for this endpoint.
-        preview_run = (
-            await deadlock_auto_assignment_run_for_tournament(
-                db_session,
-                tournament_id=tournament.id,
-            )
-            if is_organizer or is_admin
-            else None
-        )
-        materialized_user_ids = historical_deadlock_assignment_run_user_ids(preview_run)
-    if not materialized_user_ids:
+    if not state.roster_ready:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Tournament profiles are available after teams are formed.",
         )
-
-    if user_id not in materialized_user_ids:
+    if not target_is_roster_member:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Player is not part of the visible tournament roster.",
         )
 
-    profile = await db_session.scalar(select(PlayerProfile).where(PlayerProfile.user_id == user_id))
-    if profile is None:
+    if profile_payload is None:
+        record_profile_read_model_event("profile_read_model_miss")
+        async with session_factory()() as db_session:
+            profile_payload = await _build_and_cache_tournament_profile(
+                user_id,
+                db_session=db_session,
+            )
+    else:
+        record_profile_read_model_event(
+            "profile_read_model_hit",
+            payload_bytes=len(profile_payload),
+            revision=profile_read_model_cached_revision(pipeline.profile_raw),
+        )
+    if profile_payload is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
+    return Response(content=profile_payload, media_type="application/json")
 
-    deadlock_profile = await db_session.scalar(
-        select(DeadlockProfile).where(DeadlockProfile.user_id == user_id)
-    )
-    dream_slot_rows = (
-        await db_session.scalars(
-            select(DeadlockDreamSlot)
-            .where(DeadlockDreamSlot.user_id == user_id)
-            .order_by(DeadlockDreamSlot.slot_number.asc())
-        )
-    ).all()
-    dream_slots_by_number = {row.slot_number: row for row in dream_slot_rows}
-    dream_slots = [
-        DeadlockDreamSlotResponse(
-            user_id=user_id,
-            slot_number=slot_number,
-            allowed_roles=list(dream_slots_by_number[slot_number].allowed_roles or [])
-            if slot_number in dream_slots_by_number
-            else [],
-            desired_heroes=list(dream_slots_by_number[slot_number].desired_heroes or [])
-            if slot_number in dream_slots_by_number
-            else [],
-            updated_at=dream_slots_by_number[slot_number].updated_at
-            if slot_number in dream_slots_by_number
-            else None,
-        )
-        for slot_number in range(1, 7)
-    ]
 
-    tournaments_played = int(
-        await db_session.scalar(
-            select(func.count())
-            .select_from(TournamentParticipant)
-            .where(
-                TournamentParticipant.user_id == user_id,
-                TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
-            )
-        )
-        or 0
+async def _build_and_cache_tournament_profile(
+    user_id: str,
+    *,
+    db_session: AsyncSession,
+) -> bytes | None:
+    started_at = time.perf_counter()
+    record_profile_read_model_event("profile_read_model_db_fallback")
+    model = await build_profile_read_model(user_id, db_session=db_session)
+    record_profile_read_model_event(
+        "profile_read_model_build",
+        build_ms=(time.perf_counter() - started_at) * 1000,
+        payload_bytes=len(model.payload) if model is not None else 0,
+        revision=model.revision if model is not None else None,
     )
-    tournaments_organized = int(
-        await db_session.scalar(
-            select(func.count())
-            .select_from(Tournament)
-            .where(Tournament.organizer_user_id == user_id)
-        )
-        or 0
+    if model is None:
+        return None
+    await write_profile_read_model(
+        user_id,
+        revision=model.revision,
+        payload=model.payload,
     )
-    recent_tournament_rows = (
-        await db_session.scalars(
-            select(Tournament.name)
-            .join(TournamentParticipant, TournamentParticipant.tournament_id == Tournament.id)
-            .where(
-                TournamentParticipant.user_id == user_id,
-                TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
-            )
-            .order_by(Tournament.created_at.desc())
-            .limit(5)
-        )
-    ).all()
-
-    profile_media = await load_media_descriptors(
-        db_session,
-        (profile.avatar_asset_id, profile.banner_asset_id),
-    )
-    avatar_media = (
-        profile_media.get(profile.avatar_asset_id) if profile.avatar_asset_id else None
-    )
-    banner_media = (
-        profile_media.get(profile.banner_asset_id) if profile.banner_asset_id else None
-    )
-    profile_response = TournamentProfileResponse.model_validate(profile).model_copy(
-        update={
-            "avatar_url": compatibility_media_url(
-                avatar_media,
-                preferred_variant="avatar-256",
-            ),
-            "banner_url": compatibility_media_url(
-                banner_media,
-                preferred_variant="banner-1920",
-            ),
-            "avatar_media": avatar_media,
-            "banner_media": banner_media,
-        }
-    )
-
-    return TournamentScopedProfileResponse(
-        profile=profile_response,
-        deadlock_profile=DeadlockProfileResponse.model_validate(deadlock_profile)
-        if deadlock_profile is not None
-        else None,
-        dream_slots=dream_slots,
-        stats=TournamentProfileStatsResponse(
-            tournaments_played=tournaments_played,
-            tournaments_organized=tournaments_organized,
-            tournaments_won=0,
-            recent_tournaments=list(recent_tournament_rows),
-        ),
-    )
+    return model.payload
 
 
 @router.get("/{slug}/workspace", response_model=TournamentWorkspaceResponse)

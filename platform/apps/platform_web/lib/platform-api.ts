@@ -888,6 +888,8 @@ export async function getTournamentPlayerProfile(
     throw new PlatformApiError(response.statusText || "Failed to load tournament profile.", response.status);
   }
   const payload = await response.json() as PlatformTournamentScopedProfile;
+  // The tournament endpoint intentionally contains only the two read-model
+  // documents rendered by PublicProfileView.
   return mapPlayerProfile(payload.profile, payload.deadlock_profile ?? null);
 }
 

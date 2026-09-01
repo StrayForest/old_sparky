@@ -829,13 +829,6 @@ const server = createServer((request, response) => {
         captain_priority: isShadow ? "yes" : "neutral",
         updated_at: now
       },
-      dream_slots: [],
-      stats: {
-        tournaments_played: 4,
-        tournaments_organized: 0,
-        tournaments_won: 1,
-        recent_tournaments: ["Night Veil Open #5"]
-      }
     });
     return;
   }

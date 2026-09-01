@@ -19,6 +19,7 @@ from apps.platform_api.app.services.tournament_workflow import (
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
+from apps.platform_api.app.services.profile_read_models import refresh_profile_read_model
 from python_packages.platform_infra import performance
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.csrf import csrf_cookie_name, generate_csrf_token
@@ -1175,13 +1176,12 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
         run_id = generated_run_payload["id"]
         target_profile_user_id = generated_run_payload["teams"][0]["captain"]["user_id"]
 
-        organizer_profile_before_publish = self._assert_status(
+        self._assert_status(
             await organizer["client"].get(
                 f"/api/v1/tournaments/{slug}/profiles/{target_profile_user_id}"
             ),
-            200,
+            409,
         )
-        self.assertEqual(organizer_profile_before_publish["profile"]["user_id"], target_profile_user_id)
 
         participant_profile_before_publish = await players[1]["client"].get(
             f"/api/v1/tournaments/{slug}/profiles/{target_profile_user_id}"
@@ -1230,6 +1230,7 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(profile)
             profile.steam_id = "76561198000000000"
             await db_session.commit()
+        await refresh_profile_read_model(target_profile_user_id)
 
         participant_profile_payload = self._assert_status(
             await players[1]["client"].get(
@@ -1241,7 +1242,8 @@ class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("contact_email", participant_profile_payload["profile"])
         self.assertEqual(participant_profile_payload["profile"]["steam_id"], "76561198000000000")
         self.assertIn("deadlock_profile", participant_profile_payload)
-        self.assertEqual(len(participant_profile_payload["dream_slots"]), 6)
+        self.assertNotIn("dream_slots", participant_profile_payload)
+        self.assertNotIn("stats", participant_profile_payload)
 
         locked_run_payload = self._assert_status(
             await organizer["client"].post(

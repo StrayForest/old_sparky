@@ -35,6 +35,9 @@ class RequestPerformanceMetrics:
     response_bytes: int = 0
     pool_checkout_wait_seconds: float = 0.0
     redis_read_model_events: list[dict[str, Any]] = field(default_factory=list)
+    profile_read_model_events: list[dict[str, Any]] = field(default_factory=list)
+    tournament_profile_access_events: list[dict[str, Any]] = field(default_factory=list)
+    profile_read_model_fallback_count: int = 0
     # Ready Vote owns one dedicated session checkout for the complete
     # auth/preflight/upsert/commit transaction. Keep this separate from the
     # aggregate pool wait and from generic SQL timing so physical checkout
@@ -193,6 +196,52 @@ def record_redis_read_model_event(
             "get_ms": round(max(0.0, float(get_ms)), 3),
             "build_ms": round(max(0.0, float(build_ms)), 3),
             "set_ms": round(max(0.0, float(set_ms)), 3),
+            "payload_bytes": max(0, int(payload_bytes)),
+            "revision": int(revision) if revision is not None else None,
+        }
+    )
+
+
+def record_profile_read_model_event(
+    event: str,
+    *,
+    build_ms: float = 0.0,
+    pipeline_ms: float = 0.0,
+    payload_bytes: int = 0,
+    revision: int | None = None,
+) -> None:
+    metrics = _current_metrics.get()
+    if metrics is None:
+        return
+    metrics.profile_read_model_events.append(
+        {
+            "event": str(event),
+            "build_ms": round(max(0.0, float(build_ms)), 3),
+            "pipeline_ms": round(max(0.0, float(pipeline_ms)), 3),
+            "payload_bytes": max(0, int(payload_bytes)),
+            "revision": int(revision) if revision is not None else None,
+        }
+    )
+    if str(event) == "profile_read_model_db_fallback":
+        metrics.profile_read_model_fallback_count += 1
+
+
+def record_tournament_profile_access_event(
+    event: str,
+    *,
+    pipeline_ms: float = 0.0,
+    build_ms: float = 0.0,
+    payload_bytes: int = 0,
+    revision: int | None = None,
+) -> None:
+    metrics = _current_metrics.get()
+    if metrics is None:
+        return
+    metrics.tournament_profile_access_events.append(
+        {
+            "event": str(event),
+            "pipeline_ms": round(max(0.0, float(pipeline_ms)), 3),
+            "build_ms": round(max(0.0, float(build_ms)), 3),
             "payload_bytes": max(0, int(payload_bytes)),
             "revision": int(revision) if revision is not None else None,
         }
@@ -369,6 +418,13 @@ class RequestPerformanceMiddleware:
                 event["outcome"] in {"error", "fallback_db"}
                 for event in metrics.redis_read_model_events
             )
+            or any(
+                event["event"].endswith(("redis_error", "db_fallback"))
+                for event in (
+                    metrics.profile_read_model_events
+                    + metrics.tournament_profile_access_events
+                )
+            )
         )
         if not should_log:
             return
@@ -394,6 +450,8 @@ class RequestPerformanceMiddleware:
             "redis_read_model_get_ms=%.2f redis_read_model_build_ms=%.2f "
             "redis_read_model_set_ms=%.2f redis_read_model_payload_bytes=%s "
             "redis_read_model_revisions=%s "
+            "profile_read_model_metrics=%s tournament_profile_access_metrics=%s "
+            "profile_read_model_fallback_count=%s "
             "response_bytes=%s qa_phase=%s "
             "pool_wait_ms=%.2f cf_ray=%s client=%s",
             metrics.request_id,
@@ -443,6 +501,15 @@ class RequestPerformanceMiddleware:
                 for event in metrics.redis_read_model_events
                 if event.get("revision") is not None
             ) or "-",
+            "|".join(
+                str(event["event"])
+                for event in metrics.profile_read_model_events
+            ) or "-",
+            "|".join(
+                str(event["event"])
+                for event in metrics.tournament_profile_access_events
+            ) or "-",
+            metrics.profile_read_model_fallback_count,
             metrics.response_bytes,
             metrics.qa_phase or "-",
             metrics.pool_checkout_wait_seconds * 1000,

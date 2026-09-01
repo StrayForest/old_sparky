@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -27,6 +29,7 @@ from apps.platform_api.app.api.schemas import (
     PublicProfileResponse,
 )
 from apps.platform_api.app.services.home_content import get_supported_deadlock_hero_names
+from apps.platform_api.app.services.profile_read_models import refresh_profile_read_model
 from apps.platform_api.app.services.media import (
     accepted_media_response,
     api_media_service,
@@ -62,6 +65,19 @@ from python_packages.platform_infra.security import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+async def _refresh_profile_read_model_after_commit(user_id: str) -> None:
+    """Refresh the shared profile projection without failing a committed write."""
+
+    try:
+        await refresh_profile_read_model(user_id)
+    except Exception:
+        logger.exception(
+            "Post-commit profile read-model refresh failed user_id=%s",
+            user_id,
+        )
 
 
 def serialize_my_profile(
@@ -271,6 +287,7 @@ async def update_my_profile(
             status_code=status.HTTP_409_CONFLICT,
             detail="Profile update conflicts with existing data.",
         ) from exc
+    await _refresh_profile_read_model_after_commit(auth_session.user.id)
     await db_session.refresh(profile)
     avatar_media, banner_media = await profile_media_descriptors(db_session, profile)
     verified_steam_id = await verified_steam_id_for_user(
@@ -454,6 +471,7 @@ async def delete_profile_media(
         owner_id=auth_session.user.id,
         before_commit=audit_unlink,
     )
+    await _refresh_profile_read_model_after_commit(auth_session.user.id)
     invalidate_user_session_cache(auth_session.user.id)
     return MediaDeleteAcceptedResponse(
         asset_id=asset_id,
@@ -577,6 +595,7 @@ async def upsert_my_deadlock_profile(
         },
     )
     await db_session.commit()
+    await _refresh_profile_read_model_after_commit(auth_session.user.id)
     await db_session.refresh(profile)
     return DeadlockProfileResponse.model_validate(profile)
 

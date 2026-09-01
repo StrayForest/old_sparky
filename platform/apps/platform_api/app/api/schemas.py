@@ -872,13 +872,6 @@ class DeadlockDreamSlotResponse(BaseModel):
     updated_at: datetime | None = None
 
 
-class TournamentProfileStatsResponse(BaseModel):
-    tournaments_played: int = 0
-    tournaments_organized: int = 0
-    tournaments_won: int = 0
-    recent_tournaments: list[str] = Field(default_factory=list)
-
-
 class StatsRankDistributionItemResponse(BaseModel):
     rank: str
     count: int
@@ -924,8 +917,6 @@ class TournamentProfileResponse(BaseModel):
 class TournamentScopedProfileResponse(BaseModel):
     profile: TournamentProfileResponse
     deadlock_profile: DeadlockProfileResponse | None = None
-    dream_slots: list[DeadlockDreamSlotResponse] = Field(default_factory=list)
-    stats: TournamentProfileStatsResponse
 
 
 class TournamentInviteCreateRequest(BaseModel):

@@ -31,6 +31,9 @@ from apps.platform_api.app.services.tournament_workflow import (
 from apps.platform_api.app.services.tournament_read_models import (
     refresh_tournament_read_models,
 )
+from apps.platform_api.app.services.tournament_profile_access import (
+    refresh_tournament_profile_access_state,
+)
 from python_packages.platform_domain.deadlock import (
     AutoAssignmentEngine,
     CaptainRoundState,
@@ -404,6 +407,11 @@ async def run_deadlock_automation_tick(
                 now=current_time,
             )
             await db_session.commit()
+            if step_result.assignment_generated:
+                await refresh_tournament_profile_access_state(
+                    tournament.slug,
+                    db_session=db_session,
+                )
             await refresh_tournament_read_models(
                 tournament_id,
                 (
@@ -480,6 +488,11 @@ async def advance_deadlock_tournament_automation(
     if result != DeadlockAutomationResult():
         await db_session.commit()
         await db_session.refresh(tournament)
+        if result.assignment_generated:
+            await refresh_tournament_profile_access_state(
+                tournament.slug,
+                db_session=db_session,
+            )
         await refresh_tournament_read_models(
             tournament_id,
             (
@@ -1001,14 +1014,14 @@ async def _ensure_assignment_generated(
             current_inputs=current_inputs,
         )
         if not latest_run_freshness.is_stale:
-            await _ensure_assignment_handoff_completed(
+            handoff_changed = await _ensure_assignment_handoff_completed(
                 db_session,
                 tournament=tournament,
                 run_row=latest_run,
                 now=now,
             )
             tournament.automation_assignment_generated_at = latest_run.created_at or now
-            return False
+            return handoff_changed
 
     captain_rows = list(current_inputs.captain_rows)
     if len(captain_rows) != captain_round.teams_count:

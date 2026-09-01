@@ -77,6 +77,7 @@ class MediaProcessResult:
     status: str
     variants: int = 0
     error_code: str | None = None
+    owner_user_id: str | None = None
 
     def as_dict(self) -> dict[str, str | int | None]:
         return {
@@ -235,7 +236,11 @@ class MediaService:
         if asset is None:
             existing = await self.repository.get_asset(asset_id)
             status = existing.status if existing is not None else "missing"
-            return MediaProcessResult(asset_id=asset_id, status=status)
+            return MediaProcessResult(
+                asset_id=asset_id,
+                status=status,
+                owner_user_id=existing.owner_user_id if existing is not None else None,
+            )
 
         purpose = asset.purpose
         owner_id = asset.owner_user_id or asset.tournament_id
@@ -329,6 +334,7 @@ class MediaService:
                         asset_id=asset_id,
                         status="ready",
                         variants=len(variants),
+                        owner_user_id=asset.owner_user_id,
                     )
             except Exception:
                 logger.exception(
@@ -354,6 +360,7 @@ class MediaService:
             asset_id=asset_id,
             status="ready",
             variants=len(variants),
+            owner_user_id=asset.owner_user_id,
         )
 
     async def unlink_active(

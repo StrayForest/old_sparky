@@ -406,20 +406,3 @@ async def materialized_roster_members(
         (str(user_id), str(team_key), str(team_name))
         for user_id, team_key, team_name in rows
     )
-
-
-async def materialized_tournament_user_ids(
-    db_session: AsyncSession,
-    *,
-    tournament_id: str,
-) -> set[str]:
-    return {
-        str(user_id)
-        for user_id in (
-            await db_session.scalars(
-                select(TournamentTeamMember.user_id).where(
-                    TournamentTeamMember.tournament_id == tournament_id
-                )
-            )
-        ).all()
-    }
