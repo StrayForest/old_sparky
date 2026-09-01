@@ -42,8 +42,16 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("type: boolean", source)
         self.assertIn("LIVE_PROVISION", source)
         self.assertIn("LIVE_MARKER", source)
-        self.assertIn('bash -s -- "$LIVE_BASE_URL" "$LIVE_PROVISION" "$LIVE_MARKER"', source)
+        self.assertIn('live_marker="${LIVE_MARKER:-__no_live_marker__}"', source)
+        self.assertIn(
+            'bash -s -- "$LIVE_BASE_URL" "$LIVE_PROVISION" "$live_marker" "$TARGET_SHA"',
+            source,
+        )
         self.assertIn('marker="${3-}"', source)
+        self.assertIn(
+            '[[ "$marker" == "__no_live_marker__" ]] && marker=""',
+            source,
+        )
         self.assertIn("LIVE_QA_IDENTITY", source)
         self.assertIn("LIVE_QA_ENV_PATH", source)
         self.assertIn("uid_collision", source)

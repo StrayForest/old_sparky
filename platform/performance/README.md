@@ -260,6 +260,49 @@ core, PostgreSQL `26.43%`, connections `41`, waiting backends/lock waiters
 traffic failure-rate target. Both stress runs removed all fixture rows and
 preserved the control account.
 
+## Read-mix stress evidence (2026-09-01)
+
+The first valid production `read-mix-stress-v2` run after the fixture-name
+collision fix was [workflow `33559300059`](https://github.com/StrayForest/old_sparky/actions/runs/33559300059),
+source SHA `9c46f70f1d23aa84c4e1f66bdfdb9e617e767b61`. It used the canonical
+fixture of 40 tournaments × 500 users: 20,000 authenticated virtual users,
+128 HTTP workers and 10,000 conditional workspace refreshes. The external
+runner issued 30,000 requests in 499.717 seconds:
+
+- initial read mix: 20,000 requests — 10,000 workspace, 6,000 tournament
+  detail, 2,000 `/users/me`, and 2,000 tournament-list reads;
+- manual refresh: 10,000 conditional workspace requests — 9,998 `304`
+  responses;
+- overall raw HTTP p50/p95/p99: `2057/4674/6324 ms`;
+- response statuses: `19,997 × 200`, `9,998 × 304`, `3 × 503`, and `2`
+  missing-initial-ETag refreshes;
+- retries and classified overload shedding: `0` and `0%`.
+
+The stress decision was **`STRESS BEHAVIOR FAIL`**. The three `503` responses
+were unexpected for this profile (one `/users/me`, two workspace reads), and
+the two affected users could not perform their conditional refresh. Accepted
+latency budgets and origin-safety checks passed, but the correctness and
+unexpected-status checks did not.
+
+Origin evidence identifies CPU/backpressure as the current bottleneck: both
+API cores averaged about `99%` and reached `100%`; PostgreSQL reached `51`
+connections, `6` waiting backends and `0` lock waiters. Diagnostic
+`request_perf` samples recorded overall p95/p99 `4803/6475 ms`, average DB
+time `351 ms`, and pool checkout p95/p99 `3490/5182 ms`. The largest sampled
+route groups were workspace (`16,957` requests, average DB time `423 ms`),
+slug detail (`4,223`, `173 ms`) and `/me` (`1,489`, `304 ms`). This is bounded
+database pressure with CPU saturation and pool queueing, not a lock-wait
+incident.
+
+Exact cleanup passed: all `20,000` fixture users and `40` tournaments were
+deleted, with zero remaining fixture users, tournaments, sessions or audit
+rows; the control account was preserved. Earlier runs `33553459937` and
+`33553627531` were setup failures and are not performance evidence.
+
+This profile validates authenticated page/API reads and conditional ETag
+reloads. It does not validate the create → join → Ready Check → bracket
+lifecycle and does not replace the separate browser/grid gate.
+
 ## Canonical commands
 
 ## Tournament lifecycle read models

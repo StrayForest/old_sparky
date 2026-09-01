@@ -76,6 +76,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          live_marker="${LIVE_MARKER:-__no_live_marker__}"
           ssh \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -84,11 +85,12 @@ jobs:
             -o ConnectTimeout=10 \
             -i ~/.ssh/old_sparky_prod \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$LIVE_BASE_URL" "$LIVE_PROVISION" "$LIVE_MARKER" "$TARGET_SHA" <<'REMOTE' | tee live-launch-report.txt
+            bash -s -- "$LIVE_BASE_URL" "$LIVE_PROVISION" "$live_marker" "$TARGET_SHA" <<'REMOTE' | tee live-launch-report.txt
           set -Eeuo pipefail
           base_url="$1"
           provision="$2"
           marker="${3-}"
+          [[ "$marker" == "__no_live_marker__" ]] && marker=""
           target_sha="${4-}"
           test "$(id -u)" -eq 0 || { echo "Live browser supervisor must run as root" >&2; exit 1; }
           test "$base_url" = "https://old-sparky.com" \
