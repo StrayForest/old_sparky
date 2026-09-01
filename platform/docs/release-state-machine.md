@@ -131,6 +131,20 @@ service readiness before the normal deployment chain is retried. It must not
 be used for `migration-pending` or `migration-failed` without the separate
 database compatibility review and explicit abort/resume decision.
 
+When the receipt is in `migration-applied` or a later phase and the reviewed
+database evidence confirms that the migration was not reversed, use the
+explicit retained-release abort workflow:
+
+```bash
+gh workflow run platform-production-release-abort.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev \
+  -f confirmation=ABORT-RETAINED-RELEASE-MIGRATION-NOT-REVERSED
+```
+
+This restores the exact pre-operation release/runtime, restarts and verifies
+services, and never downgrades Alembic.
+
 The deploy gate also requires a read-only Cloudflare/Nginx/UFW range-parity
 proof. This repository does not contain live VPS evidence; a release is not
 production-approved until that proof and the direct-origin negative test are
