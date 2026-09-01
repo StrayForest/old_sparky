@@ -44,6 +44,20 @@ source code alone is not evidence. Never use a Global API Key.
 - VERIFY: media token is bucket-scoped and not reused for backups.
 - VERIFY: cache rule applies only to `cdn.old-sparky.com`, respects immutable
   origin Cache-Control/query keys and does not cache 4xx/5xx.
+- TODO: add a narrowly scoped Cache Rule for the exact public catalog path
+  `old-sparky.com/api/v1/tournaments`: cache only GET/HEAD HTTP 200 responses,
+  use the full query string as the cache key, honor the origin's `s-maxage=15`
+  and `stale-while-revalidate=30`, and bypass when `Authorization` or a
+  session cookie is present. Do not match `/api/v1/tournaments/mine`, other
+  `/api/` routes or HTML, and do not enable Cache Everything on the apex.
+  The origin already emits `public, max-age=5, s-maxage=15,
+  stale-while-revalidate=30`; this dashboard rule is required because the
+  extensionless JSON API URL is not currently edge-cache eligible by default.
+- VERIFY: after the rule is enabled, two immediate GETs to the same catalog
+  URL show a first `CF-Cache-Status: MISS` (or `BYPASS`) followed by `HIT`,
+  `REVALIDATED` or `UPDATING`; `/api/v1/tournaments/mine` must remain
+  `CF-Cache-Status: DYNAMIC`/uncached. Live evidence on 2026-09-01 still
+  showed `DYNAMIC`, so this item is not closed.
 - TODO: purge/revalidate pre-2026-08-08 `old-sparky.com/assets/*` responses that
   retain pre-security-header metadata.
 - DO NOT ENABLE without a measured need: Cache Reserve, Images transforms,

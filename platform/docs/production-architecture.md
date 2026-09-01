@@ -48,12 +48,15 @@ Browser
 Browser -> cdn.old-sparky.com -> Cloudflare cache -> public R2 variants
 ```
 
-Public catalog requests use a short two-layer cache: the API may serve an
-anonymous query representation from Redis for five seconds, and Nginx/
-Cloudflare may retain the same public response for the configured short edge
-TTL. The cache is keyed only by normalized public filters, limit and cursor;
-Redis failures are treated as misses. Personal `/tournaments/mine` responses
-are private and never enter either response cache.
+Public catalog requests use a short origin cache: the API may serve an
+anonymous query representation from Redis for five seconds, and Nginx emits
+`public, max-age=5, s-maxage=15, stale-while-revalidate=30` for the exact
+catalog path. Cloudflare edge caching is prepared but remains operator-owned:
+the exact-path Cache Rule is still required and the 2026-09-01 live probe saw
+`CF-Cache-Status: DYNAMIC`. The cache is keyed only by normalized public
+filters, limit and cursor; Redis failures are treated as misses. Personal
+`/tournaments/mine` responses are private and never enter either response
+cache.
 
 The catalog list path reads the rebuildable PostgreSQL
 `tournament_list_read_models` projection. Its rows contain the card fields,
@@ -64,6 +67,19 @@ profile and media mutations run best-effort post-commit refresh hooks; the
 Alembic backfill and bounded repair service provide recovery if a hook is
 interrupted. The read query applies indexed filters, keyset predicates and
 `LIMIT + 1` to derive `has_more` without an exact total count.
+
+### Catalog plan evidence
+
+On 2026-09-01, a disposable 20,000-row projection fixture was used for bounded
+`EXPLAIN (ANALYZE, BUFFERS)` checks. The default public page used
+`ix_tournament_list_public_created_at_id` without a sort (about 0.083 ms);
+participant-desc sorting used its projection index without a sort (about
+0.062 ms); the organizer `/mine` path used
+`ix_tournament_list_organizer_created_at_id` without a sort (about 0.197 ms);
+and lower-name search used a bitmap scan on the trigram index
+`ix_tournament_list_name_lower_trgm`. These are plan-shape checks on a
+disposable synthetic fixture, not production latency SLOs. Re-run them against
+production-sized data before changing index or projection strategy.
 
 The platform connects directly to PostgreSQL with explicit API and worker pool
 limits within the ordinary connection budget. High-volume

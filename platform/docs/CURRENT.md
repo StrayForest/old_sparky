@@ -93,9 +93,11 @@ catalog cards are served from the rebuildable PostgreSQL
 `tournament_list_read_models` projection: the source tables remain authoritative
 and committed tournament, participant, workflow, profile and media changes
 refresh the affected card. Catalog pages use cursor/keyset pagination and
-`LIMIT + 1`; public responses have a five-second Redis response cache plus a
-short Cloudflare/Nginx edge cache, while `/tournaments/mine` remains private
-and uncached. The initial workspace includes the bracket, passive changes
+`LIMIT + 1`; public responses have a five-second Redis response cache and emit
+short-TTL origin cache headers. The Cloudflare Cache Rule needed to turn this
+extensionless JSON response into an edge cache object is still an operator TODO
+(live probe on 2026-09-01 returned `CF-Cache-Status: DYNAMIC`), while
+`/tournaments/mine` remains private and uncached. The initial workspace includes the bracket, passive changes
 become visible after a manual page reload, and explicit organizer mutations
 may refresh their own authoritative result.
 
