@@ -24,6 +24,148 @@ type TournamentListClientProps = {
   initialPage: TournamentPage;
 };
 
+type TournamentPageLoader = (signal: AbortSignal) => Promise<TournamentPage>;
+
+type CachedTournamentPage = {
+  page: TournamentPage;
+  expiresAt: number;
+};
+
+type InFlightTournamentPage = {
+  controller: AbortController;
+  consumers: number;
+  cancelled: boolean;
+  settled: boolean;
+  promise: Promise<TournamentPage>;
+};
+
+class TournamentPageQueryCache {
+  private readonly cache = new Map<string, CachedTournamentPage>();
+  private readonly inFlight = new Map<string, InFlightTournamentPage>();
+  private static readonly maxEntries = 32;
+
+  constructor(private readonly ttlMs: number) {}
+
+  prime(key: string, page: TournamentPage): void {
+    this.setCached(key, page);
+  }
+
+  get(
+    key: string,
+    loader: TournamentPageLoader,
+    signal: AbortSignal,
+    cacheResult: boolean,
+  ): Promise<TournamentPage> {
+    if (signal.aborted) {
+      return Promise.reject(abortError());
+    }
+
+    if (cacheResult) {
+      const cached = this.cache.get(key);
+      if (cached && cached.expiresAt > Date.now()) {
+        return Promise.resolve(cached.page);
+      }
+      this.cache.delete(key);
+    }
+
+    let request = this.inFlight.get(key);
+    if (!request) {
+      const controller = new AbortController();
+      const promise = loader(controller.signal);
+      const newRequest: InFlightTournamentPage = {
+        controller,
+        consumers: 0,
+        cancelled: false,
+        settled: false,
+        promise,
+      };
+      request = newRequest;
+      this.inFlight.set(key, newRequest);
+      void promise.then(
+        () => this.finish(key, newRequest),
+        () => this.finish(key, newRequest),
+      );
+      if (cacheResult) {
+        void promise.then((page) => {
+          if (!newRequest.cancelled) {
+            this.setCached(key, page);
+          }
+        });
+      }
+    }
+
+    const activeRequest = request;
+    activeRequest.consumers += 1;
+    return new Promise<TournamentPage>((resolve, reject) => {
+      let consumed = false;
+      const release = () => {
+        if (consumed) {
+          return;
+        }
+        consumed = true;
+        activeRequest.consumers -= 1;
+        if (activeRequest.consumers === 0 && !activeRequest.settled) {
+          activeRequest.cancelled = true;
+          activeRequest.controller.abort();
+        }
+      };
+      const onAbort = () => {
+        release();
+        reject(abortError());
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      activeRequest.promise.then(
+        (page) => {
+          if (consumed) {
+            return;
+          }
+          release();
+          signal.removeEventListener("abort", onAbort);
+          resolve(page);
+        },
+        (error: unknown) => {
+          if (consumed) {
+            return;
+          }
+          release();
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private finish(key: string, request: InFlightTournamentPage): void {
+    request.settled = true;
+    if (this.inFlight.get(key) === request) {
+      this.inFlight.delete(key);
+    }
+  }
+
+  private setCached(key: string, page: TournamentPage): void {
+    const now = Date.now();
+    for (const [cachedKey, cached] of this.cache) {
+      if (cached.expiresAt <= now) {
+        this.cache.delete(cachedKey);
+      }
+    }
+    while (this.cache.size >= TournamentPageQueryCache.maxEntries) {
+      const oldestKey = this.cache.keys().next().value;
+      if (!oldestKey) {
+        break;
+      }
+      this.cache.delete(oldestKey);
+    }
+    this.cache.set(key, { page, expiresAt: now + this.ttlMs });
+  }
+}
+
+function abortError(): Error {
+  return new Error("Tournament page request was aborted");
+}
+
+const tournamentPageCacheTtlMs = 15_000;
+
 export function TournamentListClient({ initialPage }: TournamentListClientProps) {
   const { t } = useI18n();
   const [filters, setFilters] = useState<TournamentFiltersValue>(defaultFilters);
@@ -37,6 +179,15 @@ export function TournamentListClient({ initialPage }: TournamentListClientProps)
   const activeQueryKey = useRef(resolvedQueryKey);
   const loadMoreControllerRef = useRef<AbortController | null>(null);
   const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
+  const pageCacheRef = useRef<TournamentPageQueryCache | null>(null);
+  if (pageCacheRef.current === null) {
+    pageCacheRef.current = new TournamentPageQueryCache(tournamentPageCacheTtlMs);
+    pageCacheRef.current.prime(
+      tournamentPageQueryKey("all", { limit: tournamentsPerPage }),
+      initialPage,
+    );
+  }
+  const pageCache = pageCacheRef.current;
 
   useEffect(() => {
     const timeout = window.setTimeout(() => setDebouncedSearch(filters.search), 300);
@@ -80,7 +231,8 @@ export function TournamentListClient({ initialPage }: TournamentListClientProps)
     void requestTournamentPage(
       filters.scope,
       requestQuery,
-      controller.signal
+      controller.signal,
+      pageCache,
     )
       .then((nextPage) => {
         if (activeQueryKey.current !== requestedQueryKey) {
@@ -126,7 +278,8 @@ export function TournamentListClient({ initialPage }: TournamentListClientProps)
       const nextPage = await requestTournamentPage(
         filters.scope,
         { ...requestQuery, cursor: page.nextCursor ?? undefined },
-        controller.signal
+        controller.signal,
+        pageCache,
       );
       if (activeQueryKey.current !== keyAtRequest) {
         return;
@@ -152,7 +305,7 @@ export function TournamentListClient({ initialPage }: TournamentListClientProps)
         setIsLoadingMore(false);
       }
     }
-  }, [filters.scope, isLoading, isLoadingMore, page.hasMore, page.nextCursor, requestQuery, requestedQueryKey, t]);
+  }, [filters.scope, isLoading, isLoadingMore, page.hasMore, page.nextCursor, pageCache, requestQuery, requestedQueryKey, t]);
 
   useEffect(() => {
     const sentinel = loadMoreSentinelRef.current;
@@ -245,11 +398,33 @@ function buildRequestQuery(
 function requestTournamentPage(
   scope: TournamentFiltersValue["scope"],
   query: TournamentListQuery,
-  signal?: AbortSignal
+  signal: AbortSignal,
+  pageCache: TournamentPageQueryCache,
 ): Promise<TournamentPage> {
-  return scope === "all"
-    ? getTournamentSummaries(query, { signal })
-    : getMyTournamentSummaries(query, { signal });
+  const key = tournamentPageQueryKey(scope, query);
+  return pageCache.get(
+    key,
+    (requestSignal) => scope === "all"
+      ? getTournamentSummaries(query, { signal: requestSignal })
+      : getMyTournamentSummaries(query, { signal: requestSignal }),
+    signal,
+    scope === "all",
+  );
+}
+
+function tournamentPageQueryKey(
+  scope: TournamentFiltersValue["scope"],
+  query: TournamentListQuery,
+): string {
+  return JSON.stringify({
+    scope,
+    search: query.search?.trim() ?? "",
+    status: query.status ?? "",
+    rank: query.rank ?? "",
+    dateSort: query.dateSort ?? "",
+    limit: query.limit ?? tournamentsPerPage,
+    cursor: query.cursor ?? "",
+  });
 }
 
 function appendUnique(

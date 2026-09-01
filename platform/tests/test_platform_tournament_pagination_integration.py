@@ -8,6 +8,9 @@ import httpx
 from sqlalchemy import delete
 
 from apps.platform_api.app.main import create_app
+from apps.platform_api.app.services.tournament_catalog_read_models import (
+    refresh_tournament_list_read_model,
+)
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import Tournament, User
 
@@ -27,12 +30,15 @@ class PlatformTournamentPaginationIntegrationTests(unittest.IsolatedAsyncioTestC
             )
             await db_session.flush()
             created_at = datetime(2026, 6, 13, 8, 0, tzinfo=UTC)
+            tournament_ids: list[str] = []
             for index, allowed_ranks in enumerate(
                 ([], ["Oracle"], ["Phantom"], ["Oracle", "Phantom"])
             ):
+                tournament_id = str(uuid4())
+                tournament_ids.append(tournament_id)
                 db_session.add(
                     Tournament(
-                        id=str(uuid4()),
+                        id=tournament_id,
                         slug=f"{self.prefix}-{index}",
                         name=f"{self.prefix} Pagination Cup {index}",
                         visibility="public",
@@ -42,6 +48,12 @@ class PlatformTournamentPaginationIntegrationTests(unittest.IsolatedAsyncioTestC
                         organizer_user_id=self.organizer_id,
                         created_at=created_at + timedelta(minutes=index),
                     )
+                )
+            await db_session.flush()
+            for tournament_id in tournament_ids:
+                await refresh_tournament_list_read_model(
+                    tournament_id,
+                    db_session=db_session,
                 )
             await db_session.commit()
 

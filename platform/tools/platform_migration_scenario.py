@@ -23,6 +23,7 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockAssignmentRun,
     TournamentDeadlockCaptainRound,
     TournamentDeadlockReadyRound,
+    TournamentListReadModel,
     TournamentParticipantSlot,
     TournamentTeam,
     TournamentTeamMember,
@@ -31,7 +32,7 @@ from python_packages.platform_infra.models import (
 
 
 TARGET_REVISION = "20260821_0039"
-HEAD_REVISION = "20260831_0049"
+HEAD_REVISION = "20260901_0051"
 
 
 def _run_alembic(
@@ -211,6 +212,21 @@ async def _assert_repaired_state(tournament_id: str) -> None:
             raise RuntimeError("published/locked assignment teams were not backfilled")
         if len(member_rows) != 1 or member_rows[0].roster_role != "captain":
             raise RuntimeError("published/locked assignment members were not backfilled")
+        projection = await db_session.scalar(
+            select(TournamentListReadModel).where(
+                TournamentListReadModel.id == tournament_id
+            )
+        )
+        organizer_name = await db_session.scalar(
+            select(User.display_name).where(User.id == tournament.organizer_user_id)
+        )
+        if (
+            projection is None
+            or projection.slug != tournament.slug
+            or projection.organizer_display_name != organizer_name
+            or not projection.has_locked_deadlock_roster
+        ):
+            raise RuntimeError("tournament catalog read-model was not backfilled")
 
 
 async def _main() -> None:

@@ -100,3 +100,40 @@ test("tournament filters keep the newest response when an older request finishes
   await expect(page.getByRole("heading", { name: "Fresh Completed Cup" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Stale Open Cup" })).toHaveCount(0);
 });
+
+test("public tournament filter pages are cached when the user returns to a query", async ({ page }) => {
+  let openRequests = 0;
+  await page.route("**/api/v1/tournaments?**", async (route) => {
+    const status = new URL(route.request().url()).searchParams.get("status");
+    if (status === "registration_open") {
+      openRequests += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: pagedHeaders(),
+        body: JSON.stringify([tournament("cached-open", "Cached Open Cup", "registration_open")])
+      });
+      return;
+    }
+    if (status === "completed") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: pagedHeaders(),
+        body: JSON.stringify([tournament("cached-completed", "Cached Completed Cup", "completed")])
+      });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto("/tournaments");
+  await page.getByTestId("status-filter").selectOption("registration_open");
+  await expect(page.getByRole("heading", { name: "Cached Open Cup" })).toBeVisible();
+  await page.getByTestId("status-filter").selectOption("completed");
+  await expect(page.getByRole("heading", { name: "Cached Completed Cup" })).toBeVisible();
+  await page.getByTestId("status-filter").selectOption("registration_open");
+  await expect(page.getByRole("heading", { name: "Cached Open Cup" })).toBeVisible();
+
+  expect(openRequests).toBe(1);
+});

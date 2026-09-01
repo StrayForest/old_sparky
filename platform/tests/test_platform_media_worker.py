@@ -113,6 +113,7 @@ class PlatformMediaWorkerLockTests(unittest.IsolatedAsyncioTestCase):
             status="ready",
             variants=3,
             owner_user_id="user-id",
+            tournament_id="tournament-id",
         )
         with (
             patch.object(worker, "media_runtime_enabled", return_value=True),
@@ -133,12 +134,18 @@ class PlatformMediaWorkerLockTests(unittest.IsolatedAsyncioTestCase):
                 "refresh_profile_read_model",
                 AsyncMock(),
             ) as refresh_profile,
+            patch.object(
+                worker,
+                "refresh_tournament_list_read_model_after_commit",
+                AsyncMock(),
+            ) as refresh_catalog,
         ):
             payload = await worker._run_locked_media_process("asset-id")
 
         self.assertEqual(payload["status"], "ready")
         process.assert_awaited_once_with(session, "asset-id", settings=worker.settings)
         refresh_profile.assert_awaited_once_with("user-id")
+        refresh_catalog.assert_awaited_once_with("tournament-id")
         client.eval.assert_awaited_once_with(
             worker.AUTOMATION_LOCK_RELEASE_SCRIPT,
             1,

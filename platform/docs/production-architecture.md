@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-29
+- Last reviewed: 2026-09-01
 
 ## Invariants
 
@@ -47,6 +47,23 @@ Browser
 
 Browser -> cdn.old-sparky.com -> Cloudflare cache -> public R2 variants
 ```
+
+Public catalog requests use a short two-layer cache: the API may serve an
+anonymous query representation from Redis for five seconds, and Nginx/
+Cloudflare may retain the same public response for the configured short edge
+TTL. The cache is keyed only by normalized public filters, limit and cursor;
+Redis failures are treated as misses. Personal `/tournaments/mine` responses
+are private and never enter either response cache.
+
+The catalog list path reads the rebuildable PostgreSQL
+`tournament_list_read_models` projection. Its rows contain the card fields,
+organizer metadata, participant count and locked-roster flag, so the hot read
+does not join profiles or aggregate participant/assignment rows. PostgreSQL
+remains the source of truth. Committed tournament, participant, workflow,
+profile and media mutations run best-effort post-commit refresh hooks; the
+Alembic backfill and bounded repair service provide recovery if a hook is
+interrupted. The read query applies indexed filters, keyset predicates and
+`LIMIT + 1` to derive `has_more` without an exact total count.
 
 The platform connects directly to PostgreSQL with explicit API and worker pool
 limits within the ordinary connection budget. High-volume

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import logging
 from typing import Any
 
 from sqlalchemy import and_, case, func, or_, select
@@ -30,6 +31,9 @@ from apps.platform_api.app.services.tournament_workflow import (
 )
 from apps.platform_api.app.services.tournament_read_models import (
     refresh_tournament_read_models,
+)
+from apps.platform_api.app.services.tournament_catalog_read_models import (
+    refresh_tournament_list_read_model,
 )
 from apps.platform_api.app.services.tournament_profile_access import (
     refresh_tournament_profile_access_state,
@@ -72,6 +76,29 @@ from python_packages.platform_infra.performance import measure_compute_block
 
 AUTOMATION_ACTOR_USER_ID: str | None = None
 AUTOMATION_TERMINAL_STATUSES = ("in_progress", "completed", "cancelled")
+logger = logging.getLogger(__name__)
+
+
+async def _refresh_catalog_projection_after_commit(
+    db_session: AsyncSession,
+    tournament_id: str,
+) -> None:
+    """Refresh the catalog in the caller's loop and session after a commit."""
+
+    if not isinstance(db_session, AsyncSession):
+        return
+    try:
+        await refresh_tournament_list_read_model(
+            str(tournament_id),
+            db_session=db_session,
+        )
+        await db_session.commit()
+    except Exception:
+        await db_session.rollback()
+        logger.exception(
+            "Tournament catalog read-model refresh failed tournament_id=%s",
+            tournament_id,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,6 +434,7 @@ async def run_deadlock_automation_tick(
                 now=current_time,
             )
             await db_session.commit()
+            await _refresh_catalog_projection_after_commit(db_session, tournament_id)
             if step_result.assignment_generated:
                 await refresh_tournament_profile_access_state(
                     tournament.slug,
@@ -450,6 +478,7 @@ async def run_deadlock_automation_tick(
                     now=current_time,
                 )
                 await db_session.commit()
+                await _refresh_catalog_projection_after_commit(db_session, tournament_id)
             result = _increment(result, "errors")
     return result
 
@@ -484,10 +513,12 @@ async def advance_deadlock_tournament_automation(
             )
             await db_session.commit()
             await db_session.refresh(fresh_tournament)
+            await _refresh_catalog_projection_after_commit(db_session, tournament_id)
         return _increment(DeadlockAutomationResult(), "errors")
     if result != DeadlockAutomationResult():
         await db_session.commit()
         await db_session.refresh(tournament)
+        await _refresh_catalog_projection_after_commit(db_session, tournament_id)
         if result.assignment_generated:
             await refresh_tournament_profile_access_state(
                 tournament.slug,

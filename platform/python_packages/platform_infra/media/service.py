@@ -78,6 +78,7 @@ class MediaProcessResult:
     variants: int = 0
     error_code: str | None = None
     owner_user_id: str | None = None
+    tournament_id: str | None = None
 
     def as_dict(self) -> dict[str, str | int | None]:
         return {
@@ -240,6 +241,7 @@ class MediaService:
                 asset_id=asset_id,
                 status=status,
                 owner_user_id=existing.owner_user_id if existing is not None else None,
+                tournament_id=existing.tournament_id if existing is not None else None,
             )
 
         purpose = asset.purpose
@@ -335,6 +337,7 @@ class MediaService:
                         status="ready",
                         variants=len(variants),
                         owner_user_id=asset.owner_user_id,
+                        tournament_id=asset.tournament_id,
                     )
             except Exception:
                 logger.exception(
@@ -361,6 +364,7 @@ class MediaService:
             status="ready",
             variants=len(variants),
             owner_user_id=asset.owner_user_id,
+            tournament_id=asset.tournament_id,
         )
 
     async def unlink_active(

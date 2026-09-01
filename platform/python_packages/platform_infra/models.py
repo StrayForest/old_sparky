@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -609,6 +610,94 @@ Index(
     unique=True,
     postgresql_where=Tournament.visibility == "public",
 )
+
+
+class TournamentListReadModel(Base):
+    """Denormalized, durable card data for public and personal catalog reads.
+
+    PostgreSQL remains authoritative for tournament, user, profile,
+    participant, and assignment state.  This row is a rebuildable projection
+    used only by list endpoints; ``updated_at`` is copied from the source
+    tournament so the projection can be inspected and repaired independently.
+    """
+
+    __tablename__ = "tournament_list_read_models"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("platform.tournaments.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    slug: Mapped[str] = mapped_column(String(140), unique=True)
+    name: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cover_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    banner_asset_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    visibility: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20))
+    format_slug: Mapped[str] = mapped_column(String(64))
+    allowed_ranks: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    max_participants: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    registration_starts_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    registration_closes_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    ready_check_starts_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    ready_check_ends_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    captain_selection_starts_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    starts_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    match_format: Mapped[str] = mapped_column(String(20))
+    final_format: Mapped[str] = mapped_column(String(20))
+    captain_response_deadline_minutes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    teams_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    automation_ready_check_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    automation_ready_check_closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    automation_captain_round_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    automation_captain_round_finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    automation_assignment_generated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    automation_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    automation_failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    automation_retry_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    organizer_user_id: Mapped[str] = mapped_column(String(36), index=True)
+    organizer_display_name: Mapped[str] = mapped_column(String(40))
+    organizer_avatar_asset_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    participant_count: Mapped[int] = mapped_column(Integer, default=0)
+    has_locked_deadlock_roster: Mapped[bool] = mapped_column(Boolean, default=False)
+    bracket_revision: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class TournamentParticipant(TimestampMixin, Base):

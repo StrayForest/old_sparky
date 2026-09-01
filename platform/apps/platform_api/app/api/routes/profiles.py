@@ -29,6 +29,9 @@ from apps.platform_api.app.api.schemas import (
     PublicProfileResponse,
 )
 from apps.platform_api.app.services.home_content import get_supported_deadlock_hero_names
+from apps.platform_api.app.services.tournament_catalog_read_models import (
+    refresh_tournament_list_read_models_for_organizer_after_commit,
+)
 from apps.platform_api.app.services.profile_read_models import refresh_profile_read_model
 from apps.platform_api.app.services.media import (
     accepted_media_response,
@@ -73,6 +76,7 @@ async def _refresh_profile_read_model_after_commit(user_id: str) -> None:
 
     try:
         await refresh_profile_read_model(user_id)
+        await refresh_tournament_list_read_models_for_organizer_after_commit(user_id)
     except Exception:
         logger.exception(
             "Post-commit profile read-model refresh failed user_id=%s",

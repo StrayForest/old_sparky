@@ -15,6 +15,9 @@ from sqlalchemy import delete, select, update
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
+from apps.platform_api.app.services.tournament_catalog_read_models import (
+    refresh_tournament_list_read_model,
+)
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.media.service import MediaService
@@ -750,26 +753,31 @@ class PlatformTournamentPolicyApiTests(unittest.IsolatedAsyncioTestCase):
         supported_slug = f"{self.prefix}-supported-solo"
 
         async with session_factory()() as db_session:
-            db_session.add_all(
-                [
-                    Tournament(
-                        slug=legacy_slug,
-                        name=f"{self.prefix} legacy standard",
-                        visibility="public",
-                        status="registration_closed",
-                        format_slug="standard_bracket",
-                        organizer_user_id=organizer["user_id"],
-                    ),
-                    Tournament(
-                        slug=supported_slug,
-                        name=f"{self.prefix} supported solo",
-                        visibility="public",
-                        status="registration_closed",
-                        format_slug="solo",
-                        organizer_user_id=organizer["user_id"],
-                    ),
-                ]
-            )
+            tournaments = [
+                Tournament(
+                    slug=legacy_slug,
+                    name=f"{self.prefix} legacy standard",
+                    visibility="public",
+                    status="registration_closed",
+                    format_slug="standard_bracket",
+                    organizer_user_id=organizer["user_id"],
+                ),
+                Tournament(
+                    slug=supported_slug,
+                    name=f"{self.prefix} supported solo",
+                    visibility="public",
+                    status="registration_closed",
+                    format_slug="solo",
+                    organizer_user_id=organizer["user_id"],
+                ),
+            ]
+            db_session.add_all(tournaments)
+            await db_session.flush()
+            for tournament in tournaments:
+                await refresh_tournament_list_read_model(
+                    tournament.id,
+                    db_session=db_session,
+                )
             await db_session.commit()
 
         public_slugs = {

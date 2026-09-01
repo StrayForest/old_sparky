@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-08-31
+- Last reviewed: 2026-09-01
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -88,11 +88,16 @@ workflow state, idempotency and concurrency. The active load gate is the
 supported SLO profile, sustained capacity ramp, separate 15k stress profile
 and explicit spike/recovery profile, each followed by exact cleanup.
 
-The tournament catalog and bracket grid are request-driven. The public catalog
-uses cursor/keyset pages with a short edge cache; `/tournaments/mine`
-remains private and uncached. The initial workspace includes the bracket,
-passive changes become visible after a manual page reload, and explicit
-organizer mutations may refresh their own authoritative result.
+The tournament catalog and bracket grid are request-driven. Public and personal
+catalog cards are served from the rebuildable PostgreSQL
+`tournament_list_read_models` projection: the source tables remain authoritative
+and committed tournament, participant, workflow, profile and media changes
+refresh the affected card. Catalog pages use cursor/keyset pagination and
+`LIMIT + 1`; public responses have a five-second Redis response cache plus a
+short Cloudflare/Nginx edge cache, while `/tournaments/mine` remains private
+and uncached. The initial workspace includes the bracket, passive changes
+become visible after a manual page reload, and explicit organizer mutations
+may refresh their own authoritative result.
 
 The current load-test gate is request-based and is defined by the reviewed
 profiles under `platform/performance/profiles/`: read profiles measure

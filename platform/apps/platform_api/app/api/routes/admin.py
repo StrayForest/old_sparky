@@ -68,6 +68,9 @@ from apps.platform_api.app.services.player_commitments import (
 from apps.platform_api.app.services.tournament_read_models import (
     delete_tournament_read_models,
 )
+from apps.platform_api.app.services.tournament_catalog_read_models import (
+    refresh_tournament_list_read_model_after_commit,
+)
 from apps.platform_api.app.services.tournament_profile_access import (
     delete_tournament_profile_access_state,
 )
@@ -1203,6 +1206,7 @@ async def admin_override_tournament(
             status_code=status.HTTP_409_CONFLICT,
             detail="Турнир с таким публичным названием уже существует.",
         ) from exc
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
     await db_session.refresh(tournament)
     if ready_round_closed_by_override and active_ready_round is not None:
         await db_session.refresh(active_ready_round)

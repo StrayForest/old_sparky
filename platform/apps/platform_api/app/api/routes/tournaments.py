@@ -148,6 +148,14 @@ from apps.platform_api.app.services.tournament_workflow import (
 from apps.platform_api.app.services.tournament_runtime_cache import (
     register_tournament_runtime_cache_invalidator,
 )
+from apps.platform_api.app.services.tournament_catalog_cache import (
+    get_public_tournament_list_cache,
+    public_tournament_list_cache_key,
+    set_public_tournament_list_cache,
+)
+from apps.platform_api.app.services.tournament_catalog_read_models import (
+    refresh_tournament_list_read_model_after_commit,
+)
 from apps.platform_api.app.services.tournament_read_models import (
     read_model_read_or_build,
     refresh_tournament_read_models,
@@ -247,6 +255,7 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockReadyRound,
     TournamentDeadlockReadyVote,
     TournamentInvite,
+    TournamentListReadModel,
     TournamentMatch,
     TournamentParticipant,
     TournamentParticipantSlot,
@@ -692,8 +701,8 @@ async def _refresh_tournament_read_models_after_commit(
     """Best-effort post-commit projection refresh.
 
     PostgreSQL remains authoritative. A projection rebuild or Redis outage is
-    observable and recoverable on the next read, but must not turn a committed
-    tournament mutation into a failed API response.
+    observable and recoverable through the bounded repair path, but must not
+    turn a committed tournament mutation into a failed API response.
     """
 
     try:
@@ -704,6 +713,7 @@ async def _refresh_tournament_read_models_after_commit(
             tournament_id,
             models,
         )
+    await refresh_tournament_list_read_model_after_commit(tournament_id)
 
 
 async def _refresh_tournament_profile_access_after_commit(slug: str) -> None:
@@ -2580,7 +2590,7 @@ def decode_tournament_cursor(cursor: str | None, *, sort_key: str) -> dict[str, 
 
 
 def encode_tournament_cursor(
-    tournament: Tournament,
+    tournament: Any,
     *,
     sort_key: str,
     participant_count: int | None = None,
@@ -2605,14 +2615,24 @@ def tournament_cursor_filter(
     *,
     sort_key: str,
     participant_count_for_sort=None,
+    created_at_column=None,
+    id_column=None,
+    starts_at_column=None,
 ):
     if cursor is None:
         return None
 
+    created_at_column = (
+        Tournament.created_at if created_at_column is None else created_at_column
+    )
+    id_column = Tournament.id if id_column is None else id_column
+    starts_at_column = (
+        Tournament.starts_at if starts_at_column is None else starts_at_column
+    )
     created_at = _cursor_datetime(cursor, "created_at")
     assert created_at is not None
     cursor_id = cursor["id"]
-    created_and_id = tuple_(Tournament.created_at, Tournament.id)
+    created_and_id = tuple_(created_at_column, id_column)
     cursor_created_and_id = tuple_(created_at, cursor_id)
     if sort_key == "created_desc":
         return created_and_id < cursor_created_and_id
@@ -2621,22 +2641,22 @@ def tournament_cursor_filter(
         starts_at = _cursor_datetime(cursor, "starts_at", allow_none=True)
         if starts_at is None:
             return and_(
-                Tournament.starts_at.is_(None),
+                starts_at_column.is_(None),
                 created_and_id < cursor_created_and_id,
             )
         same_position = and_(
-            Tournament.starts_at == starts_at,
+            starts_at_column == starts_at,
             created_and_id < cursor_created_and_id,
         )
         if sort_key == "starts_nearest":
             return or_(
-                Tournament.starts_at > starts_at,
-                Tournament.starts_at.is_(None),
+                starts_at_column > starts_at,
+                starts_at_column.is_(None),
                 same_position,
             )
         return or_(
-            Tournament.starts_at < starts_at,
-            Tournament.starts_at.is_(None),
+            starts_at_column < starts_at,
+            starts_at_column.is_(None),
             same_position,
         )
 
@@ -2651,26 +2671,69 @@ def tournament_cursor_filter(
     return or_(participant_count_for_sort < participant_count, same_position)
 
 
-def tournament_search_filter(search: str | None):
+def tournament_search_filter(
+    search: str | None,
+    *,
+    name_column=None,
+    organizer_display_name_column=None,
+):
     normalized_search = search.strip() if isinstance(search, str) else ""
     if not normalized_search:
         return None
+    name_column = Tournament.name if name_column is None else name_column
+    organizer_display_name_column = (
+        User.display_name
+        if organizer_display_name_column is None
+        else organizer_display_name_column
+    )
     search_pattern = f"%{normalized_search.lower()}%"
     return or_(
-        func.lower(Tournament.name).like(search_pattern),
-        func.lower(User.display_name).like(search_pattern),
+        func.lower(name_column).like(search_pattern),
+        func.lower(organizer_display_name_column).like(search_pattern),
     )
 
 
-def tournament_allowed_rank_filter(rank: Sequence[str]):
+def tournament_allowed_rank_filter(rank: Sequence[str], *, allowed_ranks_column=None):
     allowed_rank_filter = normalize_tournament_allowed_ranks(rank)
     if not allowed_rank_filter:
         return None
-    return or_(
-        Tournament.allowed_ranks.is_(None),
-        func.jsonb_array_length(Tournament.allowed_ranks) == 0,
-        Tournament.allowed_ranks.has_any(postgresql.array(list(allowed_rank_filter))),
+    allowed_ranks_column = (
+        Tournament.allowed_ranks
+        if allowed_ranks_column is None
+        else allowed_ranks_column
     )
+    return or_(
+        allowed_ranks_column.is_(None),
+        func.jsonb_array_length(allowed_ranks_column) == 0,
+        allowed_ranks_column.has_any(postgresql.array(list(allowed_rank_filter))),
+    )
+
+
+def _set_tournament_list_headers(
+    response: Response,
+    *,
+    limit: int,
+    has_more: bool,
+    next_cursor: str | None,
+) -> None:
+    set_cursor_pagination_headers(
+        response,
+        limit=limit,
+        has_more=has_more,
+        next_cursor=next_cursor,
+    )
+    response.headers["Cache-Control"] = (
+        "public, max-age=5, s-maxage=15, stale-while-revalidate=30"
+    )
+    response.headers["Access-Control-Expose-Headers"] = PAGINATION_EXPOSE_HEADERS
+
+
+def _tournament_list_body(items: Sequence[TournamentResponse]) -> bytes:
+    return (
+        "["
+        + ",".join(item.model_dump_json() for item in items)
+        + "]"
+    ).encode("utf-8")
 
 
 @router.get("", response_model=list[TournamentResponse])
@@ -2693,163 +2756,154 @@ async def list_tournaments(
     ),
     cursor: str | None = Query(default=None, max_length=2048),
     db_session: AsyncSession = Depends(get_db_session),
-) -> list[TournamentResponse]:
+) -> list[TournamentResponse] | Response:
+    cache_key = public_tournament_list_cache_key(
+        search=search,
+        rank=rank,
+        open_registration=open_registration,
+        status_filter=status_filter,
+        participants_sort=participants_sort,
+        date_sort=date_sort,
+        limit=limit,
+        cursor=cursor,
+    )
+    cached = await get_public_tournament_list_cache(cache_key)
+    if cached is not None:
+        cached_response = Response(content=cached.body, media_type="application/json")
+        _set_tournament_list_headers(
+            cached_response,
+            limit=cached.limit,
+            has_more=cached.has_more,
+            next_cursor=cached.next_cursor,
+        )
+        return cached_response
+
+    projection = TournamentListReadModel
     filters = [
-        Tournament.visibility == "public",
-        Tournament.format_slug == SOLO_TOURNAMENT_FORMAT,
+        projection.visibility == "public",
+        projection.format_slug == SOLO_TOURNAMENT_FORMAT,
     ]
-    search_filter = tournament_search_filter(search)
+    search_filter = tournament_search_filter(
+        search,
+        name_column=projection.name,
+        organizer_display_name_column=projection.organizer_display_name,
+    )
     if search_filter is not None:
         filters.append(search_filter)
     if open_registration:
-        filters.append(Tournament.status == "registration_open")
+        filters.append(projection.status == "registration_open")
     if status_filter:
-        filters.append(Tournament.status == status_filter)
+        filters.append(projection.status == status_filter)
 
-    rank_filter = tournament_allowed_rank_filter(rank)
+    rank_filter = tournament_allowed_rank_filter(
+        rank,
+        allowed_ranks_column=projection.allowed_ranks,
+    )
     if rank_filter is not None:
         filters.append(rank_filter)
 
-    participant_count_for_sort = (
-        select(func.count(TournamentParticipant.id))
-        .where(
-            TournamentParticipant.tournament_id == Tournament.id,
-            TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
-        )
-        .correlate(Tournament)
-        .scalar_subquery()
-    )
-    page_stmt = (
-        select(
-            Tournament.id.label("id"),
-            Tournament.created_at.label("created_at"),
-            Tournament.starts_at.label("starts_at"),
-        )
-        .join(User, User.id == Tournament.organizer_user_id)
-        .where(*filters)
-    )
     sort_key = tournament_cursor_sort(
         participants_sort=participants_sort,
         date_sort=date_sort,
     )
     decoded_cursor = decode_tournament_cursor(cursor, sort_key=sort_key)
+    page_stmt = select(projection).where(*filters)
     cursor_filter = tournament_cursor_filter(
         decoded_cursor,
         sort_key=sort_key,
-        participant_count_for_sort=participant_count_for_sort,
+        participant_count_for_sort=projection.participant_count,
+        created_at_column=projection.created_at,
+        id_column=projection.id,
+        starts_at_column=projection.starts_at,
     )
     if cursor_filter is not None:
         page_stmt = page_stmt.where(cursor_filter)
+
     if participants_sort == "asc":
-        page_stmt = page_stmt.add_columns(
-            participant_count_for_sort.label("participant_sort_count")
-        ).order_by(
-            participant_count_for_sort.asc(),
-            Tournament.created_at.desc(),
-            Tournament.id.desc(),
+        page_stmt = page_stmt.order_by(
+            projection.participant_count.asc(),
+            projection.created_at.desc(),
+            projection.id.desc(),
         )
     elif participants_sort == "desc":
-        page_stmt = page_stmt.add_columns(
-            participant_count_for_sort.label("participant_sort_count")
-        ).order_by(
-            participant_count_for_sort.desc(),
-            Tournament.created_at.desc(),
-            Tournament.id.desc(),
+        page_stmt = page_stmt.order_by(
+            projection.participant_count.desc(),
+            projection.created_at.desc(),
+            projection.id.desc(),
         )
     elif date_sort == "nearest":
         page_stmt = page_stmt.order_by(
-            Tournament.starts_at.asc().nulls_last(),
-            Tournament.created_at.desc(),
-            Tournament.id.desc(),
+            projection.starts_at.asc().nulls_last(),
+            projection.created_at.desc(),
+            projection.id.desc(),
         )
     elif date_sort == "farthest":
         page_stmt = page_stmt.order_by(
-            Tournament.starts_at.desc().nulls_last(),
-            Tournament.created_at.desc(),
-            Tournament.id.desc(),
+            projection.starts_at.desc().nulls_last(),
+            projection.created_at.desc(),
+            projection.id.desc(),
         )
     else:
-        page_stmt = page_stmt.order_by(Tournament.created_at.desc(), Tournament.id.desc())
-    tournament_page = page_stmt.limit(limit + 1).cte("tournament_page")
+        page_stmt = page_stmt.order_by(
+            projection.created_at.desc(),
+            projection.id.desc(),
+        )
 
-    stmt = tournament_with_counts_stmt(tournament_page)
-    if participants_sort == "asc":
-        stmt = stmt.order_by(
-            tournament_page.c.participant_sort_count.asc(),
-            tournament_page.c.created_at.desc(),
-            tournament_page.c.id.desc(),
-        )
-    elif participants_sort == "desc":
-        stmt = stmt.order_by(
-            tournament_page.c.participant_sort_count.desc(),
-            tournament_page.c.created_at.desc(),
-            tournament_page.c.id.desc(),
-        )
-    elif date_sort == "nearest":
-        stmt = stmt.order_by(
-            tournament_page.c.starts_at.asc().nulls_last(),
-            tournament_page.c.created_at.desc(),
-            tournament_page.c.id.desc(),
-        )
-    elif date_sort == "farthest":
-        stmt = stmt.order_by(
-            tournament_page.c.starts_at.desc().nulls_last(),
-            tournament_page.c.created_at.desc(),
-            tournament_page.c.id.desc(),
-        )
-    else:
-        stmt = stmt.order_by(tournament_page.c.created_at.desc(), tournament_page.c.id.desc())
-
-    rows = (await db_session.execute(stmt)).all()
+    rows = list((await db_session.execute(page_stmt.limit(limit + 1))).scalars().all())
     has_more = len(rows) > limit
     if has_more:
         rows = rows[:limit]
+
     media_descriptors = await load_media_descriptors(
         db_session,
         tuple(
             asset_id
             for row in rows
-            for asset_id in (row[0].banner_asset_id, row[2])
+            for asset_id in (row.banner_asset_id, row.organizer_avatar_asset_id)
         ),
     )
     serialized = [
         serialize_tournament(
-            tournament,
-            organizer_display_name,
-            int(participant_count),
-            cover_media=media_descriptors.get(tournament.banner_asset_id)
-            if tournament.banner_asset_id
+            row,
+            row.organizer_display_name,
+            int(row.participant_count),
+            cover_media=media_descriptors.get(row.banner_asset_id)
+            if row.banner_asset_id
             else None,
-            organizer_avatar_media=media_descriptors.get(organizer_avatar_asset_id)
-            if organizer_avatar_asset_id
+            organizer_avatar_media=media_descriptors.get(row.organizer_avatar_asset_id)
+            if row.organizer_avatar_asset_id
             else None,
-            has_locked_deadlock_roster=bool(int(locked_roster_count)),
+            has_locked_deadlock_roster=bool(row.has_locked_deadlock_roster),
         )
-        for (
-            tournament,
-            organizer_display_name,
-            organizer_avatar_asset_id,
-            participant_count,
-            locked_roster_count,
-        ) in rows
+        for row in rows
     ]
     next_cursor = (
         encode_tournament_cursor(
-            rows[-1][0],
+            rows[-1],
             sort_key=sort_key,
-            participant_count=int(rows[-1][3]) if sort_key.startswith("participants_") else None,
+            participant_count=(
+                int(rows[-1].participant_count)
+                if sort_key.startswith("participants_")
+                else None
+            ),
         )
         if has_more and rows
         else None
     )
-    set_cursor_pagination_headers(
+    body = _tournament_list_body(serialized)
+    await set_public_tournament_list_cache(
+        cache_key,
+        body=body,
+        limit=limit,
+        has_more=has_more,
+        next_cursor=next_cursor,
+    )
+    _set_tournament_list_headers(
         response,
         limit=limit,
         has_more=has_more,
         next_cursor=next_cursor,
     )
-    response.headers["Cache-Control"] = "public, max-age=5, s-maxage=15, stale-while-revalidate=30"
-    response.headers["Access-Control-Expose-Headers"] = PAGINATION_EXPOSE_HEADERS
     return serialized
 
 
@@ -2878,134 +2932,153 @@ async def list_my_tournaments(
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> list[TournamentResponse]:
-    current_participant_status = (
-        select(TournamentParticipant.status)
+    projection = TournamentListReadModel
+    current_user_participations = (
+        select(
+            TournamentParticipant.tournament_id.label("tournament_id"),
+            TournamentParticipant.status.label("current_user_participant_status"),
+        )
         .where(
-            TournamentParticipant.tournament_id == Tournament.id,
             TournamentParticipant.user_id == auth_session.user.id,
             TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
         )
-        .correlate(Tournament)
-        .scalar_subquery()
+        .cte("current_user_participations")
     )
-    filters = [
-        Tournament.format_slug == SOLO_TOURNAMENT_FORMAT,
-        or_(
-            Tournament.organizer_user_id == auth_session.user.id,
-            current_participant_status.is_not(None),
-        ),
-    ]
+    organizer_tournament_ids = select(
+        projection.id.label("tournament_id")
+    ).where(projection.organizer_user_id == auth_session.user.id)
+    registered_tournament_ids = select(
+        current_user_participations.c.tournament_id
+    )
+    visible_tournament_ids = None
     if scope_filter == "mine":
-        filters.append(Tournament.organizer_user_id == auth_session.user.id)
+        # Keep the common organizer view on the projection's composite index;
+        # the participant CTE is still left-joined below for the returned
+        # current-user status.
+        filters = [
+            projection.format_slug == SOLO_TOURNAMENT_FORMAT,
+            projection.organizer_user_id == auth_session.user.id,
+        ]
     elif scope_filter == "registered":
-        filters.append(current_participant_status.is_not(None))
+        visible_tournament_ids = registered_tournament_ids
+        filters = [projection.format_slug == SOLO_TOURNAMENT_FORMAT]
+    else:
+        visible_tournament_ids = union(
+            organizer_tournament_ids,
+            registered_tournament_ids,
+        )
+        filters = [projection.format_slug == SOLO_TOURNAMENT_FORMAT]
+    if visible_tournament_ids is not None:
+        visible_tournament_ids = visible_tournament_ids.cte("my_tournament_ids")
 
-    search_filter = tournament_search_filter(search)
+    search_filter = tournament_search_filter(
+        search,
+        name_column=projection.name,
+        organizer_display_name_column=projection.organizer_display_name,
+    )
     if search_filter is not None:
         filters.append(search_filter)
     if status_filter:
-        filters.append(Tournament.status == status_filter)
+        filters.append(projection.status == status_filter)
 
-    rank_filter = tournament_allowed_rank_filter(rank)
+    rank_filter = tournament_allowed_rank_filter(
+        rank,
+        allowed_ranks_column=projection.allowed_ranks,
+    )
     if rank_filter is not None:
         filters.append(rank_filter)
+
     sort_key = tournament_cursor_sort(date_sort=date_sort)
     decoded_cursor = decode_tournament_cursor(cursor, sort_key=sort_key)
     page_stmt = (
-        select(
-            Tournament.id.label("id"),
-            Tournament.created_at.label("created_at"),
-            Tournament.starts_at.label("starts_at"),
-            current_participant_status.label("current_user_participant_status"),
+        select(projection, current_user_participations.c.current_user_participant_status)
+        .outerjoin(
+            current_user_participations,
+            current_user_participations.c.tournament_id == projection.id,
         )
-        .join(User, User.id == Tournament.organizer_user_id)
         .where(*filters)
     )
-    cursor_filter = tournament_cursor_filter(decoded_cursor, sort_key=sort_key)
+    if visible_tournament_ids is not None:
+        page_stmt = page_stmt.join(
+            visible_tournament_ids,
+            visible_tournament_ids.c.tournament_id == projection.id,
+        )
+    cursor_filter = tournament_cursor_filter(
+        decoded_cursor,
+        sort_key=sort_key,
+        created_at_column=projection.created_at,
+        id_column=projection.id,
+        starts_at_column=projection.starts_at,
+    )
     if cursor_filter is not None:
         page_stmt = page_stmt.where(cursor_filter)
+
     if date_sort == "nearest":
         page_stmt = page_stmt.order_by(
-            Tournament.starts_at.asc().nulls_last(),
-            Tournament.created_at.desc(),
-            Tournament.id.desc(),
+            projection.starts_at.asc().nulls_last(),
+            projection.created_at.desc(),
+            projection.id.desc(),
         )
     elif date_sort == "farthest":
         page_stmt = page_stmt.order_by(
-            Tournament.starts_at.desc().nulls_last(),
-            Tournament.created_at.desc(),
-            Tournament.id.desc(),
+            projection.starts_at.desc().nulls_last(),
+            projection.created_at.desc(),
+            projection.id.desc(),
         )
     else:
-        page_stmt = page_stmt.order_by(Tournament.created_at.desc(), Tournament.id.desc())
-    tournament_page = page_stmt.limit(limit + 1).cte("tournament_page")
-
-    stmt = tournament_with_counts_stmt(tournament_page).add_columns(
-        tournament_page.c.current_user_participant_status,
-    )
-    if date_sort == "nearest":
-        stmt = stmt.order_by(
-            tournament_page.c.starts_at.asc().nulls_last(),
-            tournament_page.c.created_at.desc(),
-            tournament_page.c.id.desc(),
+        page_stmt = page_stmt.order_by(
+            projection.created_at.desc(),
+            projection.id.desc(),
         )
-    elif date_sort == "farthest":
-        stmt = stmt.order_by(
-            tournament_page.c.starts_at.desc().nulls_last(),
-            tournament_page.c.created_at.desc(),
-            tournament_page.c.id.desc(),
-        )
-    else:
-        stmt = stmt.order_by(tournament_page.c.created_at.desc(), tournament_page.c.id.desc())
 
-    rows = (await db_session.execute(stmt)).all()
+    rows = list((await db_session.execute(page_stmt.limit(limit + 1))).all())
     has_more = len(rows) > limit
     if has_more:
         rows = rows[:limit]
+
     media_descriptors = await load_media_descriptors(
         db_session,
         tuple(
             asset_id
-            for row in rows
-            for asset_id in (row[0].banner_asset_id, row[2])
+            for projection_row, _current_status in rows
+            for asset_id in (
+                projection_row.banner_asset_id,
+                projection_row.organizer_avatar_asset_id,
+            )
         ),
     )
     serialized = [
         serialize_tournament(
-            tournament,
-            organizer_display_name,
-            int(participant_count),
-            cover_media=media_descriptors.get(tournament.banner_asset_id)
-            if tournament.banner_asset_id
+            projection_row,
+            projection_row.organizer_display_name,
+            int(projection_row.participant_count),
+            cover_media=media_descriptors.get(projection_row.banner_asset_id)
+            if projection_row.banner_asset_id
             else None,
-            organizer_avatar_media=media_descriptors.get(organizer_avatar_asset_id)
-            if organizer_avatar_asset_id
+            organizer_avatar_media=media_descriptors.get(
+                projection_row.organizer_avatar_asset_id
+            )
+            if projection_row.organizer_avatar_asset_id
             else None,
-            has_locked_deadlock_roster=bool(int(locked_roster_count)),
-            current_user_participant_status=current_user_participant_status,
+            has_locked_deadlock_roster=bool(
+                projection_row.has_locked_deadlock_roster
+            ),
+            current_user_participant_status=current_status,
         )
-        for (
-            tournament,
-            organizer_display_name,
-            organizer_avatar_asset_id,
-            participant_count,
-            locked_roster_count,
-            current_user_participant_status,
-        ) in rows
+        for projection_row, current_status in rows
     ]
     next_cursor = (
         encode_tournament_cursor(rows[-1][0], sort_key=sort_key)
         if has_more and rows
         else None
     )
-    set_cursor_pagination_headers(
+    _set_tournament_list_headers(
         response,
         limit=limit,
         has_more=has_more,
         next_cursor=next_cursor,
     )
     response.headers["Cache-Control"] = "private, no-store"
-    response.headers["Access-Control-Expose-Headers"] = PAGINATION_EXPOSE_HEADERS
     return serialized
 
 
@@ -3189,6 +3262,7 @@ async def create_tournament(
         },
     )
     await db_session.commit()
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
     await db_session.refresh(tournament)
     return serialize_tournament(tournament, auth_session.user.display_name, 0)
 
@@ -3326,6 +3400,7 @@ async def delete_tournament_banner(
         owner_id=tournament.id,
         before_commit=audit_unlink,
     )
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
     return MediaDeleteAcceptedResponse(
         asset_id=asset_id,
         status="cleanup_pending" if asset_id else "deleted",
@@ -3586,6 +3661,7 @@ async def organizer_add_participant(
     tournament.updated_at = auth_session.now
     await db_session.commit()
     await _refresh_tournament_profile_access_after_commit(tournament.slug)
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
     invalidate_tournament_runtime_caches(tournament.id)
     await db_session.refresh(participant)
     return serialize_participant(participant, target_user.display_name)
@@ -3671,6 +3747,7 @@ async def organizer_remove_participant(
     tournament.updated_at = auth_session.now
     await db_session.commit()
     await _refresh_tournament_profile_access_after_commit(tournament.slug)
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
     invalidate_tournament_runtime_caches(tournament.id)
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
@@ -3803,6 +3880,7 @@ async def organizer_moderate_participant(
     tournament.updated_at = auth_session.now
     await db_session.commit()
     await _refresh_tournament_profile_access_after_commit(tournament.slug)
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
     invalidate_tournament_runtime_caches(tournament.id)
     await db_session.refresh(participant)
     return serialize_participant(
@@ -4998,6 +5076,7 @@ async def start_deadlock_ready_check(
         },
     )
     await db_session.commit()
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
     await db_session.refresh(round_row)
     return await serialize_deadlock_ready_round(
         db_session,
@@ -5265,6 +5344,7 @@ async def close_deadlock_ready_check(
         payload={"tournament_slug": tournament.slug},
     )
     await db_session.commit()
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
     await db_session.refresh(active_round)
     return await serialize_deadlock_ready_round(
         db_session,
@@ -6295,6 +6375,7 @@ async def join_tournament(
     tournament.updated_at = auth_session.now
     await db_session.commit()
     await _refresh_tournament_profile_access_after_commit(tournament.slug)
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
     invalidate_tournament_runtime_caches(tournament.id)
     return serialize_participant(participant, auth_session.user.display_name)
 
@@ -6405,6 +6486,7 @@ async def leave_tournament(
     tournament.updated_at = auth_session.now
     await db_session.commit()
     await _refresh_tournament_profile_access_after_commit(tournament.slug)
+    await refresh_tournament_list_read_model_after_commit(tournament.id)
     invalidate_tournament_runtime_caches(tournament.id)
     response.status_code = status.HTTP_204_NO_CONTENT
     return response

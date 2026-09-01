@@ -23,7 +23,7 @@ from apps.platform_api.app.api.routes.tournaments import (
     list_tournaments,
 )
 from apps.platform_api.app.api.schemas import TournamentResponse
-from python_packages.platform_infra.models import Tournament
+from python_packages.platform_infra.models import Tournament, TournamentListReadModel
 
 
 def compiled_sql(statement) -> str:
@@ -35,11 +35,12 @@ def compiled_sql(statement) -> str:
 def empty_result() -> Mock:
     result = Mock()
     result.all.return_value = []
+    result.scalars.return_value.all.return_value = []
     return result
 
 
 def tournament_result(row_count: int = 1) -> Mock:
-    tournament = Tournament(
+    tournament = TournamentListReadModel(
         id="tournament-1",
         slug="night-cup",
         name="Night Cup",
@@ -67,10 +68,16 @@ def tournament_result(row_count: int = 1) -> Mock:
         automation_assignment_generated_at=None,
         automation_last_error=None,
         organizer_user_id="organizer-1",
+        organizer_display_name="Organizer",
+        participant_count=7,
+        has_locked_deadlock_roster=False,
+        bracket_revision=0,
         created_at=datetime(2026, 6, 13, tzinfo=UTC),
+        updated_at=datetime(2026, 6, 13, tzinfo=UTC),
     )
     result = Mock()
-    result.all.return_value = [(tournament, "Organizer", None, 7, 0)] * row_count
+    result.scalars.return_value.all.return_value = [tournament] * row_count
+    result.all.return_value = [(tournament, None)] * row_count
     return result
 
 
@@ -134,29 +141,20 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         page_sql = compiled_sql(db_session.execute.await_args.args[0])
-        self.assertIn("lower(platform.tournaments.name) LIKE", page_sql)
-        self.assertIn("lower(platform.users.display_name) LIKE", page_sql)
-        self.assertIn("platform.tournaments.status =", page_sql)
-        self.assertIn("platform.tournaments.allowed_ranks ?| ARRAY", page_sql)
-        self.assertIn("WITH tournament_page AS", page_sql)
+        self.assertIn("lower(platform.tournament_list_read_models.name) LIKE", page_sql)
+        self.assertIn("lower(platform.tournament_list_read_models.organizer_display_name) LIKE", page_sql)
+        self.assertIn("platform.tournament_list_read_models.status =", page_sql)
+        self.assertIn("platform.tournament_list_read_models.allowed_ranks ?| ARRAY", page_sql)
         self.assertIn("LIMIT", page_sql)
         self.assertNotIn("OFFSET", page_sql)
-        self.assertIn("participant_sort_count", page_sql)
         self.assertIn(
-            "platform.tournament_participants.tournament_id IN "
-            "(SELECT tournament_page.id FROM tournament_page)",
+            "ORDER BY platform.tournament_list_read_models.participant_count DESC, "
+            "platform.tournament_list_read_models.created_at DESC, "
+            "platform.tournament_list_read_models.id DESC",
             page_sql,
         )
-        self.assertIn(
-            "platform.tournament_deadlock_assignment_runs.tournament_id IN "
-            "(SELECT tournament_page.id FROM tournament_page)",
-            page_sql,
-        )
-        self.assertIn(
-            "ORDER BY tournament_page.participant_sort_count DESC, "
-            "tournament_page.created_at DESC, tournament_page.id DESC",
-            page_sql,
-        )
+        self.assertNotIn("COUNT(", page_sql)
+        self.assertNotIn("JOIN platform.users", page_sql)
 
     async def test_public_status_and_date_sort_apply_before_pagination(self) -> None:
         db_session = Mock()
@@ -180,10 +178,11 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload, [])
         page_sql = compiled_sql(db_session.execute.await_args.args[0])
         self.assertEqual(db_session.scalar.await_count, 0)
-        self.assertIn("platform.tournaments.status =", page_sql)
+        self.assertIn("platform.tournament_list_read_models.status =", page_sql)
         self.assertIn(
-            "ORDER BY tournament_page.starts_at DESC NULLS LAST, "
-            "tournament_page.created_at DESC, tournament_page.id DESC",
+            "ORDER BY platform.tournament_list_read_models.starts_at DESC NULLS LAST, "
+            "platform.tournament_list_read_models.created_at DESC, "
+            "platform.tournament_list_read_models.id DESC",
             page_sql,
         )
 
@@ -222,24 +221,23 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         page_sql = compiled_sql(db_session.execute.await_args.args[0])
+        self.assertIn("WITH current_user_participations AS", page_sql)
+        self.assertIn("my_tournament_ids AS", page_sql)
         self.assertIn("platform.tournament_participants.status", page_sql)
-        self.assertIn("lower(platform.tournaments.name) LIKE", page_sql)
-        self.assertIn("lower(platform.users.display_name) LIKE", page_sql)
-        self.assertIn("platform.tournaments.status =", page_sql)
-        self.assertIn("platform.tournaments.allowed_ranks ?| ARRAY", page_sql)
-        self.assertIn("WITH tournament_page AS", page_sql)
+        self.assertIn("lower(platform.tournament_list_read_models.name) LIKE", page_sql)
+        self.assertIn("lower(platform.tournament_list_read_models.organizer_display_name) LIKE", page_sql)
+        self.assertIn("platform.tournament_list_read_models.status =", page_sql)
+        self.assertIn("platform.tournament_list_read_models.allowed_ranks ?| ARRAY", page_sql)
         self.assertNotIn("OFFSET", page_sql)
         self.assertIn("current_user_participant_status", page_sql)
         self.assertIn(
-            "ORDER BY tournament_page.starts_at ASC NULLS LAST, "
-            "tournament_page.created_at DESC, tournament_page.id DESC",
+            "ORDER BY platform.tournament_list_read_models.starts_at ASC NULLS LAST, "
+            "platform.tournament_list_read_models.created_at DESC, "
+            "platform.tournament_list_read_models.id DESC",
             page_sql,
         )
-        self.assertIn(
-            "platform.tournament_participants.tournament_id IN "
-            "(SELECT tournament_page.id FROM tournament_page)",
-            page_sql,
-        )
+        self.assertNotIn("SELECT platform.tournament_participants.status", page_sql)
+        self.assertNotIn("COUNT(", page_sql)
 
     async def test_admin_aggregates_only_the_selected_page(self) -> None:
         db_session = Mock()
@@ -357,7 +355,8 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
 
         page_sql = compiled_sql(db_session.execute.await_args.args[0])
         self.assertIn(
-            "(platform.tournaments.created_at, platform.tournaments.id) <",
+            "(platform.tournament_list_read_models.created_at, "
+            "platform.tournament_list_read_models.id) <",
             page_sql,
         )
         self.assertNotIn("OFFSET", page_sql)

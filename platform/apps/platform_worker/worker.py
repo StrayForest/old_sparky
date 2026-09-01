@@ -27,6 +27,9 @@ from apps.platform_api.app.services.patch_translation import (
     translate_patch_to_russian,
 )
 from apps.platform_api.app.services.profile_read_models import refresh_profile_read_model
+from apps.platform_api.app.services.tournament_catalog_read_models import (
+    refresh_tournament_list_read_model_after_commit,
+)
 from apps.platform_api.app.services.player_commitments import reconcile_player_commitments
 from apps.platform_api.app.services.tournament_workflow import (
     generate_deadlock_auto_assignment_run_for_tournament,
@@ -492,8 +495,11 @@ async def _run_locked_media_process(asset_id: str) -> dict[str, Any]:
                 asset_id,
                 settings=settings,
             )
-        if result.status == "ready" and result.owner_user_id is not None:
-            await refresh_profile_read_model(result.owner_user_id)
+        if result.status == "ready":
+            if result.owner_user_id is not None:
+                await refresh_profile_read_model(result.owner_user_id)
+            if result.tournament_id is not None:
+                await refresh_tournament_list_read_model_after_commit(result.tournament_id)
         return result.as_dict()
     finally:
         if acquired:
