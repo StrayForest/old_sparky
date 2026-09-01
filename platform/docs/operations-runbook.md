@@ -224,6 +224,49 @@ gh workflow run platform-production-external-load.yml \
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
+For the standard full read-path stress run, select `read-mix-stress-v2`.
+It provisions 40 marked tournaments with 500 users each (20,000 authenticated
+virtual users), runs the read mix at HTTP concurrency 128, and includes 10,000
+conditional manual refreshes. This is an external HTTP load test, not 20,000
+browser processes. The fixture supervisor creates marker-qualified public
+names; do not reuse a static tournament name between runs.
+
+```bash
+gh workflow run platform-production-external-load.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
+  -f control_email=<existing-production-account-email> \
+  -f profile_id=read-mix-stress-v2
+gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+`read-mix-stress-v2` measures authenticated page/API reads and conditional
+reloads. It does not complete the create → join → Ready Check → bracket
+lifecycle and it is not the browser grid/pixel test. Run the public browser
+gate separately after a reviewed deploy:
+
+```bash
+gh workflow run platform-live-launch.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f base_url=https://old-sparky.com -f provision=false
+gh run watch <browser-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+For the full lifecycle at scale, use the QA/preprod owner route and the
+`tournament-lifecycle-scale-v1` contract: 20 tournaments × 500 users (10,000
+users), concurrent lifecycle waves, bracket match reports, conditional reads,
+terminal `completed` state and exact cleanup. It is intentionally not
+dispatchable through the production external-load workflow. The canonical
+harness command is:
+
+```bash
+python3 platform/tools/platform_production_qa.py \
+  --mode tournament-lifecycle --concurrency 128
+```
+
+Run that command only with the configured QA/preprod environment and its
+approved operator cleanup/abort procedure; it must not target production.
+
 The selected versioned profile owns the spread, fixture shape, retry behavior,
 phase/rate plan and acceptance budgets. Record raw HTTP attempts (including 200,
 `READY_VOTE_OVERLOADED`, other status and timeout counts) separately from

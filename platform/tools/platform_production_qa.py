@@ -127,6 +127,12 @@ def qa_display_name(marker: str, label: str) -> str:
     return f"{label[:7]}-{marker[-7:]}"[:15]
 
 
+def write_burst_tournament_name(marker: str, index: int, label: str) -> str:
+    """Return a marker-qualified public name within the public length limit."""
+
+    return f"WB{index:02d}-{marker[-10:]}-{label.replace('_', '-')[:5]}"[:25]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run targeted end-to-end production QA for Old Sparky Arena."
@@ -3527,7 +3533,7 @@ class ProductionQa:
             "/tournaments",
             expected=201,
             json_payload={
-                "name": f"WB {index:02d} {label.replace('_', '-')}"[:25],
+                "name": write_burst_tournament_name(self.marker, index, label),
                 "description": f"Write burst profile {self.marker} {label}.",
                 "visibility": "public",
                 "format_slug": "solo",

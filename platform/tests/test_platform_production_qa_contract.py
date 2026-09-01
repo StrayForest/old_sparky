@@ -6,6 +6,7 @@ from tools.platform_production_qa import (
     ProductionQa,
     is_local_origin,
     normalize_path_for_slugs,
+    write_burst_tournament_name,
 )
 
 
@@ -134,6 +135,17 @@ class ProductionQaContractTests(unittest.TestCase):
             ),
             "/tournaments/{slug}/bracket",
         )
+
+    def test_write_burst_tournament_names_are_unique_and_within_public_limit(self) -> None:
+        marker = "preprod2609012009294e7a"
+        names = {
+            write_burst_tournament_name(marker, index, "external_ready")
+            for index in range(1, 41)
+        }
+
+        self.assertEqual(len(names), 40)
+        self.assertTrue(all(len(name) <= 25 for name in names))
+        self.assertTrue(all(marker[-10:] in name for name in names))
 
     def test_tournament_lifecycle_uses_the_current_workspace_and_profile_flow(self) -> None:
         qa = ProductionQa(

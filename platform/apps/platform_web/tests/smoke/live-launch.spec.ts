@@ -291,7 +291,7 @@ test("live tournaments hub exposes a valid empty or populated list", async ({ pa
   const cardCount = await cards.count();
   if (cardCount === 0) {
     await expect(emptyState).toContainText("Турниров пока нет");
-    await expect(page.getByText("Показано 0 из 0 турниров")).toBeVisible();
+    await expect(page.getByTestId("shown-count")).toHaveText("Показано 0 турниров");
     return;
   }
 
