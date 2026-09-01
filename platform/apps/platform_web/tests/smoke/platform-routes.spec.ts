@@ -799,7 +799,82 @@ test("admin console loads operational data and keeps audited actions explicit", 
       body: JSON.stringify({
         users_total: 42,
         tournaments_total: 12,
-        audit_events_total: 87
+        audit_events_total: 87,
+        analytics: {
+          generated_at: "2026-06-08T13:00:00Z",
+          users_total: 42,
+          active_users: 38,
+          verified_users: 35,
+          steam_linked_users: 31,
+          player_profiles_total: 39,
+          deadlock_profiles_total: 34,
+          tournaments_total: 12,
+          active_tournaments: 5,
+          completed_tournaments: 4,
+          tournaments_attention_total: 2,
+          public_tournaments: 9,
+          invite_only_tournaments: 3,
+          average_active_participants_per_tournament: 18.5,
+          participants_total: 128,
+          active_participants: 116,
+          assigned_participants: 84,
+          unassigned_participants: 32,
+          participant_profile_coverage_percent: 82.8,
+          teams_total: 16,
+          rostered_members_total: 84,
+          locked_rosters: 4,
+          matches_total: 48,
+          scheduled_matches: 8,
+          live_matches: 2,
+          completed_matches: 36,
+          cancelled_matches: 2,
+          assignment_runs_total: 9,
+          current_assignment_runs: 5,
+          ready_rounds_total: 12,
+          active_ready_rounds: 1,
+          captain_rounds_total: 9,
+          active_captain_rounds: 0,
+          automation_failures_total: 1,
+          tournaments_with_automation_failures: 1,
+          audit_events_total: 87,
+          audit_events_24h: 6,
+          audit_events_7d: 24,
+          preprod_test_runs_total: 2,
+          preprod_test_users_total: 0,
+          user_status_distribution: [{ key: "active", count: 38, percentage: 90.5 }],
+          tournament_status_distribution: [
+            { key: "registration_open", count: 2, percentage: 16.7 },
+            { key: "registration_closed", count: 2, percentage: 16.7 },
+            { key: "in_progress", count: 1, percentage: 8.3 },
+            { key: "completed", count: 4, percentage: 33.3 },
+            { key: "cancelled", count: 3, percentage: 25 }
+          ],
+          tournament_visibility_distribution: [
+            { key: "public", count: 9, percentage: 75 },
+            { key: "invite_only", count: 3, percentage: 25 }
+          ],
+          participant_status_distribution: [{ key: "registered", count: 116, percentage: 90.6 }],
+          match_status_distribution: [
+            { key: "scheduled", count: 8, percentage: 16.7 },
+            { key: "live", count: 2, percentage: 4.2 },
+            { key: "completed", count: 36, percentage: 75 },
+            { key: "cancelled", count: 2, percentage: 4.2 }
+          ],
+          assignment_status_distribution: [{ key: "locked", count: 4, percentage: 44.4 }],
+          ready_round_status_distribution: [{ key: "closed", count: 11, percentage: 91.7 }],
+          captain_round_status_distribution: [{ key: "finalized", count: 9, percentage: 100 }],
+          rank_distribution: [
+            { key: "Oracle", count: 8, percentage: 23.5 },
+            { key: "Phantom", count: 12, percentage: 35.3 },
+            { key: "Archon", count: 14, percentage: 41.2 }
+          ],
+          active_participant_rank_distribution: [
+            { key: "Oracle", count: 6, percentage: 24 },
+            { key: "Phantom", count: 10, percentage: 40 },
+            { key: "Archon", count: 9, percentage: 36 }
+          ],
+          activity: [{ date: "2026-06-08", users: 3, tournaments: 1, participants: 8, matches: 4, audit_events: 6 }]
+        }
       })
     });
   });
@@ -906,9 +981,12 @@ test("admin console loads operational data and keeps audited actions explicit", 
 
   await page.goto("/platform-ops");
   await expect(page.getByTestId("admin-console")).toBeVisible();
+  await expect(page.getByTestId("admin-dashboard")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Сводка по платформе" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Операционный центр платформы" })).toBeVisible();
-  await expect(page.getByText("42", { exact: true })).toBeVisible();
+  await expect(page.getByText("42 всего", { exact: true })).toBeVisible();
   await expect(page.getByText("87", { exact: true })).toBeVisible();
+  await page.getByRole("tab", { name: "Операции с турнирами" }).click();
   await expect(page.getByTestId("admin-tournament-admin-cup")).toBeVisible();
   await page.getByTestId("admin-tournament-admin-cup").click();
 

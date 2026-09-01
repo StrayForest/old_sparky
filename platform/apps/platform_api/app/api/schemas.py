@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
@@ -1102,6 +1102,78 @@ class AdminOverviewResponse(BaseModel):
     audit_events_total: int
     preprod_test_runs_total: int = 0
     preprod_test_users_total: int = 0
+    analytics: "AdminAnalyticsResponse | None" = None
+
+
+class AdminAnalyticsBucketResponse(BaseModel):
+    key: str
+    count: int
+    percentage: float = 0.0
+
+
+class AdminAnalyticsActivityPointResponse(BaseModel):
+    date: date
+    users: int = 0
+    tournaments: int = 0
+    participants: int = 0
+    matches: int = 0
+    audit_events: int = 0
+
+
+class AdminAnalyticsResponse(BaseModel):
+    """Read-only aggregate telemetry for the protected operations console."""
+
+    generated_at: datetime
+    users_total: int = 0
+    active_users: int = 0
+    verified_users: int = 0
+    steam_linked_users: int = 0
+    player_profiles_total: int = 0
+    deadlock_profiles_total: int = 0
+    tournaments_total: int = 0
+    active_tournaments: int = 0
+    completed_tournaments: int = 0
+    tournaments_attention_total: int = 0
+    public_tournaments: int = 0
+    invite_only_tournaments: int = 0
+    average_active_participants_per_tournament: float = 0.0
+    participants_total: int = 0
+    active_participants: int = 0
+    assigned_participants: int = 0
+    unassigned_participants: int = 0
+    participant_profile_coverage_percent: float = 0.0
+    teams_total: int = 0
+    rostered_members_total: int = 0
+    locked_rosters: int = 0
+    matches_total: int = 0
+    scheduled_matches: int = 0
+    live_matches: int = 0
+    completed_matches: int = 0
+    cancelled_matches: int = 0
+    assignment_runs_total: int = 0
+    current_assignment_runs: int = 0
+    ready_rounds_total: int = 0
+    active_ready_rounds: int = 0
+    captain_rounds_total: int = 0
+    active_captain_rounds: int = 0
+    automation_failures_total: int = 0
+    tournaments_with_automation_failures: int = 0
+    audit_events_total: int = 0
+    audit_events_24h: int = 0
+    audit_events_7d: int = 0
+    preprod_test_runs_total: int = 0
+    preprod_test_users_total: int = 0
+    user_status_distribution: list[AdminAnalyticsBucketResponse] = Field(default_factory=list)
+    tournament_status_distribution: list[AdminAnalyticsBucketResponse] = Field(default_factory=list)
+    tournament_visibility_distribution: list[AdminAnalyticsBucketResponse] = Field(default_factory=list)
+    participant_status_distribution: list[AdminAnalyticsBucketResponse] = Field(default_factory=list)
+    match_status_distribution: list[AdminAnalyticsBucketResponse] = Field(default_factory=list)
+    assignment_status_distribution: list[AdminAnalyticsBucketResponse] = Field(default_factory=list)
+    ready_round_status_distribution: list[AdminAnalyticsBucketResponse] = Field(default_factory=list)
+    captain_round_status_distribution: list[AdminAnalyticsBucketResponse] = Field(default_factory=list)
+    rank_distribution: list[AdminAnalyticsBucketResponse] = Field(default_factory=list)
+    active_participant_rank_distribution: list[AdminAnalyticsBucketResponse] = Field(default_factory=list)
+    activity: list[AdminAnalyticsActivityPointResponse] = Field(default_factory=list)
 
 
 class AdminTournamentResponse(TournamentResponse):

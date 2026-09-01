@@ -14,6 +14,7 @@ from apps.platform_api.app.services.tournament_teams import materialize_assignme
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
+    DeadlockProfile,
     MediaAsset,
     PreprodTestRun,
     Role,
@@ -285,6 +286,16 @@ class PlatformAdminApiTests(unittest.IsolatedAsyncioTestCase):
             200,
         )
         self.assertGreaterEqual(overview["tournaments_attention_total"], 1)
+        analytics = overview["analytics"]
+        self.assertEqual(analytics["users_total"], overview["users_total"])
+        self.assertEqual(analytics["tournaments_total"], overview["tournaments_total"])
+        self.assertGreaterEqual(analytics["matches_total"], 1)
+        self.assertGreaterEqual(analytics["completed_matches"], 0)
+        self.assertEqual(len(analytics["activity"]), 14)
+        self.assertTrue(any(
+            bucket["key"] == "completed"
+            for bucket in analytics["tournament_status_distribution"]
+        ))
 
         reopened = self._assert_status(
             await admin_user["client"].patch(
@@ -392,6 +403,75 @@ class PlatformAdminApiTests(unittest.IsolatedAsyncioTestCase):
             params={"status": "draft"},
         )
         self.assertEqual(invalid_status.status_code, 422, invalid_status.text)
+
+    async def test_admin_overview_exposes_rank_and_activity_analytics(self) -> None:
+        organizer = await self._register_user("analytics-organizer")
+        player_one = await self._register_user("analytics-player-one")
+        player_two = await self._register_user("analytics-player-two")
+        admin_user = await self._register_user("analytics-admin")
+        await self._grant_role(admin_user["user_id"], "admin")
+
+        async with session_factory()() as db_session:
+            tournament = Tournament(
+                slug=f"{self.prefix}-analytics",
+                name="Admin analytics fixture",
+                visibility="public",
+                status="registration_closed",
+                format_slug="solo",
+                organizer_user_id=organizer["user_id"],
+            )
+            db_session.add(tournament)
+            await db_session.flush()
+            db_session.add_all(
+                [
+                    TournamentParticipant(
+                        tournament_id=tournament.id,
+                        user_id=player_one["user_id"],
+                        status="registered",
+                        entry_type="solo",
+                    ),
+                    TournamentParticipant(
+                        tournament_id=tournament.id,
+                        user_id=player_two["user_id"],
+                        status="withdrawn",
+                        entry_type="solo",
+                    ),
+                    DeadlockProfile(
+                        user_id=player_one["user_id"],
+                        rank="Oracle",
+                        subrank=2,
+                        playtime="1001-1500",
+                        roles=["Carry"],
+                        pool=["Abrams"],
+                        captain_priority="neutral",
+                    ),
+                    DeadlockProfile(
+                        user_id=player_two["user_id"],
+                        rank="Phantom",
+                        subrank=3,
+                        playtime="501-1000",
+                        roles=["Support"],
+                        pool=["Ivy"],
+                        captain_priority="neutral",
+                    ),
+                ]
+            )
+            await db_session.commit()
+
+        response = await admin_user["client"].get("/api/v1/admin/overview")
+        overview = self._assert_status(response, 200)
+        analytics = overview["analytics"]
+        rank_counts = {item["key"]: item["count"] for item in analytics["rank_distribution"]}
+        active_rank_counts = {
+            item["key"]: item["count"]
+            for item in analytics["active_participant_rank_distribution"]
+        }
+        self.assertGreaterEqual(rank_counts.get("Oracle", 0), 1)
+        self.assertGreaterEqual(rank_counts.get("Phantom", 0), 1)
+        self.assertGreaterEqual(active_rank_counts.get("Oracle", 0), 1)
+        self.assertEqual(len(analytics["activity"]), 14)
+        self.assertGreaterEqual(analytics["active_participants"], 1)
+        self.assertGreaterEqual(analytics["unassigned_participants"], 1)
 
     async def test_admin_visibility_override_requires_note_and_reapplies_workspace_access(self) -> None:
         organizer = await self._register_user("organizer")

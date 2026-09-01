@@ -146,8 +146,9 @@ test("admin tournament list progressively loads, retries, and deduplicates pages
   await page.goto("/platform-ops");
 
   await expect(page.getByTestId("admin-console")).toBeVisible();
+  await page.getByRole("tab", { name: "Операции с турнирами" }).click();
   await expect(page.locator(".admin-table tbody tr")).toHaveCount(25);
-  await expect(page.getByRole("tab").first().locator("span")).toHaveText("25/27");
+  await expect(page.getByRole("tab", { name: "Операции с турнирами" }).locator("span").last()).toHaveText("25/27");
   await expect(page.getByText("Записей: 27", { exact: true })).toBeVisible();
   await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading")).toHaveText("Tournament 01");
   await expect.poll(() => requestedOffsets).toEqual([0]);
@@ -164,7 +165,7 @@ test("admin tournament list progressively loads, retries, and deduplicates pages
 
   await expect(page.locator(".admin-table tbody tr")).toHaveCount(totalTournaments);
   await expect(page.getByTestId("admin-tournament-tournament-25")).toHaveCount(1);
-  await expect(page.getByRole("tab").first().locator("span")).toHaveText("27/27");
+  await expect(page.getByRole("tab", { name: "Операции с турнирами" }).locator("span").last()).toHaveText("27/27");
   await expect(page.getByText("Записей: 27", { exact: true })).toBeVisible();
   await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading")).toHaveText("Tournament 01");
   await expect(page.getByTestId("admin-tournaments-load-more")).toHaveCount(0);
@@ -176,7 +177,7 @@ test("admin tournament list progressively loads, retries, and deduplicates pages
   await page.getByTestId("admin-refresh").click();
 
   await expect(page.locator(".admin-table tbody tr")).toHaveCount(25);
-  await expect(page.getByRole("tab").first().locator("span")).toHaveText("25/27");
+  await expect(page.getByRole("tab", { name: "Операции с турнирами" }).locator("span").last()).toHaveText("25/27");
   await expect(page.getByTestId("admin-tournaments-load-more")).toBeVisible();
   await expect(page.getByTestId("admin-tournament-inspector").getByRole("heading")).toHaveText("Tournament 01");
   await expect.poll(() => requestedOffsets).toEqual([0, 25, 25, 0]);

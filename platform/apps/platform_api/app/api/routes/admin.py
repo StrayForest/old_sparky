@@ -13,6 +13,7 @@ from apps.platform_api.app.api.pagination import (
 )
 from apps.platform_api.app.api.schemas import (
     AdminAuditLogResponse,
+    AdminAnalyticsResponse,
     AdminOverviewResponse,
     AdminPreprodCleanupRequest,
     AdminPreprodCleanupResponse,
@@ -87,6 +88,7 @@ from apps.platform_api.app.services.admin_roster import (
     mutate_admin_roster,
     public_roster_snapshot,
 )
+from apps.platform_api.app.services.admin_analytics import load_admin_analytics
 from apps.platform_api.app.services.mutation_idempotency import (
     bind_mutation_idempotency_resource,
     mutation_payload_fingerprint,
@@ -433,36 +435,15 @@ async def admin_overview(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> AdminOverviewResponse:
     ensure_admin_role(auth_session)
-
-    users_total = int(await db_session.scalar(select(func.count()).select_from(User)) or 0)
-    tournaments_total = int(await db_session.scalar(select(func.count()).select_from(Tournament)) or 0)
-    preprod_test_runs_total = int(
-        await db_session.scalar(select(func.count()).select_from(PreprodTestRun))
-        or 0
-    )
-    preprod_test_users_total = int(
-        await db_session.scalar(
-            select(func.coalesce(func.sum(PreprodTestRun.created_users), 0))
-            .where(PreprodTestRun.status != "cleaned")
-        )
-        or 0
-    )
-    tournaments_attention_total = int(
-        await db_session.scalar(
-            select(func.count())
-            .select_from(Tournament)
-            .where(admin_tournament_attention_filter())
-        )
-        or 0
-    )
-    audit_events_total = int(await db_session.scalar(select(func.count()).select_from(AuditLog)) or 0)
+    analytics = AdminAnalyticsResponse.model_validate(await load_admin_analytics(db_session))
     return AdminOverviewResponse(
-        users_total=users_total,
-        tournaments_total=tournaments_total,
-        tournaments_attention_total=tournaments_attention_total,
-        audit_events_total=audit_events_total,
-        preprod_test_runs_total=preprod_test_runs_total,
-        preprod_test_users_total=preprod_test_users_total,
+        users_total=analytics.users_total,
+        tournaments_total=analytics.tournaments_total,
+        tournaments_attention_total=analytics.tournaments_attention_total,
+        audit_events_total=analytics.audit_events_total,
+        preprod_test_runs_total=analytics.preprod_test_runs_total,
+        preprod_test_users_total=analytics.preprod_test_users_total,
+        analytics=analytics,
     )
 
 

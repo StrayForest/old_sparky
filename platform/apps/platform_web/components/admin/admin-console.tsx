@@ -9,6 +9,7 @@ import {
   ClipboardList,
   Eye,
   LockKeyhole,
+  LayoutDashboard,
   RefreshCcw,
   Search,
   ShieldCheck,
@@ -22,6 +23,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { useI18n } from "@/components/i18n-provider";
 import { AdminRosterPanel } from "@/components/admin/admin-roster";
+import { AdminDashboard } from "@/components/admin/admin-dashboard";
 import {
   PlatformApiError,
   platformApiMessage,
@@ -37,7 +39,7 @@ import type {
   PlatformUser
 } from "@/lib/platform-types";
 
-type AdminTab = "tournaments" | "users" | "preprod" | "audit";
+type AdminTab = "dashboard" | "tournaments" | "users" | "preprod" | "audit";
 type AccessState = "loading" | "ready" | "unauthenticated" | "forbidden" | "error";
 type AdminTournamentFilters = {
   search: string;
@@ -70,7 +72,7 @@ export function AdminConsole() {
   const [users, setUsers] = useState<PlatformUser[]>([]);
   const [auditLogs, setAuditLogs] = useState<PlatformAuditLog[]>([]);
   const [preprodRuns, setPreprodRuns] = useState<PlatformAdminPreprodTestRun[]>([]);
-  const [activeTab, setActiveTab] = useState<AdminTab>("tournaments");
+  const [activeTab, setActiveTab] = useState<AdminTab>("dashboard");
   const [selectedTournamentSlug, setSelectedTournamentSlug] = useState<string | null>(null);
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [selectedAuditId, setSelectedAuditId] = useState<number | null>(null);
@@ -390,10 +392,6 @@ export function AdminConsole() {
     );
   }
 
-  const loadedAttentionCount = tournaments.filter((tournament) => (
-    tournament.unfinished_match_count > 0 || Boolean(tournament.admin_override_warning)
-  )).length;
-
   return (
     <section className="admin-console" data-testid="admin-console">
       <header className="admin-console-header">
@@ -417,131 +415,139 @@ export function AdminConsole() {
         </div>
       </header>
 
-      <div className="admin-metrics">
-        <AdminMetric icon={<Users size={21} />} label={t("common.users")} value={overview?.users_total ?? 0} />
-        <AdminMetric icon={<Trophy size={21} />} label={t("common.tournaments")} value={overview?.tournaments_total ?? 0} />
-        <AdminMetric icon={<Activity size={21} />} label={t("admin.preprodUsers")} value={overview?.preprod_test_users_total ?? 0} />
-        <AdminMetric icon={<Activity size={21} />} label={t("admin.auditEvents")} value={overview?.audit_events_total ?? 0} />
-        <AdminMetric
-          danger={(overview?.tournaments_attention_total ?? loadedAttentionCount) > 0}
-          icon={<AlertTriangle size={21} />}
-          label={t("admin.needAttention")}
-          value={overview?.tournaments_attention_total ?? loadedAttentionCount}
-        />
-      </div>
+      <div className="admin-console-layout">
+        <aside className="admin-sidebar">
+          <div className="admin-sidebar-brand">
+            <div className="admin-sidebar-brand-mark"><ShieldCheck size={18} /></div>
+            <div><strong>{t("admin.sidebarTitle")}</strong><span>{t("admin.sidebarSubtitle")}</span></div>
+          </div>
+          <nav className="admin-tabs" role="tablist" aria-label={t("admin.sections")}>
+            <AdminTabButton
+              active={activeTab === "dashboard"}
+              count={null}
+              icon={<LayoutDashboard size={17} />}
+              label={t("admin.dashboardTitle")}
+              onClick={() => setActiveTab("dashboard")}
+            />
+            <AdminTabButton
+              active={activeTab === "tournaments"}
+              count={`${tournaments.length}/${tournamentTotal}`}
+              icon={<Trophy size={17} />}
+              label={t("admin.tournamentOperations")}
+              onClick={() => setActiveTab("tournaments")}
+            />
+            <AdminTabButton
+              active={activeTab === "users"}
+              count={users.length}
+              icon={<Users size={17} />}
+              label={t("admin.userPermissions")}
+              onClick={() => setActiveTab("users")}
+            />
+            <AdminTabButton
+              active={activeTab === "audit"}
+              count={auditLogs.length}
+              icon={<ClipboardList size={17} />}
+              label={t("admin.auditLog")}
+              onClick={() => setActiveTab("audit")}
+            />
+            <AdminTabButton
+              active={activeTab === "preprod"}
+              count={preprodRuns.length}
+              icon={<Activity size={17} />}
+              label={t("admin.preprodQa")}
+              onClick={() => setActiveTab("preprod")}
+            />
+          </nav>
+          <div className="admin-sidebar-footer"><span>{t("admin.sidebarProtected")}</span><strong>{currentUser?.display_name ?? t("common.unknown")}</strong></div>
+        </aside>
 
-      <div className="admin-tabs" role="tablist" aria-label={t("admin.sections")}>
-        <AdminTabButton
-          active={activeTab === "tournaments"}
-          count={`${tournaments.length}/${tournamentTotal}`}
-          icon={<Trophy size={17} />}
-          label={t("admin.tournamentOperations")}
-          onClick={() => setActiveTab("tournaments")}
-        />
-        <AdminTabButton
-          active={activeTab === "users"}
-          count={users.length}
-          icon={<Users size={17} />}
-          label={t("admin.userPermissions")}
-          onClick={() => setActiveTab("users")}
-        />
-        <AdminTabButton
-          active={activeTab === "preprod"}
-          count={preprodRuns.length}
-          icon={<Activity size={17} />}
-          label={t("admin.preprodQa")}
-          onClick={() => setActiveTab("preprod")}
-        />
-        <AdminTabButton
-          active={activeTab === "audit"}
-          count={auditLogs.length}
-          icon={<ClipboardList size={17} />}
-          label={t("admin.auditLog")}
-          onClick={() => setActiveTab("audit")}
-        />
+        <div className="admin-console-content">
+          {activeTab === "dashboard" ? (
+            <AdminDashboard overview={overview} formatDate={formatDate} onNavigate={setActiveTab} />
+          ) : null}
+          {activeTab === "tournaments" ? (
+            <TournamentOperations
+              enumLabel={enumLabel}
+              formatDate={formatDate}
+              hasMore={hasMoreTournaments}
+              filters={tournamentFilters}
+              filteredTotal={tournamentTotal}
+              isFiltering={isFilteringTournaments}
+              isLoadingMore={isLoadingMoreTournaments}
+              isReloading={isRefreshing}
+              pageError={tournamentPageError}
+              selectedSlug={selectedTournamentSlug}
+              tournaments={tournaments}
+              onLoadMore={loadMoreTournaments}
+              onFiltersChange={setTournamentFilters}
+              onRetry={() => {
+                if (failedTournamentOffset === 0) {
+                  void loadFilteredTournamentPage(
+                    activeTournamentFilters.current,
+                    adminTournamentQueryKey(activeTournamentFilters.current)
+                  );
+                } else {
+                  void loadMoreTournaments();
+                }
+              }}
+              onSelect={setSelectedTournamentSlug}
+              onDelete={(deletedSlug) => {
+                const deletedTournament = tournaments.find((item) => item.slug === deletedSlug);
+                const nextTournament = tournaments.find((item) => item.slug !== deletedSlug);
+                const deletedNeededAttention = Boolean(
+                  deletedTournament
+                  && (deletedTournament.unfinished_match_count > 0 || deletedTournament.admin_override_warning)
+                );
+                setTournaments((current) => current.filter((item) => item.slug !== deletedSlug));
+                setSelectedTournamentSlug(nextTournament?.slug ?? null);
+                setTournamentTotal((current) => Math.max(0, current - 1));
+                setOverview((current) => current ? {
+                  ...current,
+                  tournaments_total: Math.max(0, current.tournaments_total - 1),
+                  tournaments_attention_total: Math.max(
+                    0,
+                    (current.tournaments_attention_total ?? 0) - (deletedNeededAttention ? 1 : 0)
+                  )
+                } : current);
+              }}
+              onUpdate={(updated) => {
+                setTournaments((current) => current.map((item) => item.id === updated.id ? updated : item));
+              }}
+            />
+          ) : null}
+          {activeTab === "users" && currentUser ? (
+            <UserPermissions
+              currentUser={currentUser}
+              formatDate={formatDate}
+              isLoading={isLoadingUsers}
+              loadError={userLoadError}
+              selectedUserId={selectedUserId}
+              users={users}
+              onSelect={setSelectedUserId}
+              onSearch={loadUsers}
+              onUpdate={(updated) => {
+                setUsers((current) => current.map((item) => item.id === updated.id ? updated : item));
+              }}
+            />
+          ) : null}
+          {activeTab === "preprod" && currentUser ? (
+            <PreprodQaOperations
+              currentUser={currentUser}
+              formatDate={formatDate}
+              runs={preprodRuns}
+              onReload={loadPreprodRuns}
+            />
+          ) : null}
+          {activeTab === "audit" ? (
+            <AuditOperations
+              auditLogs={auditLogs}
+              formatDate={formatDate}
+              selectedAuditId={selectedAuditId}
+              onSelect={setSelectedAuditId}
+            />
+          ) : null}
+        </div>
       </div>
-
-      {activeTab === "tournaments" ? (
-        <TournamentOperations
-          enumLabel={enumLabel}
-          formatDate={formatDate}
-          hasMore={hasMoreTournaments}
-          filters={tournamentFilters}
-          filteredTotal={tournamentTotal}
-          isFiltering={isFilteringTournaments}
-          isLoadingMore={isLoadingMoreTournaments}
-          isReloading={isRefreshing}
-          pageError={tournamentPageError}
-          selectedSlug={selectedTournamentSlug}
-          tournaments={tournaments}
-          onLoadMore={loadMoreTournaments}
-          onFiltersChange={setTournamentFilters}
-          onRetry={() => {
-            if (failedTournamentOffset === 0) {
-              void loadFilteredTournamentPage(
-                activeTournamentFilters.current,
-                adminTournamentQueryKey(activeTournamentFilters.current)
-              );
-            } else {
-              void loadMoreTournaments();
-            }
-          }}
-          onSelect={setSelectedTournamentSlug}
-          onDelete={(deletedSlug) => {
-            const deletedTournament = tournaments.find((item) => item.slug === deletedSlug);
-            const nextTournament = tournaments.find((item) => item.slug !== deletedSlug);
-            const deletedNeededAttention = Boolean(
-              deletedTournament
-              && (deletedTournament.unfinished_match_count > 0 || deletedTournament.admin_override_warning)
-            );
-            setTournaments((current) => current.filter((item) => item.slug !== deletedSlug));
-            setSelectedTournamentSlug(nextTournament?.slug ?? null);
-            setTournamentTotal((current) => Math.max(0, current - 1));
-            setOverview((current) => current ? {
-              ...current,
-              tournaments_total: Math.max(0, current.tournaments_total - 1),
-              tournaments_attention_total: Math.max(
-                0,
-                (current.tournaments_attention_total ?? 0) - (deletedNeededAttention ? 1 : 0)
-              )
-            } : current);
-          }}
-          onUpdate={(updated) => {
-            setTournaments((current) => current.map((item) => item.id === updated.id ? updated : item));
-          }}
-        />
-      ) : null}
-      {activeTab === "users" && currentUser ? (
-        <UserPermissions
-          currentUser={currentUser}
-          formatDate={formatDate}
-          isLoading={isLoadingUsers}
-          loadError={userLoadError}
-          selectedUserId={selectedUserId}
-          users={users}
-          onSelect={setSelectedUserId}
-          onSearch={loadUsers}
-          onUpdate={(updated) => {
-            setUsers((current) => current.map((item) => item.id === updated.id ? updated : item));
-          }}
-        />
-      ) : null}
-      {activeTab === "preprod" && currentUser ? (
-        <PreprodQaOperations
-          currentUser={currentUser}
-          formatDate={formatDate}
-          runs={preprodRuns}
-          onReload={loadPreprodRuns}
-        />
-      ) : null}
-      {activeTab === "audit" ? (
-        <AuditOperations
-          auditLogs={auditLogs}
-          formatDate={formatDate}
-          selectedAuditId={selectedAuditId}
-          onSelect={setSelectedAuditId}
-        />
-      ) : null}
     </section>
   );
 }
@@ -561,7 +567,7 @@ function AdminTabButton({
 }) {
   return (
     <button className={active ? "active" : ""} role="tab" aria-selected={active} type="button" onClick={onClick}>
-      {icon}{label}<span>{count}</span>
+      {icon}<span className="admin-tab-label">{label}</span>{count !== null ? <span>{count}</span> : null}
     </button>
   );
 }
@@ -1765,28 +1771,6 @@ function NumberField({
         onChange={(event) => onChange(Math.max(0, Math.min(1000, Number(event.target.value) || 0)))}
       />
     </label>
-  );
-}
-
-function AdminMetric({
-  icon,
-  label,
-  value,
-  danger = false
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: number;
-  danger?: boolean;
-}) {
-  return (
-    <article className={danger ? "admin-metric danger" : "admin-metric"}>
-      <div className="admin-metric-icon">{icon}</div>
-      <div>
-        <span>{label}</span>
-        <strong>{value.toLocaleString("ru-RU")}</strong>
-      </div>
-    </article>
   );
 }
 

@@ -175,6 +175,76 @@ export type PlatformAdminOverview = {
   audit_events_total: number;
   preprod_test_runs_total?: number;
   preprod_test_users_total?: number;
+  analytics?: PlatformAdminAnalytics | null;
+};
+
+export type PlatformAdminAnalyticsBucket = {
+  key: string;
+  count: number;
+  percentage: number;
+};
+
+export type PlatformAdminActivityPoint = {
+  date: string;
+  users: number;
+  tournaments: number;
+  participants: number;
+  matches: number;
+  audit_events: number;
+};
+
+export type PlatformAdminAnalytics = {
+  generated_at: string;
+  users_total: number;
+  active_users: number;
+  verified_users: number;
+  steam_linked_users: number;
+  player_profiles_total: number;
+  deadlock_profiles_total: number;
+  tournaments_total: number;
+  active_tournaments: number;
+  completed_tournaments: number;
+  tournaments_attention_total: number;
+  public_tournaments: number;
+  invite_only_tournaments: number;
+  average_active_participants_per_tournament: number;
+  participants_total: number;
+  active_participants: number;
+  assigned_participants: number;
+  unassigned_participants: number;
+  participant_profile_coverage_percent: number;
+  teams_total: number;
+  rostered_members_total: number;
+  locked_rosters: number;
+  matches_total: number;
+  scheduled_matches: number;
+  live_matches: number;
+  completed_matches: number;
+  cancelled_matches: number;
+  assignment_runs_total: number;
+  current_assignment_runs: number;
+  ready_rounds_total: number;
+  active_ready_rounds: number;
+  captain_rounds_total: number;
+  active_captain_rounds: number;
+  automation_failures_total: number;
+  tournaments_with_automation_failures: number;
+  audit_events_total: number;
+  audit_events_24h: number;
+  audit_events_7d: number;
+  preprod_test_runs_total: number;
+  preprod_test_users_total: number;
+  user_status_distribution: PlatformAdminAnalyticsBucket[];
+  tournament_status_distribution: PlatformAdminAnalyticsBucket[];
+  tournament_visibility_distribution: PlatformAdminAnalyticsBucket[];
+  participant_status_distribution: PlatformAdminAnalyticsBucket[];
+  match_status_distribution: PlatformAdminAnalyticsBucket[];
+  assignment_status_distribution: PlatformAdminAnalyticsBucket[];
+  ready_round_status_distribution: PlatformAdminAnalyticsBucket[];
+  captain_round_status_distribution: PlatformAdminAnalyticsBucket[];
+  rank_distribution: PlatformAdminAnalyticsBucket[];
+  active_participant_rank_distribution: PlatformAdminAnalyticsBucket[];
+  activity: PlatformAdminActivityPoint[];
 };
 
 export type PlatformAdminPreprodTestRun = {
