@@ -85,17 +85,20 @@ jobs:
 
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
-          guard="$current/tools/platform_release_lock_exec.sh"
+          shared="$runtime/shared"
 
           test "$(id -u)" -eq 0 || { echo "Production service recovery must run as root" >&2; exit 1; }
+          test -d "$runtime" && test ! -L "$runtime" || { echo "Production runtime directory is missing or unsafe" >&2; exit 1; }
+          test -d "$shared" && test ! -L "$shared" || { echo "Production shared directory is missing or unsafe" >&2; exit 1; }
           test -L "$current" || { echo "Current release symlink is missing" >&2; exit 1; }
-          test -x "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
 
-          /bin/bash "$guard" --app-dir "$runtime" -- /bin/bash -s <<'MUTATION'
-          set -Eeuo pipefail
-
-          runtime=/opt/oldsparky/platform
-          current="$runtime/current"
+          shared_owner="$(stat -c %u "$shared")"
+          shared_mode="$(stat -c %a "$shared")"
+          test "$shared_owner" = "0" && test $((8#$shared_mode & 8#022)) -eq 0 \
+            || { echo "Production shared directory permissions are unsafe" >&2; exit 1; }
+          exec {release_lock_fd}<"$shared"
+          /usr/bin/flock -n "$release_lock_fd" \
+            || { echo "Another platform install or rollback operation holds the release lock" >&2; exit 75; }
 
           test ! -e "$runtime/shared/.release-operation.json" \
             || { echo "A release transaction is already pending" >&2; exit 75; }
@@ -139,5 +142,4 @@ jobs:
 
           printf 'web_state_after=%s\n' "$(systemctl is-active deadlock-web)"
           printf 'web_health=passed\n'
-          MUTATION
           REMOTE
