@@ -326,11 +326,11 @@ test("live 1920 catalog stays contained after every card asset loads", async ({ 
     ));
     expect(new Set(firstRowTops).size).toBe(1);
   }
-  const sharedCoverBackgrounds = await cards.evaluateAll((items) => items
-    .map((item) => getComputedStyle(item.querySelector<HTMLElement>(".card-banner")!).backgroundImage)
-    .filter((background) => background.includes("/assets/tournament-covers/")));
-  expect(sharedCoverBackgrounds.length).toBeGreaterThan(0);
-  expect(sharedCoverBackgrounds.every((background) => background.includes("rev=20260725-2"))).toBe(true);
+  const sharedCoverSources = await cards.evaluateAll((items) => items
+    .map((item) => item.querySelector<HTMLImageElement>(".card-banner-media")?.currentSrc ?? "")
+    .filter((source) => source.includes("/assets/tournament-covers/")));
+  expect(sharedCoverSources.length).toBeGreaterThan(0);
+  expect(sharedCoverSources.every((source) => source.includes("rev=20260725-2"))).toBe(true);
   await expectNoHorizontalOverflow(page);
   await page.screenshot({
     animations: "allow",
@@ -350,10 +350,19 @@ test("live tournament detail and bracket routes render from the current public d
 
   await page.goto(href!);
   await expect(page.getByText("Описание турнира")).toBeVisible();
-  await expect(page.getByRole("link", { name: "Перейти к сетке" })).toHaveAttribute("href", `${href}/bracket`);
+  const bracketLink = page.getByRole("link", { name: "Перейти к сетке" });
+  const bracketHref = await bracketLink.getAttribute("href");
+  expect(bracketHref).toBeTruthy();
+  const detailUrl = new URL(href!, "https://old-sparky.com");
+  const bracketUrl = new URL(bracketHref!, "https://old-sparky.com");
+  expect(bracketUrl.pathname).toBe(`${detailUrl.pathname}/bracket`);
+  expect([...bracketUrl.searchParams.keys()].every((key) => key === "invite_code")).toBe(true);
+  if (bracketUrl.searchParams.has("invite_code")) {
+    expect(bracketUrl.searchParams.get("invite_code")).toMatch(/^[A-Z0-9]+$/u);
+  }
   await expectNoHorizontalOverflow(page);
 
-  await page.goto(`${href}/bracket`);
+  await page.goto(`${bracketUrl.pathname}${bracketUrl.search}`);
   await expect(
     page.getByTestId("bracket-shell").or(page.getByTestId("bracket-empty"))
   ).toBeVisible();
@@ -528,9 +537,10 @@ test("live image currentSrc inventory stays inside the exact CSP hosts", async (
           undefined,
           { timeout: 2_000 },
         ).catch(() => undefined);
-        await page.evaluate(() => new Promise<void>((resolve) => {
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-        }));
+        // WebKit can keep a background tab's animation frame queue paused;
+        // this wait is only to give lazy images a scheduling opportunity and
+        // must not make the inventory test hang until the test timeout.
+        await page.waitForTimeout(50);
       }
     }
     let images: Array<{
@@ -676,8 +686,8 @@ async function waitForTournamentCardAssets(
           }
         }
         return images.every((image) => image.complete && image.naturalWidth > 0)
-          && backgroundUrls.length === 1
-          && backgroundUrls.every((url) => probes[url].complete && probes[url].naturalWidth > 0);
+          && (backgroundUrls.length === 0
+            || backgroundUrls.every((url) => probes[url].complete && probes[url].naturalWidth > 0));
       }),
       {
         message: `card ${index + 1} images load`,
