@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, patch
 
 from redis.exceptions import ConnectionError as RedisConnectionError
 from pydantic import BaseModel
@@ -114,6 +115,21 @@ class TournamentReadModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(envelope.revision, 20)
         self.assertEqual(envelope.payload, b"new")
 
+    async def test_delete_removes_all_selected_projections(self) -> None:
+        tournament_id = "tournament-1"
+        models = ("teams", "workspace_detail", "bracket_summary", "bracket_full")
+        store = {
+            read_models.read_model_key(tournament_id, model): b"projection"
+            for model in models
+        }
+        client = _FakeRedis(store)
+
+        with patch.object(read_models, "redis_client", return_value=client):
+            await read_models.delete_tournament_read_models(tournament_id, models)
+
+        self.assertEqual(store, {})
+        self.assertTrue(client.closed)
+
     async def test_redis_outage_returns_authoritative_builder_payload(self) -> None:
         client = _FakeRedis({}, failure=RedisConnectionError("redis unavailable"))
         builder = AsyncMock(return_value=b'{"status":"ready"}')
@@ -129,6 +145,48 @@ class TournamentReadModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload, b'{"status":"ready"}')
         builder.assert_awaited_once()
         self.assertTrue(client.closed)
+
+    async def test_summary_refresh_does_not_load_members_or_profiles(self) -> None:
+        tournament = SimpleNamespace(
+            id="tournament-1",
+            status="in_progress",
+            bracket_revision=4,
+        )
+        team_loader = AsyncMock(return_value=([], []))
+        match_loader = AsyncMock(return_value=[])
+        profile_loader = AsyncMock()
+
+        with (
+            patch(
+                "apps.platform_api.app.services.tournament_teams.load_tournament_team_state",
+                team_loader,
+            ),
+            patch(
+                "apps.platform_api.app.api.routes.tournaments.tournament_matches_in_order",
+                match_loader,
+            ),
+            patch(
+                "apps.platform_api.app.api.routes.tournaments.deadlock_assignment_member_profiles",
+                profile_loader,
+            ),
+        ):
+            values = await read_models._build_selected_read_models_from_authoritative_db(
+                AsyncMock(),
+                tournament=tournament,
+                selected=("bracket_summary",),
+            )
+
+        team_loader.assert_awaited_once_with(
+            ANY,
+            tournament_id="tournament-1",
+            include_members=False,
+        )
+        match_loader.assert_awaited_once_with(
+            ANY,
+            tournament_id="tournament-1",
+        )
+        profile_loader.assert_not_awaited()
+        self.assertEqual(values["bracket_summary"].teams, [])
 
 
 if __name__ == "__main__":

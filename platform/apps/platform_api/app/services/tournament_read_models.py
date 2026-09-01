@@ -289,7 +289,12 @@ async def _build_selected_read_models_from_authoritative_db(
     from apps.platform_api.app.api.schemas import TournamentBracketResponse
     from apps.platform_api.app.services.tournament_teams import load_tournament_team_state
 
-    needs_teams = bool(set(selected) & {"teams", "workspace_detail", "bracket_summary", "bracket_full"})
+    selected_set = set(selected)
+    needs_full_teams = bool(
+        selected_set & {"teams", "workspace_detail", "bracket_full"}
+    )
+    needs_summary_teams = "bracket_summary" in selected_set
+    needs_teams = needs_full_teams or needs_summary_teams
     team_rows = []
     member_rows = []
     member_profiles: dict[str, Any] = {}
@@ -297,32 +302,40 @@ async def _build_selected_read_models_from_authoritative_db(
         team_rows, member_rows = await load_tournament_team_state(
             db_session,
             tournament_id=tournament.id,
-            include_members=True,
+            include_members=needs_full_teams,
         )
-        if member_rows:
+        if needs_full_teams and member_rows:
             member_profiles = await tournament_routes.deadlock_assignment_member_profiles(
                 db_session,
                 member_rows,
             )
-    full_teams = tournament_routes.serialize_deadlock_bracket_teams(
-        team_rows,
-        member_rows,
-        include_members=True,
-        member_profiles=member_profiles,
+    full_teams = (
+        tournament_routes.serialize_deadlock_bracket_teams(
+            team_rows,
+            member_rows,
+            include_members=True,
+            member_profiles=member_profiles,
+        )
+        if needs_full_teams
+        else []
     )
-    summary_teams = tournament_routes.serialize_deadlock_bracket_teams(
-        team_rows,
-        (),
-        include_members=False,
+    summary_teams = (
+        tournament_routes.serialize_deadlock_bracket_teams(
+            team_rows,
+            (),
+            include_members=False,
+        )
+        if needs_summary_teams
+        else []
     )
     match_rows = []
-    if set(selected) & {"bracket_summary", "bracket_full"}:
+    if selected_set & {"bracket_summary", "bracket_full"}:
         match_rows = await tournament_routes.tournament_matches_in_order(
             db_session,
             tournament_id=tournament.id,
         )
     total_rounds = max((match.round_number for match in match_rows), default=1)
-    bracket_status = "ready" if match_rows else "teams_ready" if full_teams else "pending"
+    bracket_status = "ready" if match_rows else "teams_ready" if team_rows else "pending"
     capabilities = tournament_routes.bracket_capabilities(
         tournament_status=tournament.status,
         can_manage=False,

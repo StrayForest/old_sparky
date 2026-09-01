@@ -65,6 +65,9 @@ from apps.platform_api.app.services.player_commitments import (
     reactivate_viable_tournament_commitments,
     release_active_commitments,
 )
+from apps.platform_api.app.services.tournament_read_models import (
+    delete_tournament_read_models,
+)
 
 router = APIRouter()
 PREPROD_CLEANUP_CHUNK_SIZE = 10_000
@@ -841,6 +844,11 @@ async def admin_delete_tournament(
         },
     )
     await db_session.commit()
+
+    await delete_tournament_read_models(
+        tournament_id,
+        ("teams", "workspace_detail", "bracket_summary", "bracket_full"),
+    )
 
     from apps.platform_api.app.services.tournament_runtime_cache import (
         invalidate_tournament_runtime_caches,
