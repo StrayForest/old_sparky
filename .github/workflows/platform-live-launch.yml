@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       provision:
-        description: "Provision the one-time root-only CSP QA bundle before the run"
+        description: "Provision or safely rotate the root-only CSP QA bundle before the run"
         required: true
         default: false
         type: boolean
@@ -124,8 +124,6 @@ jobs:
             true)
               [[ "$marker" =~ ^liveqa-[a-z0-9-]{6,56}$ ]] \
                 || { echo "Provisioning requires a fresh liveqa marker" >&2; exit 2; }
-              test ! -e /root/.oldsparky/liveqa/csp-live-qa.json \
-                || { echo "Refusing to replace the existing live QA bundle" >&2; exit 2; }
               install -d -o root -g root -m 0700 /root/.oldsparky/liveqa
               for path in \
                 /opt/oldsparky \

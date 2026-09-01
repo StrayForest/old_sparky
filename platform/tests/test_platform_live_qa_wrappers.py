@@ -48,7 +48,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("LIVE_QA_ENV_PATH", source)
         self.assertIn("uid_collision", source)
         self.assertIn("platform_provision_live_csp_qa.sh", source)
-        self.assertIn("Refusing to replace the existing live QA bundle", source)
+        self.assertIn("Provisioning requires a fresh liveqa marker", source)
+        self.assertNotIn("Refusing to replace the existing live QA bundle", source)
         self.assertIn(
             'reviewed_helper="$repo/platform/tools/platform_live_qa_mailbox_helper.py"',
             source,

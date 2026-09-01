@@ -225,6 +225,21 @@ Dispatch only after the exact deployed `dev` SHA is confirmed. The workflow
 creates no fixture until the release lock, checkout, helper, bundle and browser
 preflight checks pass.
 
+To rotate a stale existing bundle, dispatch the same launch workflow with
+`provision=true` and a fresh marker. The provisioner does not unlink the old
+bundle: under the release lock it checks the prior exact roster IDs, marker
+tournaments and recovery state, then atomically publishes a new bundle and
+roster. Any remaining old scope fails closed and must be recovered before a
+retry.
+
+```bash
+gh workflow run platform-live-launch.yml \
+  --ref dev \
+  -f base_url=https://old-sparky.com \
+  -f provision=true \
+  -f marker=liveqa-csp-rotate-<unique>
+```
+
 The dedicated `oldsparky-liveqa` system account has `/nonexistent` as its home,
 `/usr/sbin/nologin` as its shell, its same-named non-root primary group and no
 supplementary groups. Never substitute `oldsparky` or `oldsparky-platform`:
