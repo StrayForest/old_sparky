@@ -206,6 +206,25 @@ platform/tools/platform_provision_live_csp_qa.sh \
   --mailbox-helper /root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py
 ```
 
+For an existing bundle, both automated live workflows refresh the installed
+mailbox helper from the exact-SHA trusted checkout while holding the machine
+release lock, before starting the browser supervisor. The provenance guard then
+checks the helper digest and `0500` root-only mode. This repairs a stale helper
+without replacing the bundle or credentials; never bypass the guard or copy a
+helper from an unrelated checkout.
+
+The canonical automated journey dispatch is:
+
+```bash
+gh workflow run platform-live-user-qa.yml \
+  --ref dev \
+  -f confirmation=RUN-LIVE-USER-QA
+```
+
+Dispatch only after the exact deployed `dev` SHA is confirmed. The workflow
+creates no fixture until the release lock, checkout, helper, bundle and browser
+preflight checks pass.
+
 The dedicated `oldsparky-liveqa` system account has `/nonexistent` as its home,
 `/usr/sbin/nologin` as its shell, its same-named non-root primary group and no
 supplementary groups. Never substitute `oldsparky` or `oldsparky-platform`:

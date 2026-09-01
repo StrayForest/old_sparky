@@ -96,11 +96,28 @@ jobs:
           /bin/bash "$guard" \
             --app-dir "$runtime" \
             --expected-sha "$target_sha" \
-            -- /usr/bin/env \
+            -- /bin/bash -s -- "$repo" "$runtime" "$target_sha" <<'LOCKED'
+          set -Eeuo pipefail
+          repo="$1"
+          runtime="$2"
+          target_sha="$3"
+          test -d "$repo/.git" || { echo "Trusted production QA checkout is missing" >&2; exit 1; }
+          test -L "$runtime/current" || { echo "Active production release is missing" >&2; exit 1; }
+          test "$(git -C "$repo" rev-parse --verify HEAD)" = "$target_sha" \
+            || { echo "Trusted QA checkout does not match the dispatched target SHA" >&2; exit 1; }
+          reviewed_helper="$repo/platform/tools/platform_live_qa_mailbox_helper.py"
+          installed_helper="/root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py"
+          test -f "$reviewed_helper" \
+            || { echo "Reviewed mailbox helper is missing" >&2; exit 1; }
+          test -d /root/.oldsparky/liveqa \
+            || { echo "Live QA secret directory is missing" >&2; exit 1; }
+          install -o root -g root -m 0500 "$reviewed_helper" "$installed_helper"
+          exec /usr/bin/env \
               PLATFORM_APP_DIR="$runtime" \
               PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
               PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com \
               /root/old_sparky/platform/tools/platform_live_user_qa.sh
+          LOCKED
           echo "LIVE_USER_QA_SUCCESS source_commit=$target_sha"
           REMOTE
 

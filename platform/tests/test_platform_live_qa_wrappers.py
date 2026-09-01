@@ -49,6 +49,18 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("uid_collision", source)
         self.assertIn("platform_provision_live_csp_qa.sh", source)
         self.assertIn("Refusing to replace the existing live QA bundle", source)
+        self.assertIn(
+            'reviewed_helper="$repo/platform/tools/platform_live_qa_mailbox_helper.py"',
+            source,
+        )
+        self.assertIn(
+            'installed_helper="/root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py"',
+            source,
+        )
+        self.assertIn(
+            'install -o root -g root -m 0500 "$reviewed_helper" "$installed_helper"',
+            source,
+        )
         self.assertNotIn("npm ci", source)
         self.assertNotIn("npm run test:live", source)
 
@@ -62,6 +74,22 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("platform_live_user_qa.sh", source)
         self.assertIn("ssh", source)
         self.assertIn("LIVE_USER_QA_SUCCESS", source)
+        self.assertIn(
+            'bash -s -- "$repo" "$runtime" "$target_sha" <<\'LOCKED\'',
+            source,
+        )
+        self.assertIn(
+            'reviewed_helper="$repo/platform/tools/platform_live_qa_mailbox_helper.py"',
+            source,
+        )
+        self.assertIn(
+            'installed_helper="/root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py"',
+            source,
+        )
+        self.assertIn(
+            'install -o root -g root -m 0500 "$reviewed_helper" "$installed_helper"',
+            source,
+        )
 
     def test_all_wrappers_disable_xtrace_before_any_work(self) -> None:
         for wrapper in WRAPPERS:

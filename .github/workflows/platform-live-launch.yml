@@ -111,6 +111,15 @@ jobs:
           test -d "$repo/.git" || { echo "Trusted production QA checkout is missing" >&2; exit 1; }
           test "$(git -C "$repo" rev-parse --verify HEAD)" = "$target_sha" \
             || { echo "Trusted QA checkout does not match the active target SHA" >&2; exit 1; }
+          sync_mailbox_helper() {
+            reviewed_helper="$repo/platform/tools/platform_live_qa_mailbox_helper.py"
+            installed_helper="/root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py"
+            test -f "$reviewed_helper" \
+              || { echo "Reviewed mailbox helper is missing" >&2; exit 1; }
+            test -d /root/.oldsparky/liveqa \
+              || { echo "Live QA secret directory is missing" >&2; exit 1; }
+            install -o root -g root -m 0500 "$reviewed_helper" "$installed_helper"
+          }
           case "$provision" in
             true)
               [[ "$marker" =~ ^liveqa-[a-z0-9-]{6,56}$ ]] \
@@ -243,10 +252,8 @@ jobs:
               )
           )
           PY
+              sync_mailbox_helper
               /root/old_sparky/platform/tools/platform_install_live_qa_user.sh --apply
-              install -o root -g root -m 0500 \
-                /root/old_sparky/platform/tools/platform_live_qa_mailbox_helper.py \
-                /root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py
               PLATFORM_APP_DIR=/opt/oldsparky/platform \
               /root/old_sparky/platform/tools/platform_provision_live_csp_qa.sh \
                 --marker "$marker" \
@@ -257,6 +264,7 @@ jobs:
             false)
               test -z "$marker" \
                 || { echo "marker is allowed only with provision=true" >&2; exit 2; }
+              sync_mailbox_helper
               ;;
             *)
               echo "provision must be true or false" >&2

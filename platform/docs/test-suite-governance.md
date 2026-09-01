@@ -87,6 +87,14 @@ that the exact SHA started and critical interfaces are alive. Live public and
 destructive user QA are separate operator contours with their own identities,
 confirmation and cleanup rules.
 
+The tracked browser journey
+`apps/platform_web/tests/smoke/live-user-journey.spec.ts` is owned by the
+`platform-live-user-qa.yml` workflow. Run it only against the exact deployed
+`dev` SHA through that workflow; its dedicated server supervisor refreshes the
+reviewed mailbox helper under the release lock, runs the browser scenario, and
+performs exact fixture cleanup. The dispatch and recovery procedure is defined
+in [the CSP live-QA runbook](csp-live-qa-runbook.md).
+
 The canonical load-profile registry is `platform/performance/`.
 Profiles record fixture shape, logical actions, HTTP attempts, concurrency,
 spread/ramp, retry semantics, expected statuses, correctness, latency budgets,
