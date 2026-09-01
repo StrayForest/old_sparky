@@ -23,6 +23,19 @@ cd /opt/oldsparky/platform/current
   --keep 14
 ```
 
+For a reviewed `dev` release, an operator may run the same guarded backup
+through GitHub Actions without opening a direct production shell:
+
+```bash
+gh workflow run platform-production-backup.yml \
+  --repo StrayForest/old_sparky \
+  --ref dev
+```
+
+Wait for the `Platform production backup` workflow to pass before observing
+or repeating the automatic production deployment. It serializes with the
+production deploy concurrency group and does not bypass the release preflight.
+
 Check freshness without restoring production:
 
 ```bash
