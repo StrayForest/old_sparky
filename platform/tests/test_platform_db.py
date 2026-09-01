@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
-from unittest.mock import Mock, patch, sentinel
+from unittest.mock import AsyncMock, Mock, patch, sentinel
 
 from python_packages.platform_infra import db
 
@@ -57,3 +58,26 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
         finally:
             db._engine = previous_engine
             db._session_factory = previous_session_factory
+
+
+class PlatformDatabaseLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dispose_detaches_engine_created_on_another_event_loop(self) -> None:
+        previous_engine = db._engine
+        previous_engine_loop = db._engine_loop
+        previous_session_factory = db._session_factory
+        old_loop = asyncio.new_event_loop()
+        fake_engine = Mock()
+        fake_engine.dispose = AsyncMock()
+        db._engine = fake_engine
+        db._engine_loop = old_loop
+        db._session_factory = None
+
+        try:
+            await db.dispose_engine()
+        finally:
+            old_loop.close()
+            db._engine = previous_engine
+            db._engine_loop = previous_engine_loop
+            db._session_factory = previous_session_factory
+
+        fake_engine.dispose.assert_awaited_once_with(close=False)

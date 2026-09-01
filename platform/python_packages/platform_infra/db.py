@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, AsyncGenerator
 from contextlib import asynccontextmanager
 from hashlib import sha256
@@ -76,10 +77,11 @@ def _sanitize_public_error_fields(
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+_engine_loop: asyncio.AbstractEventLoop | None = None
 
 
 def engine() -> AsyncEngine:
-    global _engine, _session_factory
+    global _engine, _engine_loop, _session_factory
 
     if _engine is None:
         settings = get_settings()
@@ -114,6 +116,12 @@ def engine() -> AsyncEngine:
             pool_timeout=pool_timeout,
             pool_recycle=pool_recycle,
         )
+        try:
+            _engine_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Synchronous configuration tests can construct the engine without
+            # a running loop. Runtime callers create it from their event loop.
+            _engine_loop = None
         install_sqlalchemy_query_metrics(_engine.sync_engine)
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
     return _engine
@@ -132,13 +140,23 @@ async def warm_up_engine() -> None:
 
 
 async def dispose_engine() -> None:
-    global _engine, _session_factory
+    global _engine, _engine_loop, _session_factory
 
     current_engine = _engine
+    created_on_loop = _engine_loop
     _engine = None
+    _engine_loop = None
     _session_factory = None
     if current_engine is not None:
-        await current_engine.dispose()
+        current_loop = asyncio.get_running_loop()
+        # IsolatedAsyncioTestCase creates a new loop for each test. An
+        # asyncpg connection belonging to a closed/other loop cannot be
+        # awaited during normal pool disposal; detach that pool instead of
+        # emitting a cross-loop close error. Same-loop application shutdown
+        # retains the normal close semantics.
+        await current_engine.dispose(
+            close=created_on_loop is None or created_on_loop is current_loop
+        )
 
 
 async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
