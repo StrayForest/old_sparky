@@ -154,7 +154,13 @@ test("live player completes the accelerated tournament journey through visible c
     await apiJson(organizerContext, `/tournaments/${tournamentSlug}/join`, "POST", { entry_type: "solo" }, 201);
     for (const context of helpers) {
       await apiJson(context, "/tournaments/invites/claim", "POST", { code: invite.code, entry_type: "solo", team_name: null }, 201);
-      await apiJson(context, `/tournaments/${tournamentSlug}/join`, "POST", { entry_type: "solo" }, 201);
+      await apiJson(
+        context,
+        `/tournaments/${tournamentSlug}/join`,
+        "POST",
+        { entry_type: "solo", invite_code: invite.code },
+        201,
+      );
     }
 
     await playerPage.goto(`${origin}/tournaments`);
