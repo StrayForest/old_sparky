@@ -126,9 +126,11 @@ contract after the conditional-detail fast path, but failed the gate on five
 origin `503` responses (pool checkout saturation) and three derived missing
 ETags; exact cleanup and origin-safety still passed. Further read-path changes
 must be proven against the same profile without weakening authorization, ETag
-correctness or exact cleanup. The current candidate samples successful slow
-request diagnostics at `0.25` while retaining unconditional 5xx logging; the
-conditional fast path remains unaccepted until it shows a reproducible gain.
+correctness or exact cleanup. The sampling candidate is now deployed and
+validated: successful slow-request diagnostics are sampled at `0.25`, while
+5xx logging remains unconditional. The canonical run still saturates both API
+vCPUs at roughly `98.7%`; no further safe CPU-saving hypothesis is accepted
+without new profiling evidence.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
 

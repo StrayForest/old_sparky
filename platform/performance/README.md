@@ -419,6 +419,37 @@ production; 5xx diagnostics remain fully logged. This changes observability
 overhead only and does not change authorization, ETag inputs or response
 business rules.
 
+## Read-mix A/B after diagnostic-log sampling (2026-09-02)
+
+The sampling candidate was validated by [workflow
+`33594516140`](https://github.com/StrayForest/old_sparky/actions/runs/33594516140),
+source SHA `3a8363f0c8874757eb56c9b9db5595e0b4043fbd`. It used the canonical
+20,000-user, 40-tournament × 500-user fixture, 128 external HTTP workers and
+10,000 conditional workspace refreshes. The profile contract and exact cleanup
+both passed:
+
+- raw HTTP p50/p95/p99: `1890/3752/5324 ms`; wall time `454.799 s`;
+- statuses: `20,000 × 200` and `10,000 × 304`, with zero errors and unexpected
+  statuses;
+- API cores averaged `98.72%` and `98.79%`, each reaching `100%`; PostgreSQL
+  averaged `18.97%` CPU and reached `51` connections;
+- PostgreSQL waiting backends peaked at `6`, lock waiters and ungranted locks
+  stayed at `0`; server pool checkout p95/p99 was `2685/4147 ms`, with no
+  checkout timeout or `503`;
+- successful diagnostic records fell from `27,472` in the prior run to `6,685`
+  under the `0.25` sample rate; 5xx logging remains unconditional;
+- exact cleanup removed all 20,000 users and 40 tournaments, with no remaining
+  sessions or audit rows and the control account preserved.
+
+Sampling removed diagnostic-log volume but did not produce a reproducible
+latency gain versus the accepted `33588749169` run: wall time and p95/p99 were
+slightly higher in this sample. The durable conclusion is that the two-vCPU
+API is CPU-bound: PostgreSQL CPU, Redis latency and lock contention remain
+below their ceilings, while API CPU stays near 100% and pool wait is the
+resulting queue. No worker/pool increase or cache rewrite is justified without
+new profiling evidence; Cloudflare edge caching remains enabled and the Redis
+read-model cache remains the origin fallback.
+
 ## Canonical commands
 
 ## Tournament lifecycle read models
