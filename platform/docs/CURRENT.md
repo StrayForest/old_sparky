@@ -119,12 +119,16 @@ cleanup or abort handling before another run.
 
 The 2026-09-02 authenticated read-mix A/B runs improved 30,000-request wall
 time from 784.5 s to 432.0 s and reduced raw p95 from 7.11 s to 3.68 s. The
-latest canonical run passed with 20,000 users, 40×500 tournaments, 20,000
+last accepted canonical run used 20,000 users, 40×500 tournaments, 20,000
 successful `200` reads and 10,000 valid `304` refreshes; both API cores still
-reached roughly 98.5%. Further read-path changes must be proven against the
-same profile without weakening authorization, ETag correctness or exact
-cleanup. The current candidate is a narrow conditional-detail fast path that
-does not build the unchanged workspace representation.
+reached roughly 98.5%. Validation run `33591512977` exercised the same
+contract after the conditional-detail fast path, but failed the gate on five
+origin `503` responses (pool checkout saturation) and three derived missing
+ETags; exact cleanup and origin-safety still passed. Further read-path changes
+must be proven against the same profile without weakening authorization, ETag
+correctness or exact cleanup. The current candidate samples successful slow
+request diagnostics at `0.25` while retaining unconditional 5xx logging; the
+conditional fast path remains unaccepted until it shows a reproducible gain.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
 

@@ -10,6 +10,7 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
     def settings(self, *, log_mutations: bool = True) -> SimpleNamespace:
         return SimpleNamespace(
             platform_perf_log_mutations=log_mutations,
+            platform_perf_log_sample_rate=1.0,
             platform_perf_slow_request_ms=1000,
             platform_perf_slow_db_ms=500,
             platform_perf_sql_count_threshold=25,
@@ -73,6 +74,24 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
 
         log_info.assert_not_called()
         log_warning.assert_called_once()
+
+    def test_successful_slow_request_logs_can_be_sampled(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        settings = self.settings()
+        settings.platform_perf_log_sample_rate = 0.0
+        metrics = self.metrics(method="GET")
+        metrics.sql_time_seconds = 1.0
+        with (
+            patch.object(performance, "get_settings", return_value=settings),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            middleware._log_if_slow(
+                {"route": SimpleNamespace(path="/tournaments/{slug}")},
+                metrics,
+                200,
+            )
+
+        log_info.assert_not_called()
 
     def test_ready_vote_pool_wait_does_not_log_every_successful_vote(self) -> None:
         middleware = performance.RequestPerformanceMiddleware(app=None)

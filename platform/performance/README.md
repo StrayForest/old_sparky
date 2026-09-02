@@ -387,6 +387,38 @@ without serializing media, bracket, assignment or the full workspace. It is
 limited to the exact read-mix shape and must be validated by another canonical
 run before acceptance.
 
+## Read-mix validation after conditional-detail fast path (2026-09-02)
+
+The follow-up canonical run was [workflow
+`33591512977`](https://github.com/StrayForest/old_sparky/actions/runs/33591512977),
+source SHA `df277f0c0bad09d32e59f9b0b5ff0af5791bb002`. It used the same
+20,000-user, 40-tournament × 500-user fixture, 128 external HTTP workers and
+10,000 conditional workspace refreshes. The exact cleanup and origin-safety
+checks passed, but the stress contract did not:
+
+- raw HTTP p50/p95/p99: `1973/4232/5893 ms`; wall time `480.806 s`;
+- statuses: `19,995 × 200`, `9,997 × 304`, `5 × 503` and `3` derived missing-ETag
+  refreshes;
+- all five `503` responses occurred in the initial read phase and coincided
+  with DB pool checkout reaching the 10-second timeout; the three missing ETags
+  were downstream of those failed initial reads;
+- API cores averaged `98.47%` and `98.35%`; PostgreSQL averaged `18.47%` CPU;
+- PostgreSQL reached `51` connections and `4` waiting backends, with zero lock
+  waiters; server pool checkout p95/p99 was `2988/4858 ms` and reached
+  `10052 ms`;
+- exact cleanup removed all 20,000 users and 40 tournaments, with no remaining
+  sessions or audit rows and the control account preserved.
+
+The decision was **`STRESS BEHAVIOR FAIL`**. Compared with the accepted prior
+run, the result was slower and therefore does not establish a gain from the
+conditional-detail fast path under this load. Cloudflare was separately
+verified to serve the public catalog with `cf-cache-status: HIT`; it remains
+enabled, with Redis as the origin read-model fallback. The next bounded
+candidate samples successful slow-request diagnostic logs at `0.25` in
+production; 5xx diagnostics remain fully logged. This changes observability
+overhead only and does not change authorization, ETag inputs or response
+business rules.
+
 ## Canonical commands
 
 ## Tournament lifecycle read models
