@@ -583,8 +583,18 @@ class WorkspaceConditionalPreflight:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceReadyCheckPreflight:
+    """Ready Check common state plus the requesting user's overlay."""
+
+    round: TournamentDeadlockReadyRound | None
+    ready_count: int
+    declined_count: int
+    current_user_choice: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceBasePreflight:
-    """One-query tournament and viewer access snapshot for workspace reads."""
+    """One-query tournament, viewer access and Ready Check snapshot."""
 
     tournament: Tournament
     organizer_display_name: str
@@ -593,6 +603,7 @@ class WorkspaceBasePreflight:
     locked_roster_count: int
     participant_record: TournamentParticipant | None
     active_commitment: PlayerTournamentCommitmentResponse | None
+    ready_check: WorkspaceReadyCheckPreflight
 
 
 _ready_check_state_cache: dict[tuple[str, int], ReadyCheckStateCacheEntry] = {}
@@ -828,6 +839,44 @@ def _ready_check_state_response_from_cache(
     )
 
 
+def _ready_check_state_response_from_preflight(
+    preflight: WorkspaceReadyCheckPreflight,
+) -> TournamentDeadlockReadyCheckStateResponse:
+    """Build the workspace Ready Check response from its combined read."""
+
+    round_row = preflight.round
+    if round_row is None:
+        return TournamentDeadlockReadyCheckStateResponse(
+            active_round=None,
+            latest_round=None,
+            state_version=0,
+        )
+    round_response = TournamentDeadlockReadyRoundResponse(
+        id=round_row.id,
+        tournament_id=round_row.tournament_id,
+        status=round_row.status,
+        eligible_participant_count=len(list(round_row.eligible_user_ids or [])),
+        ready_count=preflight.ready_count,
+        declined_count=preflight.declined_count,
+        initiated_by_user_id=round_row.initiated_by_user_id,
+        created_at=round_row.created_at,
+        closed_at=round_row.closed_at,
+        current_user_choice=preflight.current_user_choice,
+    )
+    state_version = ready_check_state_version(round_response, round_response)
+    if round_row.status == "active":
+        return TournamentDeadlockReadyCheckStateResponse(
+            active_round=round_response,
+            latest_round=round_response,
+            state_version=state_version,
+        )
+    return TournamentDeadlockReadyCheckStateResponse(
+        active_round=None,
+        latest_round=round_response,
+        state_version=state_version,
+    )
+
+
 def tournament_with_counts_stmt(
     tournament_page=None,
 ) -> Select[tuple[Tournament, str, str | None, str | None, int, int]]:
@@ -926,9 +975,53 @@ _WORKSPACE_BASE_SLUG = bindparam(
 
 
 def _build_workspace_base_preflight_stmt() -> Select:
-    """Combine the tournament and viewer access reads for authenticated users."""
+    """Combine workspace base, viewer access and Ready Check reads."""
 
     commitment_tournament = aliased(Tournament)
+    ready_round = aliased(TournamentDeadlockReadyRound)
+    selected_ready_round_id = (
+        select(TournamentDeadlockReadyRound.id)
+        .where(TournamentDeadlockReadyRound.tournament_id == Tournament.id)
+        .order_by(
+            case(
+                (TournamentDeadlockReadyRound.status == "active", 0),
+                else_=1,
+            ),
+            TournamentDeadlockReadyRound.created_at.desc(),
+            TournamentDeadlockReadyRound.id.desc(),
+        )
+        .limit(1)
+        .correlate(Tournament)
+        .scalar_subquery()
+    )
+    ready_count = (
+        select(func.coalesce(func.sum(TournamentDeadlockReadyVoteCountShard.vote_count), 0))
+        .where(
+            TournamentDeadlockReadyVoteCountShard.round_id == ready_round.id,
+            TournamentDeadlockReadyVoteCountShard.choice == "yes",
+        )
+        .correlate(ready_round)
+        .scalar_subquery()
+    )
+    declined_count = (
+        select(func.coalesce(func.sum(TournamentDeadlockReadyVoteCountShard.vote_count), 0))
+        .where(
+            TournamentDeadlockReadyVoteCountShard.round_id == ready_round.id,
+            TournamentDeadlockReadyVoteCountShard.choice == "no",
+        )
+        .correlate(ready_round)
+        .scalar_subquery()
+    )
+    current_user_choice = (
+        select(TournamentDeadlockReadyVote.choice)
+        .where(
+            TournamentDeadlockReadyVote.round_id == ready_round.id,
+            TournamentDeadlockReadyVote.user_id == _WORKSPACE_BASE_USER_ID,
+        )
+        .limit(1)
+        .correlate(ready_round)
+        .scalar_subquery()
+    )
     return (
         tournament_with_counts_stmt()
         .add_columns(
@@ -936,6 +1029,10 @@ def _build_workspace_base_preflight_stmt() -> Select:
             PlayerTournamentCommitment,
             commitment_tournament.slug.label("commitment_tournament_slug"),
             commitment_tournament.name.label("commitment_tournament_name"),
+            ready_round,
+            ready_count.label("ready_count"),
+            declined_count.label("declined_count"),
+            current_user_choice.label("current_user_choice"),
         )
         .outerjoin(
             TournamentParticipant,
@@ -955,6 +1052,7 @@ def _build_workspace_base_preflight_stmt() -> Select:
             commitment_tournament,
             commitment_tournament.id == PlayerTournamentCommitment.tournament_id,
         )
+        .outerjoin(ready_round, ready_round.id == selected_ready_round_id)
         .where(Tournament.slug == _WORKSPACE_BASE_SLUG)
     )
 
@@ -963,7 +1061,7 @@ _WORKSPACE_BASE_PREFLIGHT_STATEMENT = _build_workspace_base_preflight_stmt()
 
 
 def workspace_base_preflight_stmt() -> Select:
-    """Return the cached tournament plus viewer-access query shape."""
+    """Return the cached workspace base/access/Ready Check query shape."""
 
     return _WORKSPACE_BASE_PREFLIGHT_STATEMENT
 
@@ -1016,6 +1114,12 @@ async def workspace_base_preflight(
             row[6],
             tournament_slug=row[7],
             tournament_name=row[8],
+        ),
+        ready_check=WorkspaceReadyCheckPreflight(
+            round=row[9],
+            ready_count=int(row[10] or 0),
+            declined_count=int(row[11] or 0),
+            current_user_choice=row[12],
         ),
     )
 
@@ -7283,12 +7387,17 @@ async def get_tournament_workspace(
             )
             assignment_runs_loaded = True
         if current_user_can_view_deadlock_state and is_solo_format and workspace_view != "bracket_summary":
-            ready_check = await build_deadlock_ready_check_state_response(
-                db_session,
-                tournament_id=tournament.id,
-                current_user_id=auth_session.user.id,
-                tournament_bracket_revision=tournament.bracket_revision,
-            )
+            if workspace_base_snapshot is not None:
+                ready_check = _ready_check_state_response_from_preflight(
+                    workspace_base_snapshot.ready_check,
+                )
+            else:
+                ready_check = await build_deadlock_ready_check_state_response(
+                    db_session,
+                    tournament_id=tournament.id,
+                    current_user_id=auth_session.user.id,
+                    tournament_bracket_revision=tournament.bracket_revision,
+                )
         if current_user_is_organizer and is_solo_format and workspace_view != "bracket_summary":
             auto_assignment = await build_deadlock_auto_assignment_state_response(
                 db_session,

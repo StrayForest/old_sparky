@@ -123,6 +123,9 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("tournament_participants", sql)
         self.assertIn("player_tournament_commitments", sql)
+        self.assertIn("tournament_deadlock_ready_rounds", sql)
+        self.assertIn("tournament_deadlock_ready_vote_count_shards", sql)
+        self.assertIn("tournament_deadlock_ready_votes", sql)
         self.assertIn("workspace_base_user_id", statement.compile().params)
         self.assertIn("workspace_base_slug", statement.compile().params)
 
@@ -148,6 +151,12 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
             locked_roster_count=0,
             participant_record=participant,
             active_commitment=None,
+            ready_check=tournament_routes.WorkspaceReadyCheckPreflight(
+                round=None,
+                ready_count=0,
+                declined_count=0,
+                current_user_choice=None,
+            ),
         )
         auth_session = SimpleNamespace(
             user=SimpleNamespace(id="user-1"),
@@ -238,6 +247,137 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
             base_lookup.await_args.kwargs,
             {"slug": "night-cup", "user_id": "user-1"},
         )
+
+    async def test_authenticated_workspace_reuses_combined_ready_check_preflight(self) -> None:
+        created_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        tournament = SimpleNamespace(
+            id="tournament-1",
+            slug="night-cup",
+            visibility="public",
+            status="registration_closed",
+            format_slug="solo",
+            organizer_user_id="organizer-1",
+            updated_at=created_at,
+            created_at=created_at,
+            bracket_revision=0,
+        )
+        ready_round = SimpleNamespace(
+            id=11,
+            tournament_id="tournament-1",
+            status="active",
+            eligible_user_ids=["user-1"],
+            initiated_by_user_id="organizer-1",
+            created_at=created_at,
+            closed_at=None,
+        )
+        base_snapshot = tournament_routes.WorkspaceBasePreflight(
+            tournament=tournament,
+            organizer_display_name="Organizer",
+            organizer_avatar_asset_id=None,
+            participant_count=500,
+            locked_roster_count=0,
+            participant_record=SimpleNamespace(status="registered"),
+            active_commitment=None,
+            ready_check=tournament_routes.WorkspaceReadyCheckPreflight(
+                round=ready_round,
+                ready_count=37,
+                declined_count=4,
+                current_user_choice="yes",
+            ),
+        )
+        auth_session = SimpleNamespace(
+            user=SimpleNamespace(id="user-1"),
+            role_slugs=frozenset(),
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/tournaments/night-cup/workspace",
+                "headers": [],
+                "query_string": b"workspace_view=bracket&include_current_user=false",
+                "scheme": "http",
+                "server": ("testserver", 80),
+                "client": ("testclient", 1),
+            }
+        )
+        serialized = Mock(return_value=Response(status_code=200))
+
+        with (
+            patch.object(
+                tournament_routes,
+                "workspace_base_preflight",
+                AsyncMock(return_value=base_snapshot),
+            ),
+            patch.object(
+                tournament_routes,
+                "workspace_access_for_user",
+                AsyncMock(side_effect=AssertionError("base preflight owns access read")),
+            ),
+            patch.object(
+                tournament_routes,
+                "tournament_media_descriptors",
+                AsyncMock(return_value=(None, None)),
+            ),
+            patch.object(
+                tournament_routes,
+                "serialize_tournament",
+                return_value=tournament_routes.TournamentResponse(
+                    id="tournament-1",
+                    slug="night-cup",
+                    name="Night Cup",
+                    description=None,
+                    visibility="public",
+                    status="registration_closed",
+                    format_slug="solo",
+                    organizer_user_id="organizer-1",
+                    created_at=created_at,
+                ),
+            ),
+            patch.object(
+                tournament_routes,
+                "can_view_tournament_workspace_data",
+                return_value=True,
+            ),
+            patch.object(
+                tournament_routes,
+                "build_tournament_bracket_response",
+                AsyncMock(
+                    return_value=tournament_routes.TournamentBracketResponse(
+                        tournament_id="tournament-1",
+                        tournament_status="registration_closed",
+                        status="pending",
+                    )
+                ),
+            ),
+            patch.object(
+                tournament_routes,
+                "build_deadlock_ready_check_state_response",
+                AsyncMock(side_effect=AssertionError("combined preflight owns Ready Check read")),
+            ),
+            patch.object(tournament_routes, "_workspace_response_etag", return_value='"base"'),
+            patch.object(tournament_routes, "_conditional_response", return_value=None),
+            patch.object(tournament_routes, "_serialized_model_response", serialized),
+        ):
+            result = await tournament_routes.get_tournament_workspace(
+                slug="night-cup",
+                request=request,
+                response=Response(),
+                participants_limit=0,
+                participants_offset=0,
+                workspace_view="bracket",
+                include_current_user=False,
+                invite_code=None,
+                auth_session=auth_session,
+                db_session=AsyncMock(),
+            )
+
+        self.assertEqual(result.status_code, 200)
+        workspace_response = serialized.call_args.args[0]
+        self.assertEqual(workspace_response.ready_check.active_round.ready_count, 37)
+        self.assertEqual(workspace_response.ready_check.active_round.declined_count, 4)
+        self.assertEqual(workspace_response.ready_check.active_round.current_user_choice, "yes")
+        self.assertEqual(workspace_response.ready_check.latest_round.id, 11)
 
     async def test_conditional_detail_returns_304_from_one_preflight_query(self) -> None:
         updated_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
