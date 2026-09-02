@@ -423,50 +423,17 @@ def _workspace_response_etag(
     if ready_check is not None:
         active_round = ready_check.active_round or ready_check.latest_round
         ready_round_id = active_round.id if active_round is not None else None
-    return _workspace_etag_from_values(
-        tournament_id=workspace_response.tournament.id,
-        tournament_state_version=workspace_response.tournament.state_version,
-        workspace_view=workspace_view,
-        participants_limit=participants_limit,
-        participants_offset=participants_offset,
-        include_current_user=include_current_user,
-        user_id=user_id,
-        bracket_revision=(
-            workspace_response.bracket.revision
-            if workspace_response.bracket is not None
-            else None
-        ),
-        ready_check_state_version=(
-            ready_check.state_version if ready_check is not None else None
-        ),
-        ready_round_id=ready_round_id,
-    )
-
-
-def _workspace_etag_from_values(
-    *,
-    tournament_id: str,
-    tournament_state_version: int,
-    workspace_view: str,
-    participants_limit: int,
-    participants_offset: int,
-    include_current_user: bool,
-    user_id: str,
-    bracket_revision: int | None,
-    ready_check_state_version: int | None,
-    ready_round_id: int | None,
-) -> str:
     return _representation_etag(
         "workspace",
-        tournament_id,
-        tournament_state_version,
+        workspace_response.tournament.id,
+        workspace_response.tournament.state_version,
         workspace_view,
         participants_limit,
         participants_offset,
         include_current_user,
         user_id,
-        bracket_revision,
-        ready_check_state_version,
+        workspace_response.bracket.revision if workspace_response.bracket is not None else None,
+        ready_check.state_version if ready_check is not None else None,
         ready_round_id,
     )
 
@@ -6678,108 +6645,11 @@ async def get_tournament_workspace(
                             etag=etag,
                         )
 
-    prefetched_row = None
-    prefetched_access: tuple[TournamentParticipant | None, PlayerTournamentCommitmentResponse | None] | None = None
-    prefetched_access_loaded = False
-    prefetched_ready_check = None
-    prefetched_ready_check_loaded = False
-    conditional_read_candidate = bool(
-        request.headers.get("if-none-match", "").strip()
-        and participants_limit == 0
-        and participants_offset == 0
-        and workspace_view == "detail"
-        and not include_current_user
-        and invite_code is None
-    )
-    if conditional_read_candidate:
-        prefetched_row = (
-            await db_session.execute(
-                tournament_with_counts_stmt().where(Tournament.slug == slug)
-            )
-        ).first()
-        if prefetched_row is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
-        (
-            prefetched_tournament,
-            _prefetched_organizer_display_name,
-            _prefetched_organizer_avatar_asset_id,
-            prefetched_participant_count,
-            _prefetched_locked_roster_count,
-        ) = prefetched_row
-        ensure_tournament_summary_visible(prefetched_tournament, auth_session)
-        if auth_session is not None:
-            prefetched_access = await workspace_access_for_user(
-                db_session,
-                tournament_id=prefetched_tournament.id,
-                user_id=auth_session.user.id,
-            )
-            prefetched_access_loaded = True
-        prefetched_participant_record = (
-            prefetched_access[0] if prefetched_access is not None else None
+    row = (
+        await db_session.execute(
+            tournament_with_counts_stmt().where(Tournament.slug == slug)
         )
-        ensure_tournament_workspace_visible(
-            prefetched_tournament,
-            auth_session=auth_session,
-            has_participant_record=prefetched_participant_record is not None,
-        )
-        prefetched_is_solo_format = is_solo_tournament_format(
-            prefetched_tournament.format_slug
-        )
-        prefetched_can_view_deadlock_state = bool(
-            auth_session is not None
-            and (
-                prefetched_tournament.organizer_user_id == auth_session.user.id
-                or (
-                    prefetched_participant_record is not None
-                    and not participant_status_is_inactive(prefetched_participant_record.status)
-                )
-            )
-        )
-        if prefetched_can_view_deadlock_state and prefetched_is_solo_format:
-            prefetched_ready_check = await build_deadlock_ready_check_state_response(
-                db_session,
-                tournament_id=prefetched_tournament.id,
-                current_user_id=auth_session.user.id,
-                tournament_bracket_revision=prefetched_tournament.bracket_revision,
-            )
-            prefetched_ready_check_loaded = True
-        prefetched_ready_round = (
-            prefetched_ready_check.active_round or prefetched_ready_check.latest_round
-            if prefetched_ready_check is not None
-            else None
-        )
-        prefetched_etag = _workspace_etag_from_values(
-            tournament_id=prefetched_tournament.id,
-            tournament_state_version=tournament_state_version(
-                prefetched_tournament,
-                participant_count=int(prefetched_participant_count),
-            ),
-            workspace_view=workspace_view,
-            participants_limit=participants_limit,
-            participants_offset=participants_offset,
-            include_current_user=include_current_user,
-            user_id=auth_session.user.id if auth_session is not None else "anonymous",
-            bracket_revision=int(prefetched_tournament.bracket_revision or 0),
-            ready_check_state_version=(
-                prefetched_ready_check.state_version
-                if prefetched_ready_check is not None
-                else None
-            ),
-            ready_round_id=(
-                prefetched_ready_round.id if prefetched_ready_round is not None else None
-            ),
-        )
-        not_modified = _conditional_response(request, response, etag=prefetched_etag)
-        if not_modified is not None:
-            return not_modified
-
-    row = prefetched_row
-    if row is None:
-        row = (
-            await db_session.execute(
-                tournament_with_counts_stmt().where(Tournament.slug == slug)
-            )
-        ).first()
+    ).first()
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
     (
@@ -6820,9 +6690,7 @@ async def get_tournament_workspace(
 
     participant_record: TournamentParticipant | None = None
     active_commitment: PlayerTournamentCommitmentResponse | None = None
-    if prefetched_access_loaded:
-        participant_record, active_commitment = prefetched_access or (None, None)
-    elif auth_session is not None:
+    if auth_session is not None:
         participant_record, active_commitment = await workspace_access_for_user(
             db_session,
             tournament_id=tournament.id,
@@ -6969,15 +6837,12 @@ async def get_tournament_workspace(
         )
     )
     if current_user_can_view_deadlock_state and is_solo_format and workspace_view != "bracket_summary":
-        if prefetched_ready_check_loaded:
-            ready_check = prefetched_ready_check
-        else:
-            ready_check = await build_deadlock_ready_check_state_response(
-                db_session,
-                tournament_id=tournament.id,
-                current_user_id=auth_session.user.id,
-                tournament_bracket_revision=tournament.bracket_revision,
-            )
+        ready_check = await build_deadlock_ready_check_state_response(
+            db_session,
+            tournament_id=tournament.id,
+            current_user_id=auth_session.user.id,
+            tournament_bracket_revision=tournament.bracket_revision,
+        )
     if current_user_is_organizer and is_solo_format and workspace_view != "bracket_summary":
         auto_assignment = await build_deadlock_auto_assignment_state_response(
             db_session,
