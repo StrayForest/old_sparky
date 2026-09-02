@@ -189,10 +189,6 @@ class PlatformSettings(BaseSettings):
         le=10 * 1024 * 1024 * 1024,
     )
     platform_perf_log_enabled: bool = True
-    # Successful slow-request diagnostics are sampled in production so
-    # journald formatting/I/O cannot become part of the API saturation point.
-    # Errors remain unconditionally observable in the middleware.
-    platform_perf_log_sample_rate: float = Field(default=0.25, ge=0, le=1)
     platform_perf_slow_request_ms: int = Field(default=1000, ge=0)
     platform_perf_slow_db_ms: int = Field(default=500, ge=0)
     platform_perf_sql_count_threshold: int = Field(default=25, ge=0)

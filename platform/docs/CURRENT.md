@@ -119,7 +119,7 @@ cleanup or abort handling before another run.
 
 The 2026-09-02 authenticated read-mix A/B runs improved 30,000-request wall
 time from 784.5 s to 432.0 s and reduced raw p95 from 7.11 s to 3.68 s. The
-last accepted canonical run used 20,000 users, 40×500 tournaments, 20,000
+latest canonical run passed with 20,000 users, 40×500 tournaments, 20,000
 successful `200` reads and 10,000 valid `304` refreshes; both API cores still
 reached roughly 98.5%. Validation run `33591512977` exercised the same
 contract after the conditional-detail fast path, but failed the gate on five

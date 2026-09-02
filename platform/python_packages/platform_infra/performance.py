@@ -5,7 +5,6 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 import logging
 import re
-from hashlib import sha256
 from time import perf_counter
 from typing import Any, Iterator
 from uuid import uuid4
@@ -429,13 +428,6 @@ class RequestPerformanceMiddleware:
         )
         if not should_log:
             return
-        if status_code < 500 and not self._sample_successful_request_log(
-            metrics,
-            sample_rate=float(
-                getattr(settings, "platform_perf_log_sample_rate", 1.0)
-            ),
-        ):
-            return
 
         log_method = logger.warning if status_code >= 500 else logger.info
         log_method(
@@ -524,17 +516,3 @@ class RequestPerformanceMiddleware:
             metrics.cf_ray or "-",
             metrics.client_fingerprint or "-",
         )
-
-    @staticmethod
-    def _sample_successful_request_log(
-        metrics: RequestPerformanceMetrics,
-        *,
-        sample_rate: float,
-    ) -> bool:
-        if sample_rate >= 1.0:
-            return True
-        if sample_rate <= 0.0:
-            return False
-        digest = sha256(metrics.request_id.encode("utf-8")).digest()
-        sample_value = int.from_bytes(digest[:8], "big") / float(1 << 64)
-        return sample_value < sample_rate
