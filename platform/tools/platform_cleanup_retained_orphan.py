@@ -19,7 +19,7 @@ import re
 import sys
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLATFORM_ROOT))
@@ -27,9 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from python_packages.platform_infra.config import get_settings, validate_platform_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
-from python_packages.platform_infra.models import PreprodTestRun
+from python_packages.platform_infra.models import PreprodTestRun, User
 from platform_cleanup_retained_matrix import (
     CONFIRMATION,
+    EMAIL_PATTERN,
     EXPECTED_ORIGIN,
     MARKER_PATTERN,
     _uuid_list,
@@ -40,6 +41,7 @@ from platform_cleanup_retained_matrix import (
 RUN_ROOT_BASE = Path("/opt/oldsparky/platform/shared/production-retained-matrix")
 SUPPORTED_MODES = frozenset({"read-mix", "write-burst"})
 LEGACY_EXTERNAL_VOTE_MODE = "external-vote"
+MAX_COMPACT_USER_RECOVERY = 20_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,6 +77,7 @@ def build_durable_manifest(
     *,
     load_run_id: str,
     control_email: str,
+    resolved_user_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the exact cleanup manifest from one durable QA row."""
 
@@ -112,7 +115,7 @@ def build_durable_manifest(
     if str(run.status or "").lower() == "cleaned" or run.cleanup_state:
         raise RuntimeError("durable QA row already records cleanup")
     user_ids = _uuid_list(
-        stored.get("user_ids"),
+        stored.get("user_ids") if resolved_user_ids is None else resolved_user_ids,
         field=f"{marker}.user_ids",
         allow_empty=False,
     )
@@ -144,6 +147,67 @@ def build_durable_manifest(
         }],
         "summary_path": report_path,
     }
+
+
+async def _resolve_user_ids(db_session: Any, run: Any) -> tuple[list[str], bool]:
+    """Resolve a complete user inventory, including compact progress reports."""
+
+    stored = dict(run.report or {})
+    marker = str(run.marker or stored.get("marker") or "")
+    if not MARKER_PATTERN.fullmatch(marker):
+        raise RuntimeError("durable QA marker is not canonical")
+    raw_user_ids = stored.get("user_ids")
+    if isinstance(raw_user_ids, list):
+        return _uuid_list(raw_user_ids, field=f"{marker}.user_ids", allow_empty=False), False
+    if not isinstance(raw_user_ids, dict):
+        raise RuntimeError("durable QA user inventory is missing")
+    if raw_user_ids.get("complete_inventory_in_final_report") is not True:
+        raise RuntimeError("durable QA compact user inventory is not marked recoverable")
+    expected_count = raw_user_ids.get("count")
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or not 1 <= expected_count <= MAX_COMPACT_USER_RECOVERY
+    ):
+        raise RuntimeError("durable QA compact user inventory count is invalid")
+    first_ids = _uuid_list(
+        raw_user_ids.get("first"),
+        field=f"{marker}.user_ids.first",
+        allow_empty=False,
+    )
+    last_ids = _uuid_list(
+        raw_user_ids.get("last"),
+        field=f"{marker}.user_ids.last",
+        allow_empty=False,
+    )
+    sample_ids = set(first_ids) | set(last_ids)
+    if len(sample_ids) > expected_count:
+        raise RuntimeError("durable QA compact user inventory samples exceed its count")
+
+    rows = (
+        await db_session.execute(
+            select(User.id, User.email).where(
+                func.lower(User.email).like(f"{marker.lower()}-%@example.com")
+            )
+        )
+    ).all()
+    if len(rows) != expected_count:
+        raise RuntimeError("durable QA compact user inventory count does not match production")
+    recovered_ids: list[str] = []
+    for row in rows:
+        email = str(row.email or "").lower()
+        match = EMAIL_PATTERN.fullmatch(email)
+        if match is None or match.group("marker") != marker:
+            raise RuntimeError("durable QA compact recovery found an invalid fixture email")
+        recovered_ids.append(str(row.id))
+    normalized_ids = _uuid_list(
+        sorted(set(recovered_ids)),
+        field=f"{marker}.user_ids",
+        allow_empty=False,
+    )
+    if len(normalized_ids) != expected_count or not sample_ids.issubset(set(normalized_ids)):
+        raise RuntimeError("durable QA compact recovery does not match its samples")
+    return normalized_ids, True
 
 
 async def clean_orphan(args: argparse.Namespace) -> dict[str, Any]:
@@ -182,12 +246,17 @@ async def clean_orphan(args: argparse.Namespace) -> dict[str, Any]:
         )
         if len(rows) != 1:
             raise RuntimeError("exactly one durable QA row is required for the orphan run")
+        resolved_user_ids, was_compact = await _resolve_user_ids(db_session, rows[0])
         manifest = build_durable_manifest(
             rows[0],
             load_run_id=args.load_run_id,
             control_email=control_email,
+            resolved_user_ids=resolved_user_ids,
         )
-    result = await cleanup_manifest(manifest)
+    recovered_user_ids = (
+        {str(rows[0].marker): set(resolved_user_ids)} if was_compact else None
+    )
+    result = await cleanup_manifest(manifest, recovered_user_ids=recovered_user_ids)
     args.result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
 

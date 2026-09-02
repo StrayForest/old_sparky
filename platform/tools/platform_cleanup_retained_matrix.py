@@ -314,7 +314,11 @@ def _merge_recovered_marker_tournaments(
     return recovered_ids - declared_ids
 
 
-async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+async def cleanup_manifest(
+    manifest: dict[str, Any],
+    *,
+    recovered_user_ids: dict[str, set[str]] | None = None,
+) -> dict[str, Any]:
     settings = get_settings()
     validate_platform_settings(settings)
     if settings.platform_environment.strip().lower() != "production":
@@ -387,9 +391,21 @@ async def cleanup_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             stored_report = dict(run.report or {})
             stored_tournament_ids = set(stored_report.get("tournament_ids") or [])
             manifest_tournament_ids = set(row["tournament_ids"])
+            stored_user_ids = stored_report.get("user_ids")
+            user_identity_matches = (
+                isinstance(stored_user_ids, list)
+                and set(stored_user_ids) == set(row["user_ids"])
+            )
+            if not user_identity_matches and recovered_user_ids is not None:
+                recovered_for_marker = recovered_user_ids.get(run.marker)
+                user_identity_matches = (
+                    isinstance(stored_user_ids, dict)
+                    and stored_user_ids.get("complete_inventory_in_final_report") is True
+                    and recovered_for_marker == set(row["user_ids"])
+                )
             if (
                 stored_report.get("marker") != run.marker
-                or set(stored_report.get("user_ids") or []) != set(row["user_ids"])
+                or not user_identity_matches
                 or (
                     stored_tournament_ids != manifest_tournament_ids
                     and not (

@@ -101,6 +101,44 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
                 control_email="control@example.com",
             )
 
+    def test_compact_inventory_requires_explicit_resolved_ids(self) -> None:
+        report_path = cleanup._legacy_external_vote_report_path(run_id="12345")
+        compact = {
+            "count": 2,
+            "first": ["00000000-0000-0000-0000-000000000001"],
+            "last": ["00000000-0000-0000-0000-000000000002"],
+            "complete_inventory_in_final_report": True,
+        }
+        run = self._run(
+            mode="write-burst",
+            report_path=report_path,
+            report={
+                "marker": "preprod260829000001abcd",
+                "origin": cleanup.EXPECTED_ORIGIN,
+                "request_origin": cleanup.EXPECTED_ORIGIN,
+                "mode": "write-burst",
+                "report_path": report_path,
+                "external_vote": {"tournament_count": 11},
+                "user_ids": compact,
+                "tournament_ids": [],
+            },
+        )
+
+        with self.assertRaises(ValueError):
+            cleanup.build_durable_manifest(
+                run,
+                load_run_id="12345",
+                control_email="control@example.com",
+            )
+
+        manifest = cleanup.build_durable_manifest(
+            run,
+            load_run_id="12345",
+            control_email="control@example.com",
+            resolved_user_ids=list(compact["first"] + compact["last"]),
+        )
+        self.assertEqual(len(manifest["user_ids"]), 2)
+
     def test_refuses_already_cleaned_row(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "already records cleanup"):
             cleanup.build_durable_manifest(
