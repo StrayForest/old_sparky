@@ -117,23 +117,23 @@ external-load workflow is the only supported retained-load measurement path; it
 is a manual operator gate, never ordinary CI, and every run requires exact
 cleanup or abort handling before another run.
 
-The 2026-09-02 authenticated read-mix A/B run on the current production
-runtime (deployed source `ffe74e8c932b9f1fbe0c3c25d8cf1fd5207058c6`, runtime
-equivalent to the proven `7425e72ef90934ea6bb8a57bbffeb53936475f66`) improved 30,000-request
-wall time from 784.5 s to 432.0 s and reduced raw p95 from 7.11 s to 3.68 s.
-The canonical profile passed with 20,000 users, 40×500 tournaments, 20,000
-successful `200` reads and 10,000 valid `304` refreshes; both API cores still
-reached roughly 98.5%. Post-rollback validation workflow `33602219984` passed
-the same `200/304` contract with 0 errors and exact cleanup; API cores reached
-`98.43%` and `98.37%`, with PostgreSQL at `18.93%` CPU and zero lock waiters.
-The later conditional-detail fast path and diagnostic
-sampling candidates were rolled back: the former failed its contract with
-origin `503` responses and was slower, while the latter reduced log volume but
-did not improve latency. The accepted runtime keeps Cloudflare edge caching
-and the Redis origin fallback enabled. Further read-path changes must be
-proven against the same profile without weakening authorization, ETag
-correctness or exact cleanup; no safe CPU-saving hypothesis is accepted
-without new profiling evidence.
+The current production read-mix winner is source
+`227a076bac3a3cfd42e8c62901ce2a29928ddd52`, deployed by
+`33618864270`. It retains the revision-based single-query conditional 304
+preflight and combines tournament base data with authenticated viewer
+access/commitment data for ordinary workspace reads without an invite code.
+Canonical production workflow `33619193304` passed with 20,000 users,
+40×500 tournaments, 20,000 successful `200` reads and 10,000 valid `304`
+refreshes; wall time was `353.045 s`, raw p95/p99 was `2908/4414 ms`, and
+both API cores averaged roughly `98.35%`. Workspace diagnostics measured
+`4.501` SQL/request, `278.235 ms` average DB time and `2068 ms` pool checkout
+p95, versus baseline `6.018`, `438.892 ms` and `3557 ms`. PostgreSQL lock
+waiters stayed at zero, and exact cleanup removed all fixture users,
+tournaments, sessions and audit rows while preserving the control account.
+The earlier conditional-detail fast path and diagnostic sampling candidates
+remain rejected historical experiments; this accepted candidate must continue
+to be proven against the same profile without weakening authorization, ETag
+correctness or exact cleanup.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
 

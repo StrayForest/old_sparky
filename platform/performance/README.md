@@ -450,14 +450,15 @@ resulting queue. No worker/pool increase or cache rewrite is justified without
 new profiling evidence; Cloudflare edge caching remains enabled and the Redis
 read-model cache remains the origin fallback.
 
-## Current accepted runtime after rollback (2026-09-02)
+## Read-mix validation after rollback (historical checkpoint, 2026-09-02)
 
-Production is intentionally back on the last proven read-mix winner. The
-deployed source is `ffe74e8c932b9f1fbe0c3c25d8cf1fd5207058c6`, whose effective
-runtime is the `7425e72ef90934ea6bb8a57bbffeb53936475f66` implementation plus
-rollback commits. It retains the authenticated tournament read-path
-optimizations and duplicate organizer-avatar lookup removal. The
-conditional-detail fast path and successful-log sampling are not present.
+This was the post-rollback checkpoint before the next workspace read-path
+candidate. The deployed source was
+`ffe74e8c932b9f1fbe0c3c25d8cf1fd5207058c6`, whose effective runtime was the
+`7425e72ef90934ea6bb8a57bbffeb53936475f66` implementation plus rollback
+commits. It retained the authenticated tournament read-path optimizations and
+duplicate organizer-avatar lookup removal; the conditional-detail fast path
+and successful-log sampling were not present.
 
 Post-rollback [workflow `33602219984`](https://github.com/StrayForest/old_sparky/actions/runs/33602219984)
 ran the canonical 20,000-user, 40-tournament × 500-user fixture with 128
@@ -475,11 +476,48 @@ contract and exact cleanup:
 - exact cleanup removed all 20,000 users and 40 tournaments, with no remaining
   sessions or audit rows and the control account preserved.
 
-The result is **`STRESS BEHAVIOR PASS`**. The historical run
-`33588749169` remains the fastest measured sample for this same runtime;
-the fresh run is slower by `2.8%` wall time, but has the same contract and
-resource-safety outcome. This does not justify reintroducing either rejected
-candidate. The durable conclusion remains that the two-vCPU API is CPU-bound.
+The result was **`STRESS BEHAVIOR PASS`**. The historical run
+`33588749169` remains the fastest measured sample for that runtime; the fresh
+run was slower by `2.8%` wall time, but had the same contract and resource-
+safety outcome.
+
+## Read-mix A/B after combined workspace base/access preflight (2026-09-02)
+
+The next candidate was deployed through [production deploy
+`33618864270`](https://github.com/StrayForest/old_sparky/actions/runs/33618864270),
+source SHA `227a076bac3a3cfd42e8c62901ce2a29928ddd52`. It combines the
+tournament base row and authenticated viewer access/commitment lookup into one
+cached SQL statement for requests without an invite code, while retaining the
+revision-based conditional 304 preflight from `829ccc2b`. The canonical
+20,000-user, 40-tournament × 500-user fixture, 128 external HTTP workers and
+10,000 conditional workspace refreshes were measured by [workflow
+`33619193304`](https://github.com/StrayForest/old_sparky/actions/runs/33619193304).
+The profile contract, origin-safety checks and exact cleanup all passed:
+
+- raw HTTP p50/p95/p99: `1341/2908/4414 ms`; wall time `353.045 s` and
+  `84.975 req/s`;
+- statuses: `20,000 × 200` and `10,000 × 304`, with zero errors, retries,
+  shedding or unexpected statuses;
+- API cores averaged `98.36%` and `98.34%`; PostgreSQL averaged `21.49%`
+  CPU and reached `41.28%` at peak;
+- PostgreSQL waiting backends peaked at `9`, while lock waiters and ungranted
+  locks stayed at `0`; workspace server pool checkout p95/p99 was
+  `2068/3458 ms`;
+- workspace request diagnostics fell from `6.018` to `4.501` SQL/request and
+  from `438.892` to `278.235 ms` average DB time versus baseline run
+  `33609896507`; the workspace pool checkout p95 fell from `3557` to `2068 ms`;
+- exact cleanup removed all 20,000 users and 40 tournaments, with no remaining
+  sessions or audit rows and the control account preserved.
+
+The result is **`STRESS BEHAVIOR PASS`**. Wall time improved by `26.1%`
+against the prior baseline and by `15.2%` against the immediately preceding
+conditional-304 candidate (`33614703285`). The initial read phase improved
+from `1849 ms` to `1576 ms` average versus the baseline; conditional refresh
+latency remained within the same range (`1342 ms` in this run). The large
+gain is consistent with removing one database checkout from authenticated
+initial workspace reads; API CPU remains the limiting resource, while
+PostgreSQL and Redis remain below their resource ceilings. Production now
+retains this combined preflight plus the proven conditional 304 path.
 
 ## Canonical commands
 
