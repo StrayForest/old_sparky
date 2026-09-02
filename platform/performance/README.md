@@ -381,11 +381,10 @@ The stress decision was **`STRESS BEHAVIOR PASS`**. Compared with the prior
 A/B, wall time improved by 8.7%, p95 by 7.5%, p99 by 6.4%, and workspace SQL
 fell from `8.012` to `7.012` per request. The API remains CPU-bound at roughly
 98.5%; PostgreSQL CPU, locks and Redis latency remain below their ceilings.
-The next reviewed candidate adds a narrow conditional-detail fast path: after
-auth/access/version checks, an unchanged `If-None-Match` request returns `304`
-without serializing media, bracket, assignment or the full workspace. It is
-limited to the exact read-mix shape and must be validated by another canonical
-run before acceptance.
+The next reviewed candidate added a narrow conditional-detail fast path, but it
+was not accepted: the follow-up canonical run below was slower and returned
+origin `503` responses. The candidate was rolled back, leaving this
+`7425e72e` runtime as the accepted production baseline.
 
 ## Read-mix validation after conditional-detail fast path (2026-09-02)
 
@@ -443,12 +442,22 @@ both passed:
 
 Sampling removed diagnostic-log volume but did not produce a reproducible
 latency gain versus the accepted `33588749169` run: wall time and p95/p99 were
-slightly higher in this sample. The durable conclusion is that the two-vCPU
+slightly higher in this sample. It was rolled back together with the
+conditional-detail fast path. The durable conclusion is that the two-vCPU
 API is CPU-bound: PostgreSQL CPU, Redis latency and lock contention remain
 below their ceilings, while API CPU stays near 100% and pool wait is the
 resulting queue. No worker/pool increase or cache rewrite is justified without
 new profiling evidence; Cloudflare edge caching remains enabled and the Redis
 read-model cache remains the origin fallback.
+
+## Current accepted runtime after rollback (2026-09-02)
+
+Production is intentionally back on the last proven read-mix winner,
+`7425e72ef90934ea6bb8a57bbffeb53936475f66`. It retains the authenticated
+tournament read-path optimizations and the duplicate organizer-avatar lookup
+removal. The conditional-detail fast path and successful-log sampling are not
+present in the runtime. A fresh canonical run is required after deployment;
+until that run completes, workflow `33588749169` remains the comparison point.
 
 ## Canonical commands
 

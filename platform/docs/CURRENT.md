@@ -117,19 +117,18 @@ external-load workflow is the only supported retained-load measurement path; it
 is a manual operator gate, never ordinary CI, and every run requires exact
 cleanup or abort handling before another run.
 
-The 2026-09-02 authenticated read-mix A/B runs improved 30,000-request wall
-time from 784.5 s to 432.0 s and reduced raw p95 from 7.11 s to 3.68 s. The
-latest canonical run passed with 20,000 users, 40×500 tournaments, 20,000
+The 2026-09-02 authenticated read-mix A/B run on the current production
+runtime (`7425e72ef90934ea6bb8a57bbffeb53936475f66`) improved 30,000-request
+wall time from 784.5 s to 432.0 s and reduced raw p95 from 7.11 s to 3.68 s.
+The canonical profile passed with 20,000 users, 40×500 tournaments, 20,000
 successful `200` reads and 10,000 valid `304` refreshes; both API cores still
-reached roughly 98.5%. Validation run `33591512977` exercised the same
-contract after the conditional-detail fast path, but failed the gate on five
-origin `503` responses (pool checkout saturation) and three derived missing
-ETags; exact cleanup and origin-safety still passed. Further read-path changes
-must be proven against the same profile without weakening authorization, ETag
-correctness or exact cleanup. The sampling candidate is now deployed and
-validated: successful slow-request diagnostics are sampled at `0.25`, while
-5xx logging remains unconditional. The canonical run still saturates both API
-vCPUs at roughly `98.7%`; no further safe CPU-saving hypothesis is accepted
+reached roughly 98.5%. The later conditional-detail fast path and diagnostic
+sampling candidates were rolled back: the former failed its contract with
+origin `503` responses and was slower, while the latter reduced log volume but
+did not improve latency. The accepted runtime keeps Cloudflare edge caching
+and the Redis origin fallback enabled. Further read-path changes must be
+proven against the same profile without weakening authorization, ETag
+correctness or exact cleanup; no safe CPU-saving hypothesis is accepted
 without new profiling evidence.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
