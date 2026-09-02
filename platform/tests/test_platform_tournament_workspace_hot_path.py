@@ -121,6 +121,10 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
         statement = tournament_routes.workspace_base_preflight_stmt()
         sql = str(statement.compile())
 
+        self.assertIn("workspace_tournament_id", sql)
+        self.assertIn("workspace_participant_status", sql)
+        self.assertIn("workspace_ready_round_id", sql)
+        self.assertNotIn("SELECT platform.tournaments.id, platform.tournaments.slug", sql)
         self.assertIn("tournament_participants", sql)
         self.assertIn("player_tournament_commitments", sql)
         self.assertIn("tournament_deadlock_ready_rounds", sql)

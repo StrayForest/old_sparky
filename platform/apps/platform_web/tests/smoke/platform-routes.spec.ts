@@ -653,6 +653,34 @@ test("authenticated header stays resolved across client navigation without a bro
   expect(browserMeRequests).toBe(0);
 });
 
+test("authenticated tournament SSR uses the bootstrap dependency graph", async ({ page }) => {
+  await page.context().addCookies([
+    {
+      name: "deadlock_platform_session",
+      value: "smoke-session",
+      url: "http://127.0.0.1:3100",
+    },
+    {
+      name: "ssr-bootstrap-profile-smoke",
+      value: "1",
+      url: "http://127.0.0.1:3100",
+    },
+  ]);
+
+  await page.goto("/tournaments/night-veil-open-5");
+  await expect(page.getByRole("heading", { name: "Night Veil Open #5", level: 1 })).toBeVisible();
+
+  const bootstrapCount = await page.request
+    .get("http://127.0.0.1:3199/__test/request-count?path=%2Fapi%2Fv1%2Fauth%2Fbootstrap")
+    .then(async (response) => (await response.json()).count as number);
+  const usersMeCount = await page.request
+    .get("http://127.0.0.1:3199/__test/request-count?path=%2Fapi%2Fv1%2Fusers%2Fme")
+    .then(async (response) => (await response.json()).count as number);
+
+  expect(bootstrapCount).toBeGreaterThanOrEqual(1);
+  expect(usersMeCount).toBe(0);
+});
+
 test("status and rank filters operate on typed tournament data", async ({ page }) => {
   await page.goto("/tournaments");
 

@@ -188,6 +188,14 @@ worker lifecycle. Use
 `tools/platform_production_qa.py --collect-performance` and
 `tools/platform_performance_audit.py`; detailed JSON stays under shared storage.
 
+For read-path diagnosis, keep these timings separate: checkout wait is the
+time before a connection is acquired, connection hold is checkout-to-checkin,
+`db_sql_ms` is SQL execution time, and request time is the complete HTTP
+request. A high hold/request ratio means the connection lease, rather than
+PostgreSQL execution, is the next investigation target. The workspace and
+`/users/me` routes release their session after their response model has been
+materialized; any exception still follows normal dependency teardown.
+
 The reviewed production load profiles are the JSON contracts under
 `platform/performance/profiles/`. They are separated by scenario category and
 are selected by profile ID in `platform-production-external-load.yml`. This
@@ -223,6 +231,35 @@ gh workflow run platform-production-external-load.yml \
   -f profile_id=ready-vote-slo-v2
 gh run watch <load-run-id> --repo StrayForest/old_sparky --exit-status
 ```
+
+To locate the concurrency knee, select `read-mix-concurrency-ramp-v1`. It
+repeats the full 20,000-user route mix at concurrency 16, 32, 48, 64, 80, 96,
+112 and 128, then performs the conditional refresh cohort. The report's
+`phases.capacity_ramp.stages` entries are the comparison table; do not infer a
+winner from the aggregate alone. This is a stress diagnostic, so bounded
+typed authenticated-read shedding is counted separately from unexpected
+errors. Run it only in the approved window and complete exact cleanup.
+
+The SSR dependency graph has a hermetic browser contract in the platform web
+smoke suite: an authenticated tournament page must call `/auth/bootstrap` and
+must not call `/users/me` from the global layout. That test verifies ownership
+of the request graph, not production latency. A real page-load timing profile
+must be collected from the browser/production operator gate separately.
+
+The selectable runtime A/B profiles are `uvicorn-classic`,
+`uvicorn-optimized`, `pool-pre-ping-off`, `authenticated-read-admission-32`
+and `api-pool-12`, `api-pool-16`, `api-pool-20`, `api-pool-24`. Apply one
+profile at a time, repeat the same canonical read profile, and restore the
+baseline when the comparison is complete. `pool-pre-ping-off` additionally
+requires a controlled PostgreSQL restart/recovery test and an API recovery
+check; a latency improvement without clean recovery is a rejection.
+
+Before attributing a transport result to Nginx, record `nginx -v` and run
+`nginx -t`. The named `platform_api` upstream has explicit loopback keepalive;
+the web upgrade connection header remains separate. For database evidence,
+collect `pg_stat_statements` top-query calls, total/mean execution time, rows
+and buffer hits/reads, then use `EXPLAIN (ANALYZE, BUFFERS, SETTINGS, MEMORY)`
+only on a reviewed disposable or read-only query target.
 
 For the standard full read-path stress run, select `read-mix-stress-v2`.
 It provisions 40 marked tournaments with 500 users each (20,000 authenticated

@@ -329,6 +329,28 @@ class MediaDescriptorResponse(BaseModel):
     variants: list[MediaVariantResponse] = Field(default_factory=list)
 
 
+class AuthBootstrapResponse(BaseModel):
+    """Small authoritative identity snapshot for the global SSR shell.
+
+    Profile, Steam, password and monthly-quota fields intentionally stay on
+    ``/users/me``.  The identity and role values come from the current DB
+    session; only the avatar representation may come from the versioned
+    profile read model.
+    """
+
+    id: str
+    email: EmailStr | None
+    display_name: str
+    status: str
+    created_at: datetime
+    roles: list[str]
+    can_create_public_tournaments: bool = False
+    public_tournament_credits: int = 0
+    private_tournament_credits: int = 0
+    avatar_url: str | None = None
+    avatar_media: MediaDescriptorResponse | None = None
+
+
 # UserResponse is declared before media contracts so auth contracts stay
 # grouped together. Resolve that one intentional forward reference once the
 # descriptor class exists.

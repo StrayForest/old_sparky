@@ -141,6 +141,18 @@ workspace diagnostics directionally, but canonical runs `33647757275` and
 run; one `URLError` and PostgreSQL connection maximum `55` versus the `52`
 origin-safety ceiling in the repeat). It was reverted by `38c06fda` and is not
 the production runtime.
+
+The next read-path candidate slice is implemented but not yet accepted in
+production. It adds connection-hold diagnostics, a short DB lease for the
+workspace and full-user routes, the smaller `/auth/bootstrap` SSR dependency,
+column-oriented workspace snapshots, explicit Nginx upstream keepalive and
+selectable `uvloop`/`httptools`, pool-pre-ping and authenticated-read-admission
+experiments. The canonical retained baseline above remains the comparison
+point until an exact-SHA external run accepts a candidate. The new
+`read-mix-concurrency-ramp-v1` profile measures the full 20,000-user read mix
+at c16/c32/c48/c64/c80/c96/c112/c128 and reports each stage separately.
+Its production execution is operator-only and requires the existing exact
+fixture cleanup/abort procedure.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
 

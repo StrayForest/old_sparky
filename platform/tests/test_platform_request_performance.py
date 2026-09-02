@@ -108,6 +108,44 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         finally:
             performance.reset_request_metrics(token)
 
+    def test_pool_hold_records_separately_from_checkout_wait(self) -> None:
+        token = performance.start_request_metrics(
+            "GET",
+            "/api/v1/users/me",
+        )
+        try:
+            performance.record_pool_checkout_wait(0.012)
+            performance.record_pool_connection_hold(0.456)
+            metrics = performance.current_request_metrics()
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertEqual(metrics.pool_checkout_wait_seconds, 0.012)
+            self.assertEqual(metrics.pool_connection_hold_seconds, 0.456)
+            self.assertEqual(metrics.pool_connection_hold_count, 1)
+        finally:
+            performance.reset_request_metrics(token)
+
+    def test_pool_hold_fields_are_emitted_for_slow_reads(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        metrics = self.metrics(method="GET")
+        metrics.path = "/api/v1/users/me"
+        metrics.pool_checkout_wait_seconds = 0.2
+        metrics.pool_connection_hold_seconds = 0.9
+        metrics.pool_connection_hold_count = 1
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings()),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            middleware._log_if_slow(
+                {"route": SimpleNamespace(path="/users/me")},
+                metrics,
+                200,
+            )
+            rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
+        self.assertIn("pool_checkout_wait_ms=200.00", rendered)
+        self.assertIn("pool_connection_hold_ms=900.00", rendered)
+        self.assertIn("pool_connection_hold_count=1", rendered)
+
     def test_workspace_stages_are_recorded_on_the_existing_request_metrics(self) -> None:
         token = performance.start_request_metrics(
             "GET",

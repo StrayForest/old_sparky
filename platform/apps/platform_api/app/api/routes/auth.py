@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.platform_api.app.api.schemas import (
     AccountSecurityUpdateRequest,
     AuthActionAcceptedResponse,
+    AuthBootstrapResponse,
     AuthSecurityConfigResponse,
     AuthSessionResponse,
     AuthSessionListItemResponse,
@@ -37,6 +38,7 @@ from apps.platform_api.app.services.auth_mail import (
     send_password_reset_email,
 )
 from apps.platform_api.app.services.current_user import serialize_current_user
+from apps.platform_api.app.services.auth_bootstrap import build_auth_bootstrap
 from apps.platform_api.app.services.steam_openid import (
     SteamOpenIDError,
     SteamOpenIDVerificationError,
@@ -75,7 +77,7 @@ from python_packages.platform_infra.auth_rate_limit import (
 )
 from python_packages.platform_infra.config import PlatformSettings, get_settings
 from python_packages.platform_infra.csrf import issue_csrf_token
-from python_packages.platform_infra.db import get_db_session
+from python_packages.platform_infra.db import get_db_session, release_db_connection
 from python_packages.platform_infra.models import (
     PasswordCredential,
     ExternalIdentity,
@@ -111,6 +113,23 @@ from python_packages.platform_infra.turnstile import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.get("/bootstrap", response_model=AuthBootstrapResponse)
+async def get_auth_bootstrap(
+    auth_session=Depends(get_authenticated_session),
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AuthBootstrapResponse:
+    """Return the small identity snapshot used by every authenticated SSR shell."""
+
+    # A profile read-model miss owns its own short-lived DB session. Release
+    # the authoritative auth session first so a cache fill cannot pin two
+    # connections for the duration of one request.
+    try:
+        await release_db_connection(db_session)
+        return await build_auth_bootstrap(auth_session)
+    finally:
+        await release_db_connection(db_session)
 
 
 async def _deliver_password_reset_email(

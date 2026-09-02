@@ -4,7 +4,7 @@ import { cookies } from "next/headers";
 import { Hero } from "@/components/layout/hero";
 import { TournamentDetailView } from "@/components/tournaments/tournament-detail-view";
 import { getTournamentWorkspace, PlatformApiError } from "@/lib/platform-api";
-import { getServerCurrentUser, platformSessionCookieName } from "@/lib/server-auth";
+import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
 import { TournamentInviteGate } from "@/components/tournaments/tournament-invite-gate";
 
 export const metadata: Metadata = {
@@ -25,7 +25,7 @@ export default async function TournamentDetailPage({
   const cookieHeader = requestCookies.toString();
   const requestHeaders: HeadersInit = cookieHeader ? { cookie: cookieHeader } : {};
   const actorUserIdPromise = requestCookies.has(platformSessionCookieName())
-    ? getServerCurrentUser(cookieHeader).then((snapshot) => snapshot.user?.id ?? null)
+    ? getServerAuthBootstrap(cookieHeader).then((snapshot) => snapshot.user?.id ?? null)
     : Promise.resolve(null);
 
   let workspace: Awaited<ReturnType<typeof getTournamentWorkspace>>;

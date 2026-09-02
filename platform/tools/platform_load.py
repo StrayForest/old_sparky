@@ -28,6 +28,7 @@ PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]+$")
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 ALLOWED_MODES = {"ready-vote", "read-mix", "tournament-lifecycle"}
 ALLOWED_CATEGORIES = {"load", "stress", "spike", "soak", "capacity"}
+MAX_CONCURRENCY = 512
 
 
 class LoadProfileError(ValueError):
@@ -135,6 +136,33 @@ def _validate_phase_plan(value: Any, *, total_users: int) -> list[dict[str, Any]
     return phases
 
 
+def _validate_concurrency_stages(
+    value: Any,
+    *,
+    mode: str,
+) -> list[int]:
+    if value is None:
+        return []
+    if mode != "read-mix":
+        raise LoadProfileError("traffic.concurrency_stages is only valid for read-mix profiles")
+    if not isinstance(value, list) or not value:
+        raise LoadProfileError("traffic.concurrency_stages must be a non-empty array")
+    stages: list[int] = []
+    previous = 0
+    for index, raw_stage in enumerate(value):
+        stage = _require_int(
+            raw_stage,
+            field=f"traffic.concurrency_stages[{index}]",
+            minimum=1,
+            maximum=MAX_CONCURRENCY,
+        )
+        if stage <= previous:
+            raise LoadProfileError("traffic.concurrency_stages must be strictly ascending")
+        stages.append(stage)
+        previous = stage
+    return stages
+
+
 def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and return a plain profile mapping."""
 
@@ -184,7 +212,16 @@ def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise LoadProfileError("profile fixture exceeds its declared user limit")
 
     traffic = _require_mapping(payload.get("traffic"), field="traffic")
-    _require_int(traffic.get("concurrency"), field="traffic.concurrency", minimum=1, maximum=512)
+    _require_int(
+        traffic.get("concurrency"),
+        field="traffic.concurrency",
+        minimum=1,
+        maximum=MAX_CONCURRENCY,
+    )
+    _validate_concurrency_stages(
+        traffic.get("concurrency_stages"),
+        mode=str(mode),
+    )
     _require_number(
         traffic.get("spread_seconds"),
         field="traffic.spread_seconds",
@@ -441,6 +478,7 @@ def profile_contract(profile: Mapping[str, Any]) -> dict[str, Any]:
         },
         "traffic": {
             "concurrency": traffic["concurrency"],
+            "concurrency_stages": traffic.get("concurrency_stages") or [],
             "spread_seconds": traffic["spread_seconds"],
             "timeout_seconds": traffic["timeout_seconds"],
             "duplicate_count": traffic["duplicate_count"],
@@ -539,6 +577,7 @@ def run_profile(profile: Mapping[str, Any], manifest_path: Path, report_path: Pa
         ),
         retry_policy=traffic["retry"],
         phase_plan=traffic.get("phases") or None,
+        concurrency_stages=traffic.get("concurrency_stages") or None,
         scenario_kind=str(acceptance.get("kind") or "slo"),
         acceptance_contract=acceptance,
     )

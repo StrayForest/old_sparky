@@ -18,6 +18,7 @@ const workspaceRequests: Array<{
 }> = [];
 const participantRequests: string[] = [];
 let usersMeRequests = 0;
+let authBootstrapRequests = 0;
 let csrfRequests = 0;
 let readyVoteRequests = 0;
 let forcedReadyVoteOverloads = 0;
@@ -34,6 +35,14 @@ test.beforeAll(async () => {
     const url = new URL(request.url ?? "/", `http://${apiHost}:${apiPort}`);
     apiRequests.push(`${request.method ?? "GET"} ${url.pathname}${url.search}`);
     const hasTestCookie = request.headers.cookie?.includes("lean-detail-smoke=1") ?? false;
+
+    if (url.pathname === "/api/v1/auth/bootstrap") {
+      authBootstrapRequests += 1;
+      respondJson(response, hasTestCookie ? 200 : 404, hasTestCookie ? platformAuthBootstrap() : {
+        detail: "Not found."
+      });
+      return;
+    }
 
     if (url.pathname === "/api/v1/users/me") {
       usersMeRequests += 1;
@@ -129,6 +138,7 @@ test.beforeEach(() => {
   workspaceRequests.length = 0;
   participantRequests.length = 0;
   usersMeRequests = 0;
+  authBootstrapRequests = 0;
   csrfRequests = 0;
   readyVoteRequests = 0;
   forcedReadyVoteOverloads = 0;
@@ -206,7 +216,7 @@ test("registered detail uses compact workspace state and ready vote avoids full 
   ]);
   await expect(page.getByRole("button", { name: "Отменить регистрацию" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Подтвердить участие" })).toBeEnabled();
-  await expect.poll(() => usersMeRequests).toBe(1);
+  await expect.poll(() => authBootstrapRequests).toBe(1);
 
   const workspaceRequestCountBeforeVote = workspaceRequests.length;
   await page.getByRole("button", { name: "Подтвердить участие" }).click();
@@ -215,7 +225,7 @@ test("registered detail uses compact workspace state and ready vote avoids full 
   await expect.poll(() => readyVoteRequests).toBe(1);
   expect(workspaceRequests).toHaveLength(workspaceRequestCountBeforeVote);
   await expect.poll(() => participantRequests).toEqual([]);
-  await expect.poll(() => usersMeRequests).toBe(1);
+  await expect.poll(() => usersMeRequests).toBe(0);
   await expect.poll(() => csrfRequests).toBe(1);
   await expectNoHorizontalOverflow(page);
 });
@@ -272,7 +282,7 @@ test("bracket page uses the initial workspace and has no background refresh", as
     workspaceView: "bracket",
     includeCurrentUser: false
   }]);
-  await expect.poll(() => usersMeRequests).toBe(1);
+  await expect.poll(() => authBootstrapRequests).toBe(1);
   expect(bracketRequests).toBe(0);
   expect(participantRequests).toEqual([]);
   await expect.poll(() => csrfRequests).toBe(0);
@@ -374,6 +384,16 @@ function platformUser() {
     created_at: "2026-05-01T12:00:00Z",
     roles: ["authenticated_user", "player"],
     can_create_public_tournaments: true
+  };
+}
+
+function platformAuthBootstrap() {
+  return {
+    ...platformUser(),
+    public_tournament_credits: 2,
+    private_tournament_credits: 1,
+    avatar_url: null,
+    avatar_media: null
   };
 }
 

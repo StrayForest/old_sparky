@@ -436,6 +436,70 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(refresh_call["expected_statuses"], frozenset({200, 304}))
         self.assertEqual(refresh_call["extra_headers"], {"If-None-Match": '"workspace-etag"'})
 
+    def test_read_mix_concurrency_ramp_reports_each_full_population_stage(self) -> None:
+        payload = manifest_payload()
+        _, users = load_manifest_from_payload(payload)
+        calls: list[str] = []
+
+        def fake_trace(origin: str, timeout: float) -> dict[str, str]:
+            return {"status": "200", "ip": "192.0.2.10", "colo": "TEST"}
+
+        def fake_request(
+            origin: str,
+            user: VirtualUser,
+            *,
+            method: str,
+            path: str,
+            phase: str,
+            timeout: float,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+            json_payload: dict[str, object] | None = None,
+            expected_statuses: frozenset[int] = frozenset({200}),
+            extra_headers: dict[str, str] | None = None,
+        ) -> RequestResult:
+            calls.append(phase)
+            return RequestResult(
+                phase=phase,
+                method=method,
+                path=path,
+                status=200,
+                elapsed_ms=10.0,
+                ok=True,
+                response_bytes=150,
+                response_etag='"workspace-etag"' if user.user_id == "user-00000001" else None,
+            )
+
+        with (
+            patch("tools.platform_external_load._trace", side_effect=fake_trace),
+            patch("tools.platform_external_load._request", side_effect=fake_request),
+        ):
+            report = run_load(
+                payload,
+                users,
+                mode="read-mix",
+                spread_seconds=0,
+                concurrency=2,
+                timeout=1,
+                duplicate_count=0,
+                manual_refresh_count=0,
+                p95_budget_ms=1000,
+                p99_budget_ms=2000,
+                concurrency_stages=[1, 2],
+            )
+
+        self.assertTrue(report["acceptance"]["passed"])
+        self.assertEqual(report["phases"]["read_mix"]["requests"], 4)
+        self.assertEqual(
+            report["phases"]["capacity_ramp"]["concurrency_stages"],
+            [1, 2],
+        )
+        self.assertEqual(
+            [report["phases"]["capacity_ramp"]["stages"][str(stage)]["requests"] for stage in (1, 2)],
+            [2, 2],
+        )
+        self.assertTrue(all(phase.startswith("scale_external_read_mix_c") for phase in calls))
+
     def test_ready_vote_rate_plan_reports_offered_rate_per_phase(self) -> None:
         payload = manifest_payload()
         _, users = load_manifest_from_payload(payload)

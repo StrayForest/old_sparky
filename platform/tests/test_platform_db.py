@@ -23,6 +23,7 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
             platform_db_max_overflow=1,
             platform_db_pool_timeout_seconds=5,
             platform_db_pool_recycle_seconds=1800,
+            platform_db_pool_pre_ping=True,
             platform_worker_concurrency=2,
             platform_worker_db_pool_size=2,
             platform_worker_db_max_overflow=0,

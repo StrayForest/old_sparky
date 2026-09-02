@@ -18,6 +18,21 @@ export type PlatformUser = {
   can_unlink_steam?: boolean;
 };
 
+export type PlatformAuthBootstrap = Pick<
+  PlatformUser,
+  | "id"
+  | "email"
+  | "display_name"
+  | "status"
+  | "created_at"
+  | "roles"
+  | "can_create_public_tournaments"
+  | "public_tournament_credits"
+  | "private_tournament_credits"
+  | "avatar_url"
+  | "avatar_media"
+>;
+
 export type PlatformAuthSessionResponse = {
   user: PlatformUser;
   expires_at: string;

@@ -8,7 +8,7 @@ import { SiteFooter } from "@/components/layout/site-footer";
 import { SiteHeader } from "@/components/layout/site-header";
 import { CspNonceProvider } from "@/components/security/csp-nonce-provider";
 import { CspRouteAnnouncer } from "@/components/security/csp-route-announcer";
-import { getServerCurrentUser, platformSessionCookieName } from "@/lib/server-auth";
+import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
 import "./globals.css";
 import "./theme-modern.css";
 import "@/components/profile/account-identities.css";
@@ -32,7 +32,7 @@ export default async function RootLayout({
   const nonce = requestHeaders.get("x-nonce");
   const cookieHeader = requestCookies.toString();
   const initialAuth = requestCookies.has(platformSessionCookieName())
-    ? await getServerCurrentUser(cookieHeader)
+    ? await getServerAuthBootstrap(cookieHeader)
     : { status: "anonymous" as const, user: null };
 
   return (

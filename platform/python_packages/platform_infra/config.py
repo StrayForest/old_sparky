@@ -197,6 +197,16 @@ class PlatformSettings(BaseSettings):
     # and CPU precisely during the bursts we need to measure.
     platform_perf_log_mutations: bool = False
     platform_api_workers: int = Field(default=2, gt=0)
+    platform_authenticated_read_admission_enabled: bool = False
+    platform_authenticated_read_admission_concurrency: int = Field(
+        default=32, ge=1, le=128
+    )
+    platform_authenticated_read_admission_max_waiters: int = Field(
+        default=0, ge=0, le=128
+    )
+    platform_authenticated_read_admission_wait_timeout_ms: float = Field(
+        default=0.0, ge=0, le=250
+    )
     # Ready Vote admission is process-local: each API worker has its own
     # bounded controller, so these limits are per worker rather than global.
     # The default 0 ms waiter budget sheds before an asyncio queue can grow;
@@ -232,6 +242,7 @@ class PlatformSettings(BaseSettings):
     platform_db_max_overflow: int = Field(default=0, ge=0)
     platform_db_pool_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     platform_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
+    platform_db_pool_pre_ping: bool = True
     platform_redis_max_connections: int = Field(default=64, gt=0, le=512)
     platform_worker_db_pool_size: int = Field(default=2, gt=0)
     platform_worker_db_max_overflow: int = Field(default=0, ge=0)

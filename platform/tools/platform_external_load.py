@@ -429,7 +429,7 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         by_route[route].append(result.elapsed_ms)
         latencies.append(result.elapsed_ms)
         retry_attempts += int(result.attempt_number > 1)
-        if _ready_vote_overload(result):
+        if _ready_vote_overload(result) or _authenticated_read_overload(result):
             temporary_overloads += 1
         if not result.ok:
             errors += 1
@@ -512,6 +512,15 @@ def _ready_vote_overload(result: RequestResult) -> bool:
         and isinstance(payload, dict)
         and payload.get("code") == "READY_VOTE_OVERLOADED"
         and payload.get("retryable") is True
+    )
+
+
+def _authenticated_read_overload(result: RequestResult) -> bool:
+    payload = result.response_json
+    return bool(
+        result.status == 503
+        and isinstance(payload, dict)
+        and payload.get("code") == "AUTHENTICATED_READ_OVERLOADED"
     )
 
 
@@ -630,6 +639,7 @@ def run_load(
     failure_budget_percent: float | None = None,
     retry_policy: dict[str, Any] | None = None,
     phase_plan: list[dict[str, Any]] | None = None,
+    concurrency_stages: list[int] | tuple[int, ...] | None = None,
     scenario_kind: str = "slo",
     acceptance_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -640,6 +650,19 @@ def run_load(
     workspace_users = sum(index % 10 < 5 for index in range(len(users)))
     if manual_refresh_count > workspace_users:
         raise ExternalLoadError("manual_refresh_count exceeds the workspace read cohort")
+    if concurrency_stages is not None:
+        if mode != "read-mix":
+            raise ExternalLoadError("concurrency_stages is only valid for read-mix")
+        if not concurrency_stages:
+            raise ExternalLoadError("concurrency_stages must not be empty")
+        previous_stage = 0
+        for stage in concurrency_stages:
+            if isinstance(stage, bool) or not isinstance(stage, int):
+                raise ExternalLoadError("concurrency_stages must contain integers")
+            if not 1 <= stage <= MAX_CONCURRENCY or stage <= previous_stage:
+                raise ExternalLoadError("concurrency_stages must be strictly ascending within bounds")
+            previous_stage = stage
+    read_concurrency_stages = tuple(concurrency_stages or (concurrency,))
     origin = str(manifest["origin"]).rstrip("/")
     session_cookie_name = str(manifest["session_cookie_name"])
     csrf_cookie_name = str(manifest["csrf_cookie_name"])
@@ -888,16 +911,26 @@ def run_load(
                 initial_workspace_etags[user.user_id] = result.response_etag
             return result
 
-        read_results = run_phase(
-            origin,
-            users,
-            phase="scale_external_read_mix",
-            spread_seconds=spread_seconds,
-            concurrency=concurrency,
-            timeout=timeout,
-            request_builder=read_builder,
-        )
+        read_results: list[RequestResult] = []
+        ramp_stages: dict[str, dict[str, Any]] = {}
+        for stage_concurrency in read_concurrency_stages:
+            stage_results = run_phase(
+                origin,
+                users,
+                phase=f"scale_external_read_mix_c{stage_concurrency}",
+                spread_seconds=spread_seconds,
+                concurrency=stage_concurrency,
+                timeout=timeout,
+                request_builder=read_builder,
+            )
+            read_results.extend(stage_results)
+            ramp_stages[str(stage_concurrency)] = summarize_results(stage_results)
         phase_results["read_mix"] = summarize_results(read_results)
+        if concurrency_stages is not None:
+            phase_results["capacity_ramp"] = {
+                "concurrency_stages": list(read_concurrency_stages),
+                "stages": ramp_stages,
+            }
         all_results.extend(read_results)
         refresh_users = [
             user
@@ -949,9 +982,18 @@ def run_load(
             )
             phase_results["manual_refresh"] = summarize_results(refresh_results)
             all_results.extend(refresh_results)
+        read_mix_summary = phase_results["read_mix"]
+        strict_read_contract = scenario_kind not in {"stress", "spike"}
+        expected_read_requests = len(users) * len(read_concurrency_stages)
+        read_errors_ok = (
+            read_mix_summary["errors"] == 0
+            if strict_read_contract
+            else read_mix_summary["errors"] == read_mix_summary["temporary_overload_responses"]
+        )
         contract_ok = (
-            phase_results["read_mix"]["requests"] == len(users)
-            and phase_results["read_mix"]["errors"] == 0
+            read_mix_summary["requests"] == expected_read_requests
+            and read_errors_ok
+            and read_mix_summary["unexpected_statuses"] == 0
             and len(initial_workspace_etags) >= manual_refresh_count
             and (
                 not manual_refresh_count
@@ -1011,6 +1053,11 @@ def run_load(
         "scenario_kind": scenario_kind,
         "manual_refresh_count": manual_refresh_count,
         "concurrency": concurrency,
+        "concurrency_stages": (
+            list(read_concurrency_stages)
+            if mode == "read-mix" and concurrency_stages is not None
+            else None
+        ),
         "offered_logical_actions_per_second": round(
             float(logical_summary.get("offered_logical_actions_per_second") or 0)
             if phase_plan

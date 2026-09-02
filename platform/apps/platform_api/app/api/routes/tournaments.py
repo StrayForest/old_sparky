@@ -254,6 +254,7 @@ from python_packages.platform_infra.db import (
     get_db_session,
     get_lazy_db_session,
     ready_vote_db_session,
+    release_db_connection,
     session_factory,
 )
 from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
@@ -570,6 +571,74 @@ class PublicWorkspaceSnapshotCacheEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceTournamentSnapshot:
+    """Column-only tournament read model for the authenticated workspace path."""
+
+    id: str
+    slug: str
+    name: str
+    description: str | None
+    cover_url: str | None
+    banner_asset_id: str | None
+    visibility: str
+    status: str
+    format_slug: str
+    allowed_ranks: list[str]
+    max_participants: int | None
+    registration_starts_at: datetime | None
+    registration_closes_at: datetime | None
+    ready_check_starts_at: datetime | None
+    ready_check_ends_at: datetime | None
+    captain_selection_starts_at: datetime | None
+    starts_at: datetime | None
+    match_format: str
+    final_format: str
+    bracket_revision: int
+    captain_response_deadline_minutes: int | None
+    teams_count: int | None
+    automation_ready_check_started_at: datetime | None
+    automation_ready_check_closed_at: datetime | None
+    automation_captain_round_started_at: datetime | None
+    automation_captain_round_finalized_at: datetime | None
+    automation_assignment_generated_at: datetime | None
+    automation_last_error: str | None
+    automation_failure_count: int
+    automation_retry_after: datetime | None
+    organizer_user_id: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceParticipantSnapshot:
+    id: str
+    tournament_id: str
+    user_id: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceCommitmentSnapshot:
+    id: str
+    tournament_id: str
+    assignment_run_id: str
+    team_id: str
+    team_name: str
+    activated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceReadyRoundSnapshot:
+    id: int
+    tournament_id: str
+    status: str
+    eligible_user_ids: list[str]
+    initiated_by_user_id: str | None
+    created_at: datetime
+    closed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceConditionalPreflight:
     """One-query authorization and revision snapshot for participant 304s."""
 
@@ -586,7 +655,7 @@ class WorkspaceConditionalPreflight:
 class WorkspaceReadyCheckPreflight:
     """Ready Check common state plus the requesting user's overlay."""
 
-    round: TournamentDeadlockReadyRound | None
+    round: WorkspaceReadyRoundSnapshot | None
     ready_count: int
     declined_count: int
     current_user_choice: str | None
@@ -596,12 +665,12 @@ class WorkspaceReadyCheckPreflight:
 class WorkspaceBasePreflight:
     """One-query tournament, viewer access and Ready Check snapshot."""
 
-    tournament: Tournament
+    tournament: WorkspaceTournamentSnapshot
     organizer_display_name: str
     organizer_avatar_asset_id: str | None
     participant_count: int
     locked_roster_count: int
-    participant_record: TournamentParticipant | None
+    participant_record: WorkspaceParticipantSnapshot | None
     active_commitment: PlayerTournamentCommitmentResponse | None
     ready_check: WorkspaceReadyCheckPreflight
 
@@ -975,7 +1044,12 @@ _WORKSPACE_BASE_SLUG = bindparam(
 
 
 def _build_workspace_base_preflight_stmt() -> Select:
-    """Combine workspace base, viewer access and Ready Check reads."""
+    """Combine workspace reads without constructing ORM entities.
+
+    The query shape and authorization inputs intentionally stay unchanged.
+    Selecting labeled columns lets the hot path materialize only primitive
+    snapshots, avoiding ORM identity-map and instrumentation work per read.
+    """
 
     commitment_tournament = aliased(Tournament)
     ready_round = aliased(TournamentDeadlockReadyRound)
@@ -1022,18 +1096,55 @@ def _build_workspace_base_preflight_stmt() -> Select:
         .correlate(ready_round)
         .scalar_subquery()
     )
+    tournament_columns = tuple(
+        column.label(f"workspace_tournament_{column.name}")
+        for column in Tournament.__table__.columns
+    )
     return (
-        tournament_with_counts_stmt()
-        .add_columns(
-            TournamentParticipant,
-            PlayerTournamentCommitment,
+        select(
+            *tournament_columns,
+            User.display_name.label("organizer_display_name"),
+            PlayerProfile.avatar_asset_id.label("organizer_avatar_asset_id"),
+            select(func.count(TournamentParticipant.id))
+            .where(
+                TournamentParticipant.tournament_id == Tournament.id,
+                TournamentParticipant.status.not_in(INACTIVE_PARTICIPANT_STATUSES),
+            )
+            .correlate(Tournament)
+            .scalar_subquery()
+            .label("participant_count"),
+            select(func.count(TournamentDeadlockAssignmentRun.id))
+            .where(
+                TournamentDeadlockAssignmentRun.tournament_id == Tournament.id,
+                TournamentDeadlockAssignmentRun.status == "locked",
+            )
+            .correlate(Tournament)
+            .scalar_subquery()
+            .label("locked_roster_count"),
+            TournamentParticipant.id.label("workspace_participant_id"),
+            TournamentParticipant.tournament_id.label("workspace_participant_tournament_id"),
+            TournamentParticipant.user_id.label("workspace_participant_user_id"),
+            TournamentParticipant.status.label("workspace_participant_status"),
+            PlayerTournamentCommitment.id.label("workspace_commitment_id"),
+            PlayerTournamentCommitment.tournament_id.label("workspace_commitment_tournament_id"),
+            PlayerTournamentCommitment.assignment_run_id.label("workspace_commitment_assignment_run_id"),
+            PlayerTournamentCommitment.team_id.label("workspace_commitment_team_id"),
+            PlayerTournamentCommitment.team_name.label("workspace_commitment_team_name"),
+            PlayerTournamentCommitment.activated_at.label("workspace_commitment_activated_at"),
             commitment_tournament.slug.label("commitment_tournament_slug"),
             commitment_tournament.name.label("commitment_tournament_name"),
-            ready_round,
+            ready_round.id.label("workspace_ready_round_id"),
+            ready_round.tournament_id.label("workspace_ready_round_tournament_id"),
+            ready_round.status.label("workspace_ready_round_status"),
+            ready_round.eligible_user_ids.label("workspace_ready_round_eligible_user_ids"),
+            ready_round.initiated_by_user_id.label("workspace_ready_round_initiated_by_user_id"),
+            ready_round.created_at.label("workspace_ready_round_created_at"),
+            ready_round.closed_at.label("workspace_ready_round_closed_at"),
             ready_count.label("ready_count"),
             declined_count.label("declined_count"),
             current_user_choice.label("current_user_choice"),
         )
+        .select_from(Tournament)
         .outerjoin(
             TournamentParticipant,
             and_(
@@ -1100,26 +1211,75 @@ async def workspace_base_preflight(
                 "workspace_base_slug": slug,
             },
         )
-    ).first()
+    ).mappings().first()
     if row is None:
         return None
+    tournament = WorkspaceTournamentSnapshot(
+        **{
+            column.name: (
+                list(row[f"workspace_tournament_{column.name}"] or [])
+                if column.name == "allowed_ranks"
+                else row[f"workspace_tournament_{column.name}"]
+            )
+            for column in Tournament.__table__.columns
+        }
+    )
+    participant = (
+        WorkspaceParticipantSnapshot(
+            id=str(row["workspace_participant_id"]),
+            tournament_id=str(row["workspace_participant_tournament_id"]),
+            user_id=str(row["workspace_participant_user_id"]),
+            status=str(row["workspace_participant_status"]),
+        )
+        if row["workspace_participant_id"] is not None
+        else None
+    )
+    commitment = (
+        WorkspaceCommitmentSnapshot(
+            id=str(row["workspace_commitment_id"]),
+            tournament_id=str(row["workspace_commitment_tournament_id"]),
+            assignment_run_id=str(row["workspace_commitment_assignment_run_id"]),
+            team_id=str(row["workspace_commitment_team_id"]),
+            team_name=str(row["workspace_commitment_team_name"]),
+            activated_at=row["workspace_commitment_activated_at"],
+        )
+        if row["workspace_commitment_id"] is not None
+        else None
+    )
+    ready_round = (
+        WorkspaceReadyRoundSnapshot(
+            id=int(row["workspace_ready_round_id"]),
+            tournament_id=str(row["workspace_ready_round_tournament_id"]),
+            status=str(row["workspace_ready_round_status"]),
+            eligible_user_ids=list(
+                row["workspace_ready_round_eligible_user_ids"] or []
+            ),
+            initiated_by_user_id=row[
+                "workspace_ready_round_initiated_by_user_id"
+            ],
+            created_at=row["workspace_ready_round_created_at"],
+            closed_at=row["workspace_ready_round_closed_at"],
+        )
+        if row["workspace_ready_round_id"] is not None
+        else None
+    )
     return WorkspaceBasePreflight(
-        tournament=row[0],
-        organizer_display_name=str(row[1]),
-        organizer_avatar_asset_id=row[2],
-        participant_count=int(row[3] or 0),
-        locked_roster_count=int(row[4] or 0),
-        participant_record=row[5],
+        tournament=tournament,
+        organizer_display_name=str(row["organizer_display_name"]),
+        organizer_avatar_asset_id=row["organizer_avatar_asset_id"],
+        participant_count=int(row["participant_count"] or 0),
+        locked_roster_count=int(row["locked_roster_count"] or 0),
+        participant_record=participant,
         active_commitment=_active_commitment_response(
-            row[6],
-            tournament_slug=row[7],
-            tournament_name=row[8],
+            commitment,
+            tournament_slug=row["commitment_tournament_slug"],
+            tournament_name=row["commitment_tournament_name"],
         ),
         ready_check=WorkspaceReadyCheckPreflight(
-            round=row[9],
-            ready_count=int(row[10] or 0),
-            declined_count=int(row[11] or 0),
-            current_user_choice=row[12],
+            round=ready_round,
+            ready_count=int(row["ready_count"] or 0),
+            declined_count=int(row["declined_count"] or 0),
+            current_user_choice=row["current_user_choice"],
         ),
     )
 
@@ -7089,6 +7249,7 @@ async def get_tournament_workspace(
                 )
                 not_modified = _conditional_response(request, response, etag=etag)
             if not_modified is not None:
+                await release_db_connection(db_session)
                 return not_modified
 
     if public_snapshot_candidate:
@@ -7147,12 +7308,15 @@ async def get_tournament_workspace(
                             )
                             not_modified = _conditional_response(request, response, etag=etag)
                         if not_modified is not None:
+                            await release_db_connection(db_session)
                             return not_modified
                         with measure_workspace_stage("workspace_serialization"):
-                            return _serialized_model_response(
+                            serialized_response = _serialized_model_response(
                                 workspace_response,
                                 etag=etag,
                             )
+                        await release_db_connection(db_session)
+                        return serialized_response
 
     workspace_base_snapshot: WorkspaceBasePreflight | None = None
     if workspace_base_preflight_candidate:
@@ -7317,9 +7481,12 @@ async def get_tournament_workspace(
             )
             not_modified = _conditional_response(request, response, etag=etag)
         if not_modified is not None:
+            await release_db_connection(db_session)
             return not_modified
         with measure_workspace_stage("workspace_serialization"):
-            return _serialized_model_response(workspace_response, etag=etag)
+            serialized_response = _serialized_model_response(workspace_response, etag=etag)
+        await release_db_connection(db_session)
+        return serialized_response
 
     if participants_limit > 0:
         with measure_workspace_stage("workspace_tournament_base"):
@@ -7460,9 +7627,12 @@ async def get_tournament_workspace(
         )
         not_modified = _conditional_response(request, response, etag=etag)
     if not_modified is not None:
+        await release_db_connection(db_session)
         return not_modified
     with measure_workspace_stage("workspace_serialization"):
-        return _serialized_model_response(workspace_response, etag=etag)
+        serialized_response = _serialized_model_response(workspace_response, etag=etag)
+    await release_db_connection(db_session)
+    return serialized_response
 
 
 @router.get("/{slug}", response_model=TournamentResponse)

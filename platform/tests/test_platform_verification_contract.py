@@ -67,6 +67,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 "ready-vote-spike-v1",
                 "read-mix-human-v2",
                 "read-mix-stress-v2",
+                "read-mix-concurrency-ramp-v1",
                 "tournament-lifecycle-capacity-v1",
                 "tournament-lifecycle-scale-v1",
                 "tournament-lifecycle-slo-v1",
@@ -112,6 +113,11 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertEqual(
             [phase["target_logical_actions_per_second"] for phase in saturation_v4["traffic"]["phases"]],
             [120, 125, 130, 135],
+        )
+        read_ramp = get_profile("read-mix-concurrency-ramp-v1")
+        self.assertEqual(
+            read_ramp["traffic"]["concurrency_stages"],
+            [16, 32, 48, 64, 80, 96, 112, 128],
         )
 
     def test_tournament_lifecycle_profiles_use_the_local_qa_harness(self) -> None:

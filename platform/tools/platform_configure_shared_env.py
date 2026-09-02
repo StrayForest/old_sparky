@@ -24,6 +24,8 @@ PUBLIC_BASELINE = {
     "PLATFORM_API_HOST": "127.0.0.1",
     "PLATFORM_API_PORT": "8010",
     "PLATFORM_API_WORKERS": "2",
+    "PLATFORM_UVICORN_LOOP": "auto",
+    "PLATFORM_UVICORN_HTTP": "auto",
     "PLATFORM_READY_VOTE_ADMISSION_ENABLED": "true",
     "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY": "4",
     "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY": "8",
@@ -38,6 +40,11 @@ PUBLIC_BASELINE = {
     "PLATFORM_DB_MAX_OVERFLOW": "0",
     "PLATFORM_DB_POOL_TIMEOUT_SECONDS": "10",
     "PLATFORM_DB_POOL_RECYCLE_SECONDS": "1800",
+    "PLATFORM_DB_POOL_PRE_PING": "true",
+    "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED": "false",
+    "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "32",
+    "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "0",
+    "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "0",
     "PLATFORM_WORKER_DB_POOL_SIZE": "2",
     "PLATFORM_WORKER_DB_MAX_OVERFLOW": "0",
     "PLATFORM_WORKER_DB_POOL_TIMEOUT_SECONDS": "5",
@@ -167,6 +174,37 @@ RUNTIME_PROFILES = {
         "PLATFORM_READY_VOTE_ADMISSION_CPU_EWMA_ALPHA": "0.25",
         "PLATFORM_READY_VOTE_ADMISSION_RECOVERY_SAMPLES": "16",
         "PLATFORM_READY_VOTE_ADMISSION_CONTROL_INTERVAL_SECONDS": "0.5",
+    },
+    "read-mix-cprofile": {
+        "PLATFORM_READY_VOTE_CPU_PROFILE_DIR": "/run/oldsparky-ready-vote-cprofile",
+        "PLATFORM_PERF_SLOW_REQUEST_MS": "0",
+        "PLATFORM_PERF_LOG_MUTATIONS": "true",
+    },
+    "authenticated-read-admission-32": {
+        "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED": "true",
+        "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "32",
+        "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "0",
+        "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "0",
+    },
+    "pool-pre-ping-off": {
+        "PLATFORM_DB_POOL_PRE_PING": "false",
+    },
+    "uvicorn-classic": {
+        "PLATFORM_UVICORN_LOOP": "asyncio",
+        "PLATFORM_UVICORN_HTTP": "h11",
+    },
+    "uvicorn-optimized": {
+        "PLATFORM_UVICORN_LOOP": "auto",
+        "PLATFORM_UVICORN_HTTP": "auto",
+    },
+    **{
+        f"api-pool-{pool_size}": {
+            "PLATFORM_API_WORKERS": "2",
+            "PLATFORM_DB_POOL_SIZE": str(pool_size),
+            "PLATFORM_DB_MAX_OVERFLOW": "0",
+            "PLATFORM_DB_CONNECTION_BUDGET": "52",
+        }
+        for pool_size in (12, 16, 20, 24)
     },
     # Keep the total API pool budget unchanged while giving a third API
     # worker a smaller private pool. This is an operator-controlled capacity

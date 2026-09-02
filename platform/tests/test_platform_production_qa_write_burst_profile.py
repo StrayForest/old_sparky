@@ -160,7 +160,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             [
                 "request_perf request_id=one method=POST path=/api/v1/tournaments/demo/join "
                 "route=/api/v1/tournaments/{slug}/join status=201 total_ms=25.00 "
-                "sql_ms=8.00 sql_count=3 max_sql_ms=5.00 compute_ms=0.00 "
+                "request_ms=25.00 db_sql_ms=8.00 sql_ms=8.00 sql_count=3 max_sql_ms=5.00 compute_ms=0.00 "
                 "compute_blocks=0 response_bytes=320"
                 " qa_phase=write_join_burst_10s"
             ],
@@ -260,6 +260,25 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
         self.assertEqual(workspace["pool_checkout_wait_ms"]["p99_ms"], 19.92)
         self.assertEqual(workspace["workspace"]["workspace_auth_ms"]["avg_ms"], 3.5)
         self.assertEqual(workspace["workspace"]["workspace_bracket_ms"]["p95_ms"], 10.95)
+
+    def test_request_perf_summary_exposes_connection_hold_and_read_admission(self) -> None:
+        summary = summarize_request_perf_logs(
+            [
+                "request_perf request_id=one method=GET path=/api/v1/users/me "
+                "route=/users/me status=200 total_ms=900.00 request_ms=900.00 "
+                "sql_ms=229.00 db_sql_ms=229.00 sql_count=5 max_sql_ms=100.00 "
+                "compute_ms=10.00 compute_blocks=1 response_bytes=420 "
+                "pool_checkout_wait_ms=100.00 pool_connection_hold_ms=900.00 "
+                "pool_connection_hold_count=1 authenticated_read_admission_wait_ms=2.00 "
+                "qa_phase=scale_external_read_mix_c64 pool_wait_ms=100.00"
+            ],
+            tournament_slug=None,
+        )
+
+        route = summary["by_route"]["/users/me"]
+        self.assertEqual(summary["pool_connection_hold_ms"]["avg_ms"], 900.0)
+        self.assertEqual(route["pool_connection_hold_ms"]["avg_ms"], 900.0)
+        self.assertEqual(summary["authenticated_read_admission_wait_ms"]["avg_ms"], 2.0)
 
     def test_write_burst_acceptance_separates_target_budget(self) -> None:
         acceptance = evaluate_write_burst_profiles(

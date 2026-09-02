@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-02
 
 ## Invariants
 
@@ -87,6 +87,39 @@ optional-authenticated reads validate the session in their request transaction
 but do not perform a second
 `last_seen_at` write transaction; that metadata is not an authorization
 decision and must not double the connection demand of a read burst.
+
+The authenticated SSR bootstrap path is intentionally smaller than the full
+`/users/me` account snapshot. `GET /api/v1/auth/bootstrap` returns the
+identity, status, roles, credits and avatar fields needed by the global layout;
+profile, Steam, password, quota and other account details remain owned by
+`/api/v1/users/me`. PostgreSQL/authentication remains authoritative. The
+bootstrap service may reuse the versioned profile read model for media fields,
+with a database fallback on a cache miss; it does not cache authorization or
+account-security decisions. The web server uses this endpoint for the global
+layout and requests the full user snapshot only from account-owner surfaces.
+
+Hot authenticated reads are instrumented with separate
+`pool_checkout_wait_ms`, `pool_connection_hold_ms`, `db_sql_ms` and request
+duration signals. The workspace preflight materializes a frozen primitive
+snapshot from a column-oriented query rather than hydrating ORM entities. A
+route may release the SQLAlchemy session immediately after materializing its
+response model, before Redis, ETag and response serialization work; dependency
+teardown remains idempotent. These are runtime changes under review, not a
+claim that the retained production baseline has already changed.
+
+The bounded authenticated-read admission controller is process-local and
+disabled in the baseline. When explicitly enabled for an A/B, it admits only
+the configured number of cookie-bearing GET/HEAD API reads before database
+checkout and returns a typed `503` when the no-waiter budget is exhausted. It
+is not a security or authorization decision and is not a substitute for the
+database pool. `pool_pre_ping=false`, alternate pool sizes, and optimized
+Uvicorn loop/HTTP implementations are separately selectable experiments; the
+baseline keeps pre-ping enabled and leaves the runtime selectors at `auto`.
+
+Nginx routes API traffic through a named loopback upstream with explicit
+keepalive and HTTP/1.1 connection reuse. This is a transport-efficiency
+candidate only; it does not change API concurrency, request authorization or
+database ownership.
 
 ## Component ownership
 

@@ -49,6 +49,12 @@ class RequestPerformanceMetrics:
     compute_time_seconds: float = 0.0
     response_bytes: int = 0
     pool_checkout_wait_seconds: float = 0.0
+    pool_connection_hold_seconds: float = 0.0
+    pool_connection_hold_count: int = 0
+    authenticated_read_admission_wait_seconds: float = 0.0
+    authenticated_read_admission_limit: int = 0
+    authenticated_read_admission_inflight: int = 0
+    authenticated_read_admission_shed: bool = False
     redis_read_model_events: list[dict[str, Any]] = field(default_factory=list)
     profile_read_model_events: list[dict[str, Any]] = field(default_factory=list)
     tournament_profile_access_events: list[dict[str, Any]] = field(default_factory=list)
@@ -121,6 +127,28 @@ def install_sqlalchemy_query_metrics(sync_engine: Any) -> None:
         metrics.sql_query_count += 1
         metrics.sql_time_seconds += elapsed
         metrics.max_sql_time_seconds = max(metrics.max_sql_time_seconds, elapsed)
+
+    # Pool events run on the synchronous engine behind SQLAlchemy's async
+    # engine.  Store the timestamp on ConnectionRecord rather than on the
+    # driver connection: asyncpg connections do not guarantee arbitrary
+    # attributes and the record survives the checkout/checkin pair.
+    @event.listens_for(sync_engine.pool, "checkout")
+    def pool_checkout(
+        _dbapi_connection: Any,
+        connection_record: Any,
+        _connection_proxy: Any,
+    ) -> None:
+        connection_record.info["platform_checked_out_at"] = perf_counter()
+
+    @event.listens_for(sync_engine.pool, "checkin")
+    def pool_checkin(
+        _dbapi_connection: Any,
+        connection_record: Any,
+    ) -> None:
+        started_at = connection_record.info.pop("platform_checked_out_at", None)
+        if started_at is None:
+            return
+        record_pool_connection_hold(perf_counter() - started_at)
 
 
 def qa_phase_from_scope(scope: dict[str, Any]) -> str | None:
@@ -207,6 +235,34 @@ def record_pool_checkout_wait(elapsed_seconds: float) -> None:
     metrics = _current_metrics.get()
     if metrics is not None:
         metrics.pool_checkout_wait_seconds += max(0.0, elapsed_seconds)
+
+
+def record_pool_connection_hold(elapsed_seconds: float) -> None:
+    """Record the wall time from pool checkout until connection checkin."""
+
+    metrics = _current_metrics.get()
+    if metrics is None:
+        return
+    metrics.pool_connection_hold_seconds += max(0.0, elapsed_seconds)
+    metrics.pool_connection_hold_count += 1
+
+
+def record_authenticated_read_admission(
+    *,
+    wait_seconds: float,
+    limit: int,
+    inflight: int,
+    admitted: bool,
+) -> None:
+    metrics = _current_metrics.get()
+    if metrics is None:
+        return
+    metrics.authenticated_read_admission_wait_seconds = max(
+        0.0, float(wait_seconds)
+    )
+    metrics.authenticated_read_admission_limit = max(0, int(limit))
+    metrics.authenticated_read_admission_inflight = max(0, int(inflight))
+    metrics.authenticated_read_admission_shed = not admitted
 
 
 def record_redis_read_model_event(
@@ -453,6 +509,8 @@ class RequestPerformanceMiddleware:
                 is_ready_vote_route
                 and metrics.ready_vote_admission_wait_ms >= 25.0
             )
+            or metrics.pool_connection_hold_seconds >= 0.5
+            or metrics.authenticated_read_admission_shed
             or any(
                 event["outcome"] in {"error", "fallback_db"}
                 for event in metrics.redis_read_model_events
@@ -471,7 +529,14 @@ class RequestPerformanceMiddleware:
         log_method = logger.warning if status_code >= 500 else logger.info
         log_method(
             "request_perf request_id=%s method=%s path=%s route=%s status=%s "
-            "total_ms=%.2f sql_ms=%.2f sql_count=%s max_sql_ms=%.2f "
+            "total_ms=%.2f request_ms=%.2f sql_ms=%.2f db_sql_ms=%.2f "
+            "sql_count=%s max_sql_ms=%.2f "
+            "pool_checkout_wait_ms=%.2f pool_connection_hold_ms=%.2f "
+            "pool_connection_hold_count=%s "
+            "authenticated_read_admission_wait_ms=%.2f "
+            "authenticated_read_admission_limit=%s "
+            "authenticated_read_admission_inflight=%s "
+            "authenticated_read_admission_shed=%s "
             "compute_ms=%.2f compute_blocks=%s "
             "ready_vote_auth_ms=%.2f ready_vote_checkout_count=%s "
             "ready_vote_checkout_ms=%.2f "
@@ -505,9 +570,18 @@ class RequestPerformanceMiddleware:
             route_path,
             status_code,
             total_ms,
+            total_ms,
+            sql_ms,
             sql_ms,
             metrics.sql_query_count,
             metrics.max_sql_time_seconds * 1000,
+            metrics.pool_checkout_wait_seconds * 1000,
+            metrics.pool_connection_hold_seconds * 1000,
+            metrics.pool_connection_hold_count,
+            metrics.authenticated_read_admission_wait_seconds * 1000,
+            metrics.authenticated_read_admission_limit,
+            metrics.authenticated_read_admission_inflight,
+            metrics.authenticated_read_admission_shed,
             metrics.compute_time_seconds * 1000,
             metrics.compute_blocks,
             metrics.ready_vote_spans.get("ready_vote_auth_ms", 0.0) * 1000,

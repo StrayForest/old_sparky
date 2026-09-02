@@ -1,7 +1,7 @@
 import "server-only";
 
 import { cache } from "react";
-import type { PlatformUser } from "@/lib/platform-types";
+import type { PlatformAuthBootstrap, PlatformUser } from "@/lib/platform-types";
 
 export type ServerAuthSnapshot = {
   status: "authenticated" | "anonymous" | "unavailable";
@@ -76,6 +76,65 @@ export const getServerCurrentUser = cache(async (
     return { status: "unavailable", user: null };
   }
 });
+
+export const getServerAuthBootstrap = cache(async (
+  cookieHeader: string
+): Promise<ServerAuthSnapshot> => {
+  if (!cookieHeader) {
+    return { status: "anonymous", user: null };
+  }
+  const baseUrl = trustedServerApiBaseUrl();
+  if (!baseUrl) {
+    return { status: "unavailable", user: null };
+  }
+  try {
+    const response = await fetch(`${baseUrl}/auth/bootstrap`, {
+      headers: {
+        accept: "application/json",
+        cookie: cookieHeader
+      },
+      cache: "no-store",
+      signal: AbortSignal.timeout(serverAuthTimeoutMs)
+    });
+    if (response.status === 401 || response.status === 403) {
+      return { status: "anonymous", user: null };
+    }
+    if (!response.ok) {
+      return { status: "unavailable", user: null };
+    }
+    const bootstrap = await response.json() as unknown;
+    if (!isPlatformAuthBootstrap(bootstrap)) {
+      return { status: "unavailable", user: null };
+    }
+    return { status: "authenticated", user: bootstrap };
+  } catch {
+    return { status: "unavailable", user: null };
+  }
+});
+
+function isPlatformAuthBootstrap(value: unknown): value is PlatformAuthBootstrap {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<PlatformAuthBootstrap>;
+  return typeof candidate.id === "string"
+    && (candidate.email === null || typeof candidate.email === "string")
+    && typeof candidate.display_name === "string"
+    && typeof candidate.status === "string"
+    && typeof candidate.created_at === "string"
+    && !Number.isNaN(Date.parse(candidate.created_at))
+    && Array.isArray(candidate.roles)
+    && candidate.roles.every((role) => typeof role === "string")
+    && typeof candidate.can_create_public_tournaments === "boolean"
+    && typeof candidate.public_tournament_credits === "number"
+    && Number.isFinite(candidate.public_tournament_credits)
+    && typeof candidate.private_tournament_credits === "number"
+    && Number.isFinite(candidate.private_tournament_credits)
+    && (candidate.avatar_url === null || typeof candidate.avatar_url === "string")
+    && (candidate.avatar_media === null
+      || candidate.avatar_media === undefined
+      || typeof candidate.avatar_media === "object");
+}
 
 function isPlatformUser(value: unknown): value is PlatformUser {
   if (!value || typeof value !== "object") {

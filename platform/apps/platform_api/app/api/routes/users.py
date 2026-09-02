@@ -9,7 +9,7 @@ from apps.platform_api.app.services.tournament_allowances import (
     PRIVATE_TOURNAMENT_MONTHLY_LIMIT,
     private_tournament_monthly_remaining,
 )
-from python_packages.platform_infra.db import get_db_session
+from python_packages.platform_infra.db import get_db_session, release_db_connection
 from python_packages.platform_infra.security import get_authenticated_session
 
 router = APIRouter()
@@ -20,15 +20,18 @@ async def get_me(
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> UserResponse:
-    monthly_remaining = await private_tournament_monthly_remaining(
-        db_session,
-        organizer_user_id=auth_session.user.id,
-        now=auth_session.now,
-    )
-    return await serialize_current_user(
-        db_session,
-        auth_session.user,
-        role_slugs=auth_session.role_slugs,
-        private_tournament_monthly_remaining=monthly_remaining,
-        private_tournament_monthly_limit=PRIVATE_TOURNAMENT_MONTHLY_LIMIT,
-    )
+    try:
+        monthly_remaining = await private_tournament_monthly_remaining(
+            db_session,
+            organizer_user_id=auth_session.user.id,
+            now=auth_session.now,
+        )
+        return await serialize_current_user(
+            db_session,
+            auth_session.user,
+            role_slugs=auth_session.role_slugs,
+            private_tournament_monthly_remaining=monthly_remaining,
+            private_tournament_monthly_limit=PRIVATE_TOURNAMENT_MONTHLY_LIMIT,
+        )
+    finally:
+        await release_db_connection(db_session)

@@ -6,6 +6,8 @@ const upstreamHost = process.env.MOCK_PLATFORM_API_HOST ?? "127.0.0.1";
 const upstreamPort = Number(process.env.MOCK_PLATFORM_API_UPSTREAM_PORT ?? 3198);
 const upstreamOrigin = `http://${upstreamHost}:${upstreamPort}`;
 
+const ssrRequestCounts = new Map();
+
 function json(response, status, payload, headers = {}) {
   response.writeHead(status, {
     "content-type": "application/json",
@@ -175,6 +177,15 @@ function proxyRequest(request, response) {
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? "/", `http://${host}:${port}`);
   const path = url.pathname.replace(/\/$/, "") || "/";
+  if ((request.headers.cookie ?? "").includes("ssr-bootstrap-profile-smoke=1")) {
+    ssrRequestCounts.set(path, (ssrRequestCounts.get(path) ?? 0) + 1);
+  }
+
+  if (path === "/__test/request-count" && request.method === "GET") {
+    const countedPath = url.searchParams.get("path") ?? "";
+    json(response, 200, { count: ssrRequestCounts.get(countedPath) ?? 0 });
+    return;
+  }
 
   if (
     (path === "/api/v1/profiles/me/workspace" || path === "/api/v1/profiles/me/bootstrap") &&

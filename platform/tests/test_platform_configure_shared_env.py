@@ -78,6 +78,12 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_GUNICORN_ACCESS_LOG"], "false")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_WORKER_LOG_LEVEL"], "WARNING")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_PERF_LOG_MUTATIONS"], "false")
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_DB_POOL_PRE_PING"], "true")
+        self.assertEqual(
+            configure.PUBLIC_BASELINE["PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED"],
+            "false",
+        )
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_UVICORN_LOOP"], "auto")
         self.assertEqual(
             configure.PUBLIC_BASELINE["PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY"],
             "4",
@@ -135,6 +141,28 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertNotIn("PLATFORM_API_WORKERS", profile)
         self.assertNotIn("PLATFORM_DB_POOL_SIZE", profile)
         self.assertNotIn("PLATFORM_DB_CONNECTION_BUDGET", profile)
+
+    def test_read_path_candidate_profiles_are_explicit_and_bounded(self) -> None:
+        self.assertEqual(
+            configure.RUNTIME_PROFILES["authenticated-read-admission-32"],
+            {
+                "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED": "true",
+                "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "32",
+                "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "0",
+                "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "0",
+            },
+        )
+        self.assertEqual(
+            configure.RUNTIME_PROFILES["pool-pre-ping-off"],
+            {"PLATFORM_DB_POOL_PRE_PING": "false"},
+        )
+        for pool_size in (12, 16, 20, 24):
+            self.assertEqual(
+                configure.RUNTIME_PROFILES[f"api-pool-{pool_size}"][
+                    "PLATFORM_DB_POOL_SIZE"
+                ],
+                str(pool_size),
+            )
 
     def test_atomic_write_preserves_private_owner_group_and_mode(self) -> None:
         with TemporaryDirectory() as directory:

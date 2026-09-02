@@ -11,6 +11,9 @@ from apps.platform_api.app.api.router import api_router
 from apps.platform_api.app.lifespan import platform_lifespan
 from python_packages.platform_infra.config import get_settings, validate_platform_settings
 from python_packages.platform_infra.csrf import CsrfProtectionMiddleware
+from python_packages.platform_infra.authenticated_read_admission import (
+    AuthenticatedReadAdmissionMiddleware,
+)
 from python_packages.platform_infra.performance import RequestPerformanceMiddleware
 from python_packages.platform_infra.security import validate_auth_security_settings
 
@@ -52,8 +55,14 @@ def create_app() -> FastAPI:
         openapi_url=None if is_production else "/openapi.json",
     )
     app.add_exception_handler(SQLAlchemyTimeoutError, handle_database_pool_timeout)
-    app.add_middleware(RequestPerformanceMiddleware)
     app.add_middleware(CsrfProtectionMiddleware, settings_factory=get_settings)
+    app.add_middleware(
+        AuthenticatedReadAdmissionMiddleware,
+        settings_factory=get_settings,
+    )
+    # Keep request performance outermost so admission-shed responses are
+    # observable in the same request_perf stream as admitted requests.
+    app.add_middleware(RequestPerformanceMiddleware)
     if not is_production:
         # Keep CORS outermost so browser clients can inspect CSRF rejections as
         # well as successful token-issuing responses.

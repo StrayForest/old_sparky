@@ -29,6 +29,7 @@ on:
           - ready-vote-spike-v1
           - read-mix-human-v2
           - read-mix-stress-v2
+          - read-mix-concurrency-ramp-v1
 
 permissions:
   contents: read

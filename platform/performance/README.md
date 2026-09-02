@@ -25,6 +25,7 @@ outside the active registry and is not selectable by the production workflow.
 | `ready-vote-spike-v1` | spike | Normal → burst → normal with recovery phases |
 | `read-mix-human-v2` | load | 500-user human-shaped authenticated reads |
 | `read-mix-stress-v2` | stress | 20,000-user authenticated reads and conditional reloads |
+| `read-mix-concurrency-ramp-v1` | stress diagnostic | Full read mix at c16/c32/c48/c64/c80/c96/c112/c128 |
 | `tournament-lifecycle-slo-v1` | load/SLO | 20 tournaments × 500 users through completed bracket |
 | `tournament-lifecycle-scale-v1` | stress | Concurrent multi-tournament lifecycle waves |
 | `tournament-lifecycle-capacity-v1` | capacity | Lifecycle capacity contour using the QA harness |
@@ -59,6 +60,34 @@ amplification and recovery can be compared instead of hidden in one aggregate.
 The measured HTTP generator runs only on the GitHub-hosted runner. The
 production origin may prepare marked fixtures, collect lightweight pressure
 evidence and perform exact cleanup; it must not execute the measured client.
+
+## Read-path candidate slice (2026-09-02)
+
+The retained accepted read-mix baseline remains the canonical comparison point:
+source `4be82f1a…`, workflow `33625164162`, raw p50/p95/p99
+`1212/2382/3492 ms`, 99.42 requests/s, API CPU about 98% per core and zero
+errors. The following changes are implemented as separately observable
+candidates and have not been promoted or accepted by a production run:
+
+- request-performance now distinguishes checkout wait, connection hold,
+  SQL time and total request time;
+- workspace and `/users/me` use an early session release after model
+  materialization, while the workspace hot preflight uses primitive column
+  snapshots instead of ORM hydration;
+- global SSR auth uses `/auth/bootstrap`; full `/users/me` remains for profile
+  and settings/account-security surfaces;
+- the external runner has `read-mix-concurrency-ramp-v1`, which records every
+  c16–c128 full-population stage separately;
+- `uvloop`/`httptools`, Nginx upstream keepalive, pool sizes 12/16/20/24,
+  `pool_pre_ping=false` and authenticated-read admission 32 are isolated
+  runtime A/B profiles, disabled in the baseline.
+
+The candidate slice deliberately does not change JSON encoding, media loading,
+the security-sensitive Redis session-validity model, or the retained
+production pool/worker envelope by default. Production acceptance still
+requires the exact-SHA external load workflow, origin observer evidence and
+exact cleanup. The `pool_pre_ping=false` candidate also requires PostgreSQL
+restart/recovery evidence.
 
 ## Ready Vote evidence (2026-08-30/31)
 

@@ -691,6 +691,32 @@ const server = createServer((request, response) => {
     );
     return;
   }
+  if (path === "/api/v1/auth/bootstrap") {
+    if ((request.headers.cookie ?? "").includes("users-me-malformed-smoke=1")) {
+      json(response, 200, { id: "u_malformed", display_name: "Malformed User" });
+      return;
+    }
+    if ((request.headers.cookie ?? "").includes("users-me-unavailable-smoke=1")) {
+      json(response, 503, { detail: "Current-user service unavailable." });
+      return;
+    }
+    const actor = actorForRequest(request);
+    json(response, actor ? 200 : 401, actor ? {
+      id: actor.id,
+      email: actor.email,
+      display_name: actor.display_name,
+      status: "active",
+      created_at: now,
+      roles: actor.roles,
+      can_create_public_tournaments: actor.roles.includes("admin")
+        || actor.roles.includes("superadmin"),
+      public_tournament_credits: actor.id === "u_limited_creator" ? 0 : 2,
+      private_tournament_credits: 4,
+      avatar_url: null,
+      avatar_media: null
+    } : { detail: "Not authenticated." });
+    return;
+  }
   if (path === "/api/v1/users/me") {
     if ((request.headers.cookie ?? "").includes("users-me-malformed-smoke=1")) {
       json(response, 200, {

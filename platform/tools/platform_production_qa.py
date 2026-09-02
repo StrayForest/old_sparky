@@ -1381,13 +1381,22 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
     numeric_keys = {
         "status": int,
         "total_ms": float,
+        "request_ms": float,
         "sql_ms": float,
+        "db_sql_ms": float,
         "sql_count": int,
         "max_sql_ms": float,
         "compute_ms": float,
         "compute_blocks": int,
         "response_bytes": int,
         "pool_wait_ms": float,
+        "pool_checkout_wait_ms": float,
+        "pool_connection_hold_ms": float,
+        "pool_connection_hold_count": int,
+        "authenticated_read_admission_wait_ms": float,
+        "authenticated_read_admission_limit": int,
+        "authenticated_read_admission_inflight": int,
+        "authenticated_read_admission_shed": int,
         "redis_read_model_get_ms": float,
         "redis_read_model_build_ms": float,
         "redis_read_model_set_ms": float,
@@ -1444,6 +1453,15 @@ def summarize_request_perf_logs(
     ]
     if not rows:
         return {"logged_requests": 0, "scope": diagnostic_scope}
+    for row in rows:
+        # Keep the original short keys for retained reports, while making the
+        # read-path diagnostic names explicit for new and old journal lines.
+        if not isinstance(row.get("request_ms"), (int, float)):
+            row["request_ms"] = row.get("total_ms")
+        if not isinstance(row.get("db_sql_ms"), (int, float)):
+            row["db_sql_ms"] = row.get("sql_ms")
+        if not isinstance(row.get("pool_checkout_wait_ms"), (int, float)):
+            row["pool_checkout_wait_ms"] = row.get("pool_wait_ms")
     by_route: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_method_route: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_qa_phase: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1500,18 +1518,20 @@ def summarize_request_perf_logs(
             "payload_bytes": byte_stats(payload_values),
         }
 
-    totals = [float(row["total_ms"]) for row in rows if isinstance(row.get("total_ms"), (int, float))]
+    totals = [float(row["request_ms"]) for row in rows if isinstance(row.get("request_ms"), (int, float))]
     sql_counts = [float(row["sql_count"]) for row in rows if isinstance(row.get("sql_count"), (int, float))]
-    sql_times = [float(row["sql_ms"]) for row in rows if isinstance(row.get("sql_ms"), (int, float))]
+    sql_times = [float(row["db_sql_ms"]) for row in rows if isinstance(row.get("db_sql_ms"), (int, float))]
     compute_times = [float(row["compute_ms"]) for row in rows if isinstance(row.get("compute_ms"), (int, float))]
     max_sql_times = [float(row["max_sql_ms"]) for row in rows if isinstance(row.get("max_sql_ms"), (int, float))]
     response_bytes = [float(row["response_bytes"]) for row in rows if isinstance(row.get("response_bytes"), (int, float))]
-    pool_wait_times = [float(row["pool_wait_ms"]) for row in rows if isinstance(row.get("pool_wait_ms"), (int, float))]
+    pool_wait_times = [float(row["pool_checkout_wait_ms"]) for row in rows if isinstance(row.get("pool_checkout_wait_ms"), (int, float))]
+    pool_hold_times = [float(row["pool_connection_hold_ms"]) for row in rows if isinstance(row.get("pool_connection_hold_ms"), (int, float))]
+    admission_wait_times = [float(row["authenticated_read_admission_wait_ms"]) for row in rows if isinstance(row.get("authenticated_read_admission_wait_ms"), (int, float))]
     non_sql_times = [
         max(
             0.0,
-            float(row.get("total_ms") or 0)
-            - float(row.get("sql_ms") or 0)
+            float(row.get("request_ms") or 0)
+            - float(row.get("db_sql_ms") or 0)
             - float(row.get("compute_ms") or 0),
         )
         for row in rows
@@ -1521,8 +1541,8 @@ def summarize_request_perf_logs(
         non_sql_times = [
             max(
                 0.0,
-                float(row.get("total_ms") or 0)
-                - float(row.get("sql_ms") or 0)
+                float(row.get("request_ms", row.get("total_ms")) or 0)
+                - float(row.get("db_sql_ms", row.get("sql_ms")) or 0)
                 - float(row.get("compute_ms") or 0),
             )
             for row in row_values
@@ -1539,15 +1559,16 @@ def summarize_request_perf_logs(
         }
         return {
             "requests": len(row_values),
-            "total": row_metric_stats("total_ms", row_values),
+            "total": row_metric_stats("request_ms", row_values),
+            "request": row_metric_stats("request_ms", row_values),
             "avg_sql_queries_per_request": round(
                 sum(float(row["sql_count"]) for row in row_values if isinstance(row.get("sql_count"), (int, float)))
                 / max(1, sum(1 for row in row_values if isinstance(row.get("sql_count"), (int, float)))),
                 3,
             ),
             "avg_db_time_ms": round(
-                sum(float(row["sql_ms"]) for row in row_values if isinstance(row.get("sql_ms"), (int, float)))
-                / max(1, sum(1 for row in row_values if isinstance(row.get("sql_ms"), (int, float)))),
+                sum(float(row["db_sql_ms"]) for row in row_values if isinstance(row.get("db_sql_ms"), (int, float)))
+                / max(1, sum(1 for row in row_values if isinstance(row.get("db_sql_ms"), (int, float)))),
                 3,
             ),
             "avg_compute_time_ms": round(
@@ -1566,7 +1587,11 @@ def summarize_request_perf_logs(
             "response_bytes": byte_stats(
                 [int(row["response_bytes"]) for row in row_values if isinstance(row.get("response_bytes"), (int, float))]
             ),
-            "pool_checkout_wait_ms": row_metric_stats("pool_wait_ms", row_values),
+            "pool_checkout_wait_ms": row_metric_stats("pool_checkout_wait_ms", row_values),
+            "pool_connection_hold_ms": row_metric_stats("pool_connection_hold_ms", row_values),
+            "authenticated_read_admission_wait_ms": row_metric_stats(
+                "authenticated_read_admission_wait_ms", row_values
+            ),
             "ready_vote": ready_vote_spans,
             "ready_vote_controller_state_counts": controller_state_counts(row_values),
             "redis_read_models": read_model_summary(row_values),
@@ -1577,13 +1602,17 @@ def summarize_request_perf_logs(
         "logged_requests": len(rows),
         "scope": diagnostic_scope,
         "overall": metric_stats(totals),
+        "request_ms": metric_stats(totals),
         "avg_sql_queries_per_request": round(sum(sql_counts) / len(sql_counts), 3) if sql_counts else None,
         "avg_db_time_ms": round(sum(sql_times) / len(sql_times), 3) if sql_times else None,
+        "db_sql_ms": metric_stats(sql_times),
         "avg_compute_time_ms": round(sum(compute_times) / len(compute_times), 3) if compute_times else None,
         "non_sql_time": metric_stats(non_sql_times),
         "max_sql_time_ms": round(max(max_sql_times), 3) if max_sql_times else None,
         "response_bytes": byte_stats([int(value) for value in response_bytes]),
         "pool_checkout_wait_ms": metric_stats(pool_wait_times),
+        "pool_connection_hold_ms": metric_stats(pool_hold_times),
+        "authenticated_read_admission_wait_ms": metric_stats(admission_wait_times),
         "ready_vote": {
             key: row_metric_stats(key, rows)
             for key in READY_VOTE_PERF_KEYS

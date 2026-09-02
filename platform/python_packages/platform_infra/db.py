@@ -110,7 +110,7 @@ def engine() -> AsyncEngine:
         _engine = create_async_engine(
             settings.platform_database_url,
             future=True,
-            pool_pre_ping=True,
+            pool_pre_ping=settings.platform_db_pool_pre_ping,
             pool_size=pool_size,
             max_overflow=max_overflow,
             pool_timeout=pool_timeout,
@@ -204,6 +204,17 @@ async def checkout_db_connection(db_session: AsyncSession) -> None:
         record_pool_checkout_wait(perf_counter() - checkout_started)
         raise
     record_pool_checkout_wait(perf_counter() - checkout_started)
+
+
+async def release_db_connection(db_session: AsyncSession) -> None:
+    """Release an eagerly checked-out connection before response work.
+
+    ``AsyncSession.close`` rolls back an open transaction and returns the
+    connection to the pool.  The session object remains safe for FastAPI's
+    dependency teardown, which may close it a second time.
+    """
+
+    await db_session.close()
 
 
 @asynccontextmanager

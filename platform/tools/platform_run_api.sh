@@ -25,7 +25,7 @@ if "$PLATFORM_PYTHON_BIN" -c "import gunicorn" >/dev/null 2>&1; then
     -m gunicorn apps.platform_api.app.main:app
     --bind "${PLATFORM_API_HOST:-127.0.0.1}:${PLATFORM_API_PORT:-8010}"
     --workers "${PLATFORM_API_WORKERS:-2}"
-    --worker-class uvicorn.workers.UvicornWorker
+    --worker-class apps.platform_api.app.uvicorn_worker.PlatformUvicornWorker
     --timeout "${PLATFORM_API_WORKER_TIMEOUT:-120}"
     --graceful-timeout "${PLATFORM_API_GRACEFUL_TIMEOUT:-30}"
     --keep-alive "${PLATFORM_API_KEEPALIVE:-5}"

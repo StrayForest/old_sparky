@@ -39,7 +39,7 @@ export function ProfileEditor({
   heroNames: string[];
   steamAuthStatus?: "error" | "success";
 }) {
-  const { status, user } = useAuth();
+  const { refreshUser, status, user } = useAuth();
   const [activeTab, setActiveTab] = useState<ProfileTabId>(initialTab);
   const [summaryProfile, setSummaryProfile] = useState(profile);
   const [summaryDreamSlots, setSummaryDreamSlots] = useState(() =>
@@ -48,6 +48,14 @@ export function ProfileEditor({
   const [summaryContacts, setSummaryContacts] = useState<ContactField[]>(() =>
     cloneContacts(profile.contacts)
   );
+
+  useEffect(() => {
+    // The global shell intentionally receives the cheap auth bootstrap. The
+    // profile editor is the owner of the full account-security snapshot.
+    if (status === "authenticated" && user?.id && user.has_password === undefined) {
+      void refreshUser().catch(() => undefined);
+    }
+  }, [refreshUser, status, user?.has_password, user?.id]);
 
   const heroOptions = useMemo(() => {
     const merged = [...heroNames, ...profile.heroes];
