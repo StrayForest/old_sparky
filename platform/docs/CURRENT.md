@@ -118,11 +118,15 @@ is a manual operator gate, never ordinary CI, and every run requires exact
 cleanup or abort handling before another run.
 
 The 2026-09-02 authenticated read-mix A/B run on the current production
-runtime (`7425e72ef90934ea6bb8a57bbffeb53936475f66`) improved 30,000-request
+runtime (deployed source `d410ce73ee6cd71f7142e115576d641b7612d442`, runtime
+equivalent to the proven `7425e72ef90934ea6bb8a57bbffeb53936475f66`) improved 30,000-request
 wall time from 784.5 s to 432.0 s and reduced raw p95 from 7.11 s to 3.68 s.
 The canonical profile passed with 20,000 users, 40×500 tournaments, 20,000
 successful `200` reads and 10,000 valid `304` refreshes; both API cores still
-reached roughly 98.5%. The later conditional-detail fast path and diagnostic
+reached roughly 98.5%. Post-rollback validation workflow `33602219984` passed
+the same `200/304` contract with 0 errors and exact cleanup; API cores reached
+`98.43%` and `98.37%`, with PostgreSQL at `18.93%` CPU and zero lock waiters.
+The later conditional-detail fast path and diagnostic
 sampling candidates were rolled back: the former failed its contract with
 origin `503` responses and was slower, while the latter reduced log volume but
 did not improve latency. The accepted runtime keeps Cloudflare edge caching

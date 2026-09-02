@@ -452,12 +452,34 @@ read-model cache remains the origin fallback.
 
 ## Current accepted runtime after rollback (2026-09-02)
 
-Production is intentionally back on the last proven read-mix winner,
-`7425e72ef90934ea6bb8a57bbffeb53936475f66`. It retains the authenticated
-tournament read-path optimizations and the duplicate organizer-avatar lookup
-removal. The conditional-detail fast path and successful-log sampling are not
-present in the runtime. A fresh canonical run is required after deployment;
-until that run completes, workflow `33588749169` remains the comparison point.
+Production is intentionally back on the last proven read-mix winner. The
+deployed source is `d410ce73ee6cd71f7142e115576d641b7612d442`, whose effective
+runtime is the `7425e72ef90934ea6bb8a57bbffeb53936475f66` implementation plus
+rollback commits. It retains the authenticated tournament read-path
+optimizations and duplicate organizer-avatar lookup removal. The
+conditional-detail fast path and successful-log sampling are not present.
+
+Post-rollback [workflow `33602219984`](https://github.com/StrayForest/old_sparky/actions/runs/33602219984)
+ran the canonical 20,000-user, 40-tournament × 500-user fixture with 128
+external workers and 10,000 conditional refreshes. It passed the stress
+contract and exact cleanup:
+
+- raw HTTP p50/p95/p99: `1967/4015/5363 ms`; wall time `444.082 s` and
+  `67.555 req/s`;
+- statuses: `20,000 × 200` and `10,000 × 304`, with zero errors and unexpected
+  statuses;
+- API cores averaged `98.43%` and `98.37%`, each reaching `100%`; PostgreSQL
+  averaged `18.93%` CPU and reached `52` connections;
+- PostgreSQL waiting backends peaked at `6`, lock waiters and ungranted locks
+  stayed at `0`; server `request_perf` p95/p99 was `4017/5370 ms`;
+- exact cleanup removed all 20,000 users and 40 tournaments, with no remaining
+  sessions or audit rows and the control account preserved.
+
+The result is **`STRESS BEHAVIOR PASS`**. The historical run
+`33588749169` remains the fastest measured sample for this same runtime;
+the fresh run is slower by `2.8%` wall time, but has the same contract and
+resource-safety outcome. This does not justify reintroducing either rejected
+candidate. The durable conclusion remains that the two-vCPU API is CPU-bound.
 
 ## Canonical commands
 
