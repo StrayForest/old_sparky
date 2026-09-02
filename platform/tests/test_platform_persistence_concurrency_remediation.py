@@ -68,38 +68,6 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
             touch_session=False,
         )
 
-    async def test_workspace_conditional_auth_defers_cached_validation_to_preflight(self) -> None:
-        request = Request(
-            {
-                "type": "http",
-                "method": "GET",
-                "headers": [(b"if-none-match", b'"workspace-etag"')],
-                "query_string": (
-                    b"participants_limit=0&participants_offset=0&"
-                    b"workspace_view=detail&include_current_user=false"
-                ),
-            }
-        )
-        db_session = Mock()
-        resolved = SimpleNamespace()
-        with patch.object(
-            security,
-            "_resolve_optional_authenticated_session",
-            AsyncMock(return_value=resolved),
-        ) as resolve:
-            result = await security.get_optional_authenticated_session_for_workspace(
-                request,
-                db_session,
-            )
-
-        self.assertIs(result, resolved)
-        resolve.assert_awaited_once_with(
-            request,
-            db_session,
-            touch_session=False,
-            defer_cached_validation=True,
-        )
-
     async def test_ready_vote_auth_uses_passed_session_and_returns_detached_snapshot(self) -> None:
         request = Mock()
         request.cookies = {"platform_session": "token"}

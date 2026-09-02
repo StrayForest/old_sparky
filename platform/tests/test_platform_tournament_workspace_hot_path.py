@@ -112,12 +112,10 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
         statement = tournament_routes.workspace_conditional_preflight_stmt()
         sql = str(statement.compile())
 
-        self.assertEqual(sql.upper().count("SELECT"), 9)
+        self.assertEqual(sql.upper().count("SELECT"), 8)
         self.assertIn("tournament_deadlock_ready_votes", sql)
         self.assertIn("tournament_deadlock_ready_vote_count_shards", sql)
-        self.assertIn("JOIN platform.users", sql)
-        self.assertIn("workspace_conditional_session_id", statement.compile().params)
-        self.assertIn("workspace_conditional_session_token_digest", statement.compile().params)
+        self.assertNotIn("JOIN platform.users", sql)
 
     def test_workspace_base_preflight_statement_includes_viewer_access(self) -> None:
         statement = tournament_routes.workspace_base_preflight_stmt()

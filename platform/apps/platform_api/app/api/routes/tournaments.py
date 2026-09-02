@@ -16,7 +16,6 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from sqlalchemy import (
-    Boolean,
     Select,
     String,
     and_,
@@ -250,8 +249,6 @@ from python_packages.platform_domain.tournaments import (
     transition_match_status,
 )
 from python_packages.platform_infra.audit import write_audit_log
-from python_packages.platform_infra.auth_lifecycle import email_verification_required
-from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import (
     checkout_db_connection,
     get_db_session,
@@ -282,7 +279,6 @@ from python_packages.platform_infra.models import (
     TournamentTeam,
     TournamentTeamMember,
     User,
-    UserSession,
     new_uuid,
 )
 from python_packages.platform_infra.security import (
@@ -290,8 +286,6 @@ from python_packages.platform_infra.security import (
     authenticate_ready_vote,
     get_authenticated_session,
     get_optional_authenticated_session,
-    get_optional_authenticated_session_for_workspace,
-    invalidate_session_cache,
 )
 from python_packages.platform_infra.performance import (
     current_request_metrics,
@@ -586,7 +580,6 @@ class WorkspaceConditionalPreflight:
     ready_count: int
     declined_count: int
     current_user_choice: str | None
-    session_valid: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1139,18 +1132,6 @@ _WORKSPACE_CONDITIONAL_SLUG = bindparam(
     "workspace_conditional_slug",
     type_=String(140),
 )
-_WORKSPACE_CONDITIONAL_SESSION_ID = bindparam(
-    "workspace_conditional_session_id",
-    type_=String(36),
-)
-_WORKSPACE_CONDITIONAL_SESSION_TOKEN_DIGEST = bindparam(
-    "workspace_conditional_session_token_digest",
-    type_=String(64),
-)
-_WORKSPACE_CONDITIONAL_EMAIL_VERIFICATION_REQUIRED = bindparam(
-    "workspace_conditional_email_verification_required",
-    type_=Boolean,
-)
 
 
 def _build_workspace_conditional_preflight_stmt() -> Select:
@@ -1225,23 +1206,6 @@ def _build_workspace_conditional_preflight_stmt() -> Select:
         .correlate(ready_round)
         .scalar_subquery()
     )
-    session_valid = (
-        select(UserSession.id)
-        .join(User, User.id == UserSession.user_id)
-        .where(
-            UserSession.id == _WORKSPACE_CONDITIONAL_SESSION_ID,
-            UserSession.token_digest == _WORKSPACE_CONDITIONAL_SESSION_TOKEN_DIGEST,
-            UserSession.invalidated_at.is_(None),
-            UserSession.expires_at > func.now(),
-            User.status == "active",
-            or_(
-                _WORKSPACE_CONDITIONAL_EMAIL_VERIFICATION_REQUIRED.is_(False),
-                User.email.is_(None) | User.email_verified_at.is_not(None),
-            ),
-        )
-        .limit(1)
-        .scalar_subquery()
-    )
     return (
         select(
             Tournament,
@@ -1251,7 +1215,6 @@ def _build_workspace_conditional_preflight_stmt() -> Select:
             ready_count.label("ready_count"),
             declined_count.label("declined_count"),
             current_user_choice.label("current_user_choice"),
-            session_valid.label("session_valid"),
         )
         .outerjoin(ready_round, ready_round.id == selected_ready_round_id)
         .where(Tournament.slug == _WORKSPACE_CONDITIONAL_SLUG)
@@ -1272,8 +1235,6 @@ async def workspace_conditional_preflight(
     *,
     slug: str,
     user_id: str,
-    session_id: str | None = None,
-    session_token_digest: str | None = None,
 ) -> WorkspaceConditionalPreflight | None:
     row = (
         await db_session.execute(
@@ -1281,11 +1242,6 @@ async def workspace_conditional_preflight(
             {
                 "workspace_conditional_user_id": user_id,
                 "workspace_conditional_slug": slug,
-                "workspace_conditional_session_id": session_id,
-                "workspace_conditional_session_token_digest": session_token_digest,
-                "workspace_conditional_email_verification_required": email_verification_required(
-                    get_settings()
-                ),
             },
         )
     ).first()
@@ -1299,7 +1255,6 @@ async def workspace_conditional_preflight(
         ready_count=int(row[4] or 0),
         declined_count=int(row[5] or 0),
         current_user_choice=row[6],
-        session_valid=bool(row[7]) if len(row) > 7 else True,
     )
 
 
@@ -7056,7 +7011,7 @@ async def get_tournament_workspace(
     workspace_view: Literal["detail", "bracket", "bracket_summary"] = Query(default="bracket"),
     include_current_user: bool = Query(default=True),
     invite_code: str | None = Query(default=None, min_length=6, max_length=64),
-    auth_session=Depends(get_optional_authenticated_session_for_workspace),
+    auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentWorkspaceResponse | Response:
     # The schedule and this timestamp travel in one authoritative response.
@@ -7085,68 +7040,56 @@ async def get_tournament_workspace(
                 db_session,
                 slug=slug,
                 user_id=auth_session.user.id,
-                session_id=getattr(getattr(auth_session, "session", None), "id", None),
-                session_token_digest=getattr(
-                    getattr(auth_session, "session", None),
-                    "token_digest",
-                    None,
-                ),
             )
         if preflight is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
-        if not preflight.session_valid:
-            invalidate_session_cache(auth_session.session.token_digest)
-            auth_session = None
-            workspace_base_preflight_candidate = False
-            conditional_read_candidate = False
-        else:
-            preflight_tournament = preflight.tournament
-            ensure_tournament_summary_visible(preflight_tournament, auth_session)
-            preflight_is_active_participant = bool(
-                preflight.participant_status is not None
-                and not participant_status_is_inactive(preflight.participant_status)
+        preflight_tournament = preflight.tournament
+        ensure_tournament_summary_visible(preflight_tournament, auth_session)
+        preflight_is_active_participant = bool(
+            preflight.participant_status is not None
+            and not participant_status_is_inactive(preflight.participant_status)
+        )
+        preflight_is_organizer = preflight_tournament.organizer_user_id == auth_session.user.id
+        if preflight_is_active_participant and not preflight_is_organizer:
+            ensure_tournament_workspace_visible(
+                preflight_tournament,
+                auth_session=auth_session,
+                has_participant_record=True,
             )
-            preflight_is_organizer = preflight_tournament.organizer_user_id == auth_session.user.id
-            if preflight_is_active_participant and not preflight_is_organizer:
-                ensure_tournament_workspace_visible(
-                    preflight_tournament,
-                    auth_session=auth_session,
-                    has_participant_record=True,
+            ready_state_version = None
+            ready_round_id = None
+            ready_current_user_choice = None
+            if (
+                is_solo_tournament_format(preflight_tournament.format_slug)
+                and preflight.ready_round_id is not None
+            ):
+                ready_state_version = (
+                    preflight.ready_round_id * 1_000_000
+                    + preflight.ready_count * 1_000
+                    + preflight.declined_count
                 )
-                ready_state_version = None
-                ready_round_id = None
-                ready_current_user_choice = None
-                if (
-                    is_solo_tournament_format(preflight_tournament.format_slug)
-                    and preflight.ready_round_id is not None
-                ):
-                    ready_state_version = (
-                        preflight.ready_round_id * 1_000_000
-                        + preflight.ready_count * 1_000
-                        + preflight.declined_count
-                    )
-                    ready_round_id = preflight.ready_round_id
-                    ready_current_user_choice = preflight.current_user_choice
-                with measure_workspace_stage("workspace_etag"):
-                    etag = _workspace_etag_from_values(
-                        tournament_id=preflight_tournament.id,
-                        tournament_state_version=tournament_state_version(
-                            preflight_tournament,
-                            participant_count=preflight.participant_count,
-                        ),
-                        workspace_view=workspace_view,
-                        participants_limit=participants_limit,
-                        participants_offset=participants_offset,
-                        include_current_user=include_current_user,
-                        user_id=auth_session.user.id,
-                        bracket_revision=int(preflight_tournament.bracket_revision or 0),
-                        ready_check_state_version=ready_state_version,
-                        ready_round_id=ready_round_id,
-                        ready_check_current_user_choice=ready_current_user_choice,
-                    )
-                    not_modified = _conditional_response(request, response, etag=etag)
-                if not_modified is not None:
-                    return not_modified
+                ready_round_id = preflight.ready_round_id
+                ready_current_user_choice = preflight.current_user_choice
+            with measure_workspace_stage("workspace_etag"):
+                etag = _workspace_etag_from_values(
+                    tournament_id=preflight_tournament.id,
+                    tournament_state_version=tournament_state_version(
+                        preflight_tournament,
+                        participant_count=preflight.participant_count,
+                    ),
+                    workspace_view=workspace_view,
+                    participants_limit=participants_limit,
+                    participants_offset=participants_offset,
+                    include_current_user=include_current_user,
+                    user_id=auth_session.user.id,
+                    bracket_revision=int(preflight_tournament.bracket_revision or 0),
+                    ready_check_state_version=ready_state_version,
+                    ready_round_id=ready_round_id,
+                    ready_check_current_user_choice=ready_current_user_choice,
+                )
+                not_modified = _conditional_response(request, response, etag=etag)
+            if not_modified is not None:
+                return not_modified
 
     if public_snapshot_candidate:
         snapshot = _get_public_workspace_snapshot_cache(slug)
