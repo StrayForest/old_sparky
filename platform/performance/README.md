@@ -303,6 +303,30 @@ This profile validates authenticated page/API reads and conditional ETag
 reloads. It does not validate the create → join → Ready Check → bracket
 lifecycle and does not replace the separate browser/grid gate.
 
+## Read-mix stress baseline (2026-09-02)
+
+The next canonical `read-mix-stress-v2` run was [workflow
+`33582068816`](https://github.com/StrayForest/old_sparky/actions/runs/33582068816),
+source SHA `eb2ade0c82c193d82bd3720c19d0e9f168fc2719`. It used the same
+40-tournament × 500-user fixture: 20,000 authenticated users, 128 external
+HTTP workers and 10,000 conditional workspace refreshes. The runner issued
+30,000 requests in 784.547 seconds:
+
+- raw HTTP p50/p95/p99: `3086/7112/10010 ms`;
+- statuses: `19,954 × 200`, `9,943 × 304`, `79 × 503` and `24` transport/status-0 errors;
+- API cores averaged `99.54%` and `99.30%`; PostgreSQL averaged `13.25%` CPU;
+- PostgreSQL reached `55` connections and `19` waiting backends, with zero lock waiters;
+- server `request_perf` p95/p99 was `6993/9897 ms`, with pool checkout p95/p99
+  `5431/8153 ms`;
+- exact cleanup passed: all 20,000 users and 40 tournaments were removed,
+  with no remaining sessions or audit rows and the control account preserved.
+
+The decision was **`STRESS BEHAVIOR FAIL`** because the profile allows only
+`200/304` responses. The evidence points to API CPU saturation and database
+pool queueing, not PostgreSQL CPU or lock contention. Cloudflare edge caching
+was separately verified on the public catalog path; this run therefore does
+not justify disabling Cloudflare or replacing it with an origin-only cache.
+
 ## Canonical commands
 
 ## Tournament lifecycle read models

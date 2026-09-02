@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-02
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -97,9 +97,10 @@ catalog cards are served from the rebuildable PostgreSQL
 and committed tournament, participant, workflow, profile and media changes
 refresh the affected card. Catalog pages use cursor/keyset pagination and
 `LIMIT + 1`; public responses have a five-second Redis response cache and emit
-short-TTL origin cache headers. The Cloudflare Cache Rule needed to turn this
-extensionless JSON response into an edge cache object is still an operator TODO
-(live probe on 2026-09-01 returned `CF-Cache-Status: DYNAMIC`), while
+short-TTL origin cache headers. A live probe on 2026-09-02 verified the
+Cloudflare Cache Rule with `CF-Cache-Status: MISS` followed by `HIT` and
+`Age: 0` on the public catalog response; an equivalent cookie-bearing probe
+also reached an edge HIT. Cloudflare caching remains enabled, while
 `/tournaments/mine` remains private and uncached. The initial workspace includes the bracket, passive changes
 become visible after a manual page reload, and explicit organizer mutations
 may refresh their own authoritative result.

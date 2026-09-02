@@ -180,17 +180,30 @@ async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
             yield db_session
             return
 
-        checkout_started = perf_counter()
-        try:
-            await db_session.connection()
-        except SQLAlchemyTimeoutError:
-            # Keep the performance record useful even when checkout itself
-            # fails: the API exception handler turns this into a controlled
-            # retryable response, while the middleware records the wait.
-            record_pool_checkout_wait(perf_counter() - checkout_started)
-            raise
-        record_pool_checkout_wait(perf_counter() - checkout_started)
+        await checkout_db_connection(db_session)
         yield db_session
+
+
+async def get_lazy_db_session() -> AsyncIterator[AsyncSession]:
+    """Yield a session without a connection checkout before it is needed."""
+
+    async with session_factory()() as db_session:
+        yield db_session
+
+
+async def checkout_db_connection(db_session: AsyncSession) -> None:
+    """Acquire the bounded pool connection and record its wait time."""
+
+    checkout_started = perf_counter()
+    try:
+        await db_session.connection()
+    except SQLAlchemyTimeoutError:
+        # Keep the performance record useful even when checkout itself fails:
+        # the API exception handler turns this into a controlled retryable
+        # response, while the middleware records the wait.
+        record_pool_checkout_wait(perf_counter() - checkout_started)
+        raise
+    record_pool_checkout_wait(perf_counter() - checkout_started)
 
 
 @asynccontextmanager

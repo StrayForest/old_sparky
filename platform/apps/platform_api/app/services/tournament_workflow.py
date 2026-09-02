@@ -24,7 +24,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from apps.platform_api.app.api.schemas import TournamentDeadlockReadyRoundResponse
+from apps.platform_api.app.api.schemas import (
+    TournamentDeadlockReadyCheckStateResponse,
+    TournamentDeadlockReadyRoundResponse,
+)
 from apps.platform_api.app.services.player_commitments import release_active_commitments
 from apps.platform_api.app.services.player_commitments import (
     PlayerCommitmentConflict,
@@ -377,6 +380,7 @@ class ReadyRoundStateSnapshot:
     response: TournamentDeadlockReadyRoundResponse
     choices_by_user_id: dict[str, str]
 
+
 @dataclass(frozen=True, slots=True)
 class ReadyVoteRoutePreflight:
     tournament: Tournament | ReadyVoteTournamentSnapshot
@@ -714,6 +718,109 @@ async def deadlock_ready_state_round_for_tournament(
     if round_row.status == "active":
         return round_row, round_row
     return None, round_row
+
+
+async def deadlock_ready_state_response_for_tournament(
+    db_session: AsyncSession,
+    *,
+    tournament_id: str,
+    current_user_id: str,
+) -> TournamentDeadlockReadyCheckStateResponse:
+    """Load the visible Ready Check state with one bounded DB round-trip.
+
+    Workspace reads already know the tournament and viewer. Keep the round
+    lookup, counter-shard aggregates and viewer's own choice in one SELECT;
+    the vote path still remains authoritative and invalidates the existing
+    process-local state cache after a committed change.
+    """
+
+    ready_count = (
+        select(func.coalesce(func.sum(TournamentDeadlockReadyVoteCountShard.vote_count), 0))
+        .where(
+            TournamentDeadlockReadyVoteCountShard.round_id == TournamentDeadlockReadyRound.id,
+            TournamentDeadlockReadyVoteCountShard.choice == "yes",
+        )
+        .correlate(TournamentDeadlockReadyRound)
+        .scalar_subquery()
+    )
+    declined_count = (
+        select(func.coalesce(func.sum(TournamentDeadlockReadyVoteCountShard.vote_count), 0))
+        .where(
+            TournamentDeadlockReadyVoteCountShard.round_id == TournamentDeadlockReadyRound.id,
+            TournamentDeadlockReadyVoteCountShard.choice == "no",
+        )
+        .correlate(TournamentDeadlockReadyRound)
+        .scalar_subquery()
+    )
+    current_user_choice = (
+        select(TournamentDeadlockReadyVote.choice)
+        .where(
+            TournamentDeadlockReadyVote.round_id == TournamentDeadlockReadyRound.id,
+            TournamentDeadlockReadyVote.user_id == current_user_id,
+        )
+        .limit(1)
+        .correlate(TournamentDeadlockReadyRound)
+        .scalar_subquery()
+    )
+    row = (
+        await db_session.execute(
+            select(
+                TournamentDeadlockReadyRound,
+                ready_count.label("ready_count"),
+                declined_count.label("declined_count"),
+                current_user_choice.label("current_user_choice"),
+            )
+            .where(TournamentDeadlockReadyRound.tournament_id == tournament_id)
+            .order_by(
+                case(
+                    (TournamentDeadlockReadyRound.status == "active", 0),
+                    else_=1,
+                ),
+                TournamentDeadlockReadyRound.created_at.desc(),
+                TournamentDeadlockReadyRound.id.desc(),
+            )
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        return TournamentDeadlockReadyCheckStateResponse(
+            active_round=None,
+            latest_round=None,
+            state_version=0,
+        )
+
+    round_row = row[0]
+    ready_count_value = row[1]
+    declined_count_value = row[2]
+    current_user_choice_value = row[3]
+    response = TournamentDeadlockReadyRoundResponse(
+        id=round_row.id,
+        tournament_id=round_row.tournament_id,
+        status=round_row.status,
+        eligible_participant_count=len(list(round_row.eligible_user_ids or [])),
+        ready_count=int(ready_count_value or 0),
+        declined_count=int(declined_count_value or 0),
+        initiated_by_user_id=round_row.initiated_by_user_id,
+        created_at=round_row.created_at,
+        closed_at=round_row.closed_at,
+        current_user_choice=current_user_choice_value,
+    )
+    state_version = (
+        int(response.id) * 1_000_000
+        + int(response.ready_count) * 1_000
+        + int(response.declined_count)
+    )
+    if round_row.status == "active":
+        return TournamentDeadlockReadyCheckStateResponse(
+            active_round=response,
+            latest_round=response,
+            state_version=state_version,
+        )
+    return TournamentDeadlockReadyCheckStateResponse(
+        active_round=None,
+        latest_round=response,
+        state_version=state_version,
+    )
 
 async def deadlock_ready_check_read_preflight(
     db_session: AsyncSession,

@@ -232,6 +232,7 @@ class PlatformSettings(BaseSettings):
     platform_db_max_overflow: int = Field(default=0, ge=0)
     platform_db_pool_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     platform_db_pool_recycle_seconds: int = Field(default=1800, gt=0)
+    platform_redis_max_connections: int = Field(default=64, gt=0, le=512)
     platform_worker_db_pool_size: int = Field(default=2, gt=0)
     platform_worker_db_max_overflow: int = Field(default=0, ge=0)
     platform_worker_db_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=120)

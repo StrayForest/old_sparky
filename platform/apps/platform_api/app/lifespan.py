@@ -11,7 +11,7 @@ from python_packages.platform_infra.ready_vote_admission import (
     start_ready_vote_admission_controller,
     stop_ready_vote_admission_controller,
 )
-from python_packages.platform_infra.redis import warm_up_redis
+from python_packages.platform_infra.redis import dispose_redis_clients, warm_up_redis
 
 
 @asynccontextmanager
@@ -29,4 +29,5 @@ async def platform_lifespan(_: FastAPI):
         if cpu_profiler is not None:
             await cpu_profiler.stop()
         await stop_ready_vote_admission_controller()
+        await dispose_redis_clients()
         await dispose_engine()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.platform_api.app.api.schemas import UserResponse
@@ -32,22 +32,25 @@ async def serialize_current_user(
         if role_slugs is not None
         else await role_slugs_for_user(db_session, user.id)
     )
-    profile = await db_session.scalar(
-        select(PlayerProfile).where(PlayerProfile.user_id == user.id)
-    )
-    steam_identity = await db_session.scalar(
-        select(ExternalIdentity).where(
-            ExternalIdentity.user_id == user.id,
-            ExternalIdentity.provider == "steam",
-        )
-    )
-    has_password = (
-        await db_session.scalar(
-            select(PasswordCredential.user_id).where(
-                PasswordCredential.user_id == user.id
+    snapshot = (
+        await db_session.execute(
+            select(PlayerProfile, ExternalIdentity, PasswordCredential.user_id)
+            .select_from(User)
+            .outerjoin(PlayerProfile, PlayerProfile.user_id == User.id)
+            .outerjoin(
+                ExternalIdentity,
+                and_(
+                    ExternalIdentity.user_id == User.id,
+                    ExternalIdentity.provider == "steam",
+                ),
             )
+            .outerjoin(PasswordCredential, PasswordCredential.user_id == User.id)
+            .where(User.id == user.id)
         )
-    ) is not None
+    ).first()
+    profile = snapshot[0] if snapshot is not None else None
+    steam_identity = snapshot[1] if snapshot is not None else None
+    has_password = snapshot is not None and snapshot[2] is not None
     can_unlink_steam = bool(
         user.email
         and user.email_verified_at is not None

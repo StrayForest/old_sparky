@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from pydantic import BaseModel
 from starlette.requests import Request
@@ -62,6 +62,33 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, "pending")
         self.assertEqual(response.teams, [])
         self.assertEqual(response.matches, [])
+
+    async def test_unversioned_ready_state_loads_round_and_counts_in_one_query(self) -> None:
+        created_at = datetime.now(timezone.utc)
+        round_row = SimpleNamespace(
+            id=11,
+            tournament_id="tournament-1",
+            status="active",
+            eligible_user_ids=["user-1"],
+            initiated_by_user_id="organizer-1",
+            created_at=created_at,
+            closed_at=None,
+        )
+        db_session = AsyncMock()
+        db_session.execute.return_value = Mock(
+            first=Mock(return_value=(round_row, 1, 0, "yes"))
+        )
+
+        state = await tournament_routes.deadlock_ready_state_response_for_tournament(
+            db_session,
+            tournament_id="tournament-1",
+            current_user_id="user-1",
+        )
+
+        db_session.execute.assert_awaited_once()
+        self.assertEqual(state.active_round.ready_count, 1)
+        self.assertEqual(state.active_round.current_user_choice, "yes")
+        self.assertEqual(state.latest_round.id, 11)
 
     async def test_public_workspace_snapshot_serves_without_rebuilding_workspace(self) -> None:
         created_at = datetime.now(timezone.utc)

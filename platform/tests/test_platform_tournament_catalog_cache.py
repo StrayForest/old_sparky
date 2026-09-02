@@ -78,7 +78,7 @@ class TournamentCatalogCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(envelope["v"], 1)
         self.assertEqual(envelope["items"], [{"id": "tournament-1"}])
         self.assertEqual(envelope["limit"], 9)
-        self.assertTrue(client.closed)
+        self.assertFalse(client.closed)
 
     async def test_redis_outage_is_a_cache_miss_and_does_not_fail_the_read(self) -> None:
         client = _FakeRedis({}, failure=RedisConnectionError("redis unavailable"))
@@ -89,7 +89,7 @@ class TournamentCatalogCacheTests(unittest.IsolatedAsyncioTestCase):
             entry = await catalog_cache.get_public_tournament_list_cache(self._key())
 
         self.assertIsNone(entry)
-        self.assertTrue(client.closed)
+        self.assertFalse(client.closed)
 
 
 if __name__ == "__main__":

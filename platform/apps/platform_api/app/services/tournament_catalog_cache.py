@@ -106,7 +106,7 @@ async def get_public_tournament_list_cache(
     if not _cache_enabled():
         return None
     started_at = perf_counter()
-    client = redis_client(decode_responses=False)
+    client = redis_client(decode_responses=False, shared=True)
     try:
         entry = _decode_entry(await client.get(key))
         record_redis_read_model_event(
@@ -124,8 +124,6 @@ async def get_public_tournament_list_cache(
         )
         logger.warning("Redis tournament list GET failed error=%s", type(exc).__name__)
         return None
-    finally:
-        await client.aclose()
 
 
 async def set_public_tournament_list_cache(
@@ -157,7 +155,7 @@ async def set_public_tournament_list_cache(
         return
 
     started_at = perf_counter()
-    client = redis_client(decode_responses=False)
+    client = redis_client(decode_responses=False, shared=True)
     try:
         await client.set(key, value, ex=PUBLIC_TOURNAMENT_LIST_CACHE_TTL_SECONDS)
         record_redis_read_model_event(
@@ -174,5 +172,3 @@ async def set_public_tournament_list_cache(
             payload_bytes=len(body),
         )
         logger.warning("Redis tournament list SET failed error=%s", type(exc).__name__)
-    finally:
-        await client.aclose()

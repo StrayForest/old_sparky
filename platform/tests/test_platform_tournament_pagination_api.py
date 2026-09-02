@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 import unittest
 
 from sqlalchemy.dialects import postgresql
@@ -23,6 +23,9 @@ from apps.platform_api.app.api.routes.tournaments import (
     list_tournaments,
 )
 from apps.platform_api.app.api.schemas import TournamentResponse
+from apps.platform_api.app.services.tournament_catalog_cache import (
+    PublicTournamentListCacheEntry,
+)
 from python_packages.platform_infra.models import Tournament, TournamentListReadModel
 
 
@@ -104,6 +107,7 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_public_list_filters_and_sorts_before_page_aggregation(self) -> None:
         db_session = Mock()
+        db_session.connection = AsyncMock()
         db_session.scalar = AsyncMock()
         db_session.execute = AsyncMock(return_value=tournament_result())
         response = Response()
@@ -156,8 +160,40 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("COUNT(", page_sql)
         self.assertNotIn("JOIN platform.users", page_sql)
 
+    async def test_public_list_cache_hit_does_not_checkout_database(self) -> None:
+        db_session = Mock()
+        response = Response()
+        cached = PublicTournamentListCacheEntry(
+            body=b"[]",
+            limit=50,
+            has_more=False,
+            next_cursor=None,
+        )
+
+        with patch(
+            "apps.platform_api.app.api.routes.tournaments.get_public_tournament_list_cache",
+            AsyncMock(return_value=cached),
+        ):
+            result = await list_tournaments(
+                response=response,
+                search=None,
+                rank=[],
+                open_registration=False,
+                status_filter=None,
+                participants_sort=None,
+                date_sort=None,
+                limit=50,
+                cursor=None,
+                db_session=db_session,
+            )
+
+        self.assertEqual(result.status_code, 200)
+        db_session.execute.assert_not_called()
+        db_session.connection.assert_not_called()
+
     async def test_public_status_and_date_sort_apply_before_pagination(self) -> None:
         db_session = Mock()
+        db_session.connection = AsyncMock()
         db_session.scalar = AsyncMock()
         db_session.execute = AsyncMock(return_value=empty_result())
         response = Response()
@@ -329,6 +365,7 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_public_cursor_filters_after_the_last_created_tournament(self) -> None:
         db_session = Mock()
+        db_session.connection = AsyncMock()
         db_session.execute = AsyncMock(return_value=empty_result())
         response = Response()
         cursor = encode_cursor(
@@ -363,6 +400,7 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_public_list_uses_an_extra_row_to_detect_more(self) -> None:
         db_session = Mock()
+        db_session.connection = AsyncMock()
         db_session.scalar = AsyncMock()
         db_session.execute = AsyncMock(return_value=tournament_result(row_count=2))
         response = Response()

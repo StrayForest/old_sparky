@@ -60,8 +60,9 @@ class TournamentReadModelTests(unittest.IsolatedAsyncioTestCase):
         store: dict[str, bytes] = {}
         clients: list[_FakeRedis] = []
 
-        def client_factory(*, decode_responses: bool) -> _FakeRedis:
+        def client_factory(*, decode_responses: bool, shared: bool) -> _FakeRedis:
             self.assertFalse(decode_responses)
+            self.assertTrue(shared)
             client = _FakeRedis(store)
             clients.append(client)
             return client
@@ -83,7 +84,7 @@ class TournamentReadModelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first, second)
         builder.assert_awaited_once()
-        self.assertTrue(all(client.closed for client in clients))
+        self.assertFalse(any(client.closed for client in clients))
 
     async def test_stale_revision_cannot_overwrite_newer_projection(self) -> None:
         store: dict[str, bytes] = {}
@@ -128,7 +129,7 @@ class TournamentReadModelTests(unittest.IsolatedAsyncioTestCase):
             await read_models.delete_tournament_read_models(tournament_id, models)
 
         self.assertEqual(store, {})
-        self.assertTrue(client.closed)
+        self.assertFalse(client.closed)
 
     async def test_redis_outage_returns_authoritative_builder_payload(self) -> None:
         client = _FakeRedis({}, failure=RedisConnectionError("redis unavailable"))
@@ -144,7 +145,7 @@ class TournamentReadModelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload, b'{"status":"ready"}')
         builder.assert_awaited_once()
-        self.assertTrue(client.closed)
+        self.assertFalse(client.closed)
 
     async def test_summary_refresh_does_not_load_members_or_profiles(self) -> None:
         tournament = SimpleNamespace(

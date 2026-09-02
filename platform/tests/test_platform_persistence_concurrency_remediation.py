@@ -24,7 +24,11 @@ from apps.platform_api.app.services.mutation_idempotency import (
     request_idempotency_key,
 )
 from python_packages.platform_infra import security
-from python_packages.platform_infra.db import get_db_session, ready_vote_db_session
+from python_packages.platform_infra.db import (
+    get_db_session,
+    get_lazy_db_session,
+    ready_vote_db_session,
+)
 from python_packages.platform_infra.models import (
     TournamentDeadlockReadyVoteCountShard,
     TournamentMatch,
@@ -211,6 +215,19 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("python_packages.platform_infra.db.session_factory", return_value=factory):
             session_generator = get_db_session(request)
+            scoped_session = await anext(session_generator)
+            self.assertIs(scoped_session, db_session)
+            db_session.connection.assert_not_awaited()
+            await session_generator.aclose()
+        self.assertTrue(context.exited)
+
+    async def test_lazy_read_session_does_not_eagerly_checkout(self) -> None:
+        db_session = Mock()
+        db_session.connection = AsyncMock()
+        context = _AsyncContext(db_session)
+        factory = Mock(return_value=context)
+        with patch("python_packages.platform_infra.db.session_factory", return_value=factory):
+            session_generator = get_lazy_db_session()
             scoped_session = await anext(session_generator)
             self.assertIs(scoped_session, db_session)
             db_session.connection.assert_not_awaited()

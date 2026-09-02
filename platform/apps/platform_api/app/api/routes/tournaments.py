@@ -130,6 +130,7 @@ from apps.platform_api.app.services.tournament_workflow import (
     deadlock_ready_candidate_rows_for_round,
     deadlock_ready_check_read_preflight,
     deadlock_ready_round_for_tournament,
+    deadlock_ready_state_response_for_tournament,
     deadlock_ready_state_round_for_tournament,
     finalize_deadlock_assignment_with_commitments,
     lock_tournament_for_workflow,
@@ -237,7 +238,9 @@ from python_packages.platform_domain.tournaments import (
 )
 from python_packages.platform_infra.audit import write_audit_log
 from python_packages.platform_infra.db import (
+    checkout_db_connection,
     get_db_session,
+    get_lazy_db_session,
     ready_vote_db_session,
     session_factory,
 )
@@ -2346,6 +2349,15 @@ async def build_deadlock_ready_check_state_response(
                     cached_state,
                     current_user_id=current_user_id,
                 )
+    elif not loaded_rounds:
+        # The read-mix fixture uses an active Ready Check with no bracket
+        # revision. Combine the round, counter shards and viewer choice into
+        # one query; do not cache mutable vote counts across requests.
+        return await deadlock_ready_state_response_for_tournament(
+            db_session,
+            tournament_id=tournament_id,
+            current_user_id=current_user_id,
+        )
     else:
         active_round, latest_round = await load_ready_rounds()
 
@@ -2742,7 +2754,7 @@ async def list_tournaments(
         le=TOURNAMENT_LIST_MAX_LIMIT,
     ),
     cursor: str | None = Query(default=None, max_length=2048),
-    db_session: AsyncSession = Depends(get_db_session),
+    db_session: AsyncSession = Depends(get_lazy_db_session),
 ) -> list[TournamentResponse] | Response:
     cache_key = public_tournament_list_cache_key(
         search=search,
@@ -2765,6 +2777,7 @@ async def list_tournaments(
         )
         return cached_response
 
+    await checkout_db_connection(db_session)
     projection = TournamentListReadModel
     filters = [
         projection.visibility == "public",

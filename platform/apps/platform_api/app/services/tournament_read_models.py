@@ -114,7 +114,7 @@ async def _redis_get(
 ) -> tuple[ReadModelEnvelope | None, float, bool]:
     key = read_model_key(tournament_id, model)
     started_at = perf_counter()
-    client = redis_client(decode_responses=False)
+    client = redis_client(decode_responses=False, shared=True)
     try:
         envelope = _decode_envelope(await client.get(key))
         get_ms = (perf_counter() - started_at) * 1000
@@ -150,8 +150,6 @@ async def _redis_get(
             revision=revision,
         )
         return None, get_ms, False
-    finally:
-        await client.aclose()
 
 
 async def _redis_set_if_newer(
@@ -164,7 +162,7 @@ async def _redis_set_if_newer(
     key = read_model_key(tournament_id, model)
     envelope = _encode_envelope(revision=revision, payload=payload)
     started_at = perf_counter()
-    client = redis_client(decode_responses=False)
+    client = redis_client(decode_responses=False, shared=True)
     try:
         stored = bool(
             await client.eval(
@@ -201,8 +199,6 @@ async def _redis_set_if_newer(
             revision=revision,
         )
         return False, set_ms
-    finally:
-        await client.aclose()
 
 
 async def read_model_read_or_build(
@@ -260,10 +256,9 @@ async def delete_tournament_read_models(
     tournament_id: str,
     models: Iterable[ReadModelKind],
 ) -> None:
-    client = redis_client(decode_responses=False)
+    client = redis_client(decode_responses=False, shared=True)
     keys = [read_model_key(tournament_id, model) for model in models]
     if not keys:
-        await client.aclose()
         return
     try:
         await client.delete(*keys)
@@ -273,8 +268,6 @@ async def delete_tournament_read_models(
             tournament_id,
             type(exc).__name__,
         )
-    finally:
-        await client.aclose()
 
 
 async def _build_selected_read_models_from_authoritative_db(
