@@ -453,7 +453,7 @@ read-model cache remains the origin fallback.
 ## Current accepted runtime after rollback (2026-09-02)
 
 Production is intentionally back on the last proven read-mix winner. The
-deployed source is `d410ce73ee6cd71f7142e115576d641b7612d442`, whose effective
+deployed source is `ffe74e8c932b9f1fbe0c3c25d8cf1fd5207058c6`, whose effective
 runtime is the `7425e72ef90934ea6bb8a57bbffeb53936475f66` implementation plus
 rollback commits. It retains the authenticated tournament read-path
 optimizations and duplicate organizer-avatar lookup removal. The

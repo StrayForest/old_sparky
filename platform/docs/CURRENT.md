@@ -118,7 +118,7 @@ is a manual operator gate, never ordinary CI, and every run requires exact
 cleanup or abort handling before another run.
 
 The 2026-09-02 authenticated read-mix A/B run on the current production
-runtime (deployed source `d410ce73ee6cd71f7142e115576d641b7612d442`, runtime
+runtime (deployed source `ffe74e8c932b9f1fbe0c3c25d8cf1fd5207058c6`, runtime
 equivalent to the proven `7425e72ef90934ea6bb8a57bbffeb53936475f66`) improved 30,000-request
 wall time from 784.5 s to 432.0 s and reduced raw p95 from 7.11 s to 3.68 s.
 The canonical profile passed with 20,000 users, 40×500 tournaments, 20,000
