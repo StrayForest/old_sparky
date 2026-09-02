@@ -1145,6 +1145,8 @@ def _build_workspace_base_preflight_stmt() -> Select:
             current_user_choice.label("current_user_choice"),
         )
         .select_from(Tournament)
+        .join(User, User.id == Tournament.organizer_user_id)
+        .outerjoin(PlayerProfile, PlayerProfile.user_id == User.id)
         .outerjoin(
             TournamentParticipant,
             and_(
