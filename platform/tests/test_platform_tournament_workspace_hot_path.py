@@ -63,6 +63,29 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.teams, [])
         self.assertEqual(response.matches, [])
 
+    async def test_explicit_missing_avatar_does_not_repeat_profile_lookup(self) -> None:
+        db_session = AsyncMock()
+        tournament = SimpleNamespace(
+            organizer_user_id="organizer-1",
+            banner_asset_id=None,
+        )
+
+        with patch.object(
+            tournament_routes,
+            "load_media_descriptors",
+            AsyncMock(return_value={}),
+        ) as load_media:
+            cover_media, organizer_avatar_media = await tournament_routes.tournament_media_descriptors(
+                db_session,
+                tournament,
+                organizer_avatar_asset_id=None,
+            )
+
+        db_session.scalar.assert_not_awaited()
+        load_media.assert_awaited_once_with(db_session, (None, None))
+        self.assertIsNone(cover_media)
+        self.assertIsNone(organizer_avatar_media)
+
     async def test_unversioned_ready_state_loads_round_and_counts_in_one_query(self) -> None:
         created_at = datetime.now(timezone.utc)
         round_row = SimpleNamespace(

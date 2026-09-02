@@ -116,6 +116,12 @@ VPS, and a bounded origin observer records API/PG/Redis/system pressure. The
 external-load workflow is the only supported retained-load measurement path; it
 is a manual operator gate, never ordinary CI, and every run requires exact
 cleanup or abort handling before another run.
+
+The 2026-09-02 authenticated read-mix A/B run improved 30,000-request wall time
+from 784.5 s to 473.2 s and reduced raw p95 from 7.11 s to 3.98 s. Both API
+cores still reached roughly 100%, so further read-path changes must be proven
+against the same 20,000-user/40×500 profile without weakening authorization,
+ETag correctness or exact cleanup.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
 

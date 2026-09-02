@@ -374,6 +374,7 @@ PUBLIC_WORKSPACE_SNAPSHOT_CACHE_TTL_SECONDS = 2.0
 PUBLIC_WORKSPACE_SNAPSHOT_CACHE_MAX_ENTRIES = 128
 MANUAL_READY_CHECK_DURATION = timedelta(minutes=10)
 TERMINAL_TOURNAMENT_STATUSES = frozenset(("completed", "cancelled"))
+_ORGANIZER_AVATAR_ASSET_ID_UNSET = object()
 
 
 def bracket_capabilities(
@@ -914,9 +915,9 @@ async def tournament_media_descriptors(
     db_session: AsyncSession,
     tournament: Tournament,
     *,
-    organizer_avatar_asset_id: str | None = None,
+    organizer_avatar_asset_id: str | None | object = _ORGANIZER_AVATAR_ASSET_ID_UNSET,
 ) -> tuple[MediaDescriptorResponse | None, MediaDescriptorResponse | None]:
-    if organizer_avatar_asset_id is None:
+    if organizer_avatar_asset_id is _ORGANIZER_AVATAR_ASSET_ID_UNSET:
         organizer_avatar_asset_id = await db_session.scalar(
             select(PlayerProfile.avatar_asset_id).where(
                 PlayerProfile.user_id == tournament.organizer_user_id

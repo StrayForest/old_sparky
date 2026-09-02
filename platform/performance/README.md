@@ -327,6 +327,36 @@ pool queueing, not PostgreSQL CPU or lock contention. Cloudflare edge caching
 was separately verified on the public catalog path; this run therefore does
 not justify disabling Cloudflare or replacing it with an origin-only cache.
 
+## Read-mix A/B after authenticated-read optimizations (2026-09-02)
+
+The first candidate after the baseline was [workflow
+`33585907064`](https://github.com/StrayForest/old_sparky/actions/runs/33585907064),
+source SHA `11a39ffd6d87f026425519eb39c83d6deda1dbf5`. It used the same
+20,000-user, 40-tournament × 500-user fixture, 128 external HTTP workers and
+10,000 conditional workspace refreshes. The runner issued all 30,000 requests
+in 473.178 seconds:
+
+- raw HTTP p50/p95/p99: `1936/3982/5396 ms` (baseline: `3086/7112/10010 ms`);
+- status counts: `19,999 × 200`, `10,000 × 304`, `1 × 503`, and no transport/status-0 errors;
+- API cores averaged `97.42%` and `97.66%`; PostgreSQL averaged `19.05%` CPU;
+- PostgreSQL reached `51` connections and `10` waiting backends, with zero lock waiters;
+- server `request_perf` p95/p99 was `3697/5143 ms`, with pool checkout p95/p99
+  `2687/4274 ms` (baseline: `5431/8153 ms`);
+- exact cleanup passed: all 20,000 users and 40 tournaments were removed,
+  with no remaining sessions or audit rows and the control account preserved.
+
+The stress decision remains **`STRESS BEHAVIOR FAIL`** because one `503` is
+still outside the profile's `200/304` contract. The A/B result is materially
+better: wall time fell by 39.7%, p95 by 44.0%, p99 by 46.0%, and unexpected
+responses fell from 103 to 1. The remaining limit is API CPU saturation and
+pool queueing; Redis and PostgreSQL are not resource ceilings. The candidate
+removed per-request Redis client creation, combined the active Ready Check
+workspace read, avoided an unnecessary initial public-list DB checkout, and
+collapsed the current-user identity reads. A subsequent candidate removes a
+duplicate organizer-profile lookup when the main tournament query already
+returned an explicit missing avatar asset; it still needs a new production A/B
+run before being treated as an accepted optimization.
+
 ## Canonical commands
 
 ## Tournament lifecycle read models
