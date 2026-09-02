@@ -134,7 +134,13 @@ tournaments, sessions and audit rows while preserving the control account.
 The earlier conditional-detail fast path and diagnostic sampling candidates
 remain rejected historical experiments; this accepted candidate must continue
 to be proven against the same profile without weakening authorization, ETag
-correctness or exact cleanup.
+correctness or exact cleanup. The follow-up candidate `6344168a` deferred
+cached-session validation into the conditional workspace preflight. It reduced
+workspace diagnostics directionally, but canonical runs `33647757275` and
+`33650029282` both failed the full stress gate (client failures in the first
+run; one `URLError` and PostgreSQL connection maximum `55` versus the `52`
+origin-safety ceiling in the repeat). It was reverted by `38c06fda` and is not
+the production runtime.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
 

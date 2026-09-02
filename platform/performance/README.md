@@ -562,6 +562,32 @@ remains the limiting resource, while PostgreSQL and Redis remain below their
 resource ceilings. Production now retains this combined
 base/access/Ready-Check preflight plus the proven conditional 304 path.
 
+## Rejected conditional workspace auth preflight (2026-09-02)
+
+The next candidate, source SHA `6344168a6ca93d6d0665c7de9ada1fdd09efabf8`,
+deferred the cached-session validation query for the exact conditional
+workspace request shape and folded that validation into the existing
+conditional workspace preflight. Authorization, session expiry/invalidation,
+email-verification policy, ETag inputs and non-workspace routes were kept
+unchanged. The candidate was deployed by [production deploy
+`33647303565`](https://github.com/StrayForest/old_sparky/actions/runs/33647303565)
+and measured twice against the canonical `read-mix-stress-v2` profile.
+
+- [first run `33647757275`](https://github.com/StrayForest/old_sparky/actions/runs/33647757275): `STRESS BEHAVIOR FAIL`, with `296` client
+  failures including one `522`; workspace diagnostics were `3.390`
+  SQL/request and `222.722 ms` average DB time;
+- [repeat `33650029282`](https://github.com/StrayForest/old_sparky/actions/runs/33650029282): `STRESS BEHAVIOR FAIL`, with `29,999/30,000`
+  successful responses and one `URLError` (`status=0`); workspace
+  diagnostics were `3.504` SQL/request and `203.693 ms` average DB time,
+  while origin safety rejected PostgreSQL connections peaking at `55` against
+  the `52` ceiling;
+- both runs completed exact cleanup, but neither satisfied the full contract.
+
+The experiment was therefore reverted by `38c06fda`; the known-good combined
+base/access/Ready-Check preflight remains the production baseline. The lower
+SQL and pool measurements are useful evidence for a future auth optimization,
+but this implementation is not accepted without a contract-passing design.
+
 ## Canonical commands
 
 ## Tournament lifecycle read models
