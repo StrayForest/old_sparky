@@ -582,10 +582,17 @@ class WorkspaceConditionalPreflight:
     current_user_choice: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class WorkspaceBasePreflight:
+    """One-query tournament and viewer access snapshot for workspace reads."""
 
-
-
-
+    tournament: Tournament
+    organizer_display_name: str
+    organizer_avatar_asset_id: str | None
+    participant_count: int
+    locked_roster_count: int
+    participant_record: TournamentParticipant | None
+    active_commitment: PlayerTournamentCommitmentResponse | None
 
 
 _ready_check_state_cache: dict[tuple[str, int], ReadyCheckStateCacheEntry] = {}
@@ -906,6 +913,111 @@ def tournament_with_counts_stmt(
     if tournament_page is not None:
         stmt = stmt.join(tournament_page, tournament_page.c.id == Tournament.id)
     return stmt
+
+
+_WORKSPACE_BASE_USER_ID = bindparam(
+    "workspace_base_user_id",
+    type_=String(36),
+)
+_WORKSPACE_BASE_SLUG = bindparam(
+    "workspace_base_slug",
+    type_=String(140),
+)
+
+
+def _build_workspace_base_preflight_stmt() -> Select:
+    """Combine the tournament and viewer access reads for authenticated users."""
+
+    commitment_tournament = aliased(Tournament)
+    return (
+        tournament_with_counts_stmt()
+        .add_columns(
+            TournamentParticipant,
+            PlayerTournamentCommitment,
+            commitment_tournament.slug.label("commitment_tournament_slug"),
+            commitment_tournament.name.label("commitment_tournament_name"),
+        )
+        .outerjoin(
+            TournamentParticipant,
+            and_(
+                TournamentParticipant.tournament_id == Tournament.id,
+                TournamentParticipant.user_id == _WORKSPACE_BASE_USER_ID,
+            ),
+        )
+        .outerjoin(
+            PlayerTournamentCommitment,
+            and_(
+                PlayerTournamentCommitment.user_id == _WORKSPACE_BASE_USER_ID,
+                PlayerTournamentCommitment.released_at.is_(None),
+            ),
+        )
+        .outerjoin(
+            commitment_tournament,
+            commitment_tournament.id == PlayerTournamentCommitment.tournament_id,
+        )
+        .where(Tournament.slug == _WORKSPACE_BASE_SLUG)
+    )
+
+
+_WORKSPACE_BASE_PREFLIGHT_STATEMENT = _build_workspace_base_preflight_stmt()
+
+
+def workspace_base_preflight_stmt() -> Select:
+    """Return the cached tournament plus viewer-access query shape."""
+
+    return _WORKSPACE_BASE_PREFLIGHT_STATEMENT
+
+
+def _active_commitment_response(
+    commitment: PlayerTournamentCommitment | None,
+    *,
+    tournament_slug: str | None,
+    tournament_name: str | None,
+) -> PlayerTournamentCommitmentResponse | None:
+    if commitment is None:
+        return None
+    return PlayerTournamentCommitmentResponse(
+        id=commitment.id,
+        tournament_id=commitment.tournament_id,
+        tournament_slug=str(tournament_slug),
+        tournament_name=str(tournament_name),
+        assignment_run_id=commitment.assignment_run_id,
+        team_id=commitment.team_id,
+        team_name=commitment.team_name,
+        activated_at=commitment.activated_at,
+    )
+
+
+async def workspace_base_preflight(
+    db_session: AsyncSession,
+    *,
+    slug: str,
+    user_id: str,
+) -> WorkspaceBasePreflight | None:
+    row = (
+        await db_session.execute(
+            workspace_base_preflight_stmt(),
+            {
+                "workspace_base_user_id": user_id,
+                "workspace_base_slug": slug,
+            },
+        )
+    ).first()
+    if row is None:
+        return None
+    return WorkspaceBasePreflight(
+        tournament=row[0],
+        organizer_display_name=str(row[1]),
+        organizer_avatar_asset_id=row[2],
+        participant_count=int(row[3] or 0),
+        locked_roster_count=int(row[4] or 0),
+        participant_record=row[5],
+        active_commitment=_active_commitment_response(
+            row[6],
+            tournament_slug=row[7],
+            tournament_name=row[8],
+        ),
+    )
 
 
 _WORKSPACE_CONDITIONAL_USER_ID = bindparam(
@@ -1975,22 +2087,12 @@ async def workspace_access_for_user(
     ).first()
     if row is None:
         return None, None
-    commitment = row[1]
     return (
         row[0],
-        (
-            PlayerTournamentCommitmentResponse(
-                id=commitment.id,
-                tournament_id=commitment.tournament_id,
-                tournament_slug=str(row[2]),
-                tournament_name=str(row[3]),
-                assignment_run_id=commitment.assignment_run_id,
-                team_id=commitment.team_id,
-                team_name=commitment.team_name,
-                activated_at=commitment.activated_at,
-            )
-            if commitment is not None
-            else None
+        _active_commitment_response(
+            row[1],
+            tournament_slug=row[2],
+            tournament_name=row[3],
         ),
     )
 
@@ -6824,6 +6926,10 @@ async def get_tournament_workspace(
         and auth_session is not None
         and not auth_session_has_admin_role(auth_session)
     )
+    workspace_base_preflight_candidate = bool(
+        auth_session is not None
+        and invite_code is None
+    )
     if conditional_read_candidate:
         with measure_workspace_stage("workspace_conditional_preflight"):
             preflight = await workspace_conditional_preflight(
@@ -6944,21 +7050,37 @@ async def get_tournament_workspace(
                                 etag=etag,
                             )
 
-    with measure_workspace_stage("workspace_tournament_base"):
-        row = (
-            await db_session.execute(
-                tournament_with_counts_stmt().where(Tournament.slug == slug)
+    workspace_base_snapshot: WorkspaceBasePreflight | None = None
+    if workspace_base_preflight_candidate:
+        with measure_workspace_stage("workspace_tournament_base"):
+            workspace_base_snapshot = await workspace_base_preflight(
+                db_session,
+                slug=slug,
+                user_id=auth_session.user.id,
             )
-        ).first()
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
-    (
-        tournament,
-        organizer_display_name,
-        organizer_avatar_asset_id,
-        participant_count,
-        locked_roster_count,
-    ) = row
+        if workspace_base_snapshot is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+        tournament = workspace_base_snapshot.tournament
+        organizer_display_name = workspace_base_snapshot.organizer_display_name
+        organizer_avatar_asset_id = workspace_base_snapshot.organizer_avatar_asset_id
+        participant_count = workspace_base_snapshot.participant_count
+        locked_roster_count = workspace_base_snapshot.locked_roster_count
+    else:
+        with measure_workspace_stage("workspace_tournament_base"):
+            row = (
+                await db_session.execute(
+                    tournament_with_counts_stmt().where(Tournament.slug == slug)
+                )
+            ).first()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+        (
+            tournament,
+            organizer_display_name,
+            organizer_avatar_asset_id,
+            participant_count,
+            locked_roster_count,
+        ) = row
     normalized_invite_code = normalize_invite_code(invite_code or "")
     invite_code_record = None
     has_valid_invite_code = False
@@ -6993,12 +7115,16 @@ async def get_tournament_workspace(
     participant_record: TournamentParticipant | None = None
     active_commitment: PlayerTournamentCommitmentResponse | None = None
     if auth_session is not None:
-        with measure_workspace_stage("workspace_access"):
-            participant_record, active_commitment = await workspace_access_for_user(
-                db_session,
-                tournament_id=tournament.id,
-                user_id=auth_session.user.id,
-            )
+        if workspace_base_snapshot is not None:
+            participant_record = workspace_base_snapshot.participant_record
+            active_commitment = workspace_base_snapshot.active_commitment
+        else:
+            with measure_workspace_stage("workspace_access"):
+                participant_record, active_commitment = await workspace_access_for_user(
+                    db_session,
+                    tournament_id=tournament.id,
+                    user_id=auth_session.user.id,
+                )
     current_user = None
     with measure_workspace_stage("workspace_serialization"):
         if include_current_user and auth_session is not None:
