@@ -21,6 +21,7 @@ QA_PHASE_RE = re.compile(
 )
 WORKSPACE_PERF_KEYS = (
     "workspace_auth_ms",
+    "workspace_conditional_preflight_ms",
     "workspace_tournament_base_ms",
     "workspace_media_ms",
     "workspace_access_ms",
@@ -490,7 +491,8 @@ class RequestPerformanceMiddleware:
             "redis_read_model_revisions=%s "
             "profile_read_model_metrics=%s tournament_profile_access_metrics=%s "
             "profile_read_model_fallback_count=%s "
-            "workspace_auth_ms=%.2f workspace_tournament_base_ms=%.2f "
+            "workspace_auth_ms=%.2f workspace_conditional_preflight_ms=%.2f "
+            "workspace_tournament_base_ms=%.2f "
             "workspace_media_ms=%.2f workspace_access_ms=%.2f "
             "workspace_invite_ms=%.2f workspace_bracket_ms=%.2f "
             "workspace_ready_check_ms=%.2f workspace_serialization_ms=%.2f "
@@ -554,6 +556,7 @@ class RequestPerformanceMiddleware:
             ) or "-",
             metrics.profile_read_model_fallback_count,
             metrics.workspace_stage_seconds.get("workspace_auth", 0.0) * 1000,
+            metrics.workspace_stage_seconds.get("workspace_conditional_preflight", 0.0) * 1000,
             metrics.workspace_stage_seconds.get("workspace_tournament_base", 0.0) * 1000,
             metrics.workspace_stage_seconds.get("workspace_media", 0.0) * 1000,
             metrics.workspace_stage_seconds.get("workspace_access", 0.0) * 1000,

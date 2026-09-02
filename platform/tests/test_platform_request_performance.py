@@ -127,6 +127,26 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         finally:
             performance.reset_request_metrics(token)
 
+    def test_workspace_log_exposes_conditional_preflight_stage(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        metrics = self.metrics(method="GET")
+        metrics.path = "/api/v1/tournaments/demo/workspace"
+        metrics.workspace_stage_seconds["workspace_conditional_preflight"] = 0.012
+        metrics.sql_time_seconds = 1.0
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings()),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            middleware._log_if_slow(
+                {"route": SimpleNamespace(path="/{slug}/workspace")},
+                metrics,
+                304,
+            )
+
+        rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
+        self.assertIn("workspace_conditional_preflight_ms=12.00", rendered)
+        self.assertIn("workspace_tournament_base_ms=0.00", rendered)
+
     def test_ready_vote_log_format_exposes_checkout_metrics(self) -> None:
         middleware = performance.RequestPerformanceMiddleware(app=None)
         metrics = self.metrics(method="POST")

@@ -83,6 +83,136 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    def test_workspace_etag_includes_viewer_ready_choice(self) -> None:
+        common = {
+            "tournament_id": "tournament-1",
+            "tournament_state_version": 12,
+            "workspace_view": "detail",
+            "participants_limit": 0,
+            "participants_offset": 0,
+            "include_current_user": False,
+            "user_id": "user-1",
+            "bracket_revision": 3,
+            "ready_check_state_version": 77,
+            "ready_round_id": 11,
+        }
+
+        self.assertNotEqual(
+            tournament_routes._workspace_etag_from_values(
+                **common,
+                ready_check_current_user_choice=None,
+            ),
+            tournament_routes._workspace_etag_from_values(
+                **common,
+                ready_check_current_user_choice="yes",
+            ),
+        )
+
+    def test_workspace_conditional_preflight_statement_is_one_read_shape(self) -> None:
+        statement = tournament_routes.workspace_conditional_preflight_stmt()
+        sql = str(statement.compile())
+
+        self.assertEqual(sql.upper().count("SELECT"), 8)
+        self.assertIn("tournament_deadlock_ready_votes", sql)
+        self.assertIn("tournament_deadlock_ready_vote_count_shards", sql)
+        self.assertNotIn("JOIN platform.users", sql)
+
+    async def test_conditional_detail_returns_304_from_one_preflight_query(self) -> None:
+        updated_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        tournament = SimpleNamespace(
+            id="tournament-1",
+            slug="night-cup",
+            visibility="public",
+            status="registration_closed",
+            format_slug="solo",
+            organizer_user_id="organizer-1",
+            updated_at=updated_at,
+            created_at=updated_at,
+            bracket_revision=0,
+        )
+        db_session = AsyncMock()
+        db_session.execute.return_value = Mock(
+            first=Mock(
+                return_value=(
+                    tournament,
+                    "registered",
+                    500,
+                    11,
+                    0,
+                    0,
+                    None,
+                )
+            )
+        )
+        auth_session = SimpleNamespace(
+            user=SimpleNamespace(id="user-1"),
+            role_slugs=frozenset(),
+        )
+        etag = tournament_routes._workspace_etag_from_values(
+            tournament_id="tournament-1",
+            tournament_state_version=tournament_routes.tournament_state_version(
+                tournament,
+                participant_count=500,
+            ),
+            workspace_view="detail",
+            participants_limit=0,
+            participants_offset=0,
+            include_current_user=False,
+            user_id="user-1",
+            bracket_revision=0,
+            ready_check_state_version=11_000_000,
+            ready_round_id=11,
+            ready_check_current_user_choice=None,
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/tournaments/night-cup/workspace",
+                "headers": [(b"if-none-match", etag.encode("ascii"))],
+                "query_string": (
+                    b"participants_limit=0&participants_offset=0&"
+                    b"workspace_view=detail&include_current_user=false"
+                ),
+                "scope": {"route": SimpleNamespace(path="/{slug}/workspace")},
+            }
+        )
+        response = Response()
+
+        with (
+            patch.object(
+                tournament_routes,
+                "tournament_media_descriptors",
+                AsyncMock(side_effect=AssertionError("304 must skip workspace build")),
+            ),
+            patch.object(
+                tournament_routes,
+                "workspace_access_for_user",
+                AsyncMock(side_effect=AssertionError("preflight owns access read")),
+            ),
+            patch.object(
+                tournament_routes,
+                "build_tournament_workspace_detail_bracket_response",
+                AsyncMock(side_effect=AssertionError("304 must skip bracket build")),
+            ),
+        ):
+            result = await tournament_routes.get_tournament_workspace(
+                slug="night-cup",
+                request=request,
+                response=response,
+                participants_limit=0,
+                participants_offset=0,
+                workspace_view="detail",
+                include_current_user=False,
+                invite_code=None,
+                auth_session=auth_session,
+                db_session=db_session,
+            )
+
+        self.assertEqual(result.status_code, 304)
+        self.assertEqual(result.headers["etag"], etag)
+        db_session.execute.assert_awaited_once()
+
     async def test_registration_open_detail_does_not_query_assignment_state(self) -> None:
         published_lookup = AsyncMock(return_value=None)
         tournament = SimpleNamespace(
