@@ -357,6 +357,36 @@ duplicate organizer-profile lookup when the main tournament query already
 returned an explicit missing avatar asset; it still needs a new production A/B
 run before being treated as an accepted optimization.
 
+## Read-mix A/B after duplicate avatar lookup removal (2026-09-02)
+
+The next canonical run was [workflow
+`33588749169`](https://github.com/StrayForest/old_sparky/actions/runs/33588749169),
+source SHA `7425e72ef90934ea6bb8a57bbffeb53936475f66`. It used the same
+20,000-user, 40-tournament × 500-user fixture, 128 external HTTP workers and
+10,000 conditional workspace refreshes. All 30,000 responses satisfied the
+profile contract and exact cleanup passed:
+
+- raw HTTP p50/p95/p99: `1792/3685/5050 ms`; wall time `432.030 s` and
+  `69.44 req/s`;
+- statuses: `20,000 × 200` and `10,000 × 304`, with no 503 or transport errors;
+- API cores averaged `98.57%` and `98.54%`; PostgreSQL averaged `18.95%` CPU;
+- PostgreSQL reached `51` connections and `7` waiting backends, with zero lock
+  waiters;
+- server `request_perf` p95/p99 was `3603/4865 ms`, SQL/request `5.753`, and
+  pool checkout p95/p99 `2668/3987 ms`;
+- all 20,000 users and 40 tournaments were removed, with no remaining
+  sessions or audit rows and the control account preserved.
+
+The stress decision was **`STRESS BEHAVIOR PASS`**. Compared with the prior
+A/B, wall time improved by 8.7%, p95 by 7.5%, p99 by 6.4%, and workspace SQL
+fell from `8.012` to `7.012` per request. The API remains CPU-bound at roughly
+98.5%; PostgreSQL CPU, locks and Redis latency remain below their ceilings.
+The next reviewed candidate adds a narrow conditional-detail fast path: after
+auth/access/version checks, an unchanged `If-None-Match` request returns `304`
+without serializing media, bracket, assignment or the full workspace. It is
+limited to the exact read-mix shape and must be validated by another canonical
+run before acceptance.
+
 ## Canonical commands
 
 ## Tournament lifecycle read models

@@ -86,6 +86,100 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(cover_media)
         self.assertIsNone(organizer_avatar_media)
 
+    async def test_conditional_detail_returns_304_before_building_workspace(self) -> None:
+        updated_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        tournament = SimpleNamespace(
+            id="tournament-1",
+            slug="night-cup",
+            visibility="public",
+            status="registration_closed",
+            format_slug="solo",
+            organizer_user_id="organizer-1",
+            updated_at=updated_at,
+            created_at=updated_at,
+            bracket_revision=0,
+        )
+        row = (tournament, "Organizer", None, 500, 0)
+        db_session = AsyncMock()
+        db_session.execute.return_value = Mock(first=Mock(return_value=row))
+        auth_session = SimpleNamespace(
+            user=SimpleNamespace(id="user-1"),
+            role_slugs=frozenset(),
+        )
+        participant = SimpleNamespace(status="active")
+        ready_check = SimpleNamespace(
+            state_version=77,
+            active_round=SimpleNamespace(id=11),
+            latest_round=SimpleNamespace(id=11),
+        )
+        etag = tournament_routes._workspace_etag_from_values(
+            tournament_id="tournament-1",
+            tournament_state_version=tournament_routes.tournament_state_version(
+                tournament,
+                participant_count=500,
+            ),
+            workspace_view="detail",
+            participants_limit=0,
+            participants_offset=0,
+            include_current_user=False,
+            user_id="user-1",
+            bracket_revision=0,
+            ready_check_state_version=77,
+            ready_round_id=11,
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/tournaments/night-cup/workspace",
+                "headers": [
+                    (b"if-none-match", etag.encode("ascii")),
+                ],
+                "query_string": (
+                    b"participants_limit=0&participants_offset=0&"
+                    b"workspace_view=detail&include_current_user=false"
+                ),
+                "scope": {"route": SimpleNamespace(path="/{slug}/workspace")},
+            }
+        )
+        response = Response()
+
+        with (
+            patch.object(
+                tournament_routes,
+                "workspace_access_for_user",
+                AsyncMock(return_value=(participant, None)),
+            ) as access,
+            patch.object(
+                tournament_routes,
+                "build_deadlock_ready_check_state_response",
+                AsyncMock(return_value=ready_check),
+            ) as ready_state,
+            patch.object(
+                tournament_routes,
+                "tournament_media_descriptors",
+                AsyncMock(side_effect=AssertionError("workspace build must be skipped")),
+            ),
+        ):
+            result = await tournament_routes.get_tournament_workspace(
+                slug="night-cup",
+                request=request,
+                response=response,
+                participants_limit=0,
+                participants_offset=0,
+                workspace_view="detail",
+                include_current_user=False,
+                invite_code=None,
+                auth_session=auth_session,
+                db_session=db_session,
+            )
+
+        self.assertEqual(result.status_code, 304)
+        self.assertEqual(result.headers["etag"], etag)
+        access.assert_awaited_once()
+        ready_state.assert_awaited_once()
+        db_session.execute.assert_awaited_once()
+
     async def test_unversioned_ready_state_loads_round_and_counts_in_one_query(self) -> None:
         created_at = datetime.now(timezone.utc)
         round_row = SimpleNamespace(
