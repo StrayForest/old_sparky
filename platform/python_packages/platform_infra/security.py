@@ -220,6 +220,10 @@ class AuthenticatedSession:
     session: UserSession
     role_slugs: frozenset[str]
     now: datetime
+    # Only the workspace conditional-read dependency sets this marker.  The
+    # conditional preflight validates the cached session in the same SQL
+    # round-trip that supplies the representation revision.
+    workspace_validation_deferred: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,6 +633,7 @@ async def _resolve_optional_authenticated_session(
     db_session: AsyncSession,
     *,
     touch_session: bool,
+    defer_cached_validation: bool = False,
 ) -> AuthenticatedSession | None:
     workspace_auth_started = time.perf_counter()
     try:
@@ -636,6 +641,7 @@ async def _resolve_optional_authenticated_session(
             request,
             db_session,
             touch_session=touch_session,
+            defer_cached_validation=defer_cached_validation,
         )
     finally:
         record_workspace_stage(
@@ -649,6 +655,7 @@ async def _resolve_optional_authenticated_session_impl(
     db_session: AsyncSession,
     *,
     touch_session: bool,
+    defer_cached_validation: bool = False,
 ) -> AuthenticatedSession | None:
     settings = get_settings()
     token = request.cookies.get(settings.platform_session_cookie_name)
@@ -666,8 +673,11 @@ async def _resolve_optional_authenticated_session_impl(
     if email_verification_required(settings):
         user_predicates.append(
             (User.email.is_(None)) | (User.email_verified_at.is_not(None))
-        )
+    )
     if cached_session is not None:
+        if defer_cached_validation:
+            cached_session.workspace_validation_deferred = True
+            return cached_session
         try:
             cached_session_is_current = await db_session.scalar(
                 select(UserSession.id)
@@ -731,6 +741,41 @@ async def get_optional_authenticated_session(
         request,
         db_session,
         touch_session=False,
+    )
+
+
+def _is_workspace_conditional_read_request(request: Request) -> bool:
+    """Recognize the one workspace shape whose preflight validates auth."""
+
+    if not request.headers.get("if-none-match", "").strip():
+        return False
+    query = request.query_params
+    return (
+        query.get("participants_limit") == "0"
+        and query.get("participants_offset") == "0"
+        and query.get("workspace_view") == "detail"
+        and query.get("include_current_user") == "false"
+        and query.get("invite_code") is None
+    )
+
+
+async def get_optional_authenticated_session_for_workspace(
+    request: Request,
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AuthenticatedSession | None:
+    """Use the workspace conditional preflight for cached-session validation.
+
+    A matching conditional workspace read already has to query the database
+    for the current tournament revision and viewer state.  Deferring only
+    the optional-auth cache validation to that query removes one SQL read
+    without trusting a process-local cache for authorization.
+    """
+
+    return await _resolve_optional_authenticated_session(
+        request,
+        db_session,
+        touch_session=False,
+        defer_cached_validation=_is_workspace_conditional_read_request(request),
     )
 
 
