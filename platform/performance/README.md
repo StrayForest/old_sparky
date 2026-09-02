@@ -509,15 +509,58 @@ The profile contract, origin-safety checks and exact cleanup all passed:
 - exact cleanup removed all 20,000 users and 40 tournaments, with no remaining
   sessions or audit rows and the control account preserved.
 
-The result is **`STRESS BEHAVIOR PASS`**. Wall time improved by `26.1%`
+The result was **`STRESS BEHAVIOR PASS`**. Wall time improved by `26.1%`
 against the prior baseline and by `15.2%` against the immediately preceding
 conditional-304 candidate (`33614703285`). The initial read phase improved
 from `1849 ms` to `1576 ms` average versus the baseline; conditional refresh
-latency remained within the same range (`1342 ms` in this run). The large
-gain is consistent with removing one database checkout from authenticated
-initial workspace reads; API CPU remains the limiting resource, while
-PostgreSQL and Redis remain below their resource ceilings. Production now
-retains this combined preflight plus the proven conditional 304 path.
+latency remained within the same range (`1342 ms` in this run). This remains
+the previous accepted workspace baseline for the next A/B below. The large
+gain was consistent with removing one database checkout from authenticated
+initial workspace reads; API CPU remained the limiting resource, while
+PostgreSQL and Redis stayed below their resource ceilings.
+
+## Read-mix A/B after combined workspace base/access/Ready Check preflight (2026-09-02)
+
+The next candidate was deployed through [production deploy
+`33624720919`](https://github.com/StrayForest/old_sparky/actions/runs/33624720919),
+source SHA `4be82f1a9e682fda8bee990667b962f1f46e0b58`. It extends the cached
+workspace base/access preflight with the selected Ready Check round, its
+counter-shard common counts and the requesting user's vote overlay. The
+workspace response contract is unchanged; the direct Ready Check endpoint,
+vote mutation path and workflow writers remain authoritative and unchanged.
+There is no schema or migration change. The canonical 20,000-user,
+40-tournament × 500-user fixture, 128 external HTTP workers and 10,000
+conditional workspace refreshes were measured by [workflow
+`33625164162`](https://github.com/StrayForest/old_sparky/actions/runs/33625164162).
+The profile contract, origin-safety checks and exact cleanup all passed:
+
+- raw HTTP p50/p95/p99: `1212/2382/3492 ms`; wall time `301.757 s` and
+  `99.418 req/s`;
+- statuses: `20,000 × 200` and `10,000 × 304`, with zero errors, retries,
+  shedding or unexpected statuses;
+- API cores averaged `98.40%` and `98.58%`; PostgreSQL averaged `23.21%`
+  CPU and reached `46.76%` at peak;
+- PostgreSQL waiting backends peaked at `4`, while lock waiters and ungranted
+  locks stayed at `0`; workspace server pool checkout p95/p99 was
+  `1659/2656 ms`;
+- workspace request diagnostics fell from `4.501` to `4.018` SQL/request and
+  from `278.235` to `228.691 ms` average DB time versus the previous accepted
+  baseline; workspace pool checkout p95 fell from `2068` to `1659 ms`;
+- exact cleanup removed all 20,000 users and 40 tournaments, with no remaining
+  sessions or audit rows and the control account preserved.
+
+The result is **`STRESS BEHAVIOR PASS`**. Wall time improved by `14.5%`
+against the previous accepted workspace baseline (`353.045 s` → `301.757 s`),
+and throughput increased by `17.0%` (`84.975` → `99.418 req/s`). The initial
+read phase in this run had average/p50/p95/p99 `1319/1253/2731/3720 ms`,
+versus `1576/1364/3620/4668 ms` in the preceding candidate. The conditional
+refresh sample was also faster (`1208 ms` average), but this candidate does
+not claim that change because matching `304` requests use the existing
+conditional preflight. The workspace Ready Check stage no longer performs a
+separate read; its state is materialized from the combined preflight. API CPU
+remains the limiting resource, while PostgreSQL and Redis remain below their
+resource ceilings. Production now retains this combined
+base/access/Ready-Check preflight plus the proven conditional 304 path.
 
 ## Canonical commands
 

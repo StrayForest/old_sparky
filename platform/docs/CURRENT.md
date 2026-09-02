@@ -118,16 +118,17 @@ is a manual operator gate, never ordinary CI, and every run requires exact
 cleanup or abort handling before another run.
 
 The current production read-mix winner is source
-`227a076bac3a3cfd42e8c62901ce2a29928ddd52`, deployed by
-`33618864270`. It retains the revision-based single-query conditional 304
-preflight and combines tournament base data with authenticated viewer
-access/commitment data for ordinary workspace reads without an invite code.
-Canonical production workflow `33619193304` passed with 20,000 users,
-40×500 tournaments, 20,000 successful `200` reads and 10,000 valid `304`
-refreshes; wall time was `353.045 s`, raw p95/p99 was `2908/4414 ms`, and
-both API cores averaged roughly `98.35%`. Workspace diagnostics measured
-`4.501` SQL/request, `278.235 ms` average DB time and `2068 ms` pool checkout
-p95, versus baseline `6.018`, `438.892 ms` and `3557 ms`. PostgreSQL lock
+`4be82f1a9e682fda8bee990667b962f1f46e0b58`, deployed by
+`33624720919`. It retains the revision-based single-query conditional 304
+preflight and combines tournament base data, authenticated viewer
+access/commitment data and the Ready Check common state plus viewer vote into
+one workspace preflight for requests without an invite code. Canonical
+production workflow `33625164162` passed with 20,000 users, 40×500
+tournaments, 20,000 successful `200` reads and 10,000 valid `304` refreshes;
+wall time was `301.757 s`, raw p95/p99 was `2382/3492 ms`, and API cores
+averaged `98.40%`/`98.58%`. Workspace diagnostics measured `4.018`
+SQL/request, `228.691 ms` average DB time and `1659 ms` pool checkout p95,
+versus the previous `4.501`, `278.235 ms` and `2068 ms`. PostgreSQL lock
 waiters stayed at zero, and exact cleanup removed all fixture users,
 tournaments, sessions and audit rows while preserving the control account.
 The earlier conditional-detail fast path and diagnostic sampling candidates
