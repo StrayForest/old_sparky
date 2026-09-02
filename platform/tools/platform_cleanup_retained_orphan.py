@@ -39,6 +39,7 @@ from platform_cleanup_retained_matrix import (
 
 RUN_ROOT_BASE = Path("/opt/oldsparky/platform/shared/production-retained-matrix")
 SUPPORTED_MODES = frozenset({"read-mix", "write-burst"})
+LEGACY_EXTERNAL_VOTE_MODE = "external-vote"
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +59,17 @@ def _canonical_report_path(*, run_id: str, mode: str) -> str:
     return str(RUN_ROOT_BASE / f"gha-{run_id}" / mode / f"{mode}.json")
 
 
+def _legacy_external_vote_report_path(*, run_id: str) -> str:
+    if not re.fullmatch(r"[0-9]+", run_id):
+        raise RuntimeError("load run id must be numeric")
+    return str(
+        RUN_ROOT_BASE
+        / f"gha-{run_id}"
+        / LEGACY_EXTERNAL_VOTE_MODE
+        / f"{LEGACY_EXTERNAL_VOTE_MODE}.json"
+    )
+
+
 def build_durable_manifest(
     run: Any,
     *,
@@ -68,9 +80,23 @@ def build_durable_manifest(
 
     stored = dict(run.report or {})
     mode = str(stored.get("mode") or "")
-    report_path = _canonical_report_path(run_id=load_run_id, mode=mode)
+    canonical_report_path = _canonical_report_path(run_id=load_run_id, mode=mode)
+    legacy_report_path = _legacy_external_vote_report_path(run_id=load_run_id)
+    stored_run_path = str(run.report_path or "")
     if (
-        str(run.report_path or "") != report_path
+        mode == "write-burst"
+        and stored_run_path == legacy_report_path
+        and isinstance(stored.get("external_vote"), dict)
+    ):
+        # The first external-vote supervisor stored a write-burst report below
+        # its transport-specific directory. Keep this narrow compatibility
+        # path so an interrupted legacy run can be cleaned from its durable
+        # inventory after the filesystem report is gone.
+        report_path = legacy_report_path
+    else:
+        report_path = canonical_report_path
+    if (
+        stored_run_path != report_path
         or str(stored.get("report_path") or "") != report_path
     ):
         raise RuntimeError("durable QA report path does not match the exact load run")
@@ -143,6 +169,7 @@ async def clean_orphan(args: argparse.Namespace) -> dict[str, Any]:
         _canonical_report_path(run_id=args.load_run_id, mode=mode)
         for mode in SUPPORTED_MODES
     }
+    report_paths.add(_legacy_external_vote_report_path(run_id=args.load_run_id))
     async with session_factory()() as db_session:
         rows = list(
             (

@@ -53,6 +53,54 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
                 control_email="control@example.com",
             )
 
+    def test_builds_manifest_for_legacy_external_vote_report(self) -> None:
+        marker = "preprod260829000001abcd"
+        report_path = cleanup._legacy_external_vote_report_path(run_id="12345")
+        run = self._run(
+            mode="write-burst",
+            report_path=report_path,
+            report={
+                "marker": marker,
+                "origin": cleanup.EXPECTED_ORIGIN,
+                "request_origin": cleanup.EXPECTED_ORIGIN,
+                "mode": "write-burst",
+                "report_path": report_path,
+                "external_vote": {"tournament_count": 11},
+                "user_ids": ["00000000-0000-0000-0000-000000000001"],
+                "tournament_ids": [],
+            },
+        )
+
+        manifest = cleanup.build_durable_manifest(
+            run,
+            load_run_id="12345",
+            control_email="control@example.com",
+        )
+
+        self.assertEqual(manifest["mode"], "write-burst")
+        self.assertEqual(manifest["rows"][0]["report_path"], report_path)
+
+    def test_legacy_external_vote_path_requires_report_metadata(self) -> None:
+        report_path = cleanup._legacy_external_vote_report_path(run_id="12345")
+        with self.assertRaisesRegex(RuntimeError, "report path"):
+            cleanup.build_durable_manifest(
+                self._run(
+                    mode="write-burst",
+                    report_path=report_path,
+                    report={
+                        "marker": "preprod260829000001abcd",
+                        "origin": cleanup.EXPECTED_ORIGIN,
+                        "request_origin": cleanup.EXPECTED_ORIGIN,
+                        "mode": "write-burst",
+                        "report_path": report_path,
+                        "user_ids": ["00000000-0000-0000-0000-000000000001"],
+                        "tournament_ids": [],
+                    },
+                ),
+                load_run_id="12345",
+                control_email="control@example.com",
+            )
+
     def test_refuses_already_cleaned_row(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "already records cleanup"):
             cleanup.build_durable_manifest(
