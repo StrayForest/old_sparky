@@ -276,6 +276,7 @@ from python_packages.platform_infra.security import (
 )
 from python_packages.platform_infra.performance import (
     current_request_metrics,
+    measure_workspace_stage,
     record_profile_read_model_event,
     record_ready_vote_span,
     record_tournament_profile_access_event,
@@ -1813,6 +1814,33 @@ def can_view_tournament_workspace_data(
         )
     except TournamentWorkflowError:
         return False
+
+
+def should_include_workspace_invite_code(
+    tournament: Tournament,
+    *,
+    auth_session,
+    participant_record: TournamentParticipant | None,
+    workspace_visible: bool,
+) -> bool:
+    """Keep invite-code reads off active participant workspace requests.
+
+    The code remains part of the public workspace contract for anonymous and
+    non-member visitors, and managers still need it for sharing/management.
+    An active participant already has access and does not need the code to
+    register, so that read is the safe optimization boundary.
+    """
+
+    if not workspace_visible:
+        return False
+    if auth_session is not None and (
+        tournament.organizer_user_id == auth_session.user.id
+        or auth_session_has_admin_role(auth_session)
+    ):
+        return True
+    if participant_record is None:
+        return True
+    return participant_status_is_inactive(participant_record.status)
 
 
 async def tournament_participant_page(
@@ -6592,9 +6620,10 @@ async def get_tournament_workspace(
     if public_snapshot_candidate:
         snapshot = _get_public_workspace_snapshot_cache(slug)
         if snapshot is not None:
-            current_tournament = await db_session.scalar(
-                select(Tournament).where(Tournament.slug == slug)
-            )
+            with measure_workspace_stage("workspace_tournament_base"):
+                current_tournament = await db_session.scalar(
+                    select(Tournament).where(Tournament.slug == slug)
+                )
             if current_tournament is not None:
                 ensure_tournament_summary_visible(current_tournament, auth_session)
                 if (
@@ -6606,11 +6635,12 @@ async def get_tournament_workspace(
                     participant_record: TournamentParticipant | None = None
                     active_commitment: PlayerTournamentCommitmentResponse | None = None
                     if auth_session is not None:
-                        participant_record, active_commitment = await workspace_access_for_user(
-                            db_session,
-                            tournament_id=current_tournament.id,
-                            user_id=auth_session.user.id,
-                        )
+                        with measure_workspace_stage("workspace_access"):
+                            participant_record, active_commitment = await workspace_access_for_user(
+                                db_session,
+                                tournament_id=current_tournament.id,
+                                user_id=auth_session.user.id,
+                            )
                     current_user_is_organizer = bool(
                         auth_session is not None
                         and current_tournament.organizer_user_id == auth_session.user.id
@@ -6621,35 +6651,41 @@ async def get_tournament_workspace(
                         and not auth_session_has_admin_role(auth_session)
                     ):
                         server_time = datetime.now(UTC)
-                        workspace_response = snapshot.response.model_copy(
-                            update={
-                                "server_time": server_time,
-                                "current_user_active_commitment": active_commitment,
-                            }
-                        )
-                        etag = _workspace_response_etag(
-                            workspace_response,
-                            workspace_view=workspace_view,
-                            participants_limit=participants_limit,
-                            participants_offset=participants_offset,
-                            include_current_user=include_current_user,
-                            user_id=(
-                                auth_session.user.id
-                                if auth_session is not None
-                                else "anonymous"
-                            ),
-                        )
-                        not_modified = _conditional_response(request, response, etag=etag)
-                        return not_modified or _serialized_model_response(
-                            workspace_response,
-                            etag=etag,
-                        )
+                        with measure_workspace_stage("workspace_serialization"):
+                            workspace_response = snapshot.response.model_copy(
+                                update={
+                                    "server_time": server_time,
+                                    "current_user_active_commitment": active_commitment,
+                                }
+                            )
+                        with measure_workspace_stage("workspace_etag"):
+                            etag = _workspace_response_etag(
+                                workspace_response,
+                                workspace_view=workspace_view,
+                                participants_limit=participants_limit,
+                                participants_offset=participants_offset,
+                                include_current_user=include_current_user,
+                                user_id=(
+                                    auth_session.user.id
+                                    if auth_session is not None
+                                    else "anonymous"
+                                ),
+                            )
+                            not_modified = _conditional_response(request, response, etag=etag)
+                        if not_modified is not None:
+                            return not_modified
+                        with measure_workspace_stage("workspace_serialization"):
+                            return _serialized_model_response(
+                                workspace_response,
+                                etag=etag,
+                            )
 
-    row = (
-        await db_session.execute(
-            tournament_with_counts_stmt().where(Tournament.slug == slug)
-        )
-    ).first()
+    with measure_workspace_stage("workspace_tournament_base"):
+        row = (
+            await db_session.execute(
+                tournament_with_counts_stmt().where(Tournament.slug == slug)
+            )
+        ).first()
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
     (
@@ -6662,84 +6698,96 @@ async def get_tournament_workspace(
     normalized_invite_code = normalize_invite_code(invite_code or "")
     invite_code_record = None
     has_valid_invite_code = False
-    if normalized_invite_code:
-        invite_code_record = await db_session.scalar(
-            select(TournamentInvite).where(
-                TournamentInvite.tournament_id == tournament.id,
-                TournamentInvite.code == normalized_invite_code,
+    with measure_workspace_stage("workspace_invite"):
+        if normalized_invite_code:
+            invite_code_record = await db_session.scalar(
+                select(TournamentInvite).where(
+                    TournamentInvite.tournament_id == tournament.id,
+                    TournamentInvite.code == normalized_invite_code,
+                )
             )
-        )
-        has_valid_invite_code = bool(
-            invite_code_record is not None
-            and invite_code_record.revoked_at is None
-            and (
-                invite_code_record.expires_at is None
-                or invite_code_record.expires_at > datetime.now(UTC)
+            has_valid_invite_code = bool(
+                invite_code_record is not None
+                and invite_code_record.revoked_at is None
+                and (
+                    invite_code_record.expires_at is None
+                    or invite_code_record.expires_at > datetime.now(UTC)
+                )
             )
-        )
     ensure_tournament_summary_visible(
         tournament,
         auth_session,
         has_valid_invite_code=has_valid_invite_code,
     )
-    cover_media, organizer_avatar_media = await tournament_media_descriptors(
-        db_session,
-        tournament,
-        organizer_avatar_asset_id=organizer_avatar_asset_id,
-    )
+    with measure_workspace_stage("workspace_media"):
+        cover_media, organizer_avatar_media = await tournament_media_descriptors(
+            db_session,
+            tournament,
+            organizer_avatar_asset_id=organizer_avatar_asset_id,
+        )
 
     participant_record: TournamentParticipant | None = None
     active_commitment: PlayerTournamentCommitmentResponse | None = None
     if auth_session is not None:
-        participant_record, active_commitment = await workspace_access_for_user(
-            db_session,
-            tournament_id=tournament.id,
-            user_id=auth_session.user.id,
-        )
-    current_user = None
-    if include_current_user and auth_session is not None:
-        current_user = await serialize_current_user(
-            db_session,
-            auth_session.user,
-            role_slugs=auth_session.role_slugs,
-            private_tournament_monthly_remaining=await private_tournament_monthly_remaining(
+        with measure_workspace_stage("workspace_access"):
+            participant_record, active_commitment = await workspace_access_for_user(
                 db_session,
-                organizer_user_id=auth_session.user.id,
-                now=auth_session.now,
-            ),
-            private_tournament_monthly_limit=PRIVATE_TOURNAMENT_MONTHLY_LIMIT,
-        )
+                tournament_id=tournament.id,
+                user_id=auth_session.user.id,
+            )
+    current_user = None
+    with measure_workspace_stage("workspace_serialization"):
+        if include_current_user and auth_session is not None:
+            current_user = await serialize_current_user(
+                db_session,
+                auth_session.user,
+                role_slugs=auth_session.role_slugs,
+                private_tournament_monthly_remaining=await private_tournament_monthly_remaining(
+                    db_session,
+                    organizer_user_id=auth_session.user.id,
+                    now=auth_session.now,
+                ),
+                private_tournament_monthly_limit=PRIVATE_TOURNAMENT_MONTHLY_LIMIT,
+            )
 
-    has_participant_record = participant_record is not None
-    workspace_visible = can_view_tournament_workspace_data(
+    with measure_workspace_stage("workspace_access"):
+        has_participant_record = participant_record is not None
+        workspace_visible = can_view_tournament_workspace_data(
+            tournament,
+            auth_session=auth_session,
+            has_participant_record=has_participant_record,
+            has_valid_invite_code=has_valid_invite_code,
+        )
+    invite_code = None
+    if should_include_workspace_invite_code(
         tournament,
         auth_session=auth_session,
-        has_participant_record=has_participant_record,
-        has_valid_invite_code=has_valid_invite_code,
-    )
-    invite_code = None
-    if workspace_visible:
-        invite_code = await db_session.scalar(
-            select(TournamentInvite.code)
-            .where(
-                TournamentInvite.tournament_id == tournament.id,
-                TournamentInvite.revoked_at.is_(None),
+        participant_record=participant_record,
+        workspace_visible=workspace_visible,
+    ):
+        with measure_workspace_stage("workspace_invite"):
+            invite_code = await db_session.scalar(
+                select(TournamentInvite.code)
+                .where(
+                    TournamentInvite.tournament_id == tournament.id,
+                    TournamentInvite.revoked_at.is_(None),
+                )
+                .order_by(TournamentInvite.created_at.asc())
+                .limit(1)
             )
-            .order_by(TournamentInvite.created_at.asc())
-            .limit(1)
+    with measure_workspace_stage("workspace_serialization"):
+        tournament_response = serialize_tournament(
+            tournament,
+            organizer_display_name,
+            int(participant_count),
+            cover_media=cover_media,
+            organizer_avatar_media=organizer_avatar_media,
+            has_locked_deadlock_roster=bool(int(locked_roster_count)),
+            current_user_participant_status=(
+                participant_record.status if participant_record is not None else None
+            ),
+            invite_code=invite_code,
         )
-    tournament_response = serialize_tournament(
-        tournament,
-        organizer_display_name,
-        int(participant_count),
-        cover_media=cover_media,
-        organizer_avatar_media=organizer_avatar_media,
-        has_locked_deadlock_roster=bool(int(locked_roster_count)),
-        current_user_participant_status=(
-            participant_record.status if participant_record is not None else None
-        ),
-        invite_code=invite_code,
-    )
     if not workspace_visible:
         if tournament.visibility == "invite_only":
             raise HTTPException(
@@ -6747,40 +6795,46 @@ async def get_tournament_workspace(
                 detail="A valid invite code or tournament membership is required.",
             )
         server_time = datetime.now(UTC)
-        workspace_response = TournamentWorkspaceResponse(
-            tournament=tournament_response,
-            server_time=server_time,
-            current_user=current_user,
-            current_user_active_commitment=active_commitment,
-            participants=[],
-            participants_total=0,
-            participants_limit=participants_limit,
-            participants_offset=participants_offset,
-            participants_has_more=False,
-            participants_available=False,
-            bracket=None,
-            ready_check=None,
-            auto_assignment=None,
-            state_version=tournament_response.state_version,
-        )
-        etag = _workspace_response_etag(
-            workspace_response,
-            workspace_view=workspace_view,
-            participants_limit=participants_limit,
-            participants_offset=participants_offset,
-            include_current_user=include_current_user,
-            user_id=auth_session.user.id if auth_session is not None else "anonymous",
-        )
-        not_modified = _conditional_response(request, response, etag=etag)
-        return not_modified or _serialized_model_response(workspace_response, etag=etag)
+        with measure_workspace_stage("workspace_serialization"):
+            workspace_response = TournamentWorkspaceResponse(
+                tournament=tournament_response,
+                server_time=server_time,
+                current_user=current_user,
+                current_user_active_commitment=active_commitment,
+                participants=[],
+                participants_total=0,
+                participants_limit=participants_limit,
+                participants_offset=participants_offset,
+                participants_has_more=False,
+                participants_available=False,
+                bracket=None,
+                ready_check=None,
+                auto_assignment=None,
+                state_version=tournament_response.state_version,
+            )
+        with measure_workspace_stage("workspace_etag"):
+            etag = _workspace_response_etag(
+                workspace_response,
+                workspace_view=workspace_view,
+                participants_limit=participants_limit,
+                participants_offset=participants_offset,
+                include_current_user=include_current_user,
+                user_id=auth_session.user.id if auth_session is not None else "anonymous",
+            )
+            not_modified = _conditional_response(request, response, etag=etag)
+        if not_modified is not None:
+            return not_modified
+        with measure_workspace_stage("workspace_serialization"):
+            return _serialized_model_response(workspace_response, etag=etag)
 
     if participants_limit > 0:
-        participants, participants_total, participants_has_more = await tournament_participant_page(
-            db_session,
-            tournament_id=tournament.id,
-            limit=participants_limit,
-            offset=participants_offset,
-        )
+        with measure_workspace_stage("workspace_tournament_base"):
+            participants, participants_total, participants_has_more = await tournament_participant_page(
+                db_session,
+                tournament_id=tournament.id,
+                limit=participants_limit,
+                offset=participants_offset,
+            )
     else:
         participants = []
         participants_total = int(participant_count)
@@ -6799,31 +6853,26 @@ async def get_tournament_workspace(
     assignment_published_run: TournamentDeadlockAssignmentRun | None = None
     is_solo_format = is_solo_tournament_format(tournament.format_slug)
     assignment_runs_loaded = not is_solo_format
-    if is_solo_format and current_user_is_organizer and workspace_view != "bracket_summary":
-        assignment_latest_run, assignment_published_run = await deadlock_auto_assignment_state_runs_for_tournament(
-            db_session,
-            tournament_id=tournament.id,
-        )
-        assignment_runs_loaded = True
-    if workspace_view == "bracket_summary":
-        bracket = build_tournament_workspace_bracket_summary_response(
-            tournament=tournament,
-            can_manage=current_user_can_manage_bracket,
-        )
-    elif workspace_view == "detail":
-        bracket = await build_tournament_workspace_detail_bracket_response(
-            db_session,
-            tournament=tournament,
-            can_manage=current_user_can_manage_bracket,
-        )
-    else:
-        bracket = await build_tournament_bracket_response(
-            db_session,
-            tournament=tournament,
-            auth_session=auth_session,
-            has_participant_record=has_participant_record,
-            has_valid_invite_code=has_valid_invite_code,
-        )
+    with measure_workspace_stage("workspace_bracket"):
+        if workspace_view == "bracket_summary":
+            bracket = build_tournament_workspace_bracket_summary_response(
+                tournament=tournament,
+                can_manage=current_user_can_manage_bracket,
+            )
+        elif workspace_view == "detail":
+            bracket = await build_tournament_workspace_detail_bracket_response(
+                db_session,
+                tournament=tournament,
+                can_manage=current_user_can_manage_bracket,
+            )
+        else:
+            bracket = await build_tournament_bracket_response(
+                db_session,
+                tournament=tournament,
+                auth_session=auth_session,
+                has_participant_record=has_participant_record,
+                has_valid_invite_code=has_valid_invite_code,
+            )
     ready_check: TournamentDeadlockReadyCheckStateResponse | None = None
     auto_assignment: TournamentDeadlockAutoAssignmentStateResponse | None = None
     current_user_can_view_deadlock_state = bool(
@@ -6836,41 +6885,49 @@ async def get_tournament_workspace(
             )
         )
     )
-    if current_user_can_view_deadlock_state and is_solo_format and workspace_view != "bracket_summary":
-        ready_check = await build_deadlock_ready_check_state_response(
-            db_session,
-            tournament_id=tournament.id,
-            current_user_id=auth_session.user.id,
-            tournament_bracket_revision=tournament.bracket_revision,
-        )
-    if current_user_is_organizer and is_solo_format and workspace_view != "bracket_summary":
-        auto_assignment = await build_deadlock_auto_assignment_state_response(
-            db_session,
-            tournament=tournament,
-            auth_session=auth_session,
-            include_freshness=False,
-            latest_run=assignment_latest_run,
-            published_run=assignment_published_run,
-            assignment_runs_loaded=assignment_runs_loaded,
-        )
+    with measure_workspace_stage("workspace_ready_check"):
+        if is_solo_format and current_user_is_organizer and workspace_view != "bracket_summary":
+            assignment_latest_run, assignment_published_run = await deadlock_auto_assignment_state_runs_for_tournament(
+                db_session,
+                tournament_id=tournament.id,
+            )
+            assignment_runs_loaded = True
+        if current_user_can_view_deadlock_state and is_solo_format and workspace_view != "bracket_summary":
+            ready_check = await build_deadlock_ready_check_state_response(
+                db_session,
+                tournament_id=tournament.id,
+                current_user_id=auth_session.user.id,
+                tournament_bracket_revision=tournament.bracket_revision,
+            )
+        if current_user_is_organizer and is_solo_format and workspace_view != "bracket_summary":
+            auto_assignment = await build_deadlock_auto_assignment_state_response(
+                db_session,
+                tournament=tournament,
+                auth_session=auth_session,
+                include_freshness=False,
+                latest_run=assignment_latest_run,
+                published_run=assignment_published_run,
+                assignment_runs_loaded=assignment_runs_loaded,
+            )
 
     server_time = datetime.now(UTC)
-    workspace_response = TournamentWorkspaceResponse(
-        tournament=tournament_response,
-        server_time=server_time,
-        current_user=current_user,
-        current_user_active_commitment=active_commitment,
-        participants=participants,
-        participants_total=participants_total,
-        participants_limit=participants_limit,
-        participants_offset=participants_offset,
-        participants_has_more=participants_has_more,
-        participants_available=True,
-        bracket=bracket,
-        ready_check=ready_check,
-        auto_assignment=auto_assignment,
-        state_version=tournament_response.state_version,
-    )
+    with measure_workspace_stage("workspace_serialization"):
+        workspace_response = TournamentWorkspaceResponse(
+            tournament=tournament_response,
+            server_time=server_time,
+            current_user=current_user,
+            current_user_active_commitment=active_commitment,
+            participants=participants,
+            participants_total=participants_total,
+            participants_limit=participants_limit,
+            participants_offset=participants_offset,
+            participants_has_more=participants_has_more,
+            participants_available=True,
+            bracket=bracket,
+            ready_check=ready_check,
+            auto_assignment=auto_assignment,
+            state_version=tournament_response.state_version,
+        )
     if (
         public_snapshot_candidate
         and tournament.visibility == "public"
@@ -6893,16 +6950,20 @@ async def get_tournament_workspace(
                 }
             ),
         )
-    etag = _workspace_response_etag(
-        workspace_response,
-        workspace_view=workspace_view,
-        participants_limit=participants_limit,
-        participants_offset=participants_offset,
-        include_current_user=include_current_user,
-        user_id=auth_session.user.id if auth_session is not None else "anonymous",
-    )
-    not_modified = _conditional_response(request, response, etag=etag)
-    return not_modified or _serialized_model_response(workspace_response, etag=etag)
+    with measure_workspace_stage("workspace_etag"):
+        etag = _workspace_response_etag(
+            workspace_response,
+            workspace_view=workspace_view,
+            participants_limit=participants_limit,
+            participants_offset=participants_offset,
+            include_current_user=include_current_user,
+            user_id=auth_session.user.id if auth_session is not None else "anonymous",
+        )
+        not_modified = _conditional_response(request, response, etag=etag)
+    if not_modified is not None:
+        return not_modified
+    with measure_workspace_stage("workspace_serialization"):
+        return _serialized_model_response(workspace_response, etag=etag)
 
 
 @router.get("/{slug}", response_model=TournamentResponse)

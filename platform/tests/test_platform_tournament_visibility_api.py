@@ -555,6 +555,15 @@ class PlatformTournamentVisibilityApiTests(unittest.IsolatedAsyncioTestCase):
             201,
         )
 
+        participant_workspace = self._assert_status(
+            await outsider["client"].get(
+                f"/api/v1/tournaments/{slug}/workspace",
+                params={"participants_limit": 0, "workspace_view": "bracket_summary"},
+            ),
+            200,
+        )
+        self.assertIsNone(participant_workspace["tournament"]["invite_code"])
+
         visible_participants = self._assert_status(
             await outsider["client"].get(f"/api/v1/tournaments/{slug}/participants"),
             200,

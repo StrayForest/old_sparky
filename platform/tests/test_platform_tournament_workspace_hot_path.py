@@ -38,6 +38,51 @@ class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SELECT count(", sql)
         self.assertNotIn("GROUP BY", sql)
 
+    def test_active_participant_workspace_does_not_load_invite_code(self) -> None:
+        tournament = SimpleNamespace(
+            organizer_user_id="organizer-1",
+            visibility="invite_only",
+        )
+        active_participant = SimpleNamespace(status="registered")
+
+        self.assertFalse(
+            tournament_routes.should_include_workspace_invite_code(
+                tournament,
+                auth_session=SimpleNamespace(
+                    user=SimpleNamespace(id="participant-1"),
+                    role_slugs=frozenset(),
+                ),
+                participant_record=active_participant,
+                workspace_visible=True,
+            )
+        )
+
+    def test_workspace_invite_code_remains_for_public_and_manager_views(self) -> None:
+        tournament = SimpleNamespace(
+            organizer_user_id="organizer-1",
+            visibility="public",
+        )
+
+        self.assertTrue(
+            tournament_routes.should_include_workspace_invite_code(
+                tournament,
+                auth_session=None,
+                participant_record=None,
+                workspace_visible=True,
+            )
+        )
+        self.assertTrue(
+            tournament_routes.should_include_workspace_invite_code(
+                tournament,
+                auth_session=SimpleNamespace(
+                    user=SimpleNamespace(id="organizer-1"),
+                    role_slugs=frozenset(),
+                ),
+                participant_record=SimpleNamespace(status="registered"),
+                workspace_visible=True,
+            )
+        )
+
     async def test_registration_open_detail_does_not_query_assignment_state(self) -> None:
         published_lookup = AsyncMock(return_value=None)
         tournament = SimpleNamespace(

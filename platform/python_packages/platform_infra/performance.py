@@ -19,6 +19,20 @@ QA_PHASE_RE = re.compile(
     r"auto|assignment|post|teammate|opponent|bracket|mixed|tournament|"
     r"completed|match|initial)_[a-z0-9_]{1,63}$"
 )
+WORKSPACE_PERF_KEYS = (
+    "workspace_auth_ms",
+    "workspace_tournament_base_ms",
+    "workspace_media_ms",
+    "workspace_access_ms",
+    "workspace_invite_ms",
+    "workspace_bracket_ms",
+    "workspace_ready_check_ms",
+    "workspace_serialization_ms",
+    "workspace_etag_ms",
+)
+_WORKSPACE_STAGE_NAMES = frozenset(
+    key.removesuffix("_ms") for key in WORKSPACE_PERF_KEYS
+)
 
 
 @dataclass(slots=True)
@@ -38,6 +52,7 @@ class RequestPerformanceMetrics:
     profile_read_model_events: list[dict[str, Any]] = field(default_factory=list)
     tournament_profile_access_events: list[dict[str, Any]] = field(default_factory=list)
     profile_read_model_fallback_count: int = 0
+    workspace_stage_seconds: dict[str, float] = field(default_factory=dict)
     # Ready Vote owns one dedicated session checkout for the complete
     # auth/preflight/upsert/commit transaction. Keep this separate from the
     # aggregate pool wait and from generic SQL timing so physical checkout
@@ -162,6 +177,29 @@ def start_request_metrics(
 
 def current_request_metrics() -> RequestPerformanceMetrics | None:
     return _current_metrics.get()
+
+
+def record_workspace_stage(name: str, elapsed_seconds: float) -> None:
+    """Attach a workspace stage to the existing request diagnostic record."""
+
+    metrics = _current_metrics.get()
+    if metrics is None or not metrics.path.endswith("/workspace"):
+        return
+    if name not in _WORKSPACE_STAGE_NAMES:
+        return
+    metrics.workspace_stage_seconds[name] = (
+        metrics.workspace_stage_seconds.get(name, 0.0)
+        + max(0.0, float(elapsed_seconds))
+    )
+
+
+@contextmanager
+def measure_workspace_stage(name: str) -> Iterator[None]:
+    started_at = perf_counter()
+    try:
+        yield
+    finally:
+        record_workspace_stage(name, perf_counter() - started_at)
 
 
 def record_pool_checkout_wait(elapsed_seconds: float) -> None:
@@ -452,6 +490,11 @@ class RequestPerformanceMiddleware:
             "redis_read_model_revisions=%s "
             "profile_read_model_metrics=%s tournament_profile_access_metrics=%s "
             "profile_read_model_fallback_count=%s "
+            "workspace_auth_ms=%.2f workspace_tournament_base_ms=%.2f "
+            "workspace_media_ms=%.2f workspace_access_ms=%.2f "
+            "workspace_invite_ms=%.2f workspace_bracket_ms=%.2f "
+            "workspace_ready_check_ms=%.2f workspace_serialization_ms=%.2f "
+            "workspace_etag_ms=%.2f "
             "response_bytes=%s qa_phase=%s "
             "pool_wait_ms=%.2f cf_ray=%s client=%s",
             metrics.request_id,
@@ -510,6 +553,15 @@ class RequestPerformanceMiddleware:
                 for event in metrics.tournament_profile_access_events
             ) or "-",
             metrics.profile_read_model_fallback_count,
+            metrics.workspace_stage_seconds.get("workspace_auth", 0.0) * 1000,
+            metrics.workspace_stage_seconds.get("workspace_tournament_base", 0.0) * 1000,
+            metrics.workspace_stage_seconds.get("workspace_media", 0.0) * 1000,
+            metrics.workspace_stage_seconds.get("workspace_access", 0.0) * 1000,
+            metrics.workspace_stage_seconds.get("workspace_invite", 0.0) * 1000,
+            metrics.workspace_stage_seconds.get("workspace_bracket", 0.0) * 1000,
+            metrics.workspace_stage_seconds.get("workspace_ready_check", 0.0) * 1000,
+            metrics.workspace_stage_seconds.get("workspace_serialization", 0.0) * 1000,
+            metrics.workspace_stage_seconds.get("workspace_etag", 0.0) * 1000,
             metrics.response_bytes,
             metrics.qa_phase or "-",
             metrics.pool_checkout_wait_seconds * 1000,

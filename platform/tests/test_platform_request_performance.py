@@ -108,6 +108,25 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         finally:
             performance.reset_request_metrics(token)
 
+    def test_workspace_stages_are_recorded_on_the_existing_request_metrics(self) -> None:
+        token = performance.start_request_metrics(
+            "GET",
+            "/api/v1/tournaments/demo/workspace",
+        )
+        try:
+            performance.record_workspace_stage("workspace_auth", 0.004)
+            performance.record_workspace_stage("workspace_auth", 0.001)
+            performance.record_workspace_stage("workspace_etag", 0.002)
+            performance.record_workspace_stage("ready_vote_auth", 0.5)
+            metrics = performance.current_request_metrics()
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertEqual(metrics.workspace_stage_seconds["workspace_auth"], 0.005)
+            self.assertEqual(metrics.workspace_stage_seconds["workspace_etag"], 0.002)
+            self.assertNotIn("ready_vote_auth", metrics.workspace_stage_seconds)
+        finally:
+            performance.reset_request_metrics(token)
+
     def test_ready_vote_log_format_exposes_checkout_metrics(self) -> None:
         middleware = performance.RequestPerformanceMiddleware(app=None)
         metrics = self.metrics(method="POST")

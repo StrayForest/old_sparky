@@ -33,6 +33,7 @@ from python_packages.platform_infra.media.hard_delete import (
     MediaCleanupRequired,
     purge_deleted_media_metadata,
 )
+from python_packages.platform_infra.performance import WORKSPACE_PERF_KEYS
 from python_packages.platform_infra.models import (
     AuditLog,
     DeadlockDreamSlot,
@@ -1411,6 +1412,7 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
                 "ready_vote_cpu_monitor_samples",
             }
         },
+        **{key: float for key in WORKSPACE_PERF_KEYS},
     }
     for key, caster in numeric_keys.items():
         if key not in values:
@@ -1530,6 +1532,11 @@ def summarize_request_perf_logs(
             for key in READY_VOTE_PERF_KEYS
             if any(isinstance(row.get(key), (int, float)) for row in row_values)
         }
+        workspace_stages = {
+            key: row_metric_stats(key, row_values)
+            for key in WORKSPACE_PERF_KEYS
+            if any(isinstance(row.get(key), (int, float)) for row in row_values)
+        }
         return {
             "requests": len(row_values),
             "total": row_metric_stats("total_ms", row_values),
@@ -1563,6 +1570,7 @@ def summarize_request_perf_logs(
             "ready_vote": ready_vote_spans,
             "ready_vote_controller_state_counts": controller_state_counts(row_values),
             "redis_read_models": read_model_summary(row_values),
+            "workspace": workspace_stages,
         }
 
     return {
@@ -1583,6 +1591,11 @@ def summarize_request_perf_logs(
         },
         "ready_vote_controller_state_counts": controller_state_counts(rows),
         "redis_read_models": read_model_summary(rows),
+        "workspace": {
+            key: row_metric_stats(key, rows)
+            for key in WORKSPACE_PERF_KEYS
+            if any(isinstance(row.get(key), (int, float)) for row in rows)
+        },
         "by_route": {
             route: summarize_route_rows(row_values)
             for route, row_values in sorted(

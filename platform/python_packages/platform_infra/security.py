@@ -23,7 +23,10 @@ from python_packages.platform_infra.config import PlatformSettings, get_settings
 from python_packages.platform_infra.csrf import clear_csrf_cookie
 from python_packages.platform_infra.db import get_db_session, session_factory
 from python_packages.platform_infra.models import Role, User, UserRole, UserSession
-from python_packages.platform_infra.performance import record_ready_vote_span
+from python_packages.platform_infra.performance import (
+    record_ready_vote_span,
+    record_workspace_stage,
+)
 from python_packages.platform_infra.turnstile import (
     normalized_turnstile_mode,
     validate_turnstile_settings,
@@ -622,6 +625,26 @@ async def authenticate_ready_vote(
 
 
 async def _resolve_optional_authenticated_session(
+    request: Request,
+    db_session: AsyncSession,
+    *,
+    touch_session: bool,
+) -> AuthenticatedSession | None:
+    workspace_auth_started = time.perf_counter()
+    try:
+        return await _resolve_optional_authenticated_session_impl(
+            request,
+            db_session,
+            touch_session=touch_session,
+        )
+    finally:
+        record_workspace_stage(
+            "workspace_auth",
+            time.perf_counter() - workspace_auth_started,
+        )
+
+
+async def _resolve_optional_authenticated_session_impl(
     request: Request,
     db_session: AsyncSession,
     *,
