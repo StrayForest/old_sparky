@@ -261,6 +261,9 @@ baseline when the comparison is complete. `pool-pre-ping-off` additionally
 requires a controlled PostgreSQL restart/recovery test and an API recovery
 check; a latency improvement without clean recovery is a rejection.
 
+The 2026-09-03 ramp and authenticated-page A/B selected
+`authenticated-read-admission-32` (c32 knee, c48 first queued stage); production uses it with API pool 24, `max_overflow=0` and `pool_pre_ping=true`. The pre-ping-off A/B was rejected; public/static HTML remains dynamic and nonce-CSP protected.
+
 Before attributing a transport result to Nginx, record `nginx -v` and run
 `nginx -t`. The named `platform_api` upstream has explicit loopback keepalive;
 the web upgrade connection header remains separate. For database evidence,

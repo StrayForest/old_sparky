@@ -61,13 +61,12 @@ The measured HTTP generator runs only on the GitHub-hosted runner. The
 production origin may prepare marked fixtures, collect lightweight pressure
 evidence and perform exact cleanup; it must not execute the measured client.
 
-## Read-path candidate slice (2026-09-02)
+## Read-path candidate slice (2026-09-03)
 
-The retained accepted read-mix baseline remains the canonical comparison point:
-source `4be82f1a…`, workflow `33625164162`, raw p50/p95/p99
-`1212/2382/3492 ms`, 99.42 requests/s, API CPU about 98% per core and zero
-errors. The following changes are implemented as separately observable
-candidates and have not been promoted or accepted by a production run:
+The retained read-mix baseline remains the comparison point: source
+`4be82f1a…`, workflow `33625164162`, raw p50/p95/p99 `1212/2382/3492 ms`,
+99.42 requests/s, API CPU about 98% per core and zero errors. The following
+read-path changes were then accepted on exact-SHA production evidence:
 
 - request-performance now distinguishes checkout wait, connection hold,
   SQL time and total request time;
@@ -79,15 +78,70 @@ candidates and have not been promoted or accepted by a production run:
 - the external runner has `read-mix-concurrency-ramp-v1`, which records every
   c16–c128 full-population stage separately;
 - `uvloop`/`httptools`, Nginx upstream keepalive, pool sizes 12/16/20/24,
-  `pool_pre_ping=false` and authenticated-read admission 32 are isolated
-  runtime A/B profiles, disabled in the baseline.
+  `pool_pre_ping=false` and authenticated-read admission 32 were isolated
+  runtime A/B profiles.
 
-The candidate slice deliberately does not change JSON encoding, media loading,
-the security-sensitive Redis session-validity model, or the retained
-production pool/worker envelope by default. Production acceptance still
-requires the exact-SHA external load workflow, origin observer evidence and
-exact cleanup. The `pool_pre_ping=false` candidate also requires PostgreSQL
-restart/recovery evidence.
+The accepted runtime keeps JSON encoding, media loading, the
+security-sensitive Redis session-validity model, and the two-worker/API-pool
+envelope unchanged. Production uses `authenticated-read-admission-32`, API
+pool `24` with `max_overflow=0`, `pool_pre_ping=true`, and the PostgreSQL
+safety budget remains `52`. The final profile was applied by exact-SHA deploy
+[`33726577559`](https://github.com/StrayForest/old_sparky/actions/runs/33726577559).
+
+### Read-path ownership, ramp and SSR evidence (2026-09-03)
+
+The exact-SHA concurrency ramp
+[`33716010545`](https://github.com/StrayForest/old_sparky/actions/runs/33716010545)
+used the full 20,000-user read mix. Its stage results were:
+
+| HTTP concurrency | p95 ms | p99 ms | Throughput req/s |
+| ---: | ---: | ---: | ---: |
+| 16 | 288.658 | 374.756 | 80.552 |
+| 32 | 529.440 | 685.602 | 104.298 |
+| 48 | 1080.505 | 1333.289 | 95.630 |
+| 64 | 1040.676 | 1264.266 | 101.799 |
+| 80 | 1436.423 | 1722.248 | 99.403 |
+| 96 | 1354.994 | 1687.727 | 103.961 |
+| 112 | 1855.392 | 2253.597 | 95.488 |
+| 128 | 1589.240 | 1925.639 | 108.532 |
+
+The report identifies `32` as the stable knee and `48` as the first queued
+stage: p95 rose materially while throughput did not. Admission limit 32 was
+therefore selected by the operator and validated in the authenticated-page
+A/B; the ramp never changes runtime limits automatically.
+
+The real Next.js HTML benchmark
+[`33719680133`](https://github.com/StrayForest/old_sparky/actions/runs/33719680133)
+at c64 had no errors or bad statuses, but exposed uncontrolled origin queueing:
+full-page p95/p99 `10378/10714 ms`, HTML TTFB p95 `3062 ms`, and pool checkout
+p95 `10001 ms`. With `authenticated-read-admission-32`,
+[`33722487079`](https://github.com/StrayForest/old_sparky/actions/runs/33722487079)
+passed the stress-behavior gate with no errors or shedding: full-page p95/p99
+`3906/4425 ms`, HTML TTFB p95 `3440 ms`, pool checkout p95 `533 ms`, and
+goodput `25.497` versus `17.83` requests/s. This is a diagnostic stress
+comparison, not a claim that the public production SLO is the same as the
+20,000-request benchmark.
+
+The PostgreSQL observer attributed the peak of `51` established connections
+to API `48`, worker `2` and observer `1`; one transient sample was unknown.
+This is within the `52` safety budget, so the API pool was not reduced or
+expanded. The observer also records normalized `pg_stat_statements` rows and
+excludes only its own diagnostic queries. Exact cleanup after the ramp
+([`33719571565`](https://github.com/StrayForest/old_sparky/actions/runs/33719571565)),
+page baseline, page A/B and pre-ping A/B removed all fixture users,
+tournaments, sessions and audit rows; the designated control account was
+preserved.
+
+The isolated `pool_pre_ping=false` stress A/B
+[`33725036233`](https://github.com/StrayForest/old_sparky/actions/runs/33725036233)
+passed functional stress checks but was not selected: p95/p99 were
+`1741/2177 ms` at `105.367` requests/s, worse than the retained accepted
+comparison, while stale-connection protection was removed. Production was
+restored to `pool_pre_ping=true` in the final deploy above.
+
+Public/static HTML remains deliberately deferred. The nonce CSP, dynamic
+authenticated layout and `private, no-store` HTML policy were not bypassed or
+weakened.
 
 ## Ready Vote evidence (2026-08-30/31)
 

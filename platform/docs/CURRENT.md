@@ -142,17 +142,19 @@ run; one `URLError` and PostgreSQL connection maximum `55` versus the `52`
 origin-safety ceiling in the repeat). It was reverted by `38c06fda` and is not
 the production runtime.
 
-The next read-path candidate slice is implemented but not yet accepted in
-production. It adds connection-hold diagnostics, a short DB lease for the
-workspace and full-user routes, the smaller `/auth/bootstrap` SSR dependency,
+The read-path candidate slice was accepted on exact-SHA external evidence. It
+adds connection-hold diagnostics, a short DB lease for the workspace and
+full-user routes, the smaller `/auth/bootstrap` SSR dependency,
 column-oriented workspace snapshots, explicit Nginx upstream keepalive and
 selectable `uvloop`/`httptools`, pool-pre-ping and authenticated-read-admission
-experiments. The canonical retained baseline above remains the comparison
-point until an exact-SHA external run accepts a candidate. The new
-`read-mix-concurrency-ramp-v1` profile measures the full 20,000-user read mix
-at c16/c32/c48/c64/c80/c96/c112/c128 and reports each stage separately.
-Its production execution is operator-only and requires the existing exact
-fixture cleanup/abort procedure.
+experiments. The `read-mix-concurrency-ramp-v1` run measured the full
+20,000-user read mix at c16/c32/c48/c64/c80/c96/c112/c128: c32 was the stable
+latency knee and c48 the first queued stage. The operator-selected
+`authenticated-read-admission-32` profile is now active in production; the
+API remains at two workers with pool size `24`, `max_overflow=0`,
+`pool_pre_ping=true`, and the PostgreSQL safety budget remains `52`.
+The ramp is operator-only and requires the existing exact fixture
+cleanup/abort procedure.
 The current dev candidate also removes the three tournament router-level
 policies from public catalog and `/mine` resolution. Private child GETs,
 invite claims and the affected roster/join mutations declare only the policy
@@ -172,8 +174,13 @@ observer labels PostgreSQL activity by `oldsparky-api`, `oldsparky-worker`,
 `oldsparky-qa`, `oldsparky-observer` and `oldsparky-maintenance`, making the
 54-versus-52 connection question attributable. The ramp report emits a
 latency-knee recommendation for admission review; it never changes runtime
-limits automatically. Public/static HTML architecture remains deferred: the
-nonce CSP is not bypassed or weakened by this candidate.
+limits automatically. The authenticated HTML benchmark confirmed that
+admission 32 materially reduces SSR-origin queueing: full-page p95/p99
+improved from `10378/10714 ms` at c64 to `3906/4425 ms`, while pool checkout
+p95 improved from `10001 ms` to `533 ms`. The isolated `pool_pre_ping=false`
+A/B was rejected and production was restored to `pool_pre_ping=true`.
+Public/static HTML architecture remains deferred: the nonce CSP is not
+bypassed or weakened by this work.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
 
