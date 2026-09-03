@@ -79,6 +79,12 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_WORKER_LOG_LEVEL"], "WARNING")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_PERF_LOG_MUTATIONS"], "false")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_DB_POOL_PRE_PING"], "true")
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_SSR_PERF_LOG_ENABLED"], "false")
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_SSR_PERF_SAMPLE_RATE"], "0.01")
+        self.assertEqual(
+            configure.PUBLIC_BASELINE["PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS"],
+            "5",
+        )
         self.assertEqual(
             configure.PUBLIC_BASELINE["PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED"],
             "false",
@@ -155,6 +161,14 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertEqual(
             configure.RUNTIME_PROFILES["pool-pre-ping-off"],
             {"PLATFORM_DB_POOL_PRE_PING": "false"},
+        )
+        self.assertEqual(
+            configure.RUNTIME_PROFILES["web-ssr-diagnostics"],
+            {
+                "PLATFORM_SSR_PERF_LOG_ENABLED": "true",
+                "PLATFORM_SSR_PERF_SAMPLE_RATE": "0.01",
+                "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
+            },
         )
         for pool_size in (12, 16, 20, 24):
             self.assertEqual(

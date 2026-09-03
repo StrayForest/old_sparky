@@ -9,6 +9,7 @@ import { SiteHeader } from "@/components/layout/site-header";
 import { CspNonceProvider } from "@/components/security/csp-nonce-provider";
 import { CspRouteAnnouncer } from "@/components/security/csp-route-announcer";
 import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
+import { measureSsrStage, recordSsrStage } from "@/lib/server-ssr-observability";
 import "./globals.css";
 import "./theme-modern.css";
 import "@/components/profile/account-identities.css";
@@ -27,15 +28,16 @@ export default async function RootLayout({
 }: Readonly<{
   children: ReactNode;
 }>) {
+  const startedAt = performance.now();
   await connection();
   const [requestHeaders, requestCookies] = await Promise.all([headers(), cookies()]);
   const nonce = requestHeaders.get("x-nonce");
   const cookieHeader = requestCookies.toString();
   const initialAuth = requestCookies.has(platformSessionCookieName())
-    ? await getServerAuthBootstrap(cookieHeader)
+    ? await measureSsrStage("root_layout_auth_bootstrap", () => getServerAuthBootstrap(cookieHeader))
     : { status: "anonymous" as const, user: null };
 
-  return (
+  const rendered = (
     <html lang="ru">
       <body>
         <CspNonceProvider nonce={nonce}>
@@ -51,4 +53,6 @@ export default async function RootLayout({
       </body>
     </html>
   );
+  await recordSsrStage("root_layout_component_tree", performance.now() - startedAt);
+  return rendered;
 }

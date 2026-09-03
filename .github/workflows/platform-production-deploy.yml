@@ -30,6 +30,7 @@ on:
           - read-mix-cprofile
           - authenticated-read-admission-32
           - pool-pre-ping-off
+          - web-ssr-diagnostics
           - uvicorn-classic
           - uvicorn-optimized
           - api-pool-12
@@ -477,7 +478,10 @@ jobs:
                 --only PLATFORM_DB_CONNECTION_BUDGET \
                 --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
                 --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
-                --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY \
+                --only PLATFORM_SSR_PERF_LOG_ENABLED \
+                --only PLATFORM_SSR_PERF_SAMPLE_RATE \
+                --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
               systemctl restart deadlock-api
               api_ready=false
               for _ in $(seq 1 30); do
@@ -497,6 +501,9 @@ jobs:
                 --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY
                 --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY
                 --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                --only PLATFORM_SSR_PERF_LOG_ENABLED
+                --only PLATFORM_SSR_PERF_SAMPLE_RATE
+                --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
               )
               if [[ "$runtime_profile" == ready-vote-cprofile ]]; then
                 ready_vote_profile_args+=(
@@ -534,6 +541,9 @@ jobs:
                   --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY
                   --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY
                   --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                  --only PLATFORM_SSR_PERF_LOG_ENABLED
+                  --only PLATFORM_SSR_PERF_SAMPLE_RATE
+                  --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
                 )
                 if [[ "$runtime_profile" == ready-vote-cprofile ]]; then
                   restore_ready_vote_profile_args+=(
@@ -582,7 +592,10 @@ jobs:
                 --only PLATFORM_READY_VOTE_ADMISSION_CPU_SAMPLE_INTERVAL_SECONDS \
                 --only PLATFORM_READY_VOTE_ADMISSION_CPU_EWMA_ALPHA \
                 --only PLATFORM_READY_VOTE_ADMISSION_RECOVERY_SAMPLES \
-                --only PLATFORM_READY_VOTE_ADMISSION_CONTROL_INTERVAL_SECONDS
+                --only PLATFORM_READY_VOTE_ADMISSION_CONTROL_INTERVAL_SECONDS \
+                --only PLATFORM_SSR_PERF_LOG_ENABLED \
+                --only PLATFORM_SSR_PERF_SAMPLE_RATE \
+                --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
               systemctl restart deadlock-api
               api_ready=false
               for _ in $(seq 1 30); do
@@ -601,7 +614,10 @@ jobs:
                   --profile ready-vote-static-8 \
                   --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
                   --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
-                  --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                  --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY \
+                  --only PLATFORM_SSR_PERF_LOG_ENABLED \
+                  --only PLATFORM_SSR_PERF_SAMPLE_RATE \
+                  --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
                 systemctl restart deadlock-api
                 api_ready=false
                 for _ in $(seq 1 30); do
@@ -616,6 +632,50 @@ jobs:
                 [[ "$api_ready" == true ]] \
                   || fail "adaptive-v2 health check failed; static-8 restore failed"
                 fail "adaptive-v2 health check failed; static-8 restored"
+              fi
+              ;;
+            web-ssr-diagnostics)
+              web_ssr_profile_args=(
+                --only PLATFORM_SSR_PERF_LOG_ENABLED
+                --only PLATFORM_SSR_PERF_SAMPLE_RATE
+                --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
+              )
+              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+                --apply \
+                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                --profile "$runtime_profile" \
+                "${web_ssr_profile_args[@]}"
+              systemctl restart deadlock-web
+              web_ready=false
+              for _ in $(seq 1 30); do
+                if systemctl is-active --quiet deadlock-web \
+                  && curl --fail --silent --show-error --max-time 2 \
+                    http://127.0.0.1:3000/ >/dev/null; then
+                  web_ready=true
+                  break
+                fi
+                sleep 1
+              done
+              if [[ "$web_ready" != true ]]; then
+                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+                  --apply \
+                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                  --profile baseline \
+                  "${web_ssr_profile_args[@]}"
+                systemctl restart deadlock-web
+                web_ready=false
+                for _ in $(seq 1 30); do
+                  if systemctl is-active --quiet deadlock-web \
+                    && curl --fail --silent --show-error --max-time 2 \
+                      http://127.0.0.1:3000/ >/dev/null; then
+                    web_ready=true
+                    break
+                  fi
+                  sleep 1
+                done
+                [[ "$web_ready" == true ]] \
+                  || fail "web SSR diagnostic profile health check failed; baseline restore failed"
+                fail "web SSR diagnostic profile health check failed; baseline restored"
               fi
               ;;
             read-mix-cprofile|authenticated-read-admission-32|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24)
@@ -634,6 +694,9 @@ jobs:
                 --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
                 --only PLATFORM_PERF_SLOW_REQUEST_MS
                 --only PLATFORM_PERF_LOG_MUTATIONS
+                --only PLATFORM_SSR_PERF_LOG_ENABLED
+                --only PLATFORM_SSR_PERF_SAMPLE_RATE
+                --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
               )
               "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
                 --apply \

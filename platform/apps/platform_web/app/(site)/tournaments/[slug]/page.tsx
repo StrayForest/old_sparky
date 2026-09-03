@@ -5,6 +5,7 @@ import { Hero } from "@/components/layout/hero";
 import { TournamentDetailView } from "@/components/tournaments/tournament-detail-view";
 import { getTournamentWorkspace, PlatformApiError } from "@/lib/platform-api";
 import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
+import { measureSsrStage, recordSsrStage } from "@/lib/server-ssr-observability";
 import { TournamentInviteGate } from "@/components/tournaments/tournament-invite-gate";
 
 export const metadata: Metadata = {
@@ -18,6 +19,7 @@ export default async function TournamentDetailPage({
   params: Promise<{ slug: string }>;
   searchParams?: Promise<{ invite_code?: string }>;
 }) {
+  const startedAt = performance.now();
   const { slug } = await params;
   const resolvedSearchParams = await searchParams;
   const inviteCode = resolvedSearchParams?.invite_code?.trim().toUpperCase() || undefined;
@@ -25,19 +27,25 @@ export default async function TournamentDetailPage({
   const cookieHeader = requestCookies.toString();
   const requestHeaders: HeadersInit = cookieHeader ? { cookie: cookieHeader } : {};
   const actorUserIdPromise = requestCookies.has(platformSessionCookieName())
-    ? getServerAuthBootstrap(cookieHeader).then((snapshot) => snapshot.user?.id ?? null)
+    ? measureSsrStage(
+      "tournament_detail_auth_bootstrap",
+      () => getServerAuthBootstrap(cookieHeader).then((snapshot) => snapshot.user?.id ?? null)
+    )
     : Promise.resolve(null);
 
   let workspace: Awaited<ReturnType<typeof getTournamentWorkspace>>;
   let actorUserId: string | null;
   try {
     [workspace, actorUserId] = await Promise.all([
-      getTournamentWorkspace(slug, requestHeaders, {
-        participantsLimit: 0,
-        workspaceView: "detail",
-        includeCurrentUser: false,
-        inviteCode
-      }),
+      measureSsrStage(
+        "tournament_workspace",
+        () => getTournamentWorkspace(slug, requestHeaders, {
+          participantsLimit: 0,
+          workspaceView: "detail",
+          includeCurrentUser: false,
+          inviteCode
+        })
+      ),
       actorUserIdPromise
     ]);
   } catch (error) {
@@ -59,7 +67,8 @@ export default async function TournamentDetailPage({
   }
   const { tournament } = workspace;
 
-  return (
+  await recordSsrStage("tournament_detail_data_ready", performance.now() - startedAt);
+  const rendered = (
     <>
       <div className="page-noise" aria-hidden="true" />
       <Hero
@@ -75,4 +84,6 @@ export default async function TournamentDetailPage({
       </main>
     </>
   );
+  await recordSsrStage("tournament_detail_component_tree", performance.now() - startedAt);
+  return rendered;
 }

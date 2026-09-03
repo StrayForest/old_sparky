@@ -136,6 +136,11 @@ PUBLIC_BASELINE = {
     "PLATFORM_PERF_SQL_COUNT_THRESHOLD": "25",
     "PLATFORM_PERF_LOG_MUTATIONS": "false",
     "PLATFORM_READY_VOTE_CPU_PROFILE_DIR": "",
+    # Disabled by default. The web SSR diagnostic profile enables bounded
+    # sampled stage logs for one reviewed load window.
+    "PLATFORM_SSR_PERF_LOG_ENABLED": "false",
+    "PLATFORM_SSR_PERF_SAMPLE_RATE": "0.01",
+    "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
 }
 RUNTIME_PROFILES = {
     "baseline": {},
@@ -188,6 +193,11 @@ RUNTIME_PROFILES = {
     },
     "pool-pre-ping-off": {
         "PLATFORM_DB_POOL_PRE_PING": "false",
+    },
+    "web-ssr-diagnostics": {
+        "PLATFORM_SSR_PERF_LOG_ENABLED": "true",
+        "PLATFORM_SSR_PERF_SAMPLE_RATE": "0.01",
+        "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
     },
     "uvicorn-classic": {
         "PLATFORM_UVICORN_LOOP": "asyncio",

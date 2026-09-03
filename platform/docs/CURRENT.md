@@ -179,6 +179,12 @@ admission 32 materially reduces SSR-origin queueing: full-page p95/p99
 improved from `10378/10714 ms` at c64 to `3906/4425 ms`, while pool checkout
 p95 improved from `10001 ms` to `533 ms`. The isolated `pool_pre_ping=false`
 A/B was rejected and production was restored to `pool_pre_ping=true`.
+The `web-ssr-diagnostics` operator profile adds bounded 1% request-correlated
+Next.js stage timings (`/auth/bootstrap`, workspace and render boundaries),
+five-second Node event-loop samples and Nginx HTML `request_time`/
+`upstream_response_time` correlation to the retained observer artifact. It is
+diagnostic-only and does not alter SSR behavior, authorization, or the nonce
+CSP. Public/static HTML remains deferred and is not part of this change.
 Public/static HTML architecture remains deferred: the nonce CSP is not
 bypassed or weakened by this work.
 Production service logs are kept in journald, Nginx owns the edge access log,

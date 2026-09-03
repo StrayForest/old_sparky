@@ -2,6 +2,7 @@ import "server-only";
 
 import { cache } from "react";
 import type { PlatformAuthBootstrap, PlatformUser } from "@/lib/platform-types";
+import { measureSsrStage } from "@/lib/server-ssr-observability";
 
 export type ServerAuthSnapshot = {
   status: "authenticated" | "anonymous" | "unavailable";
@@ -50,31 +51,33 @@ export const getServerCurrentUser = cache(async (
   if (!baseUrl) {
     return { status: "unavailable", user: null };
   }
-  try {
-    const response = await fetch(`${baseUrl}/users/me`, {
-      headers: {
-        accept: "application/json",
-        cookie: cookieHeader
-      },
-      cache: "no-store",
-      signal: AbortSignal.timeout(serverAuthTimeoutMs)
-    });
-    if (response.status === 401 || response.status === 403) {
-      return { status: "anonymous", user: null };
-    }
-    if (!response.ok) {
+  return measureSsrStage("auth_current_user_fetch", async () => {
+    try {
+      const response = await fetch(`${baseUrl}/users/me`, {
+        headers: {
+          accept: "application/json",
+          cookie: cookieHeader
+        },
+        cache: "no-store",
+        signal: AbortSignal.timeout(serverAuthTimeoutMs)
+      });
+      if (response.status === 401 || response.status === 403) {
+        return { status: "anonymous", user: null };
+      }
+      if (!response.ok) {
+        return { status: "unavailable", user: null };
+      }
+      const user = await response.json() as unknown;
+      if (!isPlatformUser(user)) {
+        return { status: "unavailable", user: null };
+      }
+      return { status: "authenticated", user };
+    } catch {
+      // Public pages remain available during a transient internal API failure;
+      // protected APIs still enforce the session independently.
       return { status: "unavailable", user: null };
     }
-    const user = await response.json() as unknown;
-    if (!isPlatformUser(user)) {
-      return { status: "unavailable", user: null };
-    }
-    return { status: "authenticated", user };
-  } catch {
-    // Public pages remain available during a transient internal API failure;
-    // protected APIs still enforce the session independently.
-    return { status: "unavailable", user: null };
-  }
+  });
 });
 
 export const getServerAuthBootstrap = cache(async (
@@ -87,29 +90,31 @@ export const getServerAuthBootstrap = cache(async (
   if (!baseUrl) {
     return { status: "unavailable", user: null };
   }
-  try {
-    const response = await fetch(`${baseUrl}/auth/bootstrap`, {
-      headers: {
-        accept: "application/json",
-        cookie: cookieHeader
-      },
-      cache: "no-store",
-      signal: AbortSignal.timeout(serverAuthTimeoutMs)
-    });
-    if (response.status === 401 || response.status === 403) {
-      return { status: "anonymous", user: null };
-    }
-    if (!response.ok) {
+  return measureSsrStage("auth_bootstrap_fetch", async () => {
+    try {
+      const response = await fetch(`${baseUrl}/auth/bootstrap`, {
+        headers: {
+          accept: "application/json",
+          cookie: cookieHeader
+        },
+        cache: "no-store",
+        signal: AbortSignal.timeout(serverAuthTimeoutMs)
+      });
+      if (response.status === 401 || response.status === 403) {
+        return { status: "anonymous", user: null };
+      }
+      if (!response.ok) {
+        return { status: "unavailable", user: null };
+      }
+      const bootstrap = await response.json() as unknown;
+      if (!isPlatformAuthBootstrap(bootstrap)) {
+        return { status: "unavailable", user: null };
+      }
+      return { status: "authenticated", user: bootstrap };
+    } catch {
       return { status: "unavailable", user: null };
     }
-    const bootstrap = await response.json() as unknown;
-    if (!isPlatformAuthBootstrap(bootstrap)) {
-      return { status: "unavailable", user: null };
-    }
-    return { status: "authenticated", user: bootstrap };
-  } catch {
-    return { status: "unavailable", user: null };
-  }
+  });
 });
 
 function isPlatformAuthBootstrap(value: unknown): value is PlatformAuthBootstrap {

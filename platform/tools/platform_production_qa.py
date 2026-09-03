@@ -84,6 +84,9 @@ UUID_RE = re.compile(
 )
 NUMERIC_PATH_RE = re.compile(r"/\d+(?=/|$)")
 REQUEST_PERF_RE = re.compile(r"\brequest_perf\b(?P<body>.*)$")
+SSR_PERF_RE = re.compile(r"\bssr_perf\b(?P<body>.*)$")
+SSR_EVENT_LOOP_RE = re.compile(r"\bssr_event_loop\b(?P<body>.*)$")
+NGINX_ACCESS_LOG_PATH = Path("/var/log/nginx/platform-access.log")
 READY_VOTE_PERF_KEYS = (
     "ready_vote_auth_ms",
     "ready_vote_checkout_count",
@@ -1930,13 +1933,13 @@ def summarize_bottleneck_evidence(
     }
 
 
-def collect_api_journal_lines(since: str, until: str) -> list[str]:
+def _collect_journal_lines(unit: str, since: str, until: str) -> list[str]:
     try:
         result = subprocess.run(
             [
                 "journalctl",
                 "-u",
-                "deadlock-api",
+                unit,
                 "--since",
                 since,
                 "--until",
@@ -1955,6 +1958,235 @@ def collect_api_journal_lines(since: str, until: str) -> list[str]:
     if result.returncode != 0:
         return []
     return result.stdout.splitlines()
+
+
+def collect_api_journal_lines(since: str, until: str) -> list[str]:
+    return _collect_journal_lines("deadlock-api", since, until)
+
+
+def collect_web_journal_lines(since: str, until: str) -> list[str]:
+    return _collect_journal_lines("deadlock-web", since, until)
+
+
+def parse_ssr_perf_line(line: str) -> dict[str, Any] | None:
+    match = SSR_PERF_RE.search(line)
+    if match is None:
+        return None
+    values: dict[str, Any] = {}
+    for token in match.group("body").strip().split():
+        if "=" not in token:
+            continue
+        key, raw_value = token.split("=", 1)
+        values[key] = raw_value
+    for key in ("duration_ms",):
+        if key in values:
+            with suppress(ValueError):
+                values[key] = float(values[key])
+    if not values.get("request_id") or not values.get("stage"):
+        return None
+    return values
+
+
+def parse_ssr_event_loop_line(line: str) -> dict[str, Any] | None:
+    match = SSR_EVENT_LOOP_RE.search(line)
+    if match is None:
+        return None
+    values: dict[str, Any] = {}
+    for token in match.group("body").strip().split():
+        if "=" not in token:
+            continue
+        key, raw_value = token.split("=", 1)
+        with suppress(ValueError):
+            values[key] = float(raw_value)
+    if not isinstance(values.get("p95_ms"), (int, float)):
+        return None
+    return values
+
+
+def _nginx_record_timestamp(raw_value: object) -> datetime | None:
+    if not isinstance(raw_value, str):
+        return None
+    try:
+        value = datetime.fromisoformat(raw_value)
+    except ValueError:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _nginx_seconds(raw_value: object) -> float | None:
+    if not isinstance(raw_value, str) or raw_value in {"", "-"}:
+        return None
+    values: list[float] = []
+    for item in raw_value.split(","):
+        with suppress(ValueError):
+            values.append(float(item.strip()) * 1000)
+    return sum(values) if values else None
+
+
+def collect_nginx_access_records(
+    since: datetime,
+    until: datetime,
+    *,
+    log_path: Path = NGINX_ACCESS_LOG_PATH,
+) -> list[dict[str, Any]]:
+    """Read only JSON access records in the observer window.
+
+    The raw records stay inside the observer process. The report contains
+    aggregate timings and never serializes the request URI or request ID.
+    Rotated, uncompressed siblings are included so a long benchmark crossing
+    the size rotation boundary does not silently lose its first requests.
+    """
+
+    paths = [log_path]
+    paths.extend(
+        sorted(
+            path
+            for path in log_path.parent.glob(f"{log_path.name}.*")
+            if path.is_file() and not path.name.endswith(".gz")
+        )
+    )
+    records: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            handle = path.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                timestamp = _nginx_record_timestamp(record.get("time"))
+                if timestamp is None or timestamp < since or timestamp > until:
+                    continue
+                records.append(record)
+    return records
+
+
+def _nginx_html_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for record in records:
+        if str(record.get("method") or "").upper() != "GET":
+            continue
+        try:
+            status = int(record.get("status") or 0)
+        except (TypeError, ValueError):
+            continue
+        if status != 200:
+            continue
+        path = str(record.get("uri") or "").split("?", 1)[0]
+        if not re.fullmatch(r"/tournaments/[^/]+", path):
+            continue
+        selected.append(record)
+    return selected
+
+
+def summarize_ssr_observability(
+    web_journal_lines: list[str],
+    nginx_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Join sampled Next stage logs with Nginx timings without leaking IDs."""
+
+    stage_rows = [
+        row
+        for row in (parse_ssr_perf_line(line) for line in web_journal_lines)
+        if row is not None
+    ]
+    event_loop_rows = [
+        row
+        for row in (parse_ssr_event_loop_line(line) for line in web_journal_lines)
+        if row is not None
+    ]
+    by_stage: dict[str, list[float]] = defaultdict(list)
+    by_request: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for row in stage_rows:
+        duration = row.get("duration_ms")
+        if not isinstance(duration, (int, float)):
+            continue
+        stage = str(row["stage"])
+        request_id = str(row["request_id"])
+        by_stage[stage].append(float(duration))
+        by_request[request_id][stage].append(float(duration))
+
+    html_records = _nginx_html_records(nginx_records)
+    correlated_rows: list[dict[str, Any]] = []
+    for record in html_records:
+        request_id = str(record.get("request_id") or "")
+        stages = by_request.get(request_id)
+        if not stages:
+            continue
+        row: dict[str, Any] = {
+            "request_ms": _nginx_seconds(record.get("request_time")),
+            "upstream_ms": _nginx_seconds(record.get("upstream_time")),
+        }
+        for stage, durations in stages.items():
+            row[stage] = sum(durations)
+        data_ready = row.get("tournament_detail_data_ready")
+        upstream_ms = row.get("upstream_ms")
+        if isinstance(data_ready, (int, float)) and isinstance(upstream_ms, (int, float)):
+            row["unattributed_upstream_after_data_ms"] = max(0.0, upstream_ms - data_ready)
+        correlated_rows.append(row)
+
+    def metric_for_rows(key: str) -> dict[str, Any]:
+        return metric_stats(
+            [float(row[key]) for row in correlated_rows if isinstance(row.get(key), (int, float))]
+        )
+
+    stage_presence = {
+        stage: sum(1 for row in correlated_rows if stage in row)
+        for stage in sorted(by_stage)
+    }
+    return {
+        "scope": {
+            "kind": "diagnostic_sample",
+            "stage_population": "sampled_ssr_requests",
+            "nginx_population": "all_authenticated_tournament_html_200_records_in_window",
+        },
+        "event_loop": {
+            "samples": len(event_loop_rows),
+            "p95_ms": metric_stats(
+                [float(row["p95_ms"]) for row in event_loop_rows]
+            ),
+            "max_ms": metric_stats(
+                [float(row["max_ms"]) for row in event_loop_rows if isinstance(row.get("max_ms"), (int, float))]
+            ),
+        },
+        "ssr_stages": {
+            "logged_stages": len(stage_rows),
+            "sampled_requests": len(by_request),
+            "by_stage": {
+                stage: metric_stats(values)
+                for stage, values in sorted(by_stage.items())
+            },
+        },
+        "nginx_html": {
+            "requests": len(html_records),
+            "request_time_ms": metric_stats(
+                [value for record in html_records if (value := _nginx_seconds(record.get("request_time"))) is not None]
+            ),
+            "upstream_time_ms": metric_stats(
+                [value for record in html_records if (value := _nginx_seconds(record.get("upstream_time"))) is not None]
+            ),
+        },
+        "correlated_html": {
+            "requests": len(correlated_rows),
+            "request_time_ms": metric_for_rows("request_ms"),
+            "upstream_time_ms": metric_for_rows("upstream_ms"),
+            "unattributed_upstream_after_data_ms": metric_for_rows(
+                "unattributed_upstream_after_data_ms"
+            ),
+            "stage_presence": stage_presence,
+            "stage_ms": {
+                stage: metric_for_rows(stage)
+                for stage in sorted(by_stage)
+            },
+        },
+    }
 
 
 class ProductionQa:

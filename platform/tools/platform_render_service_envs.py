@@ -28,6 +28,9 @@ WEB_KEYS = frozenset({
     "PLATFORM_API_BASE_URL",
     "PLATFORM_SESSION_COOKIE_NAME",
     "NEXT_PUBLIC_PLATFORM_API_BASE_URL",
+    "PLATFORM_SSR_PERF_LOG_ENABLED",
+    "PLATFORM_SSR_PERF_SAMPLE_RATE",
+    "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS",
 })
 
 # API owns the public/auth boundary and legitimately needs the complete PLATFORM_*

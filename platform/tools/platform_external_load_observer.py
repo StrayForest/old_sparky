@@ -19,9 +19,12 @@ from sqlalchemy import text
 from platform_production_qa import (
     SystemSampler,
     collect_api_journal_lines,
+    collect_nginx_access_records,
+    collect_web_journal_lines,
     iter_processes,
     process_label,
     load_env_file,
+    summarize_ssr_observability,
     summarize_request_perf_logs,
 )
 from python_packages.platform_infra.db import session_factory
@@ -389,12 +392,17 @@ async def async_main() -> int:
     finally:
         await sampler.stop()
         flushed_workers = signal_api_workers(signal.SIGUSR2) if profile_dir else []
+    # Nginx buffers access records for up to five seconds. Let the final
+    # records reach disk before taking the window's read-only snapshot.
+    await asyncio.sleep(6)
     postgres_after = await postgres_statement_snapshot()
     postgres_explain = await ready_vote_explain_evidence()
 
     finished_at = datetime.now(UTC)
     journal_until = finished_at.strftime("%Y-%m-%d %H:%M:%S UTC")
     request_perf_lines = collect_api_journal_lines(journal_since, journal_until)
+    web_journal_lines = collect_web_journal_lines(journal_since, journal_until)
+    nginx_access_records = collect_nginx_access_records(started_at, finished_at)
 
     system_summary = sampler.summary()
     system_summary["timeline"] = [
@@ -424,15 +432,20 @@ async def async_main() -> int:
         "measurement_scope": {
             "http_client": "external_load_runner_report",
             "server_request_perf_logs": "diagnostic_sample",
+            "server_ssr_observability": "diagnostic_sample_plus_nginx_html_window",
             "note": (
-                "This origin-side observer contains only the selected request_perf "
-                "journal lines; full-population HTTP latency is in the external "
-                "load runner report."
+                "The observer contains sampled API/SSR journal timings plus the "
+                "bounded Nginx HTML timing window; full-population HTTP latency "
+                "is in the external load runner report."
             ),
         },
         "server_request_perf_logs": summarize_request_perf_logs(
             request_perf_lines,
             tournament_slug=None,
+        ),
+        "server_ssr_observability": summarize_ssr_observability(
+            web_journal_lines,
+            nginx_access_records,
         ),
         "cpu_profile": {
             **cpu_profile_summary(profile_dir),

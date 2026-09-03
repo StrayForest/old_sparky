@@ -253,13 +253,11 @@ reports `time_to_first_byte`, complete page latency, HTML bytes and the
 origin-side Next.js/API/DB observer. It is still a request benchmark, not
 20,000 browser processes.
 
-The selectable runtime A/B profiles are `uvicorn-classic`,
-`uvicorn-optimized`, `pool-pre-ping-off`, `authenticated-read-admission-32`
-and `api-pool-12`, `api-pool-16`, `api-pool-20`, `api-pool-24`. Apply one
-profile at a time, repeat the same canonical read profile, and restore the
-baseline when the comparison is complete. `pool-pre-ping-off` additionally
-requires a controlled PostgreSQL restart/recovery test and an API recovery
-check; a latency improvement without clean recovery is a rejection.
+The selectable runtime A/B profiles are `uvicorn-classic`, `uvicorn-optimized`,
+`pool-pre-ping-off`, `authenticated-read-admission-32`, `web-ssr-diagnostics`
+and `api-pool-{12,16,20,24}`. Apply one at a time and restore the baseline;
+SSR diagnostics sample 1% of Next.js stages plus event-loop/Nginx timing and
+do not change SSR/CSP. The `pool-pre-ping-off` recovery test is mandatory.
 
 The 2026-09-03 ramp and authenticated-page A/B selected
 `authenticated-read-admission-32` (c32 knee, c48 first queued stage); production uses it with API pool 24, `max_overflow=0` and `pool_pre_ping=true`. The pre-ping-off A/B was rejected; public/static HTML remains dynamic and nonce-CSP protected.
@@ -288,6 +286,8 @@ quota count.
 
 The current candidate deliberately does not make public HTML static or bypass
 the nonce CSP. Any future public/static route split requires a separate
+measurement and security decision; it must not be smuggled into an SSR timing
+experiment.
 security and caching design review.
 
 For the standard full read-path stress run, select `read-mix-stress-v2`.
