@@ -251,14 +251,7 @@ class SteamAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
     ) -> httpx.Response:
         target_path = return_path or f"/{self.prefix}/profile"
         start_path = f"/api/v1/auth/steam/{purpose}/start"
-        with (
-            patch.object(auth_routes, "get_settings", return_value=self.settings),
-            patch.object(
-                auth_routes,
-                "verify_turnstile_token",
-                new_callable=AsyncMock,
-            ),
-        ):
+        with patch.object(auth_routes, "get_settings", return_value=self.settings):
             started = await client.post(
                 start_path,
                 json={"return_to": target_path},
@@ -371,10 +364,7 @@ class SteamAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_callback_rejects_missing_browser_grant_without_provider_call(self) -> None:
         client = await self._new_client()
-        with (
-            patch.object(auth_routes, "get_settings", return_value=self.settings),
-            patch.object(auth_routes, "verify_turnstile_token", new_callable=AsyncMock),
-        ):
+        with patch.object(auth_routes, "get_settings", return_value=self.settings):
             started = await client.post(
                 "/api/v1/auth/steam/login/start",
                 json={"return_to": f"/{self.prefix}/login"},
@@ -415,10 +405,7 @@ class SteamAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "http://127.0.0.1:3000/auth/login?steam_auth=error",
             )
 
-        with (
-            patch.object(auth_routes, "get_settings", return_value=self.settings),
-            patch.object(auth_routes, "verify_turnstile_token", new_callable=AsyncMock),
-        ):
+        with patch.object(auth_routes, "get_settings", return_value=self.settings):
             started = await client.post(
                 "/api/v1/auth/steam/login/start",
                 json={"return_to": f"/{self.prefix}/provider-failure"},
@@ -447,10 +434,7 @@ class SteamAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
             f"http://127.0.0.1:3000/{self.prefix}/provider-failure?steam_auth=error",
         )
 
-        with (
-            patch.object(auth_routes, "get_settings", return_value=self.settings),
-            patch.object(auth_routes, "verify_turnstile_token", new_callable=AsyncMock),
-        ):
+        with patch.object(auth_routes, "get_settings", return_value=self.settings):
             started = await client.post(
                 "/api/v1/auth/steam/login/start",
                 json={"return_to": f"/{self.prefix}/rate-limited"},

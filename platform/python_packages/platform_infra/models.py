@@ -78,8 +78,12 @@ class ExternalIdentity(Base):
         UniqueConstraint(
             "user_id", "provider", name="uq_external_identities_user_provider"
         ),
-        CheckConstraint("provider = 'steam'", name="provider_steam"),
-        CheckConstraint("subject ~ '^[0-9]{17}$'", name="subject_steam_id64"),
+        CheckConstraint("provider IN ('steam', 'google')", name="provider_allowed"),
+        CheckConstraint("length(subject) BETWEEN 1 AND 255", name="subject_length"),
+        CheckConstraint(
+            "provider <> 'steam' OR subject ~ '^[0-9]{17}$'",
+            name="subject_steam_id64",
+        ),
         Index("ix_external_identities_user_id", "user_id"),
     )
 
@@ -89,7 +93,7 @@ class ExternalIdentity(Base):
         ForeignKey("platform.users.id", ondelete="CASCADE"),
     )
     provider: Mapped[str] = mapped_column(String(16), default="steam")
-    subject: Mapped[str] = mapped_column(String(20))
+    subject: Mapped[str] = mapped_column(String(255))
     linked_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -122,6 +126,42 @@ class SteamAuthFlow(Base):
     state_digest: Mapped[str] = mapped_column(String(64), unique=True)
     browser_grant_digest: Mapped[str] = mapped_column(String(64))
     purpose: Mapped[str] = mapped_column(String(16))
+    user_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("platform.users.id", ondelete="CASCADE"), nullable=True
+    )
+    session_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("platform.sessions.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    return_path: Mapped[str] = mapped_column(String(2048))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class GoogleAuthFlow(Base):
+    """Single-use, browser-bound Google authorization-code state."""
+
+    __tablename__ = "google_auth_flows"
+    __table_args__ = (
+        CheckConstraint("purpose = 'login'", name="purpose_login_only"),
+        CheckConstraint("user_id IS NULL AND session_id IS NULL", name="purpose_owner_empty"),
+        CheckConstraint("length(state_digest) = 64", name="state_digest_length"),
+        CheckConstraint(
+            "length(browser_grant_digest) = 64", name="browser_grant_digest_length"
+        ),
+        Index("ix_google_auth_flows_cleanup", "expires_at", "consumed_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    state_digest: Mapped[str] = mapped_column(String(64), unique=True)
+    browser_grant_digest: Mapped[str] = mapped_column(String(64))
+    purpose: Mapped[str] = mapped_column(String(16), default="login")
     user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("platform.users.id", ondelete="CASCADE"), nullable=True
     )

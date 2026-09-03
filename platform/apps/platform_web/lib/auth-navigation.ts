@@ -22,6 +22,11 @@ export function steamCompletionPath(
   return `/auth/steam-complete?${params.toString()}`;
 }
 
+export function googleCompletionPath(returnTo: string): string {
+  const params = new URLSearchParams({ returnTo: safeAuthReturnPath(returnTo) });
+  return `/auth/google-complete?${params.toString()}`;
+}
+
 export function withSteamAuthStatus(
   destination: string,
   status: "error" | "success"

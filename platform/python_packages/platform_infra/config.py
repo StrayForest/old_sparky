@@ -57,6 +57,11 @@ class PlatformSettings(BaseSettings):
     # the API service. These settings only control the local callback and flow.
     platform_steam_callback_url: str | None = None
     platform_steam_openid_timeout_seconds: float = Field(default=5.0, gt=0, le=15)
+    platform_google_login_enabled: bool = False
+    platform_google_client_id: str | None = None
+    platform_google_client_secret: str | None = None
+    platform_google_callback_url: str | None = None
+    platform_google_oauth_timeout_seconds: float = Field(default=5.0, gt=0, le=15)
     platform_auth_flow_ttl_minutes: int = Field(default=15, ge=5, le=30)
     platform_auth_delivery_cooldown_seconds: int = Field(default=60, ge=30, le=300)
     platform_csrf_enabled: bool | None = None
@@ -484,4 +489,30 @@ def validate_platform_settings(
     ):
         raise RuntimeError(
             "PLATFORM_STEAM_CALLBACK_URL must use the public web HTTPS origin and exact /api/v1/auth/steam/callback path without a query or fragment."
+        )
+    google_callback_url = (settings.platform_google_callback_url or "").strip()
+    google_callback = urlsplit(google_callback_url)
+    try:
+        if settings.platform_google_login_enabled:
+            google_callback.port
+    except ValueError as exc:
+        raise RuntimeError(
+            "Production web and Google callback URLs must use valid ports."
+        ) from exc
+    if settings.platform_google_login_enabled and (
+        not (settings.platform_google_client_id or "").strip()
+        or not (settings.platform_google_client_secret or "").strip()
+        or not google_callback_url
+        or google_callback.scheme != "https"
+        or not google_callback.hostname
+        or google_callback.username
+        or google_callback.password
+        or (google_callback.hostname, google_callback.port or 443)
+        != (web_origin.hostname, web_origin.port or 443)
+        or google_callback.path != "/api/v1/auth/google/callback"
+        or google_callback.query
+        or google_callback.fragment
+    ):
+        raise RuntimeError(
+            "Enabled Google authentication requires client credentials and PLATFORM_GOOGLE_CALLBACK_URL at the public origin with exact /api/v1/auth/google/callback path."
         )

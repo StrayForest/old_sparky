@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { FormEvent, useEffect, useState, useTransition } from "react";
 import { LogIn, UserPlus } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-provider";
+import { GoogleAuthAction } from "@/components/auth/google-auth-action";
 import { useI18n } from "@/components/i18n-provider";
 import { SteamAuthAction } from "@/components/auth/steam-auth-action";
 import { TurnstileWidget, type TurnstileAction } from "@/components/auth/turnstile-widget";
@@ -25,11 +26,12 @@ type AuthFormProps = {
   mode: "login" | "register";
   returnTo?: string;
   steamAuthError?: boolean;
+  googleAuthError?: boolean;
 };
 
 type AcceptedResponse = { accepted: boolean; retry_after_seconds?: number };
 
-export function AuthForm({ mode, returnTo, steamAuthError = false }: AuthFormProps) {
+export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthError = false }: AuthFormProps) {
   const { clearUser, setUser } = useAuth();
   const { t } = useI18n();
   const router = useRouter();
@@ -192,6 +194,9 @@ export function AuthForm({ mode, returnTo, steamAuthError = false }: AuthFormPro
         {steamAuthError ? (
           <div className="auth-error" role="alert">{t("auth.steamCallbackFailed")}</div>
         ) : null}
+        {googleAuthError ? (
+          <div className="auth-error" role="alert">{t("auth.googleCallbackFailed")}</div>
+        ) : null}
         {errorMessage ? <div className="auth-error" role="alert">{errorMessage}</div> : null}
 
         <form
@@ -335,12 +340,24 @@ export function AuthForm({ mode, returnTo, steamAuthError = false }: AuthFormPro
             </div>
           ) : null}
         </form>
-        {securityConfig?.steam_login_enabled !== false ? (
-          <SteamAuthAction
-            label={t(isRegister ? "auth.steamCreate" : "auth.steamLogin")}
-            returnTo={isRegister ? "/profile/me" : safeAuthReturnPath(returnTo)}
-            security={securityConfigState}
-          />
+        {securityConfig?.google_login_enabled === true || securityConfig?.steam_login_enabled !== false ? (
+          <div className="auth-provider-actions">
+            <div className="auth-divider" aria-hidden="true"><span>{t("auth.or")}</span></div>
+            {securityConfig?.google_login_enabled === true ? (
+              <GoogleAuthAction
+                label={t(isRegister ? "auth.googleCreate" : "auth.googleLogin")}
+                returnTo={isRegister ? "/profile/me" : safeAuthReturnPath(returnTo)}
+                security={securityConfigState}
+              />
+            ) : null}
+            {securityConfig?.steam_login_enabled !== false ? (
+              <SteamAuthAction
+                label={t(isRegister ? "auth.steamCreate" : "auth.steamLogin")}
+                returnTo={isRegister ? "/profile/me" : safeAuthReturnPath(returnTo)}
+                security={securityConfigState}
+              />
+            ) : null}
+          </div>
         ) : null}
       </section>
     </main>

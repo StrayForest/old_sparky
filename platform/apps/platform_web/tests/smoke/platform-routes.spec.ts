@@ -348,7 +348,7 @@ const routes = [
   { path: "/terms", name: "terms", title: "Условия использования | Old Sparky Arena", visibleText: "Назначение платформы" },
   { path: "/tournaments", name: "tournaments", title: "Турниры | Old Sparky Arena", visibleText: "Night Veil Open #5" },
   { path: "/tournaments/new", name: "create tournament", title: "Создать турнир | Old Sparky Arena", visibleText: "Создать турнир" },
-  { path: "/tournaments/night-veil-open-5", name: "tournament detail", title: "Турнир | Old Sparky Arena", visibleText: "Описание турнира" },
+  { path: "/tournaments/night-veil-open-5", name: "tournament detail", title: "Турнир | Old Sparky Arena", visibleText: "Описание" },
   { path: "/tournaments/night-veil-open-5/bracket", name: "bracket", title: "Сетка турнира | Old Sparky Arena", visibleText: "Night Veil Open #5" },
   { path: "/auth/login", name: "login", title: "Вход | Old Sparky Arena", visibleText: "Вход" },
   { path: "/auth/register", name: "register", title: "Создать аккаунт | Old Sparky Arena", visibleText: "Создать аккаунт" },
@@ -2813,24 +2813,15 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
   expect(csrfTokenRequests).toEqual([]);
 });
 
-test("Steam auto-verification collapses immediately and blocks duplicate starts", async ({ page }) => {
+test("Steam start does not mount Turnstile, grows the panel, or duplicate requests", async ({ page }) => {
   const startPayloads: Array<Record<string, unknown>> = [];
-  let steamAttempts = 0;
-  let resolveFirstAttemptStarted: (() => void) | null = null;
-  let releaseFirstAttempt: (() => void) | null = null;
-  let resolveSecondAttemptStarted: (() => void) | null = null;
-  let releaseSecondAttempt: (() => void) | null = null;
-  const firstAttemptStarted = new Promise<void>((resolve) => {
-    resolveFirstAttemptStarted = resolve;
+  let resolveAttemptStarted: (() => void) | null = null;
+  let releaseAttempt: (() => void) | null = null;
+  const attemptStarted = new Promise<void>((resolve) => {
+    resolveAttemptStarted = resolve;
   });
-  const firstAttemptRelease = new Promise<void>((resolve) => {
-    releaseFirstAttempt = resolve;
-  });
-  const secondAttemptStarted = new Promise<void>((resolve) => {
-    resolveSecondAttemptStarted = resolve;
-  });
-  const secondAttemptRelease = new Promise<void>((resolve) => {
-    releaseSecondAttempt = resolve;
+  const attemptRelease = new Promise<void>((resolve) => {
+    releaseAttempt = resolve;
   });
 
   await page.route("**/api/v1/auth/security-config", async (route) => {
@@ -2842,41 +2833,16 @@ test("Steam auto-verification collapses immediately and blocks duplicate starts"
         email_verification_required: true,
         turnstile_mode: "always",
         turnstile_site_key: "turnstile-steam-smoke-key",
-        steam_login_enabled: true
+        steam_login_enabled: true,
+        google_login_enabled: false
       })
-    });
-  });
-  await page.route("**/turnstile/v0/api.js*", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/javascript",
-      body: `window.turnstile = {
-        render(container, options) {
-          container.dataset.turnstileAction = options.action;
-          queueMicrotask(() => options.callback("steam-auto-token"));
-          return "steam-widget";
-        },
-        remove() {},
-        reset() {}
-      };`
     });
   });
   await page.route("**/api/v1/auth/steam/login/start", async (route) => {
     expectOriginOnlyAuthRequest(route);
-    steamAttempts += 1;
     startPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
-    if (steamAttempts === 1) {
-      resolveFirstAttemptStarted?.();
-      await firstAttemptRelease;
-      await route.fulfill({
-        status: 403,
-        contentType: "application/json",
-        body: JSON.stringify({ detail: "Human verification is required." })
-      });
-      return;
-    }
-    resolveSecondAttemptStarted?.();
-    await secondAttemptRelease;
+    resolveAttemptStarted?.();
+    await attemptRelease;
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -2895,19 +2861,79 @@ test("Steam auto-verification collapses immediately and blocks duplicate starts"
     button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
-  await firstAttemptStarted;
-  await expect.poll(() => steamAttempts).toBe(1);
-  releaseFirstAttempt!();
-  await expect.poll(() => steamAttempts).toBe(2);
-  await secondAttemptStarted;
-  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
+  await attemptStarted;
+  await expect(steamButton).toHaveText("Подождите...");
   await expect(steamButton).toBeDisabled();
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
   await expect.poll(() => authPanel.evaluate((element) => Math.round(element.getBoundingClientRect().height))).toBe(initialPanelHeight);
 
-  expect(steamAttempts).toBe(2);
-  releaseSecondAttempt!();
+  expect(startPayloads).toHaveLength(1);
+  expect(startPayloads[0]).not.toHaveProperty("turnstile_token");
+  releaseAttempt!();
   await expect(page).toHaveURL(/\/auth\/login\?steam_auth=error$/u);
-  expect(startPayloads[1].turnstile_token).toBe("steam-auto-token");
+});
+
+test("Google start is a compact single request and shares the external auth layout", async ({ page }) => {
+  const startPayloads: Array<Record<string, unknown>> = [];
+  let resolveAttemptStarted: (() => void) | null = null;
+  let releaseAttempt: (() => void) | null = null;
+  const attemptStarted = new Promise<void>((resolve) => {
+    resolveAttemptStarted = resolve;
+  });
+  const attemptRelease = new Promise<void>((resolve) => {
+    releaseAttempt = resolve;
+  });
+
+  await page.route("**/api/v1/auth/security-config", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        public_registration_enabled: true,
+        email_verification_required: true,
+        turnstile_mode: "always",
+        turnstile_site_key: "turnstile-google-smoke-key",
+        steam_login_enabled: true,
+        google_login_enabled: true
+      })
+    });
+  });
+  await page.route("**/api/v1/auth/google/login/start", async (route) => {
+    expectOriginOnlyAuthRequest(route);
+    startPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
+    resolveAttemptStarted?.();
+    await attemptRelease;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        authorization_url: "/auth/login?google_auth=error",
+        expires_at: "2026-08-13T12:05:00Z"
+      })
+    });
+  });
+
+  await page.goto("/auth/login");
+  await expect(page.getByText("или", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Войти через Google", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Войти через Steam", exact: true })).toBeVisible();
+  const authPanel = page.locator(".auth-panel");
+  const initialPanelHeight = await authPanel.evaluate((element) => Math.round(element.getBoundingClientRect().height));
+  const googleButton = page.locator("button.google-auth-button");
+  await googleButton.evaluate((button) => {
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await attemptStarted;
+  await expect(googleButton).toHaveText("Подождите...");
+  await expect(googleButton).toBeDisabled();
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
+  await expect.poll(() => authPanel.evaluate((element) => Math.round(element.getBoundingClientRect().height))).toBe(initialPanelHeight);
+
+  expect(startPayloads).toHaveLength(1);
+  expect(startPayloads[0]).toEqual({ return_to: "/auth/google-complete?returnTo=%2F" });
+  releaseAttempt!();
+  await expect(page).toHaveURL(/\/auth\/login\?google_auth=error$/u);
 });
 
 test("adaptive Turnstile appears only after the API asks for human verification", async ({ page }) => {

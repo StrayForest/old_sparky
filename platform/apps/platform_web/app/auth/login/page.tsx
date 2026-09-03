@@ -9,9 +9,9 @@ export const metadata: Metadata = {
 export default async function LoginPage({
   searchParams
 }: {
-  searchParams: Promise<{ returnTo?: string; steam_auth?: string }>;
+  searchParams: Promise<{ returnTo?: string; steam_auth?: string; google_auth?: string }>;
 }) {
-  const { returnTo, steam_auth: steamAuth } = await searchParams;
+  const { returnTo, steam_auth: steamAuth, google_auth: googleAuth } = await searchParams;
   return (
     <>
       <div className="page-noise" aria-hidden="true" />
@@ -19,7 +19,12 @@ export default async function LoginPage({
         title="Вход"
         subtitle="Профиль, регистрации и управление турнирами."
       />
-      <AuthForm mode="login" returnTo={returnTo} steamAuthError={steamAuth === "error"} />
+      <AuthForm
+        googleAuthError={googleAuth === "error"}
+        mode="login"
+        returnTo={returnTo}
+        steamAuthError={steamAuth === "error"}
+      />
     </>
   );
 }

@@ -59,7 +59,7 @@ def session_token_digest(token: str) -> str:
 
 
 AUTH_FLOW_PURPOSES = frozenset(
-    {"email-change", "email-link", "password-reset", "steam", "verification"}
+    {"email-change", "email-link", "google", "password-reset", "steam", "verification"}
 )
 
 

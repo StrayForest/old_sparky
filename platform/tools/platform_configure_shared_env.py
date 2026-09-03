@@ -72,6 +72,11 @@ PUBLIC_BASELINE = {
         "https://old-sparky.com/api/v1/auth/steam/callback"
     ),
     "PLATFORM_STEAM_OPENID_TIMEOUT_SECONDS": "5",
+    "PLATFORM_GOOGLE_LOGIN_ENABLED": "false",
+    "PLATFORM_GOOGLE_CALLBACK_URL": (
+        "https://old-sparky.com/api/v1/auth/google/callback"
+    ),
+    "PLATFORM_GOOGLE_OAUTH_TIMEOUT_SECONDS": "5",
     "PLATFORM_CSRF_ENABLED": "true",
     "PLATFORM_AUTH_RATE_LIMIT_ENABLED": "true",
     "PLATFORM_AUTH_LOGIN_WINDOW_SECONDS": "600",
@@ -236,7 +241,9 @@ RUNTIME_PROFILES = {
         "PLATFORM_DB_CONNECTION_BUDGET": "52",
     },
 }
-PRESERVED_ROLLOUT_FLAGS = frozenset({"PLATFORM_STEAM_LOGIN_ENABLED"})
+PRESERVED_ROLLOUT_FLAGS = frozenset(
+    {"PLATFORM_GOOGLE_LOGIN_ENABLED", "PLATFORM_STEAM_LOGIN_ENABLED"}
+)
 ROLLOUT_FLAG_VALUES = frozenset({"true", "false"})
 
 

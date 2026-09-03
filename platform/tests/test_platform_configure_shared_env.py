@@ -34,8 +34,13 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertEqual(content.count("PLATFORM_WEB_ORIGIN="), 1)
         self.assertIn("PLATFORM_MEDIA_PUBLIC_BASE_URL", changed)
         self.assertIn("PLATFORM_STEAM_LOGIN_ENABLED=true", content)
+        self.assertIn("PLATFORM_GOOGLE_LOGIN_ENABLED=false", content)
         self.assertIn(
             "PLATFORM_STEAM_CALLBACK_URL=https://old-sparky.com/api/v1/auth/steam/callback",
+            content,
+        )
+        self.assertIn(
+            "PLATFORM_GOOGLE_CALLBACK_URL=https://old-sparky.com/api/v1/auth/google/callback",
             content,
         )
         self.assertIn("PLATFORM_AUTH_DELIVERY_COOLDOWN_SECONDS=60", content)
@@ -54,6 +59,16 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertIn("PLATFORM_STEAM_LOGIN_ENABLED=false", missing_content)
         self.assertIn("PLATFORM_STEAM_LOGIN_ENABLED=false", invalid_content)
         self.assertIn("PLATFORM_STEAM_LOGIN_ENABLED", changed)
+
+    def test_merge_defaults_new_and_invalid_google_rollout_flags_to_disabled(self) -> None:
+        missing_content, _changed = configure.merge_baseline([])
+        invalid_content, changed = configure.merge_baseline(
+            ["PLATFORM_GOOGLE_LOGIN_ENABLED=unexpected"]
+        )
+
+        self.assertIn("PLATFORM_GOOGLE_LOGIN_ENABLED=false", missing_content)
+        self.assertIn("PLATFORM_GOOGLE_LOGIN_ENABLED=false", invalid_content)
+        self.assertIn("PLATFORM_GOOGLE_LOGIN_ENABLED", changed)
 
     def test_merge_can_select_one_reviewed_baseline_key(self) -> None:
         content, changed = configure.merge_baseline(

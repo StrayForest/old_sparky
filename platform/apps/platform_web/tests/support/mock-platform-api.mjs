@@ -375,7 +375,8 @@ const server = createServer((request, response) => {
       email_verification_required: true,
       turnstile_mode: "off",
       turnstile_site_key: null,
-      steam_login_enabled: true
+      steam_login_enabled: true,
+      google_login_enabled: false
     }, { "cache-control": "no-store" });
     return;
   }

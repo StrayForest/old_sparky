@@ -168,6 +168,42 @@ class PlatformProductionConfigTests(unittest.TestCase):
             )
         )
 
+    def test_enabled_google_login_requires_valid_public_callback_and_credentials(self) -> None:
+        valid = self.production_settings(
+            platform_google_login_enabled=True,
+            platform_google_client_id="google-client-id.apps.googleusercontent.com",
+            platform_google_client_secret="google-client-secret",
+            platform_google_callback_url=(
+                "https://old-sparky.com/api/v1/auth/google/callback"
+            ),
+        )
+        validate_platform_settings(valid)
+
+        for overrides in (
+            {"platform_google_client_id": None},
+            {"platform_google_client_secret": None},
+            {"platform_google_callback_url": None},
+            {"platform_google_callback_url": "http://old-sparky.com/api/v1/auth/google/callback"},
+            {"platform_google_callback_url": "https://evil.example/api/v1/auth/google/callback"},
+            {"platform_google_callback_url": "https://old-sparky.com/alternate/callback"},
+            {"platform_google_callback_url": "https://old-sparky.com/api/v1/auth/google/callback?next=evil"},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                RuntimeError,
+                "PLATFORM_GOOGLE_CALLBACK_URL|Google authentication",
+            ):
+                validate_platform_settings(valid.model_copy(update=overrides))
+
+    def test_disabled_google_login_does_not_require_oauth_configuration(self) -> None:
+        validate_platform_settings(
+            self.production_settings(
+                platform_google_login_enabled=False,
+                platform_google_client_id=None,
+                platform_google_client_secret=None,
+                platform_google_callback_url=None,
+            )
+        )
+
     def test_staging_quota_cannot_be_smaller_than_one_upload(self) -> None:
         settings = self.production_settings(
             platform_media_max_input_bytes=6 * 1024 * 1024,

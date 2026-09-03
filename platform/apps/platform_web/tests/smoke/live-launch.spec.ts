@@ -349,7 +349,7 @@ test("live tournament detail and bracket routes render from the current public d
   expect(href).toBeTruthy();
 
   await page.goto(href!);
-  await expect(page.getByText("Описание турнира")).toBeVisible();
+  await expect(page.getByText("Описание", { exact: true })).toBeVisible();
   const bracketLink = page.getByRole("link", { name: "Перейти к сетке" });
   const bracketHref = await bracketLink.getAttribute("href");
   expect(bracketHref).toBeTruthy();

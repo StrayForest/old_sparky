@@ -13,7 +13,7 @@ Read this file for the current production baseline and next engineering priority
 - Platform database: `platformdb`, schema `platform`.
 - Web, API and worker run under separate locked Unix identities with per-service runtime environments; the web process receives no backend database, session, R2, mail, Turnstile-secret or OpenAI credentials.
 - API and worker share only the dedicated `oldsparky-media` staging group; worker state and web cache remain service-owned.
-- Current deployed product includes secure Steam OpenID login/linking, mobile auth/profile/tournament polish, enforced nonce CSP, tournament lifecycle, deterministic Deadlock assignment, locked rosters, bracket progression, durable patch-translation state, the rebuildable tournament catalog read model with keyset pagination, the admin roster control center, immutable releases and tested rollback.
+- Current deployed product includes secure Steam OpenID login/linking, mobile auth/profile/tournament polish, enforced nonce CSP, tournament lifecycle, deterministic Deadlock assignment, locked rosters, bracket progression, durable patch-translation state, the rebuildable tournament catalog read model with keyset pagination, the admin roster control center, immutable releases and tested rollback. Google OAuth login/registration is implemented behind a disabled-by-default rollout flag and requires operator-supplied OAuth credentials before activation.
 - Frontend audit remediation for contract validation, permissions, auth/session states, async draft/search races, retry boundaries, internal navigation and i18n is resolved and deployed in release `frontend-audit-remediation-20260822T204107Z`; evidence is in [`archive/frontend-audit-remediation-2026-08-22.md`](archive/frontend-audit-remediation-2026-08-22.md).
 - Cloudflare Access now protects `/platform-ops*` and `/api/v1/admin*` with an operator-scoped Allow policy and independent MFA; a fresh incognito login verified the identity -> TOTP MFA -> application path while application `admin`/`superadmin` RBAC remains authoritative.
 - Cloudflare is the single visitor-facing HSTS owner. Dashboard verification on 2026-08-21 confirmed HSTS On with six-month `max-age=15552000`, `includeSubDomains` Off and preload Off; Nginx must continue to omit HSTS.
@@ -28,7 +28,7 @@ Read this file for the current production baseline and next engineering priority
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
 - Password-login guessing protection uses independent source-IP and account-wide Redis state. Account identifiers are represented by HMAC fingerprints, shared failures drive adaptive Turnstile and a bounded cooldown, and successful login clears account failure/cooldown state.
-- Production Alembic head is `20260901_0051`, including the tournament catalog
+- Production Alembic head is `20260903_0052`, including Google external identities and browser-bound OAuth state alongside the tournament catalog
   read-model and keyset-pagination revisions. The migration scenario records
   this as the current head; see the [deployment runbook](deployment-runbook.md)
   for the exact release-SHA evidence.
@@ -55,7 +55,7 @@ database budgets are unchanged. The corrected canonical performance model uses
 `ready-vote-stress-15k-v2` and `ready-vote-spike-v1`; the optional 20k stress
 profile is retained only for a specific unresolved question.
 
-Current status: migration `20260901_0051` is the deployed Alembic head. The
+Current status: migration `20260903_0052` is the deployed Alembic head. The
 `0048` revision adds a partial covering index for the `UserSession` auth query;
 its `EXPLAIN` `Index Only Scan` / `Heap Fetches 0` result is disposable
 engineering evidence, not a production architecture claim. The supported

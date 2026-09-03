@@ -385,6 +385,25 @@ async def check_steam_auth_rate_limit(
     )
 
 
+async def check_google_auth_rate_limit(
+    request: Request,
+    account_key: str,
+    *,
+    operation: str,
+    settings: PlatformSettings | None = None,
+    now_epoch: int | None = None,
+) -> AuthRateLimitState:
+    if operation not in {"callback", "login"}:
+        raise ValueError("Google authentication operation is invalid.")
+    return await _check_token_action_rate_limit(
+        request,
+        account_key,
+        scope=f"google-{operation}",
+        settings=settings,
+        now_epoch=now_epoch,
+    )
+
+
 async def check_email_link_rate_limit(
     request: Request,
     account_key: str,

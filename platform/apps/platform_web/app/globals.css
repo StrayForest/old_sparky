@@ -384,8 +384,8 @@ button {
     height: 30px;
     overflow: hidden;
     color: var(--ui-primary-bright, #5eead4);
-    background: rgba(45, 212, 191, .1);
-    border: 1px solid rgba(45, 212, 191, .25);
+    background: transparent;
+    border: 0;
     border-radius: 50%;
   }
 
@@ -2251,12 +2251,14 @@ img.rank-icon,
   display: grid;
 }
 
-.steam-auth-button {
+.steam-auth-button,
+.google-auth-button {
   width: 100%;
 }
 
-.steam-auth-action .auth-turnstile {
-  margin-top: 12px;
+.auth-provider-actions {
+  display: grid;
+  gap: 10px;
 }
 
 .auth-error {
@@ -2919,6 +2921,7 @@ img.rank-icon,
   display: flex;
   gap: 16px;
   justify-content: space-between;
+  flex-wrap: nowrap;
 }
 
 .description-panel-heading,
@@ -2926,6 +2929,11 @@ img.rank-icon,
   align-items: center;
   display: inline-flex;
   gap: 8px;
+}
+
+.description-panel-heading {
+  min-width: 0;
+  white-space: nowrap;
 }
 
 .tournament-invite-gate {
@@ -2949,7 +2957,9 @@ img.rank-icon,
   letter-spacing: .08em;
   margin-left: auto;
   text-align: right;
-  word-break: break-word;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  word-break: normal;
 }
 
 .description-text {
@@ -4182,6 +4192,10 @@ img.rank-icon,
     width: 100%;
     height: 100%;
     border: 0;
+  }
+
+  .description-panel-title {
+    gap: 8px;
   }
 
   .nav {

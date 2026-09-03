@@ -19,3 +19,14 @@ export function SteamIcon({ size = 24, ...props }: BrandIconProps) {
     </svg>
   );
 }
+
+export function GoogleIcon({ size = 24, ...props }: BrandIconProps) {
+  return (
+    <svg data-brand="google" height={size} viewBox="0 0 24 24" width={size} {...props}>
+      <path d="M21.35 12.27c0-.79-.07-1.55-.22-2.27H12v4.3h5.22a4.46 4.46 0 0 1-1.94 2.93v2.43h3.14c1.84-1.7 2.93-4.2 2.93-7.39Z" fill="#4285F4" />
+      <path d="M12 21.6c2.63 0 4.84-.87 6.45-2.36l-3.14-2.43c-.87.58-1.98.92-3.31.92-2.54 0-4.7-1.72-5.47-4.03H3.28v2.51A9.74 9.74 0 0 0 12 21.6Z" fill="#34A853" />
+      <path d="M6.53 13.7a5.85 5.85 0 0 1 0-3.4V7.79H3.28a9.6 9.6 0 0 0 0 8.42l3.25-2.51Z" fill="#FBBC05" />
+      <path d="M12 6.27c1.43 0 2.71.49 3.72 1.45l2.79-2.79C16.84 3.34 14.63 2.4 12 2.4a9.74 9.74 0 0 0-8.72 5.39l3.25 2.51C7.3 7.99 9.46 6.27 12 6.27Z" fill="#EA4335" />
+    </svg>
+  );
+}

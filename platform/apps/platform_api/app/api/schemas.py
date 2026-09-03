@@ -200,10 +200,18 @@ class EmailVerificationResendRequest(BaseModel):
 
 class SteamAuthStartRequest(BaseModel):
     return_to: str = Field(default="/", min_length=1, max_length=512)
-    turnstile_token: str | None = Field(default=None, min_length=1, max_length=2048)
 
 
 class SteamAuthStartResponse(BaseModel):
+    authorization_url: str
+    expires_at: datetime
+
+
+class GoogleAuthStartRequest(BaseModel):
+    return_to: str = Field(default="/", min_length=1, max_length=512)
+
+
+class GoogleAuthStartResponse(BaseModel):
     authorization_url: str
     expires_at: datetime
 
@@ -311,6 +319,7 @@ class AuthSecurityConfigResponse(BaseModel):
     turnstile_mode: str
     turnstile_site_key: str | None = None
     steam_login_enabled: bool = False
+    google_login_enabled: bool = False
 
 
 class MediaVariantResponse(BaseModel):

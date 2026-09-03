@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from python_packages.platform_infra.config import PlatformSettings
 from python_packages.platform_infra.models import (
     EmailVerificationToken,
+    GoogleAuthFlow,
     PasswordResetToken,
     SteamAuthFlow,
     SteamEmailLinkIntent,
@@ -37,6 +38,7 @@ class AuthCleanupResult:
     password_reset_tokens_deleted: int
     email_verification_tokens_deleted: int
     steam_auth_flows_deleted: int
+    google_auth_flows_deleted: int
     email_link_intents_deleted: int
 
     def as_dict(self) -> dict[str, int]:
@@ -45,6 +47,7 @@ class AuthCleanupResult:
             "password_reset_tokens_deleted": self.password_reset_tokens_deleted,
             "email_verification_tokens_deleted": self.email_verification_tokens_deleted,
             "steam_auth_flows_deleted": self.steam_auth_flows_deleted,
+            "google_auth_flows_deleted": self.google_auth_flows_deleted,
             "email_link_intents_deleted": self.email_link_intents_deleted,
         }
 
@@ -400,6 +403,14 @@ async def cleanup_auth_lifecycle_records(
             )
         )
     )
+    google_flow_result = await db_session.execute(
+        delete(GoogleAuthFlow).where(
+            or_(
+                GoogleAuthFlow.expires_at <= cleanup_at,
+                GoogleAuthFlow.consumed_at <= consumed_cutoff,
+            )
+        )
+    )
     email_link_result = await db_session.execute(
         delete(SteamEmailLinkIntent).where(
             or_(
@@ -414,5 +425,6 @@ async def cleanup_auth_lifecycle_records(
         password_reset_tokens_deleted=int(reset_result.rowcount or 0),
         email_verification_tokens_deleted=int(verification_result.rowcount or 0),
         steam_auth_flows_deleted=int(steam_flow_result.rowcount or 0),
+        google_auth_flows_deleted=int(google_flow_result.rowcount or 0),
         email_link_intents_deleted=int(email_link_result.rowcount or 0),
     )

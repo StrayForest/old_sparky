@@ -44,6 +44,7 @@ export type PlatformAuthSecurityConfig = {
   turnstile_mode: "off" | "always" | "adaptive";
   turnstile_site_key: string | null;
   steam_login_enabled?: boolean;
+  google_login_enabled?: boolean;
 };
 
 export type PlatformMediaVariant = {

@@ -8,7 +8,6 @@ import { useI18n } from "@/components/i18n-provider";
 export type TurnstileAction =
   | "login"
   | "register"
-  | "steam_login"
   | "reset_request"
   | "verification_resend";
 type TurnstileState = "loading" | "checking" | "verified" | "expired" | "error";

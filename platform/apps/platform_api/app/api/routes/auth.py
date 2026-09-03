@@ -26,6 +26,8 @@ from apps.platform_api.app.api.schemas import (
     EmailChangeRequest,
     EmailLinkConfirmRequest,
     EmailLinkRequest,
+    GoogleAuthStartRequest,
+    GoogleAuthStartResponse,
     LoginRequest,
     PasswordResetCodeVerifyRequest,
     PasswordResetConfirmRequest,
@@ -40,6 +42,13 @@ from apps.platform_api.app.services.auth_mail import (
 )
 from apps.platform_api.app.services.current_user import serialize_current_user
 from apps.platform_api.app.services.auth_bootstrap import build_auth_bootstrap
+from apps.platform_api.app.services.google_oauth import (
+    GoogleOAuthError,
+    GoogleOAuthUnavailable,
+    build_google_authorization_url,
+    supported_google_params,
+    verify_google_authorization_code,
+)
 from apps.platform_api.app.services.profile_read_models import delete_profile_read_model
 from apps.platform_api.app.services.user_account_read_models import (
     delete_user_account_read_model,
@@ -72,6 +81,7 @@ from python_packages.platform_infra.auth_lifecycle import (
 from python_packages.platform_infra.auth_rate_limit import (
     check_email_verification_confirm_rate_limit,
     check_email_verification_resend_rate_limit,
+    check_google_auth_rate_limit,
     check_email_link_rate_limit,
     check_login_rate_limit,
     check_password_reset_rate_limit,
@@ -93,6 +103,7 @@ from python_packages.platform_infra.models import (
     PlayerProfile,
     Role,
     SteamAuthFlow,
+    GoogleAuthFlow,
     User,
     UserRole,
     UserSession,
@@ -225,16 +236,26 @@ def _steam_callback_url(request: Request, settings: PlatformSettings) -> str:
     return str(request.url_for("steam_callback"))
 
 
+def _google_callback_url(request: Request, settings: PlatformSettings) -> str:
+    configured = (settings.platform_google_callback_url or "").strip()
+    if configured:
+        return configured
+    return str(request.url_for("google_callback"))
+
+
 def _web_auth_redirect(
     settings: PlatformSettings,
     return_path: str,
     *,
     result: str,
+    provider: str = "steam",
 ) -> RedirectResponse:
+    if provider not in {"steam", "google"}:
+        raise ValueError("Unsupported external authentication provider.")
     normalized_path = normalize_return_path(return_path)
     parsed = urlsplit(normalized_path)
     query = parse_qsl(parsed.query, keep_blank_values=True)
-    query.append(("steam_auth", result))
+    query.append((f"{provider}_auth", result))
     destination = (
         settings.platform_web_origin.rstrip("/")
         + urlunsplit(("", "", parsed.path, urlencode(query), ""))
@@ -256,6 +277,7 @@ async def auth_security_config(response: Response) -> AuthSecurityConfigResponse
         turnstile_mode=normalized_turnstile_mode(settings),
         turnstile_site_key=(settings.platform_turnstile_site_key or "").strip() or None,
         steam_login_enabled=settings.platform_steam_login_enabled,
+        google_login_enabled=settings.platform_google_login_enabled,
     )
 
 
@@ -353,18 +375,10 @@ async def _start_steam_auth(
             detail="Steam authentication is currently unavailable.",
         )
     if purpose == "login":
-        rate_limit_state = await check_steam_auth_rate_limit(
+        await check_steam_auth_rate_limit(
             request,
             "public",
             operation="login",
-            settings=settings,
-        )
-        await verify_human_verification(
-            token=payload.turnstile_token,
-            expected_action="steam_login",
-            request=request,
-            response=response,
-            adaptive_required=rate_limit_state.adaptive_turnstile_required,
             settings=settings,
         )
     elif purpose == "link" and auth_session is not None:
@@ -737,6 +751,331 @@ async def steam_callback(
     await delete_user_account_read_model(user.id)
     redirect = _web_auth_redirect(settings, flow_return_path, result="success")
     clear_auth_flow_cookie(redirect, purpose="steam", settings=settings)
+    set_session_cookie(redirect, auth_session.token)
+    issue_csrf_token(redirect, auth_session.token, settings)
+    return redirect
+
+
+@router.post("/google/login/start", response_model=GoogleAuthStartResponse)
+async def start_google_login(
+    payload: GoogleAuthStartRequest,
+    request: Request,
+    response: Response,
+    db_session: AsyncSession = Depends(get_db_session),
+) -> GoogleAuthStartResponse:
+    settings = get_settings()
+    if not settings.platform_google_login_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google authentication is currently unavailable.",
+        )
+    if not (settings.platform_google_client_id or "").strip() or not (
+        settings.platform_google_client_secret or ""
+    ).strip():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google authentication is currently unavailable.",
+        )
+    await check_google_auth_rate_limit(
+        request,
+        "public",
+        operation="login",
+        settings=settings,
+    )
+    state = new_flow_secret()
+    browser_grant = issue_auth_flow_cookie(
+        response,
+        purpose="google",
+        account_key=state,
+        settings=settings,
+    )
+    expires_at = datetime.now(UTC) + timedelta(
+        minutes=settings.platform_auth_flow_ttl_minutes
+    )
+    db_session.add(
+        GoogleAuthFlow(
+            state_digest=digest_flow_secret(
+                state,
+                settings.platform_secret_key,
+                purpose="google-state",
+            ),
+            browser_grant_digest=digest_flow_secret(
+                browser_grant,
+                settings.platform_secret_key,
+                purpose="google-browser-grant",
+            ),
+            return_path=normalize_return_path(payload.return_to),
+            expires_at=expires_at,
+        )
+    )
+    await db_session.commit()
+    response.headers["Cache-Control"] = "no-store"
+    return GoogleAuthStartResponse(
+        authorization_url=build_google_authorization_url(
+            _google_callback_url(request, settings),
+            settings.platform_google_client_id.strip(),
+            state,
+        ),
+        expires_at=expires_at,
+    )
+
+
+@router.get("/google/callback", name="google_callback")
+async def google_callback(
+    request: Request,
+    db_session: AsyncSession = Depends(get_db_session),
+) -> Response:
+    settings = get_settings()
+    try:
+        callback_params = supported_google_params(request.query_params)
+    except GoogleOAuthError:
+        callback_params = {}
+    state = callback_params.get("state", "")
+    if not state or len(state) > 512:
+        redirect = _web_auth_redirect(
+            settings,
+            "/auth/login",
+            result="error",
+            provider="google",
+        )
+        clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
+        return redirect
+
+    flow = await db_session.scalar(
+        select(GoogleAuthFlow)
+        .where(
+            GoogleAuthFlow.state_digest
+            == digest_flow_secret(
+                state,
+                settings.platform_secret_key,
+                purpose="google-state",
+            )
+        )
+        .with_for_update()
+    )
+    now = datetime.now(UTC)
+    browser_grant = request.cookies.get(auth_flow_cookie_name("google", settings), "")
+    if (
+        flow is None
+        or flow.consumed_at is not None
+        or flow.expires_at <= now
+        or not has_valid_auth_flow_cookie(
+            request,
+            purpose="google",
+            account_key=state,
+            settings=settings,
+        )
+        or not flow_secret_matches(
+            flow.browser_grant_digest,
+            browser_grant,
+            settings.platform_secret_key,
+            purpose="google-browser-grant",
+        )
+    ):
+        return_path = flow.return_path if flow is not None else "/auth/login"
+        if flow is not None and flow.consumed_at is None:
+            flow.consumed_at = now
+            await db_session.commit()
+        else:
+            await db_session.rollback()
+        redirect = _web_auth_redirect(
+            settings,
+            return_path,
+            result="error",
+            provider="google",
+        )
+        clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
+        return redirect
+
+    try:
+        await check_google_auth_rate_limit(
+            request,
+            state,
+            operation="callback",
+            settings=settings,
+        )
+    except HTTPException:
+        flow.consumed_at = now
+        await db_session.commit()
+        redirect = _web_auth_redirect(
+            settings,
+            flow.return_path,
+            result="error",
+            provider="google",
+        )
+        clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
+        return redirect
+
+    code = callback_params.get("code", "")
+    if callback_params.get("error") or not code:
+        flow.consumed_at = now
+        await db_session.commit()
+        redirect = _web_auth_redirect(
+            settings,
+            flow.return_path,
+            result="error",
+            provider="google",
+        )
+        clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
+        return redirect
+
+    flow_return_path = flow.return_path
+    flow.consumed_at = now
+    await db_session.commit()
+    try:
+        google_identity = await verify_google_authorization_code(
+            code,
+            callback_url=_google_callback_url(request, settings),
+            settings=settings,
+        )
+    except GoogleOAuthUnavailable as exc:
+        logger.warning("Google OAuth verification unavailable: %s", type(exc).__name__)
+        redirect = _web_auth_redirect(
+            settings,
+            flow_return_path,
+            result="error",
+            provider="google",
+        )
+        clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
+        return redirect
+    except GoogleOAuthError as exc:
+        logger.info("Google OAuth assertion rejected: %s", type(exc).__name__)
+        redirect = _web_auth_redirect(
+            settings,
+            flow_return_path,
+            result="error",
+            provider="google",
+        )
+        clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
+        return redirect
+
+    identity = await db_session.scalar(
+        select(ExternalIdentity)
+        .where(
+            ExternalIdentity.provider == "google",
+            ExternalIdentity.subject == google_identity.subject,
+        )
+        .with_for_update()
+    )
+    created_user = False
+    if identity is not None:
+        user = await db_session.scalar(
+            select(User).where(User.id == identity.user_id).with_for_update()
+        )
+        if user is None or user.status != "active":
+            await db_session.commit()
+            redirect = _web_auth_redirect(
+                settings,
+                flow_return_path,
+                result="error",
+                provider="google",
+            )
+            clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
+            return redirect
+        identity.last_authenticated_at = now
+    else:
+        user = await db_session.scalar(
+            select(User).where(User.email == google_identity.email).with_for_update()
+        )
+        if user is not None:
+            if user.status not in {"active", "pending_verification"}:
+                await db_session.rollback()
+                redirect = _web_auth_redirect(
+                    settings,
+                    flow_return_path,
+                    result="error",
+                    provider="google",
+                )
+                clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
+                return redirect
+            user.status = "active"
+            user.email_verified_at = now
+        else:
+            user = User(
+                email=google_identity.email,
+                display_name=google_identity.display_name,
+                status="active",
+                email_verified_at=now,
+                public_tournament_credits=0,
+                private_tournament_credits=0,
+            )
+            db_session.add(user)
+            await db_session.flush()
+            db_session.add(
+                PlayerProfile(
+                    user_id=user.id,
+                    display_name=user.display_name,
+                    contact_email=user.email,
+                )
+            )
+            roles = list(
+                (
+                    await db_session.scalars(
+                        select(Role).where(
+                            Role.slug.in_(["authenticated_user", "player"])
+                        )
+                    )
+                ).all()
+            )
+            if {role.slug for role in roles} != {"authenticated_user", "player"}:
+                await db_session.rollback()
+                redirect = _web_auth_redirect(
+                    settings,
+                    flow_return_path,
+                    result="error",
+                    provider="google",
+                )
+                clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
+                return redirect
+            for role in roles:
+                db_session.add(UserRole(user_id=user.id, role_id=role.id))
+            created_user = True
+        identity = ExternalIdentity(
+            user_id=user.id,
+            provider="google",
+            subject=google_identity.subject,
+            linked_at=now,
+            last_authenticated_at=now,
+        )
+        db_session.add(identity)
+
+    auth_session = await create_user_session(
+        db_session=db_session,
+        user=user,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    await write_audit_log(
+        db_session,
+        actor_user_id=user.id,
+        action="auth.google.register" if created_user else "auth.google.login",
+        subject_type="user",
+        subject_id=user.id,
+        payload={"provider": "google", "created_user": created_user},
+    )
+    try:
+        await db_session.commit()
+    except IntegrityError as exc:
+        await db_session.rollback()
+        logger.info("Google identity completion conflicted: %s", type(exc).__name__)
+        redirect = _web_auth_redirect(
+            settings,
+            flow_return_path,
+            result="error",
+            provider="google",
+        )
+        clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
+        return redirect
+    invalidate_user_session_cache(user.id)
+    await delete_profile_read_model(user.id)
+    await delete_user_account_read_model(user.id)
+    redirect = _web_auth_redirect(
+        settings,
+        flow_return_path,
+        result="success",
+        provider="google",
+    )
+    clear_auth_flow_cookie(redirect, purpose="google", settings=settings)
     set_session_cookie(redirect, auth_session.token)
     issue_csrf_token(redirect, auth_session.token, settings)
     return redirect

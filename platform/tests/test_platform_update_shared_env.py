@@ -11,6 +11,7 @@ class PlatformUpdateSharedEnvTests(unittest.TestCase):
             '{"PLATFORM_ENVIRONMENT":"production",'
             '"PLATFORM_TURNSTILE_MODE":"always",'
             '"PLATFORM_STEAM_LOGIN_ENABLED":"true",'
+            '"PLATFORM_GOOGLE_LOGIN_ENABLED":"true",'
             '"PLATFORM_RESEND_API_KEY":"replace-me-private"}'
         )
         content, changed = update_env.merge_updates(
@@ -28,6 +29,7 @@ class PlatformUpdateSharedEnvTests(unittest.TestCase):
             changed,
             [
                 "PLATFORM_ENVIRONMENT",
+                "PLATFORM_GOOGLE_LOGIN_ENABLED",
                 "PLATFORM_RESEND_API_KEY",
                 "PLATFORM_STEAM_LOGIN_ENABLED",
                 "PLATFORM_TURNSTILE_MODE",
@@ -43,6 +45,8 @@ class PlatformUpdateSharedEnvTests(unittest.TestCase):
             update_env.read_updates('{"PLATFORM_ENVIRONMENT":"development"}')
         with self.assertRaisesRegex(ValueError, "invalid reviewed value"):
             update_env.read_updates('{"PLATFORM_STEAM_LOGIN_ENABLED":"yes"}')
+        with self.assertRaisesRegex(ValueError, "invalid reviewed value"):
+            update_env.read_updates('{"PLATFORM_GOOGLE_LOGIN_ENABLED":"yes"}')
 
 
 if __name__ == "__main__":

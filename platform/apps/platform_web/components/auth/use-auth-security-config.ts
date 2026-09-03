@@ -119,7 +119,8 @@ function fallbackSecurityConfig(): PlatformAuthSecurityConfig | null {
     email_verification_required: true,
     turnstile_mode: "always",
     turnstile_site_key: fallbackTurnstileSiteKey,
-    steam_login_enabled: false
+    steam_login_enabled: false,
+    google_login_enabled: false
   };
 }
 
@@ -142,6 +143,7 @@ function validateSecurityConfig(payload: PlatformAuthSecurityConfig): PlatformAu
     email_verification_required: payload.email_verification_required,
     turnstile_mode: payload.turnstile_mode,
     turnstile_site_key: siteKey,
-    steam_login_enabled: payload.steam_login_enabled === true
+    steam_login_enabled: payload.steam_login_enabled === true,
+    google_login_enabled: payload.google_login_enabled === true
   };
 }

@@ -16,8 +16,11 @@
 - Turnstile and Redis limits supplement authentication, invite, support and
   upload controls.
 - A successful Turnstile check creates a fixed-term, opaque browser trust grant
-  backed by Redis. It is shared by login, Steam login, registration and
+  backed by Redis. It is shared by password login, registration and
   password-reset request flows; the one-time Turnstile token is never reused.
+- Steam OpenID and optional Google OAuth login/registration use provider-bound,
+  single-use callback state and independent rate limits. They do not require a
+  second Turnstile check after the ordinary auth form.
 - Tokens, passwords, cookies, codes, secrets and personal data never enter
   logs or reports.
 - Application RBAC remains authoritative behind Cloudflare Access.
