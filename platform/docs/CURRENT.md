@@ -166,11 +166,15 @@ identity/roles/credits with a 60-second, versioned supplemental account
 read-model. Its small monthly quota count is refreshed authoritatively from
 PostgreSQL on cache hits; Redis does not decide authentication or
 authorization.
-The current dev candidate also makes profile-read cache access GET-first on a
+The current deployed candidate makes profile-read cache access GET-first on a
 process-local shared Redis pool and stores absent profiles as a versioned
 60-second negative sentinel. Profile creation and profile mutations invalidate
-that entry after commit; production A/B evidence for this candidate is still
-required.
+that entry after commit. Exact production measurement
+[`33760930891`](https://github.com/StrayForest/old_sparky/actions/runs/33760930891)
+completed with 20,000 successful HTML responses and exact cleanup; the
+isolated bootstrap probe confirmed one profile SQL for repeated absent-profile
+requests and GET-only warm positive hits. Full evidence and the remaining
+unmeasured hypotheses are retained in `platform/performance/README.md`.
 
 The external profile `authenticated-page-load-v1` measures authenticated
 `GET /tournaments/{slug}` HTML through the real Next.js origin and reports HTML
