@@ -56,7 +56,8 @@ export default defineConfig({
       env: {
         HOSTNAME: "127.0.0.1",
         PORT: "3100",
-        PLATFORM_API_BASE_URL: "http://127.0.0.1:3199/api/v1"
+        PLATFORM_API_BASE_URL: "http://127.0.0.1:3199/api/v1",
+        PLATFORM_ADSENSE_ENABLED: "false"
       },
       url: "http://127.0.0.1:3100",
       reuseExistingServer: true,

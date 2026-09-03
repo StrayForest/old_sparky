@@ -31,7 +31,8 @@ export default defineConfig({
     env: {
       HOSTNAME: "127.0.0.1",
       PORT: String(webPort),
-      PLATFORM_API_BASE_URL: `http://127.0.0.1:${apiPort}/api/v1`
+      PLATFORM_API_BASE_URL: `http://127.0.0.1:${apiPort}/api/v1`,
+      PLATFORM_ADSENSE_ENABLED: "false"
     },
     url: `http://127.0.0.1:${webPort}/auth/login`,
     reuseExistingServer: false,

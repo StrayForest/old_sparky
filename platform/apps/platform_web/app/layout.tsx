@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import { cookies, headers } from "next/headers";
 import { connection } from "next/server";
 import type { ReactNode } from "react";
@@ -36,9 +37,21 @@ export default async function RootLayout({
   const initialAuth = requestCookies.has(platformSessionCookieName())
     ? await measureSsrStage("root_layout_auth_bootstrap", () => getServerAuthBootstrap(cookieHeader))
     : { status: "anonymous" as const, user: null };
+  const adsenseEnabled = process.env.PLATFORM_ADSENSE_ENABLED !== "false";
 
   const rendered = (
     <html lang="ru">
+      <head>
+        {adsenseEnabled ? (
+          <Script
+            async
+            crossOrigin="anonymous"
+            nonce={nonce ?? undefined}
+            src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7185165276065459"
+            strategy="afterInteractive"
+          />
+        ) : null}
+      </head>
       <body>
         <CspNonceProvider nonce={nonce}>
           <CspRouteAnnouncer />

@@ -108,6 +108,8 @@ test("document CSP uses one fresh nonce and leaves static responses unscoped", a
   expect(firstPolicy).toContain("script-src-attr 'none'");
   expect(firstPolicy).toContain("style-src-attr 'none'");
   expect(firstPolicy).toContain("worker-src 'self'");
+  expect(firstPolicy).toContain("https://pagead2.googlesyndication.com");
+  expect(firstPolicy).toContain("https://googleads.g.doubleclick.net");
   expect(firstPolicy).toContain("https://i2.ytimg.com https://i3.ytimg.com");
   expect(firstPolicy).not.toMatch(/'unsafe-|strict-dynamic|\*|\bdata:/);
   expect(first.headers()["reporting-endpoints"]).toBe(
@@ -2814,8 +2816,16 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
 test("Steam auto-verification collapses immediately and blocks duplicate starts", async ({ page }) => {
   const startPayloads: Array<Record<string, unknown>> = [];
   let steamAttempts = 0;
+  let resolveFirstAttemptStarted: (() => void) | null = null;
+  let releaseFirstAttempt: (() => void) | null = null;
   let resolveSecondAttemptStarted: (() => void) | null = null;
   let releaseSecondAttempt: (() => void) | null = null;
+  const firstAttemptStarted = new Promise<void>((resolve) => {
+    resolveFirstAttemptStarted = resolve;
+  });
+  const firstAttemptRelease = new Promise<void>((resolve) => {
+    releaseFirstAttempt = resolve;
+  });
   const secondAttemptStarted = new Promise<void>((resolve) => {
     resolveSecondAttemptStarted = resolve;
   });
@@ -2856,6 +2866,8 @@ test("Steam auto-verification collapses immediately and blocks duplicate starts"
     steamAttempts += 1;
     startPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
     if (steamAttempts === 1) {
+      resolveFirstAttemptStarted?.();
+      await firstAttemptRelease;
       await route.fulfill({
         status: 403,
         contentType: "application/json",
@@ -2883,7 +2895,9 @@ test("Steam auto-verification collapses immediately and blocks duplicate starts"
     button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
+  await firstAttemptStarted;
   await expect.poll(() => steamAttempts).toBe(1);
+  releaseFirstAttempt!();
   await expect(page.locator(".auth-turnstile")).toHaveCount(1);
   await expect.poll(() => steamAttempts).toBe(2);
   await secondAttemptStarted;
@@ -3075,7 +3089,7 @@ test("password reset uses one Turnstile challenge before code entry", async ({ p
       body: `window.turnstile = {
         render(container, options) {
           container.dataset.turnstileAction = options.action;
-          queueMicrotask(() => options.callback("token-" + options.action));
+          setTimeout(() => options.callback("token-" + options.action), 250);
           return options.action;
         },
         remove() {},
