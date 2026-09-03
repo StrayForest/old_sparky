@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { SteamIcon } from "@/components/icons/brand-icons";
 import { TurnstileWidget } from "@/components/auth/turnstile-widget";
 import type { useAuthSecurityConfig } from "@/components/auth/use-auth-security-config";
@@ -28,15 +28,17 @@ export function SteamAuthAction({
   const [turnstileResetSignal, setTurnstileResetSignal] = useState(0);
   const [isStarting, setIsStarting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const isStartingRef = useRef(false);
   const turnstileSiteKey = security.config?.turnstile_mode !== "off"
     ? security.config?.turnstile_site_key ?? null
     : null;
   const securityReady = security.status === "ready" || security.status === "fallback";
 
   const startSteamAuth = useCallback(async (token: string | null) => {
-    if (isStarting) {
+    if (isStartingRef.current) {
       return;
     }
+    isStartingRef.current = true;
     setIsStarting(true);
     setErrorMessage("");
     try {
@@ -66,23 +68,32 @@ export function SteamAuthAction({
               : t("auth.steamStartFailed")
       );
       setTurnstileToken(null);
+      isStartingRef.current = false;
       setIsStarting(false);
-      if (needsHumanVerification && turnstileSiteKey) {
+      if ((needsHumanVerification || turnstileFailed) && turnstileSiteKey) {
         setExpanded(true);
-      } else if (turnstileSiteKey) {
+      }
+      if (turnstileSiteKey) {
         setTurnstileResetSignal((current) => current + 1);
       }
     }
-  }, [isStarting, returnTo, t, turnstileSiteKey]);
+  }, [returnTo, t, turnstileSiteKey]);
 
   useEffect(() => {
-    if (expanded && turnstileToken && !isStarting) {
+    if (turnstileToken && !isStarting) {
       void startSteamAuth(turnstileToken);
     }
-  }, [expanded, isStarting, startSteamAuth, turnstileToken]);
+  }, [isStarting, startSteamAuth, turnstileToken]);
+
+  const handleTurnstileToken = useCallback((token: string | null) => {
+    setTurnstileToken(token);
+    if (token) {
+      setExpanded(false);
+    }
+  }, []);
 
   function begin() {
-    if (!securityReady || isStarting) {
+    if (!securityReady || isStarting || isStartingRef.current || expanded) {
       return;
     }
     void startSteamAuth(null);
@@ -93,7 +104,7 @@ export function SteamAuthAction({
       <div className="auth-divider" aria-hidden="true"><span>{t("auth.or")}</span></div>
       <button
         className="secondary-button steam-auth-button"
-        disabled={!securityReady || isStarting}
+        disabled={!securityReady || isStarting || expanded}
         onClick={begin}
         type="button"
       >
@@ -103,7 +114,7 @@ export function SteamAuthAction({
       {expanded && turnstileSiteKey ? (
         <TurnstileWidget
           action="steam_login"
-          onTokenChange={setTurnstileToken}
+          onTokenChange={handleTurnstileToken}
           resetSignal={turnstileResetSignal}
           siteKey={turnstileSiteKey}
         />

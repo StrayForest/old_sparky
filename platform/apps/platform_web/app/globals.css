@@ -375,6 +375,27 @@ button {
     padding: 0 14px;
   }
 
+  .header-profile-avatar {
+    position: relative;
+    display: grid;
+    flex: 0 0 auto;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    overflow: hidden;
+    color: var(--ui-primary-bright, #5eead4);
+    background: rgba(45, 212, 191, .1);
+    border: 1px solid rgba(45, 212, 191, .25);
+    border-radius: 50%;
+  }
+
+  .header-profile-avatar-image {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
   .session-muted {
     color: #b9b1a2;
   }
@@ -2316,10 +2337,6 @@ img.rank-icon,
   border-radius: 5px;
 }
 
-.auth-turnstile[data-state="checking"] .auth-turnstile-frame {
-  min-height: 65px;
-}
-
 .auth-turnstile-retry {
   width: fit-content;
   padding: 0;
@@ -4159,6 +4176,12 @@ img.rank-icon,
   .site-header .brand-title {
     font-size: 14px;
     letter-spacing: .055em;
+  }
+
+  .header-profile-avatar {
+    width: 100%;
+    height: 100%;
+    border: 0;
   }
 
   .nav {

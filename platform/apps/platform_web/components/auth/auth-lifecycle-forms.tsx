@@ -269,7 +269,7 @@ export function PasswordResetForm({
         </>
       )}
       {mode === "request" ? <SecurityConfigFeedback security={security} /> : null}
-      {mode === "request" && turnstileSiteKey && turnstileRequired ? (
+      {mode === "request" && turnstileSiteKey && turnstileRequired && !turnstileToken ? (
         <TurnstileWidget
           action="reset_request"
           onTokenChange={setTurnstileToken}
@@ -354,9 +354,6 @@ function SecurityConfigFeedback({
   security: ReturnType<typeof useAuthSecurityConfig>;
 }) {
   const { t } = useI18n();
-  if (security.status === "loading") {
-    return <p aria-live="polite" className="auth-security-status" role="status">{t("auth.securityConfigLoading")}</p>;
-  }
   if (security.status === "error") {
     return (
       <div className="auth-security-status auth-security-status-error" role="alert">

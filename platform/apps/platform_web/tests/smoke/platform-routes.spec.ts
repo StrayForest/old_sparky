@@ -496,6 +496,19 @@ test("mobile authenticated header keeps compact icon actions beside the brand", 
   await expectNoHorizontalOverflow(page);
 });
 
+test("authenticated header shows the profile avatar when available", async ({ page }) => {
+  await authenticateTestUser(page, [{ name: "header-avatar-smoke", value: "1" }]);
+  await page.goto("/tournaments");
+
+  const profileLink = page.getByRole("banner").getByRole("link", { name: "Профиль: lisalexy" });
+  await expect(profileLink).toBeVisible();
+  await expect(profileLink.locator(".header-profile-avatar-image")).toHaveAttribute(
+    "src",
+    "/assets/heroes/Abrams.png"
+  );
+  await expect(profileLink.locator(".header-profile-avatar svg")).toHaveCount(0);
+});
+
 test("information page uses the concise rules title", async ({ page }) => {
   await page.goto("/info");
   await expect(page.getByRole("heading", { name: "Правила", exact: true })).toBeVisible();
@@ -2734,7 +2747,7 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
           render(container, options) {
             container.dataset.turnstileAction = options.action;
             container.dataset.turnstileAppearance = options.appearance;
-            queueMicrotask(() => options.callback("turnstile-login-token"));
+            setTimeout(() => options.callback("turnstile-login-token"), 250);
             return "auth-widget";
           },
           remove() {},
@@ -2775,6 +2788,7 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
 
   await page.goto("/auth/register");
   await expect(page.locator(".auth-turnstile")).toHaveCount(0);
+  await expect(page.getByText("Загружаем параметры защищённого входа...", { exact: true })).toHaveCount(0);
   await expectNoHorizontalOverflow(page);
 
   await page.goto("/auth/login");
@@ -2786,6 +2800,7 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
   await submitButton.click();
   await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "login");
   await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-appearance", "interaction-only");
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
   await expect(submitButton).toBeEnabled();
   await submitButton.click();
   await expect(page).toHaveURL(/\/$/u);
@@ -2794,6 +2809,92 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
   expect(loginPayloads[0]).toEqual({ email: "turnstile@example.test", password: "long-password" });
   expect(loginPayloads[1].turnstile_token).toBe("turnstile-login-token");
   expect(csrfTokenRequests).toEqual([]);
+});
+
+test("Steam auto-verification collapses immediately and blocks duplicate starts", async ({ page }) => {
+  const startPayloads: Array<Record<string, unknown>> = [];
+  let steamAttempts = 0;
+  let resolveSecondAttemptStarted: (() => void) | null = null;
+  let releaseSecondAttempt: (() => void) | null = null;
+  const secondAttemptStarted = new Promise<void>((resolve) => {
+    resolveSecondAttemptStarted = resolve;
+  });
+  const secondAttemptRelease = new Promise<void>((resolve) => {
+    releaseSecondAttempt = resolve;
+  });
+
+  await page.route("**/api/v1/auth/security-config", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        public_registration_enabled: true,
+        email_verification_required: true,
+        turnstile_mode: "always",
+        turnstile_site_key: "turnstile-steam-smoke-key",
+        steam_login_enabled: true
+      })
+    });
+  });
+  await page.route("**/turnstile/v0/api.js*", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: `window.turnstile = {
+        render(container, options) {
+          container.dataset.turnstileAction = options.action;
+          queueMicrotask(() => options.callback("steam-auto-token"));
+          return "steam-widget";
+        },
+        remove() {},
+        reset() {}
+      };`
+    });
+  });
+  await page.route("**/api/v1/auth/steam/login/start", async (route) => {
+    expectOriginOnlyAuthRequest(route);
+    steamAttempts += 1;
+    startPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
+    if (steamAttempts === 1) {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "Human verification is required." })
+      });
+      return;
+    }
+    resolveSecondAttemptStarted?.();
+    await secondAttemptRelease;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        authorization_url: "/auth/login?steam_auth=error",
+        expires_at: "2026-08-13T12:05:00Z"
+      })
+    });
+  });
+
+  await page.goto("/auth/login");
+  const authPanel = page.locator(".auth-panel");
+  const initialPanelHeight = await authPanel.evaluate((element) => Math.round(element.getBoundingClientRect().height));
+  const steamButton = page.locator("button.steam-auth-button");
+  await steamButton.evaluate((button) => {
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await expect.poll(() => steamAttempts).toBe(1);
+  await expect(page.locator(".auth-turnstile")).toHaveCount(1);
+  await expect.poll(() => steamAttempts).toBe(2);
+  await secondAttemptStarted;
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
+  await expect(steamButton).toBeDisabled();
+  await expect.poll(() => authPanel.evaluate((element) => Math.round(element.getBoundingClientRect().height))).toBe(initialPanelHeight);
+
+  expect(steamAttempts).toBe(2);
+  releaseSecondAttempt!();
+  await expect(page).toHaveURL(/\/auth\/login\?steam_auth=error$/u);
+  expect(startPayloads[1].turnstile_token).toBe("steam-auto-token");
 });
 
 test("adaptive Turnstile appears only after the API asks for human verification", async ({ page }) => {
@@ -2819,7 +2920,7 @@ test("adaptive Turnstile appears only after the API asks for human verification"
         render(container, options) {
           container.dataset.turnstileAction = options.action;
           container.dataset.turnstileAppearance = options.appearance;
-          queueMicrotask(() => options.callback("adaptive-token"));
+          setTimeout(() => options.callback("adaptive-token"), 250);
           return "adaptive-widget";
         },
         remove() {},
@@ -2864,6 +2965,7 @@ test("adaptive Turnstile appears only after the API asks for human verification"
   await page.getByRole("button", { name: "Войти", exact: true }).click();
   await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "login");
   await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-appearance", "interaction-only");
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
   await page.getByRole("button", { name: "Войти", exact: true }).click();
   await expect(page).toHaveURL(/\/$/u);
   expect(loginPayloads).toEqual([

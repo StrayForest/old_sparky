@@ -109,19 +109,19 @@ export function SiteHeader() {
                 className={`login-button ${MOBILE_ACCOUNT_BUTTON}`}
                 href="/profile/me"
               >
-                <span className="relative inline-grid place-items-center max-[820px]:size-full" aria-hidden="true">
-                  <User size={18} />
+                <span className="header-profile-avatar" aria-hidden="true">
                   {user.avatar_media || user.avatar_url ? (
                     <PreparedMedia
                       alt=""
-                      className="absolute inset-0 hidden h-full w-full rounded-full object-cover max-[820px]:block"
+                      className="header-profile-avatar-image"
                       descriptor={user.avatar_media}
                       fallbackUrl={user.avatar_url}
                       height={40}
                       sizes="40px"
+                      priority
                       width={40}
                     />
-                  ) : null}
+                  ) : <User size={18} />}
                 </span>
                 <span className="header-profile-label max-[820px]:hidden">
                   {user.display_name}

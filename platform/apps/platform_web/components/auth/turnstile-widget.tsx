@@ -137,13 +137,7 @@ export function TurnstileWidget({
     setState(scriptReady ? "error" : "loading");
   }
 
-  const statusKey = {
-    loading: "auth.turnstileLoading",
-    checking: "auth.turnstileChecking",
-    verified: "auth.turnstileVerified",
-    expired: "auth.turnstileExpired",
-    error: "auth.turnstileError"
-  }[state];
+  const statusKey = state === "expired" ? "auth.turnstileExpired" : "auth.turnstileError";
 
   return (
     <div

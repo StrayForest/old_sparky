@@ -155,6 +155,12 @@ function authenticated(request) {
   return (request.headers.cookie ?? "").includes("deadlock_platform_session=");
 }
 
+function headerAvatarUrl(request) {
+  return (request.headers.cookie ?? "").includes("header-avatar-smoke=1")
+    ? "/assets/heroes/Abrams.png"
+    : null;
+}
+
 function actorForRequest(request) {
   const cookie = request.headers.cookie ?? "";
   if (cookie.includes("steam-only-smoke=1")) {
@@ -712,7 +718,7 @@ const server = createServer((request, response) => {
         || actor.roles.includes("superadmin"),
       public_tournament_credits: actor.id === "u_limited_creator" ? 0 : 2,
       private_tournament_credits: 4,
-      avatar_url: null,
+      avatar_url: headerAvatarUrl(request),
       avatar_media: null
     } : { detail: "Not authenticated." });
     return;
@@ -754,6 +760,8 @@ const server = createServer((request, response) => {
       steam_id: actor.steam_id ?? (actor.id === "u_lisalexy" ? "76561198000000000" : null),
       steam_linked: Boolean(actor.steam_id || actor.id === "u_lisalexy"),
       has_password: actor.has_password ?? true,
+      avatar_url: headerAvatarUrl(request),
+      avatar_media: null,
       can_unlink_steam: Boolean(actor.email && (actor.has_password ?? true))
     } : { detail: "Not authenticated." });
     return;

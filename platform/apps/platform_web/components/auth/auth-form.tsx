@@ -272,12 +272,6 @@ export function AuthForm({ mode, returnTo, steamAuthError = false }: AuthFormPro
             </label>
           ) : null}
 
-          {securityConfigState.status === "loading" ? (
-            <p aria-live="polite" className="auth-security-status" role="status">
-              {t("auth.securityConfigLoading")}
-            </p>
-          ) : null}
-
           {securityConfigState.status === "error" ? (
             <div className="auth-security-status auth-security-status-error" role="alert">
               <span>{t("auth.securityConfigError")}</span>
@@ -297,7 +291,7 @@ export function AuthForm({ mode, returnTo, steamAuthError = false }: AuthFormPro
             </p>
           ) : null}
 
-          {!enteringCode && turnstileSiteKey && turnstileRequired ? (
+          {!enteringCode && turnstileSiteKey && turnstileRequired && !turnstileToken ? (
             <TurnstileWidget
               action={turnstileAction}
               onTokenChange={setTurnstileToken}
