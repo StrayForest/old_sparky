@@ -49,16 +49,20 @@ export function PasswordResetForm({
   const turnstileSiteKey = security.config?.turnstile_mode !== "off"
     ? security.config?.turnstile_site_key ?? null
     : null;
+  const turnstileMode = security.config?.turnstile_mode ?? "off";
+  const [turnstileChallengeRequired, setTurnstileChallengeRequired] = useState(false);
+  const turnstileRequired = turnstileChallengeRequired;
   const securityReady = security.status === "ready" || security.status === "fallback";
 
   useEffect(() => {
     setTurnstileToken(null);
-  }, [turnstileSiteKey]);
+    setTurnstileChallengeRequired(false);
+  }, [turnstileMode, turnstileSiteKey]);
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setErrorMessage("");
-    if (mode === "request" && (!securityReady || (turnstileSiteKey && !turnstileToken))) {
+    if (mode === "request" && (!securityReady || (turnstileSiteKey && turnstileRequired && !turnstileToken))) {
       return;
     }
 
@@ -127,6 +131,10 @@ export function PasswordResetForm({
           t
         ));
         if (turnstileSiteKey && mode === "request") {
+          if (isHumanVerificationRequired(error)) {
+            setTurnstileChallengeRequired(true);
+          }
+          setTurnstileToken(null);
           setTurnstileResetSignal((current) => current + 1);
         }
       }
@@ -170,7 +178,7 @@ export function PasswordResetForm({
   }
 
   const canSubmit = (mode !== "request" || (
-    securityReady && (!turnstileSiteKey || Boolean(turnstileToken))
+    securityReady && (!turnstileSiteKey || !turnstileRequired || Boolean(turnstileToken))
   ))
     && !isPending;
   const formIdentity = resetFormIdentity[mode];
@@ -261,7 +269,7 @@ export function PasswordResetForm({
         </>
       )}
       {mode === "request" ? <SecurityConfigFeedback security={security} /> : null}
-      {mode === "request" && turnstileSiteKey ? (
+      {mode === "request" && turnstileSiteKey && turnstileRequired ? (
         <TurnstileWidget
           action="reset_request"
           onTokenChange={setTurnstileToken}
@@ -294,6 +302,10 @@ export function PasswordResetForm({
       </div>
     </form>
   );
+}
+
+function isHumanVerificationRequired(error: unknown): boolean {
+  return error instanceof PlatformApiError && error.message === "Human verification is required.";
 }
 
 export function EmailVerificationForm() {

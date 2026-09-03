@@ -118,6 +118,17 @@ and supplies roles, status and credits from PostgreSQL. Cache invalidation
 follows the relevant profile, identity, password, credit, role and
 private-tournament writes; Redis is never an auth or authorization authority.
 
+Authentication routes use a shared human-verification trust grant for the
+browser after a successful Cloudflare Turnstile Siteverify call. The grant is
+an opaque HttpOnly cookie backed by a Redis key with the configured
+`PLATFORM_AUTH_HUMAN_VERIFICATION_TTL_SECONDS` TTL (900 seconds in the
+baseline); it never stores or replays the one-time Turnstile token. Login,
+Steam login, registration and password-reset requests use the same grant, so
+only the first challenged operation calls Siteverify. The grant is fixed-term,
+not refreshed on reads; a missing/expired Redis record requires a fresh
+Turnstile check, while a Redis lookup failure fails closed. Rate limits and
+account cooldowns remain independent protections.
+
 Hot authenticated reads are instrumented with separate
 `pool_checkout_wait_ms`, `pool_connection_hold_ms`, `db_sql_ms` and request
 duration signals. The workspace preflight materializes a frozen primitive

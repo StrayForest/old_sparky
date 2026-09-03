@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
+from redis.exceptions import RedisError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -82,6 +83,10 @@ from python_packages.platform_infra.auth_rate_limit import (
 from python_packages.platform_infra.config import PlatformSettings, get_settings
 from python_packages.platform_infra.csrf import issue_csrf_token
 from python_packages.platform_infra.db import get_db_session, release_db_connection
+from python_packages.platform_infra.human_verification import (
+    has_human_verification_trust,
+    issue_human_verification_trust,
+)
 from python_packages.platform_infra.models import (
     PasswordCredential,
     ExternalIdentity,
@@ -181,6 +186,38 @@ async def _wait_for_generic_auth_response(
         await asyncio.sleep(remaining)
 
 
+async def verify_human_verification(
+    *,
+    token: str | None,
+    expected_action: str,
+    request: Request,
+    response: Response,
+    adaptive_required: bool,
+    settings: PlatformSettings,
+) -> None:
+    """Accept a fresh Turnstile token or an unexpired browser trust grant."""
+
+    if normalized_turnstile_mode(settings) == "off":
+        return
+    try:
+        if await has_human_verification_trust(request, settings=settings):
+            return
+        await verify_turnstile_token(
+            token,
+            expected_action=expected_action,
+            remote_ip=request.client.host if request.client else None,
+            adaptive_required=adaptive_required,
+            settings=settings,
+        )
+        if token and token.strip():
+            await issue_human_verification_trust(response, settings=settings)
+    except RedisError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Human verification is temporarily unavailable.",
+        ) from exc
+
+
 def _steam_callback_url(request: Request, settings: PlatformSettings) -> str:
     configured = (settings.platform_steam_callback_url or "").strip()
     if configured:
@@ -236,10 +273,11 @@ async def login(
         normalized_email,
         settings=settings,
     )
-    await verify_turnstile_token(
-        payload.turnstile_token,
+    await verify_human_verification(
+        token=payload.turnstile_token,
         expected_action="login",
-        remote_ip=request.client.host if request.client else None,
+        request=request,
+        response=response,
         adaptive_required=rate_limit_state.adaptive_turnstile_required,
         settings=settings,
     )
@@ -321,10 +359,11 @@ async def _start_steam_auth(
             operation="login",
             settings=settings,
         )
-        await verify_turnstile_token(
-            payload.turnstile_token,
+        await verify_human_verification(
+            token=payload.turnstile_token,
             expected_action="steam_login",
-            remote_ip=request.client.host if request.client else None,
+            request=request,
+            response=response,
             adaptive_required=rate_limit_state.adaptive_turnstile_required,
             settings=settings,
         )
@@ -736,10 +775,11 @@ async def request_password_reset(
         settings=settings,
     )
     if not has_flow_grant:
-        await verify_turnstile_token(
-            payload.turnstile_token,
+        await verify_human_verification(
+            token=payload.turnstile_token,
             expected_action="reset_request",
-            remote_ip=request.client.host if request.client else None,
+            request=request,
+            response=response,
             adaptive_required=rate_limit_state.adaptive_turnstile_required,
             settings=settings,
         )
@@ -985,10 +1025,11 @@ async def resend_email_verification(
         settings=settings,
     )
     if not has_flow_grant:
-        await verify_turnstile_token(
-            payload.turnstile_token,
+        await verify_human_verification(
+            token=payload.turnstile_token,
             expected_action="verification_resend",
-            remote_ip=request.client.host if request.client else None,
+            request=request,
+            response=response,
             adaptive_required=rate_limit_state.adaptive_turnstile_required,
             settings=settings,
         )

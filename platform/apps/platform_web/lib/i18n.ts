@@ -386,7 +386,7 @@ const translations: Record<string, string> = {
     "auth.turnstileError": "Проверку безопасности не удалось загрузить.",
     "auth.turnstileExpired": "Срок действия проверки истёк. Запустите её ещё раз.",
     "auth.turnstileLabel": "Проверка безопасности Cloudflare Turnstile",
-    "auth.turnstileTitle": "Защита формы",
+    "auth.turnstileTitle": "Проверка на Бибопа...",
     "auth.turnstileLoading": "Загружаем проверку безопасности...",
     "auth.turnstileRejected": "Проверка безопасности не пройдена. Выполните её ещё раз.",
     "auth.turnstileRetry": "Повторить проверку",

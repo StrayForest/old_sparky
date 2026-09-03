@@ -82,6 +82,11 @@ class PlatformSettings(BaseSettings):
     )
     platform_auth_progressive_delay_max_seconds: float = Field(default=1.5, ge=0, le=10)
     platform_auth_adaptive_turnstile_threshold: int = Field(default=3, ge=1, le=100)
+    platform_auth_human_verification_ttl_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=3600,
+    )
     platform_invite_rate_limit_enabled: bool | None = None
     platform_invite_rate_window_seconds: int = Field(default=900, ge=60, le=86_400)
     platform_invite_lookup_user_limit: int = Field(default=60, ge=1, le=10_000)

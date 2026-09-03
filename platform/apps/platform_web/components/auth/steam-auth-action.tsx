@@ -6,7 +6,7 @@ import { TurnstileWidget } from "@/components/auth/turnstile-widget";
 import type { useAuthSecurityConfig } from "@/components/auth/use-auth-security-config";
 import { useI18n } from "@/components/i18n-provider";
 import { steamCompletionPath } from "@/lib/auth-navigation";
-import { platformApiRequest } from "@/lib/platform-api";
+import { PlatformApiError, platformApiRequest } from "@/lib/platform-api";
 
 type SteamAuthStartResponse = {
   authorization_url: string;
@@ -49,11 +49,27 @@ export function SteamAuthAction({
         })
       });
       window.location.assign(response.authorization_url);
-    } catch {
-      setErrorMessage(t("auth.steamStartFailed"));
+    } catch (error) {
+      const needsHumanVerification = error instanceof PlatformApiError
+        && error.message === "Human verification is required.";
+      const turnstileFailed = error instanceof PlatformApiError
+        && error.message === "Human verification failed.";
+      const turnstileUnavailable = error instanceof PlatformApiError
+        && error.message === "Human verification is temporarily unavailable.";
+      setErrorMessage(
+        needsHumanVerification
+          ? ""
+          : turnstileFailed
+            ? t("auth.turnstileRejected")
+            : turnstileUnavailable
+              ? t("auth.turnstileUnavailable")
+              : t("auth.steamStartFailed")
+      );
       setTurnstileToken(null);
       setIsStarting(false);
-      if (turnstileSiteKey) {
+      if (needsHumanVerification && turnstileSiteKey) {
+        setExpanded(true);
+      } else if (turnstileSiteKey) {
         setTurnstileResetSignal((current) => current + 1);
       }
     }
@@ -69,11 +85,7 @@ export function SteamAuthAction({
     if (!securityReady || isStarting) {
       return;
     }
-    if (!turnstileSiteKey) {
-      void startSteamAuth(null);
-      return;
-    }
-    setExpanded(true);
+    void startSteamAuth(null);
   }
 
   return (

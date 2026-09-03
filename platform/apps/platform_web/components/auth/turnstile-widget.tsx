@@ -19,7 +19,7 @@ type TurnstileApi = {
     options: {
       sitekey: string;
       action: TurnstileAction;
-      appearance: "always";
+      appearance: "interaction-only";
       language: "ru";
       size: "flexible";
       theme: "dark";
@@ -71,7 +71,7 @@ export function TurnstileWidget({
       const widgetId = turnstile.render(containerRef.current, {
         sitekey: siteKey,
         action,
-        appearance: "always",
+        appearance: "interaction-only",
         language: "ru",
         size: "flexible",
         theme: "dark",
@@ -162,19 +162,21 @@ export function TurnstileWidget({
         src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
         strategy="afterInteractive"
       />
-      <div className="auth-turnstile-heading" aria-hidden="true">
-        <span><ShieldCheck size={18} /></span>
-        <strong>{t("auth.turnstileTitle")}</strong>
-      </div>
+      {state === "expired" || state === "error" ? (
+        <div className="auth-turnstile-heading" aria-hidden="true">
+          <span><ShieldCheck size={18} /></span>
+          <strong>{t("auth.turnstileTitle")}</strong>
+        </div>
+      ) : null}
       <div className="auth-turnstile-frame" ref={containerRef} />
-      <div aria-live="polite" className="auth-turnstile-feedback" data-state={state} role="status">
-        <span>{t(statusKey)}</span>
-        {state === "expired" || state === "error" ? (
+      {state === "expired" || state === "error" ? (
+        <div aria-live="polite" className="auth-turnstile-feedback" data-state={state} role="status">
+          <span>{t(statusKey)}</span>
           <button className="auth-turnstile-retry" onClick={resetWidget} type="button">
             {t("auth.turnstileRetry")}
           </button>
-        ) : null}
-      </div>
+        </div>
+      ) : null}
     </div>
   );
 }

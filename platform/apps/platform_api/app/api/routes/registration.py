@@ -103,10 +103,11 @@ async def register(
         request,
         settings=settings,
     )
-    await auth_routes.verify_turnstile_token(
-        payload.turnstile_token,
+    await auth_routes.verify_human_verification(
+        token=payload.turnstile_token,
         expected_action="register",
-        remote_ip=request.client.host if request.client else None,
+        request=request,
+        response=response,
         adaptive_required=rate_limit_state.adaptive_turnstile_required,
         settings=settings,
     )

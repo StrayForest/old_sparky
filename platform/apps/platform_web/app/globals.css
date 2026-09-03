@@ -2264,10 +2264,6 @@ img.rank-icon,
   color: #ffb8aa;
 }
 
-.auth-turnstile-feedback[data-state="verified"] {
-  color: var(--ui-primary-bright, #5eead4);
-}
-
 .auth-turnstile {
   display: grid;
   width: 100%;
@@ -2282,8 +2278,14 @@ img.rank-icon,
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .025);
 }
 
+.auth-turnstile[data-state="loading"],
+.auth-turnstile[data-state="checking"],
 .auth-turnstile[data-state="verified"] {
-  border-color: rgba(45, 212, 191, .34);
+  gap: 0;
+  padding: 0;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
 }
 
 .auth-turnstile-heading {
@@ -2309,9 +2311,13 @@ img.rank-icon,
 .auth-turnstile-frame {
   width: 100%;
   max-width: 100%;
-  min-height: 65px;
+  min-height: 0;
   overflow: hidden;
   border-radius: 5px;
+}
+
+.auth-turnstile[data-state="checking"] .auth-turnstile-frame {
+  min-height: 65px;
 }
 
 .auth-turnstile-retry {

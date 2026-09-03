@@ -15,6 +15,9 @@
   signed expiring CSRF token.
 - Turnstile and Redis limits supplement authentication, invite, support and
   upload controls.
+- A successful Turnstile check creates a fixed-term, opaque browser trust grant
+  backed by Redis. It is shared by login, Steam login, registration and
+  password-reset request flows; the one-time Turnstile token is never reused.
 - Tokens, passwords, cookies, codes, secrets and personal data never enter
   logs or reports.
 - Application RBAC remains authoritative behind Cloudflare Access.

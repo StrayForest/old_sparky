@@ -48,22 +48,26 @@ export function AuthForm({ mode, returnTo, steamAuthError = false }: AuthFormPro
   const turnstileSiteKey = securityConfig?.turnstile_mode !== "off"
     ? securityConfig?.turnstile_site_key ?? null
     : null;
+  const turnstileMode = securityConfig?.turnstile_mode ?? "off";
   const securityConfigReady = securityConfigState.status === "ready" || securityConfigState.status === "fallback";
   const registrationEnabled = !isRegister || securityConfig?.public_registration_enabled === true;
   const enteringCode = isRegister && registrationStep === "code";
   const turnstileAction: TurnstileAction = mode;
+  const [turnstileChallengeRequired, setTurnstileChallengeRequired] = useState(false);
+  const turnstileRequired = turnstileChallengeRequired;
   const canSubmit = (
     (enteringCode || (
       securityConfigReady
       && registrationEnabled
-      && (!turnstileSiteKey || Boolean(turnstileToken))
+      && (!turnstileSiteKey || !turnstileRequired || Boolean(turnstileToken))
     ))
     && !isPending
   );
 
   useEffect(() => {
     setTurnstileToken(null);
-  }, [turnstileSiteKey]);
+    setTurnstileChallengeRequired(false);
+  }, [turnstileMode, turnstileSiteKey]);
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -128,6 +132,10 @@ export function AuthForm({ mode, returnTo, steamAuthError = false }: AuthFormPro
       } catch (error) {
         setErrorMessage(authErrorMessage(error, enteringCode, isRegister, t));
         if (turnstileSiteKey && !enteringCode) {
+          if (isHumanVerificationRequired(error)) {
+            setTurnstileChallengeRequired(true);
+          }
+          setTurnstileToken(null);
           setTurnstileResetSignal((current) => current + 1);
         }
       }
@@ -289,7 +297,7 @@ export function AuthForm({ mode, returnTo, steamAuthError = false }: AuthFormPro
             </p>
           ) : null}
 
-          {!enteringCode && turnstileSiteKey ? (
+          {!enteringCode && turnstileSiteKey && turnstileRequired ? (
             <TurnstileWidget
               action={turnstileAction}
               onTokenChange={setTurnstileToken}
@@ -343,6 +351,10 @@ export function AuthForm({ mode, returnTo, steamAuthError = false }: AuthFormPro
       </section>
     </main>
   );
+}
+
+function isHumanVerificationRequired(error: unknown): boolean {
+  return error instanceof PlatformApiError && error.message === "Human verification is required.";
 }
 
 function authErrorMessage(

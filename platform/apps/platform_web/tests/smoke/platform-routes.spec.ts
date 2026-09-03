@@ -2708,7 +2708,7 @@ test("auth forms call platform auth endpoints and preserve web sessions", async 
   expect(authPayloads.every((payload) => !("turnstile_token" in payload))).toBe(true);
 });
 
-test("auth forms use runtime Turnstile actions and reset a consumed token after failure", async ({ page }) => {
+test("auth forms mount Turnstile only when the API requires it", async ({ page }) => {
   const loginPayloads: Array<Record<string, unknown>> = [];
   const csrfTokenRequests = await trackCsrfTokenRequests(page);
 
@@ -2730,20 +2730,15 @@ test("auth forms use runtime Turnstile actions and reset a consumed token after 
       status: 200,
       contentType: "application/javascript",
       body: `(() => {
-        let currentOptions = null;
-        window.__turnstileResetCount = 0;
         window.turnstile = {
           render(container, options) {
-            currentOptions = options;
             container.dataset.turnstileAction = options.action;
-            queueMicrotask(() => options.callback("turnstile-login-initial-token"));
+            container.dataset.turnstileAppearance = options.appearance;
+            queueMicrotask(() => options.callback("turnstile-login-token"));
             return "auth-widget";
           },
           remove() {},
-          reset() {
-            window.__turnstileResetCount += 1;
-            queueMicrotask(() => currentOptions.callback("turnstile-login-reset-token"));
-          }
+          reset() {}
         };
       })();`
     });
@@ -2755,7 +2750,7 @@ test("auth forms use runtime Turnstile actions and reset a consumed token after 
       await route.fulfill({
         status: 403,
         contentType: "application/json",
-        body: JSON.stringify({ detail: "Human verification failed." })
+        body: JSON.stringify({ detail: "Human verification is required." })
       });
       return;
     }
@@ -2779,31 +2774,102 @@ test("auth forms use runtime Turnstile actions and reset a consumed token after 
   });
 
   await page.goto("/auth/register");
-  await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "register");
-  await expect(page.getByText("Защита формы")).toBeVisible();
-  await expect(page.locator(".auth-turnstile")).toHaveCSS("border-top-style", "solid");
-  await expect(page.locator(".auth-turnstile-heading svg")).toHaveCount(1);
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
   await expectNoHorizontalOverflow(page);
 
   await page.goto("/auth/login");
-  await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "login");
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
   await page.getByLabel("Email").fill("turnstile@example.test");
   await page.getByLabel("Пароль").fill("long-password");
   const submitButton = page.getByRole("button", { name: "Войти", exact: true });
   await expect(submitButton).toBeEnabled();
   await submitButton.click();
-  await expect(page.getByText("Проверка безопасности не пройдена. Выполните её ещё раз.")).toBeVisible();
-  await expect.poll(() => page.evaluate(() => (
-    Number((window as typeof window & { __turnstileResetCount?: number }).__turnstileResetCount ?? 0)
-  ))).toBe(1);
+  await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "login");
+  await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-appearance", "interaction-only");
   await expect(submitButton).toBeEnabled();
   await submitButton.click();
   await expect(page).toHaveURL(/\/$/u);
 
   expect(loginPayloads).toHaveLength(2);
-  expect(loginPayloads[0].turnstile_token).toBe("turnstile-login-initial-token");
-  expect(loginPayloads[1].turnstile_token).toBe("turnstile-login-reset-token");
+  expect(loginPayloads[0]).toEqual({ email: "turnstile@example.test", password: "long-password" });
+  expect(loginPayloads[1].turnstile_token).toBe("turnstile-login-token");
   expect(csrfTokenRequests).toEqual([]);
+});
+
+test("adaptive Turnstile appears only after the API asks for human verification", async ({ page }) => {
+  const loginPayloads: Array<Record<string, unknown>> = [];
+
+  await page.route("**/api/v1/auth/security-config", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        public_registration_enabled: true,
+        email_verification_required: true,
+        turnstile_mode: "adaptive",
+        turnstile_site_key: "turnstile-adaptive-key"
+      })
+    });
+  });
+  await page.route("**/turnstile/v0/api.js*", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: `window.turnstile = {
+        render(container, options) {
+          container.dataset.turnstileAction = options.action;
+          container.dataset.turnstileAppearance = options.appearance;
+          queueMicrotask(() => options.callback("adaptive-token"));
+          return "adaptive-widget";
+        },
+        remove() {},
+        reset() {}
+      };`
+    });
+  });
+  await page.route("**/api/v1/auth/login", async (route) => {
+    expectOriginOnlyAuthRequest(route);
+    loginPayloads.push(route.request().postDataJSON() as Record<string, unknown>);
+    if (loginPayloads.length === 1) {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "Human verification is required." })
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        user: {
+          id: "u_adaptive",
+          email: "adaptive@example.test",
+          display_name: "Adaptive Player",
+          status: "active",
+          created_at: "2026-05-20T00:00:00Z",
+          roles: ["authenticated_user", "player"],
+          can_create_public_tournaments: false,
+          has_password: true
+        },
+        expires_at: "2026-05-21T00:00:00Z"
+      })
+    });
+  });
+
+  await page.goto("/auth/login");
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
+  await page.getByLabel("Email").fill("adaptive@example.test");
+  await page.getByLabel("Пароль").fill("long-password");
+  await page.getByRole("button", { name: "Войти", exact: true }).click();
+  await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "login");
+  await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-appearance", "interaction-only");
+  await page.getByRole("button", { name: "Войти", exact: true }).click();
+  await expect(page).toHaveURL(/\/$/u);
+  expect(loginPayloads).toEqual([
+    { email: "adaptive@example.test", password: "long-password" },
+    { email: "adaptive@example.test", password: "long-password", turnstile_token: "adaptive-token" }
+  ]);
 });
 
 test("password reset uses six-digit codes and creates a session", async ({ page }) => {
@@ -2885,6 +2951,7 @@ test("password reset uses six-digit codes and creates a session", async ({ page 
 test("password reset uses one Turnstile challenge before code entry", async ({ page }) => {
   const actions: string[] = [];
   const requestBodies: Array<Record<string, unknown>> = [];
+  let resetAttempts = 0;
   const csrfTokenRequests = await trackCsrfTokenRequests(page);
 
   await page.route("**/api/v1/auth/security-config", async (route) => {
@@ -2917,6 +2984,15 @@ test("password reset uses one Turnstile challenge before code entry", async ({ p
   await page.route("**/api/v1/auth/password-reset/request", async (route) => {
     expectOriginOnlyAuthRequest(route);
     requestBodies.push(route.request().postDataJSON() as Record<string, unknown>);
+    resetAttempts += 1;
+    if (resetAttempts === 1) {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "Human verification is required." })
+      });
+      return;
+    }
     await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ accepted: true }) });
   });
   await page.route("**/api/v1/auth/password-reset/verify-code", async (route) => {
@@ -2925,9 +3001,11 @@ test("password reset uses one Turnstile challenge before code entry", async ({ p
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ accepted: true }) });
   });
   await page.goto("/reset-password");
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
+  await page.getByLabel("Email").fill("unknown@example.test");
+  await page.getByRole("button", { name: "Отправить код" }).click();
   await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "reset_request");
   actions.push(await page.locator(".auth-turnstile-frame").getAttribute("data-turnstile-action") ?? "");
-  await page.getByLabel("Email").fill("unknown@example.test");
   await page.getByRole("button", { name: "Отправить код" }).click();
   await expect(page.locator(".auth-turnstile")).toHaveCount(0);
   await page.getByLabel("Код подтверждения").fill("123456");
@@ -2936,6 +3014,7 @@ test("password reset uses one Turnstile challenge before code entry", async ({ p
 
   expect(actions).toEqual(["reset_request"]);
   await expect.poll(() => requestBodies).toEqual([
+    { email: "unknown@example.test" },
     { email: "unknown@example.test", turnstile_token: "token-reset_request" },
     { email: "unknown@example.test", code: "123456" }
   ]);
@@ -3033,7 +3112,7 @@ test("registration requiring email verification changes inline to a code form", 
 
   await page.goto("/auth/register");
   await expect(page.getByRole("banner").getByRole("link", { name: /lisalexy/u })).toBeVisible();
-  await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "register");
+  await expect(page.locator(".auth-turnstile")).toHaveCount(0);
   await page.getByLabel("Отображаемое имя").fill("Pending Player");
   await page.getByLabel("Email").fill("pending@example.test");
   await page.getByLabel("Пароль").fill("long-password");

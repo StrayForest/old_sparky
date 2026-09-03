@@ -34,6 +34,7 @@ from python_packages.platform_infra.csrf import (
     issue_csrf_token,
 )
 from python_packages.platform_infra.db import dispose_engine, session_factory
+from python_packages.platform_infra import human_verification
 from python_packages.platform_infra.models import (
     AuditLog,
     EmailVerificationToken,
@@ -73,6 +74,19 @@ class _FakeRedis:
 
     async def aclose(self) -> None:
         return None
+
+
+class _HumanVerificationRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.expirations: dict[str, int] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def set(self, key: str, value: str, *, ex: int) -> None:
+        self.values[key] = value
+        self.expirations[key] = ex
 
 
 class AuthSecurityUnitTests(unittest.IsolatedAsyncioTestCase):
@@ -599,6 +613,83 @@ class AuthSecurityUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 403)
         self.assertNotIn(secret_token, str(raised.exception))
 
+    async def test_human_verification_trust_reuses_server_grant_without_replaying_token(self) -> None:
+        settings = self._settings(
+            platform_turnstile_mode="always",
+            platform_turnstile_site_key="test-site-key",
+            platform_turnstile_secret_key="test-secret-key",
+            platform_auth_human_verification_ttl_seconds=900,
+        )
+        cache = _HumanVerificationRedis()
+        request = Request({"type": "http", "headers": []})
+        response = Response()
+        verify = AsyncMock()
+
+        with (
+            patch.object(auth_routes, "verify_turnstile_token", verify),
+            patch.object(human_verification, "redis_client", return_value=cache),
+        ):
+            await auth_routes.verify_human_verification(
+                token="fresh-turnstile-token",
+                expected_action="login",
+                request=request,
+                response=response,
+                adaptive_required=False,
+                settings=settings,
+            )
+
+        cookies = SimpleCookie()
+        cookies.load(response.headers["set-cookie"])
+        trust_cookie = human_verification.human_verification_cookie_name(settings)
+        self.assertIn(trust_cookie, cookies)
+        self.assertEqual(cookies[trust_cookie]["max-age"], "900")
+        self.assertEqual(len(cache.values), 1)
+        self.assertEqual(cache.expirations[next(iter(cache.values))], 900)
+        verify.assert_awaited_once()
+
+        trusted_request = Request(
+            {
+                "type": "http",
+                "headers": [
+                    (
+                        b"cookie",
+                        f"{trust_cookie}={cookies[trust_cookie].value}".encode(),
+                    )
+                ],
+            }
+        )
+        with (
+            patch.object(auth_routes, "verify_turnstile_token", verify),
+            patch.object(human_verification, "redis_client", return_value=cache),
+        ):
+            await auth_routes.verify_human_verification(
+                token=None,
+                expected_action="steam_login",
+                request=trusted_request,
+                response=Response(),
+                adaptive_required=True,
+                settings=settings,
+            )
+
+        verify.assert_awaited_once()
+
+        adaptive_settings = settings.model_copy(update={"platform_turnstile_mode": "adaptive"})
+        adaptive_verify = AsyncMock()
+        with (
+            patch.object(auth_routes, "verify_turnstile_token", adaptive_verify),
+            patch.object(human_verification, "redis_client", return_value=cache),
+        ):
+            await auth_routes.verify_human_verification(
+                token=None,
+                expected_action="login",
+                request=Request({"type": "http", "headers": []}),
+                response=Response(),
+                adaptive_required=False,
+                settings=adaptive_settings,
+            )
+        self.assertEqual(len(cache.values), 1)
+        adaptive_verify.assert_awaited_once()
+
     def test_operator_email_requires_matching_confirmation(self) -> None:
         self.assertEqual(
             normalize_confirmed_email("Player@Example.com", " player@example.com "),
@@ -943,6 +1034,9 @@ class AuthSecurityIntegrationTests(unittest.IsolatedAsyncioTestCase):
             platform_support_smtp_host="smtp.example.com",
             platform_support_smtp_sender_email="noreply@old-sparky.com",
             platform_auth_generic_response_min_seconds=0,
+            platform_turnstile_mode="always",
+            platform_turnstile_site_key="test-site-key",
+            platform_turnstile_secret_key="test-secret-key",
         )
         with (
             patch.object(auth_routes, "get_settings", return_value=settings),

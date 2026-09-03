@@ -39,6 +39,7 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
             content,
         )
         self.assertIn("PLATFORM_AUTH_DELIVERY_COOLDOWN_SECONDS=60", content)
+        self.assertIn("PLATFORM_AUTH_HUMAN_VERIFICATION_TTL_SECONDS=900", content)
         self.assertIn(
             "PLATFORM_LOAD_TEST_SOURCE_IPS=95.217.190.107,2a01:4f9:c012:8011::1",
             content,
