@@ -185,7 +185,9 @@ if (( ${#summaries[@]} != 1 )); then
 elif (( profile_count == 1 )) && [[ ! -f "$run_root/$recovery_profile/$recovery_profile.json" ]]; then
   recovery_needed=1
 fi
-if (( recovery_needed == 1 )); then
+if (( recovery_needed == 1 )) || {
+  [[ "$recovery_profile" == "external-vote" ]] && (( profile_count == 1 ));
+}; then
   # A coordinator can fail before publishing its cleanup inventory (for
   # example during argument validation).  Treat that exact, root-owned run
   # directory as a safe no-op after confirming no fixture/control evidence

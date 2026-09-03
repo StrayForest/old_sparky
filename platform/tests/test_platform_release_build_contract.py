@@ -248,6 +248,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             "for candidate_profile in read-mix write-burst external-vote",
             cleanup_supervisor,
         )
+        self.assertIn(
+            '[[ "$recovery_profile" == "external-vote" ]] && (( profile_count == 1 ))',
+            cleanup_supervisor,
+        )
         self.assertIn("recovery_profile/$recovery_profile.json", cleanup_supervisor)
         self.assertNotIn("manifest.json\n", workflow.split("Publish external load evidence", 1)[1])
         self.assertIn("ThreadPoolExecutor", external_client)
