@@ -193,7 +193,7 @@ if (( recovery_needed == 1 )) || {
   # directory as a safe no-op after confirming no fixture/control evidence
   # exists.  A published control or report always follows the manifest path
   # below and still requires the full identity-checked cleanup.
-  if [[ ! -e "$run_root/control.json" \
+  if (( profile_count == 0 )) && [[ ! -e "$run_root/control.json" \
     && ! -e "$run_root/event-triggered.json" \
     && ! -e "$run_root/matrix-summary.json" ]]; then
     if find "$run_root" -type l -print -quit | grep -q .; then
