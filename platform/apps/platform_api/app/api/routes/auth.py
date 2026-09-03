@@ -97,6 +97,7 @@ from python_packages.platform_infra.security import (
     clear_session_cookies,
     create_user_session,
     get_authenticated_session,
+    get_authenticated_session_for_auth_bootstrap,
     hash_password,
     has_valid_auth_flow_cookie,
     invalidate_session_cache,
@@ -120,7 +121,7 @@ logger = logging.getLogger(__name__)
 
 @router.get("/bootstrap", response_model=AuthBootstrapResponse)
 async def get_auth_bootstrap(
-    auth_session=Depends(get_authenticated_session),
+    auth_session=Depends(get_authenticated_session_for_auth_bootstrap),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> AuthBootstrapResponse:
     """Return the small identity snapshot used by every authenticated SSR shell."""

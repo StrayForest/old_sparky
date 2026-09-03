@@ -274,21 +274,21 @@ record `pg_stat_activity.application_name` ownership totals for
 changing pool size. Use `EXPLAIN (ANALYZE, BUFFERS, SETTINGS, MEMORY)` only on
 a reviewed disposable or read-only query target.
 
+The `/auth/bootstrap` SSR dependency validates session/roles against PostgreSQL
+without writing `last_seen_at`: read-only page renders avoid an extra DB
+checkout, while mutation-oriented dependencies retain normal touch behavior.
 The `/users/me` account read-model is a short-TTL supplemental representation
-for avatar and Steam/password flags. Session validity, roles, credits and all
-authorization decisions remain authoritative in PostgreSQL. The monthly quota
-count is refreshed from PostgreSQL on every cache hit because it is derived
-from tournament rows and may also change through maintenance/backfill writes;
+for avatar and Steam/password flags; session validity, roles, credits and
+authorization remain authoritative in PostgreSQL. Its monthly quota count is
+refreshed on every cache hit because it is derived from tournament rows;
 profile, identity, password, credit, role and tournament-creation commits
-invalidate the representation. A Redis hit removes the supplemental joins from
-the hot path but does not remove the authoritative auth lookup or this small
-quota count.
+invalidate the representation. A Redis hit removes supplemental joins but not
+the authoritative auth lookup or quota count.
 
 The current candidate deliberately does not make public HTML static or bypass
 the nonce CSP. Any future public/static route split requires a separate
-measurement and security decision; it must not be smuggled into an SSR timing
-experiment.
-security and caching design review.
+measurement, security and caching design review; it must not be smuggled into
+an SSR timing experiment.
 
 For the standard full read-path stress run, select `read-mix-stress-v2`.
 It provisions 40 marked tournaments with 500 users each (20,000 authenticated

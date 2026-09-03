@@ -172,21 +172,33 @@ The external profile `authenticated-page-load-v1` measures authenticated
 TTFB, total page latency, response bytes and origin SSR/API/PG evidence. The
 observer labels PostgreSQL activity by `oldsparky-api`, `oldsparky-worker`,
 `oldsparky-qa`, `oldsparky-observer` and `oldsparky-maintenance`, making the
-54-versus-52 connection question attributable. The ramp report emits a
-latency-knee recommendation for admission review; it never changes runtime
-limits automatically. The authenticated HTML benchmark confirmed that
-admission 32 materially reduces SSR-origin queueing: full-page p95/p99
-improved from `10378/10714 ms` at c64 to `3906/4425 ms`, while pool checkout
-p95 improved from `10001 ms` to `533 ms`. The isolated `pool_pre_ping=false`
-A/B was rejected and production was restored to `pool_pre_ping=true`.
+connection budget attributable. The ramp report emits a latency-knee
+recommendation for admission review; it never changes runtime limits
+automatically. The authenticated HTML benchmark confirmed that admission 32
+materially reduces SSR-origin queueing: full-page p95/p99 improved from
+`10378/10714 ms` at c64 to `3906/4425 ms`, while pool checkout p95 improved
+from `10001 ms` to `533 ms`. The isolated `pool_pre_ping=false` A/B was rejected
+and production was restored to `pool_pre_ping=true`.
+
+The diagnostic page run `33738366863` on exact SHA
+`30f49f2b8997b6b4d3049f889290946dad22ac82` completed with 20,000 successful
+HTML responses and no shedding: full-page p95/p99 was `4073/4693 ms`, HTML
+TTFB p95/p99 was `3529/3852 ms`, and origin PostgreSQL ownership peaked at
+`48 api + 2 worker + 1 observer = 51`. Sampled SSR stages show that
+`auth_bootstrap_fetch` dominates at p95 `2136 ms`, while workspace is p95
+`1310 ms`; Node event-loop p95 was `133 ms` and the web process averaged about
+`65%` CPU. The matching bootstrap stage counts confirm React `cache()` performs
+one actual bootstrap fetch per sampled request across RootLayout and page.
+The SSR bootstrap now keeps PostgreSQL-authoritative session/role validation
+but skips read-only page renders' `last_seen_at` telemetry write and its extra
+DB checkout. This does not move authentication authority to Redis.
+
 The `web-ssr-diagnostics` operator profile adds bounded 1% request-correlated
-Next.js stage timings (`/auth/bootstrap`, workspace and render boundaries),
-five-second Node event-loop samples and Nginx HTML `request_time`/
-`upstream_response_time` correlation to the retained observer artifact. It is
-diagnostic-only and does not alter SSR behavior, authorization, or the nonce
-CSP. Public/static HTML remains deferred and is not part of this change.
-Public/static HTML architecture remains deferred: the nonce CSP is not
-bypassed or weakened by this work.
+Next.js stage timings, five-second Node event-loop samples and Nginx HTML
+timing correlation to the retained observer artifact. It is diagnostic-only
+and does not alter SSR behavior, authorization, or the nonce CSP. Public/static
+HTML remains deferred and is not part of this change; the nonce CSP is not
+bypassed or weakened.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
 

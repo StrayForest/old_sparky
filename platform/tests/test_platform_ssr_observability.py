@@ -92,6 +92,22 @@ class SsrObservabilityTests(unittest.TestCase):
         summary = summarize_ssr_observability([], records)
         self.assertEqual(summary["nginx_html"]["requests"], 0)
 
+    def test_nginx_numeric_request_time_is_reported(self) -> None:
+        summary = summarize_ssr_observability(
+            [],
+            [
+                {
+                    "method": "GET",
+                    "uri": "/tournaments/fixture",
+                    "status": 200,
+                    "request_time": 1.25,
+                    "upstream_time": "1.10",
+                }
+            ],
+        )
+
+        self.assertEqual(summary["nginx_html"]["request_time_ms"]["p50_ms"], 1250.0)
+
 
 if __name__ == "__main__":
     unittest.main()

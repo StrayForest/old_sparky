@@ -578,6 +578,26 @@ async def get_authenticated_session(
     )
 
 
+async def get_authenticated_session_for_auth_bootstrap(
+    request: Request,
+    db_session: AsyncSession = Depends(get_db_session),
+) -> AuthenticatedSession:
+    """Authenticate the SSR shell without writing last-seen telemetry.
+
+    The bootstrap remains authoritative against PostgreSQL and still loads
+    roles. A page render is read-only, however, so it must not open the
+    separate short transaction used by mutation-oriented session touch
+    telemetry on every authenticated HTML request.
+    """
+
+    return await _get_authenticated_session(
+        request,
+        db_session,
+        load_roles=True,
+        touch_session=False,
+    )
+
+
 async def authenticate_ready_vote(
     request: Request,
     db_session: AsyncSession,

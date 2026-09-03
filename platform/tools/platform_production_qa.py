@@ -2016,6 +2016,8 @@ def _nginx_record_timestamp(raw_value: object) -> datetime | None:
 
 
 def _nginx_seconds(raw_value: object) -> float | None:
+    if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        return float(raw_value) * 1000
     if not isinstance(raw_value, str) or raw_value in {"", "-"}:
         return None
     values: list[float] = []

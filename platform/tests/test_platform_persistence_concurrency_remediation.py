@@ -95,6 +95,28 @@ class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(FrozenInstanceError):
             result.user_id = "other-user"
 
+    async def test_auth_bootstrap_auth_is_authoritative_without_last_seen_touch(self) -> None:
+        request = Mock()
+        db_session = Mock()
+        resolved = SimpleNamespace()
+        with patch.object(
+            security,
+            "_get_authenticated_session",
+            AsyncMock(return_value=resolved),
+        ) as resolve:
+            result = await security.get_authenticated_session_for_auth_bootstrap(
+                request,
+                db_session,
+            )
+
+        self.assertIs(result, resolved)
+        resolve.assert_awaited_once_with(
+            request,
+            db_session,
+            load_roles=True,
+            touch_session=False,
+        )
+
     async def test_ready_vote_auth_invalid_and_unverified_states_are_unauthorized(self) -> None:
         settings = SimpleNamespace(
             platform_session_cookie_name="platform_session",
