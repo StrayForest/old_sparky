@@ -100,22 +100,20 @@ test("document CSP uses one fresh nonce and leaves static responses unscoped", a
 
   const firstPolicy = firstCspHeaders[0].value;
   const secondPolicy = secondCspHeaders[0].value;
-  expect(first.headers()["content-security-policy"]).toBeUndefined();
-  expect(first.headers()["content-security-policy-report-only"]).toBeTruthy();
   const firstNonce = firstPolicy.match(/'nonce-([A-Za-z0-9+/]+={0,2})'/)?.[1] ?? "";
   const secondNonce = secondPolicy.match(/'nonce-([A-Za-z0-9+/]+={0,2})'/)?.[1] ?? "";
   expect(Buffer.from(firstNonce, "base64")).toHaveLength(16);
   expect(Buffer.from(secondNonce, "base64")).toHaveLength(16);
   expect(secondNonce).not.toBe(firstNonce);
   expect(firstPolicy).toContain("script-src-attr 'none'");
-  expect(firstPolicy).not.toContain("style-src-attr 'none'");
+  expect(firstPolicy).toContain("style-src-attr 'none'");
   expect(firstPolicy).toContain("worker-src 'self'");
-  expect(firstPolicy).toContain("'unsafe-inline'");
-  expect(firstPolicy).toContain("'unsafe-eval'");
   expect(firstPolicy).toContain("'strict-dynamic'");
-  expect(firstPolicy).toContain("https: http:");
+  expect(firstPolicy).toContain("https://pagead2.googlesyndication.com");
+  expect(firstPolicy).toContain("https://googleads.g.doubleclick.net");
+  expect(firstPolicy).toContain("https://fundingchoicesmessages.google.com");
   expect(firstPolicy).toContain("https://i2.ytimg.com https://i3.ytimg.com");
-  expect(firstPolicy).not.toMatch(/\*|\bdata:/);
+  expect(firstPolicy).not.toMatch(/'unsafe-inline'|'unsafe-eval'|\bhttp:|\*|\bdata:/);
   expect(first.headers()["reporting-endpoints"]).toBe(
     'csp-endpoint="/api/v1/security/csp-report"'
   );

@@ -39,8 +39,8 @@ obfuscate the address with JavaScript/CSS: that still publishes it to bots.
 
 ## HTTP and TLS ownership
 
-- The active AdSense diagnostic release gives document CSP ownership to the
-  Next.js document proxy in Report-Only mode. Nginx owns no CSP header.
+- The active enforcement release gives document CSP ownership to the Next.js
+  document proxy. Nginx owns no CSP header.
 - Nginx owns `nosniff`, Referrer-Policy, X-Frame-Options, Permissions-Policy
   and COOP on every response class. Candidate validation rejects either CSP
   header in the Nginx vhost or shared snippet.
@@ -58,17 +58,17 @@ The Next.js document proxy owns exactly this policy, where `{nonce}` is the
 fresh per-response value:
 
 ```text
-default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' 'nonce-{nonce}' 'unsafe-inline' 'unsafe-eval' 'strict-dynamic' https: http:; script-src-attr 'none'; style-src 'self' 'nonce-{nonce}' 'unsafe-inline'; img-src 'self' blob: https://cdn.old-sparky.com https://steamstore-a.akamaihd.net https://clan.fastly.steamstatic.com https://deadlock.io https://assets-bucket.deadlock-api.com https://i2.ytimg.com https://i3.ytimg.com https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net; connect-src 'self' https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://fundingchoicesmessages.google.com; frame-src https://challenges.cloudflare.com https://googleads.g.doubleclick.net https://tpc.googlesyndication.com; font-src 'self'; manifest-src 'self'; media-src 'none'; worker-src 'self'; report-uri /api/v1/security/csp-report; report-to csp-endpoint
+default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' 'nonce-{nonce}' 'strict-dynamic' https://challenges.cloudflare.com https://static.cloudflareinsights.com https://pagead2.googlesyndication.com; script-src-attr 'none'; style-src 'self' 'nonce-{nonce}'; style-src-attr 'none'; img-src 'self' blob: https://cdn.old-sparky.com https://steamstore-a.akamaihd.net https://clan.fastly.steamstatic.com https://deadlock.io https://assets-bucket.deadlock-api.com https://i2.ytimg.com https://i3.ytimg.com https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net; connect-src 'self' https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://fundingchoicesmessages.google.com; frame-src https://challenges.cloudflare.com https://googleads.g.doubleclick.net https://tpc.googlesyndication.com; font-src 'self'; manifest-src 'self'; media-src 'none'; worker-src 'self'; report-uri /api/v1/security/csp-report; report-to csp-endpoint
 ```
 
-This is a temporary diagnostic exception: the response header is
-`Content-Security-Policy-Report-Only`, and the Google fallback sources above
-must not be promoted to enforced CSP. The previous enforced nonce release is
-the rollback target. The proxy still removes client-supplied CSP and `x-nonce`
-headers, creates 16 random bytes for every independent document response and
-emits the fixed `Reporting-Endpoints` value. It gives that nonce to Next.js
+No `unsafe-inline`, `unsafe-eval`, `data:` or unreviewed origin is permitted.
+The proxy removes client-supplied CSP and `x-nonce` headers, creates 16 random
+bytes for every independent document response, gives that nonce to Next.js
 rendering and emits exactly one mode-selected response header plus the fixed
-`Reporting-Endpoints: csp-endpoint="/api/v1/security/csp-report"` value.
+`Reporting-Endpoints: csp-endpoint="/api/v1/security/csp-report"` value. The
+active release selects `Content-Security-Policy`. Its immediate rollback
+release selects `Content-Security-Policy-Report-Only`; that one-line response
+header selection is their only reviewed source delta.
 
 The proxy matcher owns HTML documents only. API, RSC, Next static, local asset
 and discovery responses have no CSP or Reporting-Endpoints header. Nginx keeps

@@ -101,7 +101,7 @@ jobs:
           "$restore" \
             --app-dir "$runtime" \
             --release "$current_release" \
-            --expected-csp-mode report-only \
+            --expected-csp-mode enforce \
             --edge-origin https://127.0.0.1 \
             --edge-host old-sparky.com \
             --public-edge-origin https://old-sparky.com

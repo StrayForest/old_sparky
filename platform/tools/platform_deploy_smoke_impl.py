@@ -30,8 +30,9 @@ DEFAULT_SERVICES = ("deadlock-api", "deadlock-worker", "deadlock-web", "nginx")
 
 EXPECTED_CSP_POLICY_TEMPLATE = (
     "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; "
-    "object-src 'none'; script-src 'self' 'nonce-{nonce}' 'unsafe-inline' 'unsafe-eval' 'strict-dynamic' https: http:; script-src-attr 'none'; "
-    "style-src 'self' 'nonce-{nonce}' 'unsafe-inline'; "
+    "object-src 'none'; script-src 'self' 'nonce-{nonce}' 'strict-dynamic' https://challenges.cloudflare.com "
+    "https://static.cloudflareinsights.com https://pagead2.googlesyndication.com; script-src-attr 'none'; "
+    "style-src 'self' 'nonce-{nonce}'; style-src-attr 'none'; "
     "img-src 'self' blob: https://cdn.old-sparky.com "
     "https://steamstore-a.akamaihd.net "
     "https://clan.fastly.steamstatic.com https://deadlock.io "

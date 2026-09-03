@@ -69,7 +69,7 @@ cd /root/old_sparky
 platform/tools/platform_release_deploy.sh \
   --artifact platform/dist/releases/<release-slug>.tar.gz \
   --app-dir /opt/oldsparky/platform \
-  --expected-csp-mode report-only
+  --expected-csp-mode enforce
 tools/platform_release_preflight.sh \
   --require-previous --require-verified-backup --backup-max-age-hours 24
 /opt/oldsparky/platform/shared/venv/bin/python \
@@ -166,9 +166,8 @@ reuse that exception implicitly or record the waived gates as passed.
 
 Any wrong CSP mode, unexpected directive/source, reused or short nonce,
 nonce-bearing cached HTML, live-user cleanup failure or unexplained first-party
-violation stops progression. The temporary AdSense diagnostic fallback is
-allowed only in Report-Only mode; it must never be promoted to enforcement or
-used as a reason to silence a report. The exact policy, ownership and report
+violation stops progression. Never add `unsafe-inline`, `unsafe-eval` or an
+origin just to make a report disappear. The exact policy, ownership and report
 limiter are in the [security runbook](security-runbook.md).
 
 ## CSP live-user gates
