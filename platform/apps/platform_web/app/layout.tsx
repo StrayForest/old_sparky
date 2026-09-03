@@ -1,5 +1,4 @@
 import type { Metadata } from "next";
-import Script from "next/script";
 import { cookies, headers } from "next/headers";
 import { connection } from "next/server";
 import type { ReactNode } from "react";
@@ -43,12 +42,11 @@ export default async function RootLayout({
     <html lang="ru">
       <head>
         {adsenseEnabled ? (
-          <Script
+          <script
             async
             crossOrigin="anonymous"
             nonce={nonce ?? undefined}
             src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7185165276065459"
-            strategy="afterInteractive"
           />
         ) : null}
       </head>
