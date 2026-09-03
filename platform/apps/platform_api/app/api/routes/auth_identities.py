@@ -6,6 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.platform_api.app.api.schemas import UserResponse
 from apps.platform_api.app.services.current_user import serialize_current_user
+from apps.platform_api.app.services.user_account_read_models import (
+    delete_user_account_read_model,
+)
 from python_packages.platform_infra.audit import write_audit_log
 from python_packages.platform_infra.db import get_db_session
 from python_packages.platform_infra.models import ExternalIdentity, PasswordCredential, User
@@ -74,6 +77,7 @@ async def unlink_steam_identity(
     )
     await db_session.commit()
     invalidate_user_session_cache(user.id)
+    await delete_user_account_read_model(user.id)
 
     return await serialize_current_user(
         db_session,

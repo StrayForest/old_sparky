@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import unittest
 from unittest.mock import AsyncMock, Mock, patch, sentinel
 
@@ -35,6 +36,7 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
         try:
             with (
                 patch.object(db, "get_settings", return_value=settings),
+                patch.dict(os.environ, {"PLATFORM_RUNTIME_SERVICE": "api"}),
                 patch.object(db, "create_async_engine", return_value=engine) as create_engine,
                 patch.object(db, "async_sessionmaker") as create_session_factory,
                 patch.object(db, "install_sqlalchemy_query_metrics") as install_query_metrics,
@@ -49,6 +51,9 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
                 max_overflow=1,
                 pool_timeout=5,
                 pool_recycle=1800,
+                connect_args={
+                    "server_settings": {"application_name": "oldsparky-api"}
+                },
             )
             install_query_metrics.assert_called_once_with(sentinel.sync_engine)
             create_session_factory.assert_called_once_with(
@@ -59,6 +64,19 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
         finally:
             db._engine = previous_engine
             db._session_factory = previous_session_factory
+
+    def test_postgres_application_name_follows_runtime_service(self) -> None:
+        for service, expected in (
+            ("api", "oldsparky-api"),
+            ("worker", "oldsparky-worker"),
+            ("qa", "oldsparky-qa"),
+            ("observer", "oldsparky-observer"),
+            ("maintenance", "oldsparky-maintenance"),
+        ):
+            with self.subTest(service=service), patch.dict(
+                os.environ, {"PLATFORM_RUNTIME_SERVICE": service}
+            ):
+                self.assertEqual(db.postgres_application_name(), expected)
 
 
 class PlatformDatabaseLifecycleTests(unittest.IsolatedAsyncioTestCase):

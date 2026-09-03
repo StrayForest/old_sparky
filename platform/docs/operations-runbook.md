@@ -219,7 +219,7 @@ For public capacity testing use the external-runner workflow, not a generator
 running beside the API on the VPS. The workflow keeps fixture preparation and
 exact cleanup on the origin, while the measured HTTP client runs on a
 GitHub-hosted runner outside Cloudflare's origin network. It supports the
-current `ready-vote` and `read-mix` request-driven profiles and collects a
+current `ready-vote`, `read-mix` and authenticated `page-load` profiles and collects a
 parallel origin observer report. Temporary session/CSRF credentials are never
 published as an artifact.
 
@@ -236,15 +236,22 @@ To locate the concurrency knee, select `read-mix-concurrency-ramp-v1`. It
 repeats the full 20,000-user route mix at concurrency 16, 32, 48, 64, 80, 96,
 112 and 128, then performs the conditional refresh cohort. The report's
 `phases.capacity_ramp.stages` entries are the comparison table; do not infer a
-winner from the aggregate alone. This is a stress diagnostic, so bounded
-typed authenticated-read shedding is counted separately from unexpected
-errors. Run it only in the approved window and complete exact cleanup.
+winner from the aggregate alone. `phases.capacity_ramp.analysis` marks the
+first large p95 increase with a flat throughput gain as an admission candidate;
+it is evidence for an operator-selected runtime profile, not an automatic
+configuration change. This is a stress diagnostic, so bounded typed
+authenticated-read shedding is counted separately from unexpected errors. Run
+it only in the approved window and complete exact cleanup.
 
 The SSR dependency graph has a hermetic browser contract in the platform web
 smoke suite: an authenticated tournament page must call `/auth/bootstrap` and
 must not call `/users/me` from the global layout. That test verifies ownership
-of the request graph, not production latency. A real page-load timing profile
-must be collected from the browser/production operator gate separately.
+of the request graph, not production latency. Select
+`authenticated-page-load-v1` for the real external benchmark: it requests the
+HTML route through `https://old-sparky.com` with a retained session cookie and
+reports `time_to_first_byte`, complete page latency, HTML bytes and the
+origin-side Next.js/API/DB observer. It is still a request benchmark, not
+20,000 browser processes.
 
 The selectable runtime A/B profiles are `uvicorn-classic`,
 `uvicorn-optimized`, `pool-pre-ping-off`, `authenticated-read-admission-32`
@@ -257,9 +264,28 @@ check; a latency improvement without clean recovery is a rejection.
 Before attributing a transport result to Nginx, record `nginx -v` and run
 `nginx -t`. The named `platform_api` upstream has explicit loopback keepalive;
 the web upgrade connection header remains separate. For database evidence,
-collect `pg_stat_statements` top-query calls, total/mean execution time, rows
-and buffer hits/reads, then use `EXPLAIN (ANALYZE, BUFFERS, SETTINGS, MEMORY)`
-only on a reviewed disposable or read-only query target.
+collect `pg_stat_statements` top normalized-query calls, total/mean execution
+time, rows and buffer hits/reads. The external observer excludes only its own
+diagnostic queries, so SSR/read runs expose their actual top statements. Also
+record `pg_stat_activity.application_name` ownership totals for
+`oldsparky-api`, `oldsparky-worker`, `oldsparky-qa`, `oldsparky-observer` and
+`oldsparky-maintenance`; compare those totals to the 52 safety budget before
+changing pool size. Use `EXPLAIN (ANALYZE, BUFFERS, SETTINGS, MEMORY)` only on
+a reviewed disposable or read-only query target.
+
+The `/users/me` account read-model is a short-TTL supplemental representation
+for avatar and Steam/password flags. Session validity, roles, credits and all
+authorization decisions remain authoritative in PostgreSQL. The monthly quota
+count is refreshed from PostgreSQL on every cache hit because it is derived
+from tournament rows and may also change through maintenance/backfill writes;
+profile, identity, password, credit, role and tournament-creation commits
+invalidate the representation. A Redis hit removes the supplemental joins from
+the hot path but does not remove the authoritative auth lookup or this small
+quota count.
+
+The current candidate deliberately does not make public HTML static or bypass
+the nonce CSP. Any future public/static route split requires a separate
+security and caching design review.
 
 For the standard full read-path stress run, select `read-mix-stress-v2`.
 It provisions 40 marked tournaments with 500 users each (20,000 authenticated

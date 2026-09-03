@@ -63,6 +63,7 @@ from apps.platform_api.app.api.schemas import (
     MediaDeleteAcceptedResponse,
     MediaDescriptorResponse,
     TournamentCreateRequest,
+    TournamentCardResponse,
     TournamentInviteClaimRequest,
     TournamentInviteCodeAvailabilityResponse,
     TournamentInviteCreateRequest,
@@ -89,6 +90,18 @@ from apps.platform_api.app.api.schemas import (
     TournamentWorkspaceResponse,
 )
 from apps.platform_api.app.services.current_user import serialize_current_user
+from apps.platform_api.app.services.user_account_read_models import (
+    delete_user_account_read_model,
+)
+from apps.platform_api.app.services.tournament_participant_policy import (
+    enforce_tournament_participant_policy,
+)
+from apps.platform_api.app.services.tournament_workspace_access import (
+    ensure_private_tournament_read_membership_is_active,
+)
+from apps.platform_api.app.services.tournament_write_serialization import (
+    serialize_tournament_write_invariants,
+)
 from apps.platform_api.app.services.media import (
     accepted_media_response,
     api_media_service,
@@ -1487,6 +1500,48 @@ def serialize_tournament(
             tournament,
             participant_count=participant_count,
         ),
+    )
+
+
+def serialize_tournament_card(
+    tournament: Tournament | TournamentListReadModel,
+    organizer_display_name: str | None,
+    participant_count: int,
+    *,
+    cover_media: MediaDescriptorResponse | None = None,
+    organizer_avatar_media: MediaDescriptorResponse | None = None,
+    current_user_participant_status: str | None = None,
+) -> TournamentCardResponse:
+    """Serialize only the fields needed to render a catalogue card."""
+
+    return TournamentCardResponse(
+        id=tournament.id,
+        slug=tournament.slug,
+        name=tournament.name,
+        cover_url=compatibility_media_url(
+            cover_media,
+            preferred_variant="banner-1120",
+        ),
+        cover_media=cover_media,
+        visibility=tournament.visibility,
+        status=tournament.status,
+        format_slug=tournament.format_slug,
+        organizer_user_id=tournament.organizer_user_id,
+        organizer_display_name=organizer_display_name,
+        organizer_avatar_url=compatibility_media_url(
+            organizer_avatar_media,
+            preferred_variant="avatar-256",
+        ),
+        organizer_avatar_media=organizer_avatar_media,
+        participant_count=participant_count,
+        allowed_ranks=list(tournament.allowed_ranks or []),
+        max_participants=tournament.max_participants,
+        current_user_participant_status=current_user_participant_status,
+        registration_starts_at=tournament.registration_starts_at,
+        registration_closes_at=tournament.registration_closes_at,
+        starts_at=tournament.starts_at,
+        teams_count=tournament.teams_count,
+        created_at=tournament.created_at,
     )
 
 
@@ -3324,7 +3379,7 @@ def _set_tournament_list_headers(
     response.headers["Access-Control-Expose-Headers"] = PAGINATION_EXPOSE_HEADERS
 
 
-def _tournament_list_body(items: Sequence[TournamentResponse]) -> bytes:
+def _tournament_list_body(items: Sequence[TournamentCardResponse]) -> bytes:
     return (
         "["
         + ",".join(item.model_dump_json() for item in items)
@@ -3332,7 +3387,7 @@ def _tournament_list_body(items: Sequence[TournamentResponse]) -> bytes:
     ).encode("utf-8")
 
 
-@router.get("", response_model=list[TournamentResponse])
+@router.get("", response_model=list[TournamentCardResponse])
 async def list_tournaments(
     response: Response,
     search: str | None = Query(default=None, max_length=120),
@@ -3352,7 +3407,7 @@ async def list_tournaments(
     ),
     cursor: str | None = Query(default=None, max_length=2048),
     db_session: AsyncSession = Depends(get_lazy_db_session),
-) -> list[TournamentResponse] | Response:
+) -> list[TournamentCardResponse] | Response:
     cache_key = public_tournament_list_cache_key(
         search=search,
         rank=rank,
@@ -3460,7 +3515,7 @@ async def list_tournaments(
         ),
     )
     serialized = [
-        serialize_tournament(
+        serialize_tournament_card(
             row,
             row.organizer_display_name,
             int(row.participant_count),
@@ -3470,7 +3525,6 @@ async def list_tournaments(
             organizer_avatar_media=media_descriptors.get(row.organizer_avatar_asset_id)
             if row.organizer_avatar_asset_id
             else None,
-            has_locked_deadlock_roster=bool(row.has_locked_deadlock_roster),
         )
         for row in rows
     ]
@@ -3504,7 +3558,7 @@ async def list_tournaments(
     return serialized
 
 
-@router.get("/mine", response_model=list[TournamentResponse])
+@router.get("/mine", response_model=list[TournamentCardResponse])
 async def list_my_tournaments(
     response: Response,
     scope_filter: str | None = Query(
@@ -3528,7 +3582,7 @@ async def list_my_tournaments(
     cursor: str | None = Query(default=None, max_length=2048),
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
-) -> list[TournamentResponse]:
+) -> list[TournamentCardResponse]:
     projection = TournamentListReadModel
     current_user_participations = (
         select(
@@ -3645,7 +3699,7 @@ async def list_my_tournaments(
         ),
     )
     serialized = [
-        serialize_tournament(
+        serialize_tournament_card(
             projection_row,
             projection_row.organizer_display_name,
             int(projection_row.participant_count),
@@ -3657,9 +3711,6 @@ async def list_my_tournaments(
             )
             if projection_row.organizer_avatar_asset_id
             else None,
-            has_locked_deadlock_roster=bool(
-                projection_row.has_locked_deadlock_roster
-            ),
             current_user_participant_status=current_status,
         )
         for projection_row, current_status in rows
@@ -3859,6 +3910,7 @@ async def create_tournament(
         },
     )
     await db_session.commit()
+    await delete_user_account_read_model(auth_session.user.id)
     await refresh_tournament_list_read_model_after_commit(tournament.id)
     await db_session.refresh(tournament)
     return serialize_tournament(tournament, auth_session.user.display_name, 0)
@@ -4004,7 +4056,12 @@ async def delete_tournament_banner(
     )
 
 
-@router.post("/invites/claim", response_model=TournamentInviteRedeemResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/invites/claim",
+    response_model=TournamentInviteRedeemResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(enforce_tournament_participant_policy)],
+)
 async def redeem_tournament_invite(
     payload: TournamentInviteClaimRequest,
     request: Request,
@@ -4137,7 +4194,11 @@ async def update_tournament_status(
     )
 
 
-@router.get("/{slug}/participants", response_model=list[TournamentParticipantResponse])
+@router.get(
+    "/{slug}/participants",
+    response_model=list[TournamentParticipantResponse],
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+)
 async def list_tournament_participants(
     slug: str,
     response: Response,
@@ -4192,6 +4253,7 @@ async def list_tournament_participants(
     "/{slug}/participants/manage",
     response_model=TournamentParticipantResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(serialize_tournament_write_invariants)],
 )
 async def organizer_add_participant(
     slug: str,
@@ -4264,7 +4326,11 @@ async def organizer_add_participant(
     return serialize_participant(participant, target_user.display_name)
 
 
-@router.delete("/{slug}/participants/{participant_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{slug}/participants/{participant_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(serialize_tournament_write_invariants)],
+)
 async def organizer_remove_participant(
     slug: str,
     participant_id: str,
@@ -4353,6 +4419,7 @@ async def organizer_remove_participant(
 @router.patch(
     "/{slug}/participants/{participant_id}/moderation",
     response_model=TournamentParticipantResponse,
+    dependencies=[Depends(serialize_tournament_write_invariants)],
 )
 async def organizer_moderate_participant(
     slug: str,
@@ -4486,7 +4553,11 @@ async def organizer_moderate_participant(
     )
 
 
-@router.get("/{slug}/invites", response_model=list[TournamentInviteResponse])
+@router.get(
+    "/{slug}/invites",
+    response_model=list[TournamentInviteResponse],
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+)
 async def list_tournament_invites(
     slug: str,
     auth_session=Depends(get_authenticated_session),
@@ -4592,7 +4663,11 @@ async def create_tournament_invite(
     return serialize_invite(tournament, invite, now=datetime.now(UTC))
 
 
-@router.delete("/{slug}/invites/{invite_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{slug}/invites/{invite_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(serialize_tournament_write_invariants)],
+)
 async def revoke_tournament_invite(
     slug: str,
     invite_id: str,
@@ -4627,7 +4702,11 @@ async def revoke_tournament_invite(
     return response
 
 
-@router.get("/{slug}/matches", response_model=list[TournamentMatchResponse])
+@router.get(
+    "/{slug}/matches",
+    response_model=list[TournamentMatchResponse],
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+)
 async def list_tournament_matches(
     slug: str,
     invite_code: str | None = Query(default=None, min_length=6, max_length=64),
@@ -4666,7 +4745,11 @@ async def list_tournament_matches(
     ]
 
 
-@router.get("/{slug}/bracket", response_model=TournamentBracketResponse)
+@router.get(
+    "/{slug}/bracket",
+    response_model=TournamentBracketResponse,
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+)
 async def get_tournament_bracket(
     slug: str,
     request: Request,
@@ -5548,7 +5631,11 @@ async def delete_tournament_match(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/{slug}/deadlock/ready-check", response_model=TournamentDeadlockReadyCheckStateResponse)
+@router.get(
+    "/{slug}/deadlock/ready-check",
+    response_model=TournamentDeadlockReadyCheckStateResponse,
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+)
 async def get_deadlock_ready_check_state(
     slug: str,
     auth_session=Depends(get_authenticated_session),
@@ -5950,7 +6037,11 @@ async def close_deadlock_ready_check(
     )
 
 
-@router.get("/{slug}/deadlock/captain-preview", response_model=TournamentDeadlockCaptainPreviewResponse)
+@router.get(
+    "/{slug}/deadlock/captain-preview",
+    response_model=TournamentDeadlockCaptainPreviewResponse,
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+)
 async def get_deadlock_captain_preview(
     slug: str,
     teams_count: int | None = Query(default=None, ge=2, le=8192),
@@ -6022,7 +6113,11 @@ async def get_deadlock_captain_preview(
     )
 
 
-@router.get("/{slug}/deadlock/captain-round", response_model=TournamentDeadlockCaptainRoundStateResponse)
+@router.get(
+    "/{slug}/deadlock/captain-round",
+    response_model=TournamentDeadlockCaptainRoundStateResponse,
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+)
 async def get_deadlock_captain_round_state(
     slug: str,
     auth_session=Depends(get_authenticated_session),
@@ -6568,7 +6663,11 @@ async def finalize_deadlock_captain_round(
     )
 
 
-@router.get("/{slug}/deadlock/auto-assignment", response_model=TournamentDeadlockAutoAssignmentStateResponse)
+@router.get(
+    "/{slug}/deadlock/auto-assignment",
+    response_model=TournamentDeadlockAutoAssignmentStateResponse,
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+)
 async def get_deadlock_auto_assignment_state(
     slug: str,
     auth_session=Depends(get_authenticated_session),
@@ -6829,7 +6928,12 @@ async def lock_deadlock_auto_assignment_run(
     return serialize_deadlock_auto_assignment_run(run_row)
 
 
-@router.post("/{slug}/join", response_model=TournamentParticipantResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{slug}/join",
+    response_model=TournamentParticipantResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(serialize_tournament_write_invariants)],
+)
 async def join_tournament(
     slug: str,
     payload: TournamentParticipantJoinRequest,
@@ -6977,7 +7081,11 @@ async def join_tournament(
     return serialize_participant(participant, auth_session.user.display_name)
 
 
-@router.delete("/{slug}/join", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{slug}/join",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(serialize_tournament_write_invariants)],
+)
 async def leave_tournament(
     slug: str,
     response: Response,
@@ -7089,7 +7197,11 @@ async def leave_tournament(
     return response
 
 
-@router.get("/{slug}/profiles/{user_id}", response_model=TournamentScopedProfileResponse)
+@router.get(
+    "/{slug}/profiles/{user_id}",
+    response_model=TournamentScopedProfileResponse,
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+)
 async def get_tournament_scoped_profile(
     slug: str,
     user_id: str,
@@ -7159,7 +7271,11 @@ async def get_tournament_scoped_profile(
     return Response(content=profile_payload, media_type="application/json")
 
 
-@router.get("/{slug}/workspace", response_model=TournamentWorkspaceResponse)
+@router.get(
+    "/{slug}/workspace",
+    response_model=TournamentWorkspaceResponse,
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
+)
 async def get_tournament_workspace(
     slug: str,
     request: Request,

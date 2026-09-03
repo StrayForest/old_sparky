@@ -64,6 +64,7 @@ class RequestResult:
     elapsed_ms: float
     ok: bool
     response_bytes: int
+    time_to_first_byte_ms: float | None = None
     cf_ray: str | None = None
     response_etag: str | None = None
     error_kind: str | None = None
@@ -256,6 +257,7 @@ def _request(
     expected_statuses: frozenset[int] = frozenset({200}),
     extra_headers: dict[str, str] | None = None,
     attempt_number: int = 1,
+    url_prefix: str = "/api/v1",
 ) -> RequestResult:
     body = None
     headers = {
@@ -275,7 +277,7 @@ def _request(
         body = json.dumps(json_payload, separators=(",", ":")).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = Request(
-        f"{origin}/api/v1{path}",
+        f"{origin}{url_prefix}{path}",
         data=body,
         method=method,
         headers=headers,
@@ -287,6 +289,7 @@ def _request(
     response_etag: str | None = None
     error_kind: str | None = None
     response_json: Any = None
+    time_to_first_byte_ms: float | None = None
     try:
         # URL is constructed only from the fixed manifest origin and a route
         # selected by this module; this is not an arbitrary fetch primitive.
@@ -294,7 +297,11 @@ def _request(
             status = int(response.status)
             cf_ray = response.headers.get("cf-ray", "")[:128] or None
             response_etag = response.headers.get("etag", "")[:512] or None
-            raw_body = response.read(RESPONSE_BODY_LIMIT)
+            first_chunk = response.read(1)
+            time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
+            raw_body = first_chunk + response.read(
+                max(0, RESPONSE_BODY_LIMIT - len(first_chunk))
+            )
             response_bytes = len(raw_body)
             if raw_body:
                 try:
@@ -304,7 +311,11 @@ def _request(
     except HTTPError as exc:
         status = int(exc.code)
         cf_ray = exc.headers.get("cf-ray", "")[:128] or None
-        with_error_body = exc.read(RESPONSE_BODY_LIMIT)
+        first_chunk = exc.read(1)
+        time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
+        with_error_body = first_chunk + exc.read(
+            max(0, RESPONSE_BODY_LIMIT - len(first_chunk))
+        )
         response_bytes = len(with_error_body)
         error_kind = "http_error"
         if with_error_body:
@@ -330,7 +341,34 @@ def _request(
         response_etag=response_etag,
         error_kind=error_kind,
         response_json=response_json,
+        time_to_first_byte_ms=time_to_first_byte_ms,
         attempt_number=attempt_number,
+    )
+
+
+def _page_request(
+    origin: str,
+    user: VirtualUser,
+    phase: str,
+    timeout: float,
+    *,
+    session_cookie_name: str,
+    csrf_cookie_name: str,
+) -> RequestResult:
+    """Measure the real Next.js HTML response, including server TTFB."""
+
+    return _request(
+        origin,
+        user,
+        method="GET",
+        path=f"/tournaments/{user.tournament_slug}",
+        phase=phase,
+        timeout=timeout,
+        session_cookie_name=session_cookie_name,
+        csrf_cookie_name=csrf_cookie_name,
+        expected_statuses=frozenset({200}),
+        extra_headers={"Accept": "text/html"},
+        url_prefix="",
     )
 
 
@@ -422,12 +460,17 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
     retry_attempts = 0
     error_kinds: Counter[str] = Counter()
     error_samples: list[dict[str, Any]] = []
+    first_byte_times: list[float] = []
+    response_sizes: list[int] = []
     changed = Counter()
     for result in results:
         status_counts[str(result.status)] += 1
         route = f"{result.method} {result.path.split('?', 1)[0]}"
         by_route[route].append(result.elapsed_ms)
         latencies.append(result.elapsed_ms)
+        response_sizes.append(result.response_bytes)
+        if result.time_to_first_byte_ms is not None:
+            first_byte_times.append(result.time_to_first_byte_ms)
         retry_attempts += int(result.attempt_number > 1)
         if _ready_vote_overload(result) or _authenticated_read_overload(result):
             temporary_overloads += 1
@@ -468,6 +511,14 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         "error_kinds": dict(sorted(error_kinds.items())),
         "changed_counts": dict(sorted(changed.items())),
         "latency": metric_stats(latencies),
+        "time_to_first_byte": metric_stats(first_byte_times),
+        "response_bytes": {
+            "count": len(response_sizes),
+            "avg_bytes": round(sum(response_sizes) / len(response_sizes), 3)
+            if response_sizes
+            else None,
+            "max_bytes": max(response_sizes) if response_sizes else None,
+        },
         "by_route": {
             route: metric_stats(values)
             for route, values in sorted(
@@ -478,6 +529,71 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         },
         "cf_ray_count": len({result.cf_ray for result in results if result.cf_ray}),
         "error_samples": error_samples,
+    }
+
+
+def analyze_concurrency_ramp(
+    stages: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Identify the first latency knee without turning it into a rollout."""
+
+    ordered: list[dict[str, Any]] = []
+    for raw_concurrency, summary in stages.items():
+        try:
+            concurrency = int(raw_concurrency)
+        except (TypeError, ValueError):
+            continue
+        latency = summary.get("latency") or {}
+        p95 = latency.get("p95_ms")
+        p99 = latency.get("p99_ms")
+        rps = summary.get("requests_per_second")
+        if not isinstance(p95, (int, float)) or not isinstance(p99, (int, float)):
+            continue
+        ordered.append(
+            {
+                "concurrency": concurrency,
+                "p95_ms": round(float(p95), 3),
+                "p99_ms": round(float(p99), 3),
+                "requests_per_second": round(float(rps or 0), 3),
+            }
+        )
+    ordered.sort(key=lambda row: row["concurrency"])
+    comparisons: list[dict[str, Any]] = []
+    knee: dict[str, Any] | None = None
+    for previous, current in zip(ordered, ordered[1:]):
+        previous_p95 = float(previous["p95_ms"])
+        current_p95 = float(current["p95_ms"])
+        previous_rps = float(previous["requests_per_second"])
+        current_rps = float(current["requests_per_second"])
+        p95_growth_percent = round(
+            (current_p95 - previous_p95) * 100 / max(1.0, previous_p95),
+            3,
+        )
+        throughput_growth_percent = round(
+            (current_rps - previous_rps) * 100 / max(1.0, previous_rps),
+            3,
+        )
+        comparison = {
+            "from_concurrency": previous["concurrency"],
+            "to_concurrency": current["concurrency"],
+            "p95_growth_percent": p95_growth_percent,
+            "throughput_growth_percent": throughput_growth_percent,
+        }
+        comparisons.append(comparison)
+        if knee is None and p95_growth_percent >= 50 and throughput_growth_percent <= 10:
+            knee = {
+                "stable_concurrency": previous["concurrency"],
+                "first_queued_concurrency": current["concurrency"],
+                "reason": "p95 grew at least 50% while throughput grew at most 10%",
+            }
+    return {
+        "stages": ordered,
+        "comparisons": comparisons,
+        "knee": knee,
+        "recommended_max_concurrency": (
+            knee["stable_concurrency"] if knee is not None else (ordered[-1]["concurrency"] if ordered else None)
+        ),
+        "rollout_required": True,
     }
 
 
@@ -891,6 +1007,39 @@ def run_load(
             and int(phase_results["primary"]["raw_http"].get("unexpected_statuses") or 0) == 0
             and phase_results["state"]["errors"] == 0
         )
+    elif mode == "page-load":
+        def page_builder(
+            origin_value: str,
+            user: VirtualUser,
+            phase: str,
+            request_timeout: float,
+        ) -> RequestResult:
+            return _page_request(
+                origin_value,
+                user,
+                phase,
+                request_timeout,
+                session_cookie_name=session_cookie_name,
+                csrf_cookie_name=csrf_cookie_name,
+            )
+
+        page_results = run_phase(
+            origin,
+            users,
+            phase="authenticated_page_load",
+            spread_seconds=spread_seconds,
+            concurrency=concurrency,
+            timeout=timeout,
+            request_builder=page_builder,
+        )
+        phase_results["authenticated_page_load"] = summarize_results(page_results)
+        all_results.extend(page_results)
+        page_summary = phase_results["authenticated_page_load"]
+        contract_ok = (
+            page_summary["requests"] == len(users)
+            and page_summary["errors"] == 0
+            and page_summary["unexpected_statuses"] == 0
+        )
     else:
         user_indexes = {user.user_id: index for index, user in enumerate(users)}
         initial_workspace_etags: dict[str, str] = {}
@@ -914,6 +1063,7 @@ def run_load(
         read_results: list[RequestResult] = []
         ramp_stages: dict[str, dict[str, Any]] = {}
         for stage_concurrency in read_concurrency_stages:
+            stage_started_at = time.monotonic()
             stage_results = run_phase(
                 origin,
                 users,
@@ -924,12 +1074,20 @@ def run_load(
                 request_builder=read_builder,
             )
             read_results.extend(stage_results)
-            ramp_stages[str(stage_concurrency)] = summarize_results(stage_results)
+            stage_summary = summarize_results(stage_results)
+            stage_wall_seconds = max(0.001, time.monotonic() - stage_started_at)
+            stage_summary["wall_seconds"] = round(stage_wall_seconds, 3)
+            stage_summary["requests_per_second"] = round(
+                float(stage_summary.get("requests") or 0) / stage_wall_seconds,
+                3,
+            )
+            ramp_stages[str(stage_concurrency)] = stage_summary
         phase_results["read_mix"] = summarize_results(read_results)
         if concurrency_stages is not None:
             phase_results["capacity_ramp"] = {
                 "concurrency_stages": list(read_concurrency_stages),
                 "stages": ramp_stages,
+                "analysis": analyze_concurrency_ramp(ramp_stages),
             }
         all_results.extend(read_results)
         refresh_users = [
@@ -1082,7 +1240,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
-    parser.add_argument("--mode", choices=("ready-vote", "read-mix"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("ready-vote", "read-mix", "page-load"),
+        required=True,
+    )
     parser.add_argument("--spread-seconds", type=float, required=True)
     parser.add_argument("--concurrency", type=int, required=True)
     parser.add_argument("--timeout", type=float, required=True)

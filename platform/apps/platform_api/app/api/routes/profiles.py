@@ -33,6 +33,9 @@ from apps.platform_api.app.services.tournament_catalog_read_models import (
     refresh_tournament_list_read_models_for_organizer_after_commit,
 )
 from apps.platform_api.app.services.profile_read_models import refresh_profile_read_model
+from apps.platform_api.app.services.user_account_read_models import (
+    delete_user_account_read_model,
+)
 from apps.platform_api.app.services.media import (
     accepted_media_response,
     api_media_service,
@@ -76,6 +79,7 @@ async def _refresh_profile_read_model_after_commit(user_id: str) -> None:
 
     try:
         await refresh_profile_read_model(user_id)
+        await delete_user_account_read_model(user_id)
         await refresh_tournament_list_read_models_for_organizer_after_commit(user_id)
     except Exception:
         logger.exception(

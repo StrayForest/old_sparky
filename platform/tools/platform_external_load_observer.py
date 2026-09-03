@@ -131,13 +131,15 @@ async def postgres_statement_snapshot() -> dict[str, object]:
         for row in rows:
             query = " ".join(str(row["query"] or "").split())
             lowered = query.lower()
-            if not any(
+            # Exclude the observer's own diagnostic SQL. Keep every other
+            # normalized statement so a read/SSR run exposes its actual top
+            # PostgreSQL consumers, not only the historical Ready Vote set.
+            if any(
                 marker in lowered
                 for marker in (
-                    "sessions",
-                    "tournament_deadlock_ready_rounds",
-                    "tournament_deadlock_ready_votes",
-                    "tournament_deadlock_ready_vote_count_shards",
+                    "pg_stat_activity",
+                    "pg_stat_statements",
+                    "pg_locks",
                 )
             ):
                 continue
@@ -358,6 +360,7 @@ async def async_main() -> int:
     if not 1 <= args.max_runtime <= 18_000:
         raise ValueError("observer max-runtime is outside the supported bound")
     load_env_file(args.env_file)
+    os.environ["PLATFORM_RUNTIME_SERVICE"] = "observer"
     profile_dir_raw = os.environ.get("PLATFORM_READY_VOTE_CPU_PROFILE_DIR", "").strip()
     profile_dir = Path(profile_dir_raw) if profile_dir_raw else None
     postgres_before = await postgres_statement_snapshot()

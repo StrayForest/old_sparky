@@ -98,6 +98,9 @@ from apps.platform_api.app.services.mutation_idempotency import (
 from apps.platform_api.app.services.tournament_runtime_cache import (
     invalidate_tournament_runtime_caches,
 )
+from apps.platform_api.app.services.user_account_read_models import (
+    delete_user_account_read_model,
+)
 
 router = APIRouter()
 PREPROD_CLEANUP_CHUNK_SIZE = 10_000
@@ -996,6 +999,7 @@ async def admin_delete_tournament(
     tournament_id = tournament.id
     tournament_name = tournament.name
     tournament_slug = tournament.slug
+    organizer_user_id = tournament.organizer_user_id
     cover_key = object_key_from_upload_url(tournament.cover_url)
     try:
         media_metadata_deleted = await purge_deleted_media_metadata(
@@ -1061,6 +1065,7 @@ async def admin_delete_tournament(
     )
     await db_session.commit()
 
+    await delete_user_account_read_model(organizer_user_id)
     await delete_tournament_read_models(
         tournament_id,
         ("teams", "workspace_detail", "bracket_summary", "bracket_full"),
@@ -1136,6 +1141,7 @@ async def admin_update_tournament_credits(
     )
     await db_session.commit()
     invalidate_user_session_cache(user.id)
+    await delete_user_account_read_model(user.id)
     await db_session.refresh(user)
     roles_by_user = await role_slugs_for_users(db_session, [user.id])
     return serialize_user(user, roles_by_user.get(user.id, []))
@@ -1199,6 +1205,7 @@ async def admin_update_admin_role(
     )
     await db_session.commit()
     invalidate_user_session_cache(user.id)
+    await delete_user_account_read_model(user.id)
     roles_by_user = await role_slugs_for_users(db_session, [user.id])
     return serialize_user(user, roles_by_user.get(user.id, []))
 
@@ -1416,6 +1423,8 @@ async def admin_override_tournament(
             status_code=status.HTTP_409_CONFLICT,
             detail="Турнир с таким публичным названием уже существует.",
         ) from exc
+    if original_visibility != tournament.visibility:
+        await delete_user_account_read_model(tournament.organizer_user_id)
     await refresh_tournament_list_read_model_after_commit(tournament.id)
     await db_session.refresh(tournament)
     if ready_round_closed_by_override and active_ready_round is not None:

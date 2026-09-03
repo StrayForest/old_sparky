@@ -47,6 +47,10 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
                     "max_waiting_query_ms": 10,
                     "max_lock_waiting_query_ms": 0,
                     "active_query_samples": [{"query_age_ms": 10}],
+                    "connection_ownership": [
+                        {"application_name": "oldsparky-api", "current": 2},
+                        {"application_name": "oldsparky-worker", "current": 1},
+                    ],
                 },
                 "celery_backlog": {
                     "deadlock-platform-high": 0,
@@ -63,6 +67,14 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
         self.assertEqual(
             result["postgres_waits"]["active_query_samples"][0]["query_age_ms"],
             10,
+        )
+        self.assertEqual(
+            result["postgres_connection_ownership"]["oldsparky-api"]["max"],
+            2,
+        )
+        self.assertEqual(
+            result["postgres_connection_ownership"]["oldsparky-worker"]["last"],
+            1,
         )
 
     def test_burst_offsets_are_even_and_do_not_exceed_window(self) -> None:

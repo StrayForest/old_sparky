@@ -41,8 +41,6 @@ type ApiTournamentListItem = {
   id: string;
   slug: string;
   name: string;
-  description?: string | null;
-  invite_code?: string | null;
   cover_url?: string | null;
   cover_media?: PlatformMediaDescriptor | null;
   organizer_user_id: string;
@@ -52,8 +50,9 @@ type ApiTournamentListItem = {
   starts_at?: string | null;
   registration_starts_at?: string | null;
   registration_closes_at?: string | null;
+  // Detail-only responses may provide these schedule fallbacks; compact card
+  // responses intentionally omit them.
   ready_check_starts_at?: string | null;
-  ready_check_ends_at?: string | null;
   captain_selection_starts_at?: string | null;
   status: string;
   visibility: string;
@@ -62,13 +61,19 @@ type ApiTournamentListItem = {
   max_participants?: number | null;
   teams_count?: number | null;
   format_slug: string;
-  match_format?: string | null;
-  final_format?: string | null;
   current_user_participant_status?: string | null;
   state_version?: number | null;
+  created_at: string;
 };
 
-type ApiTournamentDetail = ApiTournamentListItem;
+type ApiTournamentDetail = ApiTournamentListItem & {
+  description?: string | null;
+  invite_code?: string | null;
+  ready_check_ends_at?: string | null;
+  match_format?: string | null;
+  final_format?: string | null;
+  state_version?: number | null;
+};
 
 type ApiRegistration = {
   id: string;
@@ -1486,7 +1491,7 @@ function calculateProfileCompletion(profile: {
   return Math.round((checks.filter(Boolean).length / checks.length) * 100);
 }
 
-function mapSchedule(item: ApiTournamentListItem): TournamentSchedule | null {
+function mapSchedule(item: ApiTournamentDetail): TournamentSchedule | null {
   const registrationStartsAt = item.registration_starts_at ?? "";
   const registrationClosesAt = item.registration_closes_at ?? item.ready_check_starts_at ?? "";
   const checkInStartsAt = item.ready_check_starts_at ?? "";

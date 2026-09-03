@@ -12,6 +12,7 @@ from tools.platform_external_load import (
     RequestResult,
     VirtualUser,
     _route_for_read,
+    analyze_concurrency_ramp,
     _ready_vote_action,
     load_manifest,
     run_load,
@@ -435,6 +436,85 @@ class ExternalLoadTests(unittest.TestCase):
         refresh_call = next(call for call in calls if call["phase"] == "manual_workspace_refresh")
         self.assertEqual(refresh_call["expected_statuses"], frozenset({200, 304}))
         self.assertEqual(refresh_call["extra_headers"], {"If-None-Match": '"workspace-etag"'})
+
+    def test_page_load_reports_html_ttfb_and_total_latency(self) -> None:
+        payload = manifest_payload()
+        _, users = load_manifest_from_payload(payload)
+
+        def fake_trace(origin: str, timeout: float) -> dict[str, str]:
+            return {"status": "200", "ip": "192.0.2.10", "colo": "TEST"}
+
+        def fake_page_request(
+            origin: str,
+            user: VirtualUser,
+            phase: str,
+            timeout: float,
+            *,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+        ) -> RequestResult:
+            return RequestResult(
+                phase=phase,
+                method="GET",
+                path=f"/tournaments/{user.tournament_slug}",
+                status=200,
+                elapsed_ms=40.0,
+                ok=True,
+                response_bytes=12_000,
+                time_to_first_byte_ms=18.0,
+            )
+
+        with (
+            patch("tools.platform_external_load._trace", side_effect=fake_trace),
+            patch("tools.platform_external_load._page_request", side_effect=fake_page_request),
+        ):
+            report = run_load(
+                payload,
+                users,
+                mode="page-load",
+                spread_seconds=0,
+                concurrency=1,
+                timeout=1,
+                duplicate_count=0,
+                manual_refresh_count=0,
+                p95_budget_ms=1000,
+                p99_budget_ms=2000,
+                acceptance_contract={
+                    "kind": "stress",
+                    "accepted_request_latency": {
+                        "p50_ms": 100,
+                        "p90_ms": 100,
+                        "p95_ms": 100,
+                        "p99_ms": 100,
+                    },
+                    "logical_latency": {"p95_ms": 100, "p99_ms": 100},
+                    "max_shed_percent": 0,
+                    "max_retry_amplification_percent": 0,
+                },
+            )
+
+        self.assertTrue(report["acceptance"]["contract_ok"])
+        self.assertEqual(report["phases"]["authenticated_page_load"]["requests"], 2)
+        self.assertEqual(
+            report["overall"]["time_to_first_byte"]["p95_ms"],
+            18.0,
+        )
+        self.assertEqual(report["overall"]["response_bytes"]["max_bytes"], 12_000)
+
+    def test_concurrency_ramp_marks_latency_knee_as_operator_candidate(self) -> None:
+        def stage(p95: float, rps: float) -> dict[str, object]:
+            return {
+                "latency": {"p95_ms": p95, "p99_ms": p95 * 1.2},
+                "requests_per_second": rps,
+            }
+
+        analysis = analyze_concurrency_ramp(
+            {"16": stage(500, 100), "32": stage(700, 105), "48": stage(1400, 106)}
+        )
+
+        self.assertEqual(analysis["knee"]["stable_concurrency"], 32)
+        self.assertEqual(analysis["recommended_max_concurrency"], 32)
+        self.assertTrue(analysis["rollout_required"])
 
     def test_read_mix_concurrency_ramp_reports_each_full_population_stage(self) -> None:
         payload = manifest_payload()

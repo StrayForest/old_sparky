@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-02
+- Last reviewed: 2026-09-03
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -153,6 +153,27 @@ point until an exact-SHA external run accepts a candidate. The new
 at c16/c32/c48/c64/c80/c96/c112/c128 and reports each stage separately.
 Its production execution is operator-only and requires the existing exact
 fixture cleanup/abort procedure.
+The current dev candidate also removes the three tournament router-level
+policies from public catalog and `/mine` resolution. Private child GETs,
+invite claims and the affected roster/join mutations declare only the policy
+they need, so a cached public catalog hit does not first resolve an unrelated
+auth/DB dependency graph. Public and personal catalog endpoints now return the
+compact `TournamentCardResponse`; detail/workspace responses retain the full
+`TournamentResponse` contract. `/users/me` merges authoritative session
+identity/roles/credits with a 60-second, versioned supplemental account
+read-model. Its small monthly quota count is refreshed authoritatively from
+PostgreSQL on cache hits; Redis does not decide authentication or
+authorization.
+
+The external profile `authenticated-page-load-v1` measures authenticated
+`GET /tournaments/{slug}` HTML through the real Next.js origin and reports HTML
+TTFB, total page latency, response bytes and origin SSR/API/PG evidence. The
+observer labels PostgreSQL activity by `oldsparky-api`, `oldsparky-worker`,
+`oldsparky-qa`, `oldsparky-observer` and `oldsparky-maintenance`, making the
+54-versus-52 connection question attributable. The ramp report emits a
+latency-knee recommendation for admission review; it never changes runtime
+limits automatically. Public/static HTML architecture remains deferred: the
+nonce CSP is not bypassed or weakened by this candidate.
 Production service logs are kept in journald, Nginx owns the edge access log,
 and size-based rotation bounds text log files.
 

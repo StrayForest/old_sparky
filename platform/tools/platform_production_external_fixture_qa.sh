@@ -154,6 +154,7 @@ external_vote_observer_log="$external_vote_root/server-observer.log"
 
 set +e
 timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
+  env PLATFORM_RUNTIME_SERVICE=qa \
   "$QA_PYTHON" "$TOOLS_DIR/platform_prepare_external_vote_fixture.py" \
     --env-file "$RUNTIME_ROOT/shared/.env.platform" \
     --origin "$EXPECTED_ORIGIN" \
@@ -236,6 +237,7 @@ if [[ "$qa_status" == "0" && -s "$external_vote_manifest" ]]; then
 
   set +e
   timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
+    env PLATFORM_RUNTIME_SERVICE=observer \
     "$QA_PYTHON" "$TOOLS_DIR/platform_external_load_observer.py" \
       --env-file "$RUNTIME_ROOT/shared/.env.platform" \
       --output "$external_vote_observer_output" \

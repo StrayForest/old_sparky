@@ -68,6 +68,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 "read-mix-human-v2",
                 "read-mix-stress-v2",
                 "read-mix-concurrency-ramp-v1",
+                "authenticated-page-load-v1",
                 "tournament-lifecycle-capacity-v1",
                 "tournament-lifecycle-scale-v1",
                 "tournament-lifecycle-slo-v1",

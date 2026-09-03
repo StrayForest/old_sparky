@@ -965,6 +965,7 @@ async def sample_postgres_waits() -> dict[str, Any]:
                                     json_agg(
                                         json_build_object(
                                             'state', activity.state,
+                                            'application_name', coalesce(activity.application_name, ''),
                                             'wait_event_type', activity.wait_event_type,
                                             'wait_event', activity.wait_event,
                                             'query_age_ms', round(
@@ -981,7 +982,7 @@ async def sample_postgres_waits() -> dict[str, Any]:
                                     '[]'::json
                                 )
                                 FROM (
-                                    SELECT state, wait_event_type, wait_event, query_start, query
+                                    SELECT state, application_name, wait_event_type, wait_event, query_start, query
                                     FROM pg_stat_activity
                                     WHERE datname = current_database()
                                       AND pid <> pg_backend_pid()
@@ -990,7 +991,26 @@ async def sample_postgres_waits() -> dict[str, Any]:
                                     ORDER BY query_start
                                     LIMIT 8
                                 ) AS activity
-                            ) AS active_query_samples
+                            ) AS active_query_samples,
+                            (
+                                SELECT COALESCE(
+                                    json_agg(
+                                        json_build_object(
+                                            'application_name', activity.application_name,
+                                            'current', activity.connection_count
+                                        )
+                                        ORDER BY activity.application_name
+                                    ),
+                                    '[]'::json
+                                )
+                                FROM (
+                                    SELECT coalesce(application_name, '') AS application_name,
+                                           count(*)::integer AS connection_count
+                                    FROM pg_stat_activity
+                                    WHERE datname = current_database()
+                                    GROUP BY coalesce(application_name, '')
+                                ) AS activity
+                            ) AS connection_ownership
                         """
                     )
                 )
@@ -1006,6 +1026,7 @@ async def sample_postgres_waits() -> dict[str, Any]:
                 ),
                 "ungranted_locks": int(row["ungranted_locks"] or 0),
                 "active_query_samples": row["active_query_samples"] or [],
+                "connection_ownership": row["connection_ownership"] or [],
             }
     except Exception as exc:
         return {"error": type(exc).__name__}
@@ -1222,6 +1243,21 @@ class SystemSampler:
             key=lambda sample: float(sample.get("query_age_ms") or 0),
             reverse=True,
         )
+        ownership_values: dict[str, list[int]] = defaultdict(list)
+        for row in postgres_wait_rows:
+            ownership = row.get("connection_ownership")
+            if not isinstance(ownership, list):
+                continue
+            for entry in ownership:
+                if not isinstance(entry, dict):
+                    continue
+                application_name = str(entry.get("application_name") or "unknown")
+                try:
+                    ownership_values[application_name].append(
+                        max(0, int(entry.get("current") or 0))
+                    )
+                except (TypeError, ValueError):
+                    continue
         backlog_rows = [
             sample.get("celery_backlog", {})
             for sample in samples
@@ -1360,6 +1396,16 @@ class SystemSampler:
                     3,
                 ),
                 "active_query_samples": active_query_samples[:16],
+            },
+            "postgres_connection_ownership": {
+                application_name: {
+                    "samples": len(values),
+                    "avg": round(sum(values) / len(values), 2),
+                    "max": max(values),
+                    "last": values[-1],
+                }
+                for application_name, values in sorted(ownership_values.items())
+                if values
             },
             "celery_backlog": {
                 "samples": len(backlog_rows),

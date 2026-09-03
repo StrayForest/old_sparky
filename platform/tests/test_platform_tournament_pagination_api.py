@@ -22,7 +22,7 @@ from apps.platform_api.app.api.routes.tournaments import (
     list_tournament_participants,
     list_tournaments,
 )
-from apps.platform_api.app.api.schemas import TournamentResponse
+from apps.platform_api.app.api.schemas import TournamentCardResponse
 from apps.platform_api.app.services.tournament_catalog_cache import (
     PublicTournamentListCacheEntry,
 )
@@ -126,7 +126,7 @@ class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(payload), 1)
-        self.assertIsInstance(payload[0], TournamentResponse)
+        self.assertIsInstance(payload[0], TournamentCardResponse)
         self.assertEqual(payload[0].slug, "night-cup")
         self.assertIsNone(payload[0].organizer_avatar_url)
         self.assertEqual(db_session.scalar.await_count, 0)

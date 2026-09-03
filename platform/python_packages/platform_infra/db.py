@@ -79,6 +79,21 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _engine_loop: asyncio.AbstractEventLoop | None = None
 
+_POSTGRES_APPLICATION_NAMES = {
+    "api": "oldsparky-api",
+    "worker": "oldsparky-worker",
+    "qa": "oldsparky-qa",
+    "observer": "oldsparky-observer",
+    "maintenance": "oldsparky-maintenance",
+}
+
+
+def postgres_application_name() -> str:
+    """Return the stable PostgreSQL activity label for this process."""
+
+    service = os.environ.get("PLATFORM_RUNTIME_SERVICE", "api").strip().lower()
+    return _POSTGRES_APPLICATION_NAMES.get(service, "oldsparky-api")
+
 
 def engine() -> AsyncEngine:
     global _engine, _engine_loop, _session_factory
@@ -115,6 +130,11 @@ def engine() -> AsyncEngine:
             max_overflow=max_overflow,
             pool_timeout=pool_timeout,
             pool_recycle=pool_recycle,
+            connect_args={
+                "server_settings": {
+                    "application_name": postgres_application_name(),
+                }
+            },
         )
         try:
             _engine_loop = asyncio.get_running_loop()
@@ -162,13 +182,11 @@ async def dispose_engine() -> None:
 async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
     """Yield the request session without pinning a connection on Ready Vote.
 
-    Tournament router policy dependencies are shared by every tournament
-    route.  They are intentionally no-ops for the Ready Vote endpoint, but
-    FastAPI still resolves their session dependency.  Avoid the eager
-    checkout for that endpoint so the policy session remains connection-free;
-    the route-owned Ready Vote scope owns the only required database
-    connection. Other routes retain the eager checkout so pool
-    exhaustion remains a bounded, observable 503.
+    The Ready Vote route owns its short transaction and has no generic policy
+    dependencies. Avoid the eager checkout for that endpoint so its request
+    session remains connection-free; the route-owned Ready Vote scope owns
+    the only required database connection. Other routes retain the eager
+    checkout so pool exhaustion remains a bounded, observable 503.
     """
 
     async with session_factory()() as db_session:

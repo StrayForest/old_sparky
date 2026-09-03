@@ -89,6 +89,7 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
         raise QaFailure("external fixture exceeds the supported user bound")
 
     load_env_file(args.env_file)
+    os.environ["PLATFORM_RUNTIME_SERVICE"] = "qa"
     qa = ProductionQa(
         origin=args.origin,
         request_origin=args.origin,

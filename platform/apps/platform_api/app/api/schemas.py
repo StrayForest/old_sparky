@@ -597,6 +597,32 @@ class TournamentResponse(BaseModel):
     state_version: int | None = None
 
 
+class TournamentCardResponse(BaseModel):
+    """Small projection used by public and personal tournament catalogues."""
+
+    id: str
+    slug: str
+    name: str
+    cover_url: str | None = None
+    cover_media: MediaDescriptorResponse | None = None
+    visibility: str
+    status: str
+    format_slug: str
+    organizer_user_id: str
+    organizer_display_name: str | None = None
+    organizer_avatar_url: str | None = None
+    organizer_avatar_media: MediaDescriptorResponse | None = None
+    participant_count: int = 0
+    allowed_ranks: list[str] = Field(default_factory=list)
+    max_participants: int | None = None
+    current_user_participant_status: str | None = None
+    registration_starts_at: datetime | None = None
+    registration_closes_at: datetime | None = None
+    starts_at: datetime | None = None
+    teams_count: int | None = None
+    created_at: datetime
+
+
 class TournamentStatusUpdateRequest(BaseModel):
     status: str = Field(
         pattern="^(registration_open|registration_closed|in_progress|completed|cancelled)$"

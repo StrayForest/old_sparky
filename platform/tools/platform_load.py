@@ -26,7 +26,7 @@ PROFILE_ROOT = PLATFORM_ROOT / "performance" / "profiles"
 PROFILE_SCHEMA = 2
 PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]+$")
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-ALLOWED_MODES = {"ready-vote", "read-mix", "tournament-lifecycle"}
+ALLOWED_MODES = {"ready-vote", "read-mix", "page-load", "tournament-lifecycle"}
 ALLOWED_CATEGORIES = {"load", "stress", "spike", "soak", "capacity"}
 MAX_CONCURRENCY = 512
 
@@ -279,7 +279,7 @@ def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
             ):
                 raise LoadProfileError(f"profile traffic.retry.jitter_windows_ms[{index}] is invalid")
     elif max_retries != 0 or retry.get("jitter_windows_ms") != []:
-        raise LoadProfileError("read-mix profiles cannot define retries")
+        raise LoadProfileError("read-mix and page-load profiles cannot define retries")
 
     acceptance = _require_mapping(payload.get("acceptance"), field="acceptance")
     expected_kind = {

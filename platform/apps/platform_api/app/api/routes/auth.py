@@ -39,6 +39,9 @@ from apps.platform_api.app.services.auth_mail import (
 )
 from apps.platform_api.app.services.current_user import serialize_current_user
 from apps.platform_api.app.services.auth_bootstrap import build_auth_bootstrap
+from apps.platform_api.app.services.user_account_read_models import (
+    delete_user_account_read_model,
+)
 from apps.platform_api.app.services.steam_openid import (
     SteamOpenIDError,
     SteamOpenIDVerificationError,
@@ -687,6 +690,7 @@ async def steam_callback(
         clear_auth_flow_cookie(redirect, purpose="steam", settings=settings)
         return redirect
     invalidate_user_session_cache(user.id)
+    await delete_user_account_read_model(user.id)
     redirect = _web_auth_redirect(settings, flow_return_path, result="success")
     clear_auth_flow_cookie(redirect, purpose="steam", settings=settings)
     set_session_cookie(redirect, auth_session.token)
@@ -930,6 +934,7 @@ async def confirm_password_reset(
     await db_session.commit()
     response.headers["Cache-Control"] = "no-store"
     invalidate_user_session_cache(user.id)
+    await delete_user_account_read_model(user.id)
     clear_auth_flow_cookie(
         response,
         purpose="password-reset",
@@ -1347,6 +1352,7 @@ async def confirm_email_link(
             detail="Email link code is invalid or expired.",
         ) from exc
     invalidate_user_session_cache(user.id)
+    await delete_user_account_read_model(user.id)
     response.headers["Cache-Control"] = "no-store"
     clear_auth_flow_cookie(response, purpose="email-link", settings=settings)
     set_session_cookie(response, rotated_session.token)
@@ -1681,6 +1687,7 @@ async def confirm_email_change(
         ) from exc
 
     invalidate_user_session_cache(user.id)
+    await delete_user_account_read_model(user.id)
     response.headers["Cache-Control"] = "no-store"
     clear_auth_flow_cookie(
         response,
@@ -1947,6 +1954,7 @@ async def update_account_security(
     )
     await db_session.commit()
     invalidate_user_session_cache(auth_session.user.id)
+    await delete_user_account_read_model(auth_session.user.id)
     await db_session.refresh(auth_session.user)
     response.headers["Cache-Control"] = "no-store"
     if rotated_session is None:

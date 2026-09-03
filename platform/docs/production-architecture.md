@@ -68,6 +68,11 @@ Alembic backfill and bounded repair service provide recovery if a hook is
 interrupted. The read query applies indexed filters, keyset predicates and
 `LIMIT + 1` to derive `has_more` without an exact total count.
 
+The public and personal catalog serializers use a compact card DTO rather than
+the detail/workspace DTO. Description, invite, automation and workflow fields
+remain available only on detail-oriented responses, reducing Redis payload,
+edge payload and browser parsing work without changing authorization.
+
 ### Catalog plan evidence
 
 On 2026-09-01, a disposable 20,000-row projection fixture was used for bounded
@@ -98,6 +103,15 @@ with a database fallback on a cache miss; it does not cache authorization or
 account-security decisions. The web server uses this endpoint for the global
 layout and requests the full user snapshot only from account-owner surfaces.
 
+The full account-owner `/users/me` response uses a versioned, 60-second Redis
+read-model for supplemental profile/security-display fields. The small monthly
+quota count is refreshed from PostgreSQL on each cache hit because it is
+derived from tournament rows and must remain current across maintenance or
+backfill writes. The authoritative auth dependency still validates the session
+and supplies roles, status and credits from PostgreSQL. Cache invalidation
+follows the relevant profile, identity, password, credit, role and
+private-tournament writes; Redis is never an auth or authorization authority.
+
 Hot authenticated reads are instrumented with separate
 `pool_checkout_wait_ms`, `pool_connection_hold_ms`, `db_sql_ms` and request
 duration signals. The workspace preflight materializes a frozen primitive
@@ -115,6 +129,18 @@ is not a security or authorization decision and is not a substitute for the
 database pool. `pool_pre_ping=false`, alternate pool sizes, and optimized
 Uvicorn loop/HTTP implementations are separately selectable experiments; the
 baseline keeps pre-ping enabled and leaves the runtime selectors at `auto`.
+
+Tournament router policies are route-scoped. Public catalog and `/mine` do not
+resolve private-read, write-serialization or invite-claim policy dependencies;
+private child GETs and the exact protected mutations declare the corresponding
+policy locally. This keeps policy ownership explicit and avoids a policy
+database checkout on a cached public catalog hit.
+
+PostgreSQL sessions use stable `application_name` labels for API, worker, QA,
+observer and maintenance processes. Origin load evidence aggregates current,
+maximum, average and last connection counts per label. The external observer's
+`pg_stat_statements` snapshot includes all normalized application queries except
+its own diagnostic reads.
 
 Nginx routes API traffic through a named loopback upstream with explicit
 keepalive and HTTP/1.1 connection reuse. This is a transport-efficiency

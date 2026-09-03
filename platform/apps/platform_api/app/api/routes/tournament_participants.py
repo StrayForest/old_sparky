@@ -18,6 +18,9 @@ from python_packages.platform_infra.models import (
     User,
 )
 from python_packages.platform_infra.security import get_authenticated_session
+from apps.platform_api.app.services.tournament_workspace_access import (
+    ensure_private_tournament_read_membership_is_active,
+)
 
 router = APIRouter()
 
@@ -44,6 +47,7 @@ def _serialize_participant(
 @router.get(
     "/{slug}/participants/manage",
     response_model=list[TournamentParticipantManagementResponse],
+    dependencies=[Depends(ensure_private_tournament_read_membership_is_active)],
 )
 async def list_tournament_participants_for_management(
     slug: str,
