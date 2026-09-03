@@ -193,6 +193,17 @@ The SSR bootstrap now keeps PostgreSQL-authoritative session/role validation
 but skips read-only page renders' `last_seen_at` telemetry write and its extra
 DB checkout. This does not move authentication authority to Redis.
 
+The follow-up A/B run `33744391709` on exact SHA
+`1861b983216d8ae6b63295ab60bf22b5a6bbeda2` confirmed the change under the same
+20,000-request profile: `/bootstrap` p95/p99 improved from `3346/4114 ms` to
+`2602/2934 ms`, average SQL count fell from `3.0` to `2.0`, and pool checkout
+p95 fell from `638 ms` to `472 ms`. Full-page p95/p99 moved from
+`4073/4693 ms` to `3901/4426 ms`; HTML TTFB p95/p99 moved from
+`3529/3852 ms` to `3423/3796 ms`. PostgreSQL ownership remained `48 api + 2
+worker + 1 observer = 51`, while Nginx `request_time_ms` is now populated by
+the observer. The run passed acceptance with zero shedding/retries, and exact
+cleanup removed all 40 tournaments and 20,000 users with no fixture rows left.
+
 The `web-ssr-diagnostics` operator profile adds bounded 1% request-correlated
 Next.js stage timings, five-second Node event-loop samples and Nginx HTML
 timing correlation to the retained observer artifact. It is diagnostic-only
