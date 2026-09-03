@@ -102,6 +102,12 @@ bootstrap service may reuse the versioned profile read model for media fields,
 with a database fallback on a cache miss; it does not cache authorization or
 account-security decisions. The web server uses this endpoint for the global
 layout and requests the full user snapshot only from account-owner surfaces.
+The current development candidate reads that profile model with the process-local
+shared Redis pool and checks the cache before taking the single-flight lock.
+Absent profiles use a versioned 60-second negative sentinel in the same cache
+envelope; profile writes and profile creation paths invalidate the entry after
+commit. This candidate remains unmeasured against the retained production
+baseline until the reviewed A/B is run.
 
 The full account-owner `/users/me` response uses a versioned, 60-second Redis
 read-model for supplemental profile/security-display fields. The small monthly
@@ -142,10 +148,12 @@ maximum, average and last connection counts per label. The external observer's
 `pg_stat_statements` snapshot includes all normalized application queries except
 its own diagnostic reads.
 
-Nginx routes API traffic through a named loopback upstream with explicit
-keepalive and HTTP/1.1 connection reuse. This is a transport-efficiency
-candidate only; it does not change API concurrency, request authorization or
-database ownership.
+Nginx routes API and Next.js traffic through named loopback upstreams with
+explicit keepalive and HTTP/1.1 connection reuse. The HTML proxy inherits the
+cleared `Connection` header and does not advertise a WebSocket upgrade because
+the platform has no WebSocket route. This is a transport-efficiency candidate
+only; it does not change API concurrency, request authorization or database
+ownership.
 
 ## Component ownership
 

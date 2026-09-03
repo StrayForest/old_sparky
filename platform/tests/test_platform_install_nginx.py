@@ -57,6 +57,16 @@ class PlatformInstallNginxTests(unittest.TestCase):
         snippet_text = MODULE.DEFAULT_SNIPPET_SOURCE.read_text(encoding="utf-8")
         self.assertNotIn("Content-Security-Policy", snippet_text)
 
+    def test_web_upstream_uses_keepalive_without_websocket_headers(self) -> None:
+        vhost = MODULE.DEFAULT_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("upstream platform_web {", vhost)
+        self.assertIn("server 127.0.0.1:3000;", vhost)
+        self.assertIn("keepalive 32;", vhost)
+        self.assertIn("proxy_pass http://platform_web;", vhost)
+        self.assertNotIn("proxy_set_header Upgrade $http_upgrade;", vhost)
+        self.assertNotIn("proxy_set_header Connection $platform_connection_upgrade;", vhost)
+
     def test_main_config_is_valid(self) -> None:
         MODULE.validate_main_config(MODULE.DEFAULT_MAIN_SOURCE)
 

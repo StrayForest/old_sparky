@@ -39,6 +39,7 @@ from apps.platform_api.app.services.auth_mail import (
 )
 from apps.platform_api.app.services.current_user import serialize_current_user
 from apps.platform_api.app.services.auth_bootstrap import build_auth_bootstrap
+from apps.platform_api.app.services.profile_read_models import delete_profile_read_model
 from apps.platform_api.app.services.user_account_read_models import (
     delete_user_account_read_model,
 )
@@ -691,6 +692,9 @@ async def steam_callback(
         clear_auth_flow_cookie(redirect, purpose="steam", settings=settings)
         return redirect
     invalidate_user_session_cache(user.id)
+    # Steam registration creates a profile after a user may have been seen as
+    # profile-less; invalidate any versioned positive or negative cache entry.
+    await delete_profile_read_model(user.id)
     await delete_user_account_read_model(user.id)
     redirect = _web_auth_redirect(settings, flow_return_path, result="success")
     clear_auth_flow_cookie(redirect, purpose="steam", settings=settings)

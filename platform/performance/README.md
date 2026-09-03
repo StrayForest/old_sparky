@@ -88,6 +88,21 @@ pool `24` with `max_overflow=0`, `pool_pre_ping=true`, and the PostgreSQL
 safety budget remains `52`. The final profile was applied by exact-SHA deploy
 [`33726577559`](https://github.com/StrayForest/old_sparky/actions/runs/33726577559).
 
+### Profile cache and upstream keepalive candidate (unmeasured)
+
+The current development candidate changes profile-read access to a GET-first
+lookup on the process-local shared Redis pool, taking the single-flight lock
+only after a miss. A profile-less user is represented by a versioned 60-second
+negative sentinel, so repeated `/auth/bootstrap` requests do not repeat the
+profile builder SQL; profile creation and mutation paths invalidate the entry
+after commit. The Nginx HTML route also uses a named `platform_web` upstream
+with HTTP/1.1 keepalive and the inherited cleared `Connection` header.
+
+This is not a production acceptance claim. The next exact-SHA A/B must compare
+bootstrap/page p95/p99, Redis operations/latency, PostgreSQL normalized query
+counts and origin TTFB against the retained `authenticated-page-load-v1`
+baseline, with exact fixture cleanup.
+
 ### Read-path ownership, ramp and SSR evidence (2026-09-03)
 
 The exact-SHA concurrency ramp

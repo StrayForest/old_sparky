@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.platform_api.app.api.routes import auth as auth_routes
 from apps.platform_api.app.api.schemas import RegisterRequest, RegistrationResponse
 from apps.platform_api.app.services.current_user import serialize_current_user
+from apps.platform_api.app.services.profile_read_models import delete_profile_read_model
 from python_packages.platform_infra.audit import write_audit_log
 from python_packages.platform_infra.auth_rate_limit import check_registration_rate_limit
 from python_packages.platform_infra.auth_lifecycle import (
@@ -305,6 +306,10 @@ async def register(
         )
 
     await db_session.commit()
+    # A registration restart can create a profile for a user that previously
+    # had a negative read-model entry. Invalidate both positive and negative
+    # cache values after the profile transaction commits.
+    await delete_profile_read_model(user.id)
     if issued_verification is not None:
         background_tasks.add_task(
             auth_routes._deliver_email_verification,

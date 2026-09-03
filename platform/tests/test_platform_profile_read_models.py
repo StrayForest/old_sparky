@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 from fastapi import HTTPException
 
@@ -98,18 +98,19 @@ class _CasRedis:
 class _SingleflightRedis:
     def __init__(self) -> None:
         self.store: dict[str, bytes | str] = {}
-        self.set_calls: list[tuple[str, str, int, bool]] = []
+        self.set_calls: list[tuple[str, str | bytes, int | None, bool]] = []
         self.closed = False
 
     async def set(
         self,
         key: str,
-        value: str,
+        value: str | bytes,
         *,
-        px: int,
-        nx: bool,
+        px: int | None = None,
+        ex: int | None = None,
+        nx: bool = False,
     ) -> bool:
-        self.set_calls.append((key, value, px, nx))
+        self.set_calls.append((key, value, px if px is not None else ex, nx))
         if nx and key in self.store:
             return False
         self.store[key] = value
@@ -447,7 +448,7 @@ class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stale_profile_revision_cannot_replace_newer_json(self) -> None:
         redis = _CasRedis()
-        with patch.object(profile_read_models, "redis_client", return_value=redis):
+        with patch.object(profile_read_models, "redis_client", return_value=redis) as redis_factory:
             self.assertTrue(
                 await profile_read_models.write_profile_read_model(
                     "user-1",
@@ -462,6 +463,12 @@ class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
                     payload=b'{"profile":{"display_name":"old"}}',
                 )
             )
+        redis_factory.assert_has_calls(
+            [
+                call(decode_responses=False, shared=True),
+                call(decode_responses=False, shared=True),
+            ]
+        )
 
         cached = profile_read_models._decode_envelope(
             redis.store[profile_read_models.profile_read_model_key("user-1")]
@@ -512,6 +519,86 @@ class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             profile_read_models.profile_read_model_lock_key("user-1"),
             redis.store,
+        )
+
+    async def test_warm_profile_hit_reads_before_acquiring_singleflight_lock(self) -> None:
+        redis = _SingleflightRedis()
+        model = profile_read_models.ProfileReadModel(
+            revision=12,
+            payload=b'{"profile":{"user_id":"user-1"},"deadlock_profile":null}',
+        )
+        redis.store[profile_read_models.profile_read_model_key("user-1")] = (
+            profile_read_models._encode_envelope(
+                revision=model.revision,
+                payload=model.payload,
+            )
+        )
+
+        with (
+            patch.object(profile_read_models, "redis_client", return_value=redis) as redis_factory,
+            patch.object(
+                profile_read_models,
+                "build_profile_read_model",
+                AsyncMock(side_effect=AssertionError("warm hit must not build")),
+            ),
+        ):
+            payload = await profile_read_models.get_or_build_profile_read_model("user-1")
+
+        self.assertEqual(payload, model.payload)
+        self.assertEqual(redis.set_calls, [])
+        redis_factory.assert_called_once_with(decode_responses=False, shared=True)
+
+    async def test_absent_profile_is_negative_cached_and_does_not_rebuild(self) -> None:
+        redis = _SingleflightRedis()
+        with (
+            patch.object(profile_read_models, "redis_client", return_value=redis),
+            patch.object(
+                profile_read_models,
+                "build_profile_read_model",
+                AsyncMock(return_value=None),
+            ) as build,
+        ):
+            first = await profile_read_models.get_or_build_profile_read_model("user-1")
+            second = await profile_read_models.get_or_build_profile_read_model("user-1")
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        build.assert_awaited_once_with("user-1")
+        raw = redis.store[profile_read_models.profile_read_model_key("user-1")]
+        envelope = profile_read_models._decode_envelope(raw)
+        self.assertIsNotNone(envelope)
+        assert envelope is not None
+        self.assertEqual(
+            envelope.payload,
+            profile_read_models.PROFILE_READ_MODEL_NEGATIVE_SENTINEL,
+        )
+        self.assertEqual(
+            redis.set_calls[-1][2],
+            profile_read_models.PROFILE_READ_MODEL_NEGATIVE_TTL_SECONDS,
+        )
+
+    async def test_positive_profile_replaces_negative_sentinel(self) -> None:
+        redis = _SingleflightRedis()
+        redis.store[profile_read_models.profile_read_model_key("user-1")] = (
+            profile_read_models._encode_envelope(
+                revision=0,
+                payload=profile_read_models.PROFILE_READ_MODEL_NEGATIVE_SENTINEL,
+            )
+        )
+
+        with patch.object(profile_read_models, "redis_client", return_value=redis):
+            stored = await profile_read_models.write_profile_read_model(
+                "user-1",
+                revision=12,
+                payload=b'{"profile":{"user_id":"user-1"}}',
+            )
+
+        self.assertTrue(stored)
+        self.assertEqual(
+            profile_read_models.profile_read_model_payload(
+                redis.store[profile_read_models.profile_read_model_key("user-1")]
+            ),
+            b'{"profile":{"user_id":"user-1"}}',
         )
 
     async def test_profile_read_model_unlock_only_deletes_owned_lock(self) -> None:

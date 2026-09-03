@@ -258,13 +258,13 @@ The selectable runtime A/B profiles are `uvicorn-classic`, `uvicorn-optimized`,
 and `api-pool-{12,16,20,24}`. Apply one at a time and restore the baseline;
 SSR diagnostics sample 1% of Next.js stages plus event-loop/Nginx timing and
 do not change SSR/CSP. The `pool-pre-ping-off` recovery test is mandatory.
-
 The 2026-09-03 ramp and authenticated-page A/B selected
 `authenticated-read-admission-32` (c32 knee, c48 first queued stage); production uses it with API pool 24, `max_overflow=0` and `pool_pre_ping=true`. The pre-ping-off A/B was rejected; public/static HTML remains dynamic and nonce-CSP protected.
 
 Before attributing a transport result to Nginx, record `nginx -v` and run
-`nginx -t`. The named `platform_api` upstream has explicit loopback keepalive;
-the web upgrade connection header remains separate. For database evidence,
+`nginx -t`. The named `platform_api` and `platform_web` upstreams have explicit
+loopback keepalive; the HTML route clears `Connection` and does not advertise a
+WebSocket upgrade. For database evidence,
 collect `pg_stat_statements` top normalized-query calls, total/mean execution
 time, rows and buffer hits/reads. The external observer excludes only its own
 diagnostic queries, so SSR/read runs expose their actual top statements. Also

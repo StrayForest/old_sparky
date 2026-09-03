@@ -41,9 +41,11 @@ logger = logging.getLogger(__name__)
 PROFILE_READ_MODEL_KEY_PREFIX = "platform:profile:read-model:v1"
 PROFILE_READ_MODEL_LOCK_KEY_PREFIX = "platform:profile:read-model-lock:v1"
 PROFILE_READ_MODEL_SAFETY_TTL_SECONDS = 7 * 24 * 60 * 60
+PROFILE_READ_MODEL_NEGATIVE_TTL_SECONDS = 60
 PROFILE_READ_MODEL_LOCK_TTL_MILLISECONDS = 5_000
 PROFILE_READ_MODEL_LOCK_POLL_INTERVAL_SECONDS = 0.025
 PROFILE_READ_MODEL_LOCK_MAX_WAIT_SECONDS = 0.25
+PROFILE_READ_MODEL_NEGATIVE_SENTINEL = b"profile:none:v1"
 _REDIS_UNAVAILABLE = (RedisError, OSError, asyncio.TimeoutError)
 
 _SET_IF_NEWER_SCRIPT = """
@@ -113,12 +115,41 @@ def _decode_envelope(raw: bytes | str | None) -> ProfileReadModelEnvelope | None
 
 def profile_read_model_payload(raw: bytes | str | None) -> bytes | None:
     envelope = _decode_envelope(raw)
-    return envelope.payload if envelope is not None else None
+    if envelope is None or envelope.payload == PROFILE_READ_MODEL_NEGATIVE_SENTINEL:
+        return None
+    return envelope.payload
 
 
 def profile_read_model_cached_revision(raw: bytes | str | None) -> int | None:
     envelope = _decode_envelope(raw)
     return envelope.revision if envelope is not None else None
+
+
+def _cached_profile_read_model(
+    raw: bytes | str | None,
+) -> tuple[bool, bytes | None]:
+    """Return whether Redis contains a usable positive or negative entry."""
+
+    envelope = _decode_envelope(raw)
+    if envelope is None:
+        return False, None
+    if envelope.payload == PROFILE_READ_MODEL_NEGATIVE_SENTINEL:
+        return True, None
+    return True, envelope.payload
+
+
+def _record_profile_read_model_hit(raw: bytes | str | None) -> bytes | None:
+    hit, payload = _cached_profile_read_model(raw)
+    if not hit:
+        return None
+    record_profile_read_model_event(
+        "profile_read_model_negative_hit"
+        if payload is None
+        else "profile_read_model_hit",
+        payload_bytes=len(payload) if payload is not None else 0,
+        revision=profile_read_model_cached_revision(raw),
+    )
+    return payload
 
 
 def _variant_json_aggregate(asset_id_column):
@@ -314,7 +345,7 @@ async def write_profile_read_model(
     revision: int,
     payload: bytes,
 ) -> bool:
-    client = redis_client(decode_responses=False)
+    client = redis_client(decode_responses=False, shared=True)
     try:
         stored = bool(
             await client.eval(
@@ -344,8 +375,37 @@ async def write_profile_read_model(
             type(exc).__name__,
         )
         return False
-    finally:
-        await client.aclose()
+
+
+async def _write_negative_profile_read_model(user_id: str) -> bool:
+    """Cache an absent profile without replacing a newer positive entry."""
+
+    client = redis_client(decode_responses=False, shared=True)
+    try:
+        stored = bool(
+            await client.set(
+                profile_read_model_key(user_id),
+                _encode_envelope(
+                    revision=0,
+                    payload=PROFILE_READ_MODEL_NEGATIVE_SENTINEL,
+                ),
+                ex=PROFILE_READ_MODEL_NEGATIVE_TTL_SECONDS,
+                nx=True,
+            )
+        )
+        record_profile_read_model_event(
+            "profile_read_model_negative_write" if stored else "profile_read_model_negative_write_skipped",
+            revision=0,
+        )
+        return stored
+    except _REDIS_UNAVAILABLE as exc:
+        record_profile_read_model_event("profile_read_model_redis_error")
+        logger.warning(
+            "Redis negative profile read-model write failed user_id=%s error=%s",
+            user_id,
+            type(exc).__name__,
+        )
+        return False
 
 
 async def _build_and_cache_profile_read_model(user_id: str) -> bytes | None:
@@ -359,6 +419,7 @@ async def _build_and_cache_profile_read_model(user_id: str) -> bytes | None:
         revision=model.revision if model is not None else None,
     )
     if model is None:
+        await _write_negative_profile_read_model(user_id)
         return None
     await write_profile_read_model(
         user_id,
@@ -377,13 +438,9 @@ async def _wait_for_profile_read_model(
     while True:
         await asyncio.sleep(PROFILE_READ_MODEL_LOCK_POLL_INTERVAL_SECONDS)
         raw = await client.get(key)
-        payload = profile_read_model_payload(raw)
-        if payload is not None:
-            record_profile_read_model_event(
-                "profile_read_model_hit",
-                payload_bytes=len(payload),
-                revision=profile_read_model_cached_revision(raw),
-            )
+        hit, payload = _cached_profile_read_model(raw)
+        if hit:
+            _record_profile_read_model_hit(raw)
             return payload
         if asyncio.get_running_loop().time() >= deadline:
             return None
@@ -412,10 +469,18 @@ async def _release_profile_read_model_lock(
 async def get_or_build_profile_read_model(user_id: str) -> bytes | None:
     """Return the profile payload, collapsing concurrent cache fills to one DB read."""
 
-    client = redis_client(decode_responses=False)
+    client = redis_client(decode_responses=False, shared=True)
     token = secrets.token_urlsafe(24)
     lock_acquired = False
     try:
+        # Warm reads must not contend on the single-flight lock. The lock is
+        # only needed after both positive and negative cache entries miss.
+        raw = await client.get(profile_read_model_key(user_id))
+        hit, payload = _cached_profile_read_model(raw)
+        if hit:
+            _record_profile_read_model_hit(raw)
+            return payload
+
         lock_acquired = bool(
             await client.set(
                 profile_read_model_lock_key(user_id),
@@ -428,6 +493,11 @@ async def get_or_build_profile_read_model(user_id: str) -> bytes | None:
             payload = await _wait_for_profile_read_model(client, user_id)
             if payload is not None:
                 return payload
+            raw = await client.get(profile_read_model_key(user_id))
+            hit, payload = _cached_profile_read_model(raw)
+            if hit:
+                _record_profile_read_model_hit(raw)
+                return payload
             lock_acquired = bool(
                 await client.set(
                     profile_read_model_lock_key(user_id),
@@ -438,13 +508,9 @@ async def get_or_build_profile_read_model(user_id: str) -> bytes | None:
             )
         if not lock_acquired:
             raw = await client.get(profile_read_model_key(user_id))
-            payload = profile_read_model_payload(raw)
-            if payload is not None:
-                record_profile_read_model_event(
-                    "profile_read_model_hit",
-                    payload_bytes=len(payload),
-                    revision=profile_read_model_cached_revision(raw),
-                )
+            hit, payload = _cached_profile_read_model(raw)
+            if hit:
+                _record_profile_read_model_hit(raw)
                 return payload
             # Preserve availability if the builder exceeds the bounded wait. The
             # normal path finishes before this point, so this is not a stampede
@@ -454,13 +520,9 @@ async def get_or_build_profile_read_model(user_id: str) -> bytes | None:
         # A post-lock GET closes the race with a post-commit refresh that won
         # the write between the route pipeline and lock acquisition.
         raw = await client.get(profile_read_model_key(user_id))
-        payload = profile_read_model_payload(raw)
-        if payload is not None:
-            record_profile_read_model_event(
-                "profile_read_model_hit",
-                payload_bytes=len(payload),
-                revision=profile_read_model_cached_revision(raw),
-            )
+        hit, payload = _cached_profile_read_model(raw)
+        if hit:
+            _record_profile_read_model_hit(raw)
             return payload
         return await _build_and_cache_profile_read_model(user_id)
     except _REDIS_UNAVAILABLE as exc:
@@ -474,11 +536,10 @@ async def get_or_build_profile_read_model(user_id: str) -> bytes | None:
     finally:
         if lock_acquired:
             await _release_profile_read_model_lock(client, user_id, token)
-        await client.aclose()
 
 
 async def delete_profile_read_model(user_id: str) -> None:
-    client = redis_client(decode_responses=False)
+    client = redis_client(decode_responses=False, shared=True)
     try:
         await client.delete(profile_read_model_key(user_id))
     except _REDIS_UNAVAILABLE as exc:
@@ -487,8 +548,6 @@ async def delete_profile_read_model(user_id: str) -> None:
             user_id,
             type(exc).__name__,
         )
-    finally:
-        await client.aclose()
 
 
 async def refresh_profile_read_model(user_id: str) -> ProfileReadModel | None:
