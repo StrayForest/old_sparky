@@ -167,7 +167,25 @@ test "$run_root_uid" = "0" && test "$run_root_mode" = "700" || {
 shopt -s nullglob
 summaries=("$run_root"/*/matrix-summary.json)
 shopt -u nullglob
+# Recovery is also required when a supervisor published a summary but was
+# interrupted before its detail report was written.  The external-vote
+# supervisor uses a transport-specific directory while its durable QA row
+# remains mode=write-burst, so it needs the same exact identity recovery.
+recovery_profile=""
+profile_count=0
+for candidate_profile in read-mix write-burst external-vote; do
+  if [[ -d "$run_root/$candidate_profile" ]]; then
+    profile_count=$((profile_count + 1))
+    recovery_profile="$candidate_profile"
+  fi
+done
+recovery_needed=0
 if (( ${#summaries[@]} != 1 )); then
+  recovery_needed=1
+elif (( profile_count == 1 )) && [[ ! -f "$run_root/$recovery_profile/$recovery_profile.json" ]]; then
+  recovery_needed=1
+fi
+if (( recovery_needed == 1 )); then
   # A coordinator can fail before publishing its cleanup inventory (for
   # example during argument validation).  Treat that exact, root-owned run
   # directory as a safe no-op after confirming no fixture/control evidence
@@ -204,14 +222,6 @@ if (( ${#summaries[@]} != 1 )); then
     echo "No fixture inventory was published; removed the exact partial run root."
     exit 0
   fi
-  profile_count=0
-  recovery_profile=""
-  for candidate_profile in read-mix write-burst; do
-    if [[ -d "$run_root/$candidate_profile" ]]; then
-      profile_count=$((profile_count + 1))
-      recovery_profile="$candidate_profile"
-    fi
-  done
   if (( profile_count == 1 )); then
     "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
       --pythonpath "$PLATFORM_ROOT" \

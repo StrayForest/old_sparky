@@ -23,6 +23,26 @@ SPEC.loader.exec_module(recovery)
 
 
 class RetainedWriteBurstReportRecoveryTests(unittest.TestCase):
+    def test_external_vote_recovery_uses_transport_specific_paths(self) -> None:
+        run_root = Path(
+            "/opt/oldsparky/platform/shared/production-retained-matrix/gha-32767006384"
+        )
+
+        report_path, summary_path = recovery._recovery_paths(run_root, "external-vote")
+
+        self.assertEqual(
+            report_path,
+            run_root / "external-vote" / "external-vote.json",
+        )
+        self.assertEqual(
+            summary_path,
+            run_root / "external-vote" / "matrix-summary.json",
+        )
+
+    def test_external_vote_recovery_accepts_write_burst_durable_mode(self) -> None:
+        self.assertEqual("write-burst", recovery._expected_stored_mode("external-vote"))
+        self.assertEqual("read-mix", recovery._expected_stored_mode("read-mix"))
+
     @unittest.skipUnless(os.geteuid() == 0, "root-owned file contract")
     def test_existing_root_report_permissions_are_tightened(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

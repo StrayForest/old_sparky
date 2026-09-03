@@ -5,7 +5,8 @@ The production retained-load supervisor updates ``PreprodTestRun.report`` after
 each material setup phase.  If the GitHub SSH client is canceled, the final
 JSON files may never be copied to the run directory even though the database
 still has the exact fixture identity.  This helper reconstructs only the
-read-mix or write-burst report and compact summary for one exact ``gha-<run-id>`` root;
+read-mix, write-burst, or transport-specific external-vote report and compact
+summary for one exact ``gha-<run-id>`` root;
 the normal exact cleanup validator remains the deletion authority.
 """
 
@@ -40,6 +41,7 @@ SYNTHETIC_EMAIL_PATTERN = re.compile(
 RUN_ROOT_PATTERN = re.compile(
     r"^/opt/oldsparky/platform/shared/production-retained-matrix/gha-(?P<run_id>[0-9]+)$"
 )
+RECOVERY_MODES = ("read-mix", "write-burst", "external-vote")
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-email", required=True)
     parser.add_argument(
         "--mode",
-        choices=("read-mix", "write-burst"),
+        choices=RECOVERY_MODES,
         default="write-burst",
     )
     return parser.parse_args()
@@ -212,6 +214,39 @@ def build_recovered_summary(
     }
 
 
+def _recovery_paths(run_root: Path, mode: str) -> tuple[Path, Path]:
+    """Return the report and summary paths for a supervisor profile."""
+
+    if mode not in RECOVERY_MODES:
+        raise RuntimeError("unsupported retained report recovery mode")
+    profile_root = run_root / mode
+    return profile_root / f"{mode}.json", profile_root / "matrix-summary.json"
+
+
+def _expected_stored_mode(mode: str) -> str:
+    if mode not in RECOVERY_MODES:
+        raise RuntimeError("unsupported retained report recovery mode")
+    return "write-burst" if mode == "external-vote" else mode
+
+
+def _persist_recovered_identity(
+    run: Any,
+    *,
+    stored_report: dict[str, Any],
+    user_ids: list[str],
+    tournament_ids: list[str],
+) -> dict[str, Any]:
+    """Make the durable row usable by the normal identity-checked cleanup."""
+
+    recovered = dict(stored_report)
+    recovered["user_ids"] = user_ids
+    recovered["tournament_ids"] = tournament_ids
+    recovered["recovered_from_preprod_test_run"] = str(run.id)
+    recovered["recovered_at"] = datetime.now(UTC).isoformat()
+    run.report = recovered
+    return recovered
+
+
 async def recover(args: argparse.Namespace) -> dict[str, Any]:
     run_root = args.run_root
     expected_run = RUN_ROOT_PATTERN.fullmatch(str(run_root))
@@ -233,9 +268,7 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
     if settings.platform_web_origin.rstrip("/") != EXPECTED_ORIGIN:
         raise RuntimeError("retained report recovery requires the canonical origin")
 
-    profile_root = run_root / args.mode
-    report_path = profile_root / f"{args.mode}.json"
-    summary_path = profile_root / "matrix-summary.json"
+    report_path, summary_path = _recovery_paths(run_root, args.mode)
     generic_summary_path = run_root / "matrix-summary.json"
 
     async with session_factory()() as db_session:
@@ -259,7 +292,7 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("durable QA marker is not a canonical retained-load marker")
         if run.origin != EXPECTED_ORIGIN or stored.get("origin") != EXPECTED_ORIGIN:
             raise RuntimeError("durable QA provenance is not the canonical production origin")
-        if stored.get("mode") != args.mode:
+        if stored.get("mode") != _expected_stored_mode(args.mode):
             raise RuntimeError("durable QA row mode does not match the selected retained profile")
         user_ids = await _recover_progress_user_ids(
             db_session,
@@ -267,6 +300,13 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
             marker=marker,
         )
         tournament_ids = _uuid_list(stored.get("tournament_ids"), field="tournament_ids")
+        stored = _persist_recovered_identity(
+            run,
+            stored_report=stored,
+            user_ids=user_ids,
+            tournament_ids=tournament_ids,
+        )
+        await db_session.commit()
     if not user_ids:
         raise RuntimeError("durable QA row contains no synthetic users to recover")
     if str(stored.get("report_path") or run.report_path) != str(report_path):
@@ -299,7 +339,7 @@ async def recover(args: argparse.Namespace) -> dict[str, Any]:
         report["tournament_ids"] = tournament_ids
         report["passed"] = False
         report["recovered_from_preprod_test_run"] = str(run.id)
-        report["recovered_at"] = datetime.now(UTC).isoformat()
+        report["recovered_at"] = stored.get("recovered_at")
         _write_root_json(report_path, report)
 
     if _regular_file(summary_path, required=False):

@@ -543,6 +543,14 @@ its retained report and one-row summary from the matching durable
 ownership and graph-boundary check before deleting anything. A recovered run
 is never considered a passed load measurement.
 
+The same recovery is required when the supervisor published
+`matrix-summary.json` but was interrupted before its detail report. The cleanup
+supervisor recognizes the transport-specific
+`external-vote/external-vote.json` path, reconstructs the full user inventory
+from the marker-scoped durable row, persists that recovered identity back to
+`PreprodTestRun.report`, and only then invokes the normal exact cleanup
+validator. A missing or ambiguous profile remains fail-closed.
+
 If a fixture was committed before the external runner timed out at the edge,
 the cleanup validator recovers only the exact external-load marker and
 ownership scope recorded for that run. Any malformed marker match or ownership
