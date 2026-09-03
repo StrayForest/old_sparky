@@ -4,7 +4,10 @@ import { NextResponse } from "next/server";
 
 const CSP_HEADER = "Content-Security-Policy";
 const CSP_REPORT_ONLY_HEADER = "Content-Security-Policy-Report-Only";
-const CSP_RESPONSE_HEADER = CSP_HEADER;
+// Temporary AdSense diagnostic mode. This deliberately stays Report-Only until
+// the browser ad-serving result is observed; do not promote this policy to
+// enforcement with its Google compatibility fallbacks.
+const CSP_RESPONSE_HEADER = CSP_REPORT_ONLY_HEADER;
 const NONCE_HEADER = "x-nonce";
 const REPORTING_ENDPOINTS = 'csp-endpoint="/api/v1/security/csp-report"';
 
@@ -15,10 +18,9 @@ function contentSecurityPolicy(nonce: string): string {
     "form-action 'self'",
     "frame-ancestors 'none'",
     "object-src 'none'",
-    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic' https://challenges.cloudflare.com https://static.cloudflareinsights.com https://pagead2.googlesyndication.com`,
+    `script-src 'self' 'nonce-${nonce}' 'unsafe-inline' 'unsafe-eval' 'strict-dynamic' https: http:`,
     "script-src-attr 'none'",
-    `style-src 'self' 'nonce-${nonce}'`,
-    "style-src-attr 'none'",
+    `style-src 'self' 'nonce-${nonce}' 'unsafe-inline'`,
     "img-src 'self' blob: https://cdn.old-sparky.com https://steamstore-a.akamaihd.net https://clan.fastly.steamstatic.com https://deadlock.io https://assets-bucket.deadlock-api.com https://i2.ytimg.com https://i3.ytimg.com https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net",
     "connect-src 'self' https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://fundingchoicesmessages.google.com",
     "frame-src https://challenges.cloudflare.com https://googleads.g.doubleclick.net https://tpc.googlesyndication.com",

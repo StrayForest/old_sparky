@@ -464,7 +464,7 @@ jobs:
             --app-dir "$runtime" \
             --edge-origin https://127.0.0.1 \
             --edge-host old-sparky.com \
-            --expected-csp-mode enforce
+            --expected-csp-mode report-only
 
           case "$runtime_profile" in
             baseline)

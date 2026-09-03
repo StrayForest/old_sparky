@@ -105,7 +105,7 @@ cd /opt/oldsparky/platform/current
 tools/platform_release_deploy.sh \
   --artifact /path/to/<release-slug>.tar.gz \
   --app-dir /opt/oldsparky/platform \
-  --expected-csp-mode enforce
+  --expected-csp-mode report-only
 ```
 
 If the command reports a retained transaction, inspect the phase and database

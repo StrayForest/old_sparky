@@ -11,7 +11,7 @@ ARTIFACT=""
 RESUME=0
 ABORT_RETAINED=0
 CONFIRM_MIGRATION_NOT_REVERSED=0
-EXPECTED_CSP_MODE="enforce"
+EXPECTED_CSP_MODE="report-only"
 EDGE_ORIGIN="https://127.0.0.1"
 EDGE_HOST="old-sparky.com"
 PUBLIC_EDGE_ORIGIN="https://old-sparky.com"
@@ -109,8 +109,8 @@ if [[ "$ABORT_RETAINED" -eq 0 && "$CONFIRM_MIGRATION_NOT_REVERSED" -eq 1 ]]; the
   echo "--confirm-migration-not-reversed requires --abort-retained." >&2
   exit 1
 fi
-if [[ "$EXPECTED_CSP_MODE" != "enforce" ]]; then
-  echo "Production deploys require the enforced CSP mode." >&2
+if [[ "$EXPECTED_CSP_MODE" != "report-only" ]]; then
+  echo "This temporary AdSense diagnostic release requires Report-Only CSP mode." >&2
   exit 1
 fi
 

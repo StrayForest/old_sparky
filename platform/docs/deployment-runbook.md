@@ -154,12 +154,12 @@ tools/platform_release_preflight.sh \
   --edge-origin https://127.0.0.1 \
   --edge-host old-sparky.com \
   --edge-insecure-loopback \
-  --expected-csp-mode enforce
+  --expected-csp-mode report-only
 
 /opt/oldsparky/platform/shared/venv/bin/python \
   tools/platform_deploy_smoke.py \
   --edge-origin https://old-sparky.com \
-  --expected-csp-mode enforce
+  --expected-csp-mode report-only
 ```
 
 `--edge-insecure-loopback` is allowed only for loopback. Public smoke keeps normal certificate verification. The expected CSP mode must match the active release.
