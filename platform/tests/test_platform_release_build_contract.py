@@ -240,6 +240,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("ControlPath %s", workflow)
         self.assertIn("Remove external-load SSH control socket", workflow)
         self.assertIn("platform_production_retained_load_cleanup_qa.sh", workflow)
+        self.assertIn("Always invoke the exact supervisor", workflow)
+        self.assertNotIn('echo \'{"ok":true,"fixture_absent":true}\'', workflow)
         cleanup_supervisor = (
             REPO_ROOT
             / "platform/tools/platform_production_retained_load_cleanup_qa.sh"

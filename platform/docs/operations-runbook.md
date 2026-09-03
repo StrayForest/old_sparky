@@ -579,6 +579,11 @@ sessions and audit rows, and only then removes the VPS report directory. A
 failed cleanup keeps the data and report directory in place for operator
 recovery; do not run broad cleanup against production.
 
+The external-load workflow always invokes this supervisor, even when the
+filesystem run root is missing. In that case the supervisor uses the durable
+`PreprodTestRun` orphan path; a missing directory is not treated as proof that
+the database fixture is absent.
+
 ## Alert thresholds
 
 - failed/restarted service;

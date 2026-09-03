@@ -244,12 +244,11 @@ jobs:
           load_run_id="$2"
           control_email="$3"
           cleanup_run_id="$4"
-          if test -e "/opt/oldsparky/platform/shared/production-retained-matrix/gha-$load_run_id"; then
-            sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_cleanup_qa.sh \
-              DELETE-PRODUCTION-RETAINED-LOAD "$target_sha" "$load_run_id" "$control_email" "$cleanup_run_id"
-          else
-            echo '{"ok":true,"fixture_absent":true}'
-          fi
+          # Always invoke the exact supervisor.  A missing filesystem run root
+          # can still have a durable PreprodTestRun fixture inventory and must
+          # take the orphan-cleanup path instead of being treated as absent.
+          sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_cleanup_qa.sh \
+            DELETE-PRODUCTION-RETAINED-LOAD "$target_sha" "$load_run_id" "$control_email" "$cleanup_run_id"
           REMOTE
           cleanup_status="$?"
           set -e
