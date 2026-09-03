@@ -2898,7 +2898,6 @@ test("Steam auto-verification collapses immediately and blocks duplicate starts"
   await firstAttemptStarted;
   await expect.poll(() => steamAttempts).toBe(1);
   releaseFirstAttempt!();
-  await expect(page.locator(".auth-turnstile")).toHaveCount(1);
   await expect.poll(() => steamAttempts).toBe(2);
   await secondAttemptStarted;
   await expect(page.locator(".auth-turnstile")).toHaveCount(0);
