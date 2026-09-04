@@ -1,6 +1,6 @@
 # Pre-release audit worklog — 2026-09-05
 
-Status: Final audit recorded; publication/live rerun follow-up pending  
+Status: Final audit evidence recorded; report update pending publication
 Scope: active OldSparky platform under `platform/`; live origin
 `https://old-sparky.com`; legacy bot and `sparkydb` excluded by policy.  
 Owner: release audit  
@@ -34,7 +34,7 @@ user-facing report is stored separately as
 | Database schema and migrations | PASS | Head `20260903_0052`; migration scenario failed-fast/repaired/upgraded as expected. |
 | Background jobs and external integrations | PASS REVIEW / LIVE CONDITIONAL | Celery/Redis/mail/R2/Steam/Google/content paths reviewed; real external calls not triggered. |
 | Security and secrets | PASS WITH WARNINGS | Dependency audit, Bandit and 767-file secret scan passed; existing Bandit warnings and backend resource warnings retained. |
-| CI/CD and release safety | PASS CODE/CI; LIVE QA BLOCKED | Exact-SHA security/build, auto-deploy and production deploy runs passed; first live-public attempt was blocked by dirty QA checkout. |
+| CI/CD and release safety | PASS CODE/CI; LIVE QA FAIL | Exact-SHA security/build, auto-deploy and production deploy runs passed; clean live-public rerun reached browser QA but failed AUD-09. |
 | Backups, restore and disaster recovery | LOCAL PASS / OFFSITE BLOCKED | Local migration/restore contract passed; documented off-host encrypted recovery drill remains incomplete. |
 | Performance, capacity and observability | RETAINED EVIDENCE / LOAD NOT RUN | Existing accepted load evidence and budgets reviewed; no new external load run without operator gate. |
 | Documentation and operational readiness | PASS GATE / OPEN ACTIONS | Docs and verification contract passed before final report; final rerun and source-of-truth reconciliation required. |
@@ -54,6 +54,7 @@ user-facing report is stored separately as
 | AUD-06 | P2 | CLEANUP | Web-quality passes with four unused-symbol lint warnings. |
 | AUD-07 | P2 | CLEANUP | Backend suite passes but emits unclosed Redis/asyncpg resource warnings. |
 | AUD-08 | P2 conditional | OWNER DECISION | `www.old-sparky.com` does not resolve; confirm apex-only policy or add canonical redirect. |
+| AUD-09 | P1 release gate | FAIL | Clean live-public run had 40 passed/10 skipped/4 failed: AdSense inline-style nodes broke the CSP invariant in three projects; WebKit image inventory saw cancelled navigations. |
 
 ## Evidence log
 
@@ -90,7 +91,8 @@ user-facing report is stored separately as
   source SHA.
 - `platform-live-launch.yml` run `33928660477` reached SSH/input validation
   but was stopped by the production live-QA guard because the trusted checkout
-  had audit changes.  Rerun after publication from a clean exact-SHA checkout.
+  had audit changes.  Clean exact-SHA rerun `33930022208` reached browser QA
+  and failed AUD-09: 40 passed, 10 skipped, 4 failed.
 
 ### 2026-09-05 — report artifact
 

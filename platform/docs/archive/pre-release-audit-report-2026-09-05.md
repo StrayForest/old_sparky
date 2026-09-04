@@ -147,6 +147,11 @@ DNS state; impact depends on the intended public URL.
 **Required closure:** Either add a proxied `www` alias that redirects to the
 canonical apex, or record in the domain/SEO checklist that `www` is not a supported hostname.  Re-check `robots.txt`/sitemap `Host` compatibility with the chosen canonical policy.
 
+### AUD-09 — Clean live-public browser gate fails the CSP/AdSense invariant (P1)
+**Status:** FAIL on [run 33930022208](https://github.com/StrayForest/old_sparky/actions/runs/33930022208): 40 passed, 10 skipped, 4 failed.  Three browser projects observed six AdSense/cookie-consent nodes with inline `style` attributes while the live assertion requires zero; WebKit also recorded three cancelled navigation requests during image inventory.
+**Impact:** This is a real production launch-gate failure.  Evidence points to a contract conflict between intentional AdSense integration and the test’s global `style` invariant, plus a WebKit request-lifecycle issue; it is not an auth bypass, but it prevents a green live-public contour.
+**Required closure:** Decide whether Google-owned injected nodes are a narrow allowed exception or ads must be disabled; preserve CSP violation and app-owned nonce checks, adjust the assertion only with a reviewed vendor selector, then reproduce/close the WebKit cancellations.  Do not broadly allow inline styles.
+
 ## 4. Repository and release audit
 
 ### 4.1 Source boundaries and working state
@@ -172,7 +177,7 @@ For the reviewed source SHA, GitHub Actions reported:
 - [Platform production deploy — run 33926107320](https://github.com/StrayForest/old_sparky/actions/runs/33926107320) — success.
 
 The source and workflow contract require exact-SHA status checks, immutable attested artifacts and a VPS that verifies the artifact rather than resolving dependencies or building from source.  The deployment workflow is therefore a meaningful release-control result, but it does not close the operator-owned perimeter, backup or user-journey gates listed above.
-The first live-public workflow attempt during this audit was deliberately made with `provision=false`.  [Run 33928660477](https://github.com/StrayForest/old_sparky/actions/runs/33928660477) reached the SSH and input checks, then the production live-QA guard refused to run because the trusted QA checkout had tracked/untracked audit changes.  This is a process-state block, not evidence of a product failure.  It must be re-run against a clean exact-SHA checkout after the audit documents are published; the report will preserve the final result when that rerun is available.
+The first live-public workflow attempt with `provision=false` was blocked by the dirty audit checkout ([33928660477](https://github.com/StrayForest/old_sparky/actions/runs/33928660477)); the clean exact-SHA rerun reached the browser contour and failed AUD-09.  The clean result is the release-relevant evidence.
 
 ## 5. Deterministic verification results
 
