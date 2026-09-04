@@ -1,15 +1,17 @@
 import { HEROES, HERO_BY_ID } from "./heroes.js";
 import {
+  BAN_COUNTS,
   DEFAULT_CUSTOM_RULES,
-  PRESETS,
+  TEAM_SIZES,
+  TIMER_SECONDS,
   applyLocalAction,
+  applyLocalTimeout,
   buildRules,
+  createDefaultSequence,
   createLocalRoom,
   currentStep,
   decodeResult,
-  encodeResult,
-  pauseLocalOnTimeout,
-  resumeLocalTurn
+  encodeResult
 } from "./draft-core.js";
 
 const app = document.querySelector("#app");
@@ -18,13 +20,13 @@ const SEAT_KEY_PREFIX = "oldsparky:draft:seat:";
 const INVITE_KEY_PREFIX = "oldsparky:draft:invite:";
 
 let createMode = "online";
-let selectedPreset = "community-6v6";
+let selectedTeamSize = DEFAULT_CUSTOM_RULES.teamSize;
+let selectedBanCount = DEFAULT_CUSTOM_RULES.banCount;
 let selectedTimer = 30;
+let selectedFirstMove = "A";
 let createTeamA = "";
 let createTeamB = "";
-let customTeamSize = DEFAULT_CUSTOM_RULES.teamSize;
-let customBanSequence = DEFAULT_CUSTOM_RULES.banSequence;
-let customPickSequence = DEFAULT_CUSTOM_RULES.pickSequence;
+let customSequence = createDefaultSequence(selectedTeamSize, selectedBanCount, selectedFirstMove);
 let room = null;
 let selectedHeroId = null;
 let heroSearch = "";
@@ -36,8 +38,9 @@ let connected = false;
 let reconnectAttempt = 0;
 let reconnectHandle = null;
 let timerHandle = null;
-let timeoutSentVersion = null;
+let deadlineSentVersion = null;
 let lastError = "";
+let previewAnimationHandle = null;
 
 window.addEventListener("popstate", () => route());
 window.addEventListener("beforeunload", () => closeSocket());
@@ -46,6 +49,7 @@ route();
 
 function route() {
   stopTimer();
+  stopPreviewAnimation();
   closeSocket();
   selectedHeroId = null;
   heroSearch = "";
@@ -104,96 +108,128 @@ function renderBrand() {
 
 function currentCustomRules() {
   return {
-    teamSize: customTeamSize,
-    banSequence: customBanSequence,
-    pickSequence: customPickSequence
+    teamSize: selectedTeamSize,
+    banCount: selectedBanCount,
+    firstSide: selectedFirstMove === "B" ? "B" : "A",
+    sequence: customSequence.map(({ action, side }) => ({ action, side }))
   };
 }
 
 function currentCreateRules() {
-  return buildRules(
-    selectedPreset,
-    selectedTimer,
-    selectedPreset === "custom" ? currentCustomRules() : null
-  );
+  return buildRules("standard", selectedTimer, currentCustomRules());
 }
 
-function renderCreateRulesPreview() {
+function renderCreatePreview() {
   try {
-    return renderRulesSummary(currentCreateRules());
+    const rules = currentCreateRules();
+    const bans = { A: 0, B: 0 };
+    rules.sequence.filter((step) => step.action === "ban").forEach((step) => { bans[step.side] += 1; });
+    return `
+      <div class="preview-board" aria-label="Предпросмотр драфта">
+        <div class="preview-board__heading"><span class="team-a">Команда 1</span><span class="preview-vs">VS</span><span class="team-b">Команда 2</span></div>
+        <div class="preview-team-row team-a"><strong>Команда 1</strong><div class="preview-slots">${renderPreviewSlots(rules.teamSize, bans.A)}</div></div>
+        <div class="preview-team-row team-b"><strong>Команда 2</strong><div class="preview-slots">${renderPreviewSlots(rules.teamSize, bans.B)}</div></div>
+      </div>
+      <div class="preview-sequence" aria-label="Анимация последовательности">
+        ${rules.sequence.map((step, index) => `<span class="preview-step ${step.action === "ban" ? "ban" : "pick"} ${index === 0 ? "active" : ""}" data-preview-step="${index}" title="Шаг ${index + 1}: ${step.action === "ban" ? "бан" : "пик"} команды ${step.side}">${step.action === "ban" ? "×" : "✓"}</span>`).join("")}
+      </div>
+      <div class="preview-meta"><span>${rules.teamSize} × ${rules.teamSize}</span><span>${rules.banCount} бан${rules.banCount === 1 ? "" : rules.banCount < 5 ? "а" : "ов"}</span><span>${rules.timerSeconds ? `${rules.timerSeconds}с` : "без таймера"}</span></div>
+    `;
   } catch (cause) {
     return `<div class="error-box">${escapeHtml(errorMessage(cause))}</div>`;
   }
 }
 
+function renderPreviewSlots(teamSize, banCount) {
+  return Array.from({ length: teamSize + banCount }, (_, index) => `<span class="preview-slot ${index >= teamSize ? "preview-slot--ban" : ""}" aria-hidden="true"></span>`).join("");
+}
+
+function renderSequenceEditor() {
+  return `
+    <div class="sequence-editor" aria-label="Настройка порядка банов и пиков">
+      <div class="sequence-editor__header"><span>Порядок действий</span><span class="sequence-editor__hint">Нажмите на шаг — бан и пик поменяются местами</span></div>
+      <div class="sequence-editor__scroll">
+        <div class="sequence-editor__grid" style="--sequence-length:${customSequence.length}">
+          <div class="sequence-row-label sequence-row-label--spacer" aria-hidden="true"></div><div class="sequence-track sequence-track--numbers">${customSequence.map((_, index) => `<span>${index + 1}</span>`).join("")}</div>
+          <div class="sequence-row-label">Команда 1</div><div class="sequence-track">${customSequence.map((step, index) => step.side === "A" ? `<button class="sequence-editor-step ${step.action === "ban" ? "ban" : "pick"}" type="button" data-sequence-index="${index}" aria-label="Шаг ${index + 1}: ${step.action === "ban" ? "бан" : "пик"} команды 1"><span aria-hidden="true">${step.action === "ban" ? "×" : "✓"}</span></button>` : "<span class=\"sequence-empty\"></span>").join("")}</div>
+          <div class="sequence-row-label">Команда 2</div><div class="sequence-track">${customSequence.map((step, index) => step.side === "B" ? `<button class="sequence-editor-step ${step.action === "ban" ? "ban" : "pick"}" type="button" data-sequence-index="${index}" aria-label="Шаг ${index + 1}: ${step.action === "ban" ? "бан" : "пик"} команды 2"><span aria-hidden="true">${step.action === "ban" ? "×" : "✓"}</span></button>` : "<span class=\"sequence-empty\"></span>").join("")}</div>
+        </div>
+      </div>
+      <p class="field-hint">Крестик — бан, галочка — пик. Количество шагов фиксировано выбранными форматом и числом банов.</p>
+    </div>
+  `;
+}
+
 function renderCreate() {
+  stopPreviewAnimation();
   app.innerHTML = `
     ${renderBrand()}
     <section class="create-layout">
       <div class="panel create-main">
         <p class="eyebrow">Deadlock picks & bans</p>
-        <h1>Драфт без лишнего</h1>
-        <p class="create-lead">Создай комнату, отправь ссылку сопернику и пикайте в реальном времени. Аккаунт и турнир не нужны.</p>
+        <h1>Драфты</h1>
+        <p class="create-lead">Создай комнату, отправь ссылку сопернику и пикайте в реальном времени.</p>
 
         <div class="segmented" aria-label="Режим драфта">
-          <button type="button" data-mode="online" class="${createMode === "online" ? "active" : ""}">Онлайн</button>
+          <button type="button" data-mode="online" class="${createMode === "online" ? "active" : ""}">Стандарт</button>
           <button type="button" data-mode="solo" class="${createMode === "solo" ? "active" : ""}">Соло</button>
         </div>
 
         <div class="form-grid">
           <div class="field field--wide">
-            <label for="preset">Шаблон</label>
-            <select id="preset">
-              ${Object.values(PRESETS).map((item) => `<option value="${item.id}" ${item.id === selectedPreset ? "selected" : ""}>${escapeHtml(item.label)}</option>`).join("")}
-            </select>
+            <span class="field-title">Формат</span>
+            <div class="chip-row" role="group" aria-label="Формат команды">
+              ${TEAM_SIZES.map((size) => `<button type="button" data-team-size="${size}" class="${size === selectedTeamSize ? "active" : ""}">${size}v${size}</button>`).join("")}
+            </div>
+          </div>
+
+          <div class="field field--wide">
+            <span class="field-title">Первый ход</span>
+            <div class="chip-row" role="group" aria-label="Команда первого хода">
+              <button type="button" data-first-move="A" class="${selectedFirstMove === "A" ? "active" : ""}">Команда 1</button>
+              <button type="button" data-first-move="B" class="${selectedFirstMove === "B" ? "active" : ""}">Команда 2</button>
+              <button type="button" data-first-move="random" class="${selectedFirstMove === "random" ? "active" : ""}">Рандом</button>
+            </div>
+          </div>
+
+          <div class="field field--wide">
+            <span class="field-title">Баны</span>
+            <div class="chip-row" role="group" aria-label="Количество банов">
+              ${BAN_COUNTS.map((count) => `<button type="button" data-ban-count="${count}" class="${count === selectedBanCount ? "active" : ""}">${count === 0 ? "—" : count}</button>`).join("")}
+            </div>
           </div>
 
           <div class="field field--wide">
             <span class="field-title">Таймер хода</span>
-            <div class="chip-row" id="timer-options">
-              ${[0, 30, 45, 60, 90].map((seconds) => `<button type="button" data-timer="${seconds}" class="${seconds === selectedTimer ? "active" : ""}">${seconds === 0 ? "Выкл" : `${seconds}с`}</button>`).join("")}
+            <div class="chip-row" role="group" aria-label="Таймер хода">
+              ${TIMER_SECONDS.map((seconds) => `<button type="button" data-timer="${seconds}" class="${seconds === selectedTimer ? "active" : ""}">${seconds === 0 ? "Выкл" : `${seconds}с`}</button>`).join("")}
             </div>
           </div>
 
-          ${selectedPreset === "custom" ? `
-            <div class="field">
-              <label for="custom-team-size">Размер команды</label>
-              <select id="custom-team-size">
-                ${[2, 4, 6].map((size) => `<option value="${size}" ${size === customTeamSize ? "selected" : ""}>${size} × ${size}</option>`).join("")}
-              </select>
-            </div>
-            <div class="field">
-              <label for="custom-ban-sequence">Порядок банов</label>
-              <input id="custom-ban-sequence" maxlength="24" value="${escapeAttr(customBanSequence)}" placeholder="ABBAAB" autocomplete="off" spellcheck="false" />
-              <span class="field-hint">Только A/B. Можно оставить пустым.</span>
-            </div>
-            <div class="field field--wide">
-              <label for="custom-pick-sequence">Порядок пиков</label>
-              <input id="custom-pick-sequence" maxlength="32" value="${escapeAttr(customPickSequence)}" placeholder="ABBAABBAABBA" autocomplete="off" spellcheck="false" />
-              <span class="field-hint">Для каждой команды должно быть ровно столько пиков, сколько игроков в составе.</span>
-            </div>
-          ` : ""}
-
           <div class="field">
-            <label for="team-a">Команда A</label>
-            <input id="team-a" maxlength="40" value="${escapeAttr(createTeamA)}" placeholder="Команда A" autocomplete="off" />
+            <label for="team-a">Команда 1</label>
+            <input id="team-a" maxlength="40" value="${escapeAttr(createTeamA)}" placeholder="Команда 1" autocomplete="off" />
           </div>
           <div class="field">
-            <label for="team-b">Команда B</label>
-            <input id="team-b" maxlength="40" value="${escapeAttr(createTeamB)}" placeholder="Команда B" autocomplete="off" />
+            <label for="team-b">Команда 2</label>
+            <input id="team-b" maxlength="40" value="${escapeAttr(createTeamB)}" placeholder="Команда 2" autocomplete="off" />
           </div>
         </div>
 
+        <div class="sequence-editor-wrap">
+          ${renderSequenceEditor()}
+        </div>
+
         <div class="create-actions">
-          <button id="create-draft" class="primary-button" type="button">${createMode === "online" ? "Создать онлайн-драфт" : "Начать соло-драфт"}</button>
+          <button id="create-draft" class="primary-button" type="button">${createMode === "online" ? "Создать комнату" : "Начать соло-драфт"}</button>
         </div>
         <div id="create-error"></div>
       </div>
 
-      <aside class="panel create-summary">
-        <h2>Правила</h2>
-        <div id="rules-preview">${renderCreateRulesPreview()}</div>
-        <div class="notice" style="margin-top:18px">${createMode === "online" ? "Онлайн-комната живёт только пока она нужна. История на сервере не сохраняется." : "Соло работает только в этом браузере и не создаёт сетевую комнату."}</div>
+      <aside class="panel create-preview">
+        <div class="preview-heading"><h2>Предпросмотр</h2><span class="preview-live"><i aria-hidden="true"></i> LIVE</span></div>
+        <div id="create-preview">${renderCreatePreview()}</div>
+        <div class="notice">${createMode === "online" ? "После создания ты попадёшь в комнату ожидания и отправишь ссылку сопернику." : "Соло работает только в этом браузере и не создаёт сетевую комнату."}</div>
       </aside>
     </section>
     <div class="ad-zone" aria-label="Реклама"></div>
@@ -206,11 +242,29 @@ function renderCreate() {
       renderCreate();
     });
   });
-  app.querySelector("#preset").addEventListener("change", (event) => {
-    rememberCreateInputs();
-    selectedPreset = event.target.value;
-    selectedTimer = PRESETS[selectedPreset].timerSeconds;
-    renderCreate();
+  app.querySelectorAll("[data-team-size]").forEach((button) => {
+    button.addEventListener("click", () => {
+      rememberCreateInputs();
+      selectedTeamSize = Number(button.dataset.teamSize);
+      resetCreateSequence();
+      renderCreate();
+    });
+  });
+  app.querySelectorAll("[data-ban-count]").forEach((button) => {
+    button.addEventListener("click", () => {
+      rememberCreateInputs();
+      selectedBanCount = Number(button.dataset.banCount);
+      resetCreateSequence();
+      renderCreate();
+    });
+  });
+  app.querySelectorAll("[data-first-move]").forEach((button) => {
+    button.addEventListener("click", () => {
+      rememberCreateInputs();
+      selectedFirstMove = button.dataset.firstMove;
+      resetCreateSequence();
+      renderCreate();
+    });
   });
   app.querySelectorAll("[data-timer]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -226,21 +280,14 @@ function renderCreate() {
   app.querySelector("#team-b")?.addEventListener("input", (event) => {
     createTeamB = event.target.value.slice(0, 40);
   });
-  app.querySelector("#custom-team-size")?.addEventListener("change", (event) => {
-    customTeamSize = Number(event.target.value);
-    updateRulesPreview();
-  });
-  app.querySelector("#custom-ban-sequence")?.addEventListener("input", (event) => {
-    customBanSequence = event.target.value.toUpperCase().replace(/[^AB]/gu, "").slice(0, 12);
-    event.target.value = customBanSequence;
-    updateRulesPreview();
-  });
-  app.querySelector("#custom-pick-sequence")?.addEventListener("input", (event) => {
-    customPickSequence = event.target.value.toUpperCase().replace(/[^AB]/gu, "").slice(0, 24);
-    event.target.value = customPickSequence;
-    updateRulesPreview();
+  app.querySelectorAll("[data-sequence-index]").forEach((button) => {
+    button.addEventListener("click", () => {
+      cycleCreateSequence(Number(button.dataset.sequenceIndex));
+      renderCreate();
+    });
   });
   app.querySelector("#create-draft").addEventListener("click", () => void createDraft());
+  startPreviewAnimation();
 }
 
 function rememberCreateInputs() {
@@ -248,17 +295,39 @@ function rememberCreateInputs() {
   const teamB = app.querySelector("#team-b");
   if (teamA) createTeamA = teamA.value.slice(0, 40);
   if (teamB) createTeamB = teamB.value.slice(0, 40);
-  const size = app.querySelector("#custom-team-size");
-  const bans = app.querySelector("#custom-ban-sequence");
-  const picks = app.querySelector("#custom-pick-sequence");
-  if (size) customTeamSize = Number(size.value);
-  if (bans) customBanSequence = bans.value.toUpperCase().replace(/[^AB]/gu, "").slice(0, 12);
-  if (picks) customPickSequence = picks.value.toUpperCase().replace(/[^AB]/gu, "").slice(0, 24);
 }
 
-function updateRulesPreview() {
-  const preview = app.querySelector("#rules-preview");
-  if (preview) preview.innerHTML = renderCreateRulesPreview();
+function resetCreateSequence() {
+  const firstSide = selectedFirstMove === "B" ? "B" : "A";
+  customSequence = createDefaultSequence(selectedTeamSize, selectedBanCount, firstSide);
+}
+
+function cycleCreateSequence(index) {
+  const current = customSequence[index];
+  if (!current) return;
+  const sameSide = customSequence.findIndex((step, candidateIndex) => candidateIndex > index && step.action !== current.action && step.side === current.side);
+  const anySide = customSequence.findIndex((step, candidateIndex) => candidateIndex > index && step.action !== current.action);
+  const nextStep = customSequence.findIndex((step, candidateIndex) => candidateIndex > index && step.action === current.action);
+  const targetIndex = sameSide >= 0 ? sameSide : anySide >= 0 ? anySide : nextStep;
+  if (targetIndex < 0) return;
+  [customSequence[index], customSequence[targetIndex]] = [customSequence[targetIndex], customSequence[index]];
+}
+
+function startPreviewAnimation() {
+  const steps = [...app.querySelectorAll("[data-preview-step]")];
+  if (!steps.length) return;
+  let activeIndex = 0;
+  previewAnimationHandle = window.setInterval(() => {
+    steps.forEach((step, index) => step.classList.toggle("active", index === activeIndex));
+    activeIndex = (activeIndex + 1) % steps.length;
+  }, 900);
+}
+
+function stopPreviewAnimation() {
+  if (previewAnimationHandle) {
+    clearInterval(previewAnimationHandle);
+    previewAnimationHandle = null;
+  }
 }
 
 async function createDraft() {
@@ -270,8 +339,13 @@ async function createDraft() {
   const teamNames = { A: createTeamA, B: createTeamB };
 
   try {
-    const customRules = selectedPreset === "custom" ? currentCustomRules() : undefined;
-    const rules = buildRules(selectedPreset, selectedTimer, customRules);
+    const customRules = {
+      teamSize: selectedTeamSize,
+      banCount: selectedBanCount,
+      sequence: customSequence.map(({ action, side }) => ({ action, side }))
+    };
+    const firstMove = resolveLocalFirstSide(selectedFirstMove);
+    const rules = buildRules("standard", selectedTimer, { ...customRules, firstSide: firstMove });
     if (createMode === "solo") {
       room = createLocalRoom(rules, teamNames);
       sessionStorage.setItem(SOLO_KEY, JSON.stringify(room));
@@ -283,7 +357,7 @@ async function createDraft() {
     const response = await fetch("/draft/api/rooms", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ presetId: selectedPreset, timerSeconds: selectedTimer, teamNames, customRules })
+      body: JSON.stringify({ presetId: "standard", timerSeconds: selectedTimer, firstMove: selectedFirstMove, teamNames, customRules })
     });
     const payload = await safeJson(response);
     if (!response.ok) {
@@ -300,21 +374,12 @@ async function createDraft() {
   }
 }
 
-function renderRulesSummary(rules) {
-  const banCount = rules.sequence.filter((step) => step.action === "ban").length;
-  const pickCount = rules.sequence.filter((step) => step.action === "pick").length;
-  const banSequence = rules.sequence.filter((step) => step.action === "ban").map((step) => step.side).join(" ") || "—";
-  const pickSequence = rules.sequence.filter((step) => step.action === "pick").map((step) => step.side).join(" ");
-  return `
-    <div class="summary-list">
-      <div class="summary-line"><span>Состав</span><strong>${rules.teamSize} × ${rules.teamSize}</strong></div>
-      <div class="summary-line"><span>Баны</span><strong>${banCount}</strong></div>
-      <div class="summary-line"><span>Пики</span><strong>${pickCount}</strong></div>
-      <div class="summary-line"><span>Таймер</span><strong>${rules.timerSeconds ? `${rules.timerSeconds} сек` : "выключен"}</strong></div>
-      <div class="summary-line"><span>BAN</span><strong>${banSequence}</strong></div>
-      <div class="summary-line"><span>PICK</span><strong>${pickSequence}</strong></div>
-    </div>
-  `;
+function resolveLocalFirstSide(value) {
+  if (value === "B") return "B";
+  if (value !== "random") return "A";
+  const bytes = new Uint8Array(1);
+  crypto.getRandomValues(bytes);
+  return bytes[0] % 2 === 0 ? "A" : "B";
 }
 
 function renderLoadingRoom() {
@@ -328,9 +393,55 @@ function renderLoadingRoom() {
   `;
 }
 
+function renderLobby() {
+  const ownSide = seat.role === "host" ? "A" : seat.role === "guest" ? "B" : null;
+  const ready = room.ready || { A: false, B: false };
+  const presence = room.presence || { A: false, B: false };
+  const lobbyTeam = (side) => {
+    const isOwn = ownSide === side;
+    const connectedLabel = presence[side] ? (isOwn ? "Вы в комнате" : "Игрок подключён") : "Ожидаем игрока";
+    return `
+      <section class="lobby-team team-${side.toLowerCase()} ${isOwn ? "lobby-team--own" : ""}">
+        <div class="lobby-team__header"><span class="team-side">КОМАНДА ${side === "A" ? "1" : "2"}</span><span class="lobby-presence ${presence[side] ? "online" : ""}"><i aria-hidden="true"></i>${connectedLabel}</span></div>
+        ${isOwn ? `<label class="lobby-name-field"><span>Название команды</span><input data-team-name="${side}" maxlength="40" value="${escapeAttr(room.teamNames[side])}" autocomplete="off" /></label>` : `<h2 class="lobby-team-name">${escapeHtml(room.teamNames[side])}</h2>`}
+        <div class="lobby-team__footer">
+          <span class="ready-status ${ready[side] ? "ready" : ""}"><i aria-hidden="true"></i>${ready[side] ? "Готово" : "Ожидаем готовность"}</span>
+          ${isOwn ? `<button type="button" class="${ready[side] ? "secondary-button" : "primary-button"}" id="ready-up" ${ready[side] ? "disabled" : ""}>${ready[side] ? "Готово" : "Готов"}</button>` : ""}
+        </div>
+      </section>
+    `;
+  };
+  const firstSide = room.rules.firstSide === "B" ? "Команда 2" : "Команда 1";
+  app.innerHTML = `
+    ${renderBrand()}
+    <section class="lobby-shell">
+      <div class="lobby-status"><i aria-hidden="true"></i>Ожидание игроков</div>
+      <h1 class="lobby-title"><span class="team-a">${escapeHtml(room.teamNames.A)}</span><em>VS</em><span class="team-b">${escapeHtml(room.teamNames.B)}</span></h1>
+      <div class="lobby-roomline"><span>ROOM <strong>${escapeHtml(roomCode || "")}</strong></span>${ownSide === "A" ? `<button class="secondary-button" id="copy-opponent" type="button">Ссылка сопернику</button>` : `<button class="secondary-button" id="copy-room" type="button">Скопировать ссылку</button>`}</div>
+      <div class="lobby-meta"><span>${room.rules.teamSize}v${room.rules.teamSize}</span><span>${room.rules.banCount} бан${room.rules.banCount === 1 ? "" : room.rules.banCount < 5 ? "а" : "ов"}</span><span>${room.rules.timerSeconds ? `${room.rules.timerSeconds}с таймер` : "без таймера"}</span><span>Первый ход: ${firstSide}</span></div>
+      ${lastError ? `<div class="error-box">${escapeHtml(lastError)}</div>` : ""}
+      <div class="lobby-teams">${lobbyTeam("A")}${lobbyTeam("B")}</div>
+      <p class="lobby-help">Отправь ссылку сопернику. Драфт начнётся, когда оба игрока займут места и нажмут «Готов».</p>
+      <div class="lobby-actions"><button class="icon-button" id="new-draft" type="button">Новый драфт</button></div>
+    </section>
+  `;
+  app.querySelector("#ready-up")?.addEventListener("click", () => sendRoomMessage({ type: "ready", expectedVersion: room.version }));
+  app.querySelector("[data-team-name]")?.addEventListener("change", (event) => {
+    const input = event.target;
+    sendRoomMessage({ type: "team-name", expectedVersion: room.version, name: input.value.slice(0, 40) });
+  });
+  app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
+  app.querySelector("#copy-room")?.addEventListener("click", () => void copyText(`${location.origin}/draft/${roomCode}`, "Ссылка комнаты скопирована"));
+  app.querySelector("#new-draft")?.addEventListener("click", () => navigate("/draft"));
+}
+
 function renderRoom() {
   if (!room) {
     renderLoadingRoom();
+    return;
+  }
+  if (room.status === "waiting") {
+    renderLobby();
     return;
   }
   if (room.status === "completed") {
@@ -342,9 +453,9 @@ function renderRoom() {
   const selectedHero = selectedHeroId ? HERO_BY_ID.get(selectedHeroId) : null;
   const filteredHeroes = HEROES.filter((hero) => hero.name.toLocaleLowerCase("ru").includes(heroSearch.toLocaleLowerCase("ru")));
   const timerText = formatTimer(room);
-  const roleLabel = runtimeMode === "solo" ? "Соло" : seat.role === "host" ? "Команда A" : seat.role === "guest" ? "Команда B" : "Зритель";
+  const roleLabel = runtimeMode === "solo" ? "Соло" : seat.role === "host" ? "Команда 1" : seat.role === "guest" ? "Команда 2" : "Зритель";
   const activeSide = step?.side || null;
-  const actionText = step?.action === "ban" ? "БАН" : step?.action === "pick" ? "ПИК" : room.status === "completed" ? "ЗАВЕРШЕНО" : "ПАУЗА";
+  const actionText = step?.action === "ban" ? "БАН" : step?.action === "pick" ? "ПИК" : "ЗАВЕРШЕНО";
 
   app.innerHTML = `
     ${renderBrand()}
@@ -390,7 +501,7 @@ function renderRoom() {
           const classes = ["sequence-step"];
           if (index < room.currentStep) classes.push("done");
           if (index === room.currentStep && room.status === "drafting") classes.push("current");
-          return `<span class="${classes.join(" ")}" title="${sequenceStep.action === "ban" ? "Бан" : "Пик"} команды ${sequenceStep.side}">${sequenceStep.action === "ban" ? "B" : "P"}${sequenceStep.side}</span>`;
+          return `<span class="${classes.join(" ")}" title="${sequenceStep.action === "ban" ? "Бан" : "Пик"} команды ${sequenceStep.side === "A" ? "1" : "2"}">${sequenceStep.action === "ban" ? "B" : "P"}${sequenceStep.side}</span>`;
         }).join("")}
       </div>
 
@@ -406,24 +517,24 @@ function renderRoom() {
 function renderTeamPanel(side) {
   const picks = room.picks[side];
   const bans = room.bans[side];
-  const emptyPicks = Math.max(0, room.rules.teamSize - picks.length);
+  const expectedBans = room.rules.sequence.filter((step) => step.action === "ban" && step.side === side).length;
+  const renderSlots = (items, count) => Array.from({ length: count }, (_, index) => items[index] ? renderMiniHero(items[index]) : renderEmptySlot()).join("");
   return `
     <aside class="panel team-panel team-${side.toLowerCase()}">
       <div class="team-heading">
         <h2 class="team-name">${escapeHtml(room.teamNames[side])}</h2>
-        <span class="team-side">TEAM ${side}</span>
+        <span class="team-side">КОМАНДА ${side === "A" ? "1" : "2"}</span>
       </div>
       <div class="team-block">
         <h3>Пики</h3>
-        <div class="mini-list">
-          ${picks.map(renderMiniHero).join("")}
-          ${Array.from({ length: emptyPicks }, () => `<div class="empty-slot">Свободный слот</div>`).join("")}
+        <div class="mini-list mini-list--slots">
+          ${renderSlots(picks, room.rules.teamSize)}
         </div>
       </div>
       <div class="team-block">
         <h3>Баны</h3>
-        <div class="mini-list">
-          ${bans.length ? bans.map(renderMiniHero).join("") : `<div class="empty-slot">Пока нет</div>`}
+        <div class="mini-list mini-list--slots">
+          ${renderSlots(bans, expectedBans)}
         </div>
       </div>
     </aside>
@@ -439,14 +550,18 @@ function renderMobileTeam(side) {
 function renderMiniHero(heroId) {
   const hero = HERO_BY_ID.get(heroId);
   if (!hero) return "";
-  return `<div class="mini-hero"><img src="${hero.image}" alt="" width="26" height="26" loading="lazy" /><span>${escapeHtml(hero.name)}</span></div>`;
+  return `<div class="mini-hero" title="${escapeAttr(hero.name)}"><img src="${hero.image}" alt="" width="54" height="54" loading="lazy" /><span class="sr-only">${escapeHtml(hero.name)}</span></div>`;
+}
+
+function renderEmptySlot() {
+  return `<div class="empty-slot" aria-label="Свободный слот"></div>`;
 }
 
 function renderHeroCard(hero, canAct) {
   const state = heroUsageState(hero.id);
   const used = state !== "available";
   const selected = hero.id === selectedHeroId;
-  const disabled = used || !canAct || room.timedOut || room.status !== "drafting";
+  const disabled = used || !canAct || room.status !== "drafting";
   const stateLabel = state === "banned" ? "БАН" : state === "picked-a" ? "A" : state === "picked-b" ? "B" : "";
   return `
     <button
@@ -472,9 +587,7 @@ function heroUsageState(heroId) {
 
 function renderActionBar(selectedHero, step, canAct) {
   const action = step?.action === "ban" ? "ЗАБАНИТЬ" : "ВЫБРАТЬ";
-  const unavailableReason = room.timedOut
-    ? "Время вышло — возобновите ход"
-    : !step
+  const unavailableReason = !step
       ? "Нет активного хода"
       : !canAct
         ? seat.role === "spectator" ? "Режим зрителя" : "Сейчас ход другой команды"
@@ -484,7 +597,7 @@ function renderActionBar(selectedHero, step, canAct) {
       <div class="selected-summary">
         ${selectedHero ? `<img src="${selectedHero.image}" alt="" width="46" height="46" /><div><strong>${escapeHtml(selectedHero.name)}</strong><br /><span>${step?.action === "ban" ? "Будет забанен" : "Будет выбран"}</span></div>` : `<span>${escapeHtml(unavailableReason)}</span>`}
       </div>
-      ${room.timedOut && canAct ? `<button id="resume-turn" class="secondary-button" type="button">Продолжить таймер</button>` : `<button id="confirm-action" class="confirm-button" type="button" ${!selectedHero || !canAct ? "disabled" : ""}>${selectedHero ? `${action} ${escapeHtml(selectedHero.name)}` : action}</button>`}
+      <button id="confirm-action" class="confirm-button" type="button" ${!selectedHero || !canAct ? "disabled" : ""}>${selectedHero ? `${action} ${escapeHtml(selectedHero.name)}` : action}</button>
     </div>
   `;
 }
@@ -519,7 +632,6 @@ function attachRoomEvents(canAct) {
   });
 
   app.querySelector("#confirm-action")?.addEventListener("click", () => void confirmAction());
-  app.querySelector("#resume-turn")?.addEventListener("click", () => resumeTurn());
   app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
   app.querySelector("#copy-watch")?.addEventListener("click", () => void copyText(`${location.origin}/draft/${roomCode}`, "Ссылка зрителя скопирована"));
   app.querySelector("#new-draft")?.addEventListener("click", () => {
@@ -539,7 +651,7 @@ async function confirmAction() {
     room = applyLocalAction(room, selectedHeroId);
     selectedHeroId = null;
     sessionStorage.setItem(SOLO_KEY, JSON.stringify(room));
-    timeoutSentVersion = null;
+    deadlineSentVersion = null;
     renderRoom();
     startTimer();
     return;
@@ -552,18 +664,13 @@ async function confirmAction() {
   socket.send(JSON.stringify({ type: "action", expectedVersion: room.version, heroId: selectedHeroId }));
 }
 
-function resumeTurn() {
-  if (runtimeMode === "solo") {
-    room = resumeLocalTurn(room);
-    sessionStorage.setItem(SOLO_KEY, JSON.stringify(room));
-    timeoutSentVersion = null;
-    renderRoom();
-    startTimer();
+function sendRoomMessage(message) {
+  if (socket?.readyState !== WebSocket.OPEN) {
+    lastError = "Соединение ещё не восстановлено";
+    if (room) renderRoom();
     return;
   }
-  if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "resume", expectedVersion: room.version }));
-  }
+  socket.send(JSON.stringify(message));
 }
 
 function canCurrentSeatAct(step) {
@@ -596,7 +703,7 @@ function connectRoom() {
       if (!room || message.room.version >= room.version) {
         room = message.room;
         selectedHeroId = null;
-        timeoutSentVersion = null;
+        deadlineSentVersion = null;
         lastError = "";
         renderRoom();
         startTimer();
@@ -706,7 +813,7 @@ function showTransientNotice(message) {
 
 function startTimer() {
   stopTimer();
-  if (!room || room.status !== "drafting" || !room.turnDeadlineAt || room.timedOut) return;
+  if (!room || room.status !== "drafting" || !room.turnDeadlineAt) return;
   updateTimer();
   timerHandle = window.setInterval(updateTimer, 250);
 }
@@ -726,22 +833,22 @@ function updateTimer() {
   const remaining = Math.max(0, room.turnDeadlineAt - Date.now());
   const timer = document.querySelector("#draft-timer");
   if (timer) timer.textContent = formatMilliseconds(remaining);
-  if (remaining > 0 || timeoutSentVersion === room.version) return;
-  timeoutSentVersion = room.version;
+  if (remaining > 0 || deadlineSentVersion === room.version) return;
+  deadlineSentVersion = room.version;
   if (runtimeMode === "solo") {
-    room = pauseLocalOnTimeout(room);
+    room = applyLocalTimeout(room, HEROES.map((hero) => hero.id));
     sessionStorage.setItem(SOLO_KEY, JSON.stringify(room));
     renderRoom();
-    stopTimer();
+    startTimer();
     return;
   }
   if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "timeout", expectedVersion: room.version }));
+    socket.send(JSON.stringify({ type: "deadline", expectedVersion: room.version }));
   }
 }
 
 function formatTimer(value) {
-  if (room.timedOut) return "ПАУЗА";
+  if (value.status === "waiting") return "—";
   if (!value.turnDeadlineAt) return "∞";
   return formatMilliseconds(Math.max(0, value.turnDeadlineAt - Date.now()));
 }
@@ -770,8 +877,8 @@ function renderResult() {
       <h1 style="font-size:clamp(34px,6vw,58px)">Драфт завершён</h1>
       <p class="create-lead">Результат хранится прямо в этой ссылке. Сервер не хранит историю комнаты.</p>
       <div class="result-grid">
-        ${renderResultTeam(payload.a || "Команда A", payload.pa, payload.ba, "A")}
-        ${renderResultTeam(payload.b || "Команда B", payload.pb, payload.bb, "B")}
+        ${renderResultTeam(payload.a || "Команда 1", payload.pa, payload.ba, "A")}
+        ${renderResultTeam(payload.b || "Команда 2", payload.pb, payload.bb, "B")}
       </div>
       <div class="result-actions">
         <button id="copy-result" class="primary-button" type="button">Скопировать ссылку</button>
@@ -789,7 +896,7 @@ function renderResultTeam(name, picks, bans, side) {
   const cleanBans = bans.filter((id) => HERO_BY_ID.has(id)).slice(0, 12);
   return `
     <section class="result-team team-${side.toLowerCase()}">
-      <div class="team-heading"><h2 class="team-name">${escapeHtml(String(name).slice(0, 40))}</h2><span class="team-side">TEAM ${side}</span></div>
+      <div class="team-heading"><h2 class="team-name">${escapeHtml(String(name).slice(0, 40))}</h2><span class="team-side">КОМАНДА ${side === "A" ? "1" : "2"}</span></div>
       <div class="team-block"><h3>Пики</h3><div class="mini-list">${cleanPicks.length ? cleanPicks.map(renderMiniHeroFromId).join("") : `<div class="empty-slot">Нет</div>`}</div></div>
       <div class="team-block"><h3>Баны</h3><div class="mini-list">${cleanBans.length ? cleanBans.map(renderMiniHeroFromId).join("") : `<div class="empty-slot">Нет</div>`}</div></div>
     </section>
@@ -798,7 +905,7 @@ function renderResultTeam(name, picks, bans, side) {
 
 function renderMiniHeroFromId(heroId) {
   const hero = HERO_BY_ID.get(heroId);
-  return hero ? `<div class="mini-hero"><img src="${hero.image}" alt="" width="26" height="26" loading="lazy" /><span>${escapeHtml(hero.name)}</span></div>` : "";
+  return hero ? `<div class="mini-hero" title="${escapeAttr(hero.name)}"><img src="${hero.image}" alt="" width="54" height="54" loading="lazy" /><span class="sr-only">${escapeHtml(hero.name)}</span></div>` : "";
 }
 
 function renderExpiredRoom() {

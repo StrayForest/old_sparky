@@ -1,4 +1,4 @@
-import { buildRules } from "./public/draft-core.js";
+import { buildRules, DEFAULT_CUSTOM_RULES, validateSequence } from "./public/draft-core.js";
 import { HERO_BY_ID } from "./public/heroes.js";
 
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
@@ -8,7 +8,7 @@ const MAX_WS_MESSAGE_BYTES = 2048;
 const MAX_SPECTATORS = 50;
 const MAX_MESSAGES_PER_WINDOW = 40;
 const MESSAGE_WINDOW_MS = 10_000;
-const KNOWN_PRESET_IDS = new Set(["community-6v6", "community-6v6-no-timer", "6v6-no-bans", "custom"]);
+const KNOWN_PRESET_IDS = new Set(["standard", "community-6v6", "community-6v6-no-timer", "6v6-no-bans", "custom"]);
 const VALID_TIMER_SECONDS = new Set([0, 30, 45, 60, 90]);
 
 export default {
@@ -66,20 +66,20 @@ export class DraftRoom {
     const payload = await request.json();
     const now = Date.now();
     const room = {
-      schema: 1,
-      status: "drafting",
+      schema: 2,
+      status: "waiting",
       version: 1,
       rules: validateRules(payload.rules),
       teamNames: {
-        A: cleanTeamName(payload.teamNames?.A, "Команда A"),
-        B: cleanTeamName(payload.teamNames?.B, "Команда B")
+        A: cleanTeamName(payload.teamNames?.A, "Команда 1"),
+        B: cleanTeamName(payload.teamNames?.B, "Команда 2")
       },
       currentStep: 0,
       picks: { A: [], B: [] },
       bans: { A: [], B: [] },
-      turnStartedAt: now,
-      turnDeadlineAt: deadlineFrom(now, payload.rules?.timerSeconds),
-      timedOut: false,
+      ready: { A: false, B: false },
+      turnStartedAt: null,
+      turnDeadlineAt: null,
       createdAt: now,
       expiresAt: now + ROOM_TTL_MS,
       hostTokenHash: await hashToken(payload.hostToken),
@@ -123,12 +123,16 @@ export class DraftRoom {
         await this.applyAction(ws, message, attachment);
         return;
       }
-      if (message.type === "timeout") {
-        await this.applyTimeout(ws, message, attachment);
+      if (message.type === "ready") {
+        await this.applyReady(ws, message, attachment);
         return;
       }
-      if (message.type === "resume") {
-        await this.resumeTimer(ws, message, attachment);
+      if (message.type === "team-name") {
+        await this.updateTeamName(ws, message, attachment);
+        return;
+      }
+      if (message.type === "deadline") {
+        await this.advanceExpiredTurn(ws, message, attachment);
         return;
       }
       if (message.type === "ping") {
@@ -174,7 +178,65 @@ export class DraftRoom {
       }
     }
     ws.serializeAttachment({ ...attachment, role, authenticated: true });
-    this.sendState(ws, room);
+    if (maybeStartDraft(room, this.connectedSeats())) {
+      await this.saveAndBroadcast(room);
+    } else {
+      this.broadcastState(room);
+    }
+  }
+
+  async applyReady(ws, message, attachment) {
+    if (!["host", "guest"].includes(attachment.role)) {
+      this.sendError(ws, "Только игрок может подтвердить готовность");
+      return;
+    }
+    const room = await this.ctx.storage.get("room");
+    if (!room) {
+      ws.close(4404, "room not found");
+      return;
+    }
+    if (room.status !== "waiting") {
+      this.sendState(ws, room);
+      return;
+    }
+    if (!Number.isInteger(message.expectedVersion) || message.expectedVersion !== room.version) {
+      this.sendError(ws, "Состояние комнаты изменилось — обновлено актуальное состояние", room);
+      return;
+    }
+    const side = attachment.role === "host" ? "A" : "B";
+    room.ready = room.ready || { A: false, B: false };
+    room.ready[side] = true;
+    room.version += 1;
+    maybeStartDraft(room, this.connectedSeats());
+    await this.saveAndBroadcast(room);
+  }
+
+  async updateTeamName(ws, message, attachment) {
+    if (!["host", "guest"].includes(attachment.role)) {
+      this.sendError(ws, "Только игрок может менять название команды");
+      return;
+    }
+    const room = await this.ctx.storage.get("room");
+    if (!room) {
+      ws.close(4404, "room not found");
+      return;
+    }
+    if (room.status !== "waiting") {
+      this.sendError(ws, "Название команды уже нельзя менять", room);
+      return;
+    }
+    if (!Number.isInteger(message.expectedVersion) || message.expectedVersion !== room.version) {
+      this.sendError(ws, "Состояние комнаты изменилось — обновлено актуальное состояние", room);
+      return;
+    }
+    if (typeof message.name !== "string" || message.name.length > 40) {
+      this.sendError(ws, "Название команды слишком длинное", room);
+      return;
+    }
+    const side = attachment.role === "host" ? "A" : "B";
+    room.teamNames[side] = cleanTeamName(message.name, side === "A" ? "Команда 1" : "Команда 2");
+    room.version += 1;
+    await this.saveAndBroadcast(room);
   }
 
   async applyAction(ws, message, attachment) {
@@ -196,19 +258,13 @@ export class DraftRoom {
       this.sendError(ws, "Нет активного хода", room);
       return;
     }
-    if (!seatCanAct(attachment.role, step.side)) {
-      this.sendError(ws, "Сейчас ход другой команды", room);
-      return;
-    }
-    if (room.timedOut) {
-      this.sendError(ws, "Ход на паузе", room);
-      return;
-    }
     const now = Date.now();
     if (room.turnDeadlineAt && now >= room.turnDeadlineAt) {
-      room.timedOut = true;
-      room.version += 1;
-      await this.saveAndBroadcast(room);
+      if (advanceRoomWithAutoAction(room, now)) await this.saveAndBroadcast(room);
+      return;
+    }
+    if (!seatCanAct(attachment.role, step.side)) {
+      this.sendError(ws, "Сейчас ход другой команды", room);
       return;
     }
     if (typeof message.heroId !== "string" || !HERO_BY_ID.has(message.heroId)) {
@@ -220,25 +276,13 @@ export class DraftRoom {
       return;
     }
 
-    room[step.action === "pick" ? "picks" : "bans"][step.side].push(message.heroId);
-    room.currentStep += 1;
-    room.version += 1;
-    room.turnStartedAt = now;
-    room.turnDeadlineAt = deadlineFrom(now, room.rules.timerSeconds);
-    room.timedOut = false;
-
-    if (room.currentStep >= room.rules.sequence.length) {
-      room.status = "completed";
-      room.turnDeadlineAt = null;
-      room.expiresAt = now + COMPLETED_TTL_MS;
-      await this.ctx.storage.setAlarm(room.expiresAt);
-    }
+    applyRoomAction(room, step, message.heroId, now);
     await this.saveAndBroadcast(room);
   }
 
-  async applyTimeout(ws, message, attachment) {
+  async advanceExpiredTurn(ws, message, attachment) {
     if (!["host", "guest"].includes(attachment.role)) {
-      this.sendError(ws, "Недостаточно прав");
+      this.sendError(ws, "Только игрок может подтвердить автоматический ход");
       return;
     }
     const room = await this.ctx.storage.get("room");
@@ -246,44 +290,24 @@ export class DraftRoom {
       ws.close(4404, "room not found");
       return;
     }
-    if (room.status !== "drafting" || room.timedOut || !room.turnDeadlineAt) return;
-    if (message.expectedVersion !== room.version) {
+    if (room.status !== "drafting" || !room.turnDeadlineAt) return;
+    if (!Number.isInteger(message.expectedVersion) || message.expectedVersion !== room.version) {
       this.sendState(ws, room);
-      return;
-    }
-    if (Date.now() < room.turnDeadlineAt) return;
-    room.timedOut = true;
-    room.version += 1;
-    await this.saveAndBroadcast(room);
-  }
-
-  async resumeTimer(ws, message, attachment) {
-    const room = await this.ctx.storage.get("room");
-    if (!room) {
-      ws.close(4404, "room not found");
-      return;
-    }
-    const step = room.rules.sequence[room.currentStep];
-    if (!room.timedOut || room.status !== "drafting" || !step) return;
-    if (message.expectedVersion !== room.version) {
-      this.sendState(ws, room);
-      return;
-    }
-    if (!seatCanAct(attachment.role, step.side)) {
-      this.sendError(ws, "Возобновить ход может активная команда", room);
       return;
     }
     const now = Date.now();
-    room.timedOut = false;
-    room.version += 1;
-    room.turnStartedAt = now;
-    room.turnDeadlineAt = deadlineFrom(now, room.rules.timerSeconds);
-    await this.saveAndBroadcast(room);
+    if (now < room.turnDeadlineAt) return;
+    if (advanceRoomWithAutoAction(room, now)) await this.saveAndBroadcast(room);
   }
 
   async saveAndBroadcast(room) {
     await this.ctx.storage.put("room", room);
-    const payload = JSON.stringify({ type: "state", room: publicRoom(room), serverTime: Date.now() });
+    if (room.status === "drafting" && room.turnDeadlineAt) {
+      await this.ctx.storage.setAlarm(Math.min(room.expiresAt, room.turnDeadlineAt));
+    } else {
+      await this.ctx.storage.setAlarm(room.expiresAt);
+    }
+    const payload = JSON.stringify({ type: "state", room: publicRoom(room, this.connectedSeats()), serverTime: Date.now() });
     for (const ws of this.ctx.getWebSockets()) {
       const attachment = ws.deserializeAttachment();
       if (!attachment?.authenticated) continue;
@@ -301,15 +325,33 @@ export class DraftRoom {
 
   sendState(ws, room) {
     try {
-      ws.send(JSON.stringify({ type: "state", room: publicRoom(room), serverTime: Date.now() }));
+      ws.send(JSON.stringify({ type: "state", room: publicRoom(room, this.connectedSeats()), serverTime: Date.now() }));
     } catch {
       try { ws.close(1011, "send failed"); } catch { /* noop */ }
     }
   }
 
+  broadcastState(room) {
+    const payload = JSON.stringify({ type: "state", room: publicRoom(room, this.connectedSeats()), serverTime: Date.now() });
+    for (const ws of this.ctx.getWebSockets()) {
+      if (!ws.deserializeAttachment()?.authenticated) continue;
+      try { ws.send(payload); } catch { try { ws.close(1011, "send failed"); } catch { /* noop */ } }
+    }
+  }
+
+  connectedSeats() {
+    const presence = { A: false, B: false };
+    for (const ws of this.ctx.getWebSockets()) {
+      const role = ws.deserializeAttachment()?.role;
+      if (role === "host") presence.A = true;
+      if (role === "guest") presence.B = true;
+    }
+    return presence;
+  }
+
   sendError(ws, error, room = null) {
     try {
-      ws.send(JSON.stringify({ type: "error", error, room: room ? publicRoom(room) : undefined }));
+      ws.send(JSON.stringify({ type: "error", error, room: room ? publicRoom(room, this.connectedSeats()) : undefined }));
     } catch {
       try { ws.close(1011, "send failed"); } catch { /* noop */ }
     }
@@ -317,8 +359,16 @@ export class DraftRoom {
 
   async alarm() {
     const room = await this.ctx.storage.get("room");
-    if (room && room.expiresAt > Date.now()) {
-      await this.ctx.storage.setAlarm(room.expiresAt);
+    const now = Date.now();
+    if (room && room.status === "drafting" && room.turnDeadlineAt && now >= room.turnDeadlineAt) {
+      if (advanceRoomWithAutoAction(room, now)) await this.saveAndBroadcast(room);
+    }
+    const refreshed = await this.ctx.storage.get("room");
+    if (refreshed && refreshed.expiresAt > now) {
+      const nextAlarm = refreshed.status === "drafting" && refreshed.turnDeadlineAt
+        ? Math.min(refreshed.expiresAt, refreshed.turnDeadlineAt)
+        : refreshed.expiresAt;
+      await this.ctx.storage.setAlarm(nextAlarm);
       return;
     }
     for (const ws of this.ctx.getWebSockets()) {
@@ -329,10 +379,17 @@ export class DraftRoom {
 
   webSocketClose(ws) {
     try { ws.close(1000, "closed"); } catch { /* noop */ }
+    void this.broadcastStoredState();
   }
 
   webSocketError(ws) {
     try { ws.close(1011, "socket error"); } catch { /* noop */ }
+    void this.broadcastStoredState();
+  }
+
+  async broadcastStoredState() {
+    const room = await this.ctx.storage.get("room");
+    if (room) this.broadcastState(room);
   }
 }
 
@@ -345,20 +402,30 @@ async function createRoom(request, env) {
   } catch {
     return json({ error: "Некорректный JSON" }, 400);
   }
-  const presetId = typeof payload?.presetId === "string" ? payload.presetId : "community-6v6";
+  const presetId = typeof payload?.presetId === "string" ? payload.presetId : "standard";
   let rules;
   try {
     if (!KNOWN_PRESET_IDS.has(presetId)) throw new Error("invalid preset");
     const timerSeconds = parseTimerSeconds(payload?.timerSeconds);
-    const customRules = presetId === "custom" ? validateCustomCreateSettings(payload?.customRules) : null;
-    rules = buildRules(presetId, timerSeconds, customRules);
+    const customRules = ["standard", "custom"].includes(presetId)
+      ? validateCustomCreateSettings(payload?.customRules || {
+          teamSize: DEFAULT_CUSTOM_RULES.teamSize,
+          banCount: DEFAULT_CUSTOM_RULES.banCount,
+          sequence: DEFAULT_CUSTOM_RULES.sequence.map(({ action, side }) => ({ action, side }))
+        })
+      : null;
+    const firstSide = resolveFirstSide(payload?.firstMove);
+    rules = alignFirstStep(buildRules(presetId, timerSeconds, {
+      ...(customRules || {}),
+      firstSide
+    }), firstSide);
     validateRules(rules);
   } catch {
     return json({ error: "Некорректные правила" }, 400);
   }
   const teamNames = {
-    A: cleanTeamName(payload?.teamNames?.A, "Команда A"),
-    B: cleanTeamName(payload?.teamNames?.B, "Команда B")
+    A: cleanTeamName(payload?.teamNames?.A, "Команда 1"),
+    B: cleanTeamName(payload?.teamNames?.B, "Команда 2")
   };
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -380,7 +447,8 @@ async function createRoom(request, env) {
 
 async function serveStatic(request, env, path) {
   let assetPath;
-  if (path === "/draft" || path === "/draft/" || path === "/draft/result" || /^\/draft\/[A-Za-z0-9_-]{6,32}\/?$/u.test(path) || path === "/draft/solo") {
+  const isDraftShell = path === "/draft" || path === "/draft/" || path === "/draft/result" || /^\/draft\/[A-Za-z0-9_-]{6,32}\/?$/u.test(path) || path === "/draft/solo";
+  if (isDraftShell) {
     assetPath = "/draft/index.html";
   } else if (path.startsWith("/draft/")) {
     assetPath = path;
@@ -419,17 +487,17 @@ function validateRules(rules) {
   if (!rules || ![2, 4, 6].includes(rules.teamSize) || ![0, 30, 45, 60, 90].includes(rules.timerSeconds)) {
     throw new Error("invalid rules");
   }
-  if (!Array.isArray(rules.sequence) || rules.sequence.length < 4 || rules.sequence.length > 40) {
+  if (!Number.isInteger(rules.banCount) || rules.banCount < 0 || rules.banCount > 6) {
     throw new Error("invalid sequence");
   }
-  const picks = { A: 0, B: 0 };
+  if (!Array.isArray(rules.sequence)) throw new Error("invalid sequence");
+  const sequence = rules.sequence.map(({ action, side }) => ({ action, side }));
+  validateSequence(sequence, rules.teamSize, rules.banCount);
   for (const [index, step] of rules.sequence.entries()) {
     if (!step || !["pick", "ban"].includes(step.action) || !["A", "B"].includes(step.side) || step.index !== index) {
       throw new Error("invalid step");
     }
-    if (step.action === "pick") picks[step.side] += 1;
   }
-  if (picks.A !== rules.teamSize || picks.B !== rules.teamSize) throw new Error("invalid pick count");
   return rules;
 }
 
@@ -438,25 +506,14 @@ function validateCustomCreateSettings(value) {
     throw new Error("invalid custom settings");
   }
   const keys = Object.keys(value).sort();
-  if (keys.length !== 3 || keys.join(",") !== "banSequence,pickSequence,teamSize") {
+  if (keys.length !== 3 || keys.join(",") !== "banCount,sequence,teamSize") {
     throw new Error("invalid custom settings");
   }
-  if (!Number.isInteger(value.teamSize) || ![2, 4, 6].includes(value.teamSize)) {
+  if (!Number.isInteger(value.teamSize) || ![2, 4, 6].includes(value.teamSize) || !Number.isInteger(value.banCount) || value.banCount < 0 || value.banCount > 6) {
     throw new Error("invalid custom team size");
   }
-  if (typeof value.banSequence !== "string" || value.banSequence.length > 12 || !/^[AB]*$/u.test(value.banSequence)) {
-    throw new Error("invalid custom ban sequence");
-  }
-  if (
-    typeof value.pickSequence !== "string" ||
-    value.pickSequence.length > 24 ||
-    value.pickSequence.length !== value.teamSize * 2 ||
-    !/^[AB]+$/u.test(value.pickSequence) ||
-    [...value.pickSequence].filter((side) => side === "A").length !== value.teamSize ||
-    [...value.pickSequence].filter((side) => side === "B").length !== value.teamSize
-  ) {
-    throw new Error("invalid custom pick sequence");
-  }
+  if (!Array.isArray(value.sequence) || value.sequence.some((step) => !step || Object.keys(step).sort().join(",") !== "action,side")) throw new Error("invalid custom sequence");
+  validateSequence(value.sequence, value.teamSize, value.banCount);
   return value;
 }
 
@@ -468,20 +525,61 @@ function parseTimerSeconds(value) {
   return value;
 }
 
-function publicRoom(room) {
+function publicRoom(room, presence = { A: false, B: false }) {
   return {
     schema: room.schema,
     status: room.status,
     version: room.version,
     rules: room.rules,
     teamNames: room.teamNames,
+    ready: room.ready || { A: false, B: false },
+    presence,
     currentStep: room.currentStep,
     picks: room.picks,
     bans: room.bans,
     turnStartedAt: room.turnStartedAt,
     turnDeadlineAt: room.turnDeadlineAt,
-    timedOut: room.timedOut
   };
+}
+
+function applyRoomAction(room, step, heroId, now) {
+  room[step.action === "pick" ? "picks" : "bans"][step.side].push(heroId);
+  room.currentStep += 1;
+  room.version += 1;
+  room.turnStartedAt = now;
+  room.turnDeadlineAt = deadlineFrom(now, room.rules.timerSeconds);
+  if (room.currentStep >= room.rules.sequence.length) {
+    room.status = "completed";
+    room.turnDeadlineAt = null;
+    room.expiresAt = now + COMPLETED_TTL_MS;
+  }
+}
+
+function maybeStartDraft(room, presence) {
+  if (room.status !== "waiting" || !room.ready?.A || !room.ready?.B || !presence.A || !presence.B) return false;
+  room.status = "drafting";
+  const now = Date.now();
+  room.turnStartedAt = now;
+  room.turnDeadlineAt = deadlineFrom(now, room.rules.timerSeconds);
+  return true;
+}
+
+function advanceRoomWithAutoAction(room, now) {
+  const step = room.rules.sequence[room.currentStep];
+  if (!step) return false;
+  const heroId = [...HERO_BY_ID.keys()].find((candidate) => !heroUsed(room, candidate));
+  if (!heroId) return false;
+  applyRoomAction(room, step, heroId, now);
+  return true;
+}
+
+function alignFirstStep(rules, firstSide) {
+  const firstIndex = rules.sequence.findIndex((step) => step.side === firstSide);
+  if (firstIndex > 0) {
+    [rules.sequence[0], rules.sequence[firstIndex]] = [rules.sequence[firstIndex], rules.sequence[0]];
+    rules.sequence = rules.sequence.map((step, index) => ({ ...step, index }));
+  }
+  return rules;
 }
 
 function heroUsed(room, heroId) {
@@ -494,6 +592,18 @@ function seatCanAct(role, side) {
 
 function deadlineFrom(now, timerSeconds) {
   return timerSeconds > 0 ? now + timerSeconds * 1000 : null;
+}
+
+function resolveFirstSide(value) {
+  if (value === undefined) return "A";
+  if (value === "B") return "B";
+  if (value === "random") {
+    const bytes = new Uint8Array(1);
+    crypto.getRandomValues(bytes);
+    return bytes[0] % 2 === 0 ? "A" : "B";
+  }
+  if (value === "A") return "A";
+  throw new Error("invalid first move");
 }
 
 function cleanTeamName(value, fallback) {

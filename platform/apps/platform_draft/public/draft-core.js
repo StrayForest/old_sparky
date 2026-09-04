@@ -1,116 +1,129 @@
-export const PRESETS = {
-  "community-6v6": {
-    id: "community-6v6",
-    label: "Community 6v6",
-    teamSize: 6,
-    timerSeconds: 30,
-    sequence: [
-      { action: "ban", side: "A" },
-      { action: "ban", side: "B" },
-      { action: "ban", side: "B" },
-      { action: "ban", side: "A" },
-      { action: "ban", side: "A" },
-      { action: "ban", side: "B" },
-      { action: "pick", side: "A" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "A" },
-      { action: "pick", side: "A" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "A" },
-      { action: "pick", side: "A" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "A" }
-    ]
-  },
-  "community-6v6-no-timer": {
-    id: "community-6v6-no-timer",
-    label: "Community 6v6 — без таймера",
-    teamSize: 6,
-    timerSeconds: 0,
-    sequence: null
-  },
-  "6v6-no-bans": {
-    id: "6v6-no-bans",
-    label: "6v6 без банов",
-    teamSize: 6,
-    timerSeconds: 30,
-    sequence: [
-      { action: "pick", side: "A" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "A" },
-      { action: "pick", side: "A" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "A" },
-      { action: "pick", side: "A" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "B" },
-      { action: "pick", side: "A" }
-    ]
-  },
-  custom: {
-    id: "custom",
-    label: "Свой",
-    teamSize: 6,
-    timerSeconds: 30,
-    sequence: null
-  }
-};
+export const TEAM_SIZES = Object.freeze([2, 4, 6]);
+export const BAN_COUNTS = Object.freeze([0, 1, 2, 3, 4, 5, 6]);
+export const TIMER_SECONDS = Object.freeze([0, 30, 45, 60, 90]);
 
-PRESETS["community-6v6-no-timer"].sequence = PRESETS["community-6v6"].sequence.map((step) => ({ ...step }));
+export const PRESETS = {
+  standard: { id: "standard", label: "Стандарт", teamSize: 6, timerSeconds: 30, sequence: null },
+  "community-6v6": { id: "community-6v6", label: "Community 6v6", teamSize: 6, timerSeconds: 30, sequence: null },
+  "community-6v6-no-timer": { id: "community-6v6-no-timer", label: "Community 6v6 — без таймера", teamSize: 6, timerSeconds: 0, sequence: null },
+  "6v6-no-bans": { id: "6v6-no-bans", label: "6v6 без банов", teamSize: 6, timerSeconds: 30, sequence: null },
+  custom: { id: "custom", label: "Свой", teamSize: 6, timerSeconds: 30, sequence: null }
+};
 
 export const DEFAULT_CUSTOM_RULES = Object.freeze({
   teamSize: 6,
-  banSequence: "ABBAAB",
-  pickSequence: "ABBAABBAABBA"
+  banCount: 6,
+  firstSide: "A",
+  sequence: Object.freeze([
+    { action: "ban", side: "A" },
+    { action: "ban", side: "B" },
+    { action: "ban", side: "B" },
+    { action: "ban", side: "A" },
+    { action: "ban", side: "A" },
+    { action: "ban", side: "B" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "B" },
+    { action: "pick", side: "B" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "B" },
+    { action: "pick", side: "B" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "B" },
+    { action: "pick", side: "B" },
+    { action: "pick", side: "A" }
+  ])
 });
 
 export function buildRules(presetId, timerOverride, customRules = null) {
-  if (presetId === "custom") {
+  if (presetId === "standard" || presetId === "custom") {
     return buildCustomRules({
       ...DEFAULT_CUSTOM_RULES,
       ...(customRules || {}),
+      presetId,
       timerSeconds: timerOverride
     });
   }
-  const preset = PRESETS[presetId] || PRESETS["community-6v6"];
-  const timerSeconds = normalizeTimer(timerOverride, preset.timerSeconds);
-  return {
-    presetId: preset.id,
+  const preset = PRESETS[presetId] || PRESETS.standard;
+  return buildCustomRules({
+    ...DEFAULT_CUSTOM_RULES,
     teamSize: preset.teamSize,
-    timerSeconds,
-    sequence: preset.sequence.map((step, index) => ({ ...step, index }))
-  };
+    banCount: preset.id === "6v6-no-bans" ? 0 : DEFAULT_CUSTOM_RULES.banCount,
+    firstSide: "A",
+    sequence: null,
+    presetId: preset.id,
+    timerSeconds: timerOverride === undefined ? preset.timerSeconds : timerOverride
+  });
 }
 
 export function buildCustomRules(value) {
   const teamSize = Number(value?.teamSize);
-  if (![2, 4, 6].includes(teamSize)) {
+  if (!TEAM_SIZES.includes(teamSize)) {
     throw new Error("Размер команды должен быть 2, 4 или 6");
   }
   const timerSeconds = normalizeTimer(value?.timerSeconds, 30);
-  const banSides = parseSideSequence(value?.banSequence, 12, true);
-  const pickSides = parseSideSequence(value?.pickSequence, 24, false);
-  if (pickSides.filter((side) => side === "A").length !== teamSize || pickSides.filter((side) => side === "B").length !== teamSize) {
-    throw new Error(`В порядке пиков должно быть ровно по ${teamSize} ходов A и B`);
+  const banCount = Number(value?.banCount ?? value?.banSequence?.length ?? 0);
+  if (!BAN_COUNTS.includes(banCount)) {
+    throw new Error("Количество банов должно быть от 0 до 6");
   }
-  const sequence = [
-    ...banSides.map((side) => ({ action: "ban", side })),
-    ...pickSides.map((side) => ({ action: "pick", side }))
-  ];
-  if (sequence.length < 4 || sequence.length > 40) {
-    throw new Error("Слишком длинный или короткий порядок драфта");
+  const firstSide = value?.firstSide === "B" ? "B" : "A";
+  const sequence = Array.isArray(value?.sequence) && value.sequence.length
+    ? value.sequence.map((step) => ({ action: step?.action, side: step?.side }))
+    : value?.sequence === null || (!Object.hasOwn(value || {}, "banSequence") && !Object.hasOwn(value || {}, "pickSequence"))
+      ? createDefaultSequence(teamSize, banCount, firstSide)
+      : [
+          ...parseSideSequence(value?.banSequence, banCount, true).map((side) => ({ action: "ban", side })),
+          ...parseSideSequence(value?.pickSequence, teamSize * 2, false).map((side) => ({ action: "pick", side }))
+        ];
+  validateSequence(sequence, teamSize, banCount);
+  const firstIndex = sequence.findIndex((step) => step.side === firstSide);
+  if (firstIndex > 0) {
+    [sequence[0], sequence[firstIndex]] = [sequence[firstIndex], sequence[0]];
   }
   return {
-    presetId: "custom",
+    presetId: value?.presetId || "custom",
     teamSize,
+    banCount,
+    firstSide,
     timerSeconds,
     sequence: sequence.map((step, index) => ({ ...step, index }))
   };
+}
+
+export function createDefaultSequence(teamSize, banCount, firstSide = "A") {
+  const sideOrder = makeTurnOrder(teamSize * 2, firstSide);
+  const banOrder = makeTurnOrder(banCount, firstSide);
+  return [
+    ...banOrder.map((side) => ({ action: "ban", side })),
+    ...sideOrder.map((side) => ({ action: "pick", side }))
+  ];
+}
+
+function makeTurnOrder(count, firstSide = "A") {
+  const first = firstSide === "B" ? "B" : "A";
+  const second = first === "A" ? "B" : "A";
+  const pattern = [first, second, second, first];
+  return Array.from({ length: count }, (_, index) => pattern[index % pattern.length]);
+}
+
+export function validateSequence(sequence, teamSize, banCount) {
+  if (!Array.isArray(sequence) || sequence.length !== banCount + teamSize * 2 || sequence.length < 4 || sequence.length > 40) {
+    throw new Error("Последовательность драфта заполнена не полностью");
+  }
+  const counts = { ban: 0, pick: 0, A: 0, B: 0 };
+  const picks = { A: 0, B: 0 };
+  sequence.forEach((step) => {
+    if (!step || !["pick", "ban"].includes(step.action) || !["A", "B"].includes(step.side)) {
+      throw new Error("В последовательности есть некорректный шаг");
+    }
+    counts[step.action] += 1;
+    counts[step.side] += 1;
+    if (step.action === "pick") picks[step.side] += 1;
+  });
+  if (counts.ban !== banCount || counts.pick !== teamSize * 2 || picks.A !== teamSize || picks.B !== teamSize) {
+    throw new Error("Последовательность не соответствует выбранному формату");
+  }
 }
 
 export function normalizeSideSequence(value) {
@@ -122,20 +135,19 @@ export function normalizeSideSequence(value) {
 export function createLocalRoom(rules, teamNames) {
   const now = Date.now();
   return {
-    schema: 1,
+    schema: 2,
     status: "drafting",
     version: 1,
     rules,
     teamNames: {
-      A: cleanTeamName(teamNames?.A, "Команда A"),
-      B: cleanTeamName(teamNames?.B, "Команда B")
+      A: cleanTeamName(teamNames?.A, "Команда 1"),
+      B: cleanTeamName(teamNames?.B, "Команда 2")
     },
     currentStep: 0,
     picks: { A: [], B: [] },
     bans: { A: [], B: [] },
     turnStartedAt: now,
-    turnDeadlineAt: deadlineFrom(now, rules.timerSeconds),
-    timedOut: false
+    turnDeadlineAt: deadlineFrom(now, rules.timerSeconds)
   };
 }
 
@@ -144,7 +156,7 @@ export function applyLocalAction(room, heroId) {
     return room;
   }
   const step = room.rules.sequence[room.currentStep];
-  if (!step || heroAlreadyUsed(room, heroId) || room.timedOut) {
+  if (!step || heroAlreadyUsed(room, heroId)) {
     return room;
   }
   const next = structuredClone(room);
@@ -154,7 +166,6 @@ export function applyLocalAction(room, heroId) {
   const now = Date.now();
   next.turnStartedAt = now;
   next.turnDeadlineAt = deadlineFrom(now, next.rules.timerSeconds);
-  next.timedOut = false;
   if (next.currentStep >= next.rules.sequence.length) {
     next.status = "completed";
     next.turnDeadlineAt = null;
@@ -162,27 +173,13 @@ export function applyLocalAction(room, heroId) {
   return next;
 }
 
-export function pauseLocalOnTimeout(room) {
+export function applyLocalTimeout(room, heroIds) {
   if (!room || room.status !== "drafting" || !room.turnDeadlineAt || Date.now() < room.turnDeadlineAt) {
     return room;
   }
-  const next = structuredClone(room);
-  next.timedOut = true;
-  next.version += 1;
-  return next;
-}
-
-export function resumeLocalTurn(room) {
-  if (!room?.timedOut) {
-    return room;
-  }
-  const next = structuredClone(room);
-  const now = Date.now();
-  next.timedOut = false;
-  next.turnStartedAt = now;
-  next.turnDeadlineAt = deadlineFrom(now, next.rules.timerSeconds);
-  next.version += 1;
-  return next;
+  const heroId = heroIds.find((candidate) => !heroAlreadyUsed(room, candidate));
+  if (!heroId) return room;
+  return applyLocalAction(room, heroId);
 }
 
 export function heroAlreadyUsed(room, heroId) {

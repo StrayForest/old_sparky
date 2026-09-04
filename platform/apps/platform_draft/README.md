@@ -8,6 +8,14 @@ Standalone public Deadlock picks/bans tool for `https://old-sparky.com/draft`.
 - Static UI has no Next.js/FastAPI/auth dependency.
 - Solo mode is browser-only.
 - Online mode uses Cloudflare Durable Objects plus WebSocket Hibernation.
+- Online rooms start in a waiting lobby. Each captain claims a seat, may rename
+  that team, and must press Ready; drafting starts only after both connected
+  captains are ready.
+- Standard room creation exposes team format, total ban count, first mover,
+  timer and an editable complete pick/ban sequence. The Worker validates the
+  submitted sequence before creating the room.
+- A turn deadline always advances the authoritative sequence with the first
+  unused hero as an automatic pick or ban. There is no pause state.
 - No PostgreSQL, Redis, Celery or durable draft history.
 - Active room storage exists only so hibernated WebSockets can resume; it is deleted when a room completes or expires.
 
