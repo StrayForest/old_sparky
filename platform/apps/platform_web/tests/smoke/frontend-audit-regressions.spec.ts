@@ -87,3 +87,13 @@ test("admin cleanup keeps committed success independent from reload", () => {
   expect(reload).toBeGreaterThan(-1);
   expect(committedComment).toBeGreaterThan(reload);
 });
+
+test("AdSense keeps the global loader in layout and the diagnostic component loader-free", () => {
+  const layout = source("app/layout.tsx");
+  const diagnosticAd = source("components/adsense/diagnostic-ad.tsx");
+
+  expect(layout.match(/adsbygoogle\.js/gu) ?? []).toHaveLength(1);
+  expect(diagnosticAd).toContain('data-ad-slot="4365553701"');
+  expect(diagnosticAd).toContain('(window.adsbygoogle = window.adsbygoogle || []).push({});');
+  expect(diagnosticAd).not.toContain("adsbygoogle.js");
+});

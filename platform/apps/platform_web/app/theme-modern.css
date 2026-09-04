@@ -1853,6 +1853,11 @@ a.tournament-card:focus-visible {
 .home-social-telegram { --social-accent: #67bff5; }
 .home-social-vk { --social-accent: #79aefc; }
 
+.diagnostic-ad {
+  display: block;
+  width: 100%;
+}
+
 .home-loading-grid {
   grid-template-columns: repeat(5, minmax(0, 1fr));
 }

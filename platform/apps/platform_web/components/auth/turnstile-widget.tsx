@@ -155,8 +155,8 @@ export function TurnstileWidget({
         src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
         strategy="afterInteractive"
       />
-      {state === "expired" || state === "error" ? (
-        <div className="auth-turnstile-heading" aria-hidden="true">
+      {state !== "verified" ? (
+        <div className="auth-turnstile-heading">
           <span><ShieldCheck size={18} /></span>
           <strong>{t("auth.turnstileTitle")}</strong>
         </div>

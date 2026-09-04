@@ -4,6 +4,7 @@ import Link from "next/link";
 import { ChevronRight, Play } from "lucide-react";
 import { Fragment, useEffect, useState } from "react";
 import { useI18n } from "@/components/i18n-provider";
+import { DiagnosticAd } from "@/components/adsense/diagnostic-ad";
 import { Hero } from "@/components/layout/hero";
 import { CspImage } from "@/components/media/csp-image";
 import {
@@ -222,6 +223,8 @@ export function HomePageContent() {
             ))}
           </div>
         </nav>
+
+        <DiagnosticAd />
       </main>
     </>
   );

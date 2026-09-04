@@ -2804,6 +2804,9 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
   await submitButton.click();
   await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-action", "login");
   await expect(page.locator(".auth-turnstile-frame")).toHaveAttribute("data-turnstile-appearance", "interaction-only");
+  await expect(page.getByText("Проверка на Бибопа...", { exact: true })).toBeVisible();
+  await expect(submitButton).toBeDisabled();
+  await expect(page.locator(".auth-error")).toHaveCount(0);
   await expect(page.locator(".auth-turnstile")).toHaveCount(0);
   await expect(submitButton).toBeEnabled();
   await submitButton.click();
@@ -2813,6 +2816,41 @@ test("auth forms mount Turnstile only when the API requires it", async ({ page }
   expect(loginPayloads[0]).toEqual({ email: "turnstile@example.test", password: "long-password" });
   expect(loginPayloads[1].turnstile_token).toBe("turnstile-login-token");
   expect(csrfTokenRequests).toEqual([]);
+});
+
+test("home mounts one diagnostic AdSense slot without adding another loader", async ({ page }) => {
+  const slot = page.locator("ins.diagnostic-ad");
+
+  await page.addInitScript(() => {
+    const pushes: unknown[] = [];
+    Object.defineProperty(window, "adsbygoogle", {
+      configurable: true,
+      writable: true,
+      value: { push: (entry: unknown) => pushes.push(entry) }
+    });
+    Object.defineProperty(window, "__adsensePushes", {
+      configurable: true,
+      value: pushes
+    });
+  });
+
+  await page.goto("/");
+
+  expect(await page.locator(".home-socials, ins.diagnostic-ad, footer.site-footer").evaluateAll((nodes) => (
+    nodes.map((node) => node.tagName)
+  ))).toEqual(["NAV", "INS", "FOOTER"]);
+  await expect(slot).toHaveCount(1);
+  await expect(slot).toHaveAttribute("data-ad-client", "ca-pub-7185165276065459");
+  await expect(slot).toHaveAttribute("data-ad-slot", "4365553701");
+  await expect(slot).toHaveAttribute("data-ad-format", "auto");
+  await expect(slot).toHaveAttribute("data-full-width-responsive", "true");
+  await expect(slot).not.toHaveAttribute("style");
+  await expect(slot).toHaveCSS("display", "block");
+  await expect(page.locator('script[src*="adsbygoogle.js"]')).toHaveCount(0);
+  await expect(page.locator("article.patch-featured")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (
+    (window as Window & { __adsensePushes?: unknown[] }).__adsensePushes?.length ?? 0
+  ))).toBe(1);
 });
 
 test("Steam start does not mount Turnstile, grows the panel, or duplicate requests", async ({ page }) => {

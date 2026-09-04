@@ -132,9 +132,10 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
         router.push(isRegister ? "/profile/me" : safeAuthReturnPath(returnTo));
         router.refresh();
       } catch (error) {
-        setErrorMessage(authErrorMessage(error, enteringCode, isRegister, t));
+        const requiresHumanVerification = isHumanVerificationRequired(error);
+        setErrorMessage(requiresHumanVerification ? "" : authErrorMessage(error, enteringCode, isRegister, t));
         if (turnstileSiteKey && !enteringCode) {
-          if (isHumanVerificationRequired(error)) {
+          if (requiresHumanVerification) {
             setTurnstileChallengeRequired(true);
           }
           setTurnstileToken(null);
