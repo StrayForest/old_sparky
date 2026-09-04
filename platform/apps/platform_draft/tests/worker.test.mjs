@@ -51,7 +51,7 @@ test("same-origin room creation works without an Origin header", async () => {
     new Request("https://old-sparky.com/draft/api/rooms", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ presetId: "6v6-no-bans", timerSeconds: 0 })
+    body: JSON.stringify({ presetId: "6v6-no-bans", timerSeconds: 30 })
     }),
     environment.env
   );
@@ -59,8 +59,14 @@ test("same-origin room creation works without an Origin header", async () => {
   assert.equal(environment.created.length, 1);
 });
 
+test("room creation rejects an indefinite timer", async () => {
+  const { response, environment } = await createRoom({ presetId: "standard", timerSeconds: 0 });
+  assert.equal(response.status, 400);
+  assert.equal(environment.created.length, 0);
+});
+
 test("local browser origins with a port are accepted for development", async () => {
-  const { response } = await createRoom({ presetId: "6v6-no-bans", timerSeconds: 0 }, makeEnvironment(), "http://localhost:8788");
+  const { response } = await createRoom({ presetId: "6v6-no-bans", timerSeconds: 30 }, makeEnvironment(), "http://localhost:8788");
   assert.equal(response.status, 201);
 });
 
@@ -73,7 +79,7 @@ test("Wrangler local websocket origins are accepted during local development", a
         Origin: "http://old-sparky.com",
         "content-type": "application/json"
       },
-      body: JSON.stringify({ presetId: "6v6-no-bans", timerSeconds: 0 })
+        body: JSON.stringify({ presetId: "6v6-no-bans", timerSeconds: 30 })
     }),
     environment.env
   );
@@ -89,7 +95,7 @@ test("same-origin browser requests may use their same-origin referrer", async ()
         Referer: "https://old-sparky.com/draft",
         "content-type": "application/json"
       },
-      body: JSON.stringify({ presetId: "6v6-no-bans", timerSeconds: 0 })
+      body: JSON.stringify({ presetId: "6v6-no-bans", timerSeconds: 30 })
     }),
     environment.env
   );
@@ -154,7 +160,7 @@ async function seedDraftRoom() {
 test("online room creation preserves the submitted custom sequence", async () => {
   const { response, environment } = await createRoom({
     presetId: "standard",
-    timerSeconds: 0,
+    timerSeconds: 30,
     firstMove: "B",
     customRules: {
       teamSize: 2,
@@ -179,7 +185,7 @@ test("online room creation preserves the submitted custom sequence", async () =>
     banCount: 2,
     banCounts: { A: 1, B: 1 },
     firstSide: "B",
-    timerSeconds: 0,
+    timerSeconds: 30,
     sequence: [
       { action: "ban", side: "B", index: 0 },
       { action: "pick", side: "A", index: 1 },
@@ -252,6 +258,11 @@ test("online room stays in lobby until both seats are ready and syncs team names
   room = await storage.get("room");
   assert.equal(room.status, "waiting");
   assert.deepEqual(room.ready, { A: true, B: false });
+
+  await draft.webSocketMessage(host, JSON.stringify({ type: "team-name", expectedVersion: 3, name: "Locked" }));
+  room = await storage.get("room");
+  assert.equal(room.teamNames.A, "Alpha");
+  assert.equal(host.messages.at(-1).type, "error");
 
   await draft.webSocketMessage(guest, JSON.stringify({ type: "ready", expectedVersion: 3 }));
   room = await storage.get("room");

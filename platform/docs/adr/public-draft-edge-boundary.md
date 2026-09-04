@@ -23,7 +23,7 @@ The site already uses Cloudflare in front of `old-sparky.com` and delivers publi
   seats, can rename their own teams and confirm readiness before the first
   draft step starts.
 - Room creation carries an explicitly validated team format, per-team ban
-  template (0–3), first mover, timer and complete pick/ban sequence. The
+  template (0–3), first mover, finite timer (30/45/60/90 seconds) and complete pick/ban sequence. The
   template is editable: the resulting sequence is authoritative, with at most
   three bans per team and no gaps. A server-authoritative deadline
   automatically applies the first unused hero for the current pick or ban;
@@ -31,7 +31,7 @@ The site already uses Cloudflare in front of `old-sparky.com` and delivers publi
 - The Durable Object stores only the small current room snapshot and captain credential hashes needed to resume a hibernated room. It does not keep draft history. Completed and expired rooms delete this state.
 - Draft does not use platform PostgreSQL, Redis, Celery, FastAPI or the VPS runtime.
 - Hero thumbnails use the existing `cdn.old-sparky.com` R2/CDN boundary under an immutable Draft namespace.
-- A completed result can be encoded into the URL fragment of `/draft/result`; the server does not store that result.
+- A completed result can be encoded into the URL fragment of `/draft/result`; new links use compact v2 hero indexes, v1 links remain readable, and the server does not store that result.
 - Draft advertising uses the existing Old Sparky AdSense publisher and stays outside the hero grid and irreversible-action controls.
 
 ## Consequences

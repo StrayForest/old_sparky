@@ -21,10 +21,22 @@ test("sequence editor has unlabeled two-row cells with a three-state interaction
   assert.doesNotMatch(sequenceSource, /Команда [12]/u);
   assert.match(sequenceSource, /data-sequence-side="\$\{side\}"/u);
   assert.match(appSource, /cycleSequenceCell\(customSequence, index, side\)/u);
-  assert.match(sequenceSource, /Серые ячейки/u);
+  assert.doesNotMatch(sequenceSource, /Серые ячейки/u);
 });
 
 test("create showcase markup and styles are removed", () => {
   assert.doesNotMatch(appSource, /preview|Предпросмотр/u);
   assert.doesNotMatch(stylesSource, /preview|Предпросмотр/u);
+});
+
+test("draft controls use team A/B labels, finite timers, and live counters", () => {
+  assert.match(createSource, /Команда А/u);
+  assert.match(createSource, /Команда Б/u);
+  assert.doesNotMatch(createSource, /Выкл/u);
+  assert.match(appSource, /slot-counter--pick/u);
+  assert.match(appSource, /slot-counter--ban/u);
+  assert.match(appSource, /sequence-editor--live/u);
+  assert.match(appSource, /encodeResult\(room, HEROES\)/u);
+  assert.match(appSource, /#v2\./u);
+  assert.doesNotMatch(appSource, /ROOM <strong>/u);
 });

@@ -189,6 +189,11 @@ h1 {
 .primary-button,
 .confirm-button,
 .icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1.1;
+  text-align: center;
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease, filter 0.15s ease;
@@ -265,6 +270,46 @@ h1 {
 .chip-row button {
   min-width: 58px;
   padding: 0 12px;
+}
+
+.opponent-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 46px;
+  padding: 0 18px;
+  color: #fff;
+  background: linear-gradient(135deg, rgba(109, 40, 217, 0.86), rgba(13, 148, 136, 0.86));
+  border: 1px solid rgba(167, 139, 250, 0.72);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 9px 24px rgba(45, 212, 191, 0.16);
+  cursor: pointer;
+  font-weight: 800;
+  transition: filter 0.15s ease, transform 0.15s ease;
+}
+
+.opponent-link:hover {
+  filter: brightness(1.12);
+  transform: translateY(-1px);
+}
+
+.opponent-link--compact {
+  min-height: 38px;
+  padding: 0 12px;
+  font-size: 11px;
+}
+
+.opponent-link svg,
+.confirm-button svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
 }
 
 .create-actions {
@@ -376,6 +421,12 @@ h1 {
   transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
+.sequence-editor-step > span {
+  display: block;
+  line-height: 1;
+  transform: translateY(0);
+}
+
 .sequence-editor-step:hover {
   transform: translateY(-1px);
   border-color: var(--primary-bright);
@@ -395,6 +446,40 @@ h1 {
 
 .sequence-track--b .sequence-editor-step:not(.empty) {
   box-shadow: inset 0 0 0 1px rgba(251, 113, 133, 0.1);
+}
+
+.sequence-editor--live .sequence-editor__grid {
+  min-width: calc(86px + var(--sequence-length) * 38px);
+}
+
+.sequence-track--live {
+  grid-template-columns: 80px repeat(var(--sequence-length), 32px);
+}
+
+.sequence-track__label {
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.sequence-editor-step--live {
+  cursor: default;
+}
+
+.sequence-editor-step--live.done {
+  opacity: 0.58;
+}
+
+.sequence-editor-step--live.current {
+  color: #fff;
+  background: var(--primary-soft);
+  border-color: var(--primary-bright);
+  box-shadow: 0 0 0 1px rgba(167, 139, 250, 0.24);
 }
 
 .lobby-shell {
@@ -440,18 +525,8 @@ h1 {
   letter-spacing: 0.1em;
 }
 
-.lobby-roomline {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  color: var(--text-muted);
-  font-size: 11px;
-  letter-spacing: 0.15em;
-}
-
-.lobby-roomline strong {
-  color: var(--text);
-  letter-spacing: 0.28em;
+.lobby-shell > .opponent-link {
+  margin-top: 2px;
 }
 
 .lobby-meta {
@@ -583,7 +658,7 @@ h1 {
   justify-content: flex-end;
 }
 
-.room-code {
+.room-role {
   color: var(--text-muted);
   font-size: 12px;
 }
@@ -640,6 +715,12 @@ h1 {
   align-items: start;
 }
 
+.draft-center-column {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}
+
 .team-panel,
 .hero-panel {
   min-height: 0;
@@ -694,6 +775,13 @@ h1 {
   text-transform: uppercase;
 }
 
+.slot-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
 .mini-list {
   display: grid;
   gap: 6px;
@@ -705,8 +793,10 @@ h1 {
 
 .mini-hero,
 .empty-slot {
+  box-sizing: border-box;
   width: 54px;
   height: 54px;
+  min-width: 54px;
   min-height: 54px;
   display: flex;
   align-items: center;
@@ -735,6 +825,22 @@ h1 {
   border: 1px dashed var(--border-strong);
 }
 
+.slot-counter {
+  align-self: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.slot-counter--pick {
+  color: var(--success);
+}
+
+.slot-counter--ban {
+  color: var(--danger);
+}
+
 .sr-only {
   position: absolute;
   width: 1px;
@@ -749,6 +855,34 @@ h1 {
 
 .hero-panel {
   padding: 14px;
+}
+
+.hero-complete-state {
+  min-height: 270px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.hero-complete-state strong {
+  color: var(--text-soft);
+  font-size: 18px;
+}
+
+.hero-complete-state__mark {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  color: var(--success);
+  background: rgba(74, 222, 128, 0.1);
+  border: 1px solid rgba(74, 222, 128, 0.3);
+  border-radius: 999px;
+  font-size: 24px;
+  font-weight: 900;
 }
 
 .hero-toolbar {
@@ -857,37 +991,6 @@ h1 {
   background: rgba(225, 29, 72, 0.92);
 }
 
-.sequence-bar {
-  display: flex;
-  gap: 5px;
-  padding: 10px;
-  overflow-x: auto;
-}
-
-.sequence-step {
-  min-width: 30px;
-  height: 30px;
-  display: grid;
-  place-items: center;
-  color: var(--text-muted);
-  background: rgba(9, 14, 26, 0.78);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  font-size: 10px;
-  font-weight: 850;
-}
-
-.sequence-step.done {
-  color: var(--text-soft);
-  opacity: 0.58;
-}
-
-.sequence-step.current {
-  color: #fff;
-  background: var(--primary-soft);
-  border-color: var(--primary-bright);
-}
-
 .action-bar {
   position: sticky;
   bottom: 10px;
@@ -903,6 +1006,10 @@ h1 {
   border-radius: var(--radius-md);
   box-shadow: 0 14px 38px rgba(0, 0, 0, 0.38);
   backdrop-filter: blur(18px);
+}
+
+.completed-bar .confirm-button {
+  gap: 8px;
 }
 
 .selected-summary {
@@ -948,20 +1055,6 @@ h1 {
   max-width: 1060px;
   margin: 6vh auto 0;
   padding: clamp(20px, 3vw, 34px);
-}
-
-.result-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  margin-top: 22px;
-}
-
-.result-team {
-  padding: 16px;
-  background: var(--surface-soft);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
 }
 
 .result-actions {
@@ -1021,13 +1114,6 @@ h1 {
 
   .room-meta {
     min-width: 0;
-  }
-
-  .room-code {
-    max-width: 120px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .turn-center {
@@ -1098,6 +1184,19 @@ h1 {
     color: var(--text-muted);
   }
 
+  .mobile-team-summary small {
+    display: flex;
+    gap: 10px;
+    margin-top: 6px;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 900;
+  }
+
+  .mobile-team-summary small i {
+    font-style: normal;
+  }
+
   .action-bar {
     bottom: 6px;
     grid-template-columns: 1fr;
@@ -1118,10 +1217,6 @@ h1 {
     width: 100%;
     min-width: 0;
     min-height: 50px;
-  }
-
-  .result-grid {
-    grid-template-columns: 1fr;
   }
 
   .sequence-editor__header {

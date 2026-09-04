@@ -1,12 +1,11 @@
 export const TEAM_SIZES = Object.freeze([6, 4, 2]);
 export const MAX_BANS_PER_TEAM = 3;
 export const BAN_COUNTS = Object.freeze([0, 1, 2, 3]);
-export const TIMER_SECONDS = Object.freeze([0, 30, 45, 60, 90]);
+export const TIMER_SECONDS = Object.freeze([30, 45, 60, 90]);
 
 export const PRESETS = {
   standard: { id: "standard", label: "Стандарт", teamSize: 6, timerSeconds: 30, sequence: null },
   "community-6v6": { id: "community-6v6", label: "Community 6v6", teamSize: 6, timerSeconds: 30, sequence: null },
-  "community-6v6-no-timer": { id: "community-6v6-no-timer", label: "Community 6v6 — без таймера", teamSize: 6, timerSeconds: 0, sequence: null },
   "6v6-no-bans": { id: "6v6-no-bans", label: "6v6 без банов", teamSize: 6, timerSeconds: 30, sequence: null },
   custom: { id: "custom", label: "Свой", teamSize: 6, timerSeconds: 30, sequence: null }
 };
@@ -175,8 +174,8 @@ export function createLocalRoom(rules, teamNames) {
     version: 1,
     rules,
     teamNames: {
-      A: cleanTeamName(teamNames?.A, "Команда 1"),
-      B: cleanTeamName(teamNames?.B, "Команда 2")
+      A: cleanTeamName(teamNames?.A, "Команда А"),
+      B: cleanTeamName(teamNames?.B, "Команда Б")
     },
     currentStep: 0,
     picks: { A: [], B: [] },
@@ -194,6 +193,9 @@ export function applyLocalAction(room, heroId) {
   if (!step || heroAlreadyUsed(room, heroId)) {
     return room;
   }
+  const collection = room[step.action === "pick" ? "picks" : "bans"][step.side];
+  const capacity = step.action === "pick" ? room.rules.teamSize : MAX_BANS_PER_TEAM;
+  if (collection.length >= capacity) return room;
   const next = structuredClone(room);
   next[step.action === "pick" ? "picks" : "bans"][step.side].push(heroId);
   next.currentStep += 1;
@@ -238,8 +240,34 @@ export function makeResultPayload(room) {
   };
 }
 
-export function encodeResult(room) {
-  const json = JSON.stringify(makeResultPayload(room));
+export function encodeResult(room, heroOrder = null) {
+  const payload = Array.isArray(heroOrder)
+    ? makeCompactResultPayload(room, heroOrder)
+    : makeResultPayload(room);
+  const json = JSON.stringify(payload);
+  return encodeBase64Url(json);
+}
+
+function makeCompactResultPayload(room, heroOrder) {
+  const indexByHeroId = new Map(heroOrder.map((hero, index) => [typeof hero === "string" ? hero : hero.id, index]));
+  const encodeHeroes = (heroIds) => heroIds.map((heroId) => {
+    const index = indexByHeroId.get(heroId);
+    if (!Number.isInteger(index)) throw new Error("Некорректный герой в результате");
+    return index;
+  });
+  return {
+    v: 2,
+    a: room.teamNames.A,
+    b: room.teamNames.B,
+    pa: encodeHeroes(room.picks.A),
+    pb: encodeHeroes(room.picks.B),
+    ba: encodeHeroes(room.bans.A),
+    bb: encodeHeroes(room.bans.B),
+    s: room.rules.sequence.map((step) => `${step.side}${step.action === "ban" ? "b" : "p"}`).join("")
+  };
+}
+
+function encodeBase64Url(json) {
   const bytes = new TextEncoder().encode(json);
   let binary = "";
   for (const byte of bytes) {
@@ -248,7 +276,7 @@ export function encodeResult(room) {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
-export function decodeResult(value) {
+export function decodeResult(value, heroOrder = null) {
   if (!value || value.length > 6000) {
     throw new Error("Некорректная ссылка результата");
   }
@@ -256,9 +284,27 @@ export function decodeResult(value) {
   const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
   const binary = atob(padded);
   const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  const payload = JSON.parse(new TextDecoder().decode(bytes));
-  if (!payload || payload.v !== 1 || !Array.isArray(payload.pa) || !Array.isArray(payload.pb) || !Array.isArray(payload.ba) || !Array.isArray(payload.bb)) {
+  let payload = JSON.parse(new TextDecoder().decode(bytes));
+  if (!payload || ![1, 2].includes(payload.v) || !Array.isArray(payload.pa) || !Array.isArray(payload.pb) || !Array.isArray(payload.ba) || !Array.isArray(payload.bb)) {
     throw new Error("Версия результата не поддерживается");
+  }
+  if (payload.v === 2) {
+    if (!Array.isArray(heroOrder) || typeof payload.s !== "string") {
+      throw new Error("Для результата нужна актуальная версия героев");
+    }
+    const heroIds = heroOrder.map((hero) => typeof hero === "string" ? hero : hero.id);
+    const decodeHeroes = (indexes) => indexes.map((index) => {
+      if (!Number.isInteger(index) || index < 0 || index >= heroIds.length) throw new Error("Некорректный герой в результате");
+      return heroIds[index];
+    });
+    payload = {
+      ...payload,
+      pa: decodeHeroes(payload.pa),
+      pb: decodeHeroes(payload.pb),
+      ba: decodeHeroes(payload.ba),
+      bb: decodeHeroes(payload.bb),
+      sequence: decodeCompactSequence(payload.s)
+    };
   }
   return payload;
 }
@@ -281,10 +327,22 @@ function parseSideSequence(value, maxLength, allowEmpty) {
 
 function normalizeTimer(value, fallback) {
   const timer = Number.isFinite(Number(value)) ? Number(value) : fallback;
-  if (![0, 30, 45, 60, 90].includes(timer)) {
+  if (![30, 45, 60, 90].includes(timer)) {
     throw new Error("Некорректный таймер");
   }
   return timer;
+}
+
+function decodeCompactSequence(value) {
+  if (!value || value.length > 80 || value.length % 2 !== 0) throw new Error("Некорректная последовательность результата");
+  const sequence = [];
+  for (let index = 0; index < value.length; index += 2) {
+    const side = value[index];
+    const action = value[index + 1] === "b" ? "ban" : value[index + 1] === "p" ? "pick" : null;
+    if (!['A', 'B'].includes(side) || !action) throw new Error("Некорректная последовательность результата");
+    sequence.push({ action, side, index: index / 2 });
+  }
+  return sequence;
 }
 
 function deadlineFrom(now, timerSeconds) {
