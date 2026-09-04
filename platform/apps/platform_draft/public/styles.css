@@ -280,10 +280,10 @@ h1 {
   min-height: 46px;
   padding: 0 18px;
   color: #fff;
-  background: linear-gradient(135deg, rgba(109, 40, 217, 0.86), rgba(13, 148, 136, 0.86));
+  background: linear-gradient(135deg, var(--primary-deep), var(--primary));
   border: 1px solid rgba(167, 139, 250, 0.72);
   border-radius: var(--radius-sm);
-  box-shadow: 0 9px 24px rgba(45, 212, 191, 0.16);
+  box-shadow: 0 9px 24px rgba(109, 40, 217, 0.28);
   cursor: pointer;
   font-weight: 800;
   transition: filter 0.15s ease, transform 0.15s ease;
@@ -408,6 +408,7 @@ h1 {
   height: 32px;
   display: grid;
   place-items: center;
+  padding: 0;
   border-radius: 7px;
 }
 
@@ -422,9 +423,17 @@ h1 {
 }
 
 .sequence-editor-step > span {
-  display: block;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   line-height: 1;
-  transform: translateY(0);
+}
+
+.sequence-editor-step.ban > span {
+  font-family: Arial, sans-serif;
+  line-height: 0.75;
 }
 
 .sequence-editor-step:hover {
@@ -449,11 +458,11 @@ h1 {
 }
 
 .sequence-editor--live .sequence-editor__grid {
-  min-width: calc(86px + var(--sequence-length) * 38px);
+  min-width: calc(176px + var(--sequence-length) * 38px);
 }
 
 .sequence-track--live {
-  grid-template-columns: 80px repeat(var(--sequence-length), 32px);
+  grid-template-columns: 80px repeat(var(--sequence-length), 32px) 42px 42px;
 }
 
 .sequence-track__label {
@@ -476,10 +485,40 @@ h1 {
 }
 
 .sequence-editor-step--live.current {
-  color: #fff;
-  background: var(--primary-soft);
   border-color: var(--primary-bright);
   box-shadow: 0 0 0 1px rgba(167, 139, 250, 0.24);
+}
+
+.sequence-track--a .sequence-editor-step--live.current {
+  border-bottom-color: transparent;
+  border-radius: 7px 7px 0 0;
+}
+
+.sequence-track--b .sequence-editor-step--live.current {
+  border-top-color: transparent;
+  border-radius: 0 0 7px 7px;
+}
+
+.sequence-counter {
+  width: 42px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.sequence-counter--pick {
+  color: var(--secondary);
+}
+
+.sequence-counter--ban {
+  color: var(--danger);
 }
 
 .lobby-shell {
@@ -834,7 +873,7 @@ h1 {
 }
 
 .slot-counter--pick {
-  color: var(--success);
+  color: var(--secondary);
 }
 
 .slot-counter--ban {

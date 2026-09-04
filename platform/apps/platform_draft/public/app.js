@@ -536,12 +536,21 @@ function renderLiveSequence() {
       <div class="sequence-editor__header"><span>Последовательность пиков и банов</span><span class="sequence-editor__hint">${room.status === "completed" ? "Завершено" : `Шаг ${room.currentStep + 1} из ${sequence.length}`}</span></div>
       <div class="sequence-editor__scroll">
         <div class="sequence-editor__grid" style="--sequence-length:${sequence.length}">
-          <div class="sequence-track sequence-track--numbers sequence-track--live"><span></span>${sequence.map((_, index) => `<span>${index + 1}</span>`).join("")}</div>
+          <div class="sequence-track sequence-track--numbers sequence-track--live"><span></span>${sequence.map((_, index) => `<span>${index + 1}</span>`).join("")}<span></span><span></span></div>
           ${renderLiveSequenceTrack("A")}
           ${renderLiveSequenceTrack("B")}
         </div>
       </div>
     </section>
+  `;
+}
+
+function renderSequenceCounters(side) {
+  const picks = room.picks[side].length;
+  const bans = room.bans[side].length;
+  return `
+    <span class="sequence-counter sequence-counter--pick" aria-label="Пики ${picks} из ${room.rules.teamSize}">${picks}/${room.rules.teamSize}</span>
+    <span class="sequence-counter sequence-counter--ban" aria-label="Баны ${bans} из ${MAX_BANS_PER_TEAM}">${bans}/${MAX_BANS_PER_TEAM}</span>
   `;
 }
 
@@ -555,7 +564,7 @@ function renderLiveSequenceTrack(side) {
     const symbol = state === "ban" ? "×" : state === "pick" ? "✓" : "";
     const label = active ? `${step.action === "ban" ? "Бан" : "Пик"}, Команда ${side === "A" ? "А" : "Б"}, шаг ${index + 1}` : `Пусто, шаг ${index + 1}`;
     return `<span class="${classes.join(" ")}" role="img" aria-label="${label}"><span aria-hidden="true">${symbol}</span></span>`;
-  }).join("")}</div>`;
+  }).join("")}${renderSequenceCounters(side)}</div>`;
 }
 
 function renderActionBar(selectedHero, step, canAct) {

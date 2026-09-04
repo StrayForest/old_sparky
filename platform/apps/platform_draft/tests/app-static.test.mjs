@@ -40,3 +40,14 @@ test("draft controls use team A/B labels, finite timers, and live counters", () 
   assert.match(appSource, /#v2\./u);
   assert.doesNotMatch(appSource, /ROOM <strong>/u);
 });
+
+test("live sequence puts quota counters after each team row and frames the active column", () => {
+  assert.match(appSource, /sequence-counter--pick/u);
+  assert.match(appSource, /sequence-counter--ban/u);
+  assert.match(stylesSource, /\.sequence-track--a \.sequence-editor-step--live\.current/u);
+  assert.match(stylesSource, /\.sequence-track--b \.sequence-editor-step--live\.current/u);
+  assert.match(stylesSource, /\.sequence-editor-step\.ban > span/u);
+  assert.match(stylesSource, /\.sequence-editor-step \{[\s\S]*padding: 0;/u);
+  assert.match(stylesSource, /\.sequence-counter--pick \{\s*color: var\(--secondary\);/u);
+  assert.match(stylesSource, /background: linear-gradient\(135deg, var\(--primary-deep\), var\(--primary\)\)/u);
+});

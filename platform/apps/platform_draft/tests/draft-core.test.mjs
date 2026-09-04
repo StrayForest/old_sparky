@@ -70,6 +70,26 @@ test("local timeout automatically picks when the current step is a pick", () => 
   assert.deepEqual(next.bans.A, []);
 });
 
+test("local actions cannot exceed pick or ban stock", () => {
+  const pickRules = buildRules("standard", 30, {
+    teamSize: 2,
+    banCount: 0,
+    sequence: createDefaultSequence(2, 0, "A")
+  });
+  const pickRoom = createLocalRoom(pickRules, { A: "Alpha", B: "Bravo" });
+  pickRoom.picks.A = ["abrams", "haze"];
+  assert.strictEqual(applyLocalAction(pickRoom, "bebop"), pickRoom);
+
+  const banRules = buildRules("standard", 30, {
+    teamSize: 2,
+    banCount: 3,
+    sequence: createDefaultSequence(2, 3, "A")
+  });
+  const banRoom = createLocalRoom(banRules, { A: "Alpha", B: "Bravo" });
+  banRoom.bans.A = ["abrams", "haze", "bebop"];
+  assert.strictEqual(applyLocalAction(banRoom, "haze"), banRoom);
+});
+
 
 test("custom sequence keeps every configured ban and pick step", () => {
   const sequence = [
