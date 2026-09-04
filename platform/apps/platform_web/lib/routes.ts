@@ -9,6 +9,11 @@ export const navItems = [
     matchPrefix: "/tournaments"
   },
   {
+    href: "/draft",
+    label: "Драфты",
+    matchPrefix: "/draft"
+  },
+  {
     href: "/info",
     label: "Инфо"
   }
