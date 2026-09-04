@@ -383,13 +383,17 @@ h1 {
 .sequence-editor__grid {
   display: grid;
   gap: 7px;
-  min-width: calc(var(--sequence-length) * 38px);
+  min-width: calc(var(--sequence-length) * 38px + 90px);
 }
 
 .sequence-track {
   display: grid;
   grid-template-columns: repeat(var(--sequence-length), 32px);
   gap: 6px;
+}
+
+.sequence-track--editable {
+  grid-template-columns: repeat(var(--sequence-length), 32px) 42px 42px;
 }
 
 .sequence-track--numbers {
@@ -458,11 +462,11 @@ h1 {
 }
 
 .sequence-editor--live .sequence-editor__grid {
-  min-width: calc(176px + var(--sequence-length) * 38px);
+  min-width: calc(80px + var(--sequence-length) * 38px);
 }
 
 .sequence-track--live {
-  grid-template-columns: 80px repeat(var(--sequence-length), 32px) 42px 42px;
+  grid-template-columns: 80px repeat(var(--sequence-length), 32px);
 }
 
 .sequence-track__label {
@@ -814,13 +818,6 @@ h1 {
   text-transform: uppercase;
 }
 
-.slot-line {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 8px;
-}
-
 .mini-list {
   display: grid;
   gap: 6px;
@@ -862,22 +859,6 @@ h1 {
 .empty-slot {
   background: rgba(9, 14, 26, 0.42);
   border: 1px dashed var(--border-strong);
-}
-
-.slot-counter {
-  align-self: center;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  font-weight: 900;
-  white-space: nowrap;
-}
-
-.slot-counter--pick {
-  color: var(--secondary);
-}
-
-.slot-counter--ban {
-  color: var(--danger);
 }
 
 .sr-only {
@@ -1047,10 +1028,6 @@ h1 {
   backdrop-filter: blur(18px);
 }
 
-.completed-bar .confirm-button {
-  gap: 8px;
-}
-
 .selected-summary {
   min-width: 0;
   display: flex;
@@ -1090,13 +1067,13 @@ h1 {
   border: 1px solid rgba(251, 113, 133, 0.35);
 }
 
-.result-panel {
+.message-panel {
   max-width: 1060px;
   margin: 6vh auto 0;
   padding: clamp(20px, 3vw, 34px);
 }
 
-.result-actions {
+.message-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
@@ -1221,19 +1198,6 @@ h1 {
 
   .mobile-team-summary span {
     color: var(--text-muted);
-  }
-
-  .mobile-team-summary small {
-    display: flex;
-    gap: 10px;
-    margin-top: 6px;
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
-    font-weight: 900;
-  }
-
-  .mobile-team-summary small i {
-    font-style: normal;
   }
 
   .action-bar {

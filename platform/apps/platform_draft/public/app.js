@@ -8,12 +8,11 @@ import {
   applyLocalAction,
   applyLocalTimeout,
   buildRules,
+  countSequenceActions,
   cycleSequenceCell,
   createDefaultSequence,
   createLocalRoom,
-  currentStep,
-  decodeResult,
-  encodeResult
+  currentStep
 } from "./draft-core.js";
 
 const app = document.querySelector("#app");
@@ -75,12 +74,7 @@ function route() {
     startTimer();
     return;
   }
-  if (path === "/draft/result") {
-    runtimeMode = "result";
-    renderResult();
-    return;
-  }
-  const match = path.match(/^\/draft\/([A-Za-z0-9_-]{6,32})\/?$/u);
+  const match = path.match(/^\/draft\/(?!result\/?$)([A-Za-z0-9_-]{6,32})\/?$/u);
   if (match) {
     runtimeMode = "online";
     roomCode = match[1];
@@ -132,7 +126,7 @@ function renderSequenceEditor() {
       <div class="sequence-editor__header"><span>Последовательность пиков и банов</span><span class="sequence-editor__hint">Нажмите ячейку: пик → бан → пусто</span></div>
       <div class="sequence-editor__scroll">
         <div class="sequence-editor__grid" style="--sequence-length:${customSequence.length}">
-          <div class="sequence-track sequence-track--numbers">${customSequence.map((_, index) => `<span>${index + 1}</span>`).join("")}</div>
+          <div class="sequence-track sequence-track--numbers sequence-track--editable">${customSequence.map((_, index) => `<span>${index + 1}</span>`).join("")}<span></span><span></span></div>
           ${renderSequenceTrack("A")}
           ${renderSequenceTrack("B")}
         </div>
@@ -142,13 +136,21 @@ function renderSequenceEditor() {
 }
 
 function renderSequenceTrack(side) {
-  return `<div class="sequence-track sequence-track--${side.toLowerCase()}">${customSequence.map((step, index) => {
+  return `<div class="sequence-track sequence-track--${side.toLowerCase()} sequence-track--editable">${customSequence.map((step, index) => {
     const active = step?.side === side;
     const state = active ? step.action : "empty";
     const symbol = state === "ban" ? "×" : state === "pick" ? "✓" : "";
     const label = active ? `${state === "ban" ? "Бан" : "Пик"}, шаг ${index + 1}` : `Пусто, шаг ${index + 1}`;
     return `<button class="sequence-editor-step ${state}" type="button" data-sequence-index="${index}" data-sequence-side="${side}" aria-label="${label}"><span aria-hidden="true">${symbol}</span></button>`;
-  }).join("")}</div>`;
+  }).join("")}${renderCreateSequenceCounters(side)}</div>`;
+}
+
+function renderCreateSequenceCounters(side) {
+  const counts = countSequenceActions(customSequence, side);
+  return `
+    <span class="sequence-counter sequence-counter--pick" aria-label="Пики ${counts.pick} из ${selectedTeamSize}">${counts.pick}/${selectedTeamSize}</span>
+    <span class="sequence-counter sequence-counter--ban" aria-label="Баны ${counts.ban} из ${selectedBanCount}">${counts.ban}/${selectedBanCount}</span>
+  `;
 }
 
 function renderCreate() {
@@ -258,7 +260,10 @@ function resetCreateSequence() {
 }
 
 function cycleCreateSequence(index, side) {
-  customSequence = cycleSequenceCell(customSequence, index, side);
+  customSequence = cycleSequenceCell(customSequence, index, side, {
+    pickLimit: selectedTeamSize,
+    banLimit: selectedBanCount
+  });
 }
 
 async function createDraft() {
@@ -310,7 +315,7 @@ function resolveLocalFirstSide(value) {
 function renderLoadingRoom() {
   app.innerHTML = `
     ${renderBrand()}
-    <section class="panel result-panel">
+    <section class="panel message-panel">
       <p class="eyebrow">Подключение</p>
       <h1 style="font-size:clamp(30px,5vw,52px)">Подключаем драфт…</h1>
       <p class="create-lead">Получаем актуальное состояние комнаты.</p>
@@ -389,7 +394,7 @@ function renderRoom() {
   const selectedHero = selectedHeroId ? HERO_BY_ID.get(selectedHeroId) : null;
   const filteredHeroes = HEROES.filter((hero) => hero.name.toLocaleLowerCase("ru").includes(heroSearch.toLocaleLowerCase("ru")));
   const timerText = formatTimer(room);
-  const roleLabel = runtimeMode === "result" ? "Результат" : runtimeMode === "solo" ? "Соло" : seat.role === "host" ? "Команда А" : seat.role === "guest" ? "Команда Б" : "Зритель";
+  const roleLabel = runtimeMode === "solo" ? "Соло" : seat.role === "host" ? "Команда А" : seat.role === "guest" ? "Команда Б" : "Зритель";
   const activeSide = step?.side || null;
   const actionText = step?.action === "ban" ? "БАН" : step?.action === "pick" ? "ПИК" : "ЗАВЕРШЕНО";
   const showHeroes = room.status !== "completed";
@@ -428,10 +433,10 @@ function renderRoom() {
             </div>
             <div class="hero-grid">
               ${filteredHeroes.map((hero) => renderHeroCard(hero, canAct)).join("")}
-            </div>` : `<div class="hero-complete-state"><span class="hero-complete-state__mark">✓</span><strong>Драфт завершён</strong><span>Пики и баны сохранены в результате</span></div>`}
+            </div>` : `<div class="hero-complete-state"><span class="hero-complete-state__mark">✓</span><strong>Драфт завершён</strong><span>Пики и баны показаны по сторонам</span></div>`}
           </section>
           ${renderLiveSequence()}
-          ${runtimeMode === "result" ? renderResultActions() : room.status === "completed" ? renderCompletedActions() : renderActionBar(selectedHero, step, canAct)}
+          ${room.status === "completed" ? renderCompletedActions() : renderActionBar(selectedHero, step, canAct)}
         </section>
         ${renderTeamPanel("B")}
       </div>
@@ -456,20 +461,14 @@ function renderTeamPanel(side) {
       </div>
       <div class="team-block">
         <h3>Пики</h3>
-        <div class="slot-line">
-          <div class="mini-list mini-list--slots">
-            ${renderSlots(picks, room.rules.teamSize)}
-          </div>
-          <span class="slot-counter slot-counter--pick" aria-label="Пики ${picks.length} из ${room.rules.teamSize}">${picks.length}/${room.rules.teamSize}</span>
+        <div class="mini-list mini-list--slots">
+          ${renderSlots(picks, room.rules.teamSize)}
         </div>
       </div>
       <div class="team-block">
         <h3>Баны</h3>
-        <div class="slot-line">
-          <div class="mini-list mini-list--slots">
-            ${renderSlots(bans, expectedBans)}
-          </div>
-          <span class="slot-counter slot-counter--ban" aria-label="Баны ${bans.length} из ${MAX_BANS_PER_TEAM}">${bans.length}/${MAX_BANS_PER_TEAM}</span>
+        <div class="mini-list mini-list--slots">
+          ${renderSlots(bans, expectedBans)}
         </div>
       </div>
     </aside>
@@ -479,7 +478,7 @@ function renderTeamPanel(side) {
 function renderMobileTeam(side) {
   const picks = room.picks[side].map((id) => HERO_BY_ID.get(id)?.name || id).join(", ") || "пиков нет";
   const bans = room.bans[side].map((id) => HERO_BY_ID.get(id)?.name || id).join(", ") || "банов нет";
-  return `<div class="mobile-team-summary"><strong>${escapeHtml(room.teamNames[side])}</strong><span>${escapeHtml(picks)} · ${escapeHtml(bans)}</span><small><i class="slot-counter--pick">${room.picks[side].length}/${room.rules.teamSize}</i><i class="slot-counter--ban">${room.bans[side].length}/${MAX_BANS_PER_TEAM}</i></small></div>`;
+  return `<div class="mobile-team-summary"><strong>${escapeHtml(room.teamNames[side])}</strong><span>${escapeHtml(picks)} · ${escapeHtml(bans)}</span></div>`;
 }
 
 function renderMiniHero(heroId) {
@@ -525,7 +524,7 @@ function heroUsageState(heroId) {
 function stepHasCapacity(step) {
   if (!step || !room) return false;
   const items = room[step.action === "pick" ? "picks" : "bans"][step.side];
-  const limit = step.action === "pick" ? room.rules.teamSize : MAX_BANS_PER_TEAM;
+  const limit = step.action === "pick" ? room.rules.teamSize : room.rules.banCount;
   return items.length < limit;
 }
 
@@ -536,21 +535,12 @@ function renderLiveSequence() {
       <div class="sequence-editor__header"><span>Последовательность пиков и банов</span><span class="sequence-editor__hint">${room.status === "completed" ? "Завершено" : `Шаг ${room.currentStep + 1} из ${sequence.length}`}</span></div>
       <div class="sequence-editor__scroll">
         <div class="sequence-editor__grid" style="--sequence-length:${sequence.length}">
-          <div class="sequence-track sequence-track--numbers sequence-track--live"><span></span>${sequence.map((_, index) => `<span>${index + 1}</span>`).join("")}<span></span><span></span></div>
+          <div class="sequence-track sequence-track--numbers sequence-track--live"><span></span>${sequence.map((_, index) => `<span>${index + 1}</span>`).join("")}</div>
           ${renderLiveSequenceTrack("A")}
           ${renderLiveSequenceTrack("B")}
         </div>
       </div>
     </section>
-  `;
-}
-
-function renderSequenceCounters(side) {
-  const picks = room.picks[side].length;
-  const bans = room.bans[side].length;
-  return `
-    <span class="sequence-counter sequence-counter--pick" aria-label="Пики ${picks} из ${room.rules.teamSize}">${picks}/${room.rules.teamSize}</span>
-    <span class="sequence-counter sequence-counter--ban" aria-label="Баны ${bans} из ${MAX_BANS_PER_TEAM}">${bans}/${MAX_BANS_PER_TEAM}</span>
   `;
 }
 
@@ -564,7 +554,7 @@ function renderLiveSequenceTrack(side) {
     const symbol = state === "ban" ? "×" : state === "pick" ? "✓" : "";
     const label = active ? `${step.action === "ban" ? "Бан" : "Пик"}, Команда ${side === "A" ? "А" : "Б"}, шаг ${index + 1}` : `Пусто, шаг ${index + 1}`;
     return `<span class="${classes.join(" ")}" role="img" aria-label="${label}"><span aria-hidden="true">${symbol}</span></span>`;
-  }).join("")}${renderSequenceCounters(side)}</div>`;
+  }).join("")}</div>`;
 }
 
 function renderActionBar(selectedHero, step, canAct) {
@@ -590,16 +580,7 @@ function renderCompletedActions() {
   return `
     <div class="action-bar">
       <div class="selected-summary"><strong>Драфт завершён</strong></div>
-      <button id="open-result" class="confirm-button" type="button">Открыть результат</button>
-    </div>
-  `;
-}
-
-function renderResultActions() {
-  return `
-    <div class="action-bar completed-bar">
-      <div class="selected-summary"><strong>Результат драфта</strong></div>
-      <button id="copy-result" class="confirm-button" type="button">${COPY_ICON}<span>Скопировать ссылку</span></button>
+      <button id="restart-draft" class="confirm-button" type="button">Новый драфт</button>
     </div>
   `;
 }
@@ -627,25 +608,14 @@ function attachRoomEvents(canAct) {
   app.querySelector("#confirm-action")?.addEventListener("click", () => void confirmAction());
   app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
   app.querySelector("#copy-watch")?.addEventListener("click", () => void copyText(`${location.origin}/draft/${roomCode}`, "Ссылка зрителя скопирована"));
-  app.querySelector("#copy-result")?.addEventListener("click", () => void copyText(location.href, "Ссылка результата скопирована"));
   app.querySelector("#new-draft")?.addEventListener("click", () => {
     if (runtimeMode === "solo") sessionStorage.removeItem(SOLO_KEY);
     navigate("/draft");
   });
-  app.querySelector("#open-result")?.addEventListener("click", () => {
-    openResult();
+  app.querySelector("#restart-draft")?.addEventListener("click", () => {
+    if (runtimeMode === "solo") sessionStorage.removeItem(SOLO_KEY);
+    navigate("/draft");
   });
-}
-
-function openResult() {
-  if (!room) return;
-  const encoded = encodeResult(room, HEROES);
-  stopTimer();
-  closeSocket();
-  history.pushState({}, "", `/draft/result#v2.${encoded}`);
-  runtimeMode = "result";
-  seat = { role: "spectator", token: null };
-  renderResult();
 }
 
 async function confirmAction() {
@@ -863,83 +833,21 @@ function formatMilliseconds(ms) {
   return `${minutes}:${seconds}`;
 }
 
-function renderResult() {
-  const match = location.hash.match(/^#v\d+\.(.+)$/u);
-  const raw = match?.[1] || "";
-  let payload;
-  try {
-    payload = decodeResult(raw, HEROES);
-  } catch (cause) {
-    app.innerHTML = `${renderBrand()}<section class="panel result-panel"><div class="error-box">${escapeHtml(errorMessage(cause))}</div><div class="result-actions"><a class="secondary-button" style="display:inline-flex;align-items:center;text-decoration:none" href="/draft">Создать новый драфт</a></div></section>`;
-    return;
-  }
-  room = resultRoomFromPayload(payload);
-  runtimeMode = "result";
-  seat = { role: "spectator", token: null };
-  renderRoom();
-}
-
-function resultRoomFromPayload(payload) {
-  const picks = {
-    A: payload.pa.filter((id) => HERO_BY_ID.has(id)).slice(0, 6),
-    B: payload.pb.filter((id) => HERO_BY_ID.has(id)).slice(0, 6)
-  };
-  const bans = {
-    A: payload.ba.filter((id) => HERO_BY_ID.has(id)).slice(0, MAX_BANS_PER_TEAM),
-    B: payload.bb.filter((id) => HERO_BY_ID.has(id)).slice(0, MAX_BANS_PER_TEAM)
-  };
-  const teamSize = [2, 4, 6].find((size) => picks.A.length <= size && picks.B.length <= size) || 6;
-  const sequence = Array.isArray(payload.sequence) && payload.sequence.length
-    ? payload.sequence
-    : createDefaultSequence(teamSize, Math.max(bans.A.length, bans.B.length), "A");
-  const banCounts = {
-    A: sequence.filter((step) => step.action === "ban" && step.side === "A").length,
-    B: sequence.filter((step) => step.action === "ban" && step.side === "B").length
-  };
-  return {
-    schema: 2,
-    status: "completed",
-    version: 1,
-    rules: {
-      presetId: payload.preset || "standard",
-      teamSize,
-      banCount: Math.max(banCounts.A, banCounts.B),
-      banCounts,
-      firstSide: sequence[0]?.side || "A",
-      timerSeconds: 30,
-      sequence: sequence.map((step, index) => ({ action: step.action, side: step.side, index }))
-    },
-    teamNames: { A: cleanResultTeamName(payload.a, "Команда А"), B: cleanResultTeamName(payload.b, "Команда Б") },
-    currentStep: sequence.length,
-    picks,
-    bans,
-    ready: { A: true, B: true },
-    presence: { A: false, B: false },
-    turnStartedAt: null,
-    turnDeadlineAt: null
-  };
-}
-
-function cleanResultTeamName(value, fallback) {
-  const text = String(value || "").trim().slice(0, 40);
-  return text || fallback;
-}
-
 function renderExpiredRoom() {
   stopTimer();
   app.innerHTML = `
     ${renderBrand()}
-    <section class="panel result-panel">
+    <section class="panel message-panel">
       <p class="eyebrow">Комната недоступна</p>
       <h1 style="font-size:clamp(32px,6vw,56px)">Драфт больше не существует</h1>
       <p class="create-lead">Комнаты временные и удаляются после завершения или простоя.</p>
-      <div class="result-actions"><a class="primary-button" style="display:inline-flex;align-items:center;text-decoration:none" href="/draft">Создать новый</a></div>
+      <div class="message-actions"><a class="primary-button" style="display:inline-flex;align-items:center;text-decoration:none" href="/draft">Создать новый</a></div>
     </section>
   `;
 }
 
 function renderNotFound() {
-  app.innerHTML = `${renderBrand()}<section class="panel result-panel"><h1 style="font-size:clamp(32px,6vw,56px)">Страница не найдена</h1><div class="result-actions"><a class="primary-button" style="display:inline-flex;align-items:center;text-decoration:none" href="/draft">К драфтам</a></div></section>`;
+  app.innerHTML = `${renderBrand()}<section class="panel message-panel"><h1 style="font-size:clamp(32px,6vw,56px)">Страница не найдена</h1><div class="message-actions"><a class="primary-button" style="display:inline-flex;align-items:center;text-decoration:none" href="/draft">К драфтам</a></div></section>`;
 }
 
 function attachImageFallbacks() {

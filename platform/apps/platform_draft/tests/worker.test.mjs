@@ -45,6 +45,21 @@ async function createRoom(body, environment = makeEnvironment(), origin = "https
   return { response, environment };
 }
 
+test("legacy result path is not served as a Draft room shell", async () => {
+  let requestedPath = null;
+  const response = await worker.fetch(new Request("https://old-sparky.com/draft/result"), {
+    ASSETS: {
+      fetch(request) {
+        requestedPath = new URL(request.url).pathname;
+        return new Response("Not found", { status: 404 });
+      }
+    }
+  });
+
+  assert.equal(response.status, 404);
+  assert.equal(requestedPath, "/draft/result");
+});
+
 test("same-origin room creation works without an Origin header", async () => {
   const environment = makeEnvironment();
   const response = await worker.fetch(
@@ -235,6 +250,28 @@ test("online room creation rejects unbalanced custom picks and extra settings", 
         { action: "pick", side: "B" },
         { action: "pick", side: "B" },
         { action: "pick", side: "A" }
+      ]
+    }
+  });
+
+  assert.equal(response.status, 400);
+  assert.equal(environment.created.length, 0);
+});
+
+test("online room creation rejects a sequence above the selected per-team ban limit", async () => {
+  const { response, environment } = await createRoom({
+    presetId: "standard",
+    timerSeconds: 30,
+    customRules: {
+      teamSize: 2,
+      banCount: 1,
+      sequence: [
+        { action: "ban", side: "A" },
+        { action: "ban", side: "A" },
+        { action: "pick", side: "A" },
+        { action: "pick", side: "B" },
+        { action: "pick", side: "A" },
+        { action: "pick", side: "B" }
       ]
     }
   });

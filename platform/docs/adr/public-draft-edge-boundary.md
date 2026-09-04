@@ -1,6 +1,7 @@
 # Public Draft edge boundary
 
 - Status: Accepted
+- Superseded in part: The completed-result URL decision is superseded by [Public Draft completion without result links](public-draft-completion-without-result-links.md).
 - Date: 2026-09-04
 - Owner: Platform maintainers
 
