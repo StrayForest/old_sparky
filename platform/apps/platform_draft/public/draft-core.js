@@ -1,5 +1,6 @@
-export const TEAM_SIZES = Object.freeze([2, 4, 6]);
-export const BAN_COUNTS = Object.freeze([0, 1, 2, 3, 4, 5, 6]);
+export const TEAM_SIZES = Object.freeze([6, 4, 2]);
+export const MAX_BANS_PER_TEAM = 3;
+export const BAN_COUNTS = Object.freeze([0, 1, 2, 3]);
 export const TIMER_SECONDS = Object.freeze([0, 30, 45, 60, 90]);
 
 export const PRESETS = {
@@ -12,7 +13,7 @@ export const PRESETS = {
 
 export const DEFAULT_CUSTOM_RULES = Object.freeze({
   teamSize: 6,
-  banCount: 6,
+  banCount: MAX_BANS_PER_TEAM,
   firstSide: "A",
   sequence: Object.freeze([
     { action: "ban", side: "A" },
@@ -65,35 +66,34 @@ export function buildCustomRules(value) {
   const timerSeconds = normalizeTimer(value?.timerSeconds, 30);
   const banCount = Number(value?.banCount ?? value?.banSequence?.length ?? 0);
   if (!BAN_COUNTS.includes(banCount)) {
-    throw new Error("Количество банов должно быть от 0 до 6");
+    throw new Error(`Количество банов на команду должно быть от 0 до ${MAX_BANS_PER_TEAM}`);
   }
   const firstSide = value?.firstSide === "B" ? "B" : "A";
-  const sequence = Array.isArray(value?.sequence) && value.sequence.length
+  const sequence = Array.isArray(value?.sequence)
     ? value.sequence.map((step) => ({ action: step?.action, side: step?.side }))
     : value?.sequence === null || (!Object.hasOwn(value || {}, "banSequence") && !Object.hasOwn(value || {}, "pickSequence"))
       ? createDefaultSequence(teamSize, banCount, firstSide)
       : [
-          ...parseSideSequence(value?.banSequence, banCount, true).map((side) => ({ action: "ban", side })),
+          ...parseSideSequence(value?.banSequence, banCount * 2, true).map((side) => ({ action: "ban", side })),
           ...parseSideSequence(value?.pickSequence, teamSize * 2, false).map((side) => ({ action: "pick", side }))
         ];
   validateSequence(sequence, teamSize, banCount);
-  const firstIndex = sequence.findIndex((step) => step.side === firstSide);
-  if (firstIndex > 0) {
-    [sequence[0], sequence[firstIndex]] = [sequence[firstIndex], sequence[0]];
-  }
+  const orientedSequence = orientSequence(sequence, firstSide);
+  const banCounts = countSequenceBans(orientedSequence);
   return {
     presetId: value?.presetId || "custom",
     teamSize,
     banCount,
+    banCounts,
     firstSide,
     timerSeconds,
-    sequence: sequence.map((step, index) => ({ ...step, index }))
+    sequence: orientedSequence.map((step, index) => ({ ...step, index }))
   };
 }
 
 export function createDefaultSequence(teamSize, banCount, firstSide = "A") {
   const sideOrder = makeTurnOrder(teamSize * 2, firstSide);
-  const banOrder = makeTurnOrder(banCount, firstSide);
+  const banOrder = makeTurnOrder(banCount * 2, firstSide);
   return [
     ...banOrder.map((side) => ({ action: "ban", side })),
     ...sideOrder.map((side) => ({ action: "pick", side }))
@@ -108,11 +108,15 @@ function makeTurnOrder(count, firstSide = "A") {
 }
 
 export function validateSequence(sequence, teamSize, banCount) {
-  if (!Array.isArray(sequence) || sequence.length !== banCount + teamSize * 2 || sequence.length < 4 || sequence.length > 40) {
+  if (!Array.isArray(sequence) || sequence.length < teamSize * 2 || sequence.length > teamSize * 2 + MAX_BANS_PER_TEAM * 2) {
     throw new Error("Последовательность драфта заполнена не полностью");
+  }
+  if (!BAN_COUNTS.includes(Number(banCount))) {
+    throw new Error("Некорректное количество банов на команду");
   }
   const counts = { ban: 0, pick: 0, A: 0, B: 0 };
   const picks = { A: 0, B: 0 };
+  const bans = { A: 0, B: 0 };
   sequence.forEach((step) => {
     if (!step || !["pick", "ban"].includes(step.action) || !["A", "B"].includes(step.side)) {
       throw new Error("В последовательности есть некорректный шаг");
@@ -120,10 +124,41 @@ export function validateSequence(sequence, teamSize, banCount) {
     counts[step.action] += 1;
     counts[step.side] += 1;
     if (step.action === "pick") picks[step.side] += 1;
+    if (step.action === "ban") bans[step.side] += 1;
   });
-  if (counts.ban !== banCount || counts.pick !== teamSize * 2 || picks.A !== teamSize || picks.B !== teamSize) {
+  if (counts.pick !== teamSize * 2 || picks.A !== teamSize || picks.B !== teamSize || bans.A > MAX_BANS_PER_TEAM || bans.B > MAX_BANS_PER_TEAM) {
     throw new Error("Последовательность не соответствует выбранному формату");
   }
+}
+
+export function orientSequence(sequence, firstSide) {
+  if (!sequence.length || sequence[0].side === firstSide) return sequence.map((step) => ({ ...step }));
+  return sequence.map((step) => ({
+    ...step,
+    side: step.side === "A" ? "B" : "A"
+  }));
+}
+
+export function cycleSequenceCell(sequence, index, side) {
+  if (!Array.isArray(sequence) || !Number.isInteger(index) || !["A", "B"].includes(side) || index < 0 || index >= sequence.length) {
+    return sequence;
+  }
+  const next = sequence.map((step) => step ? { ...step } : null);
+  const current = next[index];
+  if (!current || current.side !== side) {
+    next[index] = { action: "pick", side };
+    return next;
+  }
+  next[index] = current.action === "pick" ? { action: "ban", side } : null;
+  return next;
+}
+
+function countSequenceBans(sequence) {
+  const bans = { A: 0, B: 0 };
+  sequence.forEach((step) => {
+    if (step.action === "ban") bans[step.side] += 1;
+  });
+  return bans;
 }
 
 export function normalizeSideSequence(value) {

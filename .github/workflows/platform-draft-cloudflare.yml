@@ -48,6 +48,9 @@ jobs:
           test -f dist/draft/index.html
           test -f dist/draft/app.js
           test -f dist/draft/styles.css
+          grep -q 'Драфты' dist/draft/app.js
+          grep -q 'Баны на команду' dist/draft/app.js
+          ! grep -Eq 'Предпросмотр|preview' dist/draft/app.js dist/draft/styles.css
       - name: Generate optimized hero thumbnails without network writes
         run: |
           python -m venv platform/.venv_draft_assets
@@ -215,6 +218,9 @@ jobs:
 
           get_200 "Draft app.js" "https://old-sparky.com/draft/app.js" /tmp/draft-app.js
           grep -q 'oldsparky:draft:solo' /tmp/draft-app.js
+          grep -q 'Драфты' /tmp/draft-app.js
+          grep -q 'Баны на команду' /tmp/draft-app.js
+          ! grep -Eq 'Предпросмотр|preview' /tmp/draft-app.js
 
           get_200 "Hero CDN" "https://cdn.old-sparky.com/draft/heroes/v1/abrams.webp" /tmp/abrams.webp
           test -s /tmp/abrams.webp

@@ -2,11 +2,13 @@ import { HEROES, HERO_BY_ID } from "./heroes.js";
 import {
   BAN_COUNTS,
   DEFAULT_CUSTOM_RULES,
+  MAX_BANS_PER_TEAM,
   TEAM_SIZES,
   TIMER_SECONDS,
   applyLocalAction,
   applyLocalTimeout,
   buildRules,
+  cycleSequenceCell,
   createDefaultSequence,
   createLocalRoom,
   currentStep,
@@ -24,9 +26,7 @@ let selectedTeamSize = DEFAULT_CUSTOM_RULES.teamSize;
 let selectedBanCount = DEFAULT_CUSTOM_RULES.banCount;
 let selectedTimer = 30;
 let selectedFirstMove = "A";
-let createTeamA = "";
-let createTeamB = "";
-let customSequence = createDefaultSequence(selectedTeamSize, selectedBanCount, selectedFirstMove);
+let customSequence = createEditorSequence(createDefaultSequence(selectedTeamSize, selectedBanCount, selectedFirstMove));
 let room = null;
 let selectedHeroId = null;
 let heroSearch = "";
@@ -40,7 +40,6 @@ let reconnectHandle = null;
 let timerHandle = null;
 let deadlineSentVersion = null;
 let lastError = "";
-let previewAnimationHandle = null;
 
 window.addEventListener("popstate", () => route());
 window.addEventListener("beforeunload", () => closeSocket());
@@ -49,7 +48,6 @@ route();
 
 function route() {
   stopTimer();
-  stopPreviewAnimation();
   closeSocket();
   selectedHeroId = null;
   heroSearch = "";
@@ -110,58 +108,50 @@ function currentCustomRules() {
   return {
     teamSize: selectedTeamSize,
     banCount: selectedBanCount,
-    firstSide: selectedFirstMove === "B" ? "B" : "A",
-    sequence: customSequence.map(({ action, side }) => ({ action, side }))
+    sequence: compactCreateSequence()
   };
 }
 
-function currentCreateRules() {
-  return buildRules("standard", selectedTimer, currentCustomRules());
+function createEditorSequence(sequence) {
+  const slotCount = selectedTeamSize * 2 + MAX_BANS_PER_TEAM * 2;
+  return [...sequence, ...Array.from({ length: Math.max(0, slotCount - sequence.length) }, () => null)];
 }
 
-function renderCreatePreview() {
-  try {
-    const rules = currentCreateRules();
-    const bans = { A: 0, B: 0 };
-    rules.sequence.filter((step) => step.action === "ban").forEach((step) => { bans[step.side] += 1; });
-    return `
-      <div class="preview-board" aria-label="Предпросмотр драфта">
-        <div class="preview-board__heading"><span class="team-a">Команда 1</span><span class="preview-vs">VS</span><span class="team-b">Команда 2</span></div>
-        <div class="preview-team-row team-a"><strong>Команда 1</strong><div class="preview-slots">${renderPreviewSlots(rules.teamSize, bans.A)}</div></div>
-        <div class="preview-team-row team-b"><strong>Команда 2</strong><div class="preview-slots">${renderPreviewSlots(rules.teamSize, bans.B)}</div></div>
-      </div>
-      <div class="preview-sequence" aria-label="Анимация последовательности">
-        ${rules.sequence.map((step, index) => `<span class="preview-step ${step.action === "ban" ? "ban" : "pick"} ${index === 0 ? "active" : ""}" data-preview-step="${index}" title="Шаг ${index + 1}: ${step.action === "ban" ? "бан" : "пик"} команды ${step.side}">${step.action === "ban" ? "×" : "✓"}</span>`).join("")}
-      </div>
-      <div class="preview-meta"><span>${rules.teamSize} × ${rules.teamSize}</span><span>${rules.banCount} бан${rules.banCount === 1 ? "" : rules.banCount < 5 ? "а" : "ов"}</span><span>${rules.timerSeconds ? `${rules.timerSeconds}с` : "без таймера"}</span></div>
-    `;
-  } catch (cause) {
-    return `<div class="error-box">${escapeHtml(errorMessage(cause))}</div>`;
+function compactCreateSequence() {
+  const firstEmptyIndex = customSequence.findIndex((step) => !step);
+  if (firstEmptyIndex >= 0 && customSequence.slice(firstEmptyIndex).some(Boolean)) {
+    throw new Error("Заполните последовательность без пропусков между шагами");
   }
-}
-
-function renderPreviewSlots(teamSize, banCount) {
-  return Array.from({ length: teamSize + banCount }, (_, index) => `<span class="preview-slot ${index >= teamSize ? "preview-slot--ban" : ""}" aria-hidden="true"></span>`).join("");
+  return customSequence.filter(Boolean).map(({ action, side }) => ({ action, side }));
 }
 
 function renderSequenceEditor() {
   return `
     <div class="sequence-editor" aria-label="Настройка порядка банов и пиков">
-      <div class="sequence-editor__header"><span>Порядок действий</span><span class="sequence-editor__hint">Нажмите на шаг — бан и пик поменяются местами</span></div>
+      <div class="sequence-editor__header"><span>Последовательность пиков и банов</span><span class="sequence-editor__hint">Нажмите ячейку: пик → бан → пусто</span></div>
       <div class="sequence-editor__scroll">
         <div class="sequence-editor__grid" style="--sequence-length:${customSequence.length}">
-          <div class="sequence-row-label sequence-row-label--spacer" aria-hidden="true"></div><div class="sequence-track sequence-track--numbers">${customSequence.map((_, index) => `<span>${index + 1}</span>`).join("")}</div>
-          <div class="sequence-row-label">Команда 1</div><div class="sequence-track">${customSequence.map((step, index) => step.side === "A" ? `<button class="sequence-editor-step ${step.action === "ban" ? "ban" : "pick"}" type="button" data-sequence-index="${index}" aria-label="Шаг ${index + 1}: ${step.action === "ban" ? "бан" : "пик"} команды 1"><span aria-hidden="true">${step.action === "ban" ? "×" : "✓"}</span></button>` : "<span class=\"sequence-empty\"></span>").join("")}</div>
-          <div class="sequence-row-label">Команда 2</div><div class="sequence-track">${customSequence.map((step, index) => step.side === "B" ? `<button class="sequence-editor-step ${step.action === "ban" ? "ban" : "pick"}" type="button" data-sequence-index="${index}" aria-label="Шаг ${index + 1}: ${step.action === "ban" ? "бан" : "пик"} команды 2"><span aria-hidden="true">${step.action === "ban" ? "×" : "✓"}</span></button>` : "<span class=\"sequence-empty\"></span>").join("")}</div>
+          <div class="sequence-track sequence-track--numbers">${customSequence.map((_, index) => `<span>${index + 1}</span>`).join("")}</div>
+          ${renderSequenceTrack("A")}
+          ${renderSequenceTrack("B")}
         </div>
       </div>
-      <p class="field-hint">Крестик — бан, галочка — пик. Количество шагов фиксировано выбранными форматом и числом банов.</p>
+      <p class="field-hint">Серые ячейки — пустые шаги. Галочка — пик, крестик — бан. Шаги нельзя пропускать при создании комнаты.</p>
     </div>
   `;
 }
 
+function renderSequenceTrack(side) {
+  return `<div class="sequence-track sequence-track--${side.toLowerCase()}">${customSequence.map((step, index) => {
+    const active = step?.side === side;
+    const state = active ? step.action : "empty";
+    const symbol = state === "ban" ? "×" : state === "pick" ? "✓" : "";
+    const label = active ? `${state === "ban" ? "Бан" : "Пик"}, шаг ${index + 1}` : `Пусто, шаг ${index + 1}`;
+    return `<button class="sequence-editor-step ${state}" type="button" data-sequence-index="${index}" data-sequence-side="${side}" aria-label="${label}"><span aria-hidden="true">${symbol}</span></button>`;
+  }).join("")}</div>`;
+}
+
 function renderCreate() {
-  stopPreviewAnimation();
   app.innerHTML = `
     ${renderBrand()}
     <section class="create-layout">
@@ -184,16 +174,7 @@ function renderCreate() {
           </div>
 
           <div class="field field--wide">
-            <span class="field-title">Первый ход</span>
-            <div class="chip-row" role="group" aria-label="Команда первого хода">
-              <button type="button" data-first-move="A" class="${selectedFirstMove === "A" ? "active" : ""}">Команда 1</button>
-              <button type="button" data-first-move="B" class="${selectedFirstMove === "B" ? "active" : ""}">Команда 2</button>
-              <button type="button" data-first-move="random" class="${selectedFirstMove === "random" ? "active" : ""}">Рандом</button>
-            </div>
-          </div>
-
-          <div class="field field--wide">
-            <span class="field-title">Баны</span>
+            <span class="field-title">Баны на команду</span>
             <div class="chip-row" role="group" aria-label="Количество банов">
               ${BAN_COUNTS.map((count) => `<button type="button" data-ban-count="${count}" class="${count === selectedBanCount ? "active" : ""}">${count === 0 ? "—" : count}</button>`).join("")}
             </div>
@@ -206,13 +187,13 @@ function renderCreate() {
             </div>
           </div>
 
-          <div class="field">
-            <label for="team-a">Команда 1</label>
-            <input id="team-a" maxlength="40" value="${escapeAttr(createTeamA)}" placeholder="Команда 1" autocomplete="off" />
-          </div>
-          <div class="field">
-            <label for="team-b">Команда 2</label>
-            <input id="team-b" maxlength="40" value="${escapeAttr(createTeamB)}" placeholder="Команда 2" autocomplete="off" />
+          <div class="field field--wide">
+            <span class="field-title">Первый ход</span>
+            <div class="chip-row" role="group" aria-label="Команда первого хода">
+              <button type="button" data-first-move="A" class="${selectedFirstMove === "A" ? "active" : ""}">Команда 1</button>
+              <button type="button" data-first-move="B" class="${selectedFirstMove === "B" ? "active" : ""}">Команда 2</button>
+              <button type="button" data-first-move="random" class="${selectedFirstMove === "random" ? "active" : ""}">Рандом</button>
+            </div>
           </div>
         </div>
 
@@ -225,26 +206,18 @@ function renderCreate() {
         </div>
         <div id="create-error"></div>
       </div>
-
-      <aside class="panel create-preview">
-        <div class="preview-heading"><h2>Предпросмотр</h2><span class="preview-live"><i aria-hidden="true"></i> LIVE</span></div>
-        <div id="create-preview">${renderCreatePreview()}</div>
-        <div class="notice">${createMode === "online" ? "После создания ты попадёшь в комнату ожидания и отправишь ссылку сопернику." : "Соло работает только в этом браузере и не создаёт сетевую комнату."}</div>
-      </aside>
     </section>
     <div class="ad-zone" aria-label="Реклама"></div>
   `;
 
   app.querySelectorAll("[data-mode]").forEach((button) => {
     button.addEventListener("click", () => {
-      rememberCreateInputs();
       createMode = button.dataset.mode;
       renderCreate();
     });
   });
   app.querySelectorAll("[data-team-size]").forEach((button) => {
     button.addEventListener("click", () => {
-      rememberCreateInputs();
       selectedTeamSize = Number(button.dataset.teamSize);
       resetCreateSequence();
       renderCreate();
@@ -252,7 +225,6 @@ function renderCreate() {
   });
   app.querySelectorAll("[data-ban-count]").forEach((button) => {
     button.addEventListener("click", () => {
-      rememberCreateInputs();
       selectedBanCount = Number(button.dataset.banCount);
       resetCreateSequence();
       renderCreate();
@@ -260,74 +232,33 @@ function renderCreate() {
   });
   app.querySelectorAll("[data-first-move]").forEach((button) => {
     button.addEventListener("click", () => {
-      rememberCreateInputs();
       selectedFirstMove = button.dataset.firstMove;
-      resetCreateSequence();
       renderCreate();
     });
   });
   app.querySelectorAll("[data-timer]").forEach((button) => {
     button.addEventListener("click", () => {
-      rememberCreateInputs();
       selectedTimer = Number(button.dataset.timer);
       renderCreate();
     });
   });
 
-  app.querySelector("#team-a")?.addEventListener("input", (event) => {
-    createTeamA = event.target.value.slice(0, 40);
-  });
-  app.querySelector("#team-b")?.addEventListener("input", (event) => {
-    createTeamB = event.target.value.slice(0, 40);
-  });
   app.querySelectorAll("[data-sequence-index]").forEach((button) => {
     button.addEventListener("click", () => {
-      cycleCreateSequence(Number(button.dataset.sequenceIndex));
+      cycleCreateSequence(Number(button.dataset.sequenceIndex), button.dataset.sequenceSide);
       renderCreate();
     });
   });
   app.querySelector("#create-draft").addEventListener("click", () => void createDraft());
-  startPreviewAnimation();
-}
-
-function rememberCreateInputs() {
-  const teamA = app.querySelector("#team-a");
-  const teamB = app.querySelector("#team-b");
-  if (teamA) createTeamA = teamA.value.slice(0, 40);
-  if (teamB) createTeamB = teamB.value.slice(0, 40);
 }
 
 function resetCreateSequence() {
   const firstSide = selectedFirstMove === "B" ? "B" : "A";
-  customSequence = createDefaultSequence(selectedTeamSize, selectedBanCount, firstSide);
+  customSequence = createEditorSequence(createDefaultSequence(selectedTeamSize, selectedBanCount, firstSide));
 }
 
-function cycleCreateSequence(index) {
-  const current = customSequence[index];
-  if (!current) return;
-  const sameSide = customSequence.findIndex((step, candidateIndex) => candidateIndex > index && step.action !== current.action && step.side === current.side);
-  const anySide = customSequence.findIndex((step, candidateIndex) => candidateIndex > index && step.action !== current.action);
-  const nextStep = customSequence.findIndex((step, candidateIndex) => candidateIndex > index && step.action === current.action);
-  const targetIndex = sameSide >= 0 ? sameSide : anySide >= 0 ? anySide : nextStep;
-  if (targetIndex < 0) return;
-  [customSequence[index], customSequence[targetIndex]] = [customSequence[targetIndex], customSequence[index]];
-}
-
-function startPreviewAnimation() {
-  const steps = [...app.querySelectorAll("[data-preview-step]")];
-  if (!steps.length) return;
-  let activeIndex = 0;
-  previewAnimationHandle = window.setInterval(() => {
-    steps.forEach((step, index) => step.classList.toggle("active", index === activeIndex));
-    activeIndex = (activeIndex + 1) % steps.length;
-  }, 900);
-}
-
-function stopPreviewAnimation() {
-  if (previewAnimationHandle) {
-    clearInterval(previewAnimationHandle);
-    previewAnimationHandle = null;
-  }
+function cycleCreateSequence(index, side) {
+  customSequence = cycleSequenceCell(customSequence, index, side);
 }
 
 async function createDraft() {
@@ -335,19 +266,13 @@ async function createDraft() {
   const error = app.querySelector("#create-error");
   button.disabled = true;
   error.innerHTML = "";
-  rememberCreateInputs();
-  const teamNames = { A: createTeamA, B: createTeamB };
 
   try {
-    const customRules = {
-      teamSize: selectedTeamSize,
-      banCount: selectedBanCount,
-      sequence: customSequence.map(({ action, side }) => ({ action, side }))
-    };
+    const customRules = currentCustomRules();
     const firstMove = resolveLocalFirstSide(selectedFirstMove);
     const rules = buildRules("standard", selectedTimer, { ...customRules, firstSide: firstMove });
     if (createMode === "solo") {
-      room = createLocalRoom(rules, teamNames);
+      room = createLocalRoom(rules);
       sessionStorage.setItem(SOLO_KEY, JSON.stringify(room));
       history.pushState({}, "", "/draft/solo");
       route();
@@ -357,7 +282,7 @@ async function createDraft() {
     const response = await fetch("/draft/api/rooms", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ presetId: "standard", timerSeconds: selectedTimer, firstMove: selectedFirstMove, teamNames, customRules })
+      body: JSON.stringify({ presetId: "standard", timerSeconds: selectedTimer, firstMove: selectedFirstMove, customRules })
     });
     const payload = await safeJson(response);
     if (!response.ok) {
@@ -418,7 +343,7 @@ function renderLobby() {
       <div class="lobby-status"><i aria-hidden="true"></i>Ожидание игроков</div>
       <h1 class="lobby-title"><span class="team-a">${escapeHtml(room.teamNames.A)}</span><em>VS</em><span class="team-b">${escapeHtml(room.teamNames.B)}</span></h1>
       <div class="lobby-roomline"><span>ROOM <strong>${escapeHtml(roomCode || "")}</strong></span>${ownSide === "A" ? `<button class="secondary-button" id="copy-opponent" type="button">Ссылка сопернику</button>` : `<button class="secondary-button" id="copy-room" type="button">Скопировать ссылку</button>`}</div>
-      <div class="lobby-meta"><span>${room.rules.teamSize}v${room.rules.teamSize}</span><span>${room.rules.banCount} бан${room.rules.banCount === 1 ? "" : room.rules.banCount < 5 ? "а" : "ов"}</span><span>${room.rules.timerSeconds ? `${room.rules.timerSeconds}с таймер` : "без таймера"}</span><span>Первый ход: ${firstSide}</span></div>
+      <div class="lobby-meta"><span>${room.rules.teamSize}v${room.rules.teamSize}</span><span>${formatRoomBans(room.rules)}</span><span>${room.rules.timerSeconds ? `${room.rules.timerSeconds}с таймер` : "без таймера"}</span><span>Первый ход: ${firstSide}</span></div>
       ${lastError ? `<div class="error-box">${escapeHtml(lastError)}</div>` : ""}
       <div class="lobby-teams">${lobbyTeam("A")}${lobbyTeam("B")}</div>
       <p class="lobby-help">Отправь ссылку сопернику. Драфт начнётся, когда оба игрока займут места и нажмут «Готов».</p>
@@ -433,6 +358,15 @@ function renderLobby() {
   app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
   app.querySelector("#copy-room")?.addEventListener("click", () => void copyText(`${location.origin}/draft/${roomCode}`, "Ссылка комнаты скопирована"));
   app.querySelector("#new-draft")?.addEventListener("click", () => navigate("/draft"));
+}
+
+function formatRoomBans(rules) {
+  const counts = rules.banCounts || rules.sequence.reduce((result, step) => {
+    if (step.action === "ban") result[step.side] += 1;
+    return result;
+  }, { A: 0, B: 0 });
+  if (counts.A === counts.B) return `${counts.A} бан${counts.A === 1 ? "" : counts.A < 5 ? "а" : "ов"} на команду`;
+  return `Баны ${counts.A}/${counts.B}`;
 }
 
 function renderRoom() {

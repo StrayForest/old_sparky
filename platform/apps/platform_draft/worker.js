@@ -1,4 +1,4 @@
-import { buildRules, DEFAULT_CUSTOM_RULES, validateSequence } from "./public/draft-core.js";
+import { buildRules, DEFAULT_CUSTOM_RULES, MAX_BANS_PER_TEAM, validateSequence } from "./public/draft-core.js";
 import { HERO_BY_ID } from "./public/heroes.js";
 
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
@@ -415,10 +415,10 @@ async function createRoom(request, env) {
         })
       : null;
     const firstSide = resolveFirstSide(payload?.firstMove);
-    rules = alignFirstStep(buildRules(presetId, timerSeconds, {
+    rules = buildRules(presetId, timerSeconds, {
       ...(customRules || {}),
       firstSide
-    }), firstSide);
+    });
     validateRules(rules);
   } catch {
     return json({ error: "Некорректные правила" }, 400);
@@ -487,7 +487,7 @@ function validateRules(rules) {
   if (!rules || ![2, 4, 6].includes(rules.teamSize) || ![0, 30, 45, 60, 90].includes(rules.timerSeconds)) {
     throw new Error("invalid rules");
   }
-  if (!Number.isInteger(rules.banCount) || rules.banCount < 0 || rules.banCount > 6) {
+  if (!Number.isInteger(rules.banCount) || rules.banCount < 0 || rules.banCount > MAX_BANS_PER_TEAM) {
     throw new Error("invalid sequence");
   }
   if (!Array.isArray(rules.sequence)) throw new Error("invalid sequence");
@@ -509,7 +509,7 @@ function validateCustomCreateSettings(value) {
   if (keys.length !== 3 || keys.join(",") !== "banCount,sequence,teamSize") {
     throw new Error("invalid custom settings");
   }
-  if (!Number.isInteger(value.teamSize) || ![2, 4, 6].includes(value.teamSize) || !Number.isInteger(value.banCount) || value.banCount < 0 || value.banCount > 6) {
+  if (!Number.isInteger(value.teamSize) || ![2, 4, 6].includes(value.teamSize) || !Number.isInteger(value.banCount) || value.banCount < 0 || value.banCount > MAX_BANS_PER_TEAM) {
     throw new Error("invalid custom team size");
   }
   if (!Array.isArray(value.sequence) || value.sequence.some((step) => !step || Object.keys(step).sort().join(",") !== "action,side")) throw new Error("invalid custom sequence");
@@ -573,15 +573,6 @@ function advanceRoomWithAutoAction(room, now) {
   return true;
 }
 
-function alignFirstStep(rules, firstSide) {
-  const firstIndex = rules.sequence.findIndex((step) => step.side === firstSide);
-  if (firstIndex > 0) {
-    [rules.sequence[0], rules.sequence[firstIndex]] = [rules.sequence[firstIndex], rules.sequence[0]];
-    rules.sequence = rules.sequence.map((step, index) => ({ ...step, index }));
-  }
-  return rules;
-}
-
 function heroUsed(room, heroId) {
   return room.picks.A.includes(heroId) || room.picks.B.includes(heroId) || room.bans.A.includes(heroId) || room.bans.B.includes(heroId);
 }
@@ -612,12 +603,46 @@ function cleanTeamName(value, fallback) {
 }
 
 function originAllowed(request, env) {
+  if (isLocalRequestHost(request)) return true;
+  if (sameOriginRefererAllowed(request)) return true;
   const origin = request.headers.get("Origin");
-  if (!origin) return false;
+  if (!origin) return sameOriginHostAllowed(request, env);
   if (origin === env.ALLOWED_ORIGIN) return true;
+  if (/^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/u.test(origin)) return true;
   try {
     const url = new URL(origin);
     return ["localhost", "127.0.0.1"].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function sameOriginRefererAllowed(request) {
+  const referer = request.headers.get("Referer");
+  if (!referer) return false;
+  try {
+    const requestUrl = new URL(request.url);
+    const refererUrl = new URL(referer);
+    return refererUrl.protocol === requestUrl.protocol && refererUrl.hostname === requestUrl.hostname;
+  } catch {
+    return false;
+  }
+}
+
+function sameOriginHostAllowed(request, env) {
+  try {
+    const requestUrl = new URL(request.url);
+    const allowedUrl = new URL(env.ALLOWED_ORIGIN);
+    return requestUrl.hostname === allowedUrl.hostname || isLocalRequestHost(request);
+  } catch {
+    return false;
+  }
+}
+
+function isLocalRequestHost(request) {
+  try {
+    const url = new URL(request.url);
+    return ["localhost", "127.0.0.1"].includes(url.hostname) || (url.protocol === "http:" && url.hostname === "old-sparky.com");
   } catch {
     return false;
   }
