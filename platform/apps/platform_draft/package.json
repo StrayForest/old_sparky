@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check worker.js && node --check public/app.js && node --check public/draft-core.js && node --check public/heroes.js",
+    "build": "node build-assets.mjs",
+    "check": "node --check worker.js && node --check build-assets.mjs && node --check public/app.js && node --check public/draft-core.js && node --check public/heroes.js",
     "test": "node --test tests/*.test.mjs"
   }
 }
