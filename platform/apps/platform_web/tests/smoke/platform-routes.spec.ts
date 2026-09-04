@@ -105,15 +105,23 @@ test("document CSP uses one fresh nonce and leaves static responses unscoped", a
   expect(Buffer.from(firstNonce, "base64")).toHaveLength(16);
   expect(Buffer.from(secondNonce, "base64")).toHaveLength(16);
   expect(secondNonce).not.toBe(firstNonce);
+  const scriptSrc = firstPolicy.split("; ").find((directive) => directive.startsWith("script-src "));
+  expect(scriptSrc).toBe(
+    `script-src 'nonce-${firstNonce}' 'unsafe-inline' 'unsafe-eval' 'strict-dynamic' https: http:`
+  );
   expect(firstPolicy).toContain("script-src-attr 'none'");
-  expect(firstPolicy).toContain("style-src-attr 'none'");
+  expect(firstPolicy).toContain("style-src 'self' 'nonce-");
+  expect(firstPolicy).toContain("style-src-attr 'unsafe-inline'");
   expect(firstPolicy).toContain("worker-src 'self'");
   expect(firstPolicy).toContain("'strict-dynamic'");
   expect(firstPolicy).toContain("https://pagead2.googlesyndication.com");
   expect(firstPolicy).toContain("https://googleads.g.doubleclick.net");
   expect(firstPolicy).toContain("https://fundingchoicesmessages.google.com");
+  expect(firstPolicy).toContain("https://csi.gstatic.com");
   expect(firstPolicy).toContain("https://i2.ytimg.com https://i3.ytimg.com");
-  expect(firstPolicy).not.toMatch(/'unsafe-inline'|'unsafe-eval'|\bhttp:|\*|\bdata:/);
+  expect(firstPolicy).not.toMatch(/script-src[^;]*(?:https:\/\/|http:\/\/|pagead2|doubleclick|google)/u);
+  expect(firstPolicy).not.toMatch(/style-src 'self' 'nonce-[^']+' 'unsafe-inline'/u);
+  expect(firstPolicy).not.toMatch(/\*|\bdata:/);
   expect(first.headers()["reporting-endpoints"]).toBe(
     'csp-endpoint="/api/v1/security/csp-report"'
   );

@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-04
 
 This is the special CSP/browser/live-user QA path. Normal production release,
 rollback and release-transaction recovery are owned by
@@ -25,28 +25,15 @@ cd /root/old_sparky
 platform/tools/platform_build_release.sh <release-slug>
 ```
 
-The Report-Only candidate omits a dependency baseline. The separate
-enforcement build must name the accepted candidate release directory by its
-absolute path:
-
-```bash
-cd /root/old_sparky
-platform/tools/platform_build_release.sh \
-  --dependency-baseline \
-  /root/old_sparky/platform/dist/releases/<candidate-release-slug> \
-  <enforcement-release-ref>
-```
-
-That gate requires byte-identical direct requirements, the tracked hash-locked
-Python lock, generated freeze, wheelhouse manifest and web package lock.
-Omission of the flag or any drift is a failed enforcement build, because the
-only accepted candidate-to-final runtime delta is the reviewed CSP header-mode
-line. Every build installs the hash-locked `requirements-platform.lock.txt`,
-regenerates the sorted freeze and refuses any package-pin difference before
-packaging. For this CSP candidate the tracked lock's package pins must also
-equal the accepted active production freeze; dependency updates require their
-own reviewed release. Release builds require the exact
-reviewed Node `26.3.1` and npm `11.16.0` toolchain recorded in `RELEASE.json`.
+Every CSP release is built once as an immutable enforced release. There is no
+production Report-Only candidate or temporary mode switch. The build gate
+requires byte-identical direct requirements, the tracked hash-locked Python
+lock, generated freeze, wheelhouse manifest and web package lock. Every build
+installs the hash-locked `requirements-platform.lock.txt`, regenerates the
+sorted freeze and refuses any package-pin difference before packaging.
+Dependency updates require their own reviewed release. Release builds require
+the exact reviewed Node `26.3.1` and npm `11.16.0` toolchain recorded in
+`RELEASE.json`.
 
 Record the tarball path, SHA-256 and source commit from `RELEASE.json`.
 Verify the adjacent immutable checksum before installation; the installer
@@ -77,11 +64,11 @@ tools/platform_release_preflight.sh \
   --edge-origin https://127.0.0.1 \
   --edge-host old-sparky.com \
   --edge-insecure-loopback \
-  --expected-csp-mode report-only
+  --expected-csp-mode enforce
 /opt/oldsparky/platform/shared/venv/bin/python \
   tools/platform_deploy_smoke.py \
   --edge-origin https://old-sparky.com \
-  --expected-csp-mode report-only
+  --expected-csp-mode enforce
 ```
 
 Do not print the shared environment. Use `--skip-python-deps` only after
@@ -97,10 +84,9 @@ preparer for the newly current release before restart; this creates and owns
 the intentionally unbundled `.next/cache` mount target plus the existing
 shared worker/media runtime directories. Never restart `deadlock-web` against
 a new release before that preparation succeeds.
-Pass `--expected-csp-mode enforce` for an enforcement release. For the initial
-CSP ownership transfer, restart the nonce-capable web process and immediately
-apply/reload the validated CSP-free Nginx pair; do not run smoke in the brief
-intermediate state where both layers still emit Report-Only CSP.
+Pass `--expected-csp-mode enforce` for the release. The nonce-capable web
+process owns the document policy and Nginx remains CSP-free; do not run smoke
+until the new web process is ready and the validated Nginx pair is active.
 
 ## Nginx changes
 
@@ -122,58 +108,40 @@ Dry-run is the default. The candidate must pass its policy validator and
   --edge-origin https://127.0.0.1 \
   --edge-host old-sparky.com \
   --edge-insecure-loopback \
-  --expected-csp-mode report-only
+  --expected-csp-mode enforce
 ```
 
 `--edge-insecure-loopback` is forbidden for non-loopback origins. Public smoke
-keeps normal certificate verification. The CSP mode is mandatory and must
-match the candidate (`report-only`) or final release (`enforce`).
+keeps normal certificate verification. The CSP mode is mandatory and must be
+`enforce` for every production release.
 The loopback/SNI smoke requires ready health `200`; the public smoke requires
 the intentionally private health endpoint to return `403` with the shared
 non-document security headers.
 
-## CSP two-release maintenance window
+## CSP production change
 
-The standard sequence below remains the required default for future CSP mode
-changes. The 2026-08-13 activation was an explicit owner exception: enforcement
-was activated after the owner waived manual auth/Turnstile, repeated
-enforcement browser and 30-minute/24-hour observation evidence. Do not
-reuse that exception implicitly or record the waived gates as passed.
-
-1. Build and activate an immutable fail-closed candidate using the normal
-   release flow above and `--expected-csp-mode report-only` for both origin/SNI
-   and public smoke.
+1. Build and activate one immutable release with the enforced policy described
+   in the [security runbook](security-runbook.md). Do not deploy a temporary
+   Report-Only policy.
 2. Run all release/security gates, both live-user contours below and the
    complete applicable QA/performance contour. A passing deploy smoke or only
-   one live-user contour is not the candidate gate.
-3. After synthetic probes finish, observe for at least 30 clean minutes. There
-   must be no unexplained first-party CSP report, missing/duplicate/wrong-mode
-   header, nonce/cache failure, new 5xx/service warning, queue/DB pressure or
-   accepted-performance regression. Classify browser-extension noise without
-   weakening the allowlist.
-4. Create a separate immutable release whose reviewed source delta is the
-   one-line response-header selection from Report-Only to enforcement. Build
-   it with `--dependency-baseline` pointing at the accepted candidate release
-   directory as shown above; dependency drift or an omitted baseline blocks
-   progression. Do not edit the candidate artifact in place. Activate it and
-   repeat origin/SNI and public smoke with `--expected-csp-mode enforce`, then
-   repeat both live-user contours with a fresh marker.
-5. Keep the Report-Only candidate as `previous` and observe enforcement for 24
-   hours. Follow CSP telemetry, critical browser journeys, health/journals,
-   queue/DB/system pressure and the accepted performance contour. Record
-   rollout evidence in private reports and update current state only after it
-   exists.
+   one live-user contour is not the release gate.
+3. Observe the enforced release for at least 24 hours. There must be no
+   unexplained first-party CSP report, missing/duplicate/wrong-mode header,
+   nonce/cache failure, new 5xx/service warning, queue/DB pressure or accepted
+   performance regression. Classify browser-extension noise without weakening
+   the policy.
 
 Any wrong CSP mode, unexpected directive/source, reused or short nonce,
 nonce-bearing cached HTML, live-user cleanup failure or unexplained first-party
-violation stops progression. Never add `unsafe-inline`, `unsafe-eval` or an
-origin just to make a report disappear. The exact policy, ownership and report
-limiter are in the [security runbook](security-runbook.md).
+violation stops progression. The `script-src` compatibility tokens and the
+AdSense style-attribute exception are intentional parts of the documented
+policy; do not add unrelated sources to silence a report. The exact policy,
+ownership and report limiter are in the [security runbook](security-runbook.md).
 
 ## CSP live-user gates
 
-Candidate and enforcement each require two independent contours, in this
-order:
+Each production release requires two independent contours, in this order:
 
 1. an automated tournament/roster/bracket journey using short-lived QA
    sessions and no authentication route or Turnstile;
@@ -550,29 +518,15 @@ tools/platform_release_rollback.sh
 ```
 
 The rollback script applies by default; it has no `--apply` option and must
-never be invoked with one. A final CSP release rolls back to the Report-Only
-candidate by symlink/service rollback only because both releases use the same
-CSP-free Nginx pair. Validate that rollback with the candidate tool and
-`--expected-csp-mode report-only`.
+never be invoked with one. A CSP release rolls back to the previous enforced
+application release by the normal pointer/service rollback. Both releases
+keep the document policy in the Next.js proxy; rollback does not enable a
+diagnostic Report-Only policy.
 
-When rolling the initial CSP candidate back to the pre-change release, restore
-the previous release's Nginx vhost/snippet pair first, then switch the app:
+Validate the restored release with the rollback tool and
+`--expected-csp-mode enforce`.
 
-```bash
-cd /opt/oldsparky/platform/current
-tools/platform_release_rollback.sh --dry-run
-/opt/oldsparky/platform/shared/venv/bin/python \
-  /opt/oldsparky/platform/previous/tools/platform_install_nginx.py \
-  --apply --reload --json
-tools/platform_release_rollback.sh
-```
-
-Here `--apply` belongs only to the previous release's Nginx installer; the
-release rollback command has no such option. Installing the previous Nginx
-pair before switching the application deliberately prefers a brief duplicate
-Report-Only policy over a gap with no CSP owner.
-
-After a candidate-to-pre-change rollback, rerun preflight and invoke that old
-release's deploy-smoke tool without `--expected-csp-mode`; that option did not
-exist before nonce CSP. Do not downgrade DB migrations automatically; use a
-compatible release or a reviewed forward fix.
+If a rollback ever targets a release predating nonce CSP, rerun preflight and
+invoke that old release's deploy-smoke tool without `--expected-csp-mode`; that
+option did not exist in those releases. Do not downgrade DB migrations
+automatically; use a compatible release or a reviewed forward fix.

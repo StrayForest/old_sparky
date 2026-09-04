@@ -30,20 +30,27 @@ DEFAULT_SERVICES = ("deadlock-api", "deadlock-worker", "deadlock-web", "nginx")
 
 EXPECTED_CSP_POLICY_TEMPLATE = (
     "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; "
-    "object-src 'none'; script-src 'self' 'nonce-{nonce}' 'strict-dynamic' https://challenges.cloudflare.com "
-    "https://static.cloudflareinsights.com https://pagead2.googlesyndication.com; script-src-attr 'none'; "
-    "style-src 'self' 'nonce-{nonce}'; style-src-attr 'none'; "
+    "object-src 'none'; script-src 'nonce-{nonce}' 'unsafe-inline' 'unsafe-eval' "
+    "'strict-dynamic' https: http:; script-src-attr 'none'; "
+    "style-src 'self' 'nonce-{nonce}'; style-src-attr 'unsafe-inline'; "
     "img-src 'self' blob: https://cdn.old-sparky.com "
     "https://steamstore-a.akamaihd.net "
     "https://clan.fastly.steamstatic.com https://deadlock.io "
     "https://assets-bucket.deadlock-api.com https://i2.ytimg.com https://i3.ytimg.com "
-    "https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net; "
-    "connect-src 'self' https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://fundingchoicesmessages.google.com; "
+    "https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://csi.gstatic.com; "
+    "connect-src 'self' https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net "
+    "https://fundingchoicesmessages.google.com https://csi.gstatic.com; "
     "frame-src https://challenges.cloudflare.com https://googleads.g.doubleclick.net https://tpc.googlesyndication.com; font-src 'self'; manifest-src 'self'; "
     "media-src 'none'; worker-src 'self'; report-uri /api/v1/security/csp-report; "
     "report-to csp-endpoint"
 )
 EXPECTED_REPORTING_ENDPOINTS = 'csp-endpoint="/api/v1/security/csp-report"'
+EXPECTED_ADSENSE_CLIENT = "ca-pub-7185165276065459"
+EXPECTED_ADSENSE_SLOT = "4365553701"
+EXPECTED_ADSENSE_LOADER = (
+    "https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client="
+    f"{EXPECTED_ADSENSE_CLIENT}"
+)
 EXPECTED_COMMON_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "strict-origin-when-cross-origin",
@@ -334,8 +341,9 @@ class _InlinePolicyParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.inline_script_nonces: list[str | None] = []
         self.style_nonces: list[str | None] = []
-        self.style_attribute_count = 0
         self.event_handler_count = 0
+        self.adsense_loader_srcs: list[str] = []
+        self.adsense_slots: list[dict[str, str | None]] = []
 
     def handle_starttag(
         self,
@@ -343,12 +351,21 @@ class _InlinePolicyParser(HTMLParser):
         attrs: list[tuple[str, str | None]],
     ) -> None:
         normalized = {name.lower(): value for name, value in attrs}
-        if tag.lower() == "script" and "src" not in normalized:
-            self.inline_script_nonces.append(normalized.get("nonce"))
+        if tag.lower() == "script":
+            if "src" not in normalized:
+                self.inline_script_nonces.append(normalized.get("nonce"))
+            elif (
+                normalized.get("src") is not None
+                and "adsbygoogle.js" in normalized["src"]
+            ):
+                self.adsense_loader_srcs.append(normalized["src"])
         elif tag.lower() == "style":
             self.style_nonces.append(normalized.get("nonce"))
-        if "style" in normalized:
-            self.style_attribute_count += 1
+        elif (
+            tag.lower() == "ins"
+            and "adsbygoogle" in (normalized.get("class") or "").split()
+        ):
+            self.adsense_slots.append(normalized)
         self.event_handler_count += sum(
             1 for name in normalized if name.startswith("on")
         )
@@ -413,10 +430,31 @@ def document_csp_header_errors(
         errors.append(f"inline scripts without document nonce: {invalid_inline_scripts}")
     if invalid_style_tags:
         errors.append(f"style tags without document nonce: {invalid_style_tags}")
-    if parser.style_attribute_count:
-        errors.append(f"style attributes present: {parser.style_attribute_count}")
     if parser.event_handler_count:
         errors.append(f"inline event handlers present: {parser.event_handler_count}")
+    return errors
+
+
+def adsense_markup_errors(html: str) -> list[str]:
+    parser = _InlinePolicyParser()
+    parser.feed(html)
+    errors: list[str] = []
+    if len(parser.adsense_loader_srcs) != 1:
+        errors.append(
+            "expected exactly one AdSense loader script, "
+            f"found {len(parser.adsense_loader_srcs)}"
+        )
+    elif parser.adsense_loader_srcs[0] != EXPECTED_ADSENSE_LOADER:
+        errors.append("unexpected AdSense loader source")
+    if len(parser.adsense_slots) != 1:
+        errors.append(
+            "expected exactly one diagnostic AdSense slot, "
+            f"found {len(parser.adsense_slots)}"
+        )
+    elif parser.adsense_slots[0].get("data-ad-client") != EXPECTED_ADSENSE_CLIENT:
+        errors.append("unexpected AdSense publisher on diagnostic slot")
+    elif parser.adsense_slots[0].get("data-ad-slot") != EXPECTED_ADSENSE_SLOT:
+        errors.append("unexpected AdSense diagnostic slot")
     return errors
 
 
@@ -429,6 +467,7 @@ async def check_http_document(
     expected_csp_mode: str,
     contains: str | None = None,
     require_common_security_headers: bool = False,
+    require_adsense_markup: bool = False,
 ) -> dict[str, object]:
     try:
         response = await client.get(url)
@@ -441,6 +480,8 @@ async def check_http_document(
             errors.append(f"missing body text: {contains}")
         if require_common_security_headers:
             errors.extend(common_security_header_errors(response.headers))
+        if require_adsense_markup:
+            errors.extend(adsense_markup_errors(response.text))
         errors.extend(
             document_csp_header_errors(
                 response.headers,
@@ -624,6 +665,7 @@ async def main() -> int:
                     expected_status=200,
                     expected_csp_mode=args.expected_csp_mode,
                     contains="Old Sparky Arena",
+                    require_adsense_markup=True,
                 ),
                 check_next_css_asset(
                     client,
@@ -654,6 +696,7 @@ async def main() -> int:
                     expected_csp_mode=args.expected_csp_mode,
                     contains="Old Sparky Arena",
                     require_common_security_headers=True,
+                    require_adsense_markup=True,
                 ),
                 check_http_document(
                     edge_client,

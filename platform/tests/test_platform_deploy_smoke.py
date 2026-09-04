@@ -140,6 +140,78 @@ class PlatformDeploySmokeTests(unittest.TestCase):
                     [],
                 )
 
+    def test_adsense_strict_csp_model_and_resource_fallbacks_are_exact(self) -> None:
+        policy = MODULE.EXPECTED_CSP_POLICY_TEMPLATE.format(nonce=NONCE)
+        directives = dict(
+            directive.split(" ", 1)
+            for directive in policy.split("; ")
+        )
+
+        self.assertEqual(
+            directives["script-src"],
+            f"'nonce-{NONCE}' 'unsafe-inline' 'unsafe-eval' 'strict-dynamic' https: http:",
+        )
+        self.assertEqual(directives["script-src-attr"], "'none'")
+        self.assertEqual(directives["style-src"], f"'self' 'nonce-{NONCE}'")
+        self.assertEqual(directives["style-src-attr"], "'unsafe-inline'")
+        self.assertEqual(directives["default-src"], "'none'")
+        self.assertEqual(directives["base-uri"], "'none'")
+        self.assertEqual(directives["object-src"], "'none'")
+        self.assertEqual(directives["frame-ancestors"], "'none'")
+        self.assertEqual(directives["form-action"], "'self'")
+        self.assertIn("https://pagead2.googlesyndication.com", directives["img-src"])
+        self.assertIn("https://googleads.g.doubleclick.net", directives["img-src"])
+        self.assertIn("https://csi.gstatic.com", directives["img-src"])
+        self.assertIn("https://fundingchoicesmessages.google.com", directives["connect-src"])
+        self.assertIn("https://csi.gstatic.com", directives["connect-src"])
+        self.assertIn("https://tpc.googlesyndication.com", directives["frame-src"])
+        self.assertNotIn("pagead2.googlesyndication.com", directives["script-src"])
+        self.assertNotIn("doubleclick.net", directives["script-src"])
+
+    def test_adsense_style_attributes_are_allowed_without_relaxing_style_elements(self) -> None:
+        html = (
+            f'<style nonce="{NONCE}">.ad{{display:block}}</style>'
+            '<ins class="adsbygoogle" style="display:block"></ins>'
+        )
+
+        self.assertEqual(
+            MODULE.document_csp_header_errors(
+                document_headers("enforce"), html, "enforce"
+            ),
+            [],
+        )
+        self.assertIn(
+            "style tags without document nonce: 1",
+            MODULE.document_csp_header_errors(
+                document_headers("enforce"),
+                '<style>.ad{display:block}</style>',
+                "enforce",
+            ),
+        )
+
+    def test_adsense_markup_requires_one_loader_and_the_diagnostic_slot(self) -> None:
+        html = (
+            '<script async src="https://pagead2.googlesyndication.com/pagead/js/'
+            'adsbygoogle.js?client=ca-pub-7185165276065459"></script>'
+            '<ins class="adsbygoogle diagnostic-ad" '
+            'data-ad-client="ca-pub-7185165276065459" '
+            'data-ad-slot="4365553701"></ins>'
+        )
+
+        self.assertEqual(MODULE.adsense_markup_errors(html), [])
+        self.assertIn(
+            "unexpected AdSense loader source",
+            MODULE.adsense_markup_errors(html.replace("https://pagead2", "https://evil")),
+        )
+        self.assertIn(
+            "expected exactly one AdSense loader script, found 2",
+            MODULE.adsense_markup_errors(html + html.split("<ins", 1)[0]),
+        )
+        self.assertIn(
+            "unexpected AdSense diagnostic slot",
+            MODULE.adsense_markup_errors(html.replace("4365553701", "9999999999")),
+        )
+
     def test_document_policy_rejects_wrong_mode_unsafe_source_and_short_nonce(self) -> None:
         headers = document_headers("report-only", "c2hvcnQ=")
         headers["Content-Security-Policy-Report-Only"] += " script-src 'unsafe-inline'"
@@ -155,7 +227,6 @@ class PlatformDeploySmokeTests(unittest.TestCase):
         self.assertIn("CSP nonce has less than 128 bits of encoded entropy", errors)
         self.assertIn("unexpected CSP policy", errors)
         self.assertIn("inline scripts without document nonce: 1", errors)
-        self.assertIn("style attributes present: 1", errors)
         self.assertIn("inline event handlers present: 1", errors)
 
     def test_duplicate_document_policy_is_rejected(self) -> None:

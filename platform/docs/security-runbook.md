@@ -2,7 +2,7 @@
 
 - Status: Active how-to and policy
 - Owner: Security and production operator
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-04
 
 ## Security invariants
 
@@ -58,17 +58,39 @@ The Next.js document proxy owns exactly this policy, where `{nonce}` is the
 fresh per-response value:
 
 ```text
-default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' 'nonce-{nonce}' 'strict-dynamic' https://challenges.cloudflare.com https://static.cloudflareinsights.com https://pagead2.googlesyndication.com; script-src-attr 'none'; style-src 'self' 'nonce-{nonce}'; style-src-attr 'none'; img-src 'self' blob: https://cdn.old-sparky.com https://steamstore-a.akamaihd.net https://clan.fastly.steamstatic.com https://deadlock.io https://assets-bucket.deadlock-api.com https://i2.ytimg.com https://i3.ytimg.com https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net; connect-src 'self' https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://fundingchoicesmessages.google.com; frame-src https://challenges.cloudflare.com https://googleads.g.doubleclick.net https://tpc.googlesyndication.com; font-src 'self'; manifest-src 'self'; media-src 'none'; worker-src 'self'; report-uri /api/v1/security/csp-report; report-to csp-endpoint
+default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'nonce-{nonce}' 'unsafe-inline' 'unsafe-eval' 'strict-dynamic' https: http:; script-src-attr 'none'; style-src 'self' 'nonce-{nonce}'; style-src-attr 'unsafe-inline'; img-src 'self' blob: https://cdn.old-sparky.com https://steamstore-a.akamaihd.net https://clan.fastly.steamstatic.com https://deadlock.io https://assets-bucket.deadlock-api.com https://i2.ytimg.com https://i3.ytimg.com https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://csi.gstatic.com; connect-src 'self' https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://fundingchoicesmessages.google.com https://csi.gstatic.com; frame-src https://challenges.cloudflare.com https://googleads.g.doubleclick.net https://tpc.googlesyndication.com; font-src 'self'; manifest-src 'self'; media-src 'none'; worker-src 'self'; report-uri /api/v1/security/csp-report; report-to csp-endpoint
 ```
 
-No `unsafe-inline`, `unsafe-eval`, `data:` or unreviewed origin is permitted.
-The proxy removes client-supplied CSP and `x-nonce` headers, creates 16 random
-bytes for every independent document response, gives that nonce to Next.js
-rendering and emits exactly one mode-selected response header plus the fixed
-`Reporting-Endpoints: csp-endpoint="/api/v1/security/csp-report"` value. The
-active release selects `Content-Security-Policy`. Its immediate rollback
-release selects `Content-Security-Policy-Report-Only`; that one-line response
-header selection is their only reviewed source delta.
+The `script-src` value follows the [official AdSense strict-CSP model](https://support.google.com/adsense/answer/16283098):
+the nonce and `strict-dynamic` control modern browsers, while
+`'unsafe-inline'`, `'unsafe-eval'`, `https:` and `http:` are the documented
+compatibility terms. Browsers that support `strict-dynamic` ignore the host and
+inline fallbacks when a nonce is present. `script-src-attr 'none'` remains an
+explicit protection against inline event handlers.
+
+AdSense creates inline style attributes on its ad elements, so
+`style-src-attr 'unsafe-inline'` is the only style-attribute exception.
+Ordinary `<style>` elements and external CSS remain restricted to the
+document nonce or same-origin sources by `style-src`; the application does not
+emit style attributes itself. The proxy removes client-supplied CSP and
+`x-nonce` headers, creates 16 random bytes for every independent document
+response, gives that nonce to Next.js rendering and emits exactly one enforced
+response header plus the fixed
+`Reporting-Endpoints: csp-endpoint="/api/v1/security/csp-report"` value.
+
+The non-script Google sources are intentionally limited to the observed or
+required resource types: AdSense image/beacon traffic uses
+`pagead2.googlesyndication.com`, `googleads.g.doubleclick.net` and
+`csi.gstatic.com`; consent/beacon traffic uses
+`fundingchoicesmessages.google.com`; and ad frames use
+`googleads.g.doubleclick.net` and `tpc.googlesyndication.com`. New hosts must
+be reproduced in browser evidence before changing this policy.
+
+Production always selects `Content-Security-Policy`; the deploy smoke requires
+that enforced mode and parses the home document for exactly one canonical
+AdSense loader plus diagnostic slot `4365553701`. A rollback returns to the
+previous enforced application release and does not enable a diagnostic
+Report-Only policy.
 
 The proxy matcher owns HTML documents only. API, RSC, Next static, local asset
 and discovery responses have no CSP or Reporting-Endpoints header. Nginx keeps
@@ -92,7 +114,7 @@ Enforcement was activated on 2026-08-13 after the owner explicitly waived the
 manual auth/Turnstile contour, repeated enforcement browser contour and
 30-minute/24-hour observation windows. These gaps must not be represented as
 passed evidence. Keep the live-QA tooling for future targeted validation and
-roll back to the Report-Only `previous` release on a confirmed first-party
+roll back to the previous enforced release on a confirmed first-party
 regression; never weaken the policy merely to silence telemetry.
 
 ## Live CSP QA and mailbox boundary
@@ -137,8 +159,8 @@ it ignores a process-environment API key and stores nothing. Failure output is
 generic; recipient, message ID/body, API key and OTP must never enter argv,
 stderr, journals, QA reports or application logs. The manual attestation must
 validate the exact audit sequence, clean only the resolved manual user/session
-IDs and prove no marker residue remains. Candidate and enforcement each require
-a fresh marker, both contours and both exact cleanups. Because these reviewed
+IDs and prove no marker residue remains. Each CSP release requires a fresh
+marker, both contours and both exact cleanups. Because these reviewed
 tools run as root to maintain the exact-ID secret boundary, they are not a
 filesystem sandbox; the source commit and production origin are part of the
 gate.

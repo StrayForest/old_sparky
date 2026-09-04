@@ -15,12 +15,15 @@ function contentSecurityPolicy(nonce: string): string {
     "form-action 'self'",
     "frame-ancestors 'none'",
     "object-src 'none'",
-    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic' https://challenges.cloudflare.com https://static.cloudflareinsights.com https://pagead2.googlesyndication.com`,
+    `script-src 'nonce-${nonce}' 'unsafe-inline' 'unsafe-eval' 'strict-dynamic' https: http:`,
     "script-src-attr 'none'",
     `style-src 'self' 'nonce-${nonce}'`,
-    "style-src-attr 'none'",
-    "img-src 'self' blob: https://cdn.old-sparky.com https://steamstore-a.akamaihd.net https://clan.fastly.steamstatic.com https://deadlock.io https://assets-bucket.deadlock-api.com https://i2.ytimg.com https://i3.ytimg.com https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net",
-    "connect-src 'self' https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://fundingchoicesmessages.google.com",
+    // AdSense creates inline style attributes on its ad elements. Keep this
+    // exception scoped to attributes; nonce-gate <style> elements and external
+    // stylesheets above.
+    "style-src-attr 'unsafe-inline'",
+    "img-src 'self' blob: https://cdn.old-sparky.com https://steamstore-a.akamaihd.net https://clan.fastly.steamstatic.com https://deadlock.io https://assets-bucket.deadlock-api.com https://i2.ytimg.com https://i3.ytimg.com https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://csi.gstatic.com",
+    "connect-src 'self' https://pagead2.googlesyndication.com https://googleads.g.doubleclick.net https://fundingchoicesmessages.google.com https://csi.gstatic.com",
     "frame-src https://challenges.cloudflare.com https://googleads.g.doubleclick.net https://tpc.googlesyndication.com",
     "font-src 'self'",
     "manifest-src 'self'",

@@ -268,7 +268,7 @@ test("local enforced CSP blocks negative inline and external probes", async ({ p
   expect(result).toEqual({
     handlerRan: false,
     inlineScriptRan: false,
-    styledPosition: "static",
+    styledPosition: "absolute",
   });
   expect(forbiddenRequestCount).toBe(0);
   await expect.poll(async () => page.evaluate(() => (
@@ -278,8 +278,12 @@ test("local enforced CSP blocks negative inline and external probes", async ({ p
   ))).toEqual(expect.arrayContaining([
     "script-src-elem",
     "script-src-attr",
-    "style-src-attr",
   ]));
+  await expect.poll(async () => page.evaluate(() => (
+    (globalThis as typeof globalThis & {
+      __platformCspViolations?: Array<{ effectiveDirective: string }>;
+    }).__platformCspViolations?.map((value) => value.effectiveDirective) ?? []
+  ))).not.toContain("style-src-attr");
 });
 
 test("live tournaments hub exposes a valid empty or populated list", async ({ page }) => {
