@@ -11,7 +11,8 @@ export const navItems = [
   {
     href: "/draft",
     label: "Драфты",
-    matchPrefix: "/draft"
+    matchPrefix: "/draft",
+    hardNavigation: true
   },
   {
     href: "/info",
