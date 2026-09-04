@@ -1,6 +1,6 @@
 # Pre-release audit worklog — 2026-09-05
 
-Status: Final audit evidence recorded; report update pending publication
+Status: Final audit evidence recorded and published
 Scope: active OldSparky platform under `platform/`; live origin
 `https://old-sparky.com`; legacy bot and `sparkydb` excluded by policy.  
 Owner: release audit  
@@ -98,10 +98,12 @@ user-facing report is stored separately as
 
 - Detailed report: [`pre-release-audit-report-2026-09-05.md`](pre-release-audit-report-2026-09-05.md).
 - Generated Playwright report artifact was removed before publication.
-- Remaining work is documentation-gate rerun, commit/publication, production
-  chain observation and a clean live-public rerun.  Destructive live-user QA,
-  external load and operator-only perimeter/backup actions remain intentionally
-  unavailable to this audit.
+- Publication is complete.  Final exact-SHA security/build run
+  `33930497667`, auto-deploy `33930886254` and production deploy
+  `33930892648` passed for `b9535d60f42d12f1f9962638ac91b650afd4f2fb`.
+  Clean live-public run `33930022208` failed AUD-09 as recorded above.
+  Destructive live-user QA, external load and operator-only perimeter/backup
+  actions remain intentionally unavailable to this audit.
 
 ## Context-resumption note
 
