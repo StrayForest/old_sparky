@@ -449,9 +449,9 @@ async function serveStatic(request, env, path) {
   let assetPath;
   const isDraftShell = path === "/draft" || path === "/draft/" || path === "/draft/result" || /^\/draft\/[A-Za-z0-9_-]{6,32}\/?$/u.test(path) || path === "/draft/solo";
   if (isDraftShell) {
-    assetPath = "/";
+    assetPath = "/draft/index.html";
   } else if (path.startsWith("/draft/")) {
-    assetPath = path.slice("/draft".length);
+    assetPath = path;
   } else {
     return new Response("Not found", { status: 404 });
   }
@@ -463,6 +463,7 @@ async function serveStatic(request, env, path) {
   if (!assetResponse.ok) return assetResponse;
 
   const headers = new Headers(assetResponse.headers);
+  headers.set("X-Old-Sparky-Draft", "1");
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
   headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
@@ -471,7 +472,7 @@ async function serveStatic(request, env, path) {
     "Content-Security-Policy",
     "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self' https://*.googlesyndication.com https://*.googleadservices.com https://*.google.com https://*.gstatic.com https://*.doubleclick.net 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https: wss:; frame-src https:; font-src 'self' data: https:"
   );
-  if (isDraftShell) {
+  if (assetPath === "/draft/index.html") {
     headers.set("Cache-Control", "no-cache");
   } else {
     headers.set("Cache-Control", "public, max-age=300");
