@@ -231,7 +231,7 @@ jobs:
             --request POST \
             --header 'Origin: https://old-sparky.com' \
             --header 'Content-Type: application/json' \
-            --data '{"presetId":"6v6-no-bans","timerSeconds":0,"teamNames":{"A":"Smoke A","B":"Smoke B"}}' \
+            --data '{"presetId":"6v6-no-bans","timerSeconds":30}' \
             https://old-sparky.com/draft/api/rooms || true)"
           echo "Draft room create: HTTP ${room_status}"
           test "$room_status" = "201"
@@ -243,5 +243,5 @@ jobs:
           assert isinstance(payload.get('roomCode'), str) and 6 <= len(payload['roomCode']) <= 32
           assert isinstance(payload.get('hostToken'), str) and len(payload['hostToken']) >= 20
           assert isinstance(payload.get('guestToken'), str) and len(payload['guestToken']) >= 20
-          print(f"Draft room API OK: {payload['roomCode']}")
+          print("Draft room API OK")
           PY
