@@ -1,5 +1,6 @@
 import { HEROES, HERO_BY_ID } from "./heroes.js";
 import {
+  DEFAULT_CUSTOM_RULES,
   PRESETS,
   applyLocalAction,
   buildRules,
@@ -7,7 +8,6 @@ import {
   currentStep,
   decodeResult,
   encodeResult,
-  heroAlreadyUsed,
   pauseLocalOnTimeout,
   resumeLocalTurn
 } from "./draft-core.js";
@@ -20,6 +20,11 @@ const INVITE_KEY_PREFIX = "oldsparky:draft:invite:";
 let createMode = "online";
 let selectedPreset = "community-6v6";
 let selectedTimer = 30;
+let createTeamA = "";
+let createTeamB = "";
+let customTeamSize = DEFAULT_CUSTOM_RULES.teamSize;
+let customBanSequence = DEFAULT_CUSTOM_RULES.banSequence;
+let customPickSequence = DEFAULT_CUSTOM_RULES.pickSequence;
 let room = null;
 let selectedHeroId = null;
 let heroSearch = "";
@@ -97,8 +102,31 @@ function renderBrand() {
   `;
 }
 
+function currentCustomRules() {
+  return {
+    teamSize: customTeamSize,
+    banSequence: customBanSequence,
+    pickSequence: customPickSequence
+  };
+}
+
+function currentCreateRules() {
+  return buildRules(
+    selectedPreset,
+    selectedTimer,
+    selectedPreset === "custom" ? currentCustomRules() : null
+  );
+}
+
+function renderCreateRulesPreview() {
+  try {
+    return renderRulesSummary(currentCreateRules());
+  } catch (cause) {
+    return `<div class="error-box">${escapeHtml(errorMessage(cause))}</div>`;
+  }
+}
+
 function renderCreate() {
-  const preset = PRESETS[selectedPreset];
   app.innerHTML = `
     ${renderBrand()}
     <section class="create-layout">
@@ -127,13 +155,32 @@ function renderCreate() {
             </div>
           </div>
 
+          ${selectedPreset === "custom" ? `
+            <div class="field">
+              <label for="custom-team-size">Размер команды</label>
+              <select id="custom-team-size">
+                ${[2, 4, 6].map((size) => `<option value="${size}" ${size === customTeamSize ? "selected" : ""}>${size} × ${size}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field">
+              <label for="custom-ban-sequence">Порядок банов</label>
+              <input id="custom-ban-sequence" maxlength="24" value="${escapeAttr(customBanSequence)}" placeholder="ABBAAB" autocomplete="off" spellcheck="false" />
+              <span class="field-hint">Только A/B. Можно оставить пустым.</span>
+            </div>
+            <div class="field field--wide">
+              <label for="custom-pick-sequence">Порядок пиков</label>
+              <input id="custom-pick-sequence" maxlength="32" value="${escapeAttr(customPickSequence)}" placeholder="ABBAABBAABBA" autocomplete="off" spellcheck="false" />
+              <span class="field-hint">Для каждой команды должно быть ровно столько пиков, сколько игроков в составе.</span>
+            </div>
+          ` : ""}
+
           <div class="field">
             <label for="team-a">Команда A</label>
-            <input id="team-a" maxlength="40" placeholder="Команда A" autocomplete="off" />
+            <input id="team-a" maxlength="40" value="${escapeAttr(createTeamA)}" placeholder="Команда A" autocomplete="off" />
           </div>
           <div class="field">
             <label for="team-b">Команда B</label>
-            <input id="team-b" maxlength="40" placeholder="Команда B" autocomplete="off" />
+            <input id="team-b" maxlength="40" value="${escapeAttr(createTeamB)}" placeholder="Команда B" autocomplete="off" />
           </div>
         </div>
 
@@ -145,7 +192,7 @@ function renderCreate() {
 
       <aside class="panel create-summary">
         <h2>Правила</h2>
-        ${renderRulesSummary({ ...preset, timerSeconds: selectedTimer })}
+        <div id="rules-preview">${renderCreateRulesPreview()}</div>
         <div class="notice" style="margin-top:18px">${createMode === "online" ? "Онлайн-комната живёт только пока она нужна. История на сервере не сохраняется." : "Соло работает только в этом браузере и не создаёт сетевую комнату."}</div>
       </aside>
     </section>
@@ -154,22 +201,64 @@ function renderCreate() {
 
   app.querySelectorAll("[data-mode]").forEach((button) => {
     button.addEventListener("click", () => {
+      rememberCreateInputs();
       createMode = button.dataset.mode;
       renderCreate();
     });
   });
   app.querySelector("#preset").addEventListener("change", (event) => {
+    rememberCreateInputs();
     selectedPreset = event.target.value;
     selectedTimer = PRESETS[selectedPreset].timerSeconds;
     renderCreate();
   });
   app.querySelectorAll("[data-timer]").forEach((button) => {
     button.addEventListener("click", () => {
+      rememberCreateInputs();
       selectedTimer = Number(button.dataset.timer);
       renderCreate();
     });
   });
+
+  app.querySelector("#team-a")?.addEventListener("input", (event) => {
+    createTeamA = event.target.value.slice(0, 40);
+  });
+  app.querySelector("#team-b")?.addEventListener("input", (event) => {
+    createTeamB = event.target.value.slice(0, 40);
+  });
+  app.querySelector("#custom-team-size")?.addEventListener("change", (event) => {
+    customTeamSize = Number(event.target.value);
+    updateRulesPreview();
+  });
+  app.querySelector("#custom-ban-sequence")?.addEventListener("input", (event) => {
+    customBanSequence = event.target.value.toUpperCase().replace(/[^AB]/gu, "").slice(0, 12);
+    event.target.value = customBanSequence;
+    updateRulesPreview();
+  });
+  app.querySelector("#custom-pick-sequence")?.addEventListener("input", (event) => {
+    customPickSequence = event.target.value.toUpperCase().replace(/[^AB]/gu, "").slice(0, 24);
+    event.target.value = customPickSequence;
+    updateRulesPreview();
+  });
   app.querySelector("#create-draft").addEventListener("click", () => void createDraft());
+}
+
+function rememberCreateInputs() {
+  const teamA = app.querySelector("#team-a");
+  const teamB = app.querySelector("#team-b");
+  if (teamA) createTeamA = teamA.value.slice(0, 40);
+  if (teamB) createTeamB = teamB.value.slice(0, 40);
+  const size = app.querySelector("#custom-team-size");
+  const bans = app.querySelector("#custom-ban-sequence");
+  const picks = app.querySelector("#custom-pick-sequence");
+  if (size) customTeamSize = Number(size.value);
+  if (bans) customBanSequence = bans.value.toUpperCase().replace(/[^AB]/gu, "").slice(0, 12);
+  if (picks) customPickSequence = picks.value.toUpperCase().replace(/[^AB]/gu, "").slice(0, 24);
+}
+
+function updateRulesPreview() {
+  const preview = app.querySelector("#rules-preview");
+  if (preview) preview.innerHTML = renderCreateRulesPreview();
 }
 
 async function createDraft() {
@@ -177,13 +266,12 @@ async function createDraft() {
   const error = app.querySelector("#create-error");
   button.disabled = true;
   error.innerHTML = "";
-  const teamNames = {
-    A: app.querySelector("#team-a").value,
-    B: app.querySelector("#team-b").value
-  };
-  const rules = buildRules(selectedPreset, selectedTimer);
+  rememberCreateInputs();
+  const teamNames = { A: createTeamA, B: createTeamB };
 
   try {
+    const customRules = selectedPreset === "custom" ? currentCustomRules() : undefined;
+    const rules = buildRules(selectedPreset, selectedTimer, customRules);
     if (createMode === "solo") {
       room = createLocalRoom(rules, teamNames);
       sessionStorage.setItem(SOLO_KEY, JSON.stringify(room));
@@ -195,7 +283,7 @@ async function createDraft() {
     const response = await fetch("/draft/api/rooms", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ presetId: selectedPreset, timerSeconds: selectedTimer, teamNames })
+      body: JSON.stringify({ presetId: selectedPreset, timerSeconds: selectedTimer, teamNames, customRules })
     });
     const payload = await safeJson(response);
     if (!response.ok) {
@@ -529,6 +617,11 @@ function connectRoom() {
       renderExpiredRoom();
       return;
     }
+    if (event.code === 4001) {
+      lastError = "Место капитана открыто в другой вкладке. Эта вкладка больше не переподключается как капитан.";
+      if (room) renderRoom();
+      return;
+    }
     if (event.code === 4403) {
       sessionStorage.removeItem(`${SEAT_KEY_PREFIX}${roomCode}`);
       seat = { role: "spectator", token: null };
@@ -559,7 +652,6 @@ function closeSocket() {
     reconnectHandle = null;
   }
   if (socket) {
-    socket.onclose = null;
     socket.close(1000, "navigation");
     socket = null;
   }
