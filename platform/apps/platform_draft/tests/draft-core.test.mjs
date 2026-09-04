@@ -6,6 +6,7 @@ import {
   applyLocalAction,
   applyLocalTimeout,
   buildRules,
+  cycleSequenceCell,
   createDefaultSequence,
   createLocalRoom,
   decodeResult,
@@ -16,6 +17,8 @@ import {
 test("community 6v6 has six bans and six picks per team", () => {
   const rules = buildRules("community-6v6", 30);
   assert.equal(rules.teamSize, 6);
+  assert.equal(rules.banCount, 3);
+  assert.deepEqual(rules.banCounts, { A: 3, B: 3 });
   assert.equal(rules.timerSeconds, 30);
   assert.equal(rules.sequence.filter((step) => step.action === "ban").length, 6);
   assert.equal(rules.sequence.filter((step) => step.action === "pick").length, 12);
@@ -80,12 +83,66 @@ test("custom sequence keeps every configured ban and pick step", () => {
   const rules = buildRules("standard", 0, { teamSize: 2, banCount: 2, sequence, firstSide: "B" });
   assert.deepEqual(rules.sequence, sequence.map((step, index) => ({ ...step, index })));
   assert.equal(rules.sequence.length, 6);
+  assert.deepEqual(rules.banCounts, { A: 1, B: 1 });
   assert.deepEqual(createDefaultSequence(2, 0, "B"), [
     { action: "pick", side: "B" },
     { action: "pick", side: "A" },
     { action: "pick", side: "A" },
     { action: "pick", side: "B" }
   ]);
+});
+
+test("manual sequence may change ban count within the per-team limit", () => {
+  const sequence = [
+    { action: "pick", side: "B" },
+    { action: "ban", side: "A" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "B" },
+    { action: "pick", side: "A" }
+  ];
+  const rules = buildRules("standard", 0, { teamSize: 2, banCount: 0, sequence, firstSide: "A" });
+  assert.deepEqual(rules.sequence.map(({ action }) => action), ["pick", "ban", "pick", "pick", "pick"]);
+  assert.equal(rules.sequence[0].side, "A");
+  assert.deepEqual(rules.banCounts, { A: 0, B: 1 });
+});
+
+test("default sequence treats ban count as bans per team", () => {
+  const sequence = createDefaultSequence(6, 3, "A");
+  assert.equal(sequence.filter((step) => step.action === "ban").length, 6);
+  assert.equal(sequence.filter((step) => step.action === "ban" && step.side === "A").length, 3);
+  assert.equal(sequence.filter((step) => step.action === "ban" && step.side === "B").length, 3);
+});
+
+test("sequence editor cycles empty, pick and ban cells and switches rows", () => {
+  let slots = [null, null];
+  slots = cycleSequenceCell(slots, 0, "A");
+  assert.deepEqual(slots, [{ action: "pick", side: "A" }, null]);
+  slots = cycleSequenceCell(slots, 0, "A");
+  assert.deepEqual(slots, [{ action: "ban", side: "A" }, null]);
+  slots = cycleSequenceCell(slots, 0, "A");
+  assert.deepEqual(slots, [null, null]);
+  slots = cycleSequenceCell(slots, 1, "B");
+  assert.deepEqual(slots, [null, { action: "pick", side: "B" }]);
+  slots = cycleSequenceCell(slots, 1, "A");
+  assert.deepEqual(slots, [null, { action: "pick", side: "A" }]);
+});
+
+test("an explicit empty custom sequence is rejected instead of falling back to standard", () => {
+  assert.throws(() => buildRules("standard", 0, { teamSize: 2, banCount: 0, sequence: [] }));
+});
+
+test("manual sequence rejects more than three bans for one team", () => {
+  const sequence = [
+    { action: "ban", side: "A" },
+    { action: "ban", side: "A" },
+    { action: "ban", side: "A" },
+    { action: "ban", side: "A" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "B" },
+    { action: "pick", side: "B" }
+  ];
+  assert.throws(() => buildRules("standard", 0, { teamSize: 2, banCount: 3, sequence }));
 });
 
 

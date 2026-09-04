@@ -30,12 +30,12 @@ function makeEnvironment() {
   };
 }
 
-async function createRoom(body, environment = makeEnvironment()) {
+async function createRoom(body, environment = makeEnvironment(), origin = "https://old-sparky.com") {
   const response = await worker.fetch(
     new Request("https://old-sparky.com/draft/api/rooms", {
       method: "POST",
       headers: {
-        Origin: "https://old-sparky.com",
+        Origin: origin,
         "content-type": "application/json"
       },
       body: JSON.stringify(body)
@@ -44,6 +44,57 @@ async function createRoom(body, environment = makeEnvironment()) {
   );
   return { response, environment };
 }
+
+test("same-origin room creation works without an Origin header", async () => {
+  const environment = makeEnvironment();
+  const response = await worker.fetch(
+    new Request("https://old-sparky.com/draft/api/rooms", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ presetId: "6v6-no-bans", timerSeconds: 0 })
+    }),
+    environment.env
+  );
+  assert.equal(response.status, 201);
+  assert.equal(environment.created.length, 1);
+});
+
+test("local browser origins with a port are accepted for development", async () => {
+  const { response } = await createRoom({ presetId: "6v6-no-bans", timerSeconds: 0 }, makeEnvironment(), "http://localhost:8788");
+  assert.equal(response.status, 201);
+});
+
+test("Wrangler local websocket origins are accepted during local development", async () => {
+  const environment = makeEnvironment();
+  const response = await worker.fetch(
+    new Request("http://old-sparky.com/draft/api/rooms", {
+      method: "POST",
+      headers: {
+        Origin: "http://old-sparky.com",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ presetId: "6v6-no-bans", timerSeconds: 0 })
+    }),
+    environment.env
+  );
+  assert.equal(response.status, 201);
+});
+
+test("same-origin browser requests may use their same-origin referrer", async () => {
+  const environment = makeEnvironment();
+  const response = await worker.fetch(
+    new Request("https://old-sparky.com/draft/api/rooms", {
+      method: "POST",
+      headers: {
+        Referer: "https://old-sparky.com/draft",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ presetId: "6v6-no-bans", timerSeconds: 0 })
+    }),
+    environment.env
+  );
+  assert.equal(response.status, 201);
+});
 
 class MemoryStorage {
   constructor() {
@@ -126,6 +177,7 @@ test("online room creation preserves the submitted custom sequence", async () =>
     presetId: "standard",
     teamSize: 2,
     banCount: 2,
+    banCounts: { A: 1, B: 1 },
     firstSide: "B",
     timerSeconds: 0,
     sequence: [

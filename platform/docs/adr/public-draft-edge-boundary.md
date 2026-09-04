@@ -22,8 +22,10 @@ The site already uses Cloudflare in front of `old-sparky.com` and delivers publi
 - Online rooms expose a waiting lobby where both connected captains claim their
   seats, can rename their own teams and confirm readiness before the first
   draft step starts.
-- Room creation carries an explicitly validated team format, ban count, first
-  mover, timer and complete pick/ban sequence. A server-authoritative deadline
+- Room creation carries an explicitly validated team format, per-team ban
+  template (0–3), first mover, timer and complete pick/ban sequence. The
+  template is editable: the resulting sequence is authoritative, with at most
+  three bans per team and no gaps. A server-authoritative deadline
   automatically applies the first unused hero for the current pick or ban;
   timeout never pauses a room.
 - The Durable Object stores only the small current room snapshot and captain credential hashes needed to resume a hibernated room. It does not keep draft history. Completed and expired rooms delete this state.
