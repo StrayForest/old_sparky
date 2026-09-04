@@ -51,20 +51,72 @@ export const PRESETS = {
       { action: "pick", side: "B" },
       { action: "pick", side: "A" }
     ]
+  },
+  custom: {
+    id: "custom",
+    label: "Свой",
+    teamSize: 6,
+    timerSeconds: 30,
+    sequence: null
   }
 };
 
 PRESETS["community-6v6-no-timer"].sequence = PRESETS["community-6v6"].sequence.map((step) => ({ ...step }));
 
-export function buildRules(presetId, timerOverride) {
+export const DEFAULT_CUSTOM_RULES = Object.freeze({
+  teamSize: 6,
+  banSequence: "ABBAAB",
+  pickSequence: "ABBAABBAABBA"
+});
+
+export function buildRules(presetId, timerOverride, customRules = null) {
+  if (presetId === "custom") {
+    return buildCustomRules({
+      ...DEFAULT_CUSTOM_RULES,
+      ...(customRules || {}),
+      timerSeconds: timerOverride
+    });
+  }
   const preset = PRESETS[presetId] || PRESETS["community-6v6"];
-  const timerSeconds = Number.isFinite(timerOverride) ? Math.max(0, Math.min(90, timerOverride)) : preset.timerSeconds;
+  const timerSeconds = normalizeTimer(timerOverride, preset.timerSeconds);
   return {
     presetId: preset.id,
     teamSize: preset.teamSize,
     timerSeconds,
     sequence: preset.sequence.map((step, index) => ({ ...step, index }))
   };
+}
+
+export function buildCustomRules(value) {
+  const teamSize = Number(value?.teamSize);
+  if (![2, 4, 6].includes(teamSize)) {
+    throw new Error("Размер команды должен быть 2, 4 или 6");
+  }
+  const timerSeconds = normalizeTimer(value?.timerSeconds, 30);
+  const banSides = parseSideSequence(value?.banSequence, 12, true);
+  const pickSides = parseSideSequence(value?.pickSequence, 24, false);
+  if (pickSides.filter((side) => side === "A").length !== teamSize || pickSides.filter((side) => side === "B").length !== teamSize) {
+    throw new Error(`В порядке пиков должно быть ровно по ${teamSize} ходов A и B`);
+  }
+  const sequence = [
+    ...banSides.map((side) => ({ action: "ban", side })),
+    ...pickSides.map((side) => ({ action: "pick", side }))
+  ];
+  if (sequence.length < 4 || sequence.length > 40) {
+    throw new Error("Слишком длинный или короткий порядок драфта");
+  }
+  return {
+    presetId: "custom",
+    teamSize,
+    timerSeconds,
+    sequence: sequence.map((step, index) => ({ ...step, index }))
+  };
+}
+
+export function normalizeSideSequence(value) {
+  return String(value ?? "")
+    .toUpperCase()
+    .replace(/[^AB]/gu, "");
 }
 
 export function createLocalRoom(rules, teamNames) {
@@ -182,6 +234,25 @@ export function decodeResult(value) {
 export function cleanTeamName(value, fallback) {
   const text = String(value || "").trim().slice(0, 40);
   return text || fallback;
+}
+
+function parseSideSequence(value, maxLength, allowEmpty) {
+  const normalized = normalizeSideSequence(value);
+  if (!normalized && allowEmpty) {
+    return [];
+  }
+  if (!normalized || normalized.length > maxLength) {
+    throw new Error("Некорректный порядок ходов");
+  }
+  return [...normalized];
+}
+
+function normalizeTimer(value, fallback) {
+  const timer = Number.isFinite(Number(value)) ? Number(value) : fallback;
+  if (![0, 30, 45, 60, 90].includes(timer)) {
+    throw new Error("Некорректный таймер");
+  }
+  return timer;
 }
 
 function deadlineFrom(now, timerSeconds) {
