@@ -33,7 +33,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Historical implementation context | [`archive/`](archive/) |
 | Accepted architectural decisions | [`adr/`](adr/) |
 | Ready Check / bracket boundary | [Timing and bracket ADR](adr/ready-check-and-bracket-boundary.md) |
-| Public standalone Draft / Cloudflare edge boundary | [Public Draft edge ADR](adr/public-draft-edge-boundary.md) |
+| Public standalone Draft / Cloudflare edge boundary | [Public Draft edge ADR](adr/public-draft-edge-boundary.md) and [completion without result links](adr/public-draft-completion-without-result-links.md) |
 
 ## Token-efficient reading contract
 

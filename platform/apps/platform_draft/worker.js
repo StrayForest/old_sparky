@@ -277,7 +277,7 @@ export class DraftRoom {
       return;
     }
     const collection = room[step.action === "pick" ? "picks" : "bans"][step.side];
-    const capacity = step.action === "pick" ? room.rules.teamSize : MAX_BANS_PER_TEAM;
+    const capacity = step.action === "pick" ? room.rules.teamSize : room.rules.banCount;
     if (collection.length >= capacity) {
       this.sendError(ws, step.action === "pick" ? "Лимит пиков уже исчерпан" : "Лимит банов уже исчерпан", room);
       return;
@@ -458,7 +458,7 @@ async function createRoom(request, env) {
 
 async function serveStatic(request, env, path) {
   let assetPath;
-  const isDraftShell = path === "/draft" || path === "/draft/" || path === "/draft/result" || /^\/draft\/[A-Za-z0-9_-]{6,32}\/?$/u.test(path) || path === "/draft/solo";
+  const isDraftShell = path === "/draft" || path === "/draft/" || /^\/draft\/(?!result\/?$)[A-Za-z0-9_-]{6,32}\/?$/u.test(path) || path === "/draft/solo";
   if (isDraftShell) {
     assetPath = "/draft/index.html";
   } else if (path.startsWith("/draft/")) {
@@ -490,7 +490,7 @@ async function serveStatic(request, env, path) {
   } else {
     headers.set("Cache-Control", "public, max-age=300");
   }
-  if (path === "/draft/result" || /^\/draft\/[A-Za-z0-9_-]{6,32}\/?$/u.test(path) || path === "/draft/solo") {
+  if (/^\/draft\/(?!result\/?$)[A-Za-z0-9_-]{6,32}\/?$/u.test(path) || path === "/draft/solo") {
     headers.set("X-Robots-Tag", "noindex, nofollow");
   }
   return new Response(assetResponse.body, { status: assetResponse.status, headers });

@@ -125,7 +125,7 @@ export function validateSequence(sequence, teamSize, banCount) {
     if (step.action === "pick") picks[step.side] += 1;
     if (step.action === "ban") bans[step.side] += 1;
   });
-  if (counts.pick !== teamSize * 2 || picks.A !== teamSize || picks.B !== teamSize || bans.A > MAX_BANS_PER_TEAM || bans.B > MAX_BANS_PER_TEAM) {
+  if (counts.pick !== teamSize * 2 || picks.A !== teamSize || picks.B !== teamSize || bans.A > banCount || bans.B > banCount) {
     throw new Error("Последовательность не соответствует выбранному формату");
   }
 }
@@ -138,17 +138,38 @@ export function orientSequence(sequence, firstSide) {
   }));
 }
 
-export function cycleSequenceCell(sequence, index, side) {
+export function countSequenceActions(sequence, side) {
+  if (!Array.isArray(sequence) || !["A", "B"].includes(side)) return { pick: 0, ban: 0 };
+  return sequence.reduce((counts, step) => {
+    if (step?.side === side && ["pick", "ban"].includes(step.action)) counts[step.action] += 1;
+    return counts;
+  }, { pick: 0, ban: 0 });
+}
+
+export function cycleSequenceCell(sequence, index, side, limits = {}) {
   if (!Array.isArray(sequence) || !Number.isInteger(index) || !["A", "B"].includes(side) || index < 0 || index >= sequence.length) {
     return sequence;
   }
+  const pickLimit = Number.isInteger(limits.pickLimit) && limits.pickLimit >= 0 ? limits.pickLimit : Number.POSITIVE_INFINITY;
+  const banLimit = Number.isInteger(limits.banLimit) && limits.banLimit >= 0 ? limits.banLimit : Number.POSITIVE_INFINITY;
+  const counts = countSequenceActions(sequence, side);
   const next = sequence.map((step) => step ? { ...step } : null);
   const current = next[index];
   if (!current || current.side !== side) {
-    next[index] = { action: "pick", side };
+    if (counts.pick < pickLimit) {
+      next[index] = { action: "pick", side };
+    } else if (counts.ban < banLimit) {
+      next[index] = { action: "ban", side };
+    } else {
+      return sequence;
+    }
     return next;
   }
-  next[index] = current.action === "pick" ? { action: "ban", side } : null;
+  if (current.action === "pick" && counts.ban < banLimit) {
+    next[index] = { action: "ban", side };
+  } else {
+    next[index] = null;
+  }
   return next;
 }
 
@@ -194,7 +215,7 @@ export function applyLocalAction(room, heroId) {
     return room;
   }
   const collection = room[step.action === "pick" ? "picks" : "bans"][step.side];
-  const capacity = step.action === "pick" ? room.rules.teamSize : MAX_BANS_PER_TEAM;
+  const capacity = step.action === "pick" ? room.rules.teamSize : room.rules.banCount;
   if (collection.length >= capacity) return room;
   const next = structuredClone(room);
   next[step.action === "pick" ? "picks" : "bans"][step.side].push(heroId);
@@ -227,88 +248,6 @@ export function currentStep(room) {
   return room?.rules?.sequence?.[room.currentStep] || null;
 }
 
-export function makeResultPayload(room) {
-  return {
-    v: 1,
-    preset: room.rules.presetId,
-    a: room.teamNames.A,
-    b: room.teamNames.B,
-    pa: room.picks.A,
-    pb: room.picks.B,
-    ba: room.bans.A,
-    bb: room.bans.B
-  };
-}
-
-export function encodeResult(room, heroOrder = null) {
-  const payload = Array.isArray(heroOrder)
-    ? makeCompactResultPayload(room, heroOrder)
-    : makeResultPayload(room);
-  const json = JSON.stringify(payload);
-  return encodeBase64Url(json);
-}
-
-function makeCompactResultPayload(room, heroOrder) {
-  const indexByHeroId = new Map(heroOrder.map((hero, index) => [typeof hero === "string" ? hero : hero.id, index]));
-  const encodeHeroes = (heroIds) => heroIds.map((heroId) => {
-    const index = indexByHeroId.get(heroId);
-    if (!Number.isInteger(index)) throw new Error("Некорректный герой в результате");
-    return index;
-  });
-  return {
-    v: 2,
-    a: room.teamNames.A,
-    b: room.teamNames.B,
-    pa: encodeHeroes(room.picks.A),
-    pb: encodeHeroes(room.picks.B),
-    ba: encodeHeroes(room.bans.A),
-    bb: encodeHeroes(room.bans.B),
-    s: room.rules.sequence.map((step) => `${step.side}${step.action === "ban" ? "b" : "p"}`).join("")
-  };
-}
-
-function encodeBase64Url(json) {
-  const bytes = new TextEncoder().encode(json);
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
-}
-
-export function decodeResult(value, heroOrder = null) {
-  if (!value || value.length > 6000) {
-    throw new Error("Некорректная ссылка результата");
-  }
-  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
-  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-  const binary = atob(padded);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  let payload = JSON.parse(new TextDecoder().decode(bytes));
-  if (!payload || ![1, 2].includes(payload.v) || !Array.isArray(payload.pa) || !Array.isArray(payload.pb) || !Array.isArray(payload.ba) || !Array.isArray(payload.bb)) {
-    throw new Error("Версия результата не поддерживается");
-  }
-  if (payload.v === 2) {
-    if (!Array.isArray(heroOrder) || typeof payload.s !== "string") {
-      throw new Error("Для результата нужна актуальная версия героев");
-    }
-    const heroIds = heroOrder.map((hero) => typeof hero === "string" ? hero : hero.id);
-    const decodeHeroes = (indexes) => indexes.map((index) => {
-      if (!Number.isInteger(index) || index < 0 || index >= heroIds.length) throw new Error("Некорректный герой в результате");
-      return heroIds[index];
-    });
-    payload = {
-      ...payload,
-      pa: decodeHeroes(payload.pa),
-      pb: decodeHeroes(payload.pb),
-      ba: decodeHeroes(payload.ba),
-      bb: decodeHeroes(payload.bb),
-      sequence: decodeCompactSequence(payload.s)
-    };
-  }
-  return payload;
-}
-
 export function cleanTeamName(value, fallback) {
   const text = String(value || "").trim().slice(0, 40);
   return text || fallback;
@@ -331,18 +270,6 @@ function normalizeTimer(value, fallback) {
     throw new Error("Некорректный таймер");
   }
   return timer;
-}
-
-function decodeCompactSequence(value) {
-  if (!value || value.length > 80 || value.length % 2 !== 0) throw new Error("Некорректная последовательность результата");
-  const sequence = [];
-  for (let index = 0; index < value.length; index += 2) {
-    const side = value[index];
-    const action = value[index + 1] === "b" ? "ban" : value[index + 1] === "p" ? "pick" : null;
-    if (!['A', 'B'].includes(side) || !action) throw new Error("Некорректная последовательность результата");
-    sequence.push({ action, side, index: index / 2 });
-  }
-  return sequence;
 }
 
 function deadlineFrom(now, timerSeconds) {
