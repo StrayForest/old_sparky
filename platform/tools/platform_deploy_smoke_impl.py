@@ -46,7 +46,6 @@ EXPECTED_CSP_POLICY_TEMPLATE = (
 )
 EXPECTED_REPORTING_ENDPOINTS = 'csp-endpoint="/api/v1/security/csp-report"'
 EXPECTED_ADSENSE_CLIENT = "ca-pub-7185165276065459"
-EXPECTED_ADSENSE_SLOT = "4365553701"
 EXPECTED_ADSENSE_LOADER = (
     "https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client="
     f"{EXPECTED_ADSENSE_CLIENT}"
@@ -343,7 +342,6 @@ class _InlinePolicyParser(HTMLParser):
         self.style_nonces: list[str | None] = []
         self.event_handler_count = 0
         self.adsense_loader_srcs: list[str] = []
-        self.adsense_slots: list[dict[str, str | None]] = []
 
     def handle_starttag(
         self,
@@ -361,11 +359,6 @@ class _InlinePolicyParser(HTMLParser):
                 self.adsense_loader_srcs.append(normalized["src"])
         elif tag.lower() == "style":
             self.style_nonces.append(normalized.get("nonce"))
-        elif (
-            tag.lower() == "ins"
-            and "adsbygoogle" in (normalized.get("class") or "").split()
-        ):
-            self.adsense_slots.append(normalized)
         self.event_handler_count += sum(
             1 for name in normalized if name.startswith("on")
         )
@@ -446,15 +439,6 @@ def adsense_markup_errors(html: str) -> list[str]:
         )
     elif parser.adsense_loader_srcs[0] != EXPECTED_ADSENSE_LOADER:
         errors.append("unexpected AdSense loader source")
-    if len(parser.adsense_slots) != 1:
-        errors.append(
-            "expected exactly one diagnostic AdSense slot, "
-            f"found {len(parser.adsense_slots)}"
-        )
-    elif parser.adsense_slots[0].get("data-ad-client") != EXPECTED_ADSENSE_CLIENT:
-        errors.append("unexpected AdSense publisher on diagnostic slot")
-    elif parser.adsense_slots[0].get("data-ad-slot") != EXPECTED_ADSENSE_SLOT:
-        errors.append("unexpected AdSense diagnostic slot")
     return errors
 
 

@@ -88,9 +88,8 @@ be reproduced in browser evidence before changing this policy.
 
 Production always selects `Content-Security-Policy`; the deploy smoke requires
 that enforced mode and parses the home document for exactly one canonical
-AdSense loader plus diagnostic slot `4365553701`. A rollback returns to the
-previous enforced application release and does not enable a diagnostic
-Report-Only policy.
+AdSense loader. A rollback returns to the previous enforced application
+release and does not enable a diagnostic Report-Only policy.
 
 The proxy matcher owns HTML documents only. API, RSC, Next static, local asset
 and discovery responses have no CSP or Reporting-Endpoints header. Nginx keeps

@@ -189,13 +189,10 @@ class PlatformDeploySmokeTests(unittest.TestCase):
             ),
         )
 
-    def test_adsense_markup_requires_one_loader_and_the_diagnostic_slot(self) -> None:
+    def test_adsense_markup_requires_one_canonical_loader(self) -> None:
         html = (
             '<script async src="https://pagead2.googlesyndication.com/pagead/js/'
             'adsbygoogle.js?client=ca-pub-7185165276065459"></script>'
-            '<ins class="adsbygoogle diagnostic-ad" '
-            'data-ad-client="ca-pub-7185165276065459" '
-            'data-ad-slot="4365553701"></ins>'
         )
 
         self.assertEqual(MODULE.adsense_markup_errors(html), [])
@@ -205,11 +202,7 @@ class PlatformDeploySmokeTests(unittest.TestCase):
         )
         self.assertIn(
             "expected exactly one AdSense loader script, found 2",
-            MODULE.adsense_markup_errors(html + html.split("<ins", 1)[0]),
-        )
-        self.assertIn(
-            "unexpected AdSense diagnostic slot",
-            MODULE.adsense_markup_errors(html.replace("4365553701", "9999999999")),
+            MODULE.adsense_markup_errors(html + html),
         )
 
     def test_document_policy_rejects_wrong_mode_unsafe_source_and_short_nonce(self) -> None:
