@@ -6,6 +6,7 @@ on:
       - "platform/apps/platform_draft/**"
       - "platform/apps/platform_web/components/layout/site-header.tsx"
       - "platform/apps/platform_web/lib/routes.ts"
+      - "platform/apps/platform_web/public/assets/heroes/**"
       - "platform/tools/sync_draft_hero_assets.py"
       - "platform/docs/adr/public-draft-edge-boundary.md"
       - ".github/workflows/platform-draft-cloudflare.yml"
@@ -15,6 +16,7 @@ on:
       - "platform/apps/platform_draft/**"
       - "platform/apps/platform_web/components/layout/site-header.tsx"
       - "platform/apps/platform_web/lib/routes.ts"
+      - "platform/apps/platform_web/public/assets/heroes/**"
       - "platform/tools/sync_draft_hero_assets.py"
       - "platform/docs/adr/public-draft-edge-boundary.md"
       - ".github/workflows/platform-draft-cloudflare.yml"
@@ -37,18 +39,25 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "26.3.1"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
       - name: Check JavaScript syntax
         working-directory: platform/apps/platform_draft
         run: npm run check
       - name: Run zero-dependency Draft tests
         working-directory: platform/apps/platform_draft
         run: npm test
-      - name: Check R2 thumbnail plan without writing objects
+      - name: Generate optimized hero thumbnails without network writes
         run: |
-          python3 -m venv platform/.venv_draft_assets
-          platform/.venv_draft_assets/bin/python -m pip install --disable-pip-version-check Pillow pydantic pydantic-settings boto3
+          python -m venv platform/.venv_draft_assets
+          platform/.venv_draft_assets/bin/python -m pip install \
+            --require-hashes \
+            -r platform/apps/platform_draft/requirements-assets.lock.txt
           cd platform
-          .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py --dry-run
+          .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
+            --output-dir /tmp/oldsparky-draft-heroes
+          test "$(find /tmp/oldsparky-draft-heroes -maxdepth 1 -type f -name '*.webp' | wc -l | tr -d ' ')" -ge 30
 
   deploy:
     name: Publish Draft edge runtime
@@ -59,6 +68,12 @@ jobs:
     environment: production
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26.3.1"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
 
       - name: Wait for exact-SHA platform security gate
         shell: bash
@@ -80,13 +95,17 @@ jobs:
             case "$state" in
               success)
                 echo "platform-security-build passed for ${TARGET_SHA}"
-                exit 0
+                break
                 ;;
               failure|error)
                 echo "platform-security-build failed for ${TARGET_SHA}" >&2
                 exit 1
                 ;;
               pending|missing)
+                if [[ "$attempt" == "120" ]]; then
+                  echo "Timed out waiting for platform-security-build on ${TARGET_SHA}" >&2
+                  exit 1
+                fi
                 sleep 10
                 ;;
               *)
@@ -95,8 +114,6 @@ jobs:
                 ;;
             esac
           done
-          echo "Timed out waiting for platform-security-build on ${TARGET_SHA}" >&2
-          exit 1
 
       - name: Detect Cloudflare deployment credentials
         id: cloudflare-config
@@ -113,6 +130,40 @@ jobs:
             echo "::warning::Cloudflare Draft deployment is not configured; add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID to the production environment."
           fi
 
+      - name: Generate production hero thumbnails
+        if: ${{ steps.cloudflare-config.outputs.configured == 'true' }}
+        run: |
+          python -m venv platform/.venv_draft_assets
+          platform/.venv_draft_assets/bin/python -m pip install \
+            --require-hashes \
+            -r platform/apps/platform_draft/requirements-assets.lock.txt
+          cd platform
+          .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
+            --output-dir /tmp/oldsparky-draft-heroes
+
+      - name: Upload immutable hero thumbnails to existing R2 bucket
+        if: ${{ steps.cloudflare-config.outputs.configured == 'true' }}
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DRAFT_R2_BUCKET: oldsparky
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(/tmp/oldsparky-draft-heroes/*.webp)
+          test "${#files[@]}" -ge 30
+          for file in "${files[@]}"; do
+            name="$(basename "$file")"
+            npx --yes wrangler@4.129.0 r2 object put \
+              "${DRAFT_R2_BUCKET}/draft/heroes/v1/${name}" \
+              --file "$file" \
+              --content-type image/webp \
+              --cache-control 'public, max-age=31536000, immutable' \
+              --remote \
+              --force
+          done
+
       - name: Deploy Worker, Static Assets and Durable Object
         if: ${{ steps.cloudflare-config.outputs.configured == 'true' }}
         uses: cloudflare/wrangler-action@v3
@@ -122,7 +173,7 @@ jobs:
           workingDirectory: platform/apps/platform_draft
           command: deploy
 
-      - name: Smoke-check public Draft route
+      - name: Smoke-check public Draft route and hero CDN
         if: ${{ steps.cloudflare-config.outputs.configured == 'true' }}
         shell: bash
         run: |
@@ -130,3 +181,6 @@ jobs:
           body="$(curl --fail-with-body --silent --show-error --retry 5 --retry-delay 2 https://old-sparky.com/draft)"
           grep -q 'id="app"' <<<"$body"
           grep -q 'ca-pub-7185165276065459' <<<"$body"
+          curl --fail-with-body --silent --show-error --retry 5 --retry-delay 2 \
+            --output /dev/null \
+            https://cdn.old-sparky.com/draft/heroes/v1/abrams.webp
