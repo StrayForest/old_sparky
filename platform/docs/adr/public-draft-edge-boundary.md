@@ -19,6 +19,13 @@ The site already uses Cloudflare in front of `old-sparky.com` and delivers publi
 - Static Draft HTML/CSS/JavaScript is served with Cloudflare Static Assets.
 - Solo drafts are browser-only.
 - Each online room maps to one Cloudflare Durable Object and uses WebSocket Hibernation for realtime captain/spectator transport.
+- Online rooms expose a waiting lobby where both connected captains claim their
+  seats, can rename their own teams and confirm readiness before the first
+  draft step starts.
+- Room creation carries an explicitly validated team format, ban count, first
+  mover, timer and complete pick/ban sequence. A server-authoritative deadline
+  automatically applies the first unused hero for the current pick or ban;
+  timeout never pauses a room.
 - The Durable Object stores only the small current room snapshot and captain credential hashes needed to resume a hibernated room. It does not keep draft history. Completed and expired rooms delete this state.
 - Draft does not use platform PostgreSQL, Redis, Celery, FastAPI or the VPS runtime.
 - Hero thumbnails use the existing `cdn.old-sparky.com` R2/CDN boundary under an immutable Draft namespace.

@@ -4,7 +4,9 @@ import test from "node:test";
 import {
   PRESETS,
   applyLocalAction,
+  applyLocalTimeout,
   buildRules,
+  createDefaultSequence,
   createLocalRoom,
   decodeResult,
   encodeResult
@@ -39,6 +41,51 @@ test("local actions advance the authoritative sequence and reject reused heroes"
   const afterHaze = applyLocalAction(afterAbrams, "haze");
   assert.equal(afterHaze.currentStep, 2);
   assert.deepEqual(afterHaze.bans.B, ["haze"]);
+});
+
+
+test("local timeout automatically consumes the next free hero", () => {
+  const room = createLocalRoom(buildRules("standard", 30), { A: "Alpha", B: "Bravo" });
+  room.turnDeadlineAt = Date.now() - 1;
+  const next = applyLocalTimeout(room, ["abrams", "haze"]);
+  assert.equal(next.currentStep, 1);
+  assert.deepEqual(next.bans.A, ["abrams"]);
+  assert.equal(next.timedOut, undefined);
+});
+
+test("local timeout automatically picks when the current step is a pick", () => {
+  const rules = buildRules("standard", 30, {
+    teamSize: 2,
+    banCount: 0,
+    sequence: createDefaultSequence(2, 0, "A")
+  });
+  const room = createLocalRoom(rules, { A: "Alpha", B: "Bravo" });
+  room.turnDeadlineAt = Date.now() - 1;
+  const next = applyLocalTimeout(room, ["abrams", "haze"]);
+  assert.equal(next.currentStep, 1);
+  assert.deepEqual(next.picks.A, ["abrams"]);
+  assert.deepEqual(next.bans.A, []);
+});
+
+
+test("custom sequence keeps every configured ban and pick step", () => {
+  const sequence = [
+    { action: "ban", side: "B" },
+    { action: "pick", side: "A" },
+    { action: "ban", side: "A" },
+    { action: "pick", side: "B" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "B" }
+  ];
+  const rules = buildRules("standard", 0, { teamSize: 2, banCount: 2, sequence, firstSide: "B" });
+  assert.deepEqual(rules.sequence, sequence.map((step, index) => ({ ...step, index })));
+  assert.equal(rules.sequence.length, 6);
+  assert.deepEqual(createDefaultSequence(2, 0, "B"), [
+    { action: "pick", side: "B" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "A" },
+    { action: "pick", side: "B" }
+  ]);
 });
 
 
