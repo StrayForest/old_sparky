@@ -474,7 +474,9 @@ async function serveStatic(request, env, path) {
     "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self' https://*.googlesyndication.com https://*.googleadservices.com https://*.google.com https://*.gstatic.com https://*.doubleclick.net 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https: wss:; frame-src https:; font-src 'self' data: https:"
   );
   if (assetPath === "/draft/index.html" || MUTABLE_ASSETS.has(assetPath)) {
-    headers.set("Cache-Control", "no-cache");
+    headers.set("Cache-Control", "no-store, max-age=0");
+    headers.set("CDN-Cache-Control", "no-store");
+    headers.set("Cloudflare-CDN-Cache-Control", "no-store");
   } else {
     headers.set("Cache-Control", "public, max-age=300");
   }

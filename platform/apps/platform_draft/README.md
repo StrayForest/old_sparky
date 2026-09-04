@@ -41,7 +41,7 @@ The repository workflow expects GitHub Actions secrets:
 - `CLOUDFLARE_ACCOUNT_ID`
 
 The token needs the minimum permissions required to deploy the Worker/Durable Object and manage the route for `old-sparky.com`.
-The production workflow also purges the mutable Draft UI assets after deployment so a previous CDN copy cannot keep an old interface live.
+Mutable Draft UI assets are sent with `no-store` cache headers so a previous CDN copy cannot keep an old interface live. Hero objects remain immutable under their versioned R2 namespace.
 
 Local development/deploy uses Wrangler, for example:
 
