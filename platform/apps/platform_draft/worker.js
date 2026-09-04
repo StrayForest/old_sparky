@@ -8,6 +8,8 @@ const MAX_WS_MESSAGE_BYTES = 2048;
 const MAX_SPECTATORS = 50;
 const MAX_MESSAGES_PER_WINDOW = 40;
 const MESSAGE_WINDOW_MS = 10_000;
+const KNOWN_PRESET_IDS = new Set(["community-6v6", "community-6v6-no-timer", "6v6-no-bans", "custom"]);
+const VALID_TIMER_SECONDS = new Set([0, 30, 45, 60, 90]);
 
 export default {
   async fetch(request, env) {
@@ -344,10 +346,12 @@ async function createRoom(request, env) {
     return json({ error: "Некорректный JSON" }, 400);
   }
   const presetId = typeof payload?.presetId === "string" ? payload.presetId : "community-6v6";
-  const timerSeconds = [0, 30, 45, 60, 90].includes(Number(payload?.timerSeconds)) ? Number(payload.timerSeconds) : undefined;
   let rules;
   try {
-    rules = buildRules(presetId, timerSeconds);
+    if (!KNOWN_PRESET_IDS.has(presetId)) throw new Error("invalid preset");
+    const timerSeconds = parseTimerSeconds(payload?.timerSeconds);
+    const customRules = presetId === "custom" ? validateCustomCreateSettings(payload?.customRules) : null;
+    rules = buildRules(presetId, timerSeconds, customRules);
     validateRules(rules);
   } catch {
     return json({ error: "Некорректные правила" }, 400);
@@ -426,6 +430,41 @@ function validateRules(rules) {
   }
   if (picks.A !== rules.teamSize || picks.B !== rules.teamSize) throw new Error("invalid pick count");
   return rules;
+}
+
+function validateCustomCreateSettings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("invalid custom settings");
+  }
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 3 || keys.join(",") !== "banSequence,pickSequence,teamSize") {
+    throw new Error("invalid custom settings");
+  }
+  if (!Number.isInteger(value.teamSize) || ![2, 4, 6].includes(value.teamSize)) {
+    throw new Error("invalid custom team size");
+  }
+  if (typeof value.banSequence !== "string" || value.banSequence.length > 12 || !/^[AB]*$/u.test(value.banSequence)) {
+    throw new Error("invalid custom ban sequence");
+  }
+  if (
+    typeof value.pickSequence !== "string" ||
+    value.pickSequence.length > 24 ||
+    value.pickSequence.length !== value.teamSize * 2 ||
+    !/^[AB]+$/u.test(value.pickSequence) ||
+    [...value.pickSequence].filter((side) => side === "A").length !== value.teamSize ||
+    [...value.pickSequence].filter((side) => side === "B").length !== value.teamSize
+  ) {
+    throw new Error("invalid custom pick sequence");
+  }
+  return value;
+}
+
+function parseTimerSeconds(value) {
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || !VALID_TIMER_SECONDS.has(value)) {
+    throw new Error("invalid timer");
+  }
+  return value;
 }
 
 function publicRoom(room) {
