@@ -81,12 +81,16 @@ export function SiteHeader() {
             const active = exactActiveHref
               ? item.href === exactActiveHref
               : Boolean(!isCreateTournament && item.matchPrefix && pathname.startsWith(item.matchPrefix));
+            const className = `${active ? "nav-link active nav-link-active" : "nav-link"} ${MOBILE_NAV_LINK}`;
+            if (item.hardNavigation) {
+              return (
+                <a key={item.href} className={className} href={item.href}>
+                  {item.label}
+                </a>
+              );
+            }
             return (
-              <Link
-                key={item.href}
-                className={`${active ? "nav-link active nav-link-active" : "nav-link"} ${MOBILE_NAV_LINK}`}
-                href={item.href}
-              >
+              <Link key={item.href} className={className} href={item.href}>
                 {item.label}
               </Link>
             );
