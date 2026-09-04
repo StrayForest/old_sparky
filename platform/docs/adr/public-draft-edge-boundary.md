@@ -41,3 +41,4 @@ The site already uses Cloudflare in front of `old-sparky.com` and delivers publi
 - The room URL is public spectator identity, not mutation authority. Captain authority uses separate high-entropy secrets; the guest secret is transferred in a URL fragment and removed from the visible URL after the browser captures it.
 - `/draft` is indexable, while ephemeral room/result routes are `noindex`.
 - Cloudflare Worker/Durable Object deployment requires operator-managed Cloudflare credentials in the release workflow; secrets are never committed to Git.
+- The release workflow purges the mutable Draft UI assets by URL after deployment; hero thumbnails remain immutable under their versioned R2 namespace.

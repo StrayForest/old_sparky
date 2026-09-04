@@ -8,6 +8,7 @@ const MAX_WS_MESSAGE_BYTES = 2048;
 const MAX_SPECTATORS = 50;
 const MAX_MESSAGES_PER_WINDOW = 40;
 const MESSAGE_WINDOW_MS = 10_000;
+const MUTABLE_ASSETS = new Set(["/draft/app.js", "/draft/styles.css", "/draft/draft-core.js", "/draft/heroes.js"]);
 const KNOWN_PRESET_IDS = new Set(["standard", "community-6v6", "community-6v6-no-timer", "6v6-no-bans", "custom"]);
 const VALID_TIMER_SECONDS = new Set([0, 30, 45, 60, 90]);
 
@@ -472,7 +473,7 @@ async function serveStatic(request, env, path) {
     "Content-Security-Policy",
     "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self' https://*.googlesyndication.com https://*.googleadservices.com https://*.google.com https://*.gstatic.com https://*.doubleclick.net 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https: wss:; frame-src https:; font-src 'self' data: https:"
   );
-  if (assetPath === "/draft/index.html") {
+  if (assetPath === "/draft/index.html" || MUTABLE_ASSETS.has(assetPath)) {
     headers.set("Cache-Control", "no-cache");
   } else {
     headers.set("Cache-Control", "public, max-age=300");
