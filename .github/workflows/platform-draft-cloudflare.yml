@@ -187,6 +187,46 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npx --yes wrangler@4.129.0 deploy
 
+      - name: Purge mutable Draft assets from Cloudflare cache
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            'https://api.cloudflare.com/client/v4/zones?name=old-sparky.com&status=active' \
+            --output /tmp/draft-cloudflare-zones.json
+          zone_id="$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path('/tmp/draft-cloudflare-zones.json').read_text())
+          zones = payload.get('result', [])
+          if not payload.get('success') or len(zones) != 1 or not zones[0].get('id'):
+              raise SystemExit('Could not resolve the active old-sparky.com zone')
+          print(zones[0]['id'])
+          PY
+          )"
+          test -n "$zone_id"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            --data '{"files":["https://old-sparky.com/draft/app.js","https://old-sparky.com/draft/styles.css","https://old-sparky.com/draft/draft-core.js","https://old-sparky.com/draft/heroes.js"]}' \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/purge_cache" \
+            --output /tmp/draft-cloudflare-purge.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path('/tmp/draft-cloudflare-purge.json').read_text())
+          if not payload.get('success'):
+              raise SystemExit(f"Cloudflare Draft asset purge failed: {payload.get('errors')}")
+          print('Cloudflare Draft asset purge accepted')
+          PY
+
       - name: Smoke-check Draft page, assets, CDN and room creation
         shell: bash
         run: |
