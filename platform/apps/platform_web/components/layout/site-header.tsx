@@ -17,7 +17,7 @@ const MOBILE_CREATE_BUTTON =
 const MOBILE_BRAND =
   "max-[820px]:w-auto! max-[820px]:gap-3! max-[820px]:[&_.brand-mark]:h-11! max-[820px]:[&_.brand-mark]:w-11! max-[820px]:[&_.brand-title]:text-[15px]! max-[820px]:[&_.brand-title]:tracking-[.08em]! max-[820px]:[&_.brand-sub]:text-[8px]!";
 const MOBILE_NAV =
-  "max-[820px]:grid! max-[820px]:h-12! max-[820px]:w-full! max-[820px]:grid-cols-3! max-[820px]:gap-0! max-[820px]:overflow-x-visible!";
+  "max-[820px]:grid! max-[820px]:h-12! max-[820px]:w-full! max-[820px]:grid-cols-4! max-[820px]:gap-0! max-[820px]:overflow-x-visible!";
 const MOBILE_NAV_LINK =
   "max-[820px]:h-12! max-[820px]:w-full! max-[820px]:justify-center! max-[820px]:px-0! max-[820px]:bg-transparent! max-[820px]:after:left-0! max-[820px]:after:right-0!";
 
@@ -81,12 +81,16 @@ export function SiteHeader() {
             const active = exactActiveHref
               ? item.href === exactActiveHref
               : Boolean(!isCreateTournament && item.matchPrefix && pathname.startsWith(item.matchPrefix));
+            const className = `${active ? "nav-link active nav-link-active" : "nav-link"} ${MOBILE_NAV_LINK}`;
+            if (item.hardNavigation) {
+              return (
+                <a key={item.href} className={className} href={item.href}>
+                  {item.label}
+                </a>
+              );
+            }
             return (
-              <Link
-                key={item.href}
-                className={`${active ? "nav-link active nav-link-active" : "nav-link"} ${MOBILE_NAV_LINK}`}
-                href={item.href}
-              >
+              <Link key={item.href} className={className} href={item.href}>
                 {item.label}
               </Link>
             );

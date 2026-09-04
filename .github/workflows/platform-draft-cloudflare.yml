@@ -1,0 +1,186 @@
+name: Platform Draft Cloudflare
+
+on:
+  pull_request:
+    paths:
+      - "platform/apps/platform_draft/**"
+      - "platform/apps/platform_web/components/layout/site-header.tsx"
+      - "platform/apps/platform_web/lib/routes.ts"
+      - "platform/apps/platform_web/public/assets/heroes/**"
+      - "platform/tools/sync_draft_hero_assets.py"
+      - "platform/docs/adr/public-draft-edge-boundary.md"
+      - ".github/workflows/platform-draft-cloudflare.yml"
+  push:
+    branches: [dev]
+    paths:
+      - "platform/apps/platform_draft/**"
+      - "platform/apps/platform_web/components/layout/site-header.tsx"
+      - "platform/apps/platform_web/lib/routes.ts"
+      - "platform/apps/platform_web/public/assets/heroes/**"
+      - "platform/tools/sync_draft_hero_assets.py"
+      - "platform/docs/adr/public-draft-edge-boundary.md"
+      - ".github/workflows/platform-draft-cloudflare.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: read
+
+concurrency:
+  group: platform-draft-cloudflare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Draft static and state checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26.3.1"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Check JavaScript syntax
+        working-directory: platform/apps/platform_draft
+        run: npm run check
+      - name: Run zero-dependency Draft tests
+        working-directory: platform/apps/platform_draft
+        run: npm test
+      - name: Generate optimized hero thumbnails without network writes
+        run: |
+          python -m venv platform/.venv_draft_assets
+          platform/.venv_draft_assets/bin/python -m pip install \
+            --require-hashes \
+            -r platform/apps/platform_draft/requirements-assets.lock.txt
+          cd platform
+          .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
+            --output-dir /tmp/oldsparky-draft-heroes
+          test "$(find /tmp/oldsparky-draft-heroes -maxdepth 1 -type f -name '*.webp' | wc -l | tr -d ' ')" -ge 30
+
+  deploy:
+    name: Publish Draft edge runtime
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment: production
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26.3.1"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Wait for exact-SHA platform security gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          api="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status"
+          for attempt in $(seq 1 120); do
+            state="$(
+              curl --fail-with-body --silent --show-error \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "$api" \
+              | jq -r '[.statuses[] | select(.context == "platform-security-build")][0].state // "missing"'
+            )"
+            case "$state" in
+              success)
+                echo "platform-security-build passed for ${TARGET_SHA}"
+                break
+                ;;
+              failure|error)
+                echo "platform-security-build failed for ${TARGET_SHA}" >&2
+                exit 1
+                ;;
+              pending|missing)
+                if [[ "$attempt" == "120" ]]; then
+                  echo "Timed out waiting for platform-security-build on ${TARGET_SHA}" >&2
+                  exit 1
+                fi
+                sleep 10
+                ;;
+              *)
+                echo "Unexpected platform-security-build state: $state" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Detect Cloudflare deployment credentials
+        id: cloudflare-config
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${CLOUDFLARE_API_TOKEN:-}" && -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Cloudflare Draft deployment is not configured; add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID to the production environment."
+          fi
+
+      - name: Generate production hero thumbnails
+        if: ${{ steps.cloudflare-config.outputs.configured == 'true' }}
+        run: |
+          python -m venv platform/.venv_draft_assets
+          platform/.venv_draft_assets/bin/python -m pip install \
+            --require-hashes \
+            -r platform/apps/platform_draft/requirements-assets.lock.txt
+          cd platform
+          .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
+            --output-dir /tmp/oldsparky-draft-heroes
+
+      - name: Upload immutable hero thumbnails to existing R2 bucket
+        if: ${{ steps.cloudflare-config.outputs.configured == 'true' }}
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DRAFT_R2_BUCKET: oldsparky
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(/tmp/oldsparky-draft-heroes/*.webp)
+          test "${#files[@]}" -ge 30
+          for file in "${files[@]}"; do
+            name="$(basename "$file")"
+            npx --yes wrangler@4.129.0 r2 object put \
+              "${DRAFT_R2_BUCKET}/draft/heroes/v1/${name}" \
+              --file "$file" \
+              --content-type image/webp \
+              --cache-control 'public, max-age=31536000, immutable' \
+              --remote \
+              --force
+          done
+
+      - name: Deploy Worker, Static Assets and Durable Object
+        if: ${{ steps.cloudflare-config.outputs.configured == 'true' }}
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: platform/apps/platform_draft
+          command: deploy
+
+      - name: Smoke-check public Draft route and hero CDN
+        if: ${{ steps.cloudflare-config.outputs.configured == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          body="$(curl --fail-with-body --silent --show-error --retry 5 --retry-delay 2 https://old-sparky.com/draft)"
+          grep -q 'id="app"' <<<"$body"
+          grep -q 'ca-pub-7185165276065459' <<<"$body"
+          curl --fail-with-body --silent --show-error --retry 5 --retry-delay 2 \
+            --output /dev/null \
+            https://cdn.old-sparky.com/draft/heroes/v1/abrams.webp

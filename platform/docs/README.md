@@ -2,7 +2,7 @@
 
 - Status: Active
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-04
 
 Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current production state and next engineering priority. Open deeper documents only when the task requires them.
 
@@ -33,6 +33,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Historical implementation context | [`archive/`](archive/) |
 | Accepted architectural decisions | [`adr/`](adr/) |
 | Ready Check / bracket boundary | [Timing and bracket ADR](adr/ready-check-and-bracket-boundary.md) |
+| Public standalone Draft / Cloudflare edge boundary | [Public Draft edge ADR](adr/public-draft-edge-boundary.md) |
 
 ## Token-efficient reading contract
 
