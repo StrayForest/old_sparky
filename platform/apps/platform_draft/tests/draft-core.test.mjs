@@ -32,7 +32,7 @@ test("community 6v6 has six bans and six picks per team", () => {
 
 
 test("local actions advance the authoritative sequence and reject reused heroes", () => {
-  const room = createLocalRoom(buildRules("community-6v6", 0), { A: "Alpha", B: "Bravo" });
+  const room = createLocalRoom(buildRules("community-6v6", 30), { A: "Alpha", B: "Bravo" });
   const afterAbrams = applyLocalAction(room, "abrams");
   assert.equal(afterAbrams.version, room.version + 1);
   assert.equal(afterAbrams.currentStep, 1);
@@ -80,7 +80,7 @@ test("custom sequence keeps every configured ban and pick step", () => {
     { action: "pick", side: "A" },
     { action: "pick", side: "B" }
   ];
-  const rules = buildRules("standard", 0, { teamSize: 2, banCount: 2, sequence, firstSide: "B" });
+  const rules = buildRules("standard", 30, { teamSize: 2, banCount: 2, sequence, firstSide: "B" });
   assert.deepEqual(rules.sequence, sequence.map((step, index) => ({ ...step, index })));
   assert.equal(rules.sequence.length, 6);
   assert.deepEqual(rules.banCounts, { A: 1, B: 1 });
@@ -100,7 +100,7 @@ test("manual sequence may change ban count within the per-team limit", () => {
     { action: "pick", side: "B" },
     { action: "pick", side: "A" }
   ];
-  const rules = buildRules("standard", 0, { teamSize: 2, banCount: 0, sequence, firstSide: "A" });
+  const rules = buildRules("standard", 30, { teamSize: 2, banCount: 0, sequence, firstSide: "A" });
   assert.deepEqual(rules.sequence.map(({ action }) => action), ["pick", "ban", "pick", "pick", "pick"]);
   assert.equal(rules.sequence[0].side, "A");
   assert.deepEqual(rules.banCounts, { A: 0, B: 1 });
@@ -128,7 +128,7 @@ test("sequence editor cycles empty, pick and ban cells and switches rows", () =>
 });
 
 test("an explicit empty custom sequence is rejected instead of falling back to standard", () => {
-  assert.throws(() => buildRules("standard", 0, { teamSize: 2, banCount: 0, sequence: [] }));
+  assert.throws(() => buildRules("standard", 30, { teamSize: 2, banCount: 0, sequence: [] }));
 });
 
 test("manual sequence rejects more than three bans for one team", () => {
@@ -142,7 +142,7 @@ test("manual sequence rejects more than three bans for one team", () => {
     { action: "pick", side: "B" },
     { action: "pick", side: "B" }
   ];
-  assert.throws(() => buildRules("standard", 0, { teamSize: 2, banCount: 3, sequence }));
+  assert.throws(() => buildRules("standard", 30, { teamSize: 2, banCount: 3, sequence }));
 });
 
 
@@ -156,7 +156,7 @@ test("all shipped presets normalize to bounded indexed sequences", () => {
 
 
 test("result payload round-trips without server storage", () => {
-  let room = createLocalRoom(buildRules("6v6-no-bans", 0), { A: "Команда А", B: "Команда Б" });
+  let room = createLocalRoom(buildRules("6v6-no-bans", 30), { A: "Команда А", B: "Команда Б" });
   for (const hero of ["abrams", "haze", "bebop", "ivy", "dynamo", "warden", "shiv", "seven", "lash", "yamato", "viscous", "vindicta"]) {
     room = applyLocalAction(room, hero);
   }
@@ -170,6 +170,23 @@ test("result payload round-trips without server storage", () => {
   assert.equal(decoded.b, "Команда Б");
   assert.equal(decoded.pa.length, 6);
   assert.equal(decoded.pb.length, 6);
+});
+
+test("compact result payload keeps sequence and shortens hero data", () => {
+  const heroes = ["abrams", "haze", "bebop", "ivy", "dynamo", "warden", "shiv", "seven", "lash", "yamato", "viscous", "vindicta"];
+  let room = createLocalRoom(buildRules("6v6-no-bans", 30), { A: "Команда А", B: "Команда Б" });
+  for (const hero of heroes) room = applyLocalAction(room, hero);
+  const legacy = encodeResult(room);
+  const compact = encodeResult(room, heroes);
+  const decoded = decodeResult(compact, heroes);
+  assert.equal(decoded.v, 2);
+  assert.deepEqual(decoded.pa, room.picks.A);
+  assert.equal(decoded.sequence.length, room.rules.sequence.length);
+  assert.ok(compact.length < legacy.length);
+});
+
+test("timer cannot be disabled", () => {
+  assert.throws(() => buildRules("standard", 0));
 });
 
 

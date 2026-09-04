@@ -9,8 +9,8 @@ const MAX_SPECTATORS = 50;
 const MAX_MESSAGES_PER_WINDOW = 40;
 const MESSAGE_WINDOW_MS = 10_000;
 const MUTABLE_ASSETS = new Set(["/draft/app.js", "/draft/styles.css", "/draft/draft-core.js", "/draft/heroes.js"]);
-const KNOWN_PRESET_IDS = new Set(["standard", "community-6v6", "community-6v6-no-timer", "6v6-no-bans", "custom"]);
-const VALID_TIMER_SECONDS = new Set([0, 30, 45, 60, 90]);
+const KNOWN_PRESET_IDS = new Set(["standard", "community-6v6", "6v6-no-bans", "custom"]);
+const VALID_TIMER_SECONDS = new Set([30, 45, 60, 90]);
 
 export default {
   async fetch(request, env) {
@@ -72,8 +72,8 @@ export class DraftRoom {
       version: 1,
       rules: validateRules(payload.rules),
       teamNames: {
-        A: cleanTeamName(payload.teamNames?.A, "Команда 1"),
-        B: cleanTeamName(payload.teamNames?.B, "Команда 2")
+        A: cleanTeamName(payload.teamNames?.A, "Команда А"),
+        B: cleanTeamName(payload.teamNames?.B, "Команда Б")
       },
       currentStep: 0,
       picks: { A: [], B: [] },
@@ -235,7 +235,11 @@ export class DraftRoom {
       return;
     }
     const side = attachment.role === "host" ? "A" : "B";
-    room.teamNames[side] = cleanTeamName(message.name, side === "A" ? "Команда 1" : "Команда 2");
+    if (room.ready?.[side]) {
+      this.sendError(ws, "После готовности название команды изменить нельзя", room);
+      return;
+    }
+    room.teamNames[side] = cleanTeamName(message.name, side === "A" ? "Команда А" : "Команда Б");
     room.version += 1;
     await this.saveAndBroadcast(room);
   }
@@ -270,6 +274,12 @@ export class DraftRoom {
     }
     if (typeof message.heroId !== "string" || !HERO_BY_ID.has(message.heroId)) {
       this.sendError(ws, "Неизвестный герой", room);
+      return;
+    }
+    const collection = room[step.action === "pick" ? "picks" : "bans"][step.side];
+    const capacity = step.action === "pick" ? room.rules.teamSize : MAX_BANS_PER_TEAM;
+    if (collection.length >= capacity) {
+      this.sendError(ws, step.action === "pick" ? "Лимит пиков уже исчерпан" : "Лимит банов уже исчерпан", room);
       return;
     }
     if (heroUsed(room, message.heroId)) {
@@ -425,8 +435,8 @@ async function createRoom(request, env) {
     return json({ error: "Некорректные правила" }, 400);
   }
   const teamNames = {
-    A: cleanTeamName(payload?.teamNames?.A, "Команда 1"),
-    B: cleanTeamName(payload?.teamNames?.B, "Команда 2")
+    A: cleanTeamName(payload?.teamNames?.A, "Команда А"),
+    B: cleanTeamName(payload?.teamNames?.B, "Команда Б")
   };
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -487,7 +497,7 @@ async function serveStatic(request, env, path) {
 }
 
 function validateRules(rules) {
-  if (!rules || ![2, 4, 6].includes(rules.teamSize) || ![0, 30, 45, 60, 90].includes(rules.timerSeconds)) {
+  if (!rules || ![2, 4, 6].includes(rules.teamSize) || ![30, 45, 60, 90].includes(rules.timerSeconds)) {
     throw new Error("invalid rules");
   }
   if (!Number.isInteger(rules.banCount) || rules.banCount < 0 || rules.banCount > MAX_BANS_PER_TEAM) {

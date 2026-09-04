@@ -12,12 +12,15 @@ Standalone public Deadlock picks/bans tool for `https://old-sparky.com/draft`.
   that team, and must press Ready; drafting starts only after both connected
   captains are ready.
 - Standard room creation exposes team format, bans per team (0–3), first mover,
-  timer and an editable pick/ban sequence. The selected ban count initializes
+  finite timer (30/45/60/90 seconds) and an editable pick/ban sequence. The selected ban count initializes
   the standard template; manual edits are authoritative and may use any
   sequence with at most three bans per team. The Worker validates the
   submitted sequence before creating the room.
 - A turn deadline always advances the authoritative sequence with the first
   unused hero as an automatic pick or ban. There is no pause state.
+- Completed room views and stateless result links use the same two-line sequence
+  layout; new result links use compact v2 hero indexes while older v1 links
+  remain readable.
 - No PostgreSQL, Redis, Celery or durable draft history.
 - Active room storage exists only so hibernated WebSockets can resume; it is deleted when a room completes or expires.
 
