@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "old-sparky-draft",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-04",
+  "routes": [
+    {
+      "pattern": "old-sparky.com/draft*",
+      "zone_name": "old-sparky.com"
+    }
+  ],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DRAFT_ROOMS",
+        "class_name": "DraftRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DraftRoom"]
+    }
+  ],
+  "vars": {
+    "ALLOWED_ORIGIN": "https://old-sparky.com",
+    "HERO_CDN_BASE": "https://cdn.old-sparky.com/draft/heroes/v1"
+  }
+}
