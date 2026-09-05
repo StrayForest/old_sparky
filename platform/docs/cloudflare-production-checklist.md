@@ -5,7 +5,11 @@
 - Last reviewed: 2026-09-05
 
 `DONE` requires live/dashboard evidence. `VERIFY` needs dashboard confirmation;
-source code alone is not evidence. Never use a Global API Key.
+source code alone is not evidence. Never use a Global API Key. The manual
+[`Platform Cloudflare read-only audit`](../../.github/workflows/platform-cloudflare-readonly-audit.yml)
+workflow uses the existing GitHub Actions secrets for GET-only API evidence and
+stores a redacted report as a short-lived artifact; an API permission failure is
+evidence that access is missing, not evidence that the control is configured.
 
 ## DNS and certificates
 
