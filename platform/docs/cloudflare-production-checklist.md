@@ -10,6 +10,10 @@ source code alone is not evidence. Never use a Global API Key. The manual
 workflow uses the existing GitHub Actions secrets for GET-only API evidence and
 stores a redacted report as a short-lived artifact; an API permission failure is
 evidence that access is missing, not evidence that the control is configured.
+The 2026-09-05 run produced partial evidence and confirmed that the current
+deployment token lacks the zone/ruleset read permissions needed for full AUD-02
+closure; the durable summary is in
+[`archive/as-02-cloudflare-api-audit-2026-09-05.md`](archive/as-02-cloudflare-api-audit-2026-09-05.md).
 
 ## DNS and certificates
 

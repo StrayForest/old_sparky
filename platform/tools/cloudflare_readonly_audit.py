@@ -248,17 +248,17 @@ def run_audit(token: str, account_id: str) -> dict[str, Any]:
     record(
         report,
         "www-canonical-policy",
-        "PASS" if dns.ok and not by_name[f"www.{ZONE_NAME}"] else "REVIEW",
+        "PASS" if dns.ok and not by_name[f"www.{ZONE_NAME}"] else ("UNAVAILABLE" if not dns.ok else "REVIEW"),
         "Observed whether the unsupported www hostname has DNS records.",
-        {"www_records": by_name[f"www.{ZONE_NAME}"]},
+        {**api_evidence(dns), "www_records": by_name[f"www.{ZONE_NAME}"]},
     )
     caa_records = [item for item in records if isinstance(item, dict) and item.get("type") == "CAA"]
     record(
         report,
         "caa-decision",
-        "REVIEW",
+        "REVIEW" if dns.ok else "UNAVAILABLE",
         "CAA records are observable; policy completeness still requires an operator CA decision.",
-        {"records": [short_record(item) for item in caa_records]},
+        {**api_evidence(dns), "records": [short_record(item) for item in caa_records]},
     )
 
     certificate_packs = api_get(
@@ -289,7 +289,7 @@ def run_audit(token: str, account_id: str) -> dict[str, Any]:
     record(
         report,
         "edge-certificates",
-        "PASS" if certificate_packs.ok and active_certs > 0 and not non_active_packs else "REVIEW",
+        "PASS" if certificate_packs.ok and active_certs > 0 and not non_active_packs else ("UNAVAILABLE" if certificate_packs.status in {401, 403} else "REVIEW"),
         "Read production certificate-pack status; expiry alerting is recorded separately.",
         {**api_evidence(certificate_packs), "active_certificate_count": active_certs, "packs": pack_summary},
     )
@@ -309,17 +309,26 @@ def run_audit(token: str, account_id: str) -> dict[str, Any]:
     buckets = buckets_result.get("buckets", []) if isinstance(buckets_result, dict) else []
     buckets = buckets if isinstance(buckets, list) else []
     target_bucket = next((item for item in buckets if isinstance(item, dict) and item.get("name") == R2_BUCKET_NAME), None)
+    bucket_details = (
+        api_get(token, f"/accounts/{account_id}/r2/buckets/{R2_BUCKET_NAME}")
+        if isinstance(target_bucket, dict)
+        else None
+    )
+    detailed_bucket = response_result(bucket_details) if bucket_details else None
+    detailed_bucket = detailed_bucket if isinstance(detailed_bucket, dict) else target_bucket
+    storage_class = detailed_bucket.get("storage_class") if isinstance(detailed_bucket, dict) else None
     record(
         report,
         "r2-public-bucket",
-        "PASS" if r2_buckets.ok and isinstance(target_bucket, dict) and target_bucket.get("storage_class") == "Standard" else ("UNAVAILABLE" if r2_buckets.status in {401, 403} else "REVIEW"),
+        "PASS" if bucket_details and bucket_details.ok and storage_class == "Standard" else ("UNAVAILABLE" if r2_buckets.status in {401, 403} or (bucket_details and bucket_details.status in {401, 403}) else "REVIEW"),
         "Read the configured media bucket storage class.",
         {
             **api_evidence(r2_buckets),
+            "bucket_detail": api_evidence(bucket_details) if bucket_details else None,
             "bucket": {
                 key: target_bucket[key]
                 for key in ("name", "storage_class", "jurisdiction", "location")
-                if isinstance(target_bucket, dict) and key in target_bucket
+                if isinstance(detailed_bucket, dict) and key in detailed_bucket
             },
         },
     )
@@ -344,8 +353,10 @@ def run_audit(token: str, account_id: str) -> dict[str, Any]:
         record(
             report,
             "r2-browser-put-cors",
-            "PASS" if cors.ok and cors_rules in (None, []) else ("REVIEW" if cors.ok else "UNAVAILABLE"),
-            "Read browser CORS policy for the media bucket.",
+            "PASS"
+            if (cors.ok and cors_rules in (None, [])) or (cors.status == 404 and 10059 in cors.error_codes)
+            else ("REVIEW" if cors.ok else "UNAVAILABLE"),
+            "Read browser CORS policy for the media bucket; a missing policy is the expected result.",
             {**api_evidence(cors), "rule_count": len(cors_rules) if isinstance(cors_rules, list) else None},
         )
         custom_domains = api_get(token, f"/accounts/{account_id}/r2/buckets/{R2_BUCKET_NAME}/domains/custom")

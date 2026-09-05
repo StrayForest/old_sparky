@@ -44,8 +44,13 @@ in [`archive/as-02-cloudflare-catalog-cache-2026-09-05.md`](archive/as-02-cloudf
 The finding remains open only for direct account-owner verification of the
 Cloudflare rule expression and the separate certificate-alert, CAA, R2
 public-bucket/media-token, Managed WAF, edge-rate, Turnstile-hostname, Bot
-Fight Mode and Cloudflare-range/UFW monitoring controls. The checklist must
-not be called fully closed until those dashboard/operator checks have evidence.
+Fight Mode and Cloudflare-range/UFW monitoring controls. A read-only GitHub
+Actions audit on 2026-09-05 confirmed partial R2/Turnstile evidence but also
+confirmed that the current deployment token lacks the zone/ruleset read scopes
+for the remaining controls; details are in
+[`archive/as-02-cloudflare-api-audit-2026-09-05.md`](archive/as-02-cloudflare-api-audit-2026-09-05.md).
+The checklist must not be called fully closed until those dashboard/operator
+checks have evidence.
 
 ### Additional audit actions
 
