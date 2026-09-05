@@ -35,12 +35,14 @@ CAA_AUTHORITIES = (
 
 
 class ApiFailure(RuntimeError):
-    def __init__(self, method: str, path: str, status: int, codes: list[Any]) -> None:
-        super().__init__(f"Cloudflare API {method} {path} failed with HTTP {status} (codes={codes})")
+    def __init__(self, method: str, path: str, status: int, codes: list[Any], messages: list[Any]) -> None:
+        safe_messages = [str(message)[:240] for message in messages if message]
+        super().__init__(f"Cloudflare API {method} {path} failed with HTTP {status} (codes={codes}; messages={safe_messages})")
         self.method = method
         self.path = path
         self.status = status
         self.codes = codes
+        self.messages = safe_messages
 
 
 def api_request(token: str, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -66,13 +68,15 @@ def api_request(token: str, method: str, path: str, body: dict[str, Any] | None 
             payload = {}
         errors = payload.get("errors") if isinstance(payload, dict) else None
         codes = [item.get("code") for item in errors if isinstance(item, dict)] if isinstance(errors, list) else []
-        raise ApiFailure(method, path, exc.code, codes) from exc
+        messages = [item.get("message") for item in errors if isinstance(item, dict)] if isinstance(errors, list) else []
+        raise ApiFailure(method, path, exc.code, codes, messages) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError(f"Cloudflare API {method} {path} transport failure: {exc.__class__.__name__}") from exc
     if not isinstance(payload, dict) or payload.get("success") is not True:
         errors = payload.get("errors") if isinstance(payload, dict) else None
         codes = [item.get("code") for item in errors if isinstance(item, dict)] if isinstance(errors, list) else []
-        raise ApiFailure(method, path, status, codes)
+        messages = [item.get("message") for item in errors if isinstance(item, dict)] if isinstance(errors, list) else []
+        raise ApiFailure(method, path, status, codes, messages)
     result = payload.get("result")
     return result if isinstance(result, dict) else {"value": result}
 
@@ -275,16 +279,26 @@ def main() -> int:
     zone = get_zone(token, account_id)
     zone_id = str(zone["id"])
     report: dict[str, Any] = {"zone": ZONE_NAME, "apply": args.apply, "changes": []}
-    ensure_caa(token, zone_id, report, args.apply)
-    ensure_ct_alerting(token, zone_id, email, report, args.apply)
-    ensure_ssl_policy(token, account_id, email, report, args.apply)
-    ensure_managed_waf(token, zone_id, report, args.apply)
-    ensure_rate_limits(token, zone_id, report, args.apply)
-    ensure_bot_fight(token, zone_id, report, args.apply, args.disable_bot_fight)
+    report["errors"] = []
+    steps = (
+        ("caa", lambda: ensure_caa(token, zone_id, report, args.apply)),
+        ("certificate_transparency", lambda: ensure_ct_alerting(token, zone_id, email, report, args.apply)),
+        ("ssl_policy", lambda: ensure_ssl_policy(token, account_id, email, report, args.apply)),
+        ("managed_waf", lambda: ensure_managed_waf(token, zone_id, report, args.apply)),
+        ("rate_limits", lambda: ensure_rate_limits(token, zone_id, report, args.apply)),
+        ("bot_fight_mode", lambda: ensure_bot_fight(token, zone_id, report, args.apply, args.disable_bot_fight)),
+    )
+    for name, operation in steps:
+        try:
+            operation()
+        except ApiFailure as exc:
+            report["errors"].append({"control": name, "status": exc.status, "codes": exc.codes, "messages": exc.messages})
+        except RuntimeError as exc:
+            report["errors"].append({"control": name, "error": str(exc)[:240]})
     if args.output:
         args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0
+    return 1 if report["errors"] else 0
 
 
 if __name__ == "__main__":
