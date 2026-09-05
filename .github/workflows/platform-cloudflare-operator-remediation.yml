@@ -1,0 +1,57 @@
+name: Platform Cloudflare operator remediation
+
+on:
+  workflow_dispatch:
+    inputs:
+      disable_bot_fight:
+        description: "Rollback Bot Fight Mode instead of enabling it"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-cloudflare-operator-remediation
+  cancel-in-progress: false
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_ALL_2 }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_ALERT_EMAIL: ${{ secrets.CLOUDFLARE_ALERT_EMAIL }}
+    steps:
+      - name: Check out exact operator source
+        uses: actions/checkout@v4
+
+      - name: Apply Cloudflare controls
+        run: |
+          set -euo pipefail
+          test -n "${CLOUDFLARE_API_TOKEN:-}"
+          test -n "${CLOUDFLARE_ACCOUNT_ID:-}"
+          test -n "${CLOUDFLARE_ALERT_EMAIL:-}"
+          args=(--apply --output "$RUNNER_TEMP/cloudflare-operator-report.json")
+          if [[ "${{ inputs.disable_bot_fight }}" == "true" ]]; then
+            args+=(--disable-bot-fight)
+          fi
+          python3 platform/tools/cloudflare_operator_remediation.py "${args[@]}"
+
+      - name: Live production smoke
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 20 -D "$RUNNER_TEMP/home.headers" -o /dev/null https://old-sparky.com/
+          curl --fail --silent --show-error --max-time 20 -D "$RUNNER_TEMP/catalog.headers" -o /dev/null 'https://old-sparky.com/api/v1/tournaments/public?limit=1'
+          curl --fail --silent --show-error --max-time 20 -D "$RUNNER_TEMP/mine.headers" -o /dev/null 'https://old-sparky.com/api/v1/tournaments/mine' || test "$(awk 'NR==1 {print $2}' "$RUNNER_TEMP/mine.headers")" = "401"
+          grep -qi '^server: cloudflare' "$RUNNER_TEMP/home.headers"
+
+      - name: Upload redacted operator evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflare-operator-remediation-${{ github.run_id }}
+          path: ${{ runner.temp }}/cloudflare-operator-report.json
+          if-no-files-found: ignore
