@@ -160,7 +160,7 @@ jobs:
               if not public:
                   continue
               if port not in {22, 80, 443}:
-                  failures.append("unexpected_public_port")
+                  failures.append(f"unexpected_public_port_{port}")
               elif port in {80, 443}:
                   public_web_ports.add(port)
                   if "nginx" not in line.lower():
