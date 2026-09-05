@@ -10,23 +10,29 @@ source code alone is not evidence. Never use a Global API Key. The manual
 workflow uses the existing GitHub Actions secrets for GET-only API evidence and
 stores a redacted report as a short-lived artifact; an API permission failure is
 evidence that access is missing, not evidence that the control is configured.
-The 2026-09-05 run produced partial evidence and confirmed that the current
-deployment token lacks the zone/ruleset read permissions needed for full AUD-02
-closure; the durable summary is in
+The full read-only API run on 2026-09-05 produced `9 PASS` and `8 REVIEW`.
+The narrow Cache Rule repair then succeeded in remediation run
+[`33964594777`](https://github.com/StrayForest/old_sparky/actions/runs/33964594777),
+and the follow-up read-only evidence is retained in
+[`33964617403`](https://github.com/StrayForest/old_sparky/actions/runs/33964617403).
+The durable summary is in
 [`archive/as-02-cloudflare-api-audit-2026-09-05.md`](archive/as-02-cloudflare-api-audit-2026-09-05.md).
 
 ## DNS and certificates
 
-- DONE: apex and `cdn.old-sparky.com` are proxied and serve HTTPS.
+- DONE: the read-only audit confirmed the apex A record and
+  `cdn.old-sparky.com` are proxied; no apex AAAA record was returned, and
+  `www.old-sparky.com` has no DNS records.
 - DECISION: `old-sparky.com` is the only supported public hostname. `www.old-sparky.com` intentionally has no DNS alias and must not be introduced as a second canonical origin without an explicit redirect/SEO decision.
-- VERIFY: apex origin address remains correct/proxied; no accidental AAAA until
-  origin IPv6 is tested.
 - DONE: DNSSEC is enabled and the operator confirmed the production DNSSEC/DS
   contour on 2026-08-21.
 - REVIEW: scanner reports no CAA. Add records only after confirming every CA
   Cloudflare currently needs for Universal/backup certificates; an incomplete
   CAA policy can block renewal.
-- VERIFY: edge certificate active and expiry alerts enabled.
+- DONE: the edge certificate API returned an active Universal certificate and
+  an issued Let’s Encrypt backup certificate for the production hosts.
+- VERIFY: Certificate Transparency alerting is currently disabled in the API
+  (`enabled: false`); decide and verify the expiry/alerting policy.
 
 ## Edge TLS
 
@@ -53,11 +59,15 @@ closure; the durable summary is in
   `cdn.old-sparky.com` is enabled with active ownership/SSL and minimum TLS
   1.2; see [`archive/as-02-cloudflare-api-audit-2026-09-05.md`](archive/as-02-cloudflare-api-audit-2026-09-05.md).
 - VERIFY: media token is bucket-scoped and not reused for backups.
-- VERIFY: cache rule applies only to `cdn.old-sparky.com`, respects immutable
-  origin Cache-Control/query keys and does not cache 4xx/5xx.
+- DONE: the reviewed cache ruleset now bypasses the public catalog for
+  `Authorization` or the actual `__Host-old_sparky_session` cookie. Anonymous
+  catalog requests returned `HIT`, while a session-cookie request returned
+  `DYNAMIC`; `/api/v1/tournaments/mine` remained `401`/`no-store`/`DYNAMIC`.
+  The API rule definition and live smoke are retained in the two linked runs
+  above and in [`archive/as-02-cloudflare-catalog-cache-2026-09-05.md`](archive/as-02-cloudflare-catalog-cache-2026-09-05.md).
 - DONE: public catalog cache behavior is live-proven for
-  `old-sparky.com/api/v1/tournaments`: anonymous GETs returned
-  `CF-Cache-Status: MISS` followed by `HIT` with `Age: 0`; the actual
+  `old-sparky.com/api/v1/tournaments`: warmed anonymous GETs returned
+  `CF-Cache-Status: HIT`; the actual
   production session cookie `__Host-old_sparky_session` and `Authorization`
   returned `DYNAMIC`; `/api/v1/tournaments/mine` returned `401`,
   `Cache-Control: no-store` and `DYNAMIC`. Closure evidence is in
@@ -79,14 +89,15 @@ closure; the durable summary is in
 - TODO: add bounded edge rates for register, login, reset, invite, support and
   upload; application controls stay authoritative.
 - DONE: read-only API evidence shows the active Turnstile widget allowlist is
-  only `old-sparky.com`; runtime compatibility remains covered by the separate
-  Bot Fight Mode check.
+  only `old-sparky.com`.
 - DONE: Cloudflare Access protects `/platform-ops*` and `/api/v1/admin*` with an
   operator-scoped Allow policy and independent MFA. A TOTP device was enrolled
   and a fresh incognito login verified the identity -> MFA -> application path
   on 2026-08-21; application RBAC remains authoritative. Closure evidence is in
   [`archive/as-02-cloudflare-access-mfa.md`](archive/as-02-cloudflare-access-mfa.md).
-- VERIFY: Bot Fight Mode does not break API, health, Turnstile, CDN or crawlers.
+- VERIFY: Bot Fight Mode is disabled (`fight_mode: false`); retain a deliberate
+  operator decision and runtime smoke for API, health, Turnstile, CDN and
+  crawler behavior if the feature is enabled later.
 
 ## Origin protection
 

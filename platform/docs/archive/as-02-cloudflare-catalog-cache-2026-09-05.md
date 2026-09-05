@@ -15,8 +15,8 @@ Cache-Control: public, max-age=5, s-maxage=15, stale-while-revalidate=30
 Two immediate anonymous requests with the same query produced:
 
 ```text
-first:  HTTP 200, CF-Cache-Status: MISS
-second: HTTP 200, Age: 0, CF-Cache-Status: HIT
+first:  HTTP 200, CF-Cache-Status: EXPIRED
+second: HTTP 200, CF-Cache-Status: HIT
 ```
 
 The production session cookie name is `__Host-old_sparky_session` from the
@@ -36,11 +36,13 @@ CF-Cache-Status: DYNAMIC
 
 ## Conclusion
 
-The previous contradiction was caused by treating a non-production probe
-cookie as the session-cookie test. The live behavior now proves the intended
-cache boundary: anonymous public catalog responses may be cached, while the
-actual session-cookie/authorization and `/mine` paths bypass the edge cache.
+The Cloudflare Cache Rules API initially exposed a stale bypass expression
+using `deadlock_platform_session=`. A narrowly guarded remediation run
+replaced it with the actual production cookie `__Host-old_sparky_session=`.
+The follow-up API audit showed the repaired expression, and the live behavior
+proves the intended cache boundary: anonymous public catalog responses may be
+cached, while the actual session-cookie/authorization and `/mine` paths bypass
+the edge cache.
 
-This closes the runtime cache-behavior part of AUD-02. Direct Cloudflare
-dashboard evidence for the rule expression and the other operator-owned
-controls remains tracked in the active checklist.
+This closes the cache-rule/runtime part of AUD-02. The remaining
+operator-owned controls remain tracked in the active checklist.

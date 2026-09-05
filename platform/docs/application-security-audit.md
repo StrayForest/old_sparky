@@ -11,7 +11,7 @@ This document contains only findings that still require action or direct operato
 
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
-| AUD-02 | P2 | High | Cloudflare dashboard/runtime evidence reconciliation | Open — cache behavior closed; dashboard controls remain |
+| AUD-02 | P2 | High | Cloudflare dashboard/runtime evidence reconciliation | Open — cache rule/runtime boundary closed; operator controls remain |
 
 ## Authorization matrix
 
@@ -36,18 +36,17 @@ AS-12 origin-perimeter closure evidence is retained in
 ### AUD-02 — Cloudflare dashboard/runtime evidence reconciliation
 
 The public catalog cache behavior is now live-proven and the previous
-documentation contradiction is closed: anonymous requests produce `MISS` then
+documentation contradiction is closed: warmed anonymous requests produce
 `HIT`, while the actual production session cookie and `Authorization` produce
-`DYNAMIC`; `/api/v1/tournaments/mine` remains private and uncached. Evidence is
-in [`archive/as-02-cloudflare-catalog-cache-2026-09-05.md`](archive/as-02-cloudflare-catalog-cache-2026-09-05.md).
+`DYNAMIC`; `/api/v1/tournaments/mine` remains private and uncached. Evidence
+is in [`archive/as-02-cloudflare-catalog-cache-2026-09-05.md`](archive/as-02-cloudflare-catalog-cache-2026-09-05.md).
 
-The finding remains open only for direct account-owner verification of the
-Cloudflare rule expression and the separate certificate-alert, CAA,
-media-token, Managed WAF, edge-rate, Bot Fight Mode and Cloudflare-range/UFW
-monitoring controls. A read-only GitHub Actions audit on 2026-09-05 closed the
-R2 bucket/domain/CORS and Turnstile-hostname subchecks, but also confirmed that
-the current deployment token lacks the zone/ruleset read scopes for the
-remaining controls; details are in
+The finding remains open for the CAA decision, certificate-alert policy,
+media-token scope, Managed WAF/rate-limit configuration, Bot Fight Mode runtime
+decision and Cloudflare-range/UFW monitoring. A read-only GitHub Actions audit
+on 2026-09-05 closed the DNS, active-certificate, R2, Turnstile-hostname and
+catalog cache subchecks; the cache repair and live smoke used a narrowly scoped
+remediation workflow and changed only the reviewed rule. Details are in
 [`archive/as-02-cloudflare-api-audit-2026-09-05.md`](archive/as-02-cloudflare-api-audit-2026-09-05.md).
 The checklist must not be called fully closed until those dashboard/operator
 checks have evidence.

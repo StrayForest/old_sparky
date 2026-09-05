@@ -16,7 +16,7 @@ Read this file for the current production baseline and next engineering priority
 - Current deployed product includes secure Steam OpenID login/linking, mobile auth/profile/tournament polish, enforced nonce CSP, tournament lifecycle, deterministic Deadlock assignment, locked rosters, bracket progression, durable patch-translation state, the rebuildable tournament catalog read model with keyset pagination, the admin roster control center, immutable releases and tested rollback. Google OAuth login/registration is implemented and enabled with operator-managed OAuth credentials.
 - Frontend audit remediation for contract validation, permissions, auth/session states, async draft/search races, retry boundaries, internal navigation and i18n is resolved and deployed in release `frontend-audit-remediation-20260822T204107Z`; evidence is in [`archive/frontend-audit-remediation-2026-08-22.md`](archive/frontend-audit-remediation-2026-08-22.md).
 - Cloudflare Access now protects `/platform-ops*` and `/api/v1/admin*` with an operator-scoped Allow policy and independent MFA; a fresh incognito login verified the identity -> TOTP MFA -> application path while application `admin`/`superadmin` RBAC remains authoritative.
-- The read-only Cloudflare API audit on 2026-09-05 confirmed the production R2 bucket is Standard with `r2.dev` and browser PUT CORS disabled, its `cdn.old-sparky.com` custom domain is active, and the Turnstile widget is restricted to `old-sparky.com`; remaining zone/ruleset controls are unavailable under the deployment token and remain open in [AUD-02](application-security-audit.md).
+- The full read-only Cloudflare API audit on 2026-09-05 confirmed apex-only DNS, active edge certificates, the Standard R2 bucket with `r2.dev` and browser PUT CORS disabled, the active `cdn.old-sparky.com` custom domain, and a Turnstile widget restricted to `old-sparky.com`. The reviewed catalog Cache Rule was repaired to bypass `__Host-old_sparky_session`; anonymous catalog requests are `HIT`, while session-cookie and `/mine` requests are `DYNAMIC`/uncached. AUD-02 remains open for the CAA decision, certificate alerts, media-token scope, WAF/rate-limit configuration, Bot Fight Mode runtime decision and range/UFW alerting; see [AUD-02](application-security-audit.md).
 - Cloudflare is the single visitor-facing HSTS owner. Dashboard verification on 2026-08-21 confirmed HSTS On with six-month `max-age=15552000`, `includeSubDomains` Off and preload Off; Nginx must continue to omit HSTS.
 - Cloudflare Full(strict), minimum visitor TLS 1.2, TLS 1.3/HTTP3 and DNSSEC were operator-confirmed on 2026-08-21.
 - Invite-only tournament workspace reads reject retained or otherwise inactive participant records. Bracket data is delivered through the authorized workspace response and remains governed by the ordinary request authorization boundary.
@@ -288,10 +288,11 @@ and size-based rotation bounds text log files.
 
 ## Deferred / operator-owned work
 
-- Remaining Cloudflare dashboard follow-up for certificate alerts, CAA, R2
-  public-bucket/media-token settings, WAF/rates, Turnstile hostnames, Bot Fight
-  Mode and Cloudflare-range/UFW parity where the operator checklist still marks
-  work `VERIFY`/`TODO`.
+- Remaining Cloudflare operator follow-up is limited to the CAA decision,
+  certificate-alert policy, media-token scope, WAF/rate-limit configuration,
+  Bot Fight Mode runtime decision and the daily Cloudflare-range/UFW parity
+  alert. DNS, edge certificates, R2, Turnstile hostnames and the catalog cache
+  boundary have fresh API/live evidence.
 - Real-user CSP follow-up and classification of new enforcement reports.
 - Physical removal of persisted legacy media URL fields and migration-only helpers after production data and external-consumer inventory confirms that no migration or compatibility dependency remains; this requires a reviewed API/schema migration.
 - Non-security feature expansion that does not remove a launch or production blocker. For priorities and backlog, use [`platform-roadmap.md`](platform-roadmap.md); for evidence and details, follow [`README.md`](README.md).
