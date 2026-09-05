@@ -34,11 +34,11 @@ user-facing report is stored separately as
 | Database schema and migrations | PASS | Head `20260903_0052`; migration scenario failed-fast/repaired/upgraded as expected. |
 | Background jobs and external integrations | PASS REVIEW / LIVE CONDITIONAL | Celery/Redis/mail/R2/Steam/Google/content paths reviewed; real external calls not triggered. |
 | Security and secrets | PASS WITH WARNINGS | Dependency audit, Bandit and 767-file secret scan passed; existing Bandit warnings and backend resource warnings retained. |
-| CI/CD and release safety | PASS CODE/CI; LIVE QA FAIL | Exact-SHA security/build, auto-deploy and production deploy runs passed; clean live-public rerun reached browser QA but failed AUD-09. |
+| CI/CD and release safety | CONDITIONAL / LIVE QA FAIL | Earlier exact-SHA security/build, auto-deploy and production deploy runs passed; clean live-public rerun failed AUD-09 and final docs-only SHA failed AUD-10 in Web hermetic. |
 | Backups, restore and disaster recovery | LOCAL PASS / OFFSITE BLOCKED | Local migration/restore contract passed; documented off-host encrypted recovery drill remains incomplete. |
 | Performance, capacity and observability | RETAINED EVIDENCE / LOAD NOT RUN | Existing accepted load evidence and budgets reviewed; no new external load run without operator gate. |
 | Documentation and operational readiness | PASS GATE / OPEN ACTIONS | Docs and verification contract passed before final report; final rerun and source-of-truth reconciliation required. |
-| Full automated verification | PASS DETERMINISTIC | Python quality, security, migration, backend, web-quality, web-hermetic and verification-contract passed; docs rerun after final edits pending. |
+| Full automated verification | LATEST REMOTE FAIL / LOCAL PASS | Local deterministic gates passed; final exact-SHA remote Web hermetic run 33931205805 failed one `bracket-shell` readiness test after 486 passes and 29 skips. |
 
 ## Findings register
 
@@ -55,6 +55,7 @@ user-facing report is stored separately as
 | AUD-07 | P2 | CLEANUP | Backend suite passes but emits unclosed Redis/asyncpg resource warnings. |
 | AUD-08 | P2 conditional | OWNER DECISION | `www.old-sparky.com` does not resolve; confirm apex-only policy or add canonical redirect. |
 | AUD-09 | P1 release gate | FAIL | Clean live-public run had 40 passed/10 skipped/4 failed: AdSense inline-style nodes broke the CSP invariant in three projects; WebKit image inventory saw cancelled navigations. |
+| AUD-10 | P1 release gate | FAIL | Final docs-only exact-SHA security/build run 33931205805 had one Web hermetic timeout at `platform-routes.spec.ts:87`; earlier local and b953 runs passed. |
 
 ## Evidence log
 
