@@ -169,6 +169,19 @@ jobs:
           if public_web_ports != {80, 443}:
               failures.append("missing_public_web_listener")
           if failures:
+              for address, port, line in rows:
+                  if f"unexpected_public_port_{port}" not in failures:
+                      continue
+                  protocol = line.split()[0]
+                  process = "unknown"
+                  marker = 'users:(("'
+                  if marker in line:
+                      process = line.split(marker, 1)[1].split('"', 1)[0]
+                  print(
+                      "PUBLIC_LISTENER=proto={} port={} process={}".format(
+                          protocol, port, process
+                      )
+                  )
               print("LISTENER_CHECK=FAIL reason=" + ",".join(sorted(set(failures))))
               raise SystemExit(1)
           print("LISTENER_CHECK=PASS")
@@ -221,7 +234,7 @@ jobs:
           REMOTE
           then
             echo "Remote AS-12 proof failed" >&2
-            sed -n -E 's/^(REMOTE_CHECK|EDGE_POLICY|LISTENER_CHECK|LISTENER_COUNT|FORWARDED_HEADER_CHECK)=.*/\0/p' "$remote_report" >&2 || true
+            sed -n -E 's/^(REMOTE_CHECK|EDGE_POLICY|LISTENER_CHECK|LISTENER_COUNT|PUBLIC_LISTENER|FORWARDED_HEADER_CHECK)=.*/\0/p' "$remote_report" >&2 || true
             exit 1
           fi
 
