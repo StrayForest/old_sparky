@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, CheckCircle2, ChevronRight, Search, Shield, Trash2, UserCog, UserRound } from "lucide-react";
 import { useI18n } from "@/components/i18n-provider";
-import { PlatformApiError, platformApiMessage, platformApiRequest } from "@/lib/platform-api";
+import { platformApiMessage, platformApiRequest } from "@/lib/platform-api";
 import type { PlatformUser } from "@/lib/platform-types";
 
 type AdminUsersPageProps = {

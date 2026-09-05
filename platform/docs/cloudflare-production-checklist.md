@@ -10,6 +10,7 @@ source code alone is not evidence. Never use a Global API Key.
 ## DNS and certificates
 
 - DONE: apex and `cdn.old-sparky.com` are proxied and serve HTTPS.
+- DECISION: `old-sparky.com` is the only supported public hostname. `www.old-sparky.com` intentionally has no DNS alias and must not be introduced as a second canonical origin without an explicit redirect/SEO decision.
 - VERIFY: apex origin address remains correct/proxied; no accidental AAAA until
   origin IPv6 is tested.
 - DONE: DNSSEC is enabled and the operator confirmed the production DNSSEC/DS

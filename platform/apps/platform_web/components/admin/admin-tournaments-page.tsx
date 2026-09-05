@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { AlertTriangle, ArrowUpRight, CalendarClock, CheckCircle2, ChevronRight, Eye, GitBranch, LockKeyhole, Search, Settings2, Trash2, Trophy, UsersRound } from "lucide-react";
 import { useI18n } from "@/components/i18n-provider";
 import { AdminTournamentRoster } from "@/components/admin/admin-tournament-roster";
@@ -81,7 +81,7 @@ function TournamentDetail({ tournament, enumLabel, formatDate, onUpdate, onDelet
     {tab === "summary" ? <TournamentSummary tournament={tournament} formatDate={formatDate} onOpenRoster={() => setTab("roster")} /> : null}
     {tab === "roster" ? <AdminTournamentRoster slug={tournament.slug} formatDate={formatDate} /> : null}
     {tab === "bracket" ? <BracketImpact tournament={tournament} /> : null}
-    {tab === "recovery" ? <TournamentRecovery tournament={tournament} enumLabel={enumLabel} formatDate={formatDate} onUpdate={onUpdate} onDelete={onDelete} /> : null}
+    {tab === "recovery" ? <TournamentRecovery tournament={tournament} enumLabel={enumLabel} onUpdate={onUpdate} onDelete={onDelete} /> : null}
   </aside>;
 }
 
@@ -96,7 +96,7 @@ function BracketImpact({ tournament }: { tournament: PlatformAdminTournament }) 
   return <div className="ops-detail-content"><section className="ops-detail-section"><SectionTitle title={t("admin.new.bracketTitle")} copy={t("admin.new.bracketCopy")} /><div className="ops-bracket-facts"><Fact label={t("admin.new.matches")} value={String(tournament.match_count)} /><Fact label={t("admin.new.latestRound")} value={String(tournament.latest_round_number ?? "—")} /><Fact label={t("admin.new.completed")} value={String(tournament.completed_match_count)} /></div><div className="ops-info"><GitBranch size={16} /><span>{t("admin.new.bracketIdentityCopy")}</span></div><Link className="ops-button ops-button-secondary ops-full-button" href={`/tournaments/${tournament.slug}/bracket`}><ArrowUpRight size={16} />{t("admin.new.openBracket")}</Link></section></div>;
 }
 
-function TournamentRecovery({ tournament, enumLabel, formatDate, onUpdate, onDelete }: { tournament: PlatformAdminTournament; enumLabel: (value: string | null | undefined) => string; formatDate: (value: string) => string; onUpdate: (tournament: PlatformAdminTournament) => void; onDelete: (slug: string) => void }) {
+function TournamentRecovery({ tournament, enumLabel, onUpdate, onDelete }: { tournament: PlatformAdminTournament; enumLabel: (value: string | null | undefined) => string; onUpdate: (tournament: PlatformAdminTournament) => void; onDelete: (slug: string) => void }) {
   const { t } = useI18n();
   const [status, setStatus] = useState(tournament.status);
   const [visibility, setVisibility] = useState(tournament.visibility);

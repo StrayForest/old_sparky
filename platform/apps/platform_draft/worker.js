@@ -471,9 +471,15 @@ async function serveStatic(request, env, path) {
   assetUrl.pathname = assetPath;
   const assetRequest = new Request(assetUrl.toString(), request);
   const assetResponse = await env.ASSETS.fetch(assetRequest);
-  if (!assetResponse.ok) return assetResponse;
+  if (!assetResponse.ok && assetResponse.status !== 304) return assetResponse;
 
   const headers = new Headers(assetResponse.headers);
+  const assetCacheStatus = headers.get("CF-Cache-Status");
+  if (assetCacheStatus) {
+    headers.set("X-Old-Sparky-Draft-Asset-Cache-Status", assetCacheStatus);
+  }
+  headers.delete("CF-Cache-Status");
+  headers.delete("Age");
   headers.set("X-Old-Sparky-Draft", "1");
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("Referrer-Policy", "strict-origin-when-cross-origin");

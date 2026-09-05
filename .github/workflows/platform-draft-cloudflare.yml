@@ -211,16 +211,56 @@ jobs:
             return 1
           }
 
-          get_200 "Draft page" "https://old-sparky.com/draft" /tmp/draft.html
+          assert_live_asset() {
+            local name="$1"
+            local url="$2"
+            local output="$3"
+            local expected="$4"
+            get_200 "$name" "$url" "$output"
+            if ! cmp --silent "$output" "$expected"; then
+              echo "${name} body does not match the just-built asset" >&2
+              echo "Expected: $(sha256sum "$expected" | awk '{print $1}')" >&2
+              echo "Received: $(sha256sum "$output" | awk '{print $1}')" >&2
+              return 1
+            fi
+            echo "${name}: live body matches $(sha256sum "$expected" | awk '{print $1}')"
+            grep -iE '^(cf-cache-status|age|x-old-sparky-draft-asset-cache-status):' "${output}.headers" || true
+          }
+
+          assert_live_asset \
+            "Draft page" \
+            "https://old-sparky.com/draft" \
+            /tmp/draft.html \
+            platform/apps/platform_draft/dist/draft/index.html
           grep -q 'id="app"' /tmp/draft.html
           grep -q 'ca-pub-7185165276065459' /tmp/draft.html
           grep -qi '^x-old-sparky-draft: 1' /tmp/draft.html.headers
 
-          get_200 "Draft app.js" "https://old-sparky.com/draft/app.js" /tmp/draft-app.js
+          assert_live_asset \
+            "Draft app.js" \
+            "https://old-sparky.com/draft/app.js" \
+            /tmp/draft-app.js \
+            platform/apps/platform_draft/dist/draft/app.js
           grep -q 'oldsparky:draft:solo' /tmp/draft-app.js
           grep -q 'Драфты' /tmp/draft-app.js
           grep -q 'Баны на команду' /tmp/draft-app.js
           ! grep -Eq 'Предпросмотр|preview' /tmp/draft-app.js
+
+          assert_live_asset \
+            "Draft styles.css" \
+            "https://old-sparky.com/draft/styles.css" \
+            /tmp/draft-styles.css \
+            platform/apps/platform_draft/dist/draft/styles.css
+          assert_live_asset \
+            "Draft draft-core.js" \
+            "https://old-sparky.com/draft/draft-core.js" \
+            /tmp/draft-core.js \
+            platform/apps/platform_draft/dist/draft/draft-core.js
+          assert_live_asset \
+            "Draft heroes.js" \
+            "https://old-sparky.com/draft/heroes.js" \
+            /tmp/draft-heroes.js \
+            platform/apps/platform_draft/dist/draft/heroes.js
 
           get_200 "Hero CDN" "https://cdn.old-sparky.com/draft/heroes/v1/abrams.webp" /tmp/abrams.webp
           test -s /tmp/abrams.webp

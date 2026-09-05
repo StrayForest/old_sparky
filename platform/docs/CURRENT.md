@@ -8,7 +8,7 @@ Read this file for the current production baseline and next engineering priority
 
 ## Production baseline
 
-- Public origin: `https://old-sparky.com` behind Cloudflare Full(strict) and Nginx Origin CA.
+- Public origin: `https://old-sparky.com` behind Cloudflare Full(strict) and Nginx Origin CA. The canonical public-host policy is apex-only; `www.old-sparky.com` is intentionally unsupported and has no DNS alias.
 - Active stack: Next.js standalone, FastAPI/Gunicorn, Celery, PostgreSQL, Redis, Nginx and Cloudflare R2/CDN on one VPS.
 - Platform database: `platformdb`, schema `platform`.
 - Web, API and worker run under separate locked Unix identities with per-service runtime environments; the web process receives no backend database, session, R2, mail, Turnstile-secret or OpenAI credentials.

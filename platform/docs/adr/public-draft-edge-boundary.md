@@ -32,7 +32,7 @@ The site already uses Cloudflare in front of `old-sparky.com` and delivers publi
 - The Durable Object stores only the small current room snapshot and captain credential hashes needed to resume a hibernated room. It does not keep draft history. Completed and expired rooms delete this state.
 - Draft does not use platform PostgreSQL, Redis, Celery, FastAPI or the VPS runtime.
 - Hero thumbnails use the existing `cdn.old-sparky.com` R2/CDN boundary under an immutable Draft namespace.
-- A completed result can be encoded into the URL fragment of `/draft/result`; new links use compact v2 hero indexes, v1 links remain readable, and the server does not store that result.
+- Completed drafts remain on their current room or Solo screen; Draft does not expose a `/draft/result` route, encode completed state into URL fragments or store result history. See [Public Draft completion without result links](public-draft-completion-without-result-links.md).
 - Draft advertising uses the existing Old Sparky AdSense publisher and stays outside the hero grid and irreversible-action controls.
 
 ## Consequences
@@ -42,4 +42,4 @@ The site already uses Cloudflare in front of `old-sparky.com` and delivers publi
 - The room URL is public spectator identity, not mutation authority. Captain authority uses separate high-entropy secrets; the guest secret is transferred in a URL fragment and removed from the visible URL after the browser captures it.
 - `/draft` is indexable, while ephemeral room/result routes are `noindex`.
 - Cloudflare Worker/Durable Object deployment requires operator-managed Cloudflare credentials in the release workflow; secrets are never committed to Git.
-- Mutable Draft UI assets use `no-store` cache headers; hero thumbnails remain immutable under their versioned R2 namespace.
+- Mutable Draft UI assets use `no-store` cache headers; the Worker does not expose the Static Assets subrequest's `CF-Cache-Status` or `Age` as outer-response cache evidence. It keeps that subrequest diagnostic under `X-Old-Sparky-Draft-Asset-Cache-Status`, and the release smoke-check compares live mutable asset bytes with the just-built artifact. Hero thumbnails remain immutable under their versioned R2 namespace.

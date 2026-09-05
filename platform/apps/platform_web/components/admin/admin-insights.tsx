@@ -37,7 +37,6 @@ export function AdminOverview({
   overview,
   tournaments,
   formatDate,
-  enumLabel,
   onNavigate
 }: InsightProps & { overview: PlatformAdminOverview; tournaments: PlatformAdminTournament[]; onNavigate: Navigate }) {
   const { t } = useI18n();

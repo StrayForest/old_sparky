@@ -43,7 +43,7 @@ The repository workflow expects GitHub Actions secrets:
 - `CLOUDFLARE_ACCOUNT_ID`
 
 The token needs the minimum permissions required to deploy the Worker/Durable Object and manage the route for `old-sparky.com`.
-Mutable Draft UI assets are sent with `no-store` cache headers so a previous CDN copy cannot keep an old interface live. Hero objects remain immutable under their versioned R2 namespace.
+Mutable Draft UI assets are sent with `no-store` cache headers so a previous CDN copy cannot keep an old interface live. The Worker labels the cache status returned by its internal Static Assets fetch as `X-Old-Sparky-Draft-Asset-Cache-Status` instead of exposing it as the outer response's `CF-Cache-Status`; the release smoke-check compares each live mutable asset byte-for-byte with the just-built artifact. Hero objects remain immutable under their versioned R2 namespace.
 
 Local development/deploy uses Wrangler, for example:
 

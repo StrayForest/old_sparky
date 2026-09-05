@@ -60,6 +60,52 @@ test("legacy result path is not served as a Draft room shell", async () => {
   assert.equal(requestedPath, "/draft/result");
 });
 
+test("does not expose Static Assets cache status as the outer response status", async () => {
+  const response = await worker.fetch(new Request("https://old-sparky.com/draft/app.js"), {
+    ASSETS: {
+      fetch() {
+        return Promise.resolve(new Response("canary-A", {
+          headers: {
+            "content-type": "text/javascript",
+            "CF-Cache-Status": "HIT",
+            Age: "42"
+          }
+        }));
+      }
+    }
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), "canary-A");
+  assert.equal(response.headers.get("CF-Cache-Status"), null);
+  assert.equal(response.headers.get("Age"), null);
+  assert.equal(response.headers.get("X-Old-Sparky-Draft-Asset-Cache-Status"), "HIT");
+  assert.equal(response.headers.get("Cache-Control"), "no-store, max-age=0");
+});
+
+test("normalizes a Static Assets conditional response", async () => {
+  const response = await worker.fetch(new Request("https://old-sparky.com/draft/app.js"), {
+    ASSETS: {
+      fetch() {
+        return Promise.resolve(new Response(null, {
+          status: 304,
+          headers: {
+            "content-type": "text/javascript",
+            "CF-Cache-Status": "HIT",
+            ETag: '"asset-A"'
+          }
+        }));
+      }
+    }
+  });
+
+  assert.equal(response.status, 304);
+  assert.equal(response.headers.get("CF-Cache-Status"), null);
+  assert.equal(response.headers.get("X-Old-Sparky-Draft-Asset-Cache-Status"), "HIT");
+  assert.equal(response.headers.get("Cache-Control"), "no-store, max-age=0");
+  assert.equal(response.headers.get("ETag"), '"asset-A"');
+});
+
 test("same-origin room creation works without an Origin header", async () => {
   const environment = makeEnvironment();
   const response = await worker.fetch(
