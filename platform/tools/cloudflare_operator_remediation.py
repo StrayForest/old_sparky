@@ -228,11 +228,10 @@ def rate_rule(path: str, limit: int, period: int, timeout: int, description: str
 def ensure_rate_limits(token: str, zone_id: str, report: dict[str, Any], apply: bool) -> None:
     entrypoint = phase_entrypoint(token, zone_id, "http_ratelimit")
     rules = entrypoint.get("rules", []) if entrypoint else []
-    wanted = [
-        rate_rule("/api/v1/auth/login", 60, 60, 60, "Limit password login bursts"),
-        rate_rule("/api/v1/auth/register", 30, 60, 60, "Limit registration bursts"),
-        rate_rule("/api/v1/auth/password-reset/request", 10, 600, 600, "Limit password reset requests"),
-    ]
+    # The current zone plan exposes one rule slot in http_ratelimit. The
+    # application already has Redis-backed registration/reset controls, so use
+    # the single edge slot for the highest-risk password-login burst path.
+    wanted = [rate_rule("/api/v1/auth/login", 60, 60, 60, "Limit password login bursts")]
     descriptions = {str(item.get("description")) for item in rules}
     missing = [item for item in wanted if item["description"] not in descriptions]
     report["rate_limits"] = {"entrypoint": entrypoint is not None, "missing": len(missing), "policy": "conservative per-IP auth limits"}
@@ -260,7 +259,15 @@ def ensure_rate_limits(token: str, zone_id: str, report: dict[str, Any], apply: 
 def ensure_bot_fight(token: str, zone_id: str, report: dict[str, Any], apply: bool, disable: bool) -> None:
     current = api_request(token, "GET", f"/zones/{zone_id}/bot_management")
     before = bool(current.get("fight_mode"))
-    report["bot_fight_mode"] = {"before": before, "requested": not disable if apply else None}
+    report["bot_fight_mode"] = {
+        "before": before,
+        "requested": not disable if apply else None,
+        "current_fields": {
+            key: value
+            for key, value in current.items()
+            if key not in {"stale_zone_configuration"} and isinstance(value, (bool, int, float, str, type(None)))
+        },
+    }
     if not apply or before == (not disable):
         return
     writable_fields = {
