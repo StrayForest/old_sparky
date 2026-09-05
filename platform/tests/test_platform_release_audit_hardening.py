@@ -131,7 +131,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
 
 
     def test_all_production_ssh_workflows_pin_host_identity(self) -> None:
-        workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-diagnostics.yml', 'platform-production-external-load.yml', 'platform-production-retained-load-cleanup.yml', 'platform-production-retained-load-abort.yml')
+        workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-as12-proof.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-diagnostics.yml', 'platform-production-external-load.yml', 'platform-production-retained-load-cleanup.yml', 'platform-production-retained-load-abort.yml')
         expected_fingerprint = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
         for name in workflow_names:
             workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")
@@ -143,6 +143,18 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 workflow,
                 name,
             )
+
+    def test_as12_proof_is_read_only_and_sha_locked(self) -> None:
+        proof = (WORKFLOW_DIR / "platform-production-as12-proof.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("workflow_dispatch:", proof)
+        self.assertIn("--expected-sha", proof)
+        self.assertIn("platform_validate_edge_policy.py", proof)
+        self.assertIn("direct_origin_", proof)
+        self.assertNotIn("platform_release_deploy.sh", proof)
+        self.assertNotIn("systemctl restart", proof)
+        self.assertNotIn("systemctl reload", proof)
 
     def test_live_mutations_share_release_lock_and_exact_sha(self) -> None:
         for name in (

@@ -1,0 +1,310 @@
+name: Platform production AS-12 edge proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Exact source SHA currently deployed on the production VPS"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  proof:
+    if: github.event_name == 'workflow_dispatch'
+    name: Verify origin perimeter
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      WORKFLOW_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Validate exact-SHA production proof inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "AS-12 proof must target the reviewed dev branch" >&2; exit 1; }
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "expected_sha must be a 40-character commit SHA" >&2; exit 1; }
+          test "$EXPECTED_SHA" = "$WORKFLOW_SHA" \
+            || { echo "proof workflow source and expected production SHA differ" >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
+
+      - name: Configure pinned production SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
+          chmod 600 ~/.ssh/old_sparky_prod
+          ssh_scan="$RUNNER_TEMP/as12-known-hosts"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
+            || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" \
+            || { echo "Production SSH host fingerprint mismatch" >&2; exit 1; }
+          install -m 600 "$ssh_scan" ~/.ssh/known_hosts
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s/.ssh/known_hosts\n' "$HOME"
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Run read-only VPS perimeter proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_report="$RUNNER_TEMP/as12-remote-proof.txt"
+          if ! ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$EXPECTED_SHA" <<'REMOTE' > "$remote_report"
+          set -Eeuo pipefail
+
+          expected_sha="$1"
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          guard="$current/tools/platform_release_lock_exec.sh"
+          test -x "$guard" || { echo "REMOTE_CHECK=FAIL guard_missing"; exit 1; }
+
+          /bin/bash "$guard" \
+            --app-dir "$runtime" \
+            --expected-sha "$expected_sha" \
+            -- /bin/bash -s <<'LOCKED'
+          set -Eeuo pipefail
+
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          test "$(id -u)" -eq 0 || { echo "REMOTE_CHECK=FAIL not_root"; exit 1; }
+
+          for service in deadlock-api deadlock-worker deadlock-web nginx; do
+            systemctl is-active --quiet "$service" \
+              || { echo "REMOTE_CHECK=FAIL service_inactive"; exit 1; }
+          done
+          if ! nginx -t >/dev/null 2>&1; then
+            echo "REMOTE_CHECK=FAIL nginx_config"; exit 1
+          fi
+
+          edge_policy="$($runtime/shared/venv/bin/python \
+            "$current/tools/platform_validate_edge_policy.py" --json)"
+          printf 'EDGE_POLICY=%s\n' "$edge_policy"
+
+          listener_file="$(mktemp)"
+          trap 'rm -f -- "$listener_file"' EXIT
+          ss -H -lntup > "$listener_file"
+          /usr/bin/python3 - "$listener_file" <<'PY'
+          import ipaddress
+          from pathlib import Path
+          import sys
+
+          rows = []
+          failures = []
+          public_web_ports = set()
+          for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+              fields = line.split()
+              if len(fields) < 5:
+                  failures.append("malformed_listener")
+                  continue
+              endpoint = fields[4]
+              if endpoint.startswith("["):
+                  closing = endpoint.rfind("]:")
+                  if closing < 0:
+                      failures.append("malformed_ipv6_listener")
+                      continue
+                  address = endpoint[1:closing]
+                  port_text = endpoint[closing + 2:]
+              else:
+                  address, separator, port_text = endpoint.rpartition(":")
+                  if not separator:
+                      failures.append("malformed_listener")
+                      continue
+              if not port_text.isdigit():
+                  continue
+              port = int(port_text)
+              rows.append((address, port, line.lower()))
+              wildcard = address in {"*", "0.0.0.0", "::"}
+              try:
+                  parsed = ipaddress.ip_address(address.split("%", 1)[0])
+              except ValueError:
+                  is_loopback = False
+              else:
+                  is_loopback = parsed.is_loopback or (
+                      parsed.version == 6
+                      and parsed.ipv4_mapped is not None
+                      and parsed.ipv4_mapped.is_loopback
+                  )
+              public = wildcard or not is_loopback
+              if not public:
+                  continue
+              if port not in {22, 80, 443}:
+                  failures.append("unexpected_public_port")
+              elif port in {80, 443}:
+                  public_web_ports.add(port)
+                  if "nginx" not in line.lower():
+                      failures.append("public_web_listener_not_nginx")
+
+          if public_web_ports != {80, 443}:
+              failures.append("missing_public_web_listener")
+          if failures:
+              print("LISTENER_CHECK=FAIL reason=" + ",".join(sorted(set(failures))))
+              raise SystemExit(1)
+          print("LISTENER_CHECK=PASS")
+          print("LISTENER_COUNT=" + str(len(rows)))
+          PY
+
+          for env_file in "$runtime/shared/.env.platform" "$runtime/shared/env/api.env"; do
+            test -f "$env_file" || { echo "FORWARDED_HEADER_CHECK=FAIL env_missing"; exit 1; }
+            value="$(awk -F= '$1 == "PLATFORM_API_FORWARDED_ALLOW_IPS" {print substr($0, index($0, "=") + 1)}' "$env_file")"
+            test "$value" = "127.0.0.1" \
+              || { echo "FORWARDED_HEADER_CHECK=FAIL env_value"; exit 1; }
+          done
+          api_pid="$(systemctl show -p MainPID --value deadlock-api)"
+          [[ "$api_pid" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "FORWARDED_HEADER_CHECK=FAIL api_pid"; exit 1; }
+          tr '\0' '\n' < "/proc/$api_pid/environ" \
+            | grep -Fxq 'FORWARDED_ALLOW_IPS=127.0.0.1' \
+            || { echo "FORWARDED_HEADER_CHECK=FAIL process_value"; exit 1; }
+          echo "FORWARDED_HEADER_CHECK=PASS"
+
+          /usr/bin/python3 - <<'PY'
+          import ipaddress
+          import subprocess
+
+          for version in (4, 6):
+              output = subprocess.run(
+                  ["ip", "-o", f"-{version}", "addr", "show", "scope", "global"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
+              found = set()
+              for line in output.splitlines():
+                  for token in line.split():
+                      if "/" not in token:
+                          continue
+                      candidate = token.split("/", 1)[0].split("%", 1)[0]
+                      try:
+                          address = ipaddress.ip_address(candidate)
+                      except ValueError:
+                          continue
+                      if address.version == version and address.is_global:
+                          found.add(str(address))
+              for address in sorted(found):
+                  print(f"ORIGIN_IPV{version}={address}")
+          PY
+          echo "REMOTE_CHECK=PASS"
+          LOCKED
+          printf 'PRODUCTION_SOURCE_SHA=%s\n' "$expected_sha"
+          REMOTE
+          then
+            echo "Remote AS-12 proof failed" >&2
+            sed -n -E 's/^(REMOTE_CHECK|EDGE_POLICY|LISTENER_CHECK|LISTENER_COUNT|FORWARDED_HEADER_CHECK)=.*/\0/p' "$remote_report" >&2 || true
+            exit 1
+          fi
+
+          remote_sha="$(awk -F= '$1 == "PRODUCTION_SOURCE_SHA" {print $2}' "$remote_report")"
+          test "$remote_sha" = "$EXPECTED_SHA" \
+            || { echo "Production release SHA was not confirmed" >&2; exit 1; }
+          grep -Fxq 'REMOTE_CHECK=PASS' "$remote_report"
+          grep -Fxq 'LISTENER_CHECK=PASS' "$remote_report"
+          grep -Fxq 'FORWARDED_HEADER_CHECK=PASS' "$remote_report"
+          grep -q '^EDGE_POLICY={"cloudflare_ranges":' "$remote_report"
+
+          summary="$RUNNER_TEMP/as12-proof-summary.txt"
+          : > "$summary"
+          {
+            echo "AS12_PROOF=PASS"
+            echo "source_sha=$EXPECTED_SHA"
+            echo "vps_listener_inventory=PASS"
+            echo "forwarded_header_trust=PASS"
+            echo "cloudflare_nginx_ufw_parity=PASS"
+            echo "direct_origin_probe_network=github-hosted-runner"
+          } >> "$summary"
+
+          mapfile -t ipv4_targets < <(awk -F= '$1 == "ORIGIN_IPV4" {print $2}' "$remote_report")
+          mapfile -t ipv6_targets < <(awk -F= '$1 == "ORIGIN_IPV6" {print $2}' "$remote_report")
+          for address in "${ipv4_targets[@]}" "${ipv6_targets[@]}"; do
+            [[ -n "$address" ]] || continue
+            printf '::add-mask::%s\n' "$address"
+          done
+          ((${#ipv4_targets[@]} > 0)) \
+            || { echo "No global IPv4 origin address was reported" >&2; exit 1; }
+
+          direct_failure=false
+          probe_direct() {
+            local family="$1"
+            local address="$2"
+            local port="$3"
+            local curl_family="-4"
+            local resolve_address="$address"
+            local scheme="http"
+            local error_file="$RUNNER_TEMP/as12-curl-error"
+            [[ "$family" == ipv6 ]] && curl_family="-6" && resolve_address="[$address]"
+            [[ "$port" == 443 ]] && scheme="https"
+            local code=""
+            if code="$(curl "$curl_family" \
+              --noproxy '*' \
+              --connect-timeout 8 \
+              --max-time 12 \
+              --silent \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              --insecure \
+              --resolve "old-sparky.com:$port:$resolve_address" \
+              "$scheme://old-sparky.com:$port/" 2>"$error_file")"; then
+              if [[ "$code" =~ ^[1-5][0-9]{2}$ ]]; then
+                echo "direct_origin_${family}_${port}=REACHABLE_HTTP_${code}" >> "$summary"
+                return 1
+              fi
+            fi
+            echo "direct_origin_${family}_${port}=BLOCKED_NO_HTTP_RESPONSE" >> "$summary"
+            return 0
+          }
+
+          for address in "${ipv4_targets[@]}"; do
+            if ! probe_direct ipv4 "$address" 80; then direct_failure=true; fi
+            if ! probe_direct ipv4 "$address" 443; then direct_failure=true; fi
+          done
+          if ((${#ipv6_targets[@]} == 0)); then
+            echo "direct_origin_ipv6=NOT_APPLICABLE_NO_GLOBAL_VPS_IPV6" >> "$summary"
+          else
+            for address in "${ipv6_targets[@]}"; do
+              if ! probe_direct ipv6 "$address" 80; then direct_failure=true; fi
+              if ! probe_direct ipv6 "$address" 443; then direct_failure=true; fi
+            done
+          fi
+          [[ "$direct_failure" == false ]] \
+            || { echo "Direct origin returned an HTTP response" >&2; exit 1; }
+          cat "$summary"
+
+      - name: Publish AS-12 proof summary
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: platform-production-as12-proof-${{ github.run_id }}
+          path: ${{ runner.temp }}/as12-proof-summary.txt
+          if-no-files-found: warn
+          retention-days: 14

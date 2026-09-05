@@ -26,19 +26,19 @@ service, disk, memory, backup-age and certificate-expiry gate.
 `deadlock-maintenance.timer` runs the daily restore-verified backup and bounded
 retention workflow.
 
-The read-only edge proof is:
+The complete production perimeter proof is the SHA-locked operator workflow;
+run it after the exact release is active:
 
 ```bash
-cd /opt/oldsparky/platform/current
-/opt/oldsparky/platform/shared/venv/bin/python \
-  tools/platform_validate_edge_policy.py --json
+gh workflow run platform-production-as12-proof.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f expected_sha=<exact-deployed-source-sha>
+gh run watch <proof-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-It compares the current Cloudflare ranges with both the Nginx real-IP include
-and managed UFW rules. It does not prove that a direct-origin request is
-blocked; perform that negative test separately from an approved external
-network. A release preflight with `--require-edge-parity` fails closed when the
-range proof is unavailable or mismatched.
+It inventories listeners, checks forwarded-header trust, repeats the
+Cloudflare/Nginx/UFW parity gate and probes the origin externally. It is
+read-only, publishes no origin addresses, and fails on any HTTP response.
 
 ## Retention and disk safety
 
