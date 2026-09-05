@@ -20,8 +20,21 @@ type BrowserEvidence = {
 const browserEvidence = new WeakMap<import("@playwright/test").Page, BrowserEvidence>();
 const reportOnlyFrameAncestorsWarning =
   "The Content Security Policy directive 'frame-ancestors' is ignored when delivered in a report-only policy.";
+const googleOwnedInlineStyleSelector = [
+  "ins.adsbygoogle",
+  "ins.adsbygoogle [id^=\"aswift_\"][id$=\"_host\"]",
+  "iframe[name=\"googlefcPresent\"]",
+  "iframe[name=\"googlefcInactive\"]",
+  "iframe[name=\"googlefcLoaded\"]",
+  "iframe[name=\"__tcfapiLocator\"]",
+].join(", ");
+const expectedWebKitPrefetchCancellationPaths = new Set([
+  "/privacy",
+  "/terms",
+  "/profile/me",
+]);
 
-test.beforeEach(async ({ page }) => {
+test.beforeEach(async ({ page, browserName }) => {
   const evidence: BrowserEvidence = {
     consoleCspErrors: [],
     cspViolations: [],
@@ -80,9 +93,18 @@ test.beforeEach(async ({ page }) => {
         "/api/v1/users/me",
       ].includes(parsed.pathname)
     );
+    const isExpectedWebKitPrefetchCancellation = (
+      browserName === "webkit"
+      && errorText === "Load request cancelled"
+      && request.method() === "GET"
+      && !request.isNavigationRequest()
+      && parsed.origin === new URL(process.env.PLAYWRIGHT_LIVE_BASE_URL ?? "http://127.0.0.1").origin
+      && expectedWebKitPrefetchCancellationPaths.has(parsed.pathname)
+    );
     if (
       isExpectedNextPrefetchAbort
       || isExpectedNavigationApiCancellation
+      || isExpectedWebKitPrefetchCancellation
     ) {
       return;
     }
@@ -637,12 +659,17 @@ async function expectDocumentNonce(
     eventHandlers: document.querySelectorAll("[onclick],[onerror],[onload]").length,
     inlineScriptNonces: Array.from(document.querySelectorAll("script:not([src])"))
       .map((element) => (element as HTMLScriptElement).nonce),
-    styleAttributes: document.querySelectorAll("[style]").length,
     styleNonces: Array.from(document.querySelectorAll("style"))
       .map((element) => (element as HTMLStyleElement).nonce),
   }));
+  const appOwnedStyleAttributes = await page.locator("[style]").evaluateAll(
+    (elements, vendorSelector) => elements.filter(
+      (element) => !element.matches(vendorSelector),
+    ).length,
+    googleOwnedInlineStyleSelector,
+  );
   expect(state.eventHandlers).toBe(0);
-  expect(state.styleAttributes).toBe(0);
+  expect(appOwnedStyleAttributes).toBe(0);
   expect(state.inlineScriptNonces.length).toBeGreaterThan(0);
   expect(state.inlineScriptNonces.every((value) => value === nonce)).toBe(true);
   expect(state.styleNonces.every((value) => value === nonce)).toBe(true);
