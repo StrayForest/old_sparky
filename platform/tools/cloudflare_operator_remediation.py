@@ -231,7 +231,7 @@ def ensure_rate_limits(token: str, zone_id: str, report: dict[str, Any], apply: 
     # The current zone plan exposes one rule slot in http_ratelimit. The
     # application already has Redis-backed registration/reset controls, so use
     # the single edge slot for the highest-risk password-login burst path.
-    wanted = [rate_rule("/api/v1/auth/login", 60, 60, 60, "Limit password login bursts")]
+    wanted = [rate_rule("/api/v1/auth/login", 10, 10, 10, "Limit password login bursts")]
     descriptions = {str(item.get("description")) for item in rules}
     missing = [item for item in wanted if item["description"] not in descriptions]
     report["rate_limits"] = {"entrypoint": entrypoint is not None, "missing": len(missing), "policy": "conservative per-IP auth limits"}
