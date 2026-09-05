@@ -152,9 +152,9 @@ canonical apex, or record in the domain/SEO checklist that `www` is not a suppor
 **Impact:** This is a real production launch-gate failure.  Evidence points to a contract conflict between intentional AdSense integration and the test’s global `style` invariant, plus a WebKit request-lifecycle issue; it is not an auth bypass, but it prevents a green live-public contour.
 **Required closure:** Decide whether Google-owned injected nodes are a narrow allowed exception or ads must be disabled; preserve CSP violation and app-owned nonce checks, adjust the assertion only with a reviewed vendor selector, then reproduce/close the WebKit cancellations.  Do not broadly allow inline styles.
 
-### AUD-10 — Final exact-SHA remote Web hermetic gate timed out (P1)
-**Status:** FAIL on [run 33931205805](https://github.com/StrayForest/old_sparky/actions/runs/33931205805): 486 passed, 29 skipped, 1 failed at `platform-routes.spec.ts:87` while waiting 20 seconds for `bracket-shell`; the earlier local and exact-b953 gates passed.
-**Required closure:** Reproduce and triage the readiness timeout on a clean exact SHA; do not treat a silent retry as closure.
+### AUD-10 — Historical exact-SHA remote Web hermetic timeout, clean rerun passed (P1 observation)
+**Status:** One timeout occurred on [run 33931205805](https://github.com/StrayForest/old_sparky/actions/runs/33931205805): 486 passed, 29 skipped, 1 failed at `platform-routes.spec.ts:87` while waiting 20 seconds for `bracket-shell`; the subsequent clean exact-SHA [run 33931715096](https://github.com/StrayForest/old_sparky/actions/runs/33931715096) passed all jobs, so no current CI block remains.
+**Required follow-up:** Keep the readiness test under observation and investigate if it recurs; do not use silent retries as closure.
 
 ## 4. Repository and release audit
 
@@ -233,7 +233,7 @@ The sequential web-quality rerun passed after the earlier concurrent-build colli
 The build output showed the expected dynamic/static split: auth, account, tournament, profile, stats and operational pages are server-rendered, while manifest/icon/discovery assets are static.  No build-time secret was exposed.
 
 ### 5.5 Hermetic browser suites
-The local canonical and earlier exact-b953 `web-hermetic` gates passed; the final docs-only exact-45b gate failed AUD-10:
+The local canonical, exact-b953 and final exact-72fd `web-hermetic` gates passed; one earlier exact-45b docs-only run failed AUD-10 once, then run 33931715096 passed all required jobs:
 
 ```text
 487 passed (20.8m)
@@ -579,7 +579,7 @@ All local gates below were invoked from `platform/` through the canonical regist
 | `./.venv_platform/bin/python tools/platform_verify.py security` | PASS; dependency audit, Bandit and secret scan |
 | `./.venv_platform/bin/python tools/platform_verify.py migration` | PASS |
 | `./.venv_platform/bin/python tools/platform_verify.py backend` | PASS; 994 tests |
-| `./.venv_platform/bin/python tools/platform_verify.py web-hermetic` | Local/earlier b953 PASS; final 45b remote run 33931205805 FAIL, 486 passed, 29 skipped, 1 timeout |
+| `./.venv_platform/bin/python tools/platform_verify.py web-hermetic` | PASS locally and on final 72fd run 33931715096; prior 45b run 33931205805 had one timeout (AUD-10) |
 | `./.venv_platform/bin/python tools/platform_verify.py web-quality` | PASS; build passed, four lint warnings |
 | `cd platform/apps/platform_draft && npm test && npm run check && npm run build` | PASS; 35 tests, syntax and asset build |
 | `./.venv_platform/bin/python tools/platform_verify.py docs` | PASS after report/worklog edit |
