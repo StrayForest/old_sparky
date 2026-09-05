@@ -84,6 +84,12 @@ test.beforeEach(async ({ page, browserName }) => {
         || headers["next-router-segment-prefetch"] === "1"
       )
     );
+    const isExpectedGoogleAdSensePingAbort = (
+      errorText === "net::ERR_ABORTED"
+      && request.method() === "POST"
+      && parsed.hostname === "pagead2.googlesyndication.com"
+      && parsed.pathname === "/pagead/ping"
+    );
     const isExpectedNavigationApiCancellation = (
       errorText === "Load request cancelled"
       && request.method() === "GET"
@@ -103,6 +109,7 @@ test.beforeEach(async ({ page, browserName }) => {
     );
     if (
       isExpectedNextPrefetchAbort
+      || isExpectedGoogleAdSensePingAbort
       || isExpectedNavigationApiCancellation
       || isExpectedWebKitPrefetchCancellation
     ) {
