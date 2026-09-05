@@ -48,8 +48,10 @@ closure; the durable summary is in
 
 ## Cache and R2
 
-- VERIFY: public media bucket is Standard, `r2.dev` is disabled and browser PUT
-  CORS is absent.
+- DONE: read-only API evidence confirms the public media bucket is Standard,
+  `r2.dev` is disabled and browser PUT CORS is absent. The R2 custom domain
+  `cdn.old-sparky.com` is enabled with active ownership/SSL and minimum TLS
+  1.2; see [`archive/as-02-cloudflare-api-audit-2026-09-05.md`](archive/as-02-cloudflare-api-audit-2026-09-05.md).
 - VERIFY: media token is bucket-scoped and not reused for backups.
 - VERIFY: cache rule applies only to `cdn.old-sparky.com`, respects immutable
   origin Cache-Control/query keys and does not cache 4xx/5xx.
@@ -76,7 +78,9 @@ closure; the durable summary is in
 - TODO: enable/tune Managed WAF after observing false positives.
 - TODO: add bounded edge rates for register, login, reset, invite, support and
   upload; application controls stay authoritative.
-- VERIFY: Turnstile hostname allowlist contains only production hostnames.
+- DONE: read-only API evidence shows the active Turnstile widget allowlist is
+  only `old-sparky.com`; runtime compatibility remains covered by the separate
+  Bot Fight Mode check.
 - DONE: Cloudflare Access protects `/platform-ops*` and `/api/v1/admin*` with an
   operator-scoped Allow policy and independent MFA. A TOTP device was enrolled
   and a fresh incognito login verified the identity -> MFA -> application path
