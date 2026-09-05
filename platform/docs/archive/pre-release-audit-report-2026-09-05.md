@@ -133,12 +133,16 @@ real regression when a warning budget grows.  They did not fail the current gate
 behavior, then rerun web-quality and the admin browser scenarios.
 
 ### AUD-07 — Backend test process emits unclosed Redis/asyncpg resources (P2 test hygiene)
-**Status:** Tests pass, cleanup debt remains.  **Confidence:** Medium.
+**Status at audit time:** Tests passed, cleanup debt remained.  **Confidence:** Medium.
 The canonical backend run completed with `994 tests ... OK`, but emitted `ResourceWarning` messages for unclosed Redis asyncio connections/transports and an asyncpg connection, plus slow asyncio callback diagnostics.  These warnings were not converted into test failures by the current gate.
 **Impact:** A fixture or application shutdown path that leaks only in tests may
 also leak during worker restart, integration failure or repeated long-lived operations.  The warnings reduce confidence in resource ownership and make future regressions harder to see.
 **Required closure:** Identify the owning fixtures/clients, close them in
 `asyncTearDown`/fixture finalizers, and run the backend suite with warnings visible.  Do not hide the warnings globally.
+
+**Resolved 2026-09-05:** same-loop resource ownership, regression coverage and
+exact-SHA CI evidence are retained in
+[`aud-07-async-resource-lifecycle-2026-09-05.md`](aud-07-async-resource-lifecycle-2026-09-05.md).
 
 ### AUD-08 — `www` canonical alias is absent; confirm it is intentional (P2 conditional)
 **Status:** Conditional owner decision.  **Confidence:** High for the observed

@@ -53,6 +53,13 @@ Use the lowest suitable layer in the test pyramid:
    owns the complete scenario and acceptance contract. The same external-load
    workflow should orchestrate a new reviewed profile.
 
+Async backend tests inherit `PlatformIsolatedAsyncioTestCase` from
+`tests/platform_async_case.py`. Its finalizer closes process-shared Redis
+clients and the SQLAlchemy async engine on the event loop that owns them,
+before `IsolatedAsyncioTestCase` closes that loop. Direct inheritance from the
+stdlib async test case is prohibited by a backend contract test so a new suite
+cannot silently reintroduce cross-loop Redis/asyncpg cleanup warnings.
+
 Never add an individual ordinary test by editing GitHub workflow YAML. Do not
 hide deterministic failures with grep exclusions or silent retries. A flaky
 test is explicit test debt with an owner, not a reason to weaken a gate.
