@@ -146,9 +146,11 @@ This restores the exact pre-operation release/runtime, restarts and verifies
 services, and never downgrades Alembic.
 
 The deploy gate also requires a read-only Cloudflare/Nginx/UFW range-parity
-proof. This repository does not contain live VPS evidence; a release is not
-production-approved until that proof and the direct-origin negative test are
-recorded by the operator.
+proof and a direct-origin negative test. The current closure evidence for the
+production source SHA `97db79b681dd90cc8e89dd91f549610c943c16b8` is recorded in
+[`archive/as-12-origin-perimeter-2026-09-05.md`](archive/as-12-origin-perimeter-2026-09-05.md).
+Any future perimeter, listener or trust-configuration change requires a fresh
+proof run before the affected release is approved.
 
 ## Explicit non-goals
 

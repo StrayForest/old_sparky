@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-03
+- Last reviewed: 2026-09-05
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -26,6 +26,7 @@ Read this file for the current production baseline and next engineering priority
 - Ready Check uses a deterministic timer contract: the tournament workspace carries `starts_at`, `ends_at`, eligible/current-user state and a UTC `server_time` anchor; the browser uses elapsed monotonic time to activate and expire the button locally without background requests. The vote POST revalidates server time, eligibility and workflow state under the durable concurrency rules, and a delayed automation worker cannot reject a valid in-window vote. `/tournaments` and the bracket grid remain request-driven; the initial bracket is included in the workspace response, and passive bracket changes appear after manual page reload. Redis remains available to unrelated platform services. See the [tournament timing ADR](adr/ready-check-and-bracket-boundary.md).
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
+- The production origin perimeter proof passed on 2026-09-05 for source SHA `97db79b681dd90cc8e89dd91f549610c943c16b8`: listener inventory, forwarded-header trust, Cloudflare/Nginx/UFW parity and external IPv4/IPv6 direct-origin blocking are recorded in [`archive/as-12-origin-perimeter-2026-09-05.md`](archive/as-12-origin-perimeter-2026-09-05.md).
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
 - Password-login guessing protection uses independent source-IP and account-wide Redis state. Account identifiers are represented by HMAC fingerprints, shared failures drive adaptive Turnstile and a bounded cooldown, and successful login clears account failure/cooldown state.
 - Production Alembic head is `20260903_0052`, including Google external identities and browser-bound OAuth state alongside the tournament catalog
@@ -286,9 +287,6 @@ and size-based rotation bounds text log files.
 ## Deferred / operator-owned work
 
 - Remaining Cloudflare dashboard follow-up for CAA, WAF/rates and R2 settings where the operator checklist still marks work `VERIFY`/`TODO`.
-- VPS-owned AS-12 evidence: loopback-only listeners, `FORWARDED_ALLOW_IPS=127.0.0.1`,
-  exact Cloudflare CIDR parity across UFW/Nginx, and a direct-origin negative
-  test. Repository checks do not prove live state.
 - Real-user CSP follow-up and classification of new enforcement reports.
 - Physical removal of persisted legacy media URL fields and migration-only helpers after production data and external-consumer inventory confirms that no migration or compatibility dependency remains; this requires a reviewed API/schema migration.
 - Non-security feature expansion that does not remove a launch or production blocker. For priorities and backlog, use [`platform-roadmap.md`](platform-roadmap.md); for evidence and details, follow [`README.md`](README.md).

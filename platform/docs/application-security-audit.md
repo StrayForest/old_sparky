@@ -2,7 +2,7 @@
 
 - Status: Active security/correctness tracker
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-05
 - Historical point-in-time audits and resolved findings: [`archive/`](archive/)
 
 This document contains only findings that still require action or direct operator verification. Historical evidence is archived so routine security work does not load resolved context.
@@ -11,7 +11,7 @@ This document contains only findings that still require action or direct operato
 
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
-| AS-12 | Medium / P2 | High | Proxy, Cloudflare-range, UFW and startup validation can drift independently | Open |
+| — | — | — | No active findings | — |
 
 ## Authorization matrix
 
@@ -30,12 +30,8 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 
 ## Active findings
 
-### AS-12 — Proxy and firewall configuration drift
-Production settings and runners now reject non-loopback API/web binds and
-non-loopback forwarded-header trust. Preflight can require a read-only parity
-proof across current Cloudflare ranges, the Nginx include and managed UFW
-rules. **Live proof remains open:** listener inspection, exact UFW/Nginx CIDR
-comparison and a direct-origin negative test must be run on the VPS.
+No active findings. AS-12 origin-perimeter closure evidence is retained in
+[`archive/as-12-origin-perimeter-2026-09-05.md`](archive/as-12-origin-perimeter-2026-09-05.md).
 
 ### Additional audit actions
 
@@ -70,7 +66,7 @@ comparison and a direct-origin negative test must be run on the VPS.
 
 ## Remediation order
 
-1. Complete AS-12 live proof.
+No active security remediation is tracked in this document.
 
 AS-13 was closed on 2026-09-01 after the exact-SHA security/build run passed;
 the evidence is retained in

@@ -66,9 +66,10 @@ AS-09 distributed login guessing protection is resolved and archived with accoun
 
 AS-11 public worker-error sanitization is resolved with a persistence-boundary guard, irreversible historical-data cleanup migration and a public-response regression proving arbitrary exception text cannot leave the API. Closure evidence is retained in [`archive/as-11-worker-error-sanitization.md`](archive/as-11-worker-error-sanitization.md).
 
-- **AS-12:** code-side fail-closed bind/proxy validation and a read-only
-  Cloudflare/Nginx/UFW parity gate are implemented; live listener, UFW, Nginx
-  and direct-origin evidence remains required before closure.
+- **AS-12 closed 2026-09-05:** the exact-SHA read-only production proof passed
+  listener inventory, forwarded-header trust, Cloudflare/Nginx/UFW parity and
+  external IPv4/IPv6 direct-origin blocking. Evidence is retained in
+  [`archive/as-12-origin-perimeter-2026-09-05.md`](archive/as-12-origin-perimeter-2026-09-05.md).
 - **AS-13 closed 2026-09-01:** the exact-SHA security/build workflow passed
   with the current web/api/worker identities, systemd units, runtime env
   boundary and isolated test database. Evidence is retained in
