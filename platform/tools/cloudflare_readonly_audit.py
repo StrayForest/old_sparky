@@ -275,7 +275,7 @@ def run_audit(token: str, account_id: str) -> dict[str, Any]:
         if not isinstance(pack, dict):
             continue
         status = pack.get("status")
-        if status != "active":
+        if status not in {"active", "backup_issued"}:
             non_active_packs.append(status)
         certs = pack.get("certificates") if isinstance(pack.get("certificates"), list) else []
         active_certs += sum(1 for cert in certs if isinstance(cert, dict) and cert.get("status") == "active")
@@ -418,12 +418,12 @@ def run_audit(token: str, account_id: str) -> dict[str, Any]:
     phases = {
         "cache-rules": "http_request_cache_settings",
         "managed-and-custom-waf": "http_request_firewall_custom",
-        "managed-waf-entrypoint": "http_request_main",
+        "managed-waf-entrypoint": "http_request_firewall_managed",
         "edge-rate-limits": "http_ratelimit",
     }
     for check_id, phase in phases.items():
         result = api_get(token, f"/zones/{zone_id}/rulesets/phases/{phase}/entrypoint")
-        status = "PASS" if result.ok else ("UNAVAILABLE" if result.status in {401, 403, 404} else "REVIEW")
+        status = "PASS" if result.ok else ("REVIEW" if result.status in {400, 404} else "UNAVAILABLE")
         summary = ruleset_summary(result)
         if check_id in {"cache-rules", "edge-rate-limits"} and result.ok:
             status = "REVIEW"
