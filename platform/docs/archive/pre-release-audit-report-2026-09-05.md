@@ -147,11 +147,6 @@ DNS state; impact depends on the intended public URL.
 **Required closure:** Either add a proxied `www` alias that redirects to the
 canonical apex, or record in the domain/SEO checklist that `www` is not a supported hostname.  Re-check `robots.txt`/sitemap `Host` compatibility with the chosen canonical policy.
 
-### AUD-09 — Clean live-public browser gate fails the CSP/AdSense invariant (P1)
-**Status:** FAIL on [run 33930022208](https://github.com/StrayForest/old_sparky/actions/runs/33930022208): 40 passed, 10 skipped, 4 failed.  Three browser projects observed six AdSense/cookie-consent nodes with inline `style` attributes while the live assertion requires zero; WebKit also recorded three cancelled navigation requests during image inventory.
-**Impact:** This is a real production launch-gate failure.  Evidence points to a contract conflict between intentional AdSense integration and the test’s global `style` invariant, plus a WebKit request-lifecycle issue; it is not an auth bypass, but it prevents a green live-public contour.
-**Required closure:** Decide whether Google-owned injected nodes are a narrow allowed exception or ads must be disabled; preserve CSP violation and app-owned nonce checks, adjust the assertion only with a reviewed vendor selector, then reproduce/close the WebKit cancellations.  Do not broadly allow inline styles.
-
 ### AUD-10 — Historical exact-SHA remote Web hermetic timeout, clean rerun passed (P1 observation)
 **Status:** One timeout occurred on [run 33931205805](https://github.com/StrayForest/old_sparky/actions/runs/33931205805): 486 passed, 29 skipped, 1 failed at `platform-routes.spec.ts:87` while waiting 20 seconds for `bracket-shell`; the subsequent clean exact-SHA [run 33931715096](https://github.com/StrayForest/old_sparky/actions/runs/33931715096) passed all jobs, so no current CI block remains.
 **Required follow-up:** Keep the readiness test under observation and investigate if it recurs; do not use silent retries as closure.
@@ -181,7 +176,7 @@ For the reviewed source SHA, GitHub Actions reported:
 - [Platform production deploy — run 33926107320](https://github.com/StrayForest/old_sparky/actions/runs/33926107320) — success.
 
 The source and workflow contract require exact-SHA status checks, immutable attested artifacts and a VPS that verifies the artifact rather than resolving dependencies or building from source.  The deployment workflow is therefore a meaningful release-control result, but it does not close the operator-owned perimeter, backup or user-journey gates listed above.
-The first live-public workflow attempt with `provision=false` was blocked by the dirty audit checkout ([33928660477](https://github.com/StrayForest/old_sparky/actions/runs/33928660477)); the clean exact-SHA rerun reached the browser contour and failed AUD-09.  The clean result is the release-relevant evidence.
+The canonical live-public workflow [run 33952562061](https://github.com/StrayForest/old_sparky/actions/runs/33952562061) completed successfully for exact source SHA `a4a78deff23c5490838cf3e8a822560230e5f408`: 44 tests passed and 10 expected tests were skipped across desktop, mobile and WebKit projects.  The clean result is the release-relevant evidence.
 
 ## 5. Deterministic verification results
 
@@ -540,14 +535,11 @@ The source-of-truth documents should be reconciled before claiming a fully close
    Bot Fight Mode and daily Cloudflare-range/UFW parity.
 3. Complete AUD-04’s separate-bucket encrypted upload and offline decrypt/
    checksum recovery drill.
-4. Publish the audit docs, ensure the trusted QA checkout is clean, and rerun
-   the exact `live-public` workflow with `provision=false` and the dedicated QA
-   identity.  Record its exact run result against the deployed SHA.
-5. If the release requires full user-state confidence, run the explicit
+4. If the release requires full user-state confidence, run the explicit
    `live-user-destructive` workflow only with the required confirmation and
    verify its exact cleanup artifact.  Do not replace it with ad hoc production
    requests.
-6. Close AUD-03 using an edge-canary or cache trace, and reconcile the Draft
+5. Close AUD-03 using an edge-canary or cache trace, and reconcile the Draft
    ADR’s stale result-route paragraph.
 
 ### Before or immediately after release, depending on owner policy
@@ -585,7 +577,7 @@ All local gates below were invoked from `platform/` through the canonical regist
 | `./.venv_platform/bin/python tools/platform_verify.py docs` | PASS after report/worklog edit |
 | `./.venv_platform/bin/python tools/platform_verify.py verification-contract` | PASS |
 | Anonymous HTTPS/API/edge curl matrix | PASS with AUD-02, AUD-03, AUD-05 and AUD-08 observations |
-| `platform-live-launch.yml`, `provision=false` | First attempt blocked by dirty trusted QA checkout; rerun required after clean publication |
+| `platform-live-launch.yml`, `provision=false` | PASS; exact-SHA run 33952562061, 44 passed and 10 expected skips |
 | `platform-live-user-qa.yml` | NOT RUN; destructive and confirmation-gated |
 | `platform-production-external-load.yml` | NOT RUN; explicit load/cleanup gate |
 

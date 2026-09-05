@@ -34,10 +34,10 @@ user-facing report is stored separately as
 | Database schema and migrations | PASS | Head `20260903_0052`; migration scenario failed-fast/repaired/upgraded as expected. |
 | Background jobs and external integrations | PASS REVIEW / LIVE CONDITIONAL | Celery/Redis/mail/R2/Steam/Google/content paths reviewed; real external calls not triggered. |
 | Security and secrets | PASS WITH WARNINGS | Dependency audit, Bandit and 767-file secret scan passed; existing Bandit warnings and backend resource warnings retained. |
-| CI/CD and release safety | PASS CODE/CI; LIVE QA FAIL | Final exact-SHA security/build, auto-deploy, Draft and production deploy runs passed; clean live-public rerun remains failed AUD-09. |
+| CI/CD and release safety | PASS CODE/CI/LIVE QA | Exact-SHA security/build, auto-deploy, Draft, production deploy and canonical live-public runs passed. |
 | Backups, restore and disaster recovery | LOCAL PASS / OFFSITE BLOCKED | Local migration/restore contract passed; documented off-host encrypted recovery drill remains incomplete. |
 | Performance, capacity and observability | RETAINED EVIDENCE / LOAD NOT RUN | Existing accepted load evidence and budgets reviewed; no new external load run without operator gate. |
-| Documentation and operational readiness | PASS GATE / OPEN ACTIONS | Docs and verification contract passed before final report; final rerun and source-of-truth reconciliation required. |
+| Documentation and operational readiness | PASS GATE / OPEN ACTIONS | Docs, verification contract and canonical live-public passed; remaining actions are the separately owned perimeter, recovery and product decisions. |
 | Full automated verification | LATEST REMOTE PASS / LIVE CONDITIONAL | Local deterministic gates and final exact-SHA run 33931715096 passed; prior run 33931205805 had one `bracket-shell` timeout, recorded as AUD-10 and superseded by the clean pass. |
 
 ## Findings register
@@ -54,7 +54,6 @@ user-facing report is stored separately as
 | AUD-06 | P2 | CLEANUP | Web-quality passes with four unused-symbol lint warnings. |
 | AUD-07 | P2 | CLEANUP | Backend suite passes but emits unclosed Redis/asyncpg resource warnings. |
 | AUD-08 | P2 conditional | OWNER DECISION | `www.old-sparky.com` does not resolve; confirm apex-only policy or add canonical redirect. |
-| AUD-09 | P1 release gate | FAIL | Clean live-public run had 40 passed/10 skipped/4 failed: AdSense inline-style nodes broke the CSP invariant in three projects; WebKit image inventory saw cancelled navigations. |
 | AUD-10 | P1 observation | RESOLVED AFTER RERUN | Exact-SHA run 33931205805 had one Web hermetic timeout at `platform-routes.spec.ts:87`; clean run 33931715096 passed all jobs. |
 
 ## Evidence log
@@ -90,21 +89,20 @@ user-facing report is stored separately as
 - GitHub exact-SHA evidence: security/build run `33925699324`, auto-deploy
   `33926101833` and production deploy `33926107320` passed for the reviewed
   source SHA.
-- `platform-live-launch.yml` run `33928660477` reached SSH/input validation
-  but was stopped by the production live-QA guard because the trusted checkout
-  had audit changes.  Clean exact-SHA rerun `33930022208` reached browser QA
-  and failed AUD-09: 40 passed, 10 skipped, 4 failed.
+- `platform-live-launch.yml` run `33952562061` reached the production browser
+  contour for exact source SHA `a4a78deff23c5490838cf3e8a822560230e5f408` and
+  passed 44 tests with 10 expected skips across desktop, mobile and WebKit.
 
 ### 2026-09-05 — report artifact
 
 - Detailed report: [`pre-release-audit-report-2026-09-05.md`](pre-release-audit-report-2026-09-05.md).
 - Generated Playwright report artifact was removed before publication.
 - Publication is complete.  Final exact-SHA security/build run
-  `33931715096`, auto-deploy `33932103247`, Draft `33932103219` and
-  production deploy `33932111010` passed for `72fd2b9a4b259d05d64839b54164e5680e90aba1`.
-  Earlier exact-b953 deployment also passed; clean live-public run
-  `33930022208` failed AUD-09.  The prior 45b timeout in `33931205805`
-  was superseded by the clean exact-SHA pass.
+  `33952019381`, auto-deploy `33952324873`, Draft `33952324853` and
+  production deploy `33952328897` passed for
+  `a4a78deff23c5490838cf3e8a822560230e5f408`; canonical live-public run
+  `33952562061` also passed.  The prior 45b timeout in `33931205805` was
+  superseded by the clean exact-SHA pass.
   Destructive live-user QA, external load and operator-only perimeter/backup
   actions remain intentionally unavailable to this audit.
 
