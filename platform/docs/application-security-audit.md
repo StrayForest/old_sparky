@@ -11,7 +11,7 @@ This document contains only findings that still require action or direct operato
 
 | ID | Severity / priority | Confidence | Finding | Status |
 |---|---|---:|---|---|
-| — | — | — | No active findings | — |
+| AUD-02 | P2 | High | Cloudflare dashboard/runtime evidence reconciliation | Open — cache behavior closed; dashboard controls remain |
 
 ## Authorization matrix
 
@@ -30,8 +30,22 @@ Application RBAC remains authoritative. Cloudflare Access is an additional expos
 
 ## Active findings
 
-No active findings. AS-12 origin-perimeter closure evidence is retained in
+AS-12 origin-perimeter closure evidence is retained in
 [`archive/as-12-origin-perimeter-2026-09-05.md`](archive/as-12-origin-perimeter-2026-09-05.md).
+
+### AUD-02 — Cloudflare dashboard/runtime evidence reconciliation
+
+The public catalog cache behavior is now live-proven and the previous
+documentation contradiction is closed: anonymous requests produce `MISS` then
+`HIT`, while the actual production session cookie and `Authorization` produce
+`DYNAMIC`; `/api/v1/tournaments/mine` remains private and uncached. Evidence is
+in [`archive/as-02-cloudflare-catalog-cache-2026-09-05.md`](archive/as-02-cloudflare-catalog-cache-2026-09-05.md).
+
+The finding remains open only for direct account-owner verification of the
+Cloudflare rule expression and the separate certificate-alert, CAA, R2
+public-bucket/media-token, Managed WAF, edge-rate, Turnstile-hostname, Bot
+Fight Mode and Cloudflare-range/UFW monitoring controls. The checklist must
+not be called fully closed until those dashboard/operator checks have evidence.
 
 ### Additional audit actions
 
@@ -66,7 +80,8 @@ No active findings. AS-12 origin-perimeter closure evidence is retained in
 
 ## Remediation order
 
-No active security remediation is tracked in this document.
+Complete the remaining AUD-02 dashboard/operator checks in
+[`cloudflare-production-checklist.md`](cloudflare-production-checklist.md).
 
 AS-13 was closed on 2026-09-01 after the exact-SHA security/build run passed;
 the evidence is retained in

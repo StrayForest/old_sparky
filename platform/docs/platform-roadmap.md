@@ -84,7 +84,7 @@ AS-11 public worker-error sanitization is resolved with a persistence-boundary g
 
 - AS-14 HSTS ownership/state is resolved: Cloudflare owns visitor HSTS with a six-month max-age, `includeSubDomains` Off and preload Off. Evidence is retained in [`archive/as-14-cloudflare-hsts-ownership.md`](archive/as-14-cloudflare-hsts-ownership.md).
 - Cloudflare Full(strict), minimum TLS 1.2, TLS 1.3/HTTP3 and DNSSEC were operator-confirmed on 2026-08-21.
-- Verify remaining Cloudflare CAA, WAF/rates and R2 settings with direct dashboard evidence where still marked `VERIFY`/`TODO` in the production checklist.
+- Verify remaining Cloudflare certificate alerts, CAA, R2 public-bucket/media-token settings, WAF/rates, Turnstile hostnames, Bot Fight Mode and Cloudflare-range/UFW parity with direct dashboard/operator evidence where still marked `VERIFY`/`TODO` in the production checklist. The public catalog cache behavior is live-proven; see [`archive/as-02-cloudflare-catalog-cache-2026-09-05.md`](archive/as-02-cloudflare-catalog-cache-2026-09-05.md).
 - Classify new enforced CSP reports and perform real-user follow-up; confirmed first-party regressions use the documented rollback path rather than a widened allowlist.
 - Purge/revalidate stale immutable asset metadata when required.
 - Keep password-manager/browser matrix checks for password UI releases.

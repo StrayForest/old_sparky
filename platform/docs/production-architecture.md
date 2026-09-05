@@ -48,15 +48,16 @@ Browser
 Browser -> cdn.old-sparky.com -> Cloudflare cache -> public R2 variants
 ```
 
-Public catalog requests use a short origin cache: the API may serve an
+Public catalog requests use a short two-layer cache: the API may serve an
 anonymous query representation from Redis for five seconds, and Nginx emits
 `public, max-age=5, s-maxage=15, stale-while-revalidate=30` for the exact
-catalog path. Cloudflare edge caching is prepared but remains operator-owned:
-the exact-path Cache Rule is still required and the 2026-09-01 live probe saw
-`CF-Cache-Status: DYNAMIC`. The cache is keyed only by normalized public
-filters, limit and cursor; Redis failures are treated as misses. Personal
-`/tournaments/mine` responses are private and never enter either response
-cache.
+catalog path. Cloudflare catalog cache behavior is live-proven: anonymous
+requests produce `MISS` then `HIT`, while the actual production session cookie
+`__Host-old_sparky_session` and `Authorization` produce `DYNAMIC`. The cache
+is keyed only by normalized public filters, limit and cursor; Redis failures
+are treated as misses. Personal `/tournaments/mine` responses are private and
+never enter either response cache. Remaining dashboard evidence is tracked in
+the [Cloudflare production checklist](cloudflare-production-checklist.md).
 
 The catalog list path reads the rebuildable PostgreSQL
 `tournament_list_read_models` projection. Its rows contain the card fields,

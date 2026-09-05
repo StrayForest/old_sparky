@@ -98,10 +98,11 @@ catalog cards are served from the rebuildable PostgreSQL
 and committed tournament, participant, workflow, profile and media changes
 refresh the affected card. Catalog pages use cursor/keyset pagination and
 `LIMIT + 1`; public responses have a five-second Redis response cache and emit
-short-TTL origin cache headers. A live probe on 2026-09-02 verified the
-Cloudflare Cache Rule with `CF-Cache-Status: MISS` followed by `HIT` and
-`Age: 0` on the public catalog response; an equivalent cookie-bearing probe
-also reached an edge HIT. Cloudflare caching remains enabled, while
+short-TTL origin cache headers. A live probe on 2026-09-05 verified the
+Cloudflare catalog cache behavior: anonymous requests produced
+`CF-Cache-Status: MISS` followed by `HIT` with `Age: 0`, while a request
+carrying the actual production session cookie `__Host-old_sparky_session` and
+a request carrying `Authorization` both returned `DYNAMIC`.
 `/tournaments/mine` remains private and uncached. The initial workspace includes the bracket, passive changes
 become visible after a manual page reload, and explicit organizer mutations
 may refresh their own authoritative result.
@@ -286,7 +287,10 @@ and size-based rotation bounds text log files.
 
 ## Deferred / operator-owned work
 
-- Remaining Cloudflare dashboard follow-up for CAA, WAF/rates and R2 settings where the operator checklist still marks work `VERIFY`/`TODO`.
+- Remaining Cloudflare dashboard follow-up for certificate alerts, CAA, R2
+  public-bucket/media-token settings, WAF/rates, Turnstile hostnames, Bot Fight
+  Mode and Cloudflare-range/UFW parity where the operator checklist still marks
+  work `VERIFY`/`TODO`.
 - Real-user CSP follow-up and classification of new enforcement reports.
 - Physical removal of persisted legacy media URL fields and migration-only helpers after production data and external-consumer inventory confirms that no migration or compatibility dependency remains; this requires a reviewed API/schema migration.
 - Non-security feature expansion that does not remove a launch or production blocker. For priorities and backlog, use [`platform-roadmap.md`](platform-roadmap.md); for evidence and details, follow [`README.md`](README.md).
