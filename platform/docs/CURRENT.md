@@ -288,11 +288,13 @@ and size-based rotation bounds text log files.
 
 ## Deferred / operator-owned work
 
-- Remaining Cloudflare operator follow-up is limited to the CAA decision,
-  certificate-alert policy, media-token scope, WAF/rate-limit configuration,
-  Bot Fight Mode runtime decision and the daily Cloudflare-range/UFW parity
-  alert. DNS, edge certificates, R2, Turnstile hostnames and the catalog cache
-  boundary have fresh API/live evidence.
+- Remaining Cloudflare operator follow-up is limited to media-token scope,
+  Universal SSL lifecycle-alert availability and Managed WAF entitlement.
+  CAA, Certificate Transparency alerting, the plan-compatible login edge rate
+  limit, the deliberate Bot Fight Mode-disabled decision and the daily
+  Cloudflare-range/UFW alert workflow have fresh operator/live evidence. DNS,
+  edge certificates, R2, Turnstile hostnames and the catalog cache boundary
+  also have fresh API/live evidence; see the AUD-02 archive.
 - Real-user CSP follow-up and classification of new enforcement reports.
 - Physical removal of persisted legacy media URL fields and migration-only helpers after production data and external-consumer inventory confirms that no migration or compatibility dependency remains; this requires a reviewed API/schema migration.
 - Non-security feature expansion that does not remove a launch or production blocker. For priorities and backlog, use [`platform-roadmap.md`](platform-roadmap.md); for evidence and details, follow [`README.md`](README.md).

@@ -17,6 +17,10 @@ and the follow-up read-only evidence is retained in
 [`33964617403`](https://github.com/StrayForest/old_sparky/actions/runs/33964617403).
 The durable summary is in
 [`archive/as-02-cloudflare-api-audit-2026-09-05.md`](archive/as-02-cloudflare-api-audit-2026-09-05.md).
+The follow-up operator run applied the CAA, Certificate Transparency and
+plan-compatible login edge-rate controls; evidence and provider rejection
+details are in
+[`archive/as-02-cloudflare-operator-remediation-2026-09-05.md`](archive/as-02-cloudflare-operator-remediation-2026-09-05.md).
 
 ## DNS and certificates
 
@@ -26,13 +30,15 @@ The durable summary is in
 - DECISION: `old-sparky.com` is the only supported public hostname. `www.old-sparky.com` intentionally has no DNS alias and must not be introduced as a second canonical origin without an explicit redirect/SEO decision.
 - DONE: DNSSEC is enabled and the operator confirmed the production DNSSEC/DS
   contour on 2026-08-21.
-- REVIEW: scanner reports no CAA. Add records only after confirming every CA
-  Cloudflare currently needs for Universal/backup certificates; an incomplete
-  CAA policy can block renewal.
+- DONE: apex CAA policy explicitly permits `issue` and `issuewild` for the
+  four Cloudflare partner CAs used for Universal/backup certificates; the
+  operator run observed all eight records present.
 - DONE: the edge certificate API returned an active Universal certificate and
   an issued Let’s Encrypt backup certificate for the production hosts.
-- VERIFY: Certificate Transparency alerting is currently disabled in the API
-  (`enabled: false`); decide and verify the expiry/alerting policy.
+- DONE: Certificate Transparency alerting is enabled with the operator email
+  destination. The Universal SSL lifecycle alert type was not available in
+  the account alert catalog, so provider-plan expiry/lifecycle alerting is a
+  remaining review item.
 
 ## Edge TLS
 
@@ -58,7 +64,9 @@ The durable summary is in
   `r2.dev` is disabled and browser PUT CORS is absent. The R2 custom domain
   `cdn.old-sparky.com` is enabled with active ownership/SSL and minimum TLS
   1.2; see [`archive/as-02-cloudflare-api-audit-2026-09-05.md`](archive/as-02-cloudflare-api-audit-2026-09-05.md).
-- VERIFY: media token is bucket-scoped and not reused for backups.
+- VERIFY: media token is bucket-scoped and not reused for backups. The checked-
+  in runtime contract enforces separate media/backup buckets and credentials,
+  but Cloudflare does not expose the secret token’s scope through this API.
 - DONE: the reviewed cache ruleset now bypasses the public catalog for
   `Authorization` or the actual `__Host-old_sparky_session` cookie. Anonymous
   catalog requests returned `HIT`, while a session-cookie request returned
@@ -85,9 +93,13 @@ The durable summary is in
 
 ## Security and admin edge
 
-- TODO: enable/tune Managed WAF after observing false positives.
-- TODO: add bounded edge rates for register, login, reset, invite, support and
-  upload; application controls stay authoritative.
+- REVIEW: the zone is not entitled to execute the Cloudflare Managed WAF
+  ruleset through the API; no managed-WAF rule was created. Revisit after a
+  plan/entitlement change.
+- PARTIAL: one plan-compatible login edge rate limit is active. The current
+  plan exposes one edge rule slot and a ten-second period; application Redis
+  controls remain authoritative for register and reset, while invite/support/
+  upload have no edge rule in this plan.
 - DONE: read-only API evidence shows the active Turnstile widget allowlist is
   only `old-sparky.com`.
 - DONE: Cloudflare Access protects `/platform-ops*` and `/api/v1/admin*` with an
@@ -95,16 +107,20 @@ The durable summary is in
   and a fresh incognito login verified the identity -> MFA -> application path
   on 2026-08-21; application RBAC remains authoritative. Closure evidence is in
   [`archive/as-02-cloudflare-access-mfa.md`](archive/as-02-cloudflare-access-mfa.md).
-- VERIFY: Bot Fight Mode is disabled (`fight_mode: false`); retain a deliberate
-  operator decision and runtime smoke for API, health, Turnstile, CDN and
-  crawler behavior if the feature is enabled later.
+- DECISION: keep Bot Fight Mode disabled (`fight_mode: false`). The applied
+  operator run recorded an API 400/code 10400 when attempting to enable it;
+  the live API/catalog/private-route smoke passed with it disabled. Revisit
+  only through a dashboard/plan review and an API/mobile/crawler smoke.
 
 ## Origin protection
 
 - DONE: UFW permits 80/443 only from managed Cloudflare IPv4/IPv6 ranges and
   retains SSH/out-of-band console access.
-- VERIFY: daily range update and UFW parity alert; add ranges before removing
-  old ones.
+- DONE: the daily `Platform Cloudflare range and UFW parity alert` workflow
+  runs a read-only parity proof over pinned SSH and opens/updates a GitHub
+  alert issue on failure. Configure repository notifications to deliver those
+  issue alerts to the operator mailbox; the Cloudflare Certificate
+  Transparency alert uses the separately configured Cloudflare email channel.
 - OPTIONAL: Authenticated Origin Pulls is later defense-in-depth and does not
   replace Full(strict).
 

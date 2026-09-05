@@ -1,0 +1,113 @@
+name: Platform Cloudflare range and UFW parity alert
+
+on:
+  schedule:
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: platform-cloudflare-range-alert
+  cancel-in-progress: false
+
+jobs:
+  parity:
+    name: Check Cloudflare/Nginx/UFW parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate production SSH inputs
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}"
+          test -n "${PROD_SSH_USER:-}"
+          test -n "${PROD_SSH_KEY:-}"
+
+      - name: Configure pinned production SSH
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
+          chmod 600 ~/.ssh/old_sparky_prod
+          ssh_scan="$RUNNER_TEMP/cloudflare-range-known-hosts"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan"
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1"
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
+          install -m 600 "$ssh_scan" ~/.ssh/known_hosts
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s/.ssh/known_hosts\n' "$HOME"
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Run read-only parity proof
+        id: proof
+        continue-on-error: true
+        run: |
+          set +e
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i ~/.ssh/old_sparky_prod \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s <<'REMOTE' > "$RUNNER_TEMP/cloudflare-range-proof.txt" 2>&1
+          set -Eeuo pipefail
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          guard="$current/tools/platform_release_lock_exec.sh"
+          test -x "$guard"
+          /bin/bash "$guard" --app-dir "$runtime" -- \
+            "$runtime/shared/venv/bin/python" \
+            "$current/tools/platform_validate_edge_policy.py" --json
+          REMOTE
+          status=$?
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            echo "Parity proof failed with status $status" >&2
+            sed -n -E 's/^(Cloudflare\/Nginx\/UFW parity passed|Edge policy validation failed|Traceback).*/\0/p' \
+              "$RUNNER_TEMP/cloudflare-range-proof.txt" >&2 || true
+          fi
+          exit "$status"
+
+      - name: Open or update alert issue
+        if: steps.proof.outcome != 'success'
+        run: |
+          set -euo pipefail
+          title='[ALERT] Cloudflare range/UFW parity failed'
+          body_file="$RUNNER_TEMP/cloudflare-range-alert.md"
+          {
+            echo "Daily read-only Cloudflare/Nginx/UFW parity proof failed."
+            echo
+            echo "- Workflow: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "- Host output is intentionally limited to the validation result; no origin addresses are included."
+            echo
+            echo '```text'
+            sed -n -E 's/^(Cloudflare\/Nginx\/UFW parity passed|Edge policy validation failed|Traceback).*/\0/p' \
+              "$RUNNER_TEMP/cloudflare-range-proof.txt" || true
+            echo '```'
+          } > "$body_file"
+          issue_number="$(gh issue list --state open --search '"[ALERT] Cloudflare range/UFW parity failed" in:title' --json number --jq '.[0].number // ""')"
+          if [[ -n "$issue_number" ]]; then
+            gh issue comment "$issue_number" --body-file "$body_file"
+          else
+            gh issue create --title "$title" --body-file "$body_file"
+          fi
+
+      - name: Fail the scheduled check after alerting
+        if: steps.proof.outcome != 'success'
+        run: exit 1

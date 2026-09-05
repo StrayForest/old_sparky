@@ -41,15 +41,14 @@ documentation contradiction is closed: warmed anonymous requests produce
 `DYNAMIC`; `/api/v1/tournaments/mine` remains private and uncached. Evidence
 is in [`archive/as-02-cloudflare-catalog-cache-2026-09-05.md`](archive/as-02-cloudflare-catalog-cache-2026-09-05.md).
 
-The finding remains open for the CAA decision, certificate-alert policy,
-media-token scope, Managed WAF/rate-limit configuration, Bot Fight Mode runtime
-decision and Cloudflare-range/UFW monitoring. A read-only GitHub Actions audit
-on 2026-09-05 closed the DNS, active-certificate, R2, Turnstile-hostname and
-catalog cache subchecks; the cache repair and live smoke used a narrowly scoped
-remediation workflow and changed only the reviewed rule. Details are in
-[`archive/as-02-cloudflare-api-audit-2026-09-05.md`](archive/as-02-cloudflare-api-audit-2026-09-05.md).
-The checklist must not be called fully closed until those dashboard/operator
-checks have evidence.
+The finding is narrowed but remains open for media-token scope, provider-plan
+availability of Universal SSL lifecycle alerts and Managed WAF entitlement.
+The CAA policy, Certificate Transparency alerting, one plan-compatible login
+edge rate limit, deliberate Bot Fight Mode-disabled decision and daily
+Cloudflare-range/UFW alert workflow are now evidenced. Details are in
+[`archive/as-02-cloudflare-operator-remediation-2026-09-05.md`](archive/as-02-cloudflare-operator-remediation-2026-09-05.md).
+The checklist must not be called fully closed until the remaining
+secret-scope and provider-entitlement checks have evidence.
 
 ### Additional audit actions
 
