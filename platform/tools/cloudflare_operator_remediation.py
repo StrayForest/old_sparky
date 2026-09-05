@@ -156,8 +156,12 @@ def ensure_ssl_policy(token: str, account_id: str, email: str, report: dict[str,
     policies = list_result(token, f"/accounts/{account_id}/alerting/v3/policies")
     current = next((item for item in policies if item.get("name") == SSL_ALERT_NAME), None)
     available = list_result(token, f"/accounts/{account_id}/alerting/v3/available_alerts")
-    available_types = {str(item.get("alert_type") or item.get("type")) for item in available}
-    report["ssl_policy"] = {"present": current is not None, "available": "universal_ssl_event_type" in available_types}
+    available_types = {str(item.get("alert_type") or item.get("type") or item.get("name")) for item in available}
+    report["ssl_policy"] = {
+        "present": current is not None,
+        "available": "universal_ssl_event_type" in available_types,
+        "available_types": sorted(available_types),
+    }
     if not apply or "universal_ssl_event_type" not in available_types:
         return
     body = {
@@ -195,7 +199,7 @@ def ensure_managed_waf(token: str, zone_id: str, report: dict[str, Any], apply: 
     body = {
         "name": WAF_RULESET_NAME,
         "description": "Execute Cloudflare managed WAF ruleset for the zone.",
-        "kind": "root",
+        "kind": "zone",
         "phase": "http_request_firewall_managed",
         "rules": [managed_waf_rule()],
     }
@@ -245,7 +249,7 @@ def ensure_rate_limits(token: str, zone_id: str, report: dict[str, Any], apply: 
             {
                 "name": RATE_RULESET_NAME,
                 "description": "Conservative per-IP limits for unauthenticated auth endpoints.",
-                "kind": "root",
+                "kind": "zone",
                 "phase": "http_ratelimit",
                 "rules": wanted,
             },
@@ -259,7 +263,27 @@ def ensure_bot_fight(token: str, zone_id: str, report: dict[str, Any], apply: bo
     report["bot_fight_mode"] = {"before": before, "requested": not disable if apply else None}
     if not apply or before == (not disable):
         return
-    api_request(token, "PUT", f"/zones/{zone_id}/bot_management", {"fight_mode": not disable})
+    writable_fields = {
+        "ai_bots_protection",
+        "auto_update_model",
+        "bm_cookie_enabled",
+        "bot_preference_sync_enabled",
+        "cf_robots_variant",
+        "content_bots_protection",
+        "crawler_protection",
+        "enable_js",
+        "fight_mode",
+        "is_robots_txt_managed",
+        "optimize_wordpress",
+        "sbfm_definitely_automated",
+        "sbfm_likely_automated",
+        "sbfm_static_resource_protection",
+        "sbfm_verified_bots",
+        "suppress_session_score",
+    }
+    body = {key: value for key, value in current.items() if key in writable_fields}
+    body["fight_mode"] = not disable
+    api_request(token, "PUT", f"/zones/{zone_id}/bot_management", body)
     report["changes"].append(f"{'enabled' if not disable else 'disabled'} Bot Fight Mode")
 
 

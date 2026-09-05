@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           curl --fail --silent --show-error --max-time 20 -D "$RUNNER_TEMP/home.headers" -o /dev/null https://old-sparky.com/
-          curl --fail --silent --show-error --max-time 20 -D "$RUNNER_TEMP/catalog.headers" -o /dev/null 'https://old-sparky.com/api/v1/tournaments/public?limit=1'
+          curl --fail --silent --show-error --max-time 20 -D "$RUNNER_TEMP/catalog.headers" -o /dev/null 'https://old-sparky.com/api/v1/tournaments?limit=1'
           curl --fail --silent --show-error --max-time 20 -D "$RUNNER_TEMP/mine.headers" -o /dev/null 'https://old-sparky.com/api/v1/tournaments/mine' || test "$(awk 'NR==1 {print $2}' "$RUNNER_TEMP/mine.headers")" = "401"
           grep -qi '^server: cloudflare' "$RUNNER_TEMP/home.headers"
 
