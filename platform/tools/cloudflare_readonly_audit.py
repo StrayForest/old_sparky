@@ -326,7 +326,7 @@ def run_audit(token: str, account_id: str) -> dict[str, Any]:
             **api_evidence(r2_buckets),
             "bucket_detail": api_evidence(bucket_details) if bucket_details else None,
             "bucket": {
-                key: target_bucket[key]
+                key: detailed_bucket[key]
                 for key in ("name", "storage_class", "jurisdiction", "location")
                 if isinstance(detailed_bucket, dict) and key in detailed_bucket
             },
