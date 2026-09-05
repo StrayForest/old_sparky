@@ -159,6 +159,21 @@ jobs:
               public = wildcard or not is_loopback
               if not public:
                   continue
+              protocol = line.split()[0]
+              process = "unknown"
+              marker = 'users:(("'
+              if marker in line:
+                  process = line.split(marker, 1)[1].split('"', 1)[0]
+              # Ubuntu's DHCP client may own a wildcard UDP/68 socket. It is
+              # not an origin listener; UFW's default-deny incoming policy
+              # remains the perimeter control for this system socket.
+              expected_dhcp_listener = (
+                  protocol == "udp"
+                  and port == 68
+                  and process == "systemd-network"
+              )
+              if expected_dhcp_listener:
+                  continue
               if port not in {22, 80, 443}:
                   failures.append(f"unexpected_public_port_{port}")
               elif port in {80, 443}:
@@ -252,6 +267,7 @@ jobs:
             echo "AS12_PROOF=PASS"
             echo "source_sha=$EXPECTED_SHA"
             echo "vps_listener_inventory=PASS"
+            echo "expected_non_web_listener=udp/68 systemd-network (UFW default-deny)"
             echo "forwarded_header_trust=PASS"
             echo "cloudflare_nginx_ufw_parity=PASS"
             echo "direct_origin_probe_network=github-hosted-runner"

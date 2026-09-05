@@ -152,6 +152,8 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertIn("--expected-sha", proof)
         self.assertIn("platform_validate_edge_policy.py", proof)
         self.assertIn("direct_origin_", proof)
+        self.assertIn("expected_dhcp_listener", proof)
+        self.assertIn("systemd-network", proof)
         self.assertNotIn("platform_release_deploy.sh", proof)
         self.assertNotIn("systemctl restart", proof)
         self.assertNotIn("systemctl reload", proof)
