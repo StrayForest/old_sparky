@@ -59,6 +59,9 @@ clients and the SQLAlchemy async engine on the event loop that owns them,
 before `IsolatedAsyncioTestCase` closes that loop. Direct inheritance from the
 stdlib async test case is prohibited by a backend contract test so a new suite
 cannot silently reintroduce cross-loop Redis/asyncpg cleanup warnings.
+The shared base retains asyncio debug mode but uses a five-second slow-callback
+threshold for real PostgreSQL integration steps; dedicated performance gates,
+not the generic unittest 100 ms threshold, own latency acceptance.
 
 Never add an individual ordinary test by editing GitHub workflow YAML. Do not
 hide deterministic failures with grep exclusions or silent retries. A flaky

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from pathlib import Path
+
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class PlatformAsyncTestContractTests(unittest.TestCase):
@@ -15,3 +18,10 @@ class PlatformAsyncTestContractTests(unittest.TestCase):
         ]
 
         self.assertEqual(offenders, [])
+
+
+class PlatformAsyncRuntimeContractTests(PlatformIsolatedAsyncioTestCase):
+    async def test_integration_callback_threshold_keeps_five_second_stall_signal(
+        self,
+    ) -> None:
+        self.assertEqual(asyncio.get_running_loop().slow_callback_duration, 5.0)

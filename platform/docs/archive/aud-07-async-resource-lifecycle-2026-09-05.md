@@ -3,7 +3,7 @@
 - Status: Resolved
 - Owner: Backend/platform infrastructure maintainers
 - Source finding: [`pre-release-audit-report-2026-09-05.md`](pre-release-audit-report-2026-09-05.md#aud-07--backend-test-process-emits-unclosed-redisasyncpg-resources-p2-test-hygiene)
-- Implementation commit: `ce9b2017ff7353c5028dcb657c92fe54d3e6ba72`
+- Primary implementation commit: `ce9b2017ff7353c5028dcb657c92fe54d3e6ba72`
 
 ## Resolution
 
@@ -19,6 +19,10 @@ clients followed by the SQLAlchemy engine on the owning loop. All backend async
 test classes use that base, and a source-contract regression rejects future
 direct inheritance from the stdlib isolated async test case. Focused Redis and
 database lifecycle tests cover same-loop closure and cross-loop rejection.
+The shared test base retains asyncio debug mode with a five-second callback
+threshold. That removes routine 100 ms PostgreSQL integration-step diagnostics
+while preserving a signal for an actual test-loop stall; `ResourceWarning`
+visibility is unchanged.
 
 No schema, persistent data, permission or public API contract changed. API
 lifespan shutdown and the worker's persistent event-loop shutdown retain the
@@ -26,10 +30,10 @@ same resource order and now always perform full pool closure.
 
 ## Evidence
 
-- Local canonical backend discovery ran 1,000 tests with
+- Local canonical backend discovery ran 1,001 tests with
   `ResourceWarning` converted to an error and completed with `OK`; the filtered
   output contained no resource, unclosed-connection or unclosed-transport
-  marker.
+  marker and no slow-callback diagnostic above the five-second stall threshold.
 - Exact-SHA
   [`Platform security and build` run 33968720445](https://github.com/StrayForest/old_sparky/actions/runs/33968720445)
   passed all required jobs for the implementation commit. Its backend job ran
