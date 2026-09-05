@@ -1,9 +1,10 @@
 from __future__ import annotations
+
 import asyncio
+import unittest
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from typing import Any
-import unittest
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -24,9 +25,10 @@ from python_packages.platform_infra.models import (
     TournamentParticipant,
     User,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestCase):
     """PostgreSQL transaction-level races for tournament workflow writers."""
 
     async def asyncSetUp(self) -> None:

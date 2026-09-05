@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import json
 import os
-from pathlib import Path
-import subprocess
 import stat
+import subprocess
 import tempfile
-from types import SimpleNamespace
 import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -23,8 +23,8 @@ from python_packages.platform_infra.models import (
     UserSession,
 )
 from python_packages.platform_infra.security import hash_password
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 from tools import platform_manual_live_auth_qa as manual_tool
-
 
 NOW = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)
 TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
@@ -345,7 +345,7 @@ class ManualLiveAuthQaUnitTests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.geteuid() == 0, "root-only manual QA contract requires root")
-class ManualLiveAuthQaIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class ManualLiveAuthQaIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         settings = get_settings()
         if (

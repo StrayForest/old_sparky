@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import unittest
 from datetime import UTC, datetime
 from pathlib import Path
-import unittest
 from uuid import uuid4
 
 from sqlalchemy import delete, func, select
@@ -28,9 +28,10 @@ from python_packages.platform_infra.models import (
     User,
     new_uuid,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformTournamentTeamMaterializationTests(unittest.IsolatedAsyncioTestCase):
+class PlatformTournamentTeamMaterializationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-team-state-{uuid4().hex[:8]}"
         await self._cleanup()

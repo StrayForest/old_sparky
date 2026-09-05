@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import unittest
 
 from python_packages.platform_infra.authenticated_read_admission import (
     AuthenticatedReadAdmission,
     _has_session_cookie,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class AuthenticatedReadAdmissionTests(unittest.IsolatedAsyncioTestCase):
+class AuthenticatedReadAdmissionTests(PlatformIsolatedAsyncioTestCase):
     async def test_saturated_read_is_shed_before_database_work(self) -> None:
         controller = AuthenticatedReadAdmission(
             limit=1,

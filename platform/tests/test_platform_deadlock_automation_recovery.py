@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from apps.platform_api.app.services import deadlock_automation as automation
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _RetrySession:
@@ -67,7 +67,7 @@ def _tournament(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-class PlatformDeadlockAutomationRecoveryTests(unittest.IsolatedAsyncioTestCase):
+class PlatformDeadlockAutomationRecoveryTests(PlatformIsolatedAsyncioTestCase):
     async def test_late_tick_catches_up_all_due_scheduled_transitions(self) -> None:
         now = datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
         tournament = _tournament(

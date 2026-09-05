@@ -1,40 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+import unittest
 from contextlib import AsyncExitStack
 from http.cookies import SimpleCookie
 from unittest.mock import AsyncMock, patch
-import unittest
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request, Response
 import httpx
+from fastapi import FastAPI, HTTPException, Request, Response
 from sqlalchemy import delete, or_, select, update
 
-from apps.platform_api.app.main import create_app
 from apps.platform_api.app.api.routes import auth as auth_routes
+from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services import auth_mail
-from python_packages.platform_infra import auth_rate_limit
+from python_packages.platform_infra import auth_rate_limit, human_verification
 from python_packages.platform_infra.auth_lifecycle import (
     issue_password_reset_token,
     one_time_code_digest,
 )
 from python_packages.platform_infra.auth_rate_limit import (
-    check_registration_rate_limit,
     check_password_reset_rate_limit,
+    check_registration_rate_limit,
     progressive_delay_seconds,
     record_login_failure,
 )
 from python_packages.platform_infra.config import PlatformSettings
 from python_packages.platform_infra.csrf import (
-    CsrfProtectionMiddleware,
     PUBLIC_AUTH_PATHS,
+    CsrfProtectionMiddleware,
     csrf_cookie_name,
     generate_csrf_token,
     issue_csrf_token,
 )
 from python_packages.platform_infra.db import dispose_engine, session_factory
-from python_packages.platform_infra import human_verification
 from python_packages.platform_infra.models import (
     AuditLog,
     EmailVerificationToken,
@@ -54,6 +53,7 @@ from python_packages.platform_infra.security import (
     validate_auth_security_settings,
 )
 from python_packages.platform_infra.turnstile import verify_turnstile_token
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 from tools.platform_create_operator import bootstrap_operator, normalize_confirmed_email
 
 
@@ -89,7 +89,7 @@ class _HumanVerificationRedis:
         self.expirations[key] = ex
 
 
-class AuthSecurityUnitTests(unittest.IsolatedAsyncioTestCase):
+class AuthSecurityUnitTests(PlatformIsolatedAsyncioTestCase):
     def _settings(self, **overrides: object) -> PlatformSettings:
         values: dict[str, object] = {
             "_env_file": None,
@@ -699,7 +699,7 @@ class AuthSecurityUnitTests(unittest.IsolatedAsyncioTestCase):
             normalize_confirmed_email("first@example.com", "second@example.com")
 
 
-class AuthSecurityIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class AuthSecurityIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-auth-security-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"

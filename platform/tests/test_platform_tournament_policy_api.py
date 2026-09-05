@@ -5,7 +5,6 @@ from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -14,7 +13,9 @@ from sqlalchemy import delete, select, update
 
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_api.app.main import create_app
-from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
+from apps.platform_api.app.services.deadlock_automation import (
+    advance_deadlock_tournament_automation,
+)
 from apps.platform_api.app.services.tournament_catalog_read_models import (
     refresh_tournament_list_read_model,
 )
@@ -32,9 +33,10 @@ from python_packages.platform_infra.models import (
     UserRole,
 )
 from python_packages.platform_infra.security import invalidate_user_session_cache
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformTournamentPolicyApiTests(unittest.IsolatedAsyncioTestCase):
+class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-policy-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"

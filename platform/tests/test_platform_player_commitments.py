@@ -1,26 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import unittest
 from datetime import UTC, datetime
 from types import SimpleNamespace
-import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
 from fastapi import HTTPException
 from sqlalchemy import delete, func, select
 
-from apps.platform_api.app.services.tournament_workflow import (
-    TournamentWorkflowError,
-    finalize_deadlock_assignment_with_commitments,
-    generate_deadlock_auto_assignment_run_for_tournament,
-    transition_tournament_status,
-)
 from apps.platform_api.app.services.player_commitments import (
     historical_assignment_roster_members,
     reactivate_viable_tournament_commitments,
     reconcile_player_commitments,
     release_active_commitments,
+)
+from apps.platform_api.app.services.tournament_workflow import (
+    TournamentWorkflowError,
+    finalize_deadlock_assignment_with_commitments,
+    generate_deadlock_auto_assignment_run_for_tournament,
+    transition_tournament_status,
 )
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
@@ -35,6 +35,7 @@ from python_packages.platform_infra.models import (
     User,
     new_uuid,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class FastAssignmentEngine:
@@ -75,7 +76,7 @@ class FastAssignmentEngine:
         )
 
 
-class PlatformPlayerCommitmentTests(unittest.IsolatedAsyncioTestCase):
+class PlatformPlayerCommitmentTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-commitment-{uuid4().hex[:8]}"
         await self._cleanup()

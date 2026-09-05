@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
 import unittest
+from contextlib import AsyncExitStack
 from uuid import uuid4
 
 import httpx
@@ -17,12 +17,12 @@ from python_packages.platform_infra.models import (
     TournamentParticipant,
     User,
 )
-
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 INACTIVE_PARTICIPANT_STATUSES = ("withdrawn", "disqualified")
 
 
-class PlatformTournamentConcurrencyIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-as03-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"

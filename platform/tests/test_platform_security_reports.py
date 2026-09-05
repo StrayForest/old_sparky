@@ -13,6 +13,7 @@ from apps.platform_api.app.api.routes.security_reports import (
     _safe_url,
     receive_csp_report,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class PlatformSecurityReportTests(unittest.TestCase):
@@ -106,7 +107,7 @@ class PlatformSecurityReportTests(unittest.TestCase):
         self.assertEqual(rows[0]["disposition"], "invalid")
 
 
-class PlatformSecurityReportEndpointTests(unittest.IsolatedAsyncioTestCase):
+class PlatformSecurityReportEndpointTests(PlatformIsolatedAsyncioTestCase):
     @staticmethod
     def _request(body: bytes, *, headers: dict[str, str] | None = None) -> Request:
         request_headers = {

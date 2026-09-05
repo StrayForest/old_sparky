@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from dataclasses import FrozenInstanceError, is_dataclass
 import inspect
+import unittest
+from dataclasses import FrozenInstanceError, is_dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException, Request
@@ -14,14 +14,14 @@ from sqlalchemy.dialects import postgresql
 
 from apps.platform_api.app.api.routes import profiles, tournaments
 from apps.platform_api.app.services import deadlock_automation, player_commitments
+from apps.platform_api.app.services.mutation_idempotency import (
+    mutation_payload_fingerprint,
+    request_idempotency_key,
+)
 from apps.platform_api.app.services.tournament_workflow import (
     ReadyVoteTournamentSnapshot,
     ready_vote_preflight_snapshot,
     upsert_deadlock_ready_vote,
-)
-from apps.platform_api.app.services.mutation_idempotency import (
-    mutation_payload_fingerprint,
-    request_idempotency_key,
 )
 from python_packages.platform_infra import security
 from python_packages.platform_infra.db import (
@@ -34,6 +34,7 @@ from python_packages.platform_infra.models import (
     TournamentMatch,
     TournamentParticipant,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _AsyncContext:
@@ -49,7 +50,7 @@ class _AsyncContext:
         return False
 
 
-class PersistenceConcurrencyRemediationTests(unittest.IsolatedAsyncioTestCase):
+class PersistenceConcurrencyRemediationTests(PlatformIsolatedAsyncioTestCase):
     async def test_optional_read_auth_does_not_open_last_seen_transaction(self) -> None:
         request = Mock()
         db_session = Mock()

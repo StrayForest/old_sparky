@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import unittest
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 from uuid import uuid4
 
 from sqlalchemy import delete, select, update
@@ -11,16 +11,24 @@ from sqlalchemy import delete, select, update
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.media.errors import MediaStorageError
 from python_packages.platform_infra.media.image_processor import (
-    ProcessedVariant,
     VARIANT_SPECS,
+    ProcessedVariant,
     media_object_key,
 )
 from python_packages.platform_infra.media.r2_storage import StoredObjectMetadata
 from python_packages.platform_infra.media.repository import MediaRepository
-from python_packages.platform_infra.media.service import MediaService, MediaServicePolicy
+from python_packages.platform_infra.media.service import (
+    MediaService,
+    MediaServicePolicy,
+)
 from python_packages.platform_infra.media.source_store import MediaSourceStore
-from python_packages.platform_infra.models import MediaAsset, MediaVariant, PlayerProfile, User
-
+from python_packages.platform_infra.models import (
+    MediaAsset,
+    MediaVariant,
+    PlayerProfile,
+    User,
+)
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 TINY_PNG = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
@@ -115,7 +123,7 @@ class FakeMediaStorage:
         )
 
 
-class MediaServiceIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class MediaServiceIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.user_id = str(uuid4())
         self.db_session = session_factory()()

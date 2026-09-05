@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import unittest
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
-from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, patch
-import unittest
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
-from fastapi import HTTPException
 import httpx
+from fastapi import HTTPException
 from sqlalchemy import delete, or_, select
 from starlette.datastructures import QueryParams
 
@@ -23,7 +23,9 @@ from apps.platform_api.app.services.steam_openid import (
     verify_openid_assertion,
 )
 from python_packages.platform_infra import auth_rate_limit
-from python_packages.platform_infra.auth_rate_limit import reserve_auth_delivery_cooldown
+from python_packages.platform_infra.auth_rate_limit import (
+    reserve_auth_delivery_cooldown,
+)
 from python_packages.platform_infra.config import PlatformSettings
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
@@ -35,6 +37,7 @@ from python_packages.platform_infra.models import (
     User,
 )
 from python_packages.platform_infra.security import invalidate_user_session_cache
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _CooldownRedis:
@@ -58,7 +61,7 @@ class _CooldownRedis:
         return None
 
 
-class SteamOpenIDUnitTests(unittest.IsolatedAsyncioTestCase):
+class SteamOpenIDUnitTests(PlatformIsolatedAsyncioTestCase):
     def _settings(self, **overrides: object) -> PlatformSettings:
         values: dict[str, object] = {
             "_env_file": None,
@@ -153,7 +156,7 @@ class SteamOpenIDUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.headers["Retry-After"], "43")
 
 
-class SteamAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class SteamAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-steam-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"

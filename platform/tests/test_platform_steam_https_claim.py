@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import unittest
+from datetime import UTC, datetime
 
 import httpx
 
@@ -11,9 +11,10 @@ from apps.platform_api.app.services.steam_openid import (
     verify_openid_assertion,
 )
 from python_packages.platform_infra.config import PlatformSettings
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class SteamHttpsClaimedIdTests(unittest.IsolatedAsyncioTestCase):
+class SteamHttpsClaimedIdTests(PlatformIsolatedAsyncioTestCase):
     async def test_current_https_claimed_id_is_accepted_and_provider_verified(self) -> None:
         return_to = "https://old-sparky.com/api/v1/auth/steam/callback?state=opaque"
         steam_id = "76561198000000001"

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import Request
@@ -15,9 +15,10 @@ from python_packages.platform_infra.ready_vote_admission import (
     ReadyVoteAdmissionConfig,
     ReadyVoteAdmissionController,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class ReadyVoteAdmissionControllerTests(unittest.IsolatedAsyncioTestCase):
+class ReadyVoteAdmissionControllerTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.controllers: list[ReadyVoteAdmissionController] = []
 
@@ -128,7 +129,7 @@ class ReadyVoteAdmissionControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(recovered.limit, 16)
 
 
-class ReadyVoteAdmissionRouteTests(unittest.IsolatedAsyncioTestCase):
+class ReadyVoteAdmissionRouteTests(PlatformIsolatedAsyncioTestCase):
     async def test_overload_response_does_not_enter_ready_vote_db_scope(self) -> None:
         snapshot = SimpleNamespace(
             state="pressure",

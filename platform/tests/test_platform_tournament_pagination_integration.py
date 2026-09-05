@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import unittest
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import httpx
@@ -13,9 +13,10 @@ from apps.platform_api.app.services.tournament_catalog_read_models import (
 )
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import Tournament, User
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformTournamentPaginationIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class PlatformTournamentPaginationIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-pagination-{uuid4().hex[:8]}"
         self.app = create_app()

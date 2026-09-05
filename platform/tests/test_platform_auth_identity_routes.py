@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import unittest
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from types import SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -13,11 +13,16 @@ from sqlalchemy import delete, select, update
 from apps.platform_api.app.api.routes import auth_identities
 from apps.platform_api.app.main import create_app
 from python_packages.platform_infra.db import dispose_engine, session_factory
-from python_packages.platform_infra.models import ExternalIdentity, User
-from python_packages.platform_infra.models import AuditLog, PasswordCredential
+from python_packages.platform_infra.models import (
+    AuditLog,
+    ExternalIdentity,
+    PasswordCredential,
+    User,
+)
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class AuthIdentityRouteTests(unittest.IsolatedAsyncioTestCase):
+class AuthIdentityRouteTests(PlatformIsolatedAsyncioTestCase):
     def test_steam_unlink_route_is_defined_for_delete(self) -> None:
         route = next(
             (
@@ -83,7 +88,7 @@ class AuthIdentityRouteTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class AuthIdentityIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class AuthIdentityIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-steam-unlink-{uuid4().hex[:8]}"
         self.app = create_app()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from contextlib import AsyncExitStack
 import unittest
+from contextlib import AsyncExitStack
 from uuid import uuid4
 
 import httpx
@@ -15,9 +15,10 @@ from python_packages.platform_infra.models import (
     TournamentParticipant,
     User,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformTournamentInactiveWorkspaceIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class PlatformTournamentInactiveWorkspaceIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-as04-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"

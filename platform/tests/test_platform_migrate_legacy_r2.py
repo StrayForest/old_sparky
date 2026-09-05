@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import unittest
 from collections import Counter
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 from tools import platform_migrate_legacy_r2 as cutover
 from tools import platform_migrate_media as migration
 
@@ -66,7 +67,7 @@ class FakeSettings:
         return copied
 
 
-class LegacyR2CutoverTests(unittest.IsolatedAsyncioTestCase):
+class LegacyR2CutoverTests(PlatformIsolatedAsyncioTestCase):
     def candidate(self, key: str = "avatars/legacy.png") -> migration.LegacyMediaCandidate:
         return migration.build_candidate(
             purpose="profile_avatar",

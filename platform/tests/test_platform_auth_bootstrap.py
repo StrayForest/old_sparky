@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, patch
 
 from apps.platform_api.app.services.auth_bootstrap import build_auth_bootstrap
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class AuthBootstrapServiceTests(unittest.IsolatedAsyncioTestCase):
+class AuthBootstrapServiceTests(PlatformIsolatedAsyncioTestCase):
     async def test_bootstrap_keeps_authority_in_auth_session_and_reads_cached_avatar(self) -> None:
         auth_session = SimpleNamespace(
             user=SimpleNamespace(

@@ -8,9 +8,10 @@ from apps.platform_api.app.api.routes import content
 from apps.platform_api.app.services.external_content_http import (
     BoundedNoRedirectAsyncClient,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformExternalContentSecurityTests(unittest.IsolatedAsyncioTestCase):
+class PlatformExternalContentSecurityTests(PlatformIsolatedAsyncioTestCase):
     async def test_client_refuses_redirect_following(self) -> None:
         requested_urls: list[str] = []
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
-import unittest
 from uuid import uuid4
 
 import httpx
@@ -17,9 +16,10 @@ from python_packages.platform_infra.models import (
     PlayerProfile,
     User,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformProfileWorkspaceTests(unittest.IsolatedAsyncioTestCase):
+class PlatformProfileWorkspaceTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-profile-workspace-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"

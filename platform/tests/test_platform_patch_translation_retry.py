@@ -5,9 +5,10 @@ from unittest.mock import AsyncMock, patch
 
 from apps.platform_api.app.services import patch_translation as translation
 from python_packages.platform_infra.config import PlatformSettings
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PatchTranslationRetryTests(unittest.IsolatedAsyncioTestCase):
+class PatchTranslationRetryTests(PlatformIsolatedAsyncioTestCase):
     async def test_transient_failure_retries_once_with_75_second_budget(self) -> None:
         settings = PlatformSettings(platform_openai_timeout_seconds=30.0)
         first = {

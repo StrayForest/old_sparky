@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import unittest
 from datetime import UTC, datetime
 from types import SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services import tournament_workflow as workflow
 from python_packages.platform_domain.tournaments import TournamentWorkflowError
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformBackendAuditRemediationTests(unittest.IsolatedAsyncioTestCase):
+class PlatformBackendAuditRemediationTests(PlatformIsolatedAsyncioTestCase):
     async def test_published_assignment_is_superseded_before_replacement(self) -> None:
         published = SimpleNamespace(id="old-run", status="published")
         with patch.object(

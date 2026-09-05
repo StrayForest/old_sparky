@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 
 from sqlalchemy.sql import Delete, Select
 
@@ -9,6 +9,7 @@ from python_packages.platform_infra.media.hard_delete import (
     MEDIA_QUERY_CHUNK_SIZE,
     purge_deleted_media_metadata,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _Rows:
@@ -53,7 +54,7 @@ class _ChunkRecordingSession:
         self.flushed = True
 
 
-class PlatformMediaHardDeleteTests(unittest.IsolatedAsyncioTestCase):
+class PlatformMediaHardDeleteTests(PlatformIsolatedAsyncioTestCase):
     async def test_large_owner_scope_stays_below_asyncpg_argument_limit(self) -> None:
         total_rows = MEDIA_QUERY_CHUNK_SIZE * 2 + 1
         session = _ChunkRecordingSession(total_rows)

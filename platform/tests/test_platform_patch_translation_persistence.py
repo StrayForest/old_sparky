@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from apps.platform_api.app.services import patch_translation_runtime as runtime
 from apps.platform_worker import worker
 from python_packages.platform_infra.config import PlatformSettings
 from python_packages.platform_infra.models import PatchTranslation
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _SessionContext:
@@ -77,7 +78,7 @@ def _patch_detail() -> dict[str, object]:
     }
 
 
-class PatchTranslationPersistenceTests(unittest.IsolatedAsyncioTestCase):
+class PatchTranslationPersistenceTests(PlatformIsolatedAsyncioTestCase):
     async def test_database_translation_warms_redis_after_cache_miss(self) -> None:
         patch_detail = _patch_detail()
         segments = runtime.extract_translation_segments(patch_detail)

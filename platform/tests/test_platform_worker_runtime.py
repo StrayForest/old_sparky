@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_worker import worker
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class PlatformWorkerRuntimeTests(unittest.TestCase):
@@ -114,7 +115,7 @@ class PlatformWorkerRuntimeTests(unittest.TestCase):
         self.assertFalse(worker.deadlock_auto_assignment_run.ignore_result)
 
 
-class PlatformAutoAssignmentTaskTests(unittest.IsolatedAsyncioTestCase):
+class PlatformAutoAssignmentTaskTests(PlatformIsolatedAsyncioTestCase):
     async def test_worker_persists_generated_run_and_releases_lock(self) -> None:
         class FakeRedis:
             def __init__(self) -> None:
@@ -194,7 +195,7 @@ class PlatformAutoAssignmentTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error"], "staging closed")
 
 
-class PlatformAutoAssignmentRouteTests(unittest.IsolatedAsyncioTestCase):
+class PlatformAutoAssignmentRouteTests(PlatformIsolatedAsyncioTestCase):
     async def test_async_route_enqueues_the_registered_worker_with_expiry(self) -> None:
         tournament = SimpleNamespace(
             id="tournament-1",
@@ -228,7 +229,7 @@ class PlatformAutoAssignmentRouteTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class PlatformWorkerAutomationLockTests(unittest.IsolatedAsyncioTestCase):
+class PlatformWorkerAutomationLockTests(PlatformIsolatedAsyncioTestCase):
     async def test_tick_runs_and_releases_owned_lock(self) -> None:
         client = Mock()
         client.set = AsyncMock(return_value=True)

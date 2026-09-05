@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from contextlib import AsyncExitStack
-from urllib.parse import parse_qs, urlparse
-from unittest.mock import AsyncMock, patch
 import unittest
+from contextlib import AsyncExitStack
+from unittest.mock import AsyncMock, patch
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import httpx
@@ -21,10 +21,16 @@ from apps.platform_api.app.services.google_oauth import (
 )
 from python_packages.platform_infra.config import PlatformSettings
 from python_packages.platform_infra.db import dispose_engine, session_factory
-from python_packages.platform_infra.models import AuditLog, ExternalIdentity, GoogleAuthFlow, User
+from python_packages.platform_infra.models import (
+    AuditLog,
+    ExternalIdentity,
+    GoogleAuthFlow,
+    User,
+)
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class GoogleOAuthUnitTests(unittest.IsolatedAsyncioTestCase):
+class GoogleOAuthUnitTests(PlatformIsolatedAsyncioTestCase):
     def _settings(self) -> PlatformSettings:
         return PlatformSettings(
             _env_file=None,
@@ -108,7 +114,7 @@ class GoogleOAuthUnitTests(unittest.IsolatedAsyncioTestCase):
                 )
 
 
-class GoogleAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class GoogleAuthIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         # The full backend suite uses one process with a fresh event loop for
         # each IsolatedAsyncioTestCase. Detach any pool left by the preceding

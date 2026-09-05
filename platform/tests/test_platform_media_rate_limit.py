@@ -6,7 +6,10 @@ from unittest.mock import patch
 from fastapi import HTTPException, Request
 
 from python_packages.platform_infra.config import PlatformSettings
-from python_packages.platform_infra.media_rate_limit import check_media_upload_rate_limit
+from python_packages.platform_infra.media_rate_limit import (
+    check_media_upload_rate_limit,
+)
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class FakeRedis:
@@ -41,7 +44,7 @@ def request() -> Request:
     )
 
 
-class PlatformMediaRateLimitTests(unittest.IsolatedAsyncioTestCase):
+class PlatformMediaRateLimitTests(PlatformIsolatedAsyncioTestCase):
     def settings(self, **overrides: object) -> PlatformSettings:
         values: dict[str, object] = {
             "_env_file": None,

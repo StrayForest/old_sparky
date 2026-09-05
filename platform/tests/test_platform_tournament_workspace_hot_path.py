@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -11,9 +11,10 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformTournamentWorkspaceHotPathTests(unittest.IsolatedAsyncioTestCase):
+class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         tournament_routes._public_workspace_snapshot_cache.clear()
 

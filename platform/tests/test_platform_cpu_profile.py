@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import tempfile
-import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from python_packages.platform_infra.cpu_profile import ReadyVoteCpuProfiler
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class ReadyVoteCpuProfilerTests(unittest.IsolatedAsyncioTestCase):
+class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
     async def test_profiler_is_disabled_without_explicit_output_directory(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(ReadyVoteCpuProfiler.from_environment())

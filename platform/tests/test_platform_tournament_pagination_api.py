@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import unittest
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
-import unittest
 
 from sqlalchemy.dialects import postgresql
 from starlette.responses import Response
@@ -27,6 +27,7 @@ from apps.platform_api.app.services.tournament_catalog_cache import (
     PublicTournamentListCacheEntry,
 )
 from python_packages.platform_infra.models import Tournament, TournamentListReadModel
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 def compiled_sql(statement) -> str:
@@ -84,7 +85,7 @@ def tournament_result(row_count: int = 1) -> Mock:
     return result
 
 
-class PlatformTournamentPaginationTests(unittest.IsolatedAsyncioTestCase):
+class PlatformTournamentPaginationTests(PlatformIsolatedAsyncioTestCase):
     def test_pagination_limits_and_headers(self) -> None:
         self.assertEqual(TOURNAMENT_LIST_DEFAULT_LIMIT, 50)
         self.assertEqual(TOURNAMENT_LIST_MAX_LIMIT, 100)

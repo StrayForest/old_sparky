@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import unittest
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, Mock, patch
 
 from pydantic import ValidationError
@@ -15,6 +15,7 @@ from apps.platform_api.app.services.deadlock_automation import (
 )
 from python_packages.platform_infra.config import PlatformSettings
 from python_packages.platform_infra.models import Tournament
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 def compiled_sql(statement) -> str:
@@ -28,7 +29,7 @@ def compiled_sql(statement) -> str:
     )
 
 
-class PlatformDeadlockAutomationSchedulerTests(unittest.IsolatedAsyncioTestCase):
+class PlatformDeadlockAutomationSchedulerTests(PlatformIsolatedAsyncioTestCase):
     def test_cohort_query_is_due_only_fifo_bounded_and_excludes_finished_rows(self) -> None:
         now = datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
 

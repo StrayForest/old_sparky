@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 import json
-from types import SimpleNamespace
 import unittest
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
 from fastapi import HTTPException
 
 from apps.platform_api.app.api.routes import tournaments as tournament_routes
-from apps.platform_api.app.services import profile_read_models, tournament_profile_access
+from apps.platform_api.app.services import (
+    profile_read_models,
+    tournament_profile_access,
+)
 from apps.platform_api.app.services.tournament_profile_access import (
     TournamentProfilePipelineResult,
 )
 from python_packages.platform_infra.media.r2_storage import R2Storage
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _Row(tuple):
@@ -143,7 +147,7 @@ class _SingleflightRedis:
         self.closed = True
 
 
-class ProfileReadModelTests(unittest.IsolatedAsyncioTestCase):
+class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
     @staticmethod
     def _auth_session() -> SimpleNamespace:
         return SimpleNamespace(

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from sqlalchemy.dialects import postgresql
 
-from apps.platform_api.app.services import tournament_catalog_read_models as catalog_models
+from apps.platform_api.app.services import (
+    tournament_catalog_read_models as catalog_models,
+)
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class TournamentCatalogReadModelTests(unittest.IsolatedAsyncioTestCase):
+class TournamentCatalogReadModelTests(PlatformIsolatedAsyncioTestCase):
     async def test_upsert_statement_contains_authoritative_bounded_aggregates(self) -> None:
         db_session = Mock()
         db_session.execute = AsyncMock(return_value=SimpleNamespace(rowcount=1))

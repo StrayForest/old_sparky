@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from apps.platform_api.app.services import home_content
-from apps.platform_api.app.services import patch_detail_security
+from apps.platform_api.app.services import home_content, patch_detail_security
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _Pipeline:
@@ -55,7 +55,7 @@ class _Cache:
         return None
 
 
-class PlatformPatchMissSecurityTests(unittest.IsolatedAsyncioTestCase):
+class PlatformPatchMissSecurityTests(PlatformIsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         tasks = list(patch_detail_security._BACKGROUND_REFRESH_TASKS)
         if tasks:

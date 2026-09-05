@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from contextlib import AsyncExitStack
 import unittest
+from contextlib import AsyncExitStack
 from uuid import uuid4
 
 import httpx
@@ -15,10 +15,11 @@ from python_packages.platform_infra.models import (
     TournamentParticipant,
     User,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class PlatformTournamentParticipantExclusionIntegrationTests(
-    unittest.IsolatedAsyncioTestCase
+    PlatformIsolatedAsyncioTestCase
 ):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-exclude-{uuid4().hex[:8]}"

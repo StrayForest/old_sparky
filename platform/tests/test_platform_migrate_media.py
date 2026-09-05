@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import os
+import unittest
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -18,7 +18,10 @@ from python_packages.platform_infra.media.r2_storage import (
     IMMUTABLE_CACHE_CONTROL,
     StoredObjectMetadata,
 )
-from python_packages.platform_infra.media.service import MediaService, MediaServicePolicy
+from python_packages.platform_infra.media.service import (
+    MediaService,
+    MediaServicePolicy,
+)
 from python_packages.platform_infra.media.source_store import MediaSourceStore
 from python_packages.platform_infra.models import (
     AuditLog,
@@ -26,8 +29,8 @@ from python_packages.platform_infra.models import (
     PlayerProfile,
     User,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 from tools import platform_migrate_media as migration
-
 
 TINY_PNG = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
@@ -89,7 +92,7 @@ def migration_settings(upload_root: Path) -> PlatformSettings:
     )
 
 
-class PlatformMediaMigrationUnitTests(unittest.IsolatedAsyncioTestCase):
+class PlatformMediaMigrationUnitTests(PlatformIsolatedAsyncioTestCase):
     def test_env_file_must_be_private_and_loads_without_printing_values(self) -> None:
         with TemporaryDirectory() as directory:
             env_file = Path(directory) / ".env.platform"
@@ -257,7 +260,7 @@ class PlatformMediaMigrationUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(grace.exception.code, "cleanup_grace_not_elapsed")
 
 
-class PlatformMediaMigrationIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class PlatformMediaMigrationIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.user_id = str(uuid4())
         self.temporary = TemporaryDirectory()

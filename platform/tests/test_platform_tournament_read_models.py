@@ -4,10 +4,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, patch
 
-from redis.exceptions import ConnectionError as RedisConnectionError
 from pydantic import BaseModel
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from apps.platform_api.app.services import tournament_read_models as read_models
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _FakeRedis:
@@ -46,7 +47,7 @@ class _FakeRedis:
         self.closed = True
 
 
-class TournamentReadModelTests(unittest.IsolatedAsyncioTestCase):
+class TournamentReadModelTests(PlatformIsolatedAsyncioTestCase):
     def test_serializes_pydantic_lists_as_json_objects(self) -> None:
         class Team(BaseModel):
             id: str

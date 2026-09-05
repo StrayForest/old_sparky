@@ -7,6 +7,7 @@ from fastapi import HTTPException, Request
 
 from python_packages.platform_infra.config import PlatformSettings
 from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class FakeRedis:
@@ -38,7 +39,7 @@ def request() -> Request:
     )
 
 
-class PlatformInviteRateLimitTests(unittest.IsolatedAsyncioTestCase):
+class PlatformInviteRateLimitTests(PlatformIsolatedAsyncioTestCase):
     def settings(self, **overrides: object) -> PlatformSettings:
         values: dict[str, object] = {
             "_env_file": None,

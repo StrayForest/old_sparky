@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import unittest
 from datetime import UTC, datetime
 from types import SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, patch
 
 from apps.platform_api.app.api.schemas import UserResponse
@@ -14,9 +14,10 @@ from apps.platform_api.app.services.user_account_read_models import (
     get_or_build_user_account_read_model,
     user_account_read_model_key,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class UserAccountReadModelTests(unittest.IsolatedAsyncioTestCase):
+class UserAccountReadModelTests(PlatformIsolatedAsyncioTestCase):
     def test_serializer_keeps_auth_fields_outside_cached_account_payload(self) -> None:
         user = SimpleNamespace(
             id="user-1",

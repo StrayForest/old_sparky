@@ -8,6 +8,7 @@ from python_packages.platform_infra.media.service import (
     MediaProcessResult,
     MediaReconciliationResult,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class AsyncSessionContext:
@@ -39,7 +40,7 @@ class PlatformMediaWorkerConfigurationTests(unittest.TestCase):
         self.assertEqual(worker.media_process_asset.time_limit, 120)
 
 
-class PlatformMediaWorkerLockTests(unittest.IsolatedAsyncioTestCase):
+class PlatformMediaWorkerLockTests(PlatformIsolatedAsyncioTestCase):
     @staticmethod
     def _redis_client(*, acquired: bool) -> Mock:
         client = Mock()

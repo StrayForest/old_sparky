@@ -7,6 +7,7 @@ from unittest.mock import patch
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from apps.platform_api.app.services import tournament_catalog_cache as catalog_cache
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _FakeRedis:
@@ -30,7 +31,7 @@ class _FakeRedis:
         self.closed = True
 
 
-class TournamentCatalogCacheTests(unittest.IsolatedAsyncioTestCase):
+class TournamentCatalogCacheTests(PlatformIsolatedAsyncioTestCase):
     @staticmethod
     def _key(**overrides: object) -> str:
         values: dict[str, object] = {

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import unittest
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock, patch
 
 from apps.platform_api.app.services import home_content_runtime
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _Response:
@@ -68,7 +69,7 @@ def _lockup_page(*videos: tuple[str, str, str]) -> bytes:
     ).encode("utf-8")
 
 
-class PlatformHomeContentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+class PlatformHomeContentRuntimeTests(PlatformIsolatedAsyncioTestCase):
     def test_legacy_video_renderer_parser_preserves_channel_order(self) -> None:
         page = """<script>var ytInitialData={"contents":[
           {"videoRenderer":{"videoId":"fresh123456","title":{"runs":[{"text":"Fresh video"}]},"publishedTimeText":{"simpleText":"2 hours ago"}}},

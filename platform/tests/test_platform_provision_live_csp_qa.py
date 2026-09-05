@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
 import json
 import os
-from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -28,6 +28,7 @@ from python_packages.platform_infra.models import (
     UserRole,
     UserSession,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 from tools import platform_cleanup_live_user_qa as cleanup_tool
 from tools import platform_provision_live_csp_qa as provisioner
 
@@ -389,7 +390,7 @@ class LiveCspQaProvisionerUnitTests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.geteuid() == 0, "root-owned bundle contract requires root")
-class LiveCspQaProvisionerIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class LiveCspQaProvisionerIntegrationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         settings = get_settings()
         if (

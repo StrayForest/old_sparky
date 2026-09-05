@@ -4,15 +4,14 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
 from sqlalchemy import delete, select, update
 
-from apps.platform_api.app.main import create_app
 from apps.platform_api.app.api.routes import profiles as profile_routes
+from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services import media as media_service_helpers
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
@@ -27,9 +26,10 @@ from python_packages.platform_infra.models import (
     UserSession,
     new_uuid,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformProfilesApiTests(unittest.IsolatedAsyncioTestCase):
+class PlatformProfilesApiTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-profile-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"

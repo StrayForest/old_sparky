@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import unittest
 from email.message import EmailMessage
 from unittest.mock import patch
-import unittest
 
 from apps.platform_api.app.services import support_mail
 from python_packages.platform_infra.auth_lifecycle import email_delivery_configured
 from python_packages.platform_infra.config import PlatformSettings
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _Response:
@@ -38,7 +39,7 @@ class _ResendClient:
         return _Response()
 
 
-class PlatformEmailDeliveryTests(unittest.IsolatedAsyncioTestCase):
+class PlatformEmailDeliveryTests(PlatformIsolatedAsyncioTestCase):
     async def test_resend_delivery_uses_official_https_endpoint(self) -> None:
         settings = PlatformSettings(
             _env_file=None,

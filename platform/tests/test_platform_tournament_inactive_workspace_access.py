@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from fastapi import HTTPException
@@ -12,6 +12,7 @@ from apps.platform_api.app.services.tournament_workspace_access import (
     ensure_private_tournament_read_membership_is_active,
     private_tournament_child_slug_from_request,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _ExecuteResult:
@@ -73,7 +74,7 @@ def _db_session(row):
     return SimpleNamespace(execute=AsyncMock(return_value=_ExecuteResult(row)))
 
 
-class PlatformTournamentInactiveWorkspaceAccessTests(unittest.IsolatedAsyncioTestCase):
+class PlatformTournamentInactiveWorkspaceAccessTests(PlatformIsolatedAsyncioTestCase):
     def test_child_route_detection_uses_matched_route_not_suffix_allowlist(self) -> None:
         route_cases = (
             ("workspace", None),

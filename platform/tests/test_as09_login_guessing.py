@@ -7,12 +7,13 @@ from fastapi import HTTPException, Request
 
 from python_packages.platform_infra import auth_rate_limit
 from python_packages.platform_infra.auth_rate_limit import (
-    check_password_reset_rate_limit,
     check_login_rate_limit,
+    check_password_reset_rate_limit,
     clear_login_failures,
     record_login_failure,
 )
 from python_packages.platform_infra.config import PlatformSettings
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _FakeRedis:
@@ -65,7 +66,7 @@ class _FakeRedis:
         return None
 
 
-class DistributedLoginGuessingTests(unittest.IsolatedAsyncioTestCase):
+class DistributedLoginGuessingTests(PlatformIsolatedAsyncioTestCase):
     def _settings(self, **overrides: object) -> PlatformSettings:
         values: dict[str, object] = {
             "_env_file": None,

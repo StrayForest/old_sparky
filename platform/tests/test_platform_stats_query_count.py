@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, Mock
-import unittest
 
 from apps.platform_api.app.api.routes.stats import stats_overview
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformStatsQueryCountTests(unittest.IsolatedAsyncioTestCase):
+class PlatformStatsQueryCountTests(PlatformIsolatedAsyncioTestCase):
     async def test_stats_overview_uses_two_database_round_trips(self) -> None:
         metric_result = Mock()
         metric_result.mappings.return_value.one.return_value = {

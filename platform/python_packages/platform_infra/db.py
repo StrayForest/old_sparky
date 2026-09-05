@@ -98,6 +98,17 @@ def postgres_application_name() -> str:
 def engine() -> AsyncEngine:
     global _engine, _engine_loop, _session_factory
 
+    if _engine is not None and _engine_loop is not None:
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is not None and current_loop is not _engine_loop:
+            raise RuntimeError(
+                "Database engine belongs to another event loop; "
+                "dispose it on its owning loop before reuse."
+            )
+
     if _engine is None:
         settings = get_settings()
         validate_platform_settings(settings)
@@ -164,19 +175,20 @@ async def dispose_engine() -> None:
 
     current_engine = _engine
     created_on_loop = _engine_loop
-    _engine = None
-    _engine_loop = None
-    _session_factory = None
-    if current_engine is not None:
-        current_loop = asyncio.get_running_loop()
-        # IsolatedAsyncioTestCase creates a new loop for each test. An
-        # asyncpg connection belonging to a closed/other loop cannot be
-        # awaited during normal pool disposal; detach that pool instead of
-        # emitting a cross-loop close error. Same-loop application shutdown
-        # retains the normal close semantics.
-        await current_engine.dispose(
-            close=created_on_loop is None or created_on_loop is current_loop
+    if current_engine is None:
+        return
+
+    current_loop = asyncio.get_running_loop()
+    if created_on_loop is not None and created_on_loop is not current_loop:
+        raise RuntimeError(
+            "Database engine must be disposed on the event loop that created it."
         )
+
+    await current_engine.dispose()
+    if _engine is current_engine:
+        _engine = None
+        _engine_loop = None
+        _session_factory = None
 
 
 async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:

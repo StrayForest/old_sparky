@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import unittest
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
-import unittest
 from uuid import uuid4
 
 import httpx
@@ -16,9 +16,10 @@ from python_packages.platform_infra.db import (
     session_factory,
 )
 from python_packages.platform_infra.models import AuditLog, Tournament, User
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class AS11WorkerErrorSanitizationTests(unittest.IsolatedAsyncioTestCase):
+class AS11WorkerErrorSanitizationTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-as11-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"

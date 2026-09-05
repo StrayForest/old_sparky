@@ -4,7 +4,6 @@ import asyncio
 from contextlib import AsyncExitStack
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
-import unittest
 from typing import Any
 from unittest.mock import patch
 from uuid import uuid4
@@ -13,13 +12,17 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy import delete, event, func, select, update
 
+from apps.platform_api.app.api.routes import tournaments as tournament_routes
+from apps.platform_api.app.main import create_app
+from apps.platform_api.app.services.deadlock_automation import (
+    advance_deadlock_tournament_automation,
+)
+from apps.platform_api.app.services.profile_read_models import (
+    refresh_profile_read_model,
+)
 from apps.platform_api.app.services.tournament_workflow import (
     generate_deadlock_auto_assignment_run_for_tournament,
 )
-from apps.platform_api.app.api.routes import tournaments as tournament_routes
-from apps.platform_api.app.main import create_app
-from apps.platform_api.app.services.deadlock_automation import advance_deadlock_tournament_automation
-from apps.platform_api.app.services.profile_read_models import refresh_profile_read_model
 from python_packages.platform_infra import performance
 from python_packages.platform_infra.config import get_settings
 from python_packages.platform_infra.csrf import csrf_cookie_name, generate_csrf_token
@@ -34,13 +37,14 @@ from python_packages.platform_infra.models import (
     TournamentDeadlockReadyVote,
     TournamentDeadlockReadyVoteCountShard,
     TournamentParticipant,
-    UserSession,
     User,
+    UserSession,
 )
 from python_packages.platform_infra.security import session_token_digest
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformDeadlockApiFlowTests(unittest.IsolatedAsyncioTestCase):
+class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-deadlock-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"

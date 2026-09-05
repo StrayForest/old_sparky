@@ -6,13 +6,16 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch, sentinel
 
 from python_packages.platform_infra import db
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class PlatformDatabaseConfigurationTests(unittest.TestCase):
     def test_engine_pre_pings_connections_before_checkout(self) -> None:
         previous_engine = db._engine
+        previous_engine_loop = db._engine_loop
         previous_session_factory = db._session_factory
         db._engine = None
+        db._engine_loop = None
         db._session_factory = None
         settings = Mock(
             platform_database_url="postgresql+asyncpg://platform_user@127.0.0.1/platformdb",
@@ -63,6 +66,7 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
             )
         finally:
             db._engine = previous_engine
+            db._engine_loop = previous_engine_loop
             db._session_factory = previous_session_factory
 
     def test_postgres_application_name_follows_runtime_service(self) -> None:
@@ -79,8 +83,8 @@ class PlatformDatabaseConfigurationTests(unittest.TestCase):
                 self.assertEqual(db.postgres_application_name(), expected)
 
 
-class PlatformDatabaseLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_dispose_detaches_engine_created_on_another_event_loop(self) -> None:
+class PlatformDatabaseLifecycleTests(PlatformIsolatedAsyncioTestCase):
+    async def test_dispose_rejects_engine_created_on_another_event_loop(self) -> None:
         previous_engine = db._engine
         previous_engine_loop = db._engine_loop
         previous_session_factory = db._session_factory
@@ -92,11 +96,35 @@ class PlatformDatabaseLifecycleTests(unittest.IsolatedAsyncioTestCase):
         db._session_factory = None
 
         try:
-            await db.dispose_engine()
+            with self.assertRaisesRegex(RuntimeError, "event loop that created it"):
+                await db.dispose_engine()
+            self.assertIs(db._engine, fake_engine)
         finally:
             old_loop.close()
             db._engine = previous_engine
             db._engine_loop = previous_engine_loop
             db._session_factory = previous_session_factory
 
-        fake_engine.dispose.assert_awaited_once_with(close=False)
+        fake_engine.dispose.assert_not_awaited()
+
+    async def test_dispose_closes_engine_on_its_owning_event_loop(self) -> None:
+        previous_engine = db._engine
+        previous_engine_loop = db._engine_loop
+        previous_session_factory = db._session_factory
+        fake_engine = Mock()
+        fake_engine.dispose = AsyncMock()
+        db._engine = fake_engine
+        db._engine_loop = asyncio.get_running_loop()
+        db._session_factory = Mock()
+
+        try:
+            await db.dispose_engine()
+            self.assertIsNone(db._engine)
+            self.assertIsNone(db._engine_loop)
+            self.assertIsNone(db._session_factory)
+        finally:
+            db._engine = previous_engine
+            db._engine_loop = previous_engine_loop
+            db._session_factory = previous_session_factory
+
+        fake_engine.dispose.assert_awaited_once_with()

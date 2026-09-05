@@ -2,14 +2,15 @@ from __future__ import annotations
 
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
-import unittest
 from uuid import uuid4
 
 import httpx
 from sqlalchemy import delete, or_, select
 
 from apps.platform_api.app.main import create_app
-from apps.platform_api.app.services.tournament_teams import materialize_assignment_run_teams
+from apps.platform_api.app.services.tournament_teams import (
+    materialize_assignment_run_teams,
+)
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import (
     AuditLog,
@@ -25,9 +26,10 @@ from python_packages.platform_infra.models import (
     User,
     UserRole,
 )
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformAdminRosterApiTests(unittest.IsolatedAsyncioTestCase):
+class PlatformAdminRosterApiTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-admin-roster-{uuid4().hex[:8]}"
         self.password = "integration-pass-123"

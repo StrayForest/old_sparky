@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import unittest
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
-import unittest
 from uuid import uuid4
 
 import httpx
@@ -11,9 +11,10 @@ from sqlalchemy import delete, select
 from apps.platform_api.app.main import create_app
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.models import AuditLog, User
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
-class PlatformAuditApiTests(unittest.IsolatedAsyncioTestCase):
+class PlatformAuditApiTests(PlatformIsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = f"it-audit-{uuid4().hex[:8]}"
         self.app = create_app()

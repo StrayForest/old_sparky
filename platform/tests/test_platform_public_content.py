@@ -17,6 +17,7 @@ from apps.platform_api.app.api.schemas import (
 )
 from apps.platform_api.app.services import home_content
 from python_packages.platform_infra.config import PlatformSettings
+from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
 
 
 class _Response:
@@ -75,7 +76,7 @@ class _Cache:
         return None
 
 
-class PlatformPublicContentTests(unittest.IsolatedAsyncioTestCase):
+class PlatformPublicContentTests(PlatformIsolatedAsyncioTestCase):
     async def test_game_assets_uses_etag_and_returns_not_modified_without_body(self) -> None:
         catalog = {
             "heroes": {"abrams": {"name": "Abrams"}},
