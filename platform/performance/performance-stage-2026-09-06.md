@@ -48,6 +48,17 @@ a proved origin, database, Redis, socket, deployment, or Cloudflare cause.
 This remains an unexplained transient production anomaly; no external cause is
 asserted.
 
+### Targeted-run setup failure
+
+The attempted auth targeted run `34020346471` is not a performance sample. Its
+fixture supervisor stopped before creating the barrier because production was
+still released at `9f48eadf`, while the workflow target was the later doc-only
+SHA `12263cf7`. The exact cleanup guard reported the same active-release SHA
+mismatch. The supervisor checks the release before creating its run root or
+fixture inventory, and the artifacts contain no manifest, client report, or
+ready marker. This is recorded as a workflow setup failure; the auth profile
+must be rerun only against a deployed exact SHA.
+
 ## Runtime baseline
 
 The reviewed public baseline and deployment/runbook records show:
@@ -149,6 +160,7 @@ Every optimization must add one row here before targeted retest.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | D1 | Auth/read attribution incomplete | Canonical run has no SSR stage or CPU call-stack data | SSR diagnostic and read cProfile on unchanged source | Attribute web upstream and Python CPU time | Temporary diagnostic overhead; no persistent profiler | Same authenticated/read profiles; restore baseline after each | SSR evidence captured in `34015185444`; cProfile evidence captured in `34016833739`; runtime restored by `34018104403` |
 | D2 | Read-mix API workers spend CPU scanning the optional-auth cache | cProfile run `34016833739` attributes about 24–25 seconds per worker profile to `_trim_optional_auth_session_cache`, a full dict scan on every cache insert; API CPU was ~99% while PostgreSQL CPU averaged 14.85% and DB connections stayed below the 52-connection safety ceiling | Sweep expired optional-auth entries at most every 5 seconds; retain per-entry expiry/status validation and the existing oldest-entry capacity eviction | Remove repeated O(n) cache scans, reducing Python CPU per authenticated read and potentially raising useful read throughput without changing workers, pools, auth semantics, or load thresholds | Expired untouched entries remain resident until the next sweep (bounded by 5s); cache remains capacity-bounded; invalidate paths are unchanged | New cache unit test; backend/security/quality gates; exact `read-mix-stress-v2` targeted A/B on the same contract; restore normal runtime after diagnostics | Accepted: run `34019227166` on `9f48eadf` returned 20,000×200 + 10,000×304 with 0 errors/unexpected; combined p95 `1697.138→1596.691 ms` (−5.9%), TTFB p95 `1694.728→1596.526 ms` (−5.8%), p99 `2032.400→1930.282 ms` (−5.0%), useful rate `109.349→113.622/s` (+3.9%); CPU remained ~98%/core, so further CPU work is required |
+| D3 | v3 and anomaly reports do not expose API-side Nginx status/timing distributions | Existing observer retained only HTML Nginx aggregates; v3 exposed client timeouts but its Nginx API path was not available for correlation | Add bounded API Nginx aggregation by safe route class, method, status, request/upstream timing, and `cf_ray` presence; never serialize URI or request IDs | Identify whether unexpected v3/anomaly outcomes reached Nginx/API and where time was spent, without changing application behavior | Report schema changes; route classes are intentionally coarse; observer still samples the log window | Unit test for route-class/status/timing redaction; local observer/parser gates; deploy exact SHA; rerun v3 and correlate artifacts | Pending |
 
 ## Required next sequence
 

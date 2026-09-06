@@ -2088,6 +2088,40 @@ def _nginx_html_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return selected
 
 
+def _nginx_api_route(record: dict[str, Any]) -> str | None:
+    """Return a safe route class without retaining a user-controlled path."""
+
+    path = str(record.get("uri") or "").split("?", 1)[0]
+    if path == "/api/v1/auth/bootstrap":
+        return "auth_bootstrap"
+    if path == "/api/v1/users/me":
+        return "users_me"
+    if path == "/api/v1/tournaments":
+        return "tournaments_collection"
+    if re.fullmatch(r"/api/v1/tournaments/[^/]+/deadlock/ready-check/vote", path):
+        return "ready_vote"
+    if re.fullmatch(r"/api/v1/tournaments/[^/]+", path):
+        return "tournament_detail"
+    if path.startswith("/api/v1/"):
+        return "other_api"
+    return None
+
+
+def _nginx_api_records(records: list[dict[str, Any]]) -> list[tuple[str, str, int, dict[str, Any]]]:
+    selected: list[tuple[str, str, int, dict[str, Any]]] = []
+    for record in records:
+        route = _nginx_api_route(record)
+        if route is None:
+            continue
+        try:
+            status = int(record.get("status") or 0)
+        except (TypeError, ValueError):
+            continue
+        method = str(record.get("method") or "").upper() or "-"
+        selected.append((route, method, status, record))
+    return selected
+
+
 def summarize_ssr_observability(
     web_journal_lines: list[str],
     nginx_records: list[dict[str, Any]],
@@ -2116,6 +2150,7 @@ def summarize_ssr_observability(
         by_request[request_id][stage].append(float(duration))
 
     html_records = _nginx_html_records(nginx_records)
+    api_records = _nginx_api_records(nginx_records)
     correlated_rows: list[dict[str, Any]] = []
     for record in html_records:
         request_id = str(record.get("request_id") or "")
@@ -2143,11 +2178,33 @@ def summarize_ssr_observability(
         stage: sum(1 for row in correlated_rows if stage in row)
         for stage in sorted(by_stage)
     }
+
+    api_groups: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    for route, method, status, record in api_records:
+        api_groups[f"{method} {route}"].append((status, record))
+
+    def api_group_summary(rows: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
+        return {
+            "requests": len(rows),
+            "statuses": dict(sorted(Counter(str(status) for status, _record in rows).items())),
+            "request_time_ms": metric_stats(
+                [value for _status, record in rows if (value := _nginx_seconds(record.get("request_time"))) is not None]
+            ),
+            "upstream_time_ms": metric_stats(
+                [value for _status, record in rows if (value := _nginx_seconds(record.get("upstream_time"))) is not None]
+            ),
+            "cf_ray_present": sum(
+                1
+                for _status, record in rows
+                if str(record.get("cf_ray") or "").strip() not in {"", "-"}
+            ),
+        }
+
     return {
         "scope": {
             "kind": "diagnostic_sample",
             "stage_population": "sampled_ssr_requests",
-            "nginx_population": "all_authenticated_tournament_html_200_records_in_window",
+            "nginx_population": "all_selected_html_and_api_records_in_window",
         },
         "event_loop": {
             "samples": len(event_loop_rows),
@@ -2174,6 +2231,14 @@ def summarize_ssr_observability(
             "upstream_time_ms": metric_stats(
                 [value for record in html_records if (value := _nginx_seconds(record.get("upstream_time"))) is not None]
             ),
+        },
+        "nginx_api": {
+            "requests": len(api_records),
+            "route_classes": len(api_groups),
+            "by_method_route": {
+                key: api_group_summary(rows)
+                for key, rows in sorted(api_groups.items())
+            },
         },
         "correlated_html": {
             "requests": len(correlated_rows),

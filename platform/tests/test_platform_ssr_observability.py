@@ -108,6 +108,52 @@ class SsrObservabilityTests(unittest.TestCase):
 
         self.assertEqual(summary["nginx_html"]["request_time_ms"]["p50_ms"], 1250.0)
 
+    def test_nginx_api_summary_uses_safe_route_classes_and_statuses(self) -> None:
+        summary = summarize_ssr_observability(
+            [],
+            [
+                {
+                    "request_id": "request-secret",
+                    "cf_ray": "ray-secret",
+                    "method": "GET",
+                    "uri": "/api/v1/auth/bootstrap?token=secret",
+                    "status": 200,
+                    "request_time": "0.800",
+                    "upstream_time": "0.700",
+                },
+                {
+                    "request_id": "request-secret-2",
+                    "cf_ray": "-",
+                    "method": "POST",
+                    "uri": "/api/v1/tournaments/private-fixture/deadlock/ready-check/vote",
+                    "status": 503,
+                    "request_time": "0.010",
+                    "upstream_time": "0.009",
+                },
+                {
+                    "method": "POST",
+                    "uri": "/api/v1/tournaments/private-fixture/deadlock/ready-check/vote",
+                    "status": 522,
+                    "request_time": "30.000",
+                    "upstream_time": "30.000",
+                },
+            ],
+        )
+
+        api = summary["nginx_api"]
+        self.assertEqual(api["requests"], 3)
+        self.assertEqual(
+            api["by_method_route"]["GET auth_bootstrap"]["request_time_ms"]["p50_ms"],
+            800.0,
+        )
+        vote = api["by_method_route"]["POST ready_vote"]
+        self.assertEqual(vote["statuses"], {"503": 1, "522": 1})
+        self.assertEqual(vote["request_time_ms"]["p99_ms"], 29700.1)
+        self.assertEqual(vote["cf_ray_present"], 0)
+        serialized = json.dumps(summary)
+        self.assertNotIn("private-fixture", serialized)
+        self.assertNotIn("request-secret", serialized)
+
 
 if __name__ == "__main__":
     unittest.main()

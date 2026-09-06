@@ -432,11 +432,12 @@ async def async_main() -> int:
         "measurement_scope": {
             "http_client": "external_load_runner_report",
             "server_request_perf_logs": "diagnostic_sample",
-            "server_ssr_observability": "diagnostic_sample_plus_nginx_html_window",
+            "server_ssr_observability": "diagnostic_sample_plus_nginx_html_and_api_window",
             "note": (
                 "The observer contains sampled API/SSR journal timings plus the "
-                "bounded Nginx HTML timing window; full-population HTTP latency "
-                "is in the external load runner report."
+                "bounded Nginx HTML/API timing window; full-population HTTP latency "
+                "is in the external load runner report. API paths are emitted only "
+                "as safe route classes."
             ),
         },
         "server_request_perf_logs": summarize_request_perf_logs(
