@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { cookies, headers } from "next/headers";
 import { connection } from "next/server";
-import type { ReactNode } from "react";
+import { Suspense, type ReactNode } from "react";
 import { AuthProvider } from "@/components/auth/auth-provider";
 import { I18nProvider } from "@/components/i18n-provider";
 import { SiteFooter } from "@/components/layout/site-footer";
@@ -56,7 +56,9 @@ export default async function RootLayout({
           <AuthProvider initialStatus={initialAuth.status} initialUser={initialAuth.user}>
             <I18nProvider>
               <SiteHeader />
-              {children}
+              <Suspense fallback={<div className="page-noise" aria-hidden="true" />}>
+                {children}
+              </Suspense>
               <SiteFooter />
             </I18nProvider>
           </AuthProvider>

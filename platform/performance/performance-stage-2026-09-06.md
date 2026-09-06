@@ -171,6 +171,30 @@ p95 451.727 ms), while API CPU averaged 97% per core, PostgreSQL averaged
 Next/HTML streaming/render boundary in addition to the API/pool contention;
 it does not prove Cloudflare as the cause.
 
+The first exact retest of the combined D6/D7 implementation, `34034944141`,
+ran on SHA `258b94a7` with the unchanged authenticated-page contract. It
+returned 20,000/20,000 HTTP 200 responses, zero errors/unexpected statuses,
+and exact cleanup removed 20,000 users and 40 tournaments while preserving the
+control account. Client total p95/p99 were 3,093.472/3,694.199 ms and TTFB
+p95/p99 were 2,413.060/2,937.894 ms. Against the canonical baseline, total
+p95 improved `3,744.723→3,093.472` (−17.4%) and TTFB p95 improved
+`3,158.586→2,413.060` (−23.6%), but the requested TTFB target below 1,000 ms
+remains unmet. The full population completed in 649.255 s with no client
+timeouts or 520/522 responses.
+
+Server request evidence recorded `/bootstrap` at 5,577 sampled requests,
+2.0 SQL/request, request p95 1,174.146 ms, DB p95 488.311 ms, pool checkout
+p95 736.178 ms, and non-SQL p95 919.846 ms. The workspace route recorded
+5,650 requests, 3.008 SQL/request, request p95 1,289.647 ms, pool checkout
+p95 779.463 ms, and non-SQL p95 962.283 ms. The lower workspace SQL count is
+consistent with D7's dependency reuse, but D6 and D7 were both present in
+this first exact retest, so this run is a combined result rather than an
+isolated attribution for either change. API CPU remained saturated at about
+96.6% per core; PostgreSQL averaged 12.53% CPU, reached 52 connections, had
+zero lock waiters and at most one waiting backend. This confirms material
+application CPU/pool contention remains, with the post-data Next/HTML boundary
+still preventing the sub-second TTFB target.
+
 ### Read ceiling
 
 The read stress origin summary reports CPU per core averaging about 98.6%,
@@ -192,6 +216,26 @@ The evidence supports an API/Python CPU knee around c48, with useful
 throughput flat at approximately 105–107 requests/s. Pool checkout p95 in the
 ramp was 225.945 ms and PostgreSQL lock waits were absent; increasing the pool
 or concurrency is therefore not a justified first change.
+
+The final D6+D7 targeted ramp retest, `34039365807`, used the unchanged
+`read-mix-concurrency-ramp-v1` contract on SHA `01e170ac`. It completed all
+170,000 requests with 160,000×200 and 10,000×304, zero errors/unexpected
+statuses, and exact cleanup removed 20,000 users and 40 tournaments. Overall
+p95/p99 were 1,272.385/1,644.253 ms versus the baseline
+1,390.286/1,866.793 ms (−8.5%/−11.9%); overall useful rate rose from
+90.009/s to 108.703/s (+20.8%). Every concurrency stage completed without a
+timeout: c16/c32/c48/c64/c80/c96/c112/c128 delivered 78.446/108.867/113.303/
+119.753/117.053/113.670/111.449/114.973 requests/s. The new knee is therefore
+materially above the old ~105–107/s ceiling, with the best observed stage at
+119.753/s; c128 remained useful rather than producing the old timeout shape.
+
+Origin safety remained within contract: CPU averaged about 95.5% per core,
+PostgreSQL 23.25% CPU, maximum PostgreSQL connections 51, maximum waiting
+backends 3, and zero lock waiters. Server request evidence showed 3.289
+SQL/request overall, pool-checkout p95 195.649 ms, and workspace
+`3.013` SQL/request with `workspace_auth` p95 139.893 ms. This supports a
+real read-path improvement from D2/D7 and confirms that pool expansion is not
+needed to claim the gain.
 
 ### Saturation v3
 
@@ -218,6 +262,33 @@ historical path. The historical v3 failure remains an unexplained transient
 production anomaly; no Cloudflare, Nginx, origin, database, or socket cause is
 asserted.
 
+The final targeted v3 retest, `34041927271`, used the unchanged contract on
+SHA `01e170ac`. It completed all 13,500 logical actions with 13,304 final
+successes and 196 expected controlled failures, 15,821 HTTP attempts, zero
+unexpected statuses, zero client timeouts, and zero 520/522 responses. The
+four stages produced 100.108/105.302/110.324/113.495 successful actions/s at
+offered rates 105/110/115/120; final failure rates were 0.127%/2.485%/
+0.696%/2.389%. The run passed the unchanged stress contract. Origin evidence
+showed API CPU averaging 78.58%/79.93% per core, PostgreSQL averaging 29.29%,
+51 connections, at most 2 waiting backends and at most 1 lock waiter. Exact
+cleanup removed 20,000 users and 40 tournaments, leaving all retained-load
+tables empty apart from the control account. This closes the current v3
+timeout/522 regression gate, but does not retroactively explain the historical
+v3 failure; it remains an unexplained transient episode.
+
+### Ready Vote SLO regression
+
+The final SHA `01e170ac` passed the unchanged `ready-vote-slo-v2` targeted
+regression as run `34041777713`. The run completed 500 primary and 100
+duplicate actions with 601/601 HTTP 200 responses, zero errors/unexpected
+statuses, zero shedding and zero retries. Primary accepted-request p95/p99
+were 189.882/437.086 ms; logical p95/p99 were 190.052/437.236 ms. Against
+the canonical baseline (accepted p95/p99 192.028/424.893 ms), p95 improved by
+1.1% while p99 increased by 2.9%, remaining within the 1,000 ms contract and
+without a correctness regression. Exact cleanup deleted 500 users and one
+tournament and left users, tournaments, sessions and audit logs at zero apart
+from the control account.
+
 ### DB, pool, and cache conclusion
 
 The current measurements do not prove PostgreSQL or Redis as the read ceiling:
@@ -238,8 +309,9 @@ Every optimization must add one row here before targeted retest.
 | D3 | v3 and anomaly reports do not expose API-side Nginx status/timing distributions | Existing observer retained only HTML Nginx aggregates; v3 exposed client timeouts but its Nginx API path was not available for correlation | Add bounded API Nginx aggregation by safe route class, method, status, request/upstream timing, and `cf_ray` presence; never serialize URI or request IDs | Identify whether unexpected v3/anomaly outcomes reached Nginx/API and where time was spent, without changing application behavior | Report schema changes; route classes are intentionally coarse; observer still samples the log window | Unit test for route-class/status/timing redaction; local observer/parser gates; deploy exact SHA; rerun v3 and correlate artifacts | Instrumentation accepted. `34022561287` observed all current v3 responses at Nginx: 0 timeout/520/522, 13,406×200 and 1,376×503; historical timeout path was not reproduced and remains unexplained |
 | D4 | Auth bootstrap spends CPU building the full profile read model for a shell avatar-only response | Auth cProfile `34023738831` attributes about 3.1–3.2 s sampled self CPU to `_build_profile_with_session`, with `build_profile_read_model` and `_variant_json_aggregate` on the `/bootstrap` call stack; the route makes 2 SQL/request and `player_profiles` appears once per bootstrap, while the shell consumes only `avatar_url`/`avatar_media` | Replace the auth bootstrap's full profile read-model/cache-fill path with one avatar-only projection query in the already authoritative auth DB session; keep the existing profile read-model path for profile endpoints | Reduce Python/ORM/SQL payload work and one Redis cache workflow per bootstrap; reduce authenticated page TTFB/pool contention without changing auth authority, roles, media contract, workers, pools, or load thresholds | Avatar projection adds one direct read on the request session; query must preserve ready-media URL/descriptor semantics; profile endpoints and invalidation remain unchanged | Unit/service tests for avatar projection and fallback semantics; backend/security/quality gates; exact authenticated-page targeted retest; Ready Vote SLO and v3 regression gates | Accepted as partial: `34027567855` returned 20,000×200 with 0 errors/unexpected; total p95 `3,744.723→3,142.199 ms` (−16.1%), TTFB p95 `3,158.586→2,373.082 ms` (−24.9%); target <1,000 ms remains unmet. `/bootstrap` pool p95 713.830 ms and `/{slug}/workspace` pool p95 740.360 ms remain material under saturated API CPU |
 | D5 | Full authenticated page data is ready before a material Next/HTML upstream boundary sends the first byte | SSR diagnostics `34029194574` recorded `tournament_detail_data_ready` p95 1,368.708 ms but correlated HTML upstream-after-data p95 2,180.611 ms; existing route loading boundary did not provide a sub-second measured first byte | A bounded Suspense shell was prototyped locally, but was rejected and reverted because the no-JavaScript authenticated-header contract failed: the resolved profile link was replaced by the generic fallback | Streaming would lower client-observed TTFB, but the tested implementation would regress server-rendered auth semantics; total server work remains a separate metric | Do not expose a private fallback that cannot resolve the authenticated identity; preserve the existing dynamic, nonce-CSP protected layout | Local web-hermetic gate; targeted production retest is not warranted for the rejected implementation | Rejected: `web-hermetic D5` had 475 passed / 4 failed; all failures were the authenticated no-JavaScript header contract. Layout restored before further changes; no production deploy was made for D5 |
-| D6 | Auth bootstrap still hydrates full SQLAlchemy `User`/`UserSession` rows although the endpoint is a read-only identity projection | Auth page run `34027567855` kept 2 SQL/request and `/bootstrap` DB p95 `567.690 ms`; the dependency selected complete ORM entities and only `id`, identity fields, credits and roles were consumed by `build_auth_bootstrap` | Keep the authoritative PostgreSQL session/role predicates, but select only the shell fields and return detached `AuthBootstrapUser`/`AuthBootstrapSession` projections; leave mutation and full `/users/me` auth dependencies unchanged | Reduce ORM construction, selected-column transfer and Python object work on every SSR bootstrap without changing session validity, role checks, verification policy, avatar projection, workers, pools or thresholds | Dedicated projection must retain active/expiry/invalidation/email-verification predicates; detached type must not leak into mutation routes | Focused security/service tests; full backend and security/build gates; exact authenticated-page retest; Ready Vote SLO and v3 regression gates | Pending |
-| D7 | Workspace read path resolves optional authentication twice through a dependency wrapper | Read cProfile `34032037346` recorded `31,530` cached-session validation queries (`SELECT sessions.id`) during `20,000` workspace and related reads; workspace averaged `4.018` SQL/request and `workspace_auth` p95 `245.654 ms`; route and private-read policy used different dependency callables | Make the private-read policy depend directly on the same `get_optional_authenticated_session` callable as the workspace route, allowing FastAPI request-scope dependency reuse; retain the existing membership/visibility SQL and the separate ready-vote policy wrapper | Remove one authoritative session-validation round trip from requests that share the route dependency, reducing DB/pool/CPU work without weakening revocation, expiry, verification or private-tournament checks | Dependency-focused tests; backend/security/build gates; exact `read-mix-stress-v2` targeted retest; authenticated page and Ready Vote regression gates | Pending |
+| D6 | Auth bootstrap still hydrates full SQLAlchemy `User`/`UserSession` rows although the endpoint is a read-only identity projection | Auth page run `34027567855` kept 2 SQL/request and `/bootstrap` DB p95 `567.690 ms`; the dependency selected complete ORM entities and only `id`, identity fields, credits and roles were consumed by `build_auth_bootstrap` | Keep the authoritative PostgreSQL session/role predicates, but select only the shell fields and return detached `AuthBootstrapUser`/`AuthBootstrapSession` projections; leave mutation and full `/users/me` auth dependencies unchanged | Reduce ORM construction, selected-column transfer and Python object work on every SSR bootstrap without changing session validity, role checks, verification policy, avatar projection, workers, pools or thresholds | Dedicated projection must retain active/expiry/invalidation/email-verification predicates; detached type must not leak into mutation routes | Focused security/service tests; full backend and security/build gates; exact authenticated-page retest; Ready Vote SLO and v3 regression gates | Accepted with isolated run `34036947842` on D6-only SHA `811fce7d`: 20,000×200, 0 errors/unexpected, total p95 `3,744.723→3,607.815` (−3.7%), TTFB p95 `3,158.586→2,776.080` (−12.1%); target <1,000 ms remains unmet |
+| D7 | Workspace read path resolves optional authentication twice through a dependency wrapper | Read cProfile `34032037346` recorded `31,530` cached-session validation queries (`SELECT sessions.id`) during `20,000` workspace and related reads; workspace averaged `4.018` SQL/request and `workspace_auth` p95 `245.654 ms`; route and private-read policy used different dependency callables | Make the private-read policy depend directly on the same `get_optional_authenticated_session` callable as the workspace route, allowing FastAPI request-scope dependency reuse; retain the existing membership/visibility SQL and the separate ready-vote policy wrapper | Remove one authoritative session-validation round trip from requests that share the route dependency, reducing DB/pool/CPU work without weakening revocation, expiry, verification or private-tournament checks | Dependency-focused tests; backend/security/build gates; exact `read-mix-stress-v2` targeted retest; authenticated page and Ready Vote regression gates | Accepted with final combined run `34039365807` on SHA `01e170ac`: all 170,000 requests passed with 0 errors/unexpected; useful rate `90.009→108.703/s` (+20.8%), stage peak 119.753/s, and workspace averaged 3.013 SQL/request. D7 was isolated from D6 by the cProfile evidence and D6-only A/B; the final ramp result is the combined production outcome |
+| D8 | Dynamic page data is ready only after a material post-data Next/HTML boundary, so the first byte waits for the complete child tree | SSR diagnostics `34029194574` measured `tournament_detail_data_ready` p95 1,368.708 ms but correlated HTML upstream-after-data p95 2,180.611 ms; the earlier whole-provider Suspense prototype was rejected because it replaced the authenticated no-JavaScript header | Add a Suspense boundary around route children only, keeping the already-resolved authenticated root header/provider outside the fallback; use a minimal non-private child fallback | Allow the authenticated header and initial document shell to stream once auth is resolved while preserving server-rendered identity semantics; reduce client-observed TTFB without changing API contracts, auth authority, workers, pools or thresholds | The initial HTML can contain an empty route fallback before child data; fallback must not contain private data or replace the authenticated header; total server work remains separately measured | Focused web-hermetic/no-JavaScript auth tests; security/build gates; exact authenticated-page targeted retest; Ready Vote and v3 regression gates | Local canonical run: 478 passed / 29 expected skips with one wide-only CSP timeout; isolated rerun of that exact test passed 1/1 in 48.6s. No auth-header or CSP semantic regression observed; production retest pending |
 
 ## Required next sequence
 
