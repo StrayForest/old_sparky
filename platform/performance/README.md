@@ -61,6 +61,26 @@ The measured HTTP generator runs only on the GitHub-hosted runner. The
 production origin may prepare marked fixtures, collect lightweight pressure
 evidence and perform exact cleanup; it must not execute the measured client.
 
+## Latest production performance stage
+
+The 2026-09-06 performance stage is complete as far as the available evidence
+allows. The exact 13-profile repeat used the unchanged contracts and thresholds
+on deployed SHA `a32c0feb`. Read useful throughput improved from the prior
+~105–107 req/s ceiling to a 104.878 req/s full-ramp rate with a best stage of
+125.484 req/s and no ramp timeouts. Ready Vote capacity measured 80 logical
+actions/s with no shedding in the capacity profile, and the unchanged SLO
+recheck remained within baseline (`195.665/433.655 ms` accepted p95/p99
+versus `192.028/424.893 ms`).
+
+The authenticated page remained functionally correct and improved to total p95
+`3,023.669 ms` and TTFB p95 `2,291.430 ms`, but the requested sub-second TTFB
+target was not reached. Saturation v1/v2 remain origin-safety failures because
+the observer saw 54/53 PostgreSQL connections against the 52-connection
+ceiling; neither run produced timeout, 520 or 522 responses. The historical v3
+timeout and anomaly `33991798604` remain unexplained transient episodes. The
+full evidence table, change ledger, cleanup proof and remaining follow-ups are
+in the archived [2026-09-06 performance-stage report](../docs/archive/performance-stage-2026-09-06.md).
+
 ## Read-path candidate slice (2026-09-03)
 
 The retained read-mix baseline remains the comparison point: source

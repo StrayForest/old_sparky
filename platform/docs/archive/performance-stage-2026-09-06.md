@@ -1,7 +1,8 @@
 # Production performance stage — 2026-09-06
 
-Status: in progress. This is the working evidence log for the performance
-stage requested in [`active-stage-request-2026-09-06.md`](active-stage-request-2026-09-06.md).
+Status: completed with explicit follow-up items. This is the evidence log for
+the performance stage requested in
+[`active-stage-request-2026-09-06.md`](../../performance/active-stage-request-2026-09-06.md).
 The request file is retained verbatim in the repository so the scope survives
 context compression.
 
@@ -311,21 +312,89 @@ Every optimization must add one row here before targeted retest.
 | D5 | Full authenticated page data is ready before a material Next/HTML upstream boundary sends the first byte | SSR diagnostics `34029194574` recorded `tournament_detail_data_ready` p95 1,368.708 ms but correlated HTML upstream-after-data p95 2,180.611 ms; existing route loading boundary did not provide a sub-second measured first byte | A bounded Suspense shell was prototyped locally, but was rejected and reverted because the no-JavaScript authenticated-header contract failed: the resolved profile link was replaced by the generic fallback | Streaming would lower client-observed TTFB, but the tested implementation would regress server-rendered auth semantics; total server work remains a separate metric | Do not expose a private fallback that cannot resolve the authenticated identity; preserve the existing dynamic, nonce-CSP protected layout | Local web-hermetic gate; targeted production retest is not warranted for the rejected implementation | Rejected: `web-hermetic D5` had 475 passed / 4 failed; all failures were the authenticated no-JavaScript header contract. Layout restored before further changes; no production deploy was made for D5 |
 | D6 | Auth bootstrap still hydrates full SQLAlchemy `User`/`UserSession` rows although the endpoint is a read-only identity projection | Auth page run `34027567855` kept 2 SQL/request and `/bootstrap` DB p95 `567.690 ms`; the dependency selected complete ORM entities and only `id`, identity fields, credits and roles were consumed by `build_auth_bootstrap` | Keep the authoritative PostgreSQL session/role predicates, but select only the shell fields and return detached `AuthBootstrapUser`/`AuthBootstrapSession` projections; leave mutation and full `/users/me` auth dependencies unchanged | Reduce ORM construction, selected-column transfer and Python object work on every SSR bootstrap without changing session validity, role checks, verification policy, avatar projection, workers, pools or thresholds | Dedicated projection must retain active/expiry/invalidation/email-verification predicates; detached type must not leak into mutation routes | Focused security/service tests; full backend and security/build gates; exact authenticated-page retest; Ready Vote SLO and v3 regression gates | Accepted with isolated run `34036947842` on D6-only SHA `811fce7d`: 20,000×200, 0 errors/unexpected, total p95 `3,744.723→3,607.815` (−3.7%), TTFB p95 `3,158.586→2,776.080` (−12.1%); target <1,000 ms remains unmet |
 | D7 | Workspace read path resolves optional authentication twice through a dependency wrapper | Read cProfile `34032037346` recorded `31,530` cached-session validation queries (`SELECT sessions.id`) during `20,000` workspace and related reads; workspace averaged `4.018` SQL/request and `workspace_auth` p95 `245.654 ms`; route and private-read policy used different dependency callables | Make the private-read policy depend directly on the same `get_optional_authenticated_session` callable as the workspace route, allowing FastAPI request-scope dependency reuse; retain the existing membership/visibility SQL and the separate ready-vote policy wrapper | Remove one authoritative session-validation round trip from requests that share the route dependency, reducing DB/pool/CPU work without weakening revocation, expiry, verification or private-tournament checks | Dependency-focused tests; backend/security/build gates; exact `read-mix-stress-v2` targeted retest; authenticated page and Ready Vote regression gates | Accepted with final combined run `34039365807` on SHA `01e170ac`: all 170,000 requests passed with 0 errors/unexpected; useful rate `90.009→108.703/s` (+20.8%), stage peak 119.753/s, and workspace averaged 3.013 SQL/request. D7 was isolated from D6 by the cProfile evidence and D6-only A/B; the final ramp result is the combined production outcome |
-| D8 | Dynamic page data is ready only after a material post-data Next/HTML boundary, so the first byte waits for the complete child tree | SSR diagnostics `34029194574` measured `tournament_detail_data_ready` p95 1,368.708 ms but correlated HTML upstream-after-data p95 2,180.611 ms; the earlier whole-provider Suspense prototype was rejected because it replaced the authenticated no-JavaScript header | Add a Suspense boundary around route children only, keeping the already-resolved authenticated root header/provider outside the fallback; use a minimal non-private child fallback | Allow the authenticated header and initial document shell to stream once auth is resolved while preserving server-rendered identity semantics; reduce client-observed TTFB without changing API contracts, auth authority, workers, pools or thresholds | The initial HTML can contain an empty route fallback before child data; fallback must not contain private data or replace the authenticated header; total server work remains separately measured | Focused web-hermetic/no-JavaScript auth tests; security/build gates; exact authenticated-page targeted retest; Ready Vote and v3 regression gates | Local canonical run: 478 passed / 29 expected skips with one wide-only CSP timeout; isolated rerun of that exact test passed 1/1 in 48.6s. No auth-header or CSP semantic regression observed; production retest pending |
+| D8 | Dynamic page data is ready only after a material post-data Next/HTML boundary, so the first byte waits for the complete child tree | SSR diagnostics `34029194574` measured `tournament_detail_data_ready` p95 1,368.708 ms but correlated HTML upstream-after-data p95 2,180.611 ms; the earlier whole-provider Suspense prototype was rejected because it replaced the authenticated no-JavaScript header | Add a Suspense boundary around route children only, keeping the already-resolved authenticated root header/provider outside the fallback; use a minimal non-private child fallback | Allow the authenticated header and initial document shell to stream once auth is resolved while preserving server-rendered identity semantics; reduce client-observed TTFB without changing API contracts, auth authority, workers, pools or thresholds | The initial HTML can contain an empty route fallback before child data; fallback must not contain private data or replace the authenticated header; total server work remains separately measured | Focused web-hermetic/no-JavaScript auth tests; security/build gates; exact authenticated-page targeted retest; Ready Vote and v3 regression gates | Accepted as partial: local canonical run had 478 passed / 29 expected skips with one wide-only CSP timeout; isolated rerun passed 1/1 in 48.6s. Production run `34044660766` on `a32c0feb` returned 20,000×200 with 0 errors/unexpected and exact cleanup; total p95 `3,744.723→3,023.669 ms` (−19.2%), TTFB p95 `3,158.586→2,291.430 ms` (−27.5%). Target <1,000 ms remains unmet, but no auth-header/CSP semantic regression was observed |
 
-## Required next sequence
+## Full matrix results
 
-1. Identify the next highest-cost read endpoint/function after D2, using the
-   cProfile and route/SQL evidence; keep PostgreSQL pool sizes and workers
-   unchanged until a measured resource bottleneck justifies them.
-2. Correlate the v3 timeout phase and anomaly with the available access,
-   application, system, PostgreSQL, Redis, and deployment records. If records
-   still cannot prove a path, document the data limitation and improve only the
-   minimum bounded observability needed for a future occurrence.
-3. Make one evidence-backed code/config change at a time, run its focused unit,
-   integration, browser/security/build and performance gates, then compare.
-4. Run targeted gates in the requested order. Only after they pass, repeat the
-   exact 13-profile production matrix with the same contracts and thresholds.
-5. Perform fixture cleanup and observer/lock checks after every production load;
-   finish with documentation archive, clean tree, commit, push to `dev`, and
-   post-push equality proof.
+The exact repeat completed sequentially against SHA `a32c0feb` with the
+original production contracts, thresholds and dataset sizes. Lifecycle profiles
+were not run on production. Every row below includes the workflow's exact
+cleanup result.
+
+| Profile | Baseline | New result | Delta | Status |
+| --- | --- | --- | --- | --- |
+| Read mix human (`read-mix-human-v2`) | p95 231.759 ms; p99 432.223 ms | 500/500 HTTP 200; p95 195.203 ms; p99 425.184 ms; TTFB p95 194.988 ms; 0 errors/unexpected; cleanup users500/tournaments1, retained tables empty | p95 −36.556 ms (−15.8%); p99 −7.039 ms (−1.6%) | PASS |
+| Read mix stress (`read-mix-stress-v2`) | p95 1,697.138 ms; p99 2,032.400 ms; useful 109.349/s; CPU reached ~100%/core | 20,000×200 + 10,000×304; p95 1,622.765 ms; p99 2,009.482 ms; TTFB p95 1,621.826 ms; useful 119.067/s; 0 errors/unexpected; CPU 98.43%/98.34% per core; cleanup users20,000/tournaments40, retained tables empty | p95 −74.373 ms (−4.4%); p99 −22.918 ms (−1.1%); useful +9.718/s (+8.9%) | PASS |
+| Read concurrency ramp (`read-mix-concurrency-ramp-v1`) | p95 1,390.286 ms; p99 1,866.793 ms; useful 90.009/s; 5 c16 timeouts in baseline; ceiling ~105–107/s | Run `34047380146` on `a32c0feb`; 170,000 requests (160,000×200 + 10,000×304), 0 errors/unexpected/timeouts; overall p95 1,205.798 ms; p99 1,599.252 ms; useful 104.878/s; stage peak 125.484/s; c16–c128 had 0 timeouts; CPU 90.47%/90.45% per core; PostgreSQL CPU avg 22.4%; cleanup users20,000/tournaments40, retained tables empty | p95 −184.488 ms (−13.3%); p99 −267.541 ms (−14.3%); useful +14.869/s (+16.5%); no timeout at any stage; peak stage throughput above prior ~105–107/s ceiling | PASS |
+| Authenticated page load (`authenticated-page-load-v1`) | p95 3,744.723 ms; p99 4,203.714 ms; TTFB p95 3,158.586 ms; 20,000×200; stress PASS | Run `34044660766` on `a32c0feb`; 20,000×200, 0 errors/unexpected; total p95/p99 3,023.669/3,534.792 ms; TTFB p95/p99 2,291.430/2,831.486 ms; CPU ~96.9%/core; cleanup users20,000/tournaments40, retained tables empty | total p95 −721.054 ms (−19.2%); p99 −668.922 ms (−15.9%); TTFB p95 −867.156 ms (−27.5%); target TTFB <1,000 ms remains unmet | PASS (stress behavior; target unmet) |
+| Ready Vote capacity (`ready-vote-capacity-ramp-v2`) | SLO capacity 70 actions/s; 80 actions/s shed 12.9%; baseline overall p95/p99 237.551/578.932 ms with 349 final 503s | Run `34049632873` on `a32c0feb`; 10,521 HTTP actions, 0 errors/unexpected/final failures; rate-20…80 all SLO PASS; rate-80 logical p95/p99 198.474/240.798 ms; SLO capacity 80 actions/s; max stable goodput 79.551/s; CPU max 99.2%/core, PostgreSQL CPU avg 19.58%; cleanup users20,000/tournaments40, retained tables empty | SLO capacity +10 actions/s (+14.3%); at 80/s final shedding 12.9%→0%; overall p95 237.551→188.777 ms (−20.7%); overall p99 578.932→241.801 ms (−58.2%) | PASS |
+| Ready Vote saturation v1 (`ready-vote-saturation-ramp-v1`) | p95 349.883 ms; p99 476.105 ms; 195 overload 503s / 1.2808% shedding; stress PASS; origin safety passed | Run `34050598650` on `a32c0feb`; 15,000 logical actions, 14 final failures, 434 retries; 15,434 HTTP requests with 14,986×200 and 448×503, no unexpected status/timeout/520/522; final logical failure 0.0933%, shedding 2.9027%, retry amplification 2.8933%; HTTP p95/p99 424.412/682.693 ms; rate-80…120 goodput 78.982/89.342/98.695/108.325/118.275 actions/s; observer saw max 54 established PostgreSQL connections against the 52-connection safety ceiling, so origin-safety gate failed; cleanup users20,000/tournaments40, retained tables empty | HTTP p95 +74.529 ms (+21.3%); p99 +206.588 ms (+43.4%); shedding +1.6219 pp; final failures remain controlled 503s but PostgreSQL safety regressed (51→54 observed connections) | FAIL (origin safety); no timeout/520/522 |
+| Ready Vote saturation v2 (`ready-vote-saturation-ramp-v2`) | p95 461.056 ms; p99 654.687 ms; 3,243 overload 503s / 16.0751% shedding; final logical failure 0.0%; origin safety passed | Run `34051590858` on `a32c0feb`; 17,100 logical actions, 5,001 retries, 16,691×200 and 5,445×503; no unexpected status/timeout/520/522; final logical failure 2.5965%, shedding 24.6369%, retry amplification 29.2456%; HTTP p95/p99 592.511/866.415 ms; rate-120…165 goodput 108.944/131.598/133.943/154.508 actions/s; observer max 53 established PostgreSQL connections against the 52-connection safety ceiling, so origin-safety gate failed; cleanup users20,000/tournaments40, retained tables empty | HTTP p95 +131.455 ms (+28.5%); p99 +211.728 ms (+32.3%); shedding +8.5618 pp; higher goodput at every offered rate, but connection budget still exceeded and final failures appeared at rate-120/135/150/165 | FAIL (origin safety); no timeout/520/522 |
+| Ready Vote saturation v3 (`ready-vote-saturation-ramp-v3`) | p95 413.948 ms; p99 7,787.051 ms; 79 client timeouts + 1×522 + 82 unexpected statuses; final logical failure 10.0284%; origin safety not accepted | Run `34052538046` on `a32c0feb`; 13,500 logical actions, 14,101 HTTP attempts, 13,483×200 and 618×503; 0 errors/unexpected/timeouts/520/522; final logical failure 0.3259%, shedding 4.3911%, retry amplification 4.2519%; HTTP p95/p99 418.946/600.976 ms; rate-105…120 goodput 103.005/108.730/110.642/118.546 actions/s; observer max 51 PostgreSQL connections and zero lock waiters; cleanup users20,000/tournaments40, retained tables empty | timeout 79→0; 522 1→0; unexpected 82→0; p99 −7,186.075 ms (−92.3%); final logical failure −9.7025 pp; current stress behavior and origin safety PASS | PASS; historical timeout path remains unexplained |
+| Ready Vote saturation v4 (`ready-vote-saturation-ramp-v4`) | p95 391.235 ms; p99 498.872 ms; aggregate final failure/shedding 6.696%; rate-120 logical final failure 0.3611%; stress PASS; origin safety passed | Run `34053427081` on `a32c0feb`; 15,300 logical actions, 18,108 HTTP requests, 15,010×200 and 3,098×503; 0 unexpected/timeout/520/522; final logical failure 2.098%, shedding 17.1378%, retry amplification 18.1503%; HTTP p95/p99 546.509/759.041 ms; rate-120/125/130/135 goodput 112.850/123.250/118.366/133.828 actions/s; observer max 52 PostgreSQL connections and zero lock waiters; cleanup users20,000/tournaments40, retained tables empty | HTTP p95 +155.274 ms (+39.7%); p99 +260.169 ms (+52.2%); aggregate shedding +10.4418 pp; no external timeout/520/522; narrow-band goodput remains positive but does not establish normal operating capacity | PASS (stress behavior) |
+| Ready Vote stress 15k (`ready-vote-stress-15k-v2`) | p95 547.325 ms; p99 699.459 ms; aggregate shedding 46.2051%; logical final failure 10.26%; stress PASS; origin safety passed | Run `34054352428` on `a32c0feb`; 15,000 logical actions, 26,255 primary HTTP requests, 13,071×200 and 13,184×503; 0 unexpected/timeout/520/522; primary accepted p95/p99 515.622/664.766 ms; primary logical final failure 12.86%, shedding 50.2152%, retry amplification 75.0333%, goodput 136.926/s; CPU 91.69%/91.58% per core; max PostgreSQL connections 51, max lock waiters 1; cleanup users15,000/tournaments30, retained tables empty | accepted p95 −68.715 ms (−11.8%); p99 −84.693 ms (−12.9%); aggregate shedding +4.0101 pp; logical final failure +2.60 pp; no timeout/520/522 | PASS (stress behavior) |
+| Ready Vote stress 20k (`ready-vote-stress-20k-v2`) | p95 475.202 ms; p99 619.312 ms; aggregate shedding 52.4198%; logical final failure 14.46%; stress PASS; origin safety passed | Run `34055026423` on `a32c0feb`; 20,000 logical actions, 33,582 primary HTTP requests, 17,951×200 and 15,631×503; 0 unexpected/timeout/520/522; primary accepted p95/p99 595.268/797.217 ms; primary logical final failure 10.245%, shedding 46.5458%, retry amplification 67.91%, goodput 132.363/s; CPU 90.72%/91.53% per core; max PostgreSQL connections 51, max lock waiters 1; cleanup users20,000/tournaments40, retained tables empty | accepted p95 +120.066 ms (+25.3%); p99 +177.905 ms (+28.7%); aggregate shedding −5.8740 pp; logical final failure −4.215 pp; goodput +4.652/s (+3.6%); no timeout/520/522 | PASS (stress behavior) |
+| Ready Vote spike (`ready-vote-spike-v1`) | p95 247.257 ms; p99 529.358 ms; 1,800/1,800 actions successful; 0 shedding/errors; burst and recovery PASS | Run `34055943956` on `a32c0feb`; 1,804 HTTP requests, 1,800 logical successes, 0 errors/unexpected/timeout/520/522; aggregate p95/p99 161.998/404.943 ms; burst goodput 79.237/s with p95 189.357 ms; recovery goodput 9.983/s with p95 164.328 ms; CPU max 100% on one core, max PostgreSQL connections 51, max lock waiters 0; cleanup users2,000/tournaments4, retained tables empty | aggregate p95 −85.259 ms (−34.5%); p99 −124.415 ms (−23.5%); 0→0 shedding and errors; burst/recovery remained successful | PASS |
+| Ready Vote SLO (`ready-vote-slo-v2`) | Canonical accepted p95/p99 192.028/424.893 ms; 0 errors; 500 primary + 100 duplicate requests; SLO PASS | Initial run `34056213247` on `a32c0feb` was 601/601 HTTP 200 with a transient p95/p99 excursion 491.604/740.264 ms; unchanged-workload recheck `34056392463` returned 500/500 primary successes, 0 errors/unexpected/shedding/retries, accepted p95/p99 195.665/433.655 ms and logical p95/p99 195.739/433.746 ms; recheck CPU ~25%/core, max PostgreSQL connections 51, lock waiters 0; both cleanups users500/tournament1, retained tables empty | Recheck p95 +3.637 ms (+1.9%); p99 +8.762 ms (+2.1%); absolute SLO remains PASS and no meaningful Ready Vote regression is confirmed; initial 491/740 tail excursion is recorded as transient | PASS; transient tail excursion documented |
+
+## Final capacity conclusion
+
+The repeatable measurements support these operating conclusions:
+
+- Ready Vote SLO capacity increased from 70 to 80 logical actions/s in the
+  exact capacity profile; 80 actions/s also passed the spike profile. Keep the
+  recommended normal operating range at `<= 65–70 actions/s` until the
+  saturation v1/v2 connection-budget excursions are explained and bounded.
+- Useful read throughput improved from the prior ~105–107 req/s ceiling. The
+  final ramp had no timeout through c128, 104.878 req/s aggregate useful rate,
+  and 125.484 req/s at its best stage. A conservative operational range is
+  `~105–120 req/s`; the new queueing knee is around c48 rather than the old
+  c32/c48 boundary.
+- Authenticated pages remain functionally correct and improved to total p95
+  3,023.669 ms and TTFB p95 2,291.430 ms, but the required <1,000 ms TTFB
+  target was not reached. The proven cost is split between API/Python CPU and
+  pool contention before data readiness and a material post-data Next/HTML
+  boundary. No pool/worker increase is justified by the measurements.
+- Ready Vote SLO did not show a confirmed regression: the unchanged-workload
+  recheck was 195.665/433.655 ms accepted p95/p99 versus 192.028/424.893 ms
+  baseline, with zero errors, shedding or retries. The preceding 491.604/740.264
+  ms run is retained as a transient tail excursion.
+
+## Remaining follow-up items
+
+1. Investigate why saturation v1/v2 observer samples reached 54/53 established
+   PostgreSQL connections against the 52-connection safety ceiling. The runs
+   had controlled 503s and no timeout/520/522, but the origin-safety gate is a
+   real FAIL. Do not increase pools or workers until the connection ownership
+   and observer/setup contribution are proven.
+2. Continue authenticated-page work in QA/preprod with a narrowly scoped
+   experiment for the remaining API/pool and post-data rendering costs. The
+   <1,000 ms TTFB target remains open; D5's full-provider fallback is rejected
+   because it regressed the authenticated no-JavaScript header contract.
+3. Retain D3's bounded Nginx/API observability and correlate any recurrence of
+   historical v3 run `33988234852` or anomaly `33991798604`. The current v3
+   retests have 0 timeout/520/522, but the historical path is still not
+   causally explained. No Cloudflare/origin cause is asserted.
+
+## Completion and cleanup record
+
+- All 13 original dispatchable profiles were repeated with unchanged workload
+  definitions, thresholds and dataset sizes; lifecycle profiles were not run
+  on production.
+- Targeted read-ramp, v3 and Ready Vote SLO gates passed. Authenticated-page
+  correctness passed, but its requested TTFB target remains unmet. Saturation
+  v1/v2 remain FAIL only on the origin-safety connection ceiling.
+- Every production run recorded exact fixture cleanup; retained-load tables
+  were empty apart from the control account. Observer processes were stopped,
+  no active load run or lock remained, and the final branch/deployment SHA
+  equality was checked before this documentation-only handoff.
+- Final local verification passed: `docs`, `verification-contract`,
+  `backend` (1,004 tests, sequential run), `security` (dependency audit,
+  Bandit and secret scan) and `web-quality` (dependency audit, typecheck, lint
+  and production build). The earlier parallel duplicate backend invocation
+  was invalidated because it shared the test database with a second backend
+  gate and produced fixture collisions; its result is not used.
+- The saved request remains at
+  [`active-stage-request-2026-09-06.md`](../../performance/active-stage-request-2026-09-06.md)
+  for context recovery. This report is the completed historical record for the
+  stage; only the listed follow-up items remain active.

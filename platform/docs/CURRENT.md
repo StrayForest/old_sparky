@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-05
+- Last reviewed: 2026-09-06
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -43,6 +43,30 @@ Read this file for the current production baseline and next engineering priority
   and zero participant/workflow/audit rows.
 
 ## Current engineering priority
+
+The latest production performance stage completed on 2026-09-06 against
+deployed SHA `a32c0feb`. The exact 13-profile matrix was repeated with the
+original contracts, thresholds and dataset sizes; lifecycle profiles were not
+run on production. The detailed evidence, before/after table and cleanup proof
+are in the [archived performance-stage report](archive/performance-stage-2026-09-06.md);
+the original work order is retained in
+[`platform/performance/active-stage-request-2026-09-06.md`](../performance/active-stage-request-2026-09-06.md).
+
+Measured result: read-ramp useful rate improved from the prior ~105–107 req/s
+ceiling to 104.878 req/s for the full ramp, with a best stage of 125.484 req/s
+and no c16–c128 timeouts. Ready Vote capacity measured 80 logical actions/s
+with no shedding in the unchanged capacity profile. The unchanged SLO
+recheck was 195.665/433.655 ms accepted p95/p99 versus the 192.028/424.893 ms
+baseline, with zero errors, shedding or retries.
+
+Remaining performance work is explicit: authenticated page TTFB improved to
+2,291.430 ms but remains above the <1,000 ms target; saturation v1/v2 failed
+only the origin-safety connection ceiling after observer samples reached
+54/53 versus 52; and the historical v3 timeout plus anomaly `33991798604`
+remain unexplained transient episodes. No worker/pool increase or external
+Cloudflare root cause is asserted without further evidence.
+
+### Historical AS-18 context
 
 AS-18 — hot-path capacity and backpressure implementation is complete.
 Production remains commit- and exact-SHA-gated; detailed load output belongs in
