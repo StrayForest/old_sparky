@@ -14,6 +14,7 @@ from tools.platform_external_load import (
     _route_for_read,
     analyze_concurrency_ramp,
     _ready_vote_action,
+    _request,
     load_manifest,
     run_load,
     spread_offsets,
@@ -123,6 +124,84 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(summary["requests"], 1)
         self.assertEqual(summary["errors"], 0)
         self.assertNotIn(secret, serialized)
+
+    def test_summary_keeps_only_bounded_cloudflare_failure_diagnostics(self) -> None:
+        result = RequestResult(
+            phase="write_external_vote",
+            method="POST",
+            path="/tournaments/qa/deadlock/ready-check/vote",
+            status=522,
+            elapsed_ms=30_000.0,
+            ok=False,
+            response_bytes=0,
+            time_to_first_byte_ms=None,
+            cf_ray="ray-522",
+            cf_error_type="522",
+            cf_error_origin="connection_failure",
+            retry_after="60",
+            error_kind="unexpected_status",
+        )
+
+        summary = summarize_results([result])
+
+        self.assertEqual(summary["cf_error_type_counts"], {"522": 1})
+        self.assertEqual(summary["cf_error_origin_counts"], {"connection_failure": 1})
+        self.assertEqual(
+            summary["error_samples"][0],
+            {
+                "phase": "write_external_vote",
+                "method": "POST",
+                "path": "/tournaments/qa/deadlock/ready-check/vote",
+                "status": 522,
+                "error_kind": "unexpected_status",
+                "cf_ray": "ray-522",
+                "cf_error_type": "522",
+                "cf_error_origin": "connection_failure",
+                "retry_after": "60",
+                "ttfb": None,
+                "total_time": 30_000.0,
+            },
+        )
+
+    def test_request_extracts_only_allowlisted_failure_headers(self) -> None:
+        class FakeResponse:
+            status = 522
+            headers = {
+                "cf-ray": "ray-522",
+                "cf-error-type": "type-" + ("x" * 200),
+                "cf-error-origin": "origin",
+                "retry-after": "60",
+                "x-private-debug": "must-not-be-captured",
+            }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            @staticmethod
+            def read(_size: int) -> bytes:
+                return b""
+
+        user = VirtualUser("user-00000001", "qa-tournament", "s" * 64, "c" * 64)
+        with patch("tools.platform_external_load.urlopen", return_value=FakeResponse()):
+            result = _request(
+                "https://old-sparky.com",
+                user,
+                method="GET",
+                path="/tournaments/qa-tournament",
+                phase="diagnostic",
+                timeout=1.0,
+                session_cookie_name="session",
+                csrf_cookie_name="csrf",
+            )
+
+        self.assertEqual(result.status, 522)
+        self.assertEqual(result.cf_ray, "ray-522")
+        self.assertEqual(result.cf_error_origin, "origin")
+        self.assertEqual(result.retry_after, "60")
+        self.assertEqual(len(result.cf_error_type or ""), 128)
 
     def test_ready_vote_retries_only_explicit_overload_and_reports_logical_latency(self) -> None:
         _, users = load_manifest_from_payload(manifest_payload())

@@ -394,6 +394,35 @@ class ProfileReadModelTests(PlatformIsolatedAsyncioTestCase):
         self.assertNotIn("dream_slots", payload)
         self.assertNotIn("stats", payload)
 
+    async def test_auth_avatar_projection_selects_one_ready_variant_without_json_aggregate(self) -> None:
+        row = _Row(
+            ("ready", "avatars/user-1/avatar-256.webp"),
+            avatar_status="ready",
+            avatar_object_key="avatars/user-1/avatar-256.webp",
+        )
+        session = SimpleNamespace(
+            execute=AsyncMock(return_value=SimpleNamespace(first=lambda: row))
+        )
+
+        with patch.object(
+            profile_read_models,
+            "public_media_url",
+            return_value="https://cdn.old-sparky.com/avatars/user-1/avatar-256.webp",
+        ) as public_url:
+            projection = await profile_read_models.get_profile_avatar_read_model(
+                session,
+                "user-1",
+            )
+
+        statement = str(session.execute.await_args.args[0]).lower()
+        self.assertNotIn("json_agg", statement)
+        self.assertEqual(
+            projection.avatar_url,
+            "https://cdn.old-sparky.com/avatars/user-1/avatar-256.webp",
+        )
+        self.assertIsNone(projection.avatar_media)
+        public_url.assert_called_once_with("avatars/user-1/avatar-256.webp")
+
     async def test_tournament_profile_pipeline_is_one_redis_round_trip(self) -> None:
         access = b'{"tournament_id":"tournament-1","organizer_user_id":"organizer","roster_ready":true,"revision":7}'
         redis = _Redis(pipeline_values=[access, True, True, b"9\n{}"])

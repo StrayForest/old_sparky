@@ -38,6 +38,7 @@ MAX_TOURNAMENTS = 64
 MAX_CONCURRENCY = 512
 RESPONSE_BODY_LIMIT = 2 * 1024 * 1024
 ERROR_SAMPLE_LIMIT = 25
+DIAGNOSTIC_HEADER_LIMIT = 128
 MARKER_RE = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,139}$")
 COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$")
@@ -66,6 +67,9 @@ class RequestResult:
     response_bytes: int
     time_to_first_byte_ms: float | None = None
     cf_ray: str | None = None
+    cf_error_type: str | None = None
+    cf_error_origin: str | None = None
+    retry_after: str | None = None
     response_etag: str | None = None
     error_kind: str | None = None
     response_json: Any = None
@@ -290,12 +294,26 @@ def _request(
     error_kind: str | None = None
     response_json: Any = None
     time_to_first_byte_ms: float | None = None
+    cf_error_type: str | None = None
+    cf_error_origin: str | None = None
+    retry_after: str | None = None
+
+    def diagnostic_headers(headers: Any) -> tuple[str | None, str | None, str | None]:
+        if status < 400:
+            return None, None, None
+        return (
+            (headers.get("cf-error-type", "")[:DIAGNOSTIC_HEADER_LIMIT] or None),
+            (headers.get("cf-error-origin", "")[:DIAGNOSTIC_HEADER_LIMIT] or None),
+            (headers.get("retry-after", "")[:DIAGNOSTIC_HEADER_LIMIT] or None),
+        )
+
     try:
         # URL is constructed only from the fixed manifest origin and a route
         # selected by this module; this is not an arbitrary fetch primitive.
         with urlopen(request, timeout=timeout) as response:  # nosec B310
             status = int(response.status)
             cf_ray = response.headers.get("cf-ray", "")[:128] or None
+            cf_error_type, cf_error_origin, retry_after = diagnostic_headers(response.headers)
             response_etag = response.headers.get("etag", "")[:512] or None
             first_chunk = response.read(1)
             time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
@@ -311,6 +329,7 @@ def _request(
     except HTTPError as exc:
         status = int(exc.code)
         cf_ray = exc.headers.get("cf-ray", "")[:128] or None
+        cf_error_type, cf_error_origin, retry_after = diagnostic_headers(exc.headers)
         first_chunk = exc.read(1)
         time_to_first_byte_ms = (time.monotonic() - started_at) * 1000
         with_error_body = first_chunk + exc.read(
@@ -338,6 +357,9 @@ def _request(
         ok=ok,
         response_bytes=response_bytes,
         cf_ray=cf_ray,
+        cf_error_type=cf_error_type,
+        cf_error_origin=cf_error_origin,
+        retry_after=retry_after,
         response_etag=response_etag,
         error_kind=error_kind,
         response_json=response_json,
@@ -459,6 +481,8 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
     temporary_overloads = 0
     retry_attempts = 0
     error_kinds: Counter[str] = Counter()
+    cf_error_types: Counter[str] = Counter()
+    cf_error_origins: Counter[str] = Counter()
     error_samples: list[dict[str, Any]] = []
     first_byte_times: list[float] = []
     response_sizes: list[int] = []
@@ -487,8 +511,17 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
                         "status": result.status,
                         "error_kind": kind,
                         "cf_ray": result.cf_ray,
+                        "cf_error_type": result.cf_error_type,
+                        "cf_error_origin": result.cf_error_origin,
+                        "retry_after": result.retry_after,
+                        "ttfb": result.time_to_first_byte_ms,
+                        "total_time": result.elapsed_ms,
                     }
                 )
+            if result.cf_error_type:
+                cf_error_types[result.cf_error_type] += 1
+            if result.cf_error_origin:
+                cf_error_origins[result.cf_error_origin] += 1
         if isinstance(result.response_json, dict) and "changed" in result.response_json:
             changed[str(bool(result.response_json.get("changed")))] += 1
     return {
@@ -509,6 +542,8 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         "unexpected_statuses": max(0, errors - temporary_overloads),
         "status_counts": dict(sorted(status_counts.items())),
         "error_kinds": dict(sorted(error_kinds.items())),
+        "cf_error_type_counts": dict(sorted(cf_error_types.items())),
+        "cf_error_origin_counts": dict(sorted(cf_error_origins.items())),
         "changed_counts": dict(sorted(changed.items())),
         "latency": metric_stats(latencies),
         "time_to_first_byte": metric_stats(first_byte_times),

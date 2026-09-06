@@ -1,26 +1,11 @@
 from __future__ import annotations
 
-import json
-from typing import Any
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.platform_api.app.api.schemas import AuthBootstrapResponse
 from apps.platform_api.app.services.profile_read_models import (
     get_profile_avatar_read_model,
-    get_or_build_profile_read_model,
 )
-
-
-def _cached_profile_fields(payload: bytes | None) -> dict[str, Any]:
-    if not payload:
-        return {}
-    try:
-        decoded = json.loads(payload)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return {}
-    profile = decoded.get("profile") if isinstance(decoded, dict) else None
-    return profile if isinstance(profile, dict) else {}
 
 
 async def build_auth_bootstrap(
@@ -31,19 +16,11 @@ async def build_auth_bootstrap(
     """Build the global-shell identity without full account hydration."""
 
     if db_session is None:
-        profile = _cached_profile_fields(
-            await get_or_build_profile_read_model(auth_session.user.id)
-        )
-        avatar_url = (
-            profile.get("avatar_url")
-            if isinstance(profile.get("avatar_url"), str)
-            else None
-        )
-        avatar_media = (
-            profile.get("avatar_media")
-            if isinstance(profile.get("avatar_media"), dict)
-            else None
-        )
+        # The API route always supplies the authoritative request session. Keep
+        # direct service callers safe without reviving the full profile
+        # read-model aggregate that this shell intentionally avoids.
+        avatar_url = None
+        avatar_media = None
     else:
         avatar_projection = await get_profile_avatar_read_model(
             db_session,

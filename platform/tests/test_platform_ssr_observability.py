@@ -44,6 +44,8 @@ class SsrObservabilityTests(unittest.TestCase):
                 "uri": "/tournaments/private-fixture-slug",
                 "status": 200,
                 "request_time": "0.120",
+                "upstream_connect_time": "0.002",
+                "upstream_header_time": "0.050",
                 "upstream_time": "0.110",
             },
         ]
@@ -53,6 +55,8 @@ class SsrObservabilityTests(unittest.TestCase):
         correlated = summary["correlated_html"]
         self.assertEqual(correlated["requests"], 1)
         self.assertEqual(correlated["upstream_time_ms"]["p50_ms"], 110.0)
+        self.assertEqual(correlated["upstream_connect_time_ms"]["p50_ms"], 2.0)
+        self.assertEqual(correlated["upstream_header_time_ms"]["p50_ms"], 50.0)
         self.assertEqual(
             correlated["stage_ms"]["tournament_workspace"]["p50_ms"],
             80.0,
@@ -119,6 +123,8 @@ class SsrObservabilityTests(unittest.TestCase):
                     "uri": "/api/v1/auth/bootstrap?token=secret",
                     "status": 200,
                     "request_time": "0.800",
+                    "upstream_connect_time": "0.002",
+                    "upstream_header_time": "0.400",
                     "upstream_time": "0.700",
                 },
                 {
@@ -128,6 +134,8 @@ class SsrObservabilityTests(unittest.TestCase):
                     "uri": "/api/v1/tournaments/private-fixture/deadlock/ready-check/vote",
                     "status": 503,
                     "request_time": "0.010",
+                    "upstream_connect_time": "0.001",
+                    "upstream_header_time": "0.003",
                     "upstream_time": "0.009",
                 },
                 {
@@ -135,6 +143,8 @@ class SsrObservabilityTests(unittest.TestCase):
                     "uri": "/api/v1/tournaments/private-fixture/deadlock/ready-check/vote",
                     "status": 522,
                     "request_time": "30.000",
+                    "upstream_connect_time": "5.000",
+                    "upstream_header_time": "5.000",
                     "upstream_time": "30.000",
                 },
             ],
@@ -149,6 +159,8 @@ class SsrObservabilityTests(unittest.TestCase):
         vote = api["by_method_route"]["POST ready_vote"]
         self.assertEqual(vote["statuses"], {"503": 1, "522": 1})
         self.assertEqual(vote["request_time_ms"]["p99_ms"], 29700.1)
+        self.assertEqual(vote["upstream_connect_time_ms"]["p99_ms"], 4950.01)
+        self.assertEqual(vote["upstream_header_time_ms"]["p99_ms"], 4950.03)
         self.assertEqual(vote["cf_ray_present"], 0)
         serialized = json.dumps(summary)
         self.assertNotIn("private-fixture", serialized)

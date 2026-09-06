@@ -11,7 +11,7 @@ from time import perf_counter
 from typing import Any
 
 from redis.exceptions import RedisError
-from sqlalchemy import JSON, cast, func, literal, select
+from sqlalchemy import JSON, case, cast, func, literal, select
 from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -25,6 +25,7 @@ from apps.platform_api.app.api.schemas import (
 from apps.platform_api.app.services.media import (
     compatibility_media_url,
     media_descriptor_response,
+    public_media_url,
 )
 from python_packages.platform_infra.db import session_factory
 from python_packages.platform_infra.media.repository import AssetDescriptor, VariantRecord
@@ -256,18 +257,30 @@ async def get_profile_avatar_read_model(
     """Read only the avatar projection required by auth bootstrap.
 
     The full profile read model also hydrates DeadlockProfile, banner media and
-    both variant aggregates.  Those fields are intentionally kept on profile
-    endpoints; the global SSR shell only needs the avatar descriptor.
+    both variant aggregates. Those fields are intentionally kept on profile
+    endpoints; the global SSR shell only needs one ready avatar URL. The
+    responsive descriptor is deliberately omitted because SiteHeader already
+    has a safe URL fallback and does not render a responsive media surface.
     """
 
     AvatarAsset = aliased(MediaAsset, name="avatar_asset")
+    preferred_avatar_object_key = (
+        select(MediaVariant.object_key)
+        .where(MediaVariant.asset_id == PlayerProfile.avatar_asset_id)
+        .order_by(
+            case((MediaVariant.variant_name == "avatar-256", 0), else_=1),
+            MediaVariant.width.desc(),
+            MediaVariant.variant_name.desc(),
+        )
+        .limit(1)
+        .correlate(PlayerProfile)
+        .scalar_subquery()
+    )
     row = (
         await db_session.execute(
             select(
-                AvatarAsset,
-                _variant_json_aggregate(PlayerProfile.avatar_asset_id).label(
-                    "avatar_variants"
-                ),
+                AvatarAsset.status.label("avatar_status"),
+                preferred_avatar_object_key.label("avatar_object_key"),
             )
             .select_from(PlayerProfile)
             .outerjoin(AvatarAsset, AvatarAsset.id == PlayerProfile.avatar_asset_id)
@@ -276,13 +289,12 @@ async def get_profile_avatar_read_model(
     ).first()
     if row is None:
         return None
-    avatar_media = _media_descriptor(row[0], row.avatar_variants)
+    avatar_url = None
+    if row.avatar_status == "ready" and row.avatar_object_key:
+        avatar_url = public_media_url(str(row.avatar_object_key))
     return ProfileAvatarReadModel(
-        avatar_url=compatibility_media_url(
-            avatar_media,
-            preferred_variant="avatar-256",
-        ),
-        avatar_media=avatar_media,
+        avatar_url=avatar_url,
+        avatar_media=None,
     )
 
 

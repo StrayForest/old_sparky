@@ -674,6 +674,22 @@ def read_cpu_totals() -> dict[str, tuple[int, int]]:
     return totals
 
 
+def read_cpu_steal_ticks() -> dict[str, int]:
+    """Return per-core scheduler steal ticks when the kernel exposes them."""
+
+    steals: dict[str, int] = {}
+    for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+        if not line.startswith("cpu"):
+            continue
+        columns = line.split()
+        name = columns[0]
+        if name == "cpu" or not name[3:].isdigit() or len(columns) < 9:
+            continue
+        with suppress(ValueError):
+            steals[name] = int(columns[8])
+    return steals
+
+
 def cpu_percentages(
     previous: dict[str, tuple[int, int]] | None,
     current: dict[str, tuple[int, int]],
@@ -688,6 +704,31 @@ def cpu_percentages(
         if total_delta <= 0:
             continue
         percentages[core] = round((1 - idle_delta / total_delta) * 100, 2)
+    return percentages
+
+
+def cpu_steal_percentages(
+    previous: dict[str, int] | None,
+    current: dict[str, int],
+    previous_totals: dict[str, tuple[int, int]] | None,
+    current_totals: dict[str, tuple[int, int]],
+) -> dict[str, float]:
+    if previous is None or previous_totals is None:
+        return {}
+    percentages: dict[str, float] = {}
+    for core, steal_ticks in current.items():
+        previous_ticks = previous.get(core, steal_ticks)
+        current_total = current_totals.get(core)
+        previous_total = previous_totals.get(core)
+        if current_total is None or previous_total is None:
+            continue
+        total_delta = current_total[0] - previous_total[0]
+        if total_delta <= 0:
+            continue
+        percentages[core] = round(
+            max(0.0, (steal_ticks - previous_ticks) / total_delta * 100),
+            2,
+        )
     return percentages
 
 
@@ -720,6 +761,87 @@ def read_tcp_connection_counts(port: int) -> dict[str, int]:
     return {"total": counts["total"], "established": counts["established"]}
 
 
+def read_tcp_socket_states() -> dict[str, int]:
+    """Return bounded TCP socket-state counts from the local kernel tables."""
+
+    state_names = {
+        "01": "established",
+        "02": "syn_sent",
+        "03": "syn_recv",
+        "04": "fin_wait1",
+        "05": "fin_wait2",
+        "06": "time_wait",
+        "07": "close",
+        "08": "close_wait",
+        "09": "last_ack",
+        "0A": "listen",
+        "0B": "closing",
+    }
+    counts: Counter[str] = Counter()
+    for proc_path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        if not proc_path.exists():
+            continue
+        try:
+            lines = proc_path.read_text(encoding="utf-8").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            columns = line.split()
+            if len(columns) < 4:
+                continue
+            state = state_names.get(columns[3].upper(), "other")
+            counts[state] += 1
+    return dict(sorted(counts.items()))
+
+
+def read_tcp_listen_counters() -> dict[str, int]:
+    """Read kernel listen overflow/drop counters without privileged tooling."""
+
+    path = Path("/proc/net/netstat")
+    if not path.exists():
+        return {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    for index, header in enumerate(lines[:-1]):
+        if not header.startswith("TcpExt: ") or not lines[index + 1].startswith("TcpExt: "):
+            continue
+        names = header.split()[1:]
+        values = lines[index + 1].split()[1:]
+        if len(names) != len(values):
+            continue
+        result: dict[str, int] = {}
+        for field in ("ListenOverflows", "ListenDrops"):
+            if field in names:
+                with suppress(ValueError):
+                    result[field] = int(values[names.index(field)])
+        return result
+    return {}
+
+
+def read_conntrack_utilization() -> dict[str, float | int] | dict[str, str]:
+    """Read conntrack utilization only when the procfs counters are exposed."""
+
+    count_path = Path("/proc/sys/net/netfilter/nf_conntrack_count")
+    max_path = Path("/proc/sys/net/netfilter/nf_conntrack_max")
+    if not count_path.exists() or not max_path.exists():
+        return {"available": False, "reason": "not_exposed"}
+    try:
+        current = int(count_path.read_text(encoding="utf-8").strip())
+        maximum = int(max_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return {"available": False, "reason": "unreadable"}
+    if maximum <= 0:
+        return {"available": False, "reason": "invalid_limit"}
+    return {
+        "available": True,
+        "current": current,
+        "max": maximum,
+        "percent": round(current * 100 / maximum, 3),
+    }
+
+
 def read_process_io(proc_path: Path) -> dict[str, int]:
     values = {"read_bytes": 0, "write_bytes": 0}
     io_path = proc_path / "io"
@@ -746,28 +868,38 @@ def read_process_rss_bytes(proc_path: Path) -> int:
     return 0
 
 
-def parse_process_stat(raw_stat: str) -> tuple[int, int, int]:
+def parse_process_stat(raw_stat: str) -> tuple[int, int, int, int]:
     comm_end = raw_stat.rfind(")")
     if comm_end < 0:
         raise ValueError("invalid /proc stat row")
     columns = raw_stat[comm_end + 2:].split()
-    if len(columns) < 13:
+    if len(columns) < 20:
         raise ValueError("short /proc stat row")
     # After pid + comm, columns start at state (field 3).
     ppid = int(columns[1])
     utime = int(columns[11])
     stime = int(columns[12])
-    return ppid, utime, stime
+    start_time_ticks = int(columns[19])
+    return ppid, utime, stime, start_time_ticks
+
+
+def read_boot_time_epoch() -> float | None:
+    with suppress(OSError, ValueError):
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    return None
 
 
 def iter_processes() -> list[dict[str, Any]]:
     processes: list[dict[str, Any]] = []
     proc_root = Path("/proc")
+    boot_time = read_boot_time_epoch()
     for child in proc_root.iterdir():
         if not child.name.isdigit():
             continue
         with suppress(OSError, ValueError):
-            ppid, utime, stime = parse_process_stat(
+            ppid, utime, stime, start_time_ticks = parse_process_stat(
                 (child / "stat").read_text(encoding="utf-8")
             )
             comm = (child / "comm").read_text(encoding="utf-8").strip()
@@ -784,6 +916,15 @@ def iter_processes() -> list[dict[str, Any]]:
                     "cmdline": cmdline,
                     "utime": utime,
                     "stime": stime,
+                    "start_time_ticks": start_time_ticks,
+                    "start_time": (
+                        datetime.fromtimestamp(
+                            (boot_time or 0) + start_time_ticks / PROCESS_CLK_TCK,
+                            UTC,
+                        ).isoformat()
+                        if boot_time is not None
+                        else None
+                    ),
                     "rss_bytes": read_process_rss_bytes(child),
                     "read_bytes": io_values["read_bytes"],
                     "write_bytes": io_values["write_bytes"],
@@ -840,6 +981,8 @@ def process_group_snapshot(processes: list[dict[str, Any]]) -> dict[str, dict[st
             "rss_bytes": 0,
             "read_bytes": 0,
             "write_bytes": 0,
+            "pids": [],
+            "start_times": {},
         }
         for label in PROCESS_LABELS
     }
@@ -853,6 +996,8 @@ def process_group_snapshot(processes: list[dict[str, Any]]) -> dict[str, dict[st
         group["rss_bytes"] += int(process.get("rss_bytes") or 0)
         group["read_bytes"] += int(process.get("read_bytes") or 0)
         group["write_bytes"] += int(process.get("write_bytes") or 0)
+        group["pids"].append(int(process["pid"]))
+        group["start_times"][str(process["pid"])] = process.get("start_time")
     return groups
 
 
@@ -962,8 +1107,13 @@ async def sample_postgres_waits() -> dict[str, Any]:
                                 JOIN pg_database AS db ON db.oid = locks.database
                                 WHERE db.datname = current_database()
                                   AND NOT locks.granted
-                            ) AS ungranted_locks
-                            ,(
+                            ) AS ungranted_locks,
+                            (
+                                SELECT count(*)::integer
+                                FROM pg_stat_activity
+                                WHERE datname = current_database()
+                            ) AS backend_connections,
+                            (
                                 SELECT COALESCE(
                                     json_agg(
                                         json_build_object(
@@ -999,10 +1149,10 @@ async def sample_postgres_waits() -> dict[str, Any]:
                                 SELECT COALESCE(
                                     json_agg(
                                         json_build_object(
-                                            'application_name', activity.application_name,
+                                            'application_name', coalesce(nullif(activity.application_name, ''), 'unknown'),
                                             'current', activity.connection_count
                                         )
-                                        ORDER BY activity.application_name
+                                        ORDER BY coalesce(nullif(activity.application_name, ''), 'unknown')
                                     ),
                                     '[]'::json
                                 )
@@ -1013,7 +1163,7 @@ async def sample_postgres_waits() -> dict[str, Any]:
                                     WHERE datname = current_database()
                                     GROUP BY coalesce(application_name, '')
                                 ) AS activity
-                            ) AS connection_ownership
+                            ) AS backend_ownership
                         """
                     )
                 )
@@ -1028,8 +1178,9 @@ async def sample_postgres_waits() -> dict[str, Any]:
                     3,
                 ),
                 "ungranted_locks": int(row["ungranted_locks"] or 0),
+                "backend_connections": int(row["backend_connections"] or 0),
                 "active_query_samples": row["active_query_samples"] or [],
-                "connection_ownership": row["connection_ownership"] or [],
+                "backend_ownership": row["backend_ownership"] or [],
             }
     except Exception as exc:
         return {"error": type(exc).__name__}
@@ -1041,6 +1192,7 @@ class SystemSampler:
         self.samples: list[dict[str, Any]] = []
         self._task: asyncio.Task[None] | None = None
         self._previous_cpu: dict[str, tuple[int, int]] | None = None
+        self._previous_cpu_steal: dict[str, int] | None = None
         self._previous_postgres_ticks: int | None = None
         self._previous_process_groups: dict[str, dict[str, Any]] | None = None
         self._previous_monotonic: float | None = None
@@ -1088,8 +1240,16 @@ class SystemSampler:
     async def sample(self) -> None:
         now = time.monotonic()
         cpu_totals = read_cpu_totals()
+        cpu_steal_ticks = read_cpu_steal_ticks()
         per_core_cpu = cpu_percentages(self._previous_cpu, cpu_totals)
+        per_core_steal = cpu_steal_percentages(
+            self._previous_cpu_steal,
+            cpu_steal_ticks,
+            self._previous_cpu,
+            cpu_totals,
+        )
         self._previous_cpu = cpu_totals
+        self._previous_cpu_steal = cpu_steal_ticks
 
         meminfo = read_meminfo()
         memory_total = meminfo.get("MemTotal", 0)
@@ -1100,6 +1260,26 @@ class SystemSampler:
         processes = iter_processes()
         postgres_ticks = process_cpu_total(processes, is_postgres_process)
         process_groups = process_group_snapshot(processes)
+        process_lifecycle: dict[str, dict[str, Any]] = {}
+        for label, current in process_groups.items():
+            current_pids = {int(pid) for pid in current.get("pids", [])}
+            previous_pids = {
+                int(pid)
+                for pid in ((self._previous_process_groups or {}).get(label, {}).get("pids", []))
+            }
+            process_lifecycle[label] = {
+                "new_processes": sorted(current_pids - previous_pids)
+                if self._previous_process_groups is not None
+                else [],
+                "missing_processes": sorted(previous_pids - current_pids),
+                "new_process_starts": [
+                    {
+                        "pid": pid,
+                        "started_at": (current.get("start_times") or {}).get(str(pid)),
+                    }
+                    for pid in sorted(current_pids - previous_pids)
+                ],
+            }
         postgres_cpu_percent = 0.0
         process_metrics: dict[str, dict[str, Any]] = {}
         if self._previous_postgres_ticks is not None and self._previous_monotonic is not None:
@@ -1151,6 +1331,7 @@ class SystemSampler:
             {
                 "timestamp": datetime.now(UTC).isoformat(),
                 "cpu_per_core_percent": per_core_cpu,
+                "cpu_steal_per_core_percent": per_core_steal,
                 "memory_used_bytes": max(0, memory_total - memory_available),
                 "memory_total_bytes": memory_total,
                 "swap_used_bytes": max(0, swap_total - swap_free),
@@ -1162,7 +1343,10 @@ class SystemSampler:
                 },
                 "nginx_connections": read_tcp_connection_counts(80),
                 "api_connections": read_tcp_connection_counts(self._api_port),
-                "postgres_connections": read_tcp_connection_counts(5432),
+                "postgres_tcp_connections": read_tcp_connection_counts(5432),
+                "tcp_socket_states": read_tcp_socket_states(),
+                "tcp_listen_counters": read_tcp_listen_counters(),
+                "conntrack": read_conntrack_utilization(),
                 # Keep Redis socket pressure beside the existing counters so a
                 # load run can distinguish cache/queue pressure from
                 # PostgreSQL pool pressure without issuing extra Redis
@@ -1171,6 +1355,7 @@ class SystemSampler:
                 "gunicorn": gunicorn_counts(processes),
                 "postgres_cpu_percent": round(postgres_cpu_percent, 2),
                 "processes": process_metrics,
+                "process_lifecycle": process_lifecycle,
                 "postgres_waits": await sample_postgres_waits(),
                 "celery_backlog": await self.celery_backlog(),
             }
@@ -1187,11 +1372,16 @@ class SystemSampler:
         memory_used = [float(sample["memory_used_bytes"]) for sample in samples]
         swap_used = [float(sample["swap_used_bytes"]) for sample in samples]
         load_1m = [float(sample["load_average"]["1m"]) for sample in samples]
+        cpu_steal_by_core: dict[str, list[float]] = defaultdict(list)
+        for sample in samples:
+            for core, value in (sample.get("cpu_steal_per_core_percent") or {}).items():
+                cpu_steal_by_core[core].append(float(value))
         nginx_established = [
             int(sample["nginx_connections"]["established"]) for sample in samples
         ]
-        postgres_connections = [
-            int(sample["postgres_connections"]["established"]) for sample in samples
+        postgres_tcp_connections = [
+            int((sample.get("postgres_tcp_connections") or {}).get("established", 0))
+            for sample in samples
         ]
         redis_connections = [
             int(sample["redis_connections"]["established"]) for sample in samples
@@ -1234,6 +1424,17 @@ class SystemSampler:
             float(row.get("max_lock_waiting_query_ms") or 0)
             for row in postgres_wait_rows
         ]
+        postgres_backend_connections = [
+            int(
+                row.get("backend_connections")
+                or sum(
+                    int(entry.get("current") or 0)
+                    for entry in (row.get("backend_ownership") or [])
+                    if isinstance(entry, dict)
+                )
+            )
+            for row in postgres_wait_rows
+        ]
         active_query_samples: list[dict[str, Any]] = []
         for row in postgres_wait_rows:
             active_rows = row.get("active_query_samples")
@@ -1247,20 +1448,27 @@ class SystemSampler:
             reverse=True,
         )
         ownership_values: dict[str, list[int]] = defaultdict(list)
+        ownership_consistency: list[bool] = []
         for row in postgres_wait_rows:
-            ownership = row.get("connection_ownership")
+            ownership = row.get("backend_ownership")
             if not isinstance(ownership, list):
                 continue
+            ownership_total = 0
             for entry in ownership:
                 if not isinstance(entry, dict):
                     continue
                 application_name = str(entry.get("application_name") or "unknown")
                 try:
+                    current = max(0, int(entry.get("current") or 0))
+                    ownership_total += current
                     ownership_values[application_name].append(
-                        max(0, int(entry.get("current") or 0))
+                        current
                     )
                 except (TypeError, ValueError):
                     continue
+            ownership_consistency.append(
+                ownership_total == int(row.get("backend_connections") or 0)
+            )
         backlog_rows = [
             sample.get("celery_backlog", {})
             for sample in samples
@@ -1315,9 +1523,17 @@ class SystemSampler:
                 "avg": round(sum(nginx_established) / len(nginx_established), 2),
                 "max": max(nginx_established),
             },
-            "postgres_established_connections": {
-                "avg": round(sum(postgres_connections) / len(postgres_connections), 2),
-                "max": max(postgres_connections),
+            "postgres_tcp_established_connections": {
+                "avg": round(sum(postgres_tcp_connections) / len(postgres_tcp_connections), 2),
+                "max": max(postgres_tcp_connections),
+            },
+            "postgres_backend_connections": {
+                "samples": len(postgres_backend_connections),
+                "avg": round(
+                    sum(postgres_backend_connections) / len(postgres_backend_connections),
+                    2,
+                ) if postgres_backend_connections else 0,
+                "max": max(postgres_backend_connections or [0]),
             },
             "redis_established_connections": {
                 "avg": round(sum(redis_connections) / len(redis_connections), 2),
@@ -1331,6 +1547,14 @@ class SystemSampler:
             "postgres_cpu_percent": {
                 "avg": round(sum(postgres_cpu) / len(postgres_cpu), 2) if postgres_cpu else 0,
                 "max": round(max(postgres_cpu), 2) if postgres_cpu else 0,
+            },
+            "cpu_steal_per_core": {
+                core: {
+                    "avg_percent": round(sum(values) / len(values), 3),
+                    "max_percent": round(max(values), 3),
+                }
+                for core, values in sorted(cpu_steal_by_core.items())
+                if values
             },
             "processes": {
                 label: {
@@ -1400,7 +1624,7 @@ class SystemSampler:
                 ),
                 "active_query_samples": active_query_samples[:16],
             },
-            "postgres_connection_ownership": {
+            "postgres_backend_ownership": {
                 application_name: {
                     "samples": len(values),
                     "avg": round(sum(values) / len(values), 2),
@@ -1409,6 +1633,72 @@ class SystemSampler:
                 }
                 for application_name, values in sorted(ownership_values.items())
                 if values
+            },
+            "postgres_backend_ownership_consistency": {
+                "samples": len(ownership_consistency),
+                "mismatches": sum(not value for value in ownership_consistency),
+                "all_match": bool(ownership_consistency)
+                and all(ownership_consistency),
+            },
+            "process_lifecycle": {
+                label: {
+                    "new_processes": sum(
+                        len((sample.get("process_lifecycle") or {}).get(label, {}).get("new_processes", []))
+                        for sample in samples
+                    ),
+                    "missing_processes": sum(
+                        len((sample.get("process_lifecycle") or {}).get(label, {}).get("missing_processes", []))
+                        for sample in samples
+                    ),
+                }
+                for label in PROCESS_LABELS
+                if any(
+                    (sample.get("process_lifecycle") or {}).get(label)
+                    for sample in samples
+                )
+            },
+            "tcp_socket_states": {
+                state: max(
+                    int((sample.get("tcp_socket_states") or {}).get(state) or 0)
+                    for sample in samples
+                )
+                for state in sorted(
+                    {
+                        state
+                        for sample in samples
+                        for state in (sample.get("tcp_socket_states") or {})
+                    }
+                )
+            },
+            "tcp_listen_counters": {
+                field: {
+                    "first": int(values[0]),
+                    "last": int(values[-1]),
+                    "delta": int(values[-1] - values[0]),
+                    "max": max(values),
+                }
+                for field in ("ListenOverflows", "ListenDrops")
+                if (
+                    values := [
+                        int((sample.get("tcp_listen_counters") or {}).get(field) or 0)
+                        for sample in samples
+                        if field in (sample.get("tcp_listen_counters") or {})
+                    ]
+                )
+            },
+            "conntrack": {
+                "available": any(
+                    (sample.get("conntrack") or {}).get("available") is True
+                    for sample in samples
+                ),
+                "max_percent": max(
+                    [
+                        float((sample.get("conntrack") or {}).get("percent") or 0)
+                        for sample in samples
+                        if (sample.get("conntrack") or {}).get("available") is True
+                    ]
+                    or [0.0]
+                ),
             },
             "celery_backlog": {
                 "samples": len(backlog_rows),
@@ -1831,14 +2121,14 @@ def summarize_bottleneck_evidence(
         else {}
     )
     load_high = isinstance(load_average, dict) and float(load_average.get("max") or 0) >= 4
-    postgres_connections = (
-        system_summary.get("postgres_established_connections", {})
+    postgres_backend_connections = (
+        system_summary.get("postgres_backend_connections", {})
         if isinstance(system_summary, dict)
         else {}
     )
     postgres_connection_peak_high = (
-        isinstance(postgres_connections, dict)
-        and int(postgres_connections.get("max") or 0) >= 30
+        isinstance(postgres_backend_connections, dict)
+        and int(postgres_backend_connections.get("max") or 0) >= 30
     )
     postgres_waits = (
         system_summary.get("postgres_waits", {})
@@ -2159,6 +2449,8 @@ def summarize_ssr_observability(
             continue
         row: dict[str, Any] = {
             "request_ms": _nginx_seconds(record.get("request_time")),
+            "upstream_connect_ms": _nginx_seconds(record.get("upstream_connect_time")),
+            "upstream_header_ms": _nginx_seconds(record.get("upstream_header_time")),
             "upstream_ms": _nginx_seconds(record.get("upstream_time")),
         }
         for stage, durations in stages.items():
@@ -2189,6 +2481,12 @@ def summarize_ssr_observability(
             "statuses": dict(sorted(Counter(str(status) for status, _record in rows).items())),
             "request_time_ms": metric_stats(
                 [value for _status, record in rows if (value := _nginx_seconds(record.get("request_time"))) is not None]
+            ),
+            "upstream_connect_time_ms": metric_stats(
+                [value for _status, record in rows if (value := _nginx_seconds(record.get("upstream_connect_time"))) is not None]
+            ),
+            "upstream_header_time_ms": metric_stats(
+                [value for _status, record in rows if (value := _nginx_seconds(record.get("upstream_header_time"))) is not None]
             ),
             "upstream_time_ms": metric_stats(
                 [value for _status, record in rows if (value := _nginx_seconds(record.get("upstream_time"))) is not None]
@@ -2228,6 +2526,12 @@ def summarize_ssr_observability(
             "request_time_ms": metric_stats(
                 [value for record in html_records if (value := _nginx_seconds(record.get("request_time"))) is not None]
             ),
+            "upstream_connect_time_ms": metric_stats(
+                [value for record in html_records if (value := _nginx_seconds(record.get("upstream_connect_time"))) is not None]
+            ),
+            "upstream_header_time_ms": metric_stats(
+                [value for record in html_records if (value := _nginx_seconds(record.get("upstream_header_time"))) is not None]
+            ),
             "upstream_time_ms": metric_stats(
                 [value for record in html_records if (value := _nginx_seconds(record.get("upstream_time"))) is not None]
             ),
@@ -2243,6 +2547,8 @@ def summarize_ssr_observability(
         "correlated_html": {
             "requests": len(correlated_rows),
             "request_time_ms": metric_for_rows("request_ms"),
+            "upstream_connect_time_ms": metric_for_rows("upstream_connect_ms"),
+            "upstream_header_time_ms": metric_for_rows("upstream_header_ms"),
             "upstream_time_ms": metric_for_rows("upstream_ms"),
             "unattributed_upstream_after_data_ms": metric_for_rows(
                 "unattributed_upstream_after_data_ms"
@@ -2563,7 +2869,7 @@ class ProductionQa:
                     "worker_cpu": worker_process,
                     "postgres_cpu": system.get("postgres_cpu_percent", {}),
                     "memory": system.get("memory", {}),
-                    "db_connections": system.get("postgres_established_connections", {}),
+                    "db_connections": system.get("postgres_backend_connections", {}),
                     "db_pool_wait": (phase_report["server_request_perf"] or {}).get(
                         "pool_checkout_wait_ms", {}
                     ),

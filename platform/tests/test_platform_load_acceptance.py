@@ -60,7 +60,7 @@ class LoadAcceptanceTests(unittest.TestCase):
                 "accepted_request_latency": latency(1500, 3000, 5000, 8000),
                 "max_shed_percent": 99.9,
                 "max_retry_amplification_percent": 100,
-                "max_postgres_connections": 52,
+                "max_postgres_backend_connections": 52,
                 "max_waiting_backends": 20,
                 "max_lock_waiters": 20,
                 "max_cpu_per_core_percent": 100,
@@ -71,7 +71,8 @@ class LoadAcceptanceTests(unittest.TestCase):
                 "timed_out": False,
                 "system": {
                     "cpu_per_core": {"cpu0": {"max_percent": 80}},
-                    "postgres_established_connections": {"max": 40},
+                    "postgres_backend_connections": {"max": 51},
+                    "postgres_tcp_established_connections": {"max": 54},
                     "postgres_waits": {"max_waiting_backends": 1, "max_lock_waiters": 0},
                 },
                 "server_request_perf_logs": {
@@ -101,7 +102,7 @@ class LoadAcceptanceTests(unittest.TestCase):
                 **SLO,
                 "resource_safety": {
                     "pool_checkout_wait_ms": {"p95_ms": 5000, "p99_ms": 10000},
-                    "max_postgres_connections": 52,
+                    "max_postgres_backend_connections": 52,
                     "max_waiting_backends": 20,
                     "max_lock_waiters": 20,
                     "max_cpu_per_core_percent": 100,
@@ -113,7 +114,7 @@ class LoadAcceptanceTests(unittest.TestCase):
                 "timed_out": False,
                 "system": {
                     "cpu_per_core": {"cpu0": {"max_percent": 50}},
-                    "postgres_established_connections": {"max": 30},
+                    "postgres_backend_connections": {"max": 30},
                     "postgres_waits": {
                         "max_waiting_backends": 0,
                         "max_lock_waiters": 0,
@@ -130,6 +131,89 @@ class LoadAcceptanceTests(unittest.TestCase):
             result["origin_safety"]["missing_diagnostics"],
             ["pool_checkout_p95_ms", "pool_checkout_p99_ms"],
         )
+
+    def test_tcp_socket_peak_does_not_fail_backend_safety_budget(self) -> None:
+        result = evaluate_acceptance(
+            contract_ok=True,
+            logical_summary={
+                "actions": 1,
+                "final_failure_rate_percent": 0,
+                "successful_goodput_actions_per_second": 1,
+                "end_to_end_latency": {"p95_ms": 100, "p99_ms": 200},
+                "accepted_request_latency": latency(50, 75, 100, 200),
+            },
+            raw_http_summary={"temporary_overload_rate_percent": 0, "unexpected_statuses": 0},
+            acceptance_contract={
+                "kind": "stress",
+                "accepted_request_latency": latency(150, 300, 500, 800),
+                "max_shed_percent": 1,
+                "max_retry_amplification_percent": 10,
+                "max_postgres_backend_connections": 52,
+                "max_waiting_backends": 20,
+                "max_lock_waiters": 20,
+                "max_cpu_per_core_percent": 100,
+                "pool_checkout_wait_ms": {"p95_ms": 5000, "p99_ms": 10000},
+            },
+            origin_observability={
+                "stop_file_seen": True,
+                "timed_out": False,
+                "system": {
+                    "cpu_per_core": {"cpu0": {"max_percent": 50}},
+                    "postgres_backend_connections": {"max": 51},
+                    "postgres_tcp_established_connections": {"max": 54},
+                    "postgres_waits": {"max_waiting_backends": 0, "max_lock_waiters": 0},
+                },
+                "server_request_perf_logs": {
+                    "pool_checkout_wait_ms": {"p95_ms": 10, "p99_ms": 20},
+                },
+            },
+        )
+
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["origin_safety"]["checks"]["postgres_backend_connections"])
+        self.assertEqual(
+            result["origin_safety"]["postgres_tcp_established_connections"]["max"],
+            54,
+        )
+
+    def test_backend_peak_fails_even_when_tcp_socket_count_is_lower(self) -> None:
+        result = evaluate_acceptance(
+            contract_ok=True,
+            logical_summary={
+                "actions": 1,
+                "final_failure_rate_percent": 0,
+                "end_to_end_latency": {"p95_ms": 100, "p99_ms": 200},
+                "accepted_request_latency": latency(50, 75, 100, 200),
+            },
+            raw_http_summary={"temporary_overload_rate_percent": 0, "unexpected_statuses": 0},
+            acceptance_contract={
+                "kind": "stress",
+                "accepted_request_latency": latency(150, 300, 500, 800),
+                "max_shed_percent": 1,
+                "max_retry_amplification_percent": 10,
+                "max_postgres_backend_connections": 52,
+                "max_waiting_backends": 20,
+                "max_lock_waiters": 20,
+                "max_cpu_per_core_percent": 100,
+                "pool_checkout_wait_ms": {"p95_ms": 5000, "p99_ms": 10000},
+            },
+            origin_observability={
+                "stop_file_seen": True,
+                "timed_out": False,
+                "system": {
+                    "cpu_per_core": {"cpu0": {"max_percent": 50}},
+                    "postgres_backend_connections": {"max": 53},
+                    "postgres_tcp_established_connections": {"max": 51},
+                    "postgres_waits": {"max_waiting_backends": 0, "max_lock_waiters": 0},
+                },
+                "server_request_perf_logs": {
+                    "pool_checkout_wait_ms": {"p95_ms": 10, "p99_ms": 20},
+                },
+            },
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["origin_safety"]["checks"]["postgres_backend_connections"])
 
     def test_capacity_reports_slo_capacity_separately_from_goodput(self) -> None:
         result = evaluate_acceptance(
