@@ -111,6 +111,35 @@ The sampled API diagnostics show:
   recorded as an operational observation and is not treated as request
   latency.
 
+The first exact targeted retest after D2/D3 was `34021138355` on the same
+`fe29f8bf…6b57` contract. It returned 20,000/20,000 HTTP 200 responses with
+zero errors or unexpected statuses. Total p95 improved from 3,744.723 ms to
+3,552.941 ms (-5.12%); TTFB p95 improved from 3,158.586 ms to 2,984.922 ms
+(-5.50%). The requested TTFB target of <1,000 ms therefore remains unmet.
+Route-level request diagnostics recorded `/bootstrap` at 16,336 requests,
+2.0 SQL/request, request p95 1,748.530 ms, pool checkout p95 414.148 ms,
+connection-hold p95 697.735 ms, and non-SQL p95 1,451.257 ms. The workspace
+route recorded 7,736 requests, 4.012 SQL/request, request p95 1,382.020 ms,
+pool checkout p95 604.110 ms, and connection-hold p95 1,010.367 ms. Both API
+cores averaged about 97%; PostgreSQL averaged 11.31% CPU, with zero lock
+waiters. This proves application CPU/pool contention remains material, but it
+does not justify changing pool sizes without isolating the next expensive
+operation. SSR stage logging was disabled for this production run and the
+internal SSR API calls bypass Nginx, so the new Nginx API aggregate is
+correctly empty for this profile; the existing request-perf route data is the
+authoritative API-side evidence here.
+
+A bounded diagnostic run, `34023738831`, temporarily used the reviewed
+`read-mix-cprofile` runtime profile with the same auth contract. Its exact
+cleanup passed, but the profiler overhead changed the workload shape: 58
+client timeouts and 19,942 HTTP 200 responses, so it is not a performance
+sample. The pstats nevertheless provide attribution: the auth profile builder
+(`_build_profile_with_session`) consumed about 3.1–3.2 seconds of sampled
+self CPU per worker profile, while `get_auth_bootstrap` and
+`get_or_build_profile_read_model` dominated its site-owned cumulative stack.
+The diagnostic profile was removed immediately by successful baseline restore
+deploy `34025266585`; no profiler remains active.
+
 ### Read ceiling
 
 The read stress origin summary reports CPU per core averaging about 98.6%,
@@ -143,6 +172,21 @@ the 80 unexpected requests were admitted requests that did not complete within
 the client boundary. The exact timeout path is not yet proven; v1/v2/v3/v4
 comparison and correlated Nginx/application access records remain required.
 
+An exact retest after D3, `34022561287`, used the unchanged v3 contract and
+the same production application SHA `540dacdb`. It completed with 13,500
+logical actions, 13,406 successes, 94 final controlled 503 failures, zero
+timeouts, zero 520/522 responses, and a stress-behavior PASS. Nginx recorded
+14,782 `POST ready_vote` requests: 13,406×200 and 1,376×503, with request
+p95 238.000 ms and upstream p95 237.950 ms. The selected application logs
+covered 1,376 shed responses only; their admission p95 was 0.030 ms, with no
+SQL or pool checkout. The accepted path reached PostgreSQL under load, but
+the observer saw zero lock waiters and at most 5.587 ms waiting-query age.
+Because this is a same-code retest that did not reproduce the original
+timeout/522, D3 improves future correlation but does not explain or close the
+historical path. The historical v3 failure remains an unexplained transient
+production anomaly; no Cloudflare, Nginx, origin, database, or socket cause is
+asserted.
+
 ### DB, pool, and cache conclusion
 
 The current measurements do not prove PostgreSQL or Redis as the read ceiling:
@@ -160,7 +204,8 @@ Every optimization must add one row here before targeted retest.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | D1 | Auth/read attribution incomplete | Canonical run has no SSR stage or CPU call-stack data | SSR diagnostic and read cProfile on unchanged source | Attribute web upstream and Python CPU time | Temporary diagnostic overhead; no persistent profiler | Same authenticated/read profiles; restore baseline after each | SSR evidence captured in `34015185444`; cProfile evidence captured in `34016833739`; runtime restored by `34018104403` |
 | D2 | Read-mix API workers spend CPU scanning the optional-auth cache | cProfile run `34016833739` attributes about 24–25 seconds per worker profile to `_trim_optional_auth_session_cache`, a full dict scan on every cache insert; API CPU was ~99% while PostgreSQL CPU averaged 14.85% and DB connections stayed below the 52-connection safety ceiling | Sweep expired optional-auth entries at most every 5 seconds; retain per-entry expiry/status validation and the existing oldest-entry capacity eviction | Remove repeated O(n) cache scans, reducing Python CPU per authenticated read and potentially raising useful read throughput without changing workers, pools, auth semantics, or load thresholds | Expired untouched entries remain resident until the next sweep (bounded by 5s); cache remains capacity-bounded; invalidate paths are unchanged | New cache unit test; backend/security/quality gates; exact `read-mix-stress-v2` targeted A/B on the same contract; restore normal runtime after diagnostics | Accepted: run `34019227166` on `9f48eadf` returned 20,000×200 + 10,000×304 with 0 errors/unexpected; combined p95 `1697.138→1596.691 ms` (−5.9%), TTFB p95 `1694.728→1596.526 ms` (−5.8%), p99 `2032.400→1930.282 ms` (−5.0%), useful rate `109.349→113.622/s` (+3.9%); CPU remained ~98%/core, so further CPU work is required |
-| D3 | v3 and anomaly reports do not expose API-side Nginx status/timing distributions | Existing observer retained only HTML Nginx aggregates; v3 exposed client timeouts but its Nginx API path was not available for correlation | Add bounded API Nginx aggregation by safe route class, method, status, request/upstream timing, and `cf_ray` presence; never serialize URI or request IDs | Identify whether unexpected v3/anomaly outcomes reached Nginx/API and where time was spent, without changing application behavior | Report schema changes; route classes are intentionally coarse; observer still samples the log window | Unit test for route-class/status/timing redaction; local observer/parser gates; deploy exact SHA; rerun v3 and correlate artifacts | Pending |
+| D3 | v3 and anomaly reports do not expose API-side Nginx status/timing distributions | Existing observer retained only HTML Nginx aggregates; v3 exposed client timeouts but its Nginx API path was not available for correlation | Add bounded API Nginx aggregation by safe route class, method, status, request/upstream timing, and `cf_ray` presence; never serialize URI or request IDs | Identify whether unexpected v3/anomaly outcomes reached Nginx/API and where time was spent, without changing application behavior | Report schema changes; route classes are intentionally coarse; observer still samples the log window | Unit test for route-class/status/timing redaction; local observer/parser gates; deploy exact SHA; rerun v3 and correlate artifacts | Instrumentation accepted. `34022561287` observed all current v3 responses at Nginx: 0 timeout/520/522, 13,406×200 and 1,376×503; historical timeout path was not reproduced and remains unexplained |
+| D4 | Auth bootstrap spends CPU building the full profile read model for a shell avatar-only response | Auth cProfile `34023738831` attributes about 3.1–3.2 s sampled self CPU to `_build_profile_with_session`, with `build_profile_read_model` and `_variant_json_aggregate` on the `/bootstrap` call stack; the route makes 2 SQL/request and `player_profiles` appears once per bootstrap, while the shell consumes only `avatar_url`/`avatar_media` | Replace the auth bootstrap's full profile read-model/cache-fill path with one avatar-only projection query in the already authoritative auth DB session; keep the existing profile read-model path for profile endpoints | Reduce Python/ORM/SQL payload work and one Redis cache workflow per bootstrap; reduce authenticated page TTFB/pool contention without changing auth authority, roles, media contract, workers, pools, or load thresholds | Avatar projection adds one direct read on the request session; query must preserve ready-media URL/descriptor semantics; profile endpoints and invalidation remain unchanged | Unit/service tests for avatar projection and fallback semantics; backend/security/quality gates; exact authenticated-page targeted retest; Ready Vote SLO and v3 regression gates | Pending |
 
 ## Required next sequence
 

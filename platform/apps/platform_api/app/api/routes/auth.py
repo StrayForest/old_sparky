@@ -143,12 +143,11 @@ async def get_auth_bootstrap(
 ) -> AuthBootstrapResponse:
     """Return the small identity snapshot used by every authenticated SSR shell."""
 
-    # A profile read-model miss owns its own short-lived DB session. Release
-    # the authoritative auth session first so a cache fill cannot pin two
-    # connections for the duration of one request.
+    # The avatar projection runs on the authoritative auth session. Keeping it
+    # on this same bounded connection avoids a second pool checkout while
+    # retaining the full profile read model for profile endpoints.
     try:
-        await release_db_connection(db_session)
-        return await build_auth_bootstrap(auth_session)
+        return await build_auth_bootstrap(auth_session, db_session=db_session)
     finally:
         await release_db_connection(db_session)
 

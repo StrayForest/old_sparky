@@ -18,6 +18,7 @@ from sqlalchemy.orm import aliased
 
 from apps.platform_api.app.api.schemas import (
     DeadlockProfileResponse,
+    MediaDescriptorResponse,
     TournamentProfileResponse,
     TournamentScopedProfileResponse,
 )
@@ -86,6 +87,14 @@ class ProfileReadModel:
 class ProfileReadModelEnvelope:
     revision: int
     payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileAvatarReadModel:
+    """The small media projection needed by the authenticated SSR shell."""
+
+    avatar_url: str | None
+    avatar_media: MediaDescriptorResponse | None
 
 
 def profile_read_model_key(user_id: str) -> str:
@@ -238,6 +247,43 @@ def _media_descriptor(
         ),
     )
     return media_descriptor_response(descriptor)
+
+
+async def get_profile_avatar_read_model(
+    db_session: AsyncSession,
+    user_id: str,
+) -> ProfileAvatarReadModel | None:
+    """Read only the avatar projection required by auth bootstrap.
+
+    The full profile read model also hydrates DeadlockProfile, banner media and
+    both variant aggregates.  Those fields are intentionally kept on profile
+    endpoints; the global SSR shell only needs the avatar descriptor.
+    """
+
+    AvatarAsset = aliased(MediaAsset, name="avatar_asset")
+    row = (
+        await db_session.execute(
+            select(
+                AvatarAsset,
+                _variant_json_aggregate(PlayerProfile.avatar_asset_id).label(
+                    "avatar_variants"
+                ),
+            )
+            .select_from(PlayerProfile)
+            .outerjoin(AvatarAsset, AvatarAsset.id == PlayerProfile.avatar_asset_id)
+            .where(PlayerProfile.user_id == user_id)
+        )
+    ).first()
+    if row is None:
+        return None
+    avatar_media = _media_descriptor(row[0], row.avatar_variants)
+    return ProfileAvatarReadModel(
+        avatar_url=compatibility_media_url(
+            avatar_media,
+            preferred_variant="avatar-256",
+        ),
+        avatar_media=avatar_media,
+    )
 
 
 def _revision_timestamp(value: datetime | None) -> int:
