@@ -99,24 +99,39 @@ class PersistenceConcurrencyRemediationTests(PlatformIsolatedAsyncioTestCase):
     async def test_auth_bootstrap_auth_is_authoritative_without_last_seen_touch(self) -> None:
         request = Mock()
         db_session = Mock()
-        resolved = SimpleNamespace()
-        with patch.object(
-            security,
-            "_get_authenticated_session",
-            AsyncMock(return_value=resolved),
-        ) as resolve:
+        request.cookies = {"platform_session": "token"}
+        db_session.execute = AsyncMock(
+            return_value=SimpleNamespace(
+                all=lambda: [
+                    SimpleNamespace(
+                        user_id="user-1",
+                        user_email="player@example.com",
+                        user_display_name="Player",
+                        user_status="active",
+                        user_email_verified_at=None,
+                        public_tournament_credits=2,
+                        private_tournament_credits=4,
+                        user_created_at=datetime(2026, 9, 2, tzinfo=UTC),
+                        role_slug="player",
+                    ),
+                ],
+            )
+        )
+        settings = SimpleNamespace(
+            platform_session_cookie_name="platform_session",
+            platform_environment="test",
+            platform_email_verification_required=False,
+        )
+        with patch.object(security, "get_settings", return_value=settings):
             result = await security.get_authenticated_session_for_auth_bootstrap(
                 request,
                 db_session,
             )
 
-        self.assertIs(result, resolved)
-        resolve.assert_awaited_once_with(
-            request,
-            db_session,
-            load_roles=True,
-            touch_session=False,
-        )
+        self.assertEqual(result.user.id, "user-1")
+        self.assertEqual(result.role_slugs, frozenset({"player"}))
+        self.assertEqual(result.user.display_name, "Player")
+        db_session.execute.assert_awaited_once()
 
     async def test_ready_vote_auth_invalid_and_unverified_states_are_unauthorized(self) -> None:
         settings = SimpleNamespace(

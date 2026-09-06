@@ -224,6 +224,29 @@ class AuthenticatedSession:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthBootstrapUser:
+    """The authoritative identity projection required by the SSR shell."""
+
+    id: str
+    email: str | None
+    display_name: str
+    status: str
+    email_verified_at: datetime | None
+    public_tournament_credits: int
+    private_tournament_credits: int
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AuthBootstrapSession:
+    """Detached auth result for the read-only bootstrap endpoint."""
+
+    user: AuthBootstrapUser
+    role_slugs: frozenset[str]
+    now: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ReadyVoteAuthSnapshot:
     """Detached, minimum authentication result for a Ready Vote request."""
 
@@ -595,20 +618,71 @@ async def get_authenticated_session(
 async def get_authenticated_session_for_auth_bootstrap(
     request: Request,
     db_session: AsyncSession = Depends(get_db_session),
-) -> AuthenticatedSession:
+) -> AuthBootstrapSession:
     """Authenticate the SSR shell without writing last-seen telemetry.
 
     The bootstrap remains authoritative against PostgreSQL and still loads
-    roles. A page render is read-only, however, so it must not open the
-    separate short transaction used by mutation-oriented session touch
-    telemetry on every authenticated HTML request.
+    roles. It selects only the fields needed by the shell instead of
+    hydrating full ``User`` and ``UserSession`` ORM objects. A page render is
+    read-only, so it must not open the separate short transaction used by
+    mutation-oriented session touch telemetry on every authenticated HTML
+    request.
     """
 
-    return await _get_authenticated_session(
-        request,
-        db_session,
-        load_roles=True,
-        touch_session=False,
+    settings = get_settings()
+    token = request.cookies.get(settings.platform_session_cookie_name)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    now = datetime.now(UTC)
+    user_predicates = [User.status == "active"]
+    if email_verification_required(settings):
+        user_predicates.append(
+            (User.email.is_(None)) | (User.email_verified_at.is_not(None))
+        )
+
+    rows = (
+        await db_session.execute(
+            select(
+                User.id.label("user_id"),
+                User.email.label("user_email"),
+                User.display_name.label("user_display_name"),
+                User.status.label("user_status"),
+                User.email_verified_at.label("user_email_verified_at"),
+                User.public_tournament_credits.label("public_tournament_credits"),
+                User.private_tournament_credits.label("private_tournament_credits"),
+                User.created_at.label("user_created_at"),
+                Role.slug.label("role_slug"),
+            )
+            .select_from(UserSession)
+            .join(User, User.id == UserSession.user_id)
+            .outerjoin(UserRole, UserRole.user_id == User.id)
+            .outerjoin(Role, Role.id == UserRole.role_id)
+            .where(
+                UserSession.token_digest == session_token_digest(token),
+                UserSession.invalidated_at.is_(None),
+                UserSession.expires_at > now,
+                *user_predicates,
+            )
+        )
+    ).all()
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session is invalid.")
+
+    first = rows[0]
+    return AuthBootstrapSession(
+        user=AuthBootstrapUser(
+            id=str(first.user_id),
+            email=first.user_email,
+            display_name=first.user_display_name,
+            status=first.user_status,
+            email_verified_at=first.user_email_verified_at,
+            public_tournament_credits=int(first.public_tournament_credits or 0),
+            private_tournament_credits=int(first.private_tournament_credits or 0),
+            created_at=first.user_created_at,
+        ),
+        role_slugs=frozenset(str(row.role_slug) for row in rows if row.role_slug),
+        now=now,
     )
 
 
