@@ -148,14 +148,13 @@ Every optimization must add one row here before targeted retest.
 | ID | Problem | Evidence | Change | Expected effect | Risk | Test | Result |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | D1 | Auth/read attribution incomplete | Canonical run has no SSR stage or CPU call-stack data | SSR diagnostic and read cProfile on unchanged source | Attribute web upstream and Python CPU time | Temporary diagnostic overhead; no persistent profiler | Same authenticated/read profiles; restore baseline after each | SSR evidence captured in `34015185444`; cProfile evidence captured in `34016833739`; runtime restored by `34018104403` |
-| D2 | Read-mix API workers spend CPU scanning the optional-auth cache | cProfile run `34016833739` attributes about 24–25 seconds per worker profile to `_trim_optional_auth_session_cache`, a full dict scan on every cache insert; API CPU was ~99% while PostgreSQL CPU averaged 14.85% and DB connections stayed below the 52-connection safety ceiling | Sweep expired optional-auth entries at most every 5 seconds; retain per-entry expiry/status validation and the existing oldest-entry capacity eviction | Remove repeated O(n) cache scans, reducing Python CPU per authenticated read and potentially raising useful read throughput without changing workers, pools, auth semantics, or load thresholds | Expired untouched entries remain resident until the next sweep (bounded by 5s); cache remains capacity-bounded; invalidate paths are unchanged | New cache unit test; backend/security/quality gates; exact `read-mix-stress-v2` targeted A/B on the same contract; restore normal runtime after diagnostics | Pending |
+| D2 | Read-mix API workers spend CPU scanning the optional-auth cache | cProfile run `34016833739` attributes about 24–25 seconds per worker profile to `_trim_optional_auth_session_cache`, a full dict scan on every cache insert; API CPU was ~99% while PostgreSQL CPU averaged 14.85% and DB connections stayed below the 52-connection safety ceiling | Sweep expired optional-auth entries at most every 5 seconds; retain per-entry expiry/status validation and the existing oldest-entry capacity eviction | Remove repeated O(n) cache scans, reducing Python CPU per authenticated read and potentially raising useful read throughput without changing workers, pools, auth semantics, or load thresholds | Expired untouched entries remain resident until the next sweep (bounded by 5s); cache remains capacity-bounded; invalidate paths are unchanged | New cache unit test; backend/security/quality gates; exact `read-mix-stress-v2` targeted A/B on the same contract; restore normal runtime after diagnostics | Accepted: run `34019227166` on `9f48eadf` returned 20,000×200 + 10,000×304 with 0 errors/unexpected; combined p95 `1697.138→1596.691 ms` (−5.9%), TTFB p95 `1694.728→1596.526 ms` (−5.8%), p99 `2032.400→1930.282 ms` (−5.0%), useful rate `109.349→113.622/s` (+3.9%); CPU remained ~98%/core, so further CPU work is required |
 
 ## Required next sequence
 
-1. Test D2 locally, deploy the reviewed change through the normal exact-SHA
-   release path, and repeat only `read-mix-stress-v2`; keep the change only if
-   useful throughput/latency and correctness improve or remain within the
-   agreed regression gate.
+1. Identify the next highest-cost read endpoint/function after D2, using the
+   cProfile and route/SQL evidence; keep PostgreSQL pool sizes and workers
+   unchanged until a measured resource bottleneck justifies them.
 2. Correlate the v3 timeout phase and anomaly with the available access,
    application, system, PostgreSQL, Redis, and deployment records. If records
    still cannot prove a path, document the data limitation and improve only the
