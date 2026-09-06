@@ -36,6 +36,7 @@ password_hasher = PasswordHash.recommended()
 DUMMY_PASSWORD_HASH = password_hasher.hash("oldsparky-dummy-login-credential")
 OPTIONAL_AUTH_SESSION_CACHE_TTL_SECONDS = 15 * 60.0
 OPTIONAL_AUTH_SESSION_CACHE_MAX_ENTRIES = 30_000
+OPTIONAL_AUTH_SESSION_CACHE_SWEEP_INTERVAL_SECONDS = 5.0
 
 
 def hash_password(password: str) -> str:
@@ -260,16 +261,29 @@ class CachedAuthenticatedSession:
 
 
 _optional_auth_session_cache: dict[str, CachedAuthenticatedSession] = {}
+_optional_auth_cache_last_sweep_monotonic = 0.0
 
 
 def _trim_optional_auth_session_cache(now_monotonic: float) -> None:
-    expired_keys = [
-        token_digest
-        for token_digest, entry in _optional_auth_session_cache.items()
-        if entry.expires_at <= now_monotonic
-    ]
-    for token_digest in expired_keys:
-        _optional_auth_session_cache.pop(token_digest, None)
+    global _optional_auth_cache_last_sweep_monotonic
+
+    # Each cache hit still validates its own TTL and session state.  The
+    # periodic sweep only reclaims expired entries that have not been touched;
+    # avoiding a full-cache scan on every cache insert keeps optional auth
+    # cheap under high-volume authenticated reads.
+    if (
+        now_monotonic - _optional_auth_cache_last_sweep_monotonic
+        >= OPTIONAL_AUTH_SESSION_CACHE_SWEEP_INTERVAL_SECONDS
+    ):
+        expired_keys = [
+            token_digest
+            for token_digest, entry in _optional_auth_session_cache.items()
+            if entry.expires_at <= now_monotonic
+        ]
+        for token_digest in expired_keys:
+            _optional_auth_session_cache.pop(token_digest, None)
+        _optional_auth_cache_last_sweep_monotonic = now_monotonic
+
     while len(_optional_auth_session_cache) >= OPTIONAL_AUTH_SESSION_CACHE_MAX_ENTRIES:
         oldest_key = next(iter(_optional_auth_session_cache), None)
         if oldest_key is None:

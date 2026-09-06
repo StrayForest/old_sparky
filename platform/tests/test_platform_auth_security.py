@@ -4,6 +4,7 @@ import asyncio
 import unittest
 from contextlib import AsyncExitStack
 from http.cookies import SimpleCookie
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -14,7 +15,7 @@ from sqlalchemy import delete, or_, select, update
 from apps.platform_api.app.api.routes import auth as auth_routes
 from apps.platform_api.app.main import create_app
 from apps.platform_api.app.services import auth_mail
-from python_packages.platform_infra import auth_rate_limit, human_verification
+from python_packages.platform_infra import auth_rate_limit, human_verification, security
 from python_packages.platform_infra.auth_lifecycle import (
     issue_password_reset_token,
     one_time_code_digest,
@@ -101,6 +102,51 @@ class AuthSecurityUnitTests(PlatformIsolatedAsyncioTestCase):
         }
         values.update(overrides)
         return PlatformSettings(**values)
+
+    async def test_optional_auth_cache_sweep_is_periodic_and_remains_bounded(self) -> None:
+        original_cache = security._optional_auth_session_cache.copy()
+        original_last_sweep = security._optional_auth_cache_last_sweep_monotonic
+        self.addCleanup(security._optional_auth_session_cache.clear)
+        self.addCleanup(security._optional_auth_session_cache.update, original_cache)
+        self.addCleanup(
+            setattr,
+            security,
+            "_optional_auth_cache_last_sweep_monotonic",
+            original_last_sweep,
+        )
+
+        security._optional_auth_session_cache.clear()
+        security._optional_auth_session_cache.update(
+            {
+                "expired": SimpleNamespace(expires_at=0.0),
+                "live": SimpleNamespace(expires_at=10_000.0),
+            }
+        )
+        security._optional_auth_cache_last_sweep_monotonic = 100.0
+
+        before_sweep = (
+            100.0 + security.OPTIONAL_AUTH_SESSION_CACHE_SWEEP_INTERVAL_SECONDS - 0.001
+        )
+        security._trim_optional_auth_session_cache(before_sweep)
+        self.assertIn("expired", security._optional_auth_session_cache)
+
+        security._trim_optional_auth_session_cache(
+            100.0 + security.OPTIONAL_AUTH_SESSION_CACHE_SWEEP_INTERVAL_SECONDS
+        )
+        self.assertNotIn("expired", security._optional_auth_session_cache)
+        self.assertIn("live", security._optional_auth_session_cache)
+
+        with patch.object(security, "OPTIONAL_AUTH_SESSION_CACHE_MAX_ENTRIES", 2):
+            security._optional_auth_session_cache.clear()
+            security._optional_auth_session_cache.update(
+                {
+                    "oldest": SimpleNamespace(expires_at=20_000.0),
+                    "newest": SimpleNamespace(expires_at=20_000.0),
+                }
+            )
+            security._trim_optional_auth_session_cache(10_000.0)
+
+        self.assertEqual(list(security._optional_auth_session_cache), ["newest"])
 
     async def test_one_time_code_digest_is_bound_to_the_server_secret(self) -> None:
         first = one_time_code_digest("user-1", "123456", secret_key="first-secret")
