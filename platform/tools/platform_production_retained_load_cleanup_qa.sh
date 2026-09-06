@@ -2,12 +2,11 @@
 set +x
 set -euo pipefail
 
-TRUSTED_REPO_ROOT="/root/old_sparky"
-PLATFORM_ROOT="$TRUSTED_REPO_ROOT/platform"
-TOOLS_DIR="$PLATFORM_ROOT/tools"
-SCRIPT_PATH="$TOOLS_DIR/platform_production_retained_load_cleanup_qa.sh"
-QA_PYTHON="$PLATFORM_ROOT/.venv_platform/bin/python"
 RUNTIME_ROOT="/opt/oldsparky/platform"
+PLATFORM_ROOT="$RUNTIME_ROOT/current"
+TOOLS_DIR="$PLATFORM_ROOT/tools"
+SCRIPT_PATH="$(readlink -f -- "$TOOLS_DIR/platform_production_retained_load_cleanup_qa.sh")"
+QA_PYTHON="$RUNTIME_ROOT/shared/venv/bin/python"
 RUN_ROOT_BASE="$RUNTIME_ROOT/shared/production-retained-matrix"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 CONFIRMATION="DELETE-PRODUCTION-RETAINED-LOAD"
@@ -19,7 +18,7 @@ if [[ "$EUID" -ne 0 ]]; then
   exit 1
 fi
 if [[ "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" != "$SCRIPT_PATH" ]]; then
-  echo "Production retained cleanup must run from the fixed root-controlled checkout." >&2
+  echo "Production retained cleanup must run from the active immutable release." >&2
   exit 1
 fi
 exec 9>"$LOCK_PATH"
@@ -52,21 +51,12 @@ cleanup_run_id="$5"
   exit 1
 }
 
-test -d "$TRUSTED_REPO_ROOT/.git" || {
-  echo "Trusted production checkout is missing." >&2
-  exit 1
-}
 test -x "$QA_PYTHON" || {
   echo "Production cleanup Python runtime is missing." >&2
   exit 1
 }
 test -L "$RUNTIME_ROOT/current" || {
   echo "Active production release is missing." >&2
-  exit 1
-}
-checkout_sha="$(git -C "$TRUSTED_REPO_ROOT" rev-parse --verify HEAD)"
-test "$checkout_sha" = "$target_sha" || {
-  echo "Trusted production checkout does not match the cleanup workflow SHA." >&2
   exit 1
 }
 release_sha="$($SYSTEM_PYTHON -I - "$RUNTIME_ROOT/current/RELEASE.json" <<'PY'

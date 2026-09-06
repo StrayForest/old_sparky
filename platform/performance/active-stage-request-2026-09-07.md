@@ -24,8 +24,8 @@ is authorized by this work order.
 
 - Repository branch: `dev`; baseline checkout for this stage: `73f81596`.
 - `origin/dev` matched the baseline checkout before implementation began.
-- Production baseline documented in `docs/CURRENT.md`: deployed SHA prefix
-  `a32c0feb`.
+- Production baseline documented in `docs/CURRENT.md`: the latest deployed
+  SHA is `73f8159622458cd2e38ad0f9257163ba7c596982`.
 - PostgreSQL safety budget remains 52 server backends.
 - The 2026-09-06 v1/v2 reports recorded TCP established peaks of 54/53. Those
   historical decisions remain FAIL under their old TCP-based gate, but the
@@ -69,6 +69,15 @@ reports retain their original TCP terminology for auditability.
 - The system sampler adds bounded CPU steal, process start/exit detection with
   timestamps, TCP socket-state pressure, listen overflow/drop counters and
   non-invasive conntrack utilization when procfs exposes it.
+- The first fresh authenticated-page workflow attempt
+  [`34067801649`](https://github.com/StrayForest/old_sparky/actions/runs/34067801649)
+  failed closed before fixture creation: the deployed release was `73f8159`,
+  but the old `/root/old_sparky` checkout was stale. Cleanup also ran and
+  confirmed there was no retained fixture to remove. The load supervisor,
+  cleanup and abort paths now execute from the exact immutable
+  `/opt/oldsparky/platform/current` release and verify `RELEASE.json`; the
+  deployment state machine shares the retained-load lock so the release cannot
+  change during measurement or cleanup.
 
 ### D9 candidate
 
@@ -90,15 +99,17 @@ semantic regression.
 | Nginx/connectivity diagnostics | Existing structured access log already has request/upstream timing and correlation fields | Log schema drift or sensitive data leakage | Nginx contract tests and parser tests |
 | Bounded external 52x diagnostics | Load client already retained `cf_ray`; Cloudflare fields are explicitly allowlisted | Artifact growth or header leakage | External-load unit tests |
 | System correlation counters | Procfs reads are local, bounded and optional | Kernel-specific missing files | Instrumentation tests plus retained observer artifact review |
+| Exact release contour for retained loads | First fresh attempt exposed a stale trusted-checkout gate before measurement | A moving release could invalidate evidence or cleanup | Release-contract tests, shared deployment/load lock and exact `RELEASE.json` checks |
 | D9 minimal shell projection | Current `SiteHeader`, auth schema and profile read-model code | Missing avatar variant or auth/no-JS regression | Backend/web tests, then same-contract QA/preprod A/B |
 
 ## Required next gates
 
 1. Run the focused backend/tool/web verification gates and inspect the exact
    retained failure log if any gate fails.
-2. Run a fresh authenticated-page diagnostic on the current code, preferably
-   QA/preprod, and attribute client TTFB through Nginx connect/header/response,
-   Next stages, bootstrap duration, pool wait, SQL and response bytes.
+2. After the release-contour fix is deployed, rerun the fresh
+   `authenticated-page-load-v1` control and attribute client TTFB through
+   Nginx connect/header/response, Next stages, bootstrap duration, pool wait,
+   SQL and response bytes.
 3. Compare D9 candidate versus unchanged code under the same workload. Keep
    the target TTFB p95 `<1,000 ms` open unless measured evidence closes it.
 4. Run corrected v1/v2 targeted production gates only after local/CI checks.
@@ -109,7 +120,9 @@ semantic regression.
 
 ## Explicitly not done
 
-- No production load or lifecycle profile was run in this stage.
+- No production load reached the measurement barrier in this stage yet; run
+  `34067801649` was setup-rejected by the stale-checkout guard and performed
+  exact cleanup without creating a fixture.
 - No historical raw artifact was rewritten.
 - No root cause is assigned to the historical 520/522 episodes or anomaly
   `33991798604` without a correlated recurrence.

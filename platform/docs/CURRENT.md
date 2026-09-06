@@ -68,6 +68,14 @@ remain a separate diagnostic metric. The historical v1/v2 decisions are not
 rewritten; their 54/53 TCP peaks are not by themselves proof of a backend
 budget breach.
 
+The first fresh authenticated-page attempt after that instrumentation change
+([`34067801649`](https://github.com/StrayForest/old_sparky/actions/runs/34067801649))
+failed closed before measurement because the production load supervisor still
+required a stale `/root/old_sparky` checkout, even though the active immutable
+release was the dispatched SHA. The retained-load supervisor, cleanup and abort
+paths are being moved to the exact `current` release, with a shared
+deployment/load lock, before the control run is repeated.
+
 Remaining performance work is explicit: authenticated page TTFB improved to
 2,291.430 ms but remains above the <1,000 ms target; the current D9 candidate
 still needs an unchanged-contract A/B; and the historical v3 timeout plus

@@ -116,7 +116,7 @@ jobs:
           load_run_id="$3"
           control_email="$4"
           cleanup_run_id="$5"
-          sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_cleanup_qa.sh \
+          sudo -n -- /opt/oldsparky/platform/current/tools/platform_production_retained_load_cleanup_qa.sh \
             "$confirmation" "$target_sha" "$load_run_id" "$control_email" "$cleanup_run_id"
           REMOTE
           remote_status=$?

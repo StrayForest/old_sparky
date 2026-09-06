@@ -15,11 +15,10 @@ import time
 
 
 SCRIPT_PATHS = {
-    "/root/old_sparky/platform/tools/platform_production_external_fixture_qa.sh",
+    "/opt/oldsparky/platform/current/tools/platform_production_external_fixture_qa.sh",
 }
 LOCK_PATH = "/run/lock/oldsparky-retained-load-matrix.lock"
 CONFIRMATION = "ABORT-PRODUCTION-RETAINED-LOAD"
-TRUSTED_REPO_ROOT = "/root/old_sparky"
 RELEASE_PATH = "/opt/oldsparky/platform/current/RELEASE.json"
 RUN_ROOT_BASE = Path("/opt/oldsparky/platform/shared/production-retained-matrix")
 ABORT_EXPORT_BASE = Path("/tmp")
@@ -168,14 +167,6 @@ def main() -> int:
     if not re.fullmatch(r"[0-9]+", args.load_run_id):
         raise SystemExit("load_run_id must be numeric")
 
-    checkout_sha = subprocess.run(
-        ["git", "-C", TRUSTED_REPO_ROOT, "rev-parse", "--verify", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if checkout_sha != args.target_sha:
-        raise SystemExit("trusted production checkout does not match target_sha")
     try:
         release_payload = Path(RELEASE_PATH).read_text(encoding="utf-8")
         release_sha = str(json.loads(release_payload).get("source_git_commit") or "")

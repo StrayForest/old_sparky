@@ -94,7 +94,7 @@ jobs:
             -o ServerAliveCountMax=3 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            sudo -n -- /root/old_sparky/platform/tools/platform_abort_retained_load.py \
+            sudo -n -- /opt/oldsparky/platform/current/tools/platform_abort_retained_load.py \
               "$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" \
             > "$ssh_output_file" 2>&1
           remote_status=$?

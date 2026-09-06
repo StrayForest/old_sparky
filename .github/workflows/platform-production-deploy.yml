@@ -362,6 +362,13 @@ jobs:
             exit 1
           }
 
+          # Keep immutable release activation out of an active retained-load
+          # window.  The load supervisor and its cleanup use this same lock,
+          # so the exact current release remains stable for both measurement
+          # and evidence collection.
+          exec 8>/run/lock/oldsparky-retained-load-matrix.lock
+          flock -n 8 || fail "a retained production load or cleanup is active"
+
           cleanup() {
             if [[ -n "$artifact_dir" && -d "$artifact_dir" && ! -L "$artifact_dir" ]]; then
               rm -rf -- "$artifact_dir"
