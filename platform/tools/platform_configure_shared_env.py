@@ -197,6 +197,16 @@ RUNTIME_PROFILES = {
         "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "0",
         "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "0",
     },
+    # Keep each API worker's admitted DB-backed read set within its pool and
+    # move the excess burst into a small, connection-free queue. The total
+    # admitted-plus-waiting envelope remains 32; this is a TTFB/pool-contention
+    # candidate, not a capacity increase.
+    "authenticated-read-admission-24x8": {
+        "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED": "true",
+        "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "24",
+        "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "8",
+        "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "2000",
+    },
     "pool-pre-ping-off": {
         "PLATFORM_DB_POOL_PRE_PING": "false",
     },

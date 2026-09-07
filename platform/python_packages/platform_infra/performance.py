@@ -34,6 +34,14 @@ WORKSPACE_PERF_KEYS = (
 _WORKSPACE_STAGE_NAMES = frozenset(
     key.removesuffix("_ms") for key in WORKSPACE_PERF_KEYS
 )
+AUTH_BOOTSTRAP_PERF_KEYS = (
+    "auth_bootstrap_auth_query_ms",
+    "auth_bootstrap_avatar_query_ms",
+    "auth_bootstrap_response_build_ms",
+)
+_AUTH_BOOTSTRAP_STAGE_NAMES = frozenset(
+    key.removesuffix("_ms") for key in AUTH_BOOTSTRAP_PERF_KEYS
+)
 
 
 @dataclass(slots=True)
@@ -55,6 +63,7 @@ class RequestPerformanceMetrics:
     authenticated_read_admission_limit: int = 0
     authenticated_read_admission_inflight: int = 0
     authenticated_read_admission_shed: bool = False
+    auth_bootstrap_stage_seconds: dict[str, float] = field(default_factory=dict)
     redis_read_model_events: list[dict[str, Any]] = field(default_factory=list)
     profile_read_model_events: list[dict[str, Any]] = field(default_factory=list)
     tournament_profile_access_events: list[dict[str, Any]] = field(default_factory=list)
@@ -263,6 +272,27 @@ def record_authenticated_read_admission(
     metrics.authenticated_read_admission_limit = max(0, int(limit))
     metrics.authenticated_read_admission_inflight = max(0, int(inflight))
     metrics.authenticated_read_admission_shed = not admitted
+
+
+def record_auth_bootstrap_stage(name: str, elapsed_seconds: float) -> None:
+    """Attach one bounded stage from the authoritative bootstrap path."""
+
+    metrics = _current_metrics.get()
+    if metrics is None or name not in _AUTH_BOOTSTRAP_STAGE_NAMES:
+        return
+    metrics.auth_bootstrap_stage_seconds[name] = (
+        metrics.auth_bootstrap_stage_seconds.get(name, 0.0)
+        + max(0.0, float(elapsed_seconds))
+    )
+
+
+@contextmanager
+def measure_auth_bootstrap_stage(name: str) -> Iterator[None]:
+    started_at = perf_counter()
+    try:
+        yield
+    finally:
+        record_auth_bootstrap_stage(name, perf_counter() - started_at)
 
 
 def record_redis_read_model_event(
@@ -537,6 +567,9 @@ class RequestPerformanceMiddleware:
             "authenticated_read_admission_limit=%s "
             "authenticated_read_admission_inflight=%s "
             "authenticated_read_admission_shed=%s "
+            "auth_bootstrap_auth_query_ms=%.2f "
+            "auth_bootstrap_avatar_query_ms=%.2f "
+            "auth_bootstrap_response_build_ms=%.2f "
             "compute_ms=%.2f compute_blocks=%s "
             "ready_vote_auth_ms=%.2f ready_vote_checkout_count=%s "
             "ready_vote_checkout_ms=%.2f "
@@ -582,6 +615,9 @@ class RequestPerformanceMiddleware:
             metrics.authenticated_read_admission_limit,
             metrics.authenticated_read_admission_inflight,
             metrics.authenticated_read_admission_shed,
+            metrics.auth_bootstrap_stage_seconds.get("auth_bootstrap_auth_query", 0.0) * 1000,
+            metrics.auth_bootstrap_stage_seconds.get("auth_bootstrap_avatar_query", 0.0) * 1000,
+            metrics.auth_bootstrap_stage_seconds.get("auth_bootstrap_response_build", 0.0) * 1000,
             metrics.compute_time_seconds * 1000,
             metrics.compute_blocks,
             metrics.ready_vote_spans.get("ready_vote_auth_ms", 0.0) * 1000,

@@ -86,10 +86,16 @@ completed their 200/304 contracts without errors or retries.
 The authenticated page returned 20,000/20,000 HTTP 200 responses, with total
 p95 `3357.939 ms` and HTML TTFB p95 `2568.859 ms`. The D9 shell projection is
 functionally clean, but this run is not a same-window unchanged-code A/B and
-the requested authenticated TTFB target `<1,000 ms` remains open. The next
-step is a bounded web/API investigation; no worker or pool scaling is inferred.
+the requested authenticated TTFB target `<1,000 ms` remains open. The final
+attribution for the bounded authenticated HTML/TTFB investigation is archived
+in
+[`performance-authenticated-html-ttfb-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-2026-09-07.md);
+the active single-candidate follow-up is in
+[`active-authenticated-html-ttfb-2026-09-07.md`](active-authenticated-html-ttfb-2026-09-07.md).
+The candidate changes only bounded authenticated-read admission; no worker or
+DB-pool scaling is inferred.
 The execution record remains available in
-[the 2026-09-07 work order](active-stage-request-2026-09-07.md), now closed
+[the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.
 
 ## Read-path candidate slice (2026-09-03)

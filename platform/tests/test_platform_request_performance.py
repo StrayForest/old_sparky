@@ -125,6 +125,39 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         finally:
             performance.reset_request_metrics(token)
 
+    def test_auth_bootstrap_stages_record_bounded_components(self) -> None:
+        token = performance.start_request_metrics(
+            "GET",
+            "/api/v1/auth/bootstrap",
+        )
+        try:
+            performance.record_auth_bootstrap_stage(
+                "auth_bootstrap_auth_query",
+                0.012,
+            )
+            performance.record_auth_bootstrap_stage(
+                "auth_bootstrap_avatar_query",
+                0.034,
+            )
+            performance.record_auth_bootstrap_stage(
+                "auth_bootstrap_response_build",
+                0.005,
+            )
+            performance.record_auth_bootstrap_stage("untrusted_stage", 99.0)
+            metrics = performance.current_request_metrics()
+            self.assertIsNotNone(metrics)
+            assert metrics is not None
+            self.assertEqual(
+                metrics.auth_bootstrap_stage_seconds,
+                {
+                    "auth_bootstrap_auth_query": 0.012,
+                    "auth_bootstrap_avatar_query": 0.034,
+                    "auth_bootstrap_response_build": 0.005,
+                },
+            )
+        finally:
+            performance.reset_request_metrics(token)
+
     def test_pool_hold_fields_are_emitted_for_slow_reads(self) -> None:
         middleware = performance.RequestPerformanceMiddleware(app=None)
         metrics = self.metrics(method="GET")
@@ -145,6 +178,30 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         self.assertIn("pool_checkout_wait_ms=200.00", rendered)
         self.assertIn("pool_connection_hold_ms=900.00", rendered)
         self.assertIn("pool_connection_hold_count=1", rendered)
+
+    def test_auth_bootstrap_stage_fields_are_emitted(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        metrics = self.metrics(method="GET")
+        metrics.path = "/api/v1/auth/bootstrap"
+        metrics.auth_bootstrap_stage_seconds = {
+            "auth_bootstrap_auth_query": 0.012,
+            "auth_bootstrap_avatar_query": 0.034,
+            "auth_bootstrap_response_build": 0.005,
+        }
+        metrics.sql_time_seconds = 1.0
+        with (
+            patch.object(performance, "get_settings", return_value=self.settings()),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            middleware._log_if_slow(
+                {"route": SimpleNamespace(path="/auth/bootstrap")},
+                metrics,
+                200,
+            )
+            rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
+        self.assertIn("auth_bootstrap_auth_query_ms=12.00", rendered)
+        self.assertIn("auth_bootstrap_avatar_query_ms=34.00", rendered)
+        self.assertIn("auth_bootstrap_response_build_ms=5.00", rendered)
 
     def test_workspace_stages_are_recorded_on_the_existing_request_metrics(self) -> None:
         token = performance.start_request_metrics(

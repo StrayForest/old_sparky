@@ -29,6 +29,7 @@ on:
           - api-1x48
           - read-mix-cprofile
           - authenticated-read-admission-32
+          - authenticated-read-admission-24x8
           - pool-pre-ping-off
           - web-ssr-diagnostics
           - uvicorn-classic
@@ -685,7 +686,7 @@ jobs:
                 fail "web SSR diagnostic profile health check failed; baseline restored"
               fi
               ;;
-            read-mix-cprofile|authenticated-read-admission-32|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24)
+            read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24)
               candidate_profile_args=(
                 --only PLATFORM_API_WORKERS
                 --only PLATFORM_UVICORN_LOOP

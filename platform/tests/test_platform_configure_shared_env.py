@@ -175,6 +175,15 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
             },
         )
         self.assertEqual(
+            configure.RUNTIME_PROFILES["authenticated-read-admission-24x8"],
+            {
+                "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED": "true",
+                "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "24",
+                "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "8",
+                "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "2000",
+            },
+        )
+        self.assertEqual(
             configure.RUNTIME_PROFILES["pool-pre-ping-off"],
             {"PLATFORM_DB_POOL_PRE_PING": "false"},
         )

@@ -1,8 +1,8 @@
-# Performance stage request — 2026-09-07
+# Archived performance stage request — 2026-09-07
 
 Status: completed with explicit follow-up. The canonical closeout and complete
 13-profile production matrix are in
-[`docs/archive/performance-stage-2026-09-07.md`](../docs/archive/performance-stage-2026-09-07.md).
+[`performance-stage-2026-09-07.md`](performance-stage-2026-09-07.md).
 
 This is the recorded work order for the follow-up performance stage. The
 2026-09-06 production matrix remains historical evidence; it is not rewritten
@@ -112,7 +112,7 @@ All 13 canonical profiles were rerun against deployed SHA
 `bba3fb278e348906a6942aee8462b758c3d616ef`. Every profile passed its declared
 acceptance and exact cleanup. The complete table, run links, status splits,
 origin-safety peaks and remaining follow-up are in the
-[archived closeout](../docs/archive/performance-stage-2026-09-07.md).
+[archived closeout](performance-stage-2026-09-07.md).
 
 The Ready Vote stress profiles returned only their declared `503`
 `READY_VOTE_OVERLOADED` responses when shedding was required; no unexpected

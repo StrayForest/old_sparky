@@ -304,6 +304,34 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
         self.assertEqual(route["pool_connection_hold_ms"]["avg_ms"], 900.0)
         self.assertEqual(summary["authenticated_read_admission_wait_ms"]["avg_ms"], 2.0)
 
+    def test_request_perf_summary_exposes_auth_bootstrap_breakdown(self) -> None:
+        summary = summarize_request_perf_logs(
+            [
+                "request_perf request_id=one method=GET path=/api/v1/auth/bootstrap "
+                "route=/auth/bootstrap status=200 total_ms=900.00 request_ms=900.00 "
+                "sql_ms=229.00 db_sql_ms=229.00 sql_count=2 max_sql_ms=130.00 "
+                "compute_ms=10.00 compute_blocks=1 response_bytes=368 "
+                "pool_checkout_wait_ms=100.00 pool_connection_hold_ms=600.00 "
+                "auth_bootstrap_auth_query_ms=120.00 "
+                "auth_bootstrap_avatar_query_ms=90.00 "
+                "auth_bootstrap_response_build_ms=5.00",
+            ],
+            tournament_slug=None,
+        )
+
+        route = summary["by_route"]["/auth/bootstrap"]
+        self.assertEqual(
+            route["auth_bootstrap"]["auth_bootstrap_auth_query_ms"]["avg_ms"],
+            120.0,
+        )
+        self.assertEqual(
+            route["auth_bootstrap"]["auth_bootstrap_avatar_query_ms"]["p95_ms"],
+            90.0,
+        )
+        self.assertEqual(route["non_sql_after_pool_time"]["avg_ms"], 561.0)
+        self.assertEqual(route["connection_after_sql_ms"]["avg_ms"], 371.0)
+        self.assertEqual(summary["auth_bootstrap"]["auth_bootstrap_response_build_ms"]["avg_ms"], 5.0)
+
     def test_write_burst_acceptance_separates_target_budget(self) -> None:
         acceptance = evaluate_write_burst_profiles(
             [
