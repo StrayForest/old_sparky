@@ -4,7 +4,7 @@ import { cookies } from "next/headers";
 import { Suspense } from "react";
 import { Hero } from "@/components/layout/hero";
 import { RouteLoadingShell } from "@/components/layout/loading-shells";
-import { TournamentDetailView } from "@/components/tournaments/tournament-detail-view";
+import { TournamentDetailViewBoundary } from "@/components/tournaments/tournament-detail-view-boundary";
 import { PlatformApiError } from "@/lib/platform-api";
 import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
 import { getServerTournamentWorkspace } from "@/lib/server-tournament-workspace";
@@ -84,7 +84,7 @@ async function TournamentDetailContent({
         subtitle="Проверьте параметры турнира, расписание и текущий этап."
       />
       <main className="main">
-        <TournamentDetailView
+        <TournamentDetailViewBoundary
           tournament={tournament}
           actorUserId={actorUserId}
         />

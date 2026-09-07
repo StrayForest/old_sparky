@@ -91,7 +91,7 @@ attribution for the bounded authenticated HTML/TTFB investigation is archived
 in
 [`performance-authenticated-html-ttfb-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-2026-09-07.md);
 the active single-candidate follow-up is in
-[`active-authenticated-html-ttfb-prefetch-2026-09-07.md`](active-authenticated-html-ttfb-prefetch-2026-09-07.md).
+[`active-authenticated-html-ttfb-client-boundary-2026-09-07.md`](active-authenticated-html-ttfb-client-boundary-2026-09-07.md).
 The rejected admission candidate and its exact A/B result are archived in
 [`performance-authenticated-html-ttfb-admission-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-admission-2026-09-07.md).
 The first merged overlap candidate was deployed in release
@@ -101,10 +101,11 @@ cleanup, but TTFB p95 was `2527.624 ms`, only `1.605%` below baseline. The
 follow-up SSR-only diagnostic run `34148261104` measured post-data
 unattributed upstream p95 `2340.311 ms` after detail data-ready p95
 `1112.536 ms`; production was restored to ordinary `ready-vote-static-8`.
-The active second candidate puts the existing detail content behind an
-explicit route-local Suspense boundary to test early Next fallback/flush. It
-does not change workers, DB-pool sizing, API contracts or authoritative
-session validation.
+The archived route-local Suspense candidate improved TTFB p95 to
+`2325.559 ms` in exact run `34153656342` but did not close the target. The
+active candidate defers the heavy interactive detail view from SSR while
+retaining server workspace/auth reads and SSR header/hero; it does not change
+workers, DB-pool sizing, API contracts or authoritative session validation.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.
