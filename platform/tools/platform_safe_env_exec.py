@@ -353,7 +353,7 @@ def validate_trusted_command(command: list[str], *, pythonpath: Path) -> None:
         except OSError as exc:
             raise SafeEnvError("clean exec target is unavailable") from exc
         if metadata.st_uid != 0 or (
-            path not in {TRUSTED_PYTHON, ACTIVE_PYTHON}
+            path not in {TRUSTED_PYTHON, ACTIVE_PYTHON, ACTIVE_PLATFORM_ROOT}
             and stat.S_IMODE(metadata.st_mode) & 0o022
         ):
             raise SafeEnvError("clean exec target ownership is unsafe")
