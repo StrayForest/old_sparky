@@ -69,25 +69,28 @@ original TCP-based wording and decisions.
 
 ## Latest production performance stage
 
-The 2026-09-06 performance stage is complete as far as the available evidence
-allows. The exact 13-profile repeat used the unchanged contracts and thresholds
-on deployed SHA `a32c0feb`. Read useful throughput improved from the prior
-~105–107 req/s ceiling to a 104.878 req/s full-ramp rate with a best stage of
-125.484 req/s and no ramp timeouts. Ready Vote capacity measured 80 logical
-actions/s with no shedding in the capacity profile, and the unchanged SLO
-recheck remained within baseline (`195.665/433.655 ms` accepted p95/p99
-versus `192.028/424.893 ms`).
+The 2026-09-07 performance stage is complete with an explicit authenticated
+HTML follow-up. The exact 13-profile repeat used the unchanged contracts and
+thresholds on deployed SHA
+`bba3fb278e348906a6942aee8462b758c3d616ef`; lifecycle profiles remain
+preproduction-only. The full evidence table, run links, change ledger,
+origin-safety results and cleanup proof are in the archived
+[2026-09-07 performance-stage report](../docs/archive/performance-stage-2026-09-07.md).
 
-The authenticated page remained functionally correct and improved to total p95
-`3,023.669 ms` and TTFB p95 `2,291.430 ms`, but the requested sub-second TTFB
-target was not reached. Saturation v1/v2 remain origin-safety failures because
-the old observer gate saw 54/53 TCP established sockets against the 52-
-connection ceiling; neither run produced timeout, 520 or 522 responses. The
-historical v3 timeout and anomaly `33991798604` remain unexplained transient
-episodes. The full evidence table, change ledger, cleanup proof and remaining
-follow-ups are in the archived [2026-09-06 performance-stage report](../docs/archive/performance-stage-2026-09-06.md).
-The active measurement-correction and D9 work order is
-[2026-09-07](active-stage-request-2026-09-07.md).
+All 13 profiles passed their declared acceptance and exact cleanup. Backend
+peaks were 51–52 against the 52-backend budget. Normal Ready Vote/read traffic
+had no unexpected statuses, timeouts, 520s or 522s. Stress profiles returned
+only their declared controlled `503` overload responses, while read profiles
+completed their 200/304 contracts without errors or retries.
+
+The authenticated page returned 20,000/20,000 HTTP 200 responses, with total
+p95 `3357.939 ms` and HTML TTFB p95 `2568.859 ms`. The D9 shell projection is
+functionally clean, but this run is not a same-window unchanged-code A/B and
+the requested authenticated TTFB target `<1,000 ms` remains open. The next
+step is a bounded web/API investigation; no worker or pool scaling is inferred.
+The execution record remains available in
+[the 2026-09-07 work order](active-stage-request-2026-09-07.md), now closed
+with that explicit follow-up.
 
 ## Read-path candidate slice (2026-09-03)
 

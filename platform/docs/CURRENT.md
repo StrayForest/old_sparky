@@ -44,51 +44,46 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-The latest production performance stage completed on 2026-09-06 against
-deployed SHA `a32c0feb`. The exact 13-profile matrix was repeated with the
-original contracts, thresholds and dataset sizes; lifecycle profiles were not
-run on production. The detailed evidence, before/after table and cleanup proof
-are in the [archived performance-stage report](archive/performance-stage-2026-09-06.md);
-the original work order is retained in
-[`platform/performance/active-stage-request-2026-09-06.md`](../performance/active-stage-request-2026-09-06.md).
+The latest production performance stage completed on 2026-09-07 against
+deployed SHA `bba3fb278e348906a6942aee8462b758c3d616ef`. The measurement
+boundary and retained-load runtime contour were corrected, then the exact
+13-profile matrix was rerun with the original contracts, thresholds and
+dataset sizes; lifecycle profiles were not run on production. The complete
+table, run links, status splits, origin-safety peaks and cleanup proof are in
+the [archived performance-stage report](archive/performance-stage-2026-09-07.md).
 
-Measured result: read-ramp useful rate improved from the prior ~105–107 req/s
-ceiling to 104.878 req/s for the full ramp, with a best stage of 125.484 req/s
-and no c16–c128 timeouts. Ready Vote capacity measured 80 logical actions/s
-with no shedding in the unchanged capacity profile. The unchanged SLO
-recheck was 195.665/433.655 ms accepted p95/p99 versus the 192.028/424.893 ms
-baseline, with zero errors, shedding or retries.
+All 13 profiles passed their declared acceptance and exact cleanup. Normal
+Ready Vote/read traffic had no unexpected statuses, timeouts, 520s or 522s.
+Stress profiles shed only with the declared `503 READY_VOTE_OVERLOADED`
+response, and read profiles completed their 200/304 contracts. PostgreSQL
+backend peaks were `51–52`, within the 52-backend budget, with ownership
+consistency passing.
 
-The follow-up stage is active in
-[`platform/performance/active-stage-request-2026-09-07.md`](../performance/active-stage-request-2026-09-07.md).
-It corrects the safety-evidence boundary before another load gate: the
-canonical `max_postgres_backend_connections` budget is checked against the
-`pg_stat_activity` backend count, while `/proc/net/tcp*` established sockets
-remain a separate diagnostic metric. The historical v1/v2 decisions are not
-rewritten; their 54/53 TCP peaks are not by themselves proof of a backend
-budget breach.
+The authenticated control returned 20,000/20,000 HTTP 200 responses with total
+p95 `3357.939 ms` and HTML TTFB p95 `2568.859 ms`. The D9 projection is
+functionally clean and its stress contract passed, but this was not a
+same-window unchanged-code A/B and it did not close the requested authenticated
+TTFB target of `<1,000 ms`. The remaining owner-level priority is a bounded
+authenticated web/API investigation; no worker or pool scaling is authorized
+by this evidence.
 
-The first fresh authenticated-page attempt after that instrumentation change
+The earlier stale-checkout attempt
 ([`34067801649`](https://github.com/StrayForest/old_sparky/actions/runs/34067801649))
-failed closed before measurement because the production load supervisor still
-required a stale `/root/old_sparky` checkout, even though the active immutable
-release was the dispatched SHA. The retained-load supervisor, cleanup and abort
-paths now use the exact `current` release with a shared deployment/load lock.
-The first post-deploy control [`34089756423`](https://github.com/StrayForest/old_sparky/actions/runs/34089756423)
-completed 20,000/20,000 authenticated HTML responses with zero errors,
-timeouts, 520s or 522s; total p95 was 3,213.900 ms and HTML TTFB p95 was
-2,482.642 ms. Its measurement passed, but cleanup failed at the safe-env
-interpreter contour before deleting the retained fixture; the follow-up patch
-switches that guard to the active immutable release and shared runtime before
-the next control.
+failed closed before fixture creation. The first post-deploy control
+([`34089756423`](https://github.com/StrayForest/old_sparky/actions/runs/34089756423))
+passed its HTTP measurement but failed cleanup at the safe-env contour;
+corrected cleanup [`34096318760`](https://github.com/StrayForest/old_sparky/actions/runs/34096318760)
+removed the retained fixture completely. Subsequent controls and the full
+matrix used the exact immutable `current` release with the shared
+deployment/load lock.
 
 The GitHub `Protect dev` ruleset no longer requires PR approval for merge.
 Branch deletion and force-push remain protected, and exact-SHA CI/build plus
 the automatic production deployment chain remain mandatory.
 
-Remaining performance work is explicit: authenticated page TTFB improved to
-2,291.430 ms but remains above the <1,000 ms target; the current D9 candidate
-still needs an unchanged-contract A/B; and the historical v3 timeout plus
+Remaining performance work is explicit: authenticated page TTFB remains above
+the `<1,000 ms` target and needs a bounded same-contract A/B only after the
+remaining web/API component is isolated. The historical v3 timeout plus
 anomaly `33991798604` remain unexplained transient episodes. No worker/pool
 increase or external Cloudflare root cause is asserted without further
 evidence.
