@@ -71,4 +71,5 @@ test("mobile draft has a rotate prompt and a dedicated side action control", () 
   assert.match(appSource, /data-confirm-action/u);
   assert.match(stylesSource, /max-width: 900px\) and \(orientation: landscape\)/u);
   assert.match(stylesSource, /\.room-view \.sequence-editor--live/u);
+  assert.match(stylesSource, /max-width: 820px\) and \(orientation: portrait\)[\s\S]*?\.room-view \.sequence-editor--live \{\s*display: none;/u);
 });
