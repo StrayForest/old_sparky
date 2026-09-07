@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-06
+- Last reviewed: 2026-09-07
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -73,8 +73,18 @@ The first fresh authenticated-page attempt after that instrumentation change
 failed closed before measurement because the production load supervisor still
 required a stale `/root/old_sparky` checkout, even though the active immutable
 release was the dispatched SHA. The retained-load supervisor, cleanup and abort
-paths are being moved to the exact `current` release, with a shared
-deployment/load lock, before the control run is repeated.
+paths now use the exact `current` release with a shared deployment/load lock.
+The first post-deploy control [`34089756423`](https://github.com/StrayForest/old_sparky/actions/runs/34089756423)
+completed 20,000/20,000 authenticated HTML responses with zero errors,
+timeouts, 520s or 522s; total p95 was 3,213.900 ms and HTML TTFB p95 was
+2,482.642 ms. Its measurement passed, but cleanup failed at the safe-env
+interpreter contour before deleting the retained fixture; the follow-up patch
+switches that guard to the active immutable release and shared runtime before
+the next control.
+
+The GitHub `Protect dev` ruleset no longer requires PR approval for merge.
+Branch deletion and force-push remain protected, and exact-SHA CI/build plus
+the automatic production deployment chain remain mandatory.
 
 Remaining performance work is explicit: authenticated page TTFB improved to
 2,291.430 ms but remains above the <1,000 ms target; the current D9 candidate

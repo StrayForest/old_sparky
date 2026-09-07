@@ -78,6 +78,15 @@ reports retain their original TCP terminology for auditability.
   `/opt/oldsparky/platform/current` release and verify `RELEASE.json`; the
   deployment state machine shares the retained-load lock so the release cannot
   change during measurement or cleanup.
+- The first post-deploy control
+  [`34089756423`](https://github.com/StrayForest/old_sparky/actions/runs/34089756423)
+  created the full 40-tournament/20,000-user fixture and completed 20,000
+  authenticated HTML responses with zero errors, timeout, 520 or 522 samples.
+  Total p95 was 3,213.900 ms and HTML TTFB p95 was 2,482.642 ms. The load gate
+  still failed because cleanup reached the safe-env wrapper with the shared
+  production Python path while that wrapper only accepted the retired fixed
+  checkout contour; the fixture must be removed by the corrected cleanup path
+  before another production run.
 
 ### D9 candidate
 
@@ -120,9 +129,10 @@ semantic regression.
 
 ## Explicitly not done
 
-- No production load reached the measurement barrier in this stage yet; run
-  `34067801649` was setup-rejected by the stale-checkout guard and performed
-  exact cleanup without creating a fixture.
+- The stale-checkout rejection in run `34067801649` is resolved. Run
+  `34089756423` reached the measurement barrier and passed the HTTP response
+  portion, but its cleanup gate failed before fixture deletion; the corrected
+  cleanup must run before the result can be accepted.
 - No historical raw artifact was rewritten.
 - No root cause is assigned to the historical 520/522 episodes or anomaly
   `33991798604` without a correlated recurrence.

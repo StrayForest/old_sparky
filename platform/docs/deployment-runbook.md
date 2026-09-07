@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-07
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -12,11 +12,16 @@ Use this document for the normal immutable release path. CSP mode changes and pr
    GitHub target SHA.
 2. Push the reviewed commit to `dev` and wait for the GitHub Actions
    `Platform security and build` gate. A successful push run for the current
-   `dev` HEAD is the normal production approval signal and is consumed by the
+   `dev` HEAD is the normal production release signal and is consumed by the
    automatic deployment workflow; do not substitute a manually run local test.
 3. Confirm migration expand/rollback compatibility.
 4. Confirm services are healthy, disk has at least 5 GiB free and is below 85%, and `current`/`previous` releases are protected.
 5. Create a fresh restore-verified backup.
+
+The active GitHub `Protect dev` ruleset does not require a pull-request
+approval for merge. It still protects the branch against deletion and
+force-push, and the exact-SHA security/build status plus automatic production
+deployment chain remain mandatory release gates.
 
 ## Normal production deploy through GitHub Actions
 

@@ -80,12 +80,17 @@ class SafeEnvExecTests(unittest.TestCase):
             child["PLATFORM_DATABASE_URL"], values["PLATFORM_DATABASE_URL"]
         )
 
-    def test_command_validation_rejects_opt_runtime(self) -> None:
-        with self.assertRaisesRegex(safe_env.SafeEnvError, "fixed root-controlled"):
+    def test_command_validation_requires_matching_runtime_contour(self) -> None:
+        with self.assertRaisesRegex(
+            safe_env.SafeEnvError, "approved live QA DB tool"
+        ):
             safe_env.validate_trusted_command(
                 [
-                    "/opt/oldsparky/platform/shared/venv/bin/python",
-                    "/opt/oldsparky/platform/current/tools/platform_cleanup_live_user_qa.py",
+                    str(safe_env.ACTIVE_PYTHON),
+                    str(
+                        safe_env.ACTIVE_PLATFORM_ROOT
+                        / "tools/platform_cleanup_live_user_qa.py"
+                    ),
                 ],
                 pythonpath=safe_env.TRUSTED_PLATFORM_ROOT,
             )
