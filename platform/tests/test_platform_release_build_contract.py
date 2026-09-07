@@ -240,12 +240,28 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("ControlPath %s", workflow)
         self.assertIn("Remove external-load SSH control socket", workflow)
         self.assertIn("platform_production_retained_load_cleanup_qa.sh", workflow)
+        self.assertIn(
+            "/opt/oldsparky/platform/current/tools/"
+            "platform_production_external_fixture_qa.sh",
+            workflow,
+        )
+        self.assertIn(
+            "/opt/oldsparky/platform/current/tools/"
+            "platform_production_retained_load_cleanup_qa.sh",
+            workflow,
+        )
         self.assertIn("Always invoke the exact supervisor", workflow)
         self.assertNotIn('echo \'{"ok":true,"fixture_absent":true}\'', workflow)
         cleanup_supervisor = (
             REPO_ROOT
             / "platform/tools/platform_production_retained_load_cleanup_qa.sh"
         ).read_text()
+        self.assertIn('PLATFORM_ROOT="$RUNTIME_ROOT/current"', supervisor)
+        self.assertIn('PLATFORM_ROOT="$RUNTIME_ROOT/current"', cleanup_supervisor)
+        self.assertIn('QA_PYTHON="$RUNTIME_ROOT/shared/venv/bin/python"', supervisor)
+        self.assertIn('QA_PYTHON="$RUNTIME_ROOT/shared/venv/bin/python"', cleanup_supervisor)
+        self.assertNotIn("TRUSTED_REPO_ROOT", supervisor)
+        self.assertNotIn("TRUSTED_REPO_ROOT", cleanup_supervisor)
         self.assertIn(
             "for candidate_profile in read-mix write-burst external-vote",
             cleanup_supervisor,

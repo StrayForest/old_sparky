@@ -6,12 +6,11 @@ set -euo pipefail
 # production load workflow.  The measured HTTP generator runs on the
 # GitHub-hosted runner; no production retained-matrix generator is allowed
 # here.
-TRUSTED_REPO_ROOT="/root/old_sparky"
-PLATFORM_ROOT="$TRUSTED_REPO_ROOT/platform"
-TOOLS_DIR="$PLATFORM_ROOT/tools"
-SCRIPT_PATH="$TOOLS_DIR/platform_production_external_fixture_qa.sh"
-QA_PYTHON="$PLATFORM_ROOT/.venv_platform/bin/python"
 RUNTIME_ROOT="/opt/oldsparky/platform"
+PLATFORM_ROOT="$RUNTIME_ROOT/current"
+TOOLS_DIR="$PLATFORM_ROOT/tools"
+SCRIPT_PATH="$(readlink -f -- "$TOOLS_DIR/platform_production_external_fixture_qa.sh")"
+QA_PYTHON="$RUNTIME_ROOT/shared/venv/bin/python"
 OUTPUT_ROOT_BASE="$RUNTIME_ROOT/shared/production-retained-matrix"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"
@@ -24,7 +23,7 @@ if [[ "$EUID" -ne 0 ]]; then
   exit 1
 fi
 if [[ "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" != "$SCRIPT_PATH" ]]; then
-  echo "Production external-load fixture must run from the fixed root-controlled checkout." >&2
+  echo "Production external-load fixture must run from the active immutable release." >&2
   exit 1
 fi
 exec 9>"$LOCK_PATH"
@@ -79,22 +78,12 @@ external_vote_users_per_tournament="$8"
   exit 1
 }
 
-test -d "$TRUSTED_REPO_ROOT/.git" || {
-  echo "Trusted production checkout is missing." >&2
-  exit 1
-}
 test -x "$QA_PYTHON" || {
   echo "Production QA Python runtime is missing." >&2
   exit 1
 }
 test -L "$RUNTIME_ROOT/current" || {
   echo "Active production release is missing." >&2
-  exit 1
-}
-
-checkout_sha="$(git -C "$TRUSTED_REPO_ROOT" rev-parse --verify HEAD)"
-test "$checkout_sha" = "$target_sha" || {
-  echo "Trusted production checkout does not match the dispatched target SHA." >&2
   exit 1
 }
 

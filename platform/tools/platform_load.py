@@ -336,7 +336,7 @@ def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
             percentiles=("p50", "p90", "p95", "p99"),
         )
         for field in (
-            "max_postgres_connections",
+            "max_postgres_backend_connections",
             "max_waiting_backends",
             "max_lock_waiters",
             "max_cpu_per_core_percent",
@@ -357,7 +357,7 @@ def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
     if resource_safety is not None:
         resource = _require_mapping(resource_safety, field="acceptance.resource_safety")
         for field in (
-            "max_postgres_connections",
+            "max_postgres_backend_connections",
             "max_waiting_backends",
             "max_lock_waiters",
             "max_cpu_per_core_percent",

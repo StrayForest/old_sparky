@@ -42,7 +42,7 @@ def _origin_safety_checks(
     server = origin_observability.get("server_request_perf_logs") or {}
     pool = server.get("pool_checkout_wait_ms") or {}
     waits = system.get("postgres_waits") or {}
-    postgres_connections = system.get("postgres_established_connections") or {}
+    postgres_backends = system.get("postgres_backend_connections") or {}
     cpu_per_core = system.get("cpu_per_core") or {}
     missing_diagnostics: list[str] = []
 
@@ -58,10 +58,15 @@ def _origin_safety_checks(
             checks[f"pool_checkout_{percentile_name}_ms"] = actual <= budget
     _budget_check(
         checks,
-        "postgres_connections",
-        _number(postgres_connections, "max"),
-        _number(contract, "max_postgres_connections"),
+        "postgres_backend_connections",
+        _number(postgres_backends, "max"),
+        _number(contract, "max_postgres_backend_connections"),
     )
+    ownership_consistency = system.get("postgres_backend_ownership_consistency")
+    if isinstance(ownership_consistency, dict):
+        checks["postgres_backend_ownership_consistent"] = (
+            ownership_consistency.get("all_match") is True
+        )
     _budget_check(
         checks,
         "waiting_backends",
@@ -93,6 +98,10 @@ def _origin_safety_checks(
         "passed": bool(checks) and all(checks.values()),
         "evidence_scope": "origin_observer_summary",
         "missing_diagnostics": missing_diagnostics,
+        "postgres_backend_connections": postgres_backends,
+        "postgres_tcp_established_connections": (
+            system.get("postgres_tcp_established_connections") or {}
+        ),
     }
 
 

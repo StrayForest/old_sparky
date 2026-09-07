@@ -67,6 +67,13 @@ class PlatformInstallNginxTests(unittest.TestCase):
         self.assertNotIn("proxy_set_header Upgrade $http_upgrade;", vhost)
         self.assertNotIn("proxy_set_header Connection $platform_connection_upgrade;", vhost)
 
+    def test_access_log_keeps_upstream_connect_and_header_timing(self) -> None:
+        vhost = MODULE.DEFAULT_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn('"upstream_connect_time":"$upstream_connect_time"', vhost)
+        self.assertIn('"upstream_header_time":"$upstream_header_time"', vhost)
+        self.assertIn('"upstream_time":"$upstream_response_time"', vhost)
+
     def test_main_config_is_valid(self) -> None:
         MODULE.validate_main_config(MODULE.DEFAULT_MAIN_SOURCE)
 

@@ -143,7 +143,7 @@ jobs:
               "$GITHUB_RUN_ID" external-vote "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
             > "$remote_log" 2>&1 <<'REMOTE' &
           set -Eeuo pipefail
-          sudo -n -- /root/old_sparky/platform/tools/platform_production_external_fixture_qa.sh "$@"
+          sudo -n -- /opt/oldsparky/platform/current/tools/platform_production_external_fixture_qa.sh "$@"
           REMOTE
           remote_pid="$!"
           set -e
@@ -247,7 +247,7 @@ jobs:
           # Always invoke the exact supervisor.  A missing filesystem run root
           # can still have a durable PreprodTestRun fixture inventory and must
           # take the orphan-cleanup path instead of being treated as absent.
-          sudo -n -- /root/old_sparky/platform/tools/platform_production_retained_load_cleanup_qa.sh \
+          sudo -n -- /opt/oldsparky/platform/current/tools/platform_production_retained_load_cleanup_qa.sh \
             DELETE-PRODUCTION-RETAINED-LOAD "$target_sha" "$load_run_id" "$control_email" "$cleanup_run_id"
           REMOTE
           cleanup_status="$?"

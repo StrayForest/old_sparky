@@ -409,9 +409,20 @@ async def async_main() -> int:
         {
             "timestamp": sample.get("timestamp"),
             "cpu_per_core_percent": sample.get("cpu_per_core_percent"),
+            "cpu_steal_per_core_percent": sample.get("cpu_steal_per_core_percent"),
             "postgres_cpu_percent": sample.get("postgres_cpu_percent"),
             "api_connections": sample.get("api_connections"),
-            "postgres_connections": sample.get("postgres_connections"),
+            "postgres_tcp_established_connections": sample.get("postgres_tcp_connections"),
+            "postgres_backend_connections": (
+                (sample.get("postgres_waits") or {}).get("backend_connections")
+            ),
+            "postgres_backend_ownership": (
+                (sample.get("postgres_waits") or {}).get("backend_ownership")
+            ),
+            "tcp_socket_states": sample.get("tcp_socket_states"),
+            "tcp_listen_counters": sample.get("tcp_listen_counters"),
+            "conntrack": sample.get("conntrack"),
+            "process_lifecycle": sample.get("process_lifecycle"),
             "redis_connections": sample.get("redis_connections"),
             "gunicorn": sample.get("gunicorn"),
             "postgres_waits": sample.get("postgres_waits"),

@@ -32,7 +32,7 @@
     "logical_latency": {"p95_ms": 8000, "p99_ms": 12000},
     "max_shed_percent": 100,
     "max_retry_amplification_percent": 0,
-    "max_postgres_connections": 52,
+    "max_postgres_backend_connections": 52,
     "max_waiting_backends": 20,
     "max_lock_waiters": 20,
     "max_cpu_per_core_percent": 100,

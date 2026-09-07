@@ -51,7 +51,7 @@
       "steady_duration_seconds": 1
     },
     "resource_safety": {
-      "max_postgres_connections": 80,
+      "max_postgres_backend_connections": 80,
       "max_waiting_backends": 40,
       "max_lock_waiters": 40,
       "max_cpu_per_core_percent": 100,

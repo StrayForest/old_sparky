@@ -27,7 +27,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
                 "swap_total_bytes": 0,
                 "load_average": {"1m": 0.1, "5m": 0.1, "15m": 0.1},
                 "nginx_connections": {"established": 1},
-                "postgres_connections": {"established": 2},
+                "postgres_tcp_connections": {"established": 2},
                 "redis_connections": {"established": 3},
                 "gunicorn": {"workers": 2},
                 "postgres_cpu_percent": 4.0,
@@ -47,9 +47,11 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
                     "max_waiting_query_ms": 10,
                     "max_lock_waiting_query_ms": 0,
                     "active_query_samples": [{"query_age_ms": 10}],
-                    "connection_ownership": [
+                    "backend_connections": 4,
+                    "backend_ownership": [
                         {"application_name": "oldsparky-api", "current": 2},
                         {"application_name": "oldsparky-worker", "current": 1},
+                        {"application_name": "unknown", "current": 1},
                     ],
                 },
                 "celery_backlog": {
@@ -69,13 +71,23 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             10,
         )
         self.assertEqual(
-            result["postgres_connection_ownership"]["oldsparky-api"]["max"],
+            result["postgres_backend_ownership"]["oldsparky-api"]["max"],
             2,
         )
         self.assertEqual(
-            result["postgres_connection_ownership"]["oldsparky-worker"]["last"],
+            result["postgres_backend_ownership"]["oldsparky-worker"]["last"],
             1,
         )
+        self.assertEqual(result["postgres_backend_connections"]["max"], 4)
+        self.assertEqual(
+            sum(
+                entry["max"]
+                for entry in result["postgres_backend_ownership"].values()
+            ),
+            result["postgres_backend_connections"]["max"],
+        )
+        self.assertEqual(result["postgres_backend_ownership"]["unknown"]["max"], 1)
+        self.assertTrue(result["postgres_backend_ownership_consistency"]["all_match"])
 
     def test_burst_offsets_are_even_and_do_not_exceed_window(self) -> None:
         offsets = burst_offsets(count=5, spread_seconds=10)
@@ -326,7 +338,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
                     "cpu1": {"avg_percent": 24, "max_percent": 100},
                 },
                 "load_average_1m": {"max": 1.5},
-                "postgres_established_connections": {"max": 40},
+                "postgres_backend_connections": {"max": 40},
                 "postgres_waits": {
                     "max_lock_waiters": 1,
                     "max_ungranted_locks": 0,

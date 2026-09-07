@@ -61,6 +61,12 @@ The measured HTTP generator runs only on the GitHub-hosted runner. The
 production origin may prepare marked fixtures, collect lightweight pressure
 evidence and perform exact cleanup; it must not execute the measured client.
 
+Current resource-safety semantics are explicit: `max_postgres_backend_connections`
+is evaluated from the observer's `pg_stat_activity` backend count and grouped
+`postgres_backend_ownership`; `postgres_tcp_established_connections` is a
+separate `/proc/net/tcp*` socket diagnostic. Historical reports retain their
+original TCP-based wording and decisions.
+
 ## Latest production performance stage
 
 The 2026-09-06 performance stage is complete as far as the available evidence
@@ -75,11 +81,13 @@ versus `192.028/424.893 ms`).
 The authenticated page remained functionally correct and improved to total p95
 `3,023.669 ms` and TTFB p95 `2,291.430 ms`, but the requested sub-second TTFB
 target was not reached. Saturation v1/v2 remain origin-safety failures because
-the observer saw 54/53 PostgreSQL connections against the 52-connection
-ceiling; neither run produced timeout, 520 or 522 responses. The historical v3
-timeout and anomaly `33991798604` remain unexplained transient episodes. The
-full evidence table, change ledger, cleanup proof and remaining follow-ups are
-in the archived [2026-09-06 performance-stage report](../docs/archive/performance-stage-2026-09-06.md).
+the old observer gate saw 54/53 TCP established sockets against the 52-
+connection ceiling; neither run produced timeout, 520 or 522 responses. The
+historical v3 timeout and anomaly `33991798604` remain unexplained transient
+episodes. The full evidence table, change ledger, cleanup proof and remaining
+follow-ups are in the archived [2026-09-06 performance-stage report](../docs/archive/performance-stage-2026-09-06.md).
+The active measurement-correction and D9 work order is
+[2026-09-07](active-stage-request-2026-09-07.md).
 
 ## Read-path candidate slice (2026-09-03)
 

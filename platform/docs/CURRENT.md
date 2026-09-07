@@ -59,12 +59,29 @@ with no shedding in the unchanged capacity profile. The unchanged SLO
 recheck was 195.665/433.655 ms accepted p95/p99 versus the 192.028/424.893 ms
 baseline, with zero errors, shedding or retries.
 
+The follow-up stage is active in
+[`platform/performance/active-stage-request-2026-09-07.md`](../performance/active-stage-request-2026-09-07.md).
+It corrects the safety-evidence boundary before another load gate: the
+canonical `max_postgres_backend_connections` budget is checked against the
+`pg_stat_activity` backend count, while `/proc/net/tcp*` established sockets
+remain a separate diagnostic metric. The historical v1/v2 decisions are not
+rewritten; their 54/53 TCP peaks are not by themselves proof of a backend
+budget breach.
+
+The first fresh authenticated-page attempt after that instrumentation change
+([`34067801649`](https://github.com/StrayForest/old_sparky/actions/runs/34067801649))
+failed closed before measurement because the production load supervisor still
+required a stale `/root/old_sparky` checkout, even though the active immutable
+release was the dispatched SHA. The retained-load supervisor, cleanup and abort
+paths are being moved to the exact `current` release, with a shared
+deployment/load lock, before the control run is repeated.
+
 Remaining performance work is explicit: authenticated page TTFB improved to
-2,291.430 ms but remains above the <1,000 ms target; saturation v1/v2 failed
-only the origin-safety connection ceiling after observer samples reached
-54/53 versus 52; and the historical v3 timeout plus anomaly `33991798604`
-remain unexplained transient episodes. No worker/pool increase or external
-Cloudflare root cause is asserted without further evidence.
+2,291.430 ms but remains above the <1,000 ms target; the current D9 candidate
+still needs an unchanged-contract A/B; and the historical v3 timeout plus
+anomaly `33991798604` remain unexplained transient episodes. No worker/pool
+increase or external Cloudflare root cause is asserted without further
+evidence.
 
 ### Historical AS-18 context
 
