@@ -400,8 +400,17 @@ function renderRoom() {
   const showHeroes = room.status !== "completed";
 
   app.innerHTML = `
-    ${renderBrand()}
-    <div class="room-shell">
+    <div class="room-view">
+      ${renderBrand()}
+      ${room.status === "drafting" ? `<div class="draft-rotate-notice" role="status">
+        <div class="draft-rotate-notice__icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none"><rect x="15" y="7" width="18" height="34" rx="3" stroke="currentColor" stroke-width="2.5"/><path d="M20 12h8M23 36h2" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/><path d="M7 20c1.7-5 6.1-8.5 11.4-9.1M7 20l-.8-5.7M7 20l5.5-.6M41 28c-1.7 5-6.1 8.5-11.4 9.1M41 28l.8 5.7M41 28l-5.5.6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <p class="eyebrow">Драфт идёт</p>
+        <h2>Поверните телефон</h2>
+        <p>В горизонтальном режиме поле героев и команды поместятся на одном экране.</p>
+      </div>` : ""}
+      <div class="room-shell">
       ${lastError ? `<div class="error-box">${escapeHtml(lastError)}</div>` : ""}
       <div class="room-topbar">
         <div class="room-meta">
@@ -436,11 +445,12 @@ function renderRoom() {
             </div>` : `<div class="hero-complete-state"><span class="hero-complete-state__mark">✓</span><strong>Драфт завершён</strong><span>Пики и баны показаны по сторонам</span></div>`}
           </section>
           ${renderLiveSequence()}
-          ${room.status === "completed" ? renderCompletedActions() : renderActionBar(selectedHero, step, canAct)}
+          ${room.status === "completed" ? renderCompletedActions("desktop") : renderActionBar(selectedHero, step, canAct, "desktop")}
         </section>
-        ${renderTeamPanel("B")}
+        ${renderTeamPanel("B", { selectedHero, step, canAct })}
       </div>
       <div class="ad-zone" aria-label="Реклама"></div>
+      </div>
     </div>
   `;
 
@@ -448,11 +458,16 @@ function renderRoom() {
   attachImageFallbacks();
 }
 
-function renderTeamPanel(side) {
+function renderTeamPanel(side, actionContext = null) {
   const picks = room.picks[side];
   const bans = room.bans[side];
   const expectedBans = room.rules.sequence.filter((step) => step.action === "ban" && step.side === side).length;
   const renderSlots = (items, count) => Array.from({ length: count }, (_, index) => items[index] ? renderMiniHero(items[index]) : renderEmptySlot()).join("");
+  const mobileAction = side === "B" && actionContext
+    ? room.status === "completed"
+      ? renderCompletedActions("mobile-side")
+      : renderActionBar(actionContext.selectedHero, actionContext.step, actionContext.canAct, "mobile-side")
+    : "";
   return `
     <aside class="panel team-panel team-${side.toLowerCase()}">
       <div class="team-heading">
@@ -471,6 +486,7 @@ function renderTeamPanel(side) {
           ${renderSlots(bans, expectedBans)}
         </div>
       </div>
+      ${mobileAction}
     </aside>
   `;
 }
@@ -557,8 +573,11 @@ function renderLiveSequenceTrack(side) {
   }).join("")}</div>`;
 }
 
-function renderActionBar(selectedHero, step, canAct) {
+function renderActionBar(selectedHero, step, canAct, variant = "default") {
   const action = step?.action === "ban" ? "ЗАБАНИТЬ" : "ВЫБРАТЬ";
+  const buttonLabel = variant === "mobile-side"
+    ? (step?.action === "ban" ? "БАН" : "ПИК")
+    : selectedHero ? `${action} ${escapeHtml(selectedHero.name)}` : action;
   const unavailableReason = !step
       ? "Нет активного хода"
       : !canAct
@@ -567,20 +586,20 @@ function renderActionBar(selectedHero, step, canAct) {
           ? step.action === "ban" ? "Лимит банов уже исчерпан" : "Лимит пиков уже исчерпан"
         : "Выберите героя";
   return `
-    <div class="action-bar">
+    <div class="action-bar action-bar--${variant}">
       <div class="selected-summary">
         ${selectedHero ? `<img src="${selectedHero.image}" alt="" width="46" height="46" /><div><strong>${escapeHtml(selectedHero.name)}</strong><br /><span>${step?.action === "ban" ? "Будет забанен" : "Будет выбран"}</span></div>` : `<span>${escapeHtml(unavailableReason)}</span>`}
       </div>
-      <button id="confirm-action" class="confirm-button" type="button" ${!selectedHero || !canAct ? "disabled" : ""}>${selectedHero ? `${action} ${escapeHtml(selectedHero.name)}` : action}</button>
+      <button id="${variant === "mobile-side" ? "confirm-action-mobile" : "confirm-action"}" data-confirm-action class="confirm-button" type="button" aria-label="${escapeAttr(selectedHero ? `${action} ${selectedHero.name}` : unavailableReason)}" ${!selectedHero || !canAct ? "disabled" : ""}>${buttonLabel}</button>
     </div>
   `;
 }
 
-function renderCompletedActions() {
+function renderCompletedActions(variant = "default") {
   return `
-    <div class="action-bar">
+    <div class="action-bar action-bar--${variant}">
       <div class="selected-summary"><strong>Драфт завершён</strong></div>
-      <button id="restart-draft" class="confirm-button" type="button">Новый драфт</button>
+      <button id="${variant === "mobile-side" ? "restart-draft-mobile" : "restart-draft"}" data-restart-draft class="confirm-button" type="button">Новый драфт</button>
     </div>
   `;
 }
@@ -605,17 +624,19 @@ function attachRoomEvents(canAct) {
     });
   });
 
-  app.querySelector("#confirm-action")?.addEventListener("click", () => void confirmAction());
+  app.querySelectorAll("[data-confirm-action]").forEach((button) => {
+    button.addEventListener("click", () => void confirmAction());
+  });
   app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
   app.querySelector("#copy-watch")?.addEventListener("click", () => void copyText(`${location.origin}/draft/${roomCode}`, "Ссылка зрителя скопирована"));
   app.querySelector("#new-draft")?.addEventListener("click", () => {
     if (runtimeMode === "solo") sessionStorage.removeItem(SOLO_KEY);
     navigate("/draft");
   });
-  app.querySelector("#restart-draft")?.addEventListener("click", () => {
+  app.querySelectorAll("[data-restart-draft]").forEach((button) => button.addEventListener("click", () => {
     if (runtimeMode === "solo") sessionStorage.removeItem(SOLO_KEY);
     navigate("/draft");
-  });
+  }));
 }
 
 async function confirmAction() {

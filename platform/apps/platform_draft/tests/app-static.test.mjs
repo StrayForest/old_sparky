@@ -64,3 +64,11 @@ test("stateless result routes and link controls are removed", () => {
   assert.doesNotMatch(appSource, /open-result|copy-result|encodeResult|decodeResult|\/draft\/result|#v2\./u);
   assert.doesNotMatch(coreSource, /encodeResult|decodeResult|makeResultPayload/u);
 });
+
+test("mobile draft has a rotate prompt and a dedicated side action control", () => {
+  assert.match(appSource, /draft-rotate-notice/u);
+  assert.match(appSource, /confirm-action-mobile/u);
+  assert.match(appSource, /data-confirm-action/u);
+  assert.match(stylesSource, /max-width: 900px\) and \(orientation: landscape\)/u);
+  assert.match(stylesSource, /\.room-view \.sequence-editor--live/u);
+});
