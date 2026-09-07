@@ -174,15 +174,13 @@ test("tournament detail skips participant roster payload and session refetch", a
 
   expect(serverHtml).not.toContain("data-testid=\"tournament-participant-roster\"");
   expect(serverHtml).not.toContain("SSR Player");
-  expect(workspaceRequests).toEqual([
-    {
-      slug: publicTournamentSlug,
-      participantsLimit: 0,
-      participantsOffset: 0,
-      workspaceView: "detail",
-      includeCurrentUser: false
-    }
-  ]);
+  await expectWorkspaceRequest({
+    slug: publicTournamentSlug,
+    participantsLimit: 0,
+    participantsOffset: 0,
+    workspaceView: "detail",
+    includeCurrentUser: false
+  });
   await expect(page.getByTestId("tournament-participant-roster")).toHaveCount(0);
   await expect(page.locator(".participants-value").first()).toHaveText("26 / 64");
   await expect.poll(() => participantRequests).toEqual([]);
@@ -205,15 +203,13 @@ test("registered detail uses compact workspace state and ready vote avoids full 
 
   const response = await page.goto(`/tournaments/${readyTournamentSlug}`);
   expect(response?.status()).toBe(200);
-  expect(workspaceRequests).toEqual([
-    {
-      slug: readyTournamentSlug,
-      participantsLimit: 0,
-      participantsOffset: 0,
-      workspaceView: "detail",
-      includeCurrentUser: false
-    }
-  ]);
+  await expectWorkspaceRequest({
+    slug: readyTournamentSlug,
+    participantsLimit: 0,
+    participantsOffset: 0,
+    workspaceView: "detail",
+    includeCurrentUser: false
+  });
   await expect(page.getByRole("button", { name: "Отменить регистрацию" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Подтвердить участие" })).toBeEnabled();
   await expect.poll(() => authBootstrapRequests).toBe(1);
@@ -290,6 +286,10 @@ test("bracket page uses the initial workspace and has no background refresh", as
   expect(bracketRequests).toBe(0);
   await expectNoHorizontalOverflow(page);
 });
+
+async function expectWorkspaceRequest(expected: typeof workspaceRequests[number]) {
+  await expect.poll(() => workspaceRequests).toEqual([expected]);
+}
 
 function workspacePayload(slug: string, authenticated: boolean, includeCurrentUser: boolean) {
   const isReady = slug === readyTournamentSlug;

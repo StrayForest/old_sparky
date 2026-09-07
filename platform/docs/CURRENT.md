@@ -86,7 +86,7 @@ the `<1,000 ms` target; the final attribution and next candidate are recorded
 in the blocked
 [`authenticated HTML/TTFB work order`](archive/performance-authenticated-html-ttfb-2026-09-07.md).
 The active one-candidate A/B work order is
-[`authenticated HTML/TTFB candidate`](../performance/active-authenticated-html-ttfb-client-boundary-2026-09-07.md).
+[`authenticated HTML/TTFB candidate`](../performance/active-authenticated-html-ttfb-workspace-client-2026-09-08.md).
 The bounded admission/pool-contention candidate was rejected after exact A/B
 run `34137667234`: TTFB p95 was `2356.822 ms` with all 20,000 HTTP responses
 successful and exact cleanup. Production is restored to
@@ -98,9 +98,15 @@ as the target solution. SSR-only diagnostics in run `34148261104` measured
 post-data unattributed upstream p95 `2340.311 ms` after detail data-ready p95
 `1112.536 ms`; the archived route-local Suspense candidate improved TTFB p95 to
 `2325.559 ms` in exact run `34153656342` but did not close the target. The
-active candidate defers the heavy interactive detail view from SSR while
-retaining server workspace/auth reads and SSR header/hero. It still does not
-change workers, pool sizing, API contracts or authoritative session validation.
+rejected client detail-boundary candidate was measured by exact run
+`34159422212`: it returned `20,000/20,000` HTTP 200 responses with exact
+cleanup and TTFB p95 `2270.945 ms`, a safe incremental result that did not
+close the target. The active candidate defers the tournament workspace read
+to the browser while retaining the server-rendered authoritative auth/header
+path. It still does not change workers, pool sizing, API contracts or
+authoritative session validation. Fresh diagnostic attribution is in exact
+run `34161768785`; production was restored to `ready-vote-static-8` by
+`34163426494`.
 The historical v3 timeout plus anomaly
 `33991798604` remain unexplained transient episodes. No worker/pool increase or
 external Cloudflare root cause is asserted without further evidence.

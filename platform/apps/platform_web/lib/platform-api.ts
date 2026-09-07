@@ -781,6 +781,7 @@ export async function getTournamentWorkspace(
     workspaceView?: "detail" | "bracket" | "bracket_summary";
     includeCurrentUser?: boolean;
     inviteCode?: string;
+    signal?: AbortSignal;
   } = {}
 ): Promise<{ tournament: TournamentDetail; currentUser: PlatformUser | null } | null> {
   const headers = new Headers(requestHeaders);
@@ -801,7 +802,8 @@ export async function getTournamentWorkspace(
   const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/workspace?${params.toString()}`, {
     headers,
     credentials: "include",
-    cache: "no-store"
+    cache: "no-store",
+    signal: options.signal
   });
   if (response.status === 404) {
     return null;

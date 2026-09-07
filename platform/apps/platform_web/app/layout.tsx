@@ -9,32 +9,11 @@ import { SiteHeader } from "@/components/layout/site-header";
 import { CspNonceProvider } from "@/components/security/csp-nonce-provider";
 import { CspRouteAnnouncer } from "@/components/security/csp-route-announcer";
 import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
-import { getServerTournamentWorkspace } from "@/lib/server-tournament-workspace";
 import { measureSsrStage, recordSsrStage } from "@/lib/server-ssr-observability";
 import "./globals.css";
 import "./theme-modern.css";
 import "@/components/profile/account-identities.css";
 import "@/components/tournaments/tournament-card.css";
-
-const SERVER_RENDER_PATHNAME_HEADER = "x-platform-render-pathname";
-const SERVER_RENDER_SEARCH_HEADER = "x-platform-render-search";
-
-function tournamentDetailSlugFromRequest(requestHeaders: Headers): string | null {
-  if (requestHeaders.get(SERVER_RENDER_SEARCH_HEADER)) {
-    return null;
-  }
-  const pathname = requestHeaders.get(SERVER_RENDER_PATHNAME_HEADER);
-  const match = pathname?.match(/^\/tournaments\/([^/]+)$/u);
-  if (!match) {
-    return null;
-  }
-  try {
-    const slug = decodeURIComponent(match[1]);
-    return slug && !slug.includes("/") ? slug : null;
-  } catch {
-    return null;
-  }
-}
 
 export const metadata: Metadata = {
   title: {
@@ -54,16 +33,6 @@ export default async function RootLayout({
   const [requestHeaders, requestCookies] = await Promise.all([headers(), cookies()]);
   const nonce = requestHeaders.get("x-nonce");
   const cookieHeader = requestCookies.toString();
-  const tournamentDetailSlug = tournamentDetailSlugFromRequest(requestHeaders);
-  if (tournamentDetailSlug) {
-    const workspacePrefetch = measureSsrStage(
-      "root_layout_tournament_workspace_prefetch",
-      () => getServerTournamentWorkspace(tournamentDetailSlug, cookieHeader, undefined),
-    );
-    // The detail page consumes this same request-local promise. Attach a
-    // rejection handler here as a safety net for an interrupted render.
-    void workspacePrefetch.catch(() => undefined);
-  }
   const initialAuth = requestCookies.has(platformSessionCookieName())
     ? await measureSsrStage("root_layout_auth_bootstrap", () => getServerAuthBootstrap(cookieHeader))
     : { status: "anonymous" as const, user: null };
