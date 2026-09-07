@@ -91,9 +91,12 @@ attribution for the bounded authenticated HTML/TTFB investigation is archived
 in
 [`performance-authenticated-html-ttfb-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-2026-09-07.md);
 the active single-candidate follow-up is in
-[`active-authenticated-html-ttfb-2026-09-07.md`](active-authenticated-html-ttfb-2026-09-07.md).
-The candidate changes only bounded authenticated-read admission; no worker or
-DB-pool scaling is inferred.
+[`active-authenticated-html-ttfb-prefetch-2026-09-07.md`](active-authenticated-html-ttfb-prefetch-2026-09-07.md).
+The rejected admission candidate and its exact A/B result are archived in
+[`performance-authenticated-html-ttfb-admission-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-admission-2026-09-07.md).
+The active candidate overlaps the existing detail workspace request with the
+root-layout auth wait on the initial queryless detail route; it does not change
+workers, DB-pool sizing, API contracts or authoritative session validation.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.

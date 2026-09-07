@@ -86,12 +86,16 @@ the `<1,000 ms` target; the final attribution and next candidate are recorded
 in the blocked
 [`authenticated HTML/TTFB work order`](archive/performance-authenticated-html-ttfb-2026-09-07.md).
 The active one-candidate A/B work order is
-[`authenticated HTML/TTFB candidate`](../performance/active-authenticated-html-ttfb-2026-09-07.md).
-It is a bounded same-contract admission/pool-contention experiment after the
-remaining web/API component was isolated. The historical v3 timeout plus
-anomaly `33991798604` remain unexplained transient episodes. No worker/pool
-increase or external Cloudflare root cause is asserted without further
-evidence.
+[`authenticated HTML/TTFB candidate`](../performance/active-authenticated-html-ttfb-prefetch-2026-09-07.md).
+The bounded admission/pool-contention candidate was rejected after exact A/B
+run `34137667234`: TTFB p95 was `2356.822 ms` with all 20,000 HTTP responses
+successful and exact cleanup. Production is restored to
+`authenticated-read-admission-32`. The active candidate overlaps the existing
+detail workspace request with root-layout auth on the initial queryless detail
+route; it does not change workers, pool sizing, API contracts or authoritative
+session validation. The historical v3 timeout plus anomaly `33991798604`
+remain unexplained transient episodes. No worker/pool increase or external
+Cloudflare root cause is asserted without further evidence.
 
 ### Historical AS-18 context
 

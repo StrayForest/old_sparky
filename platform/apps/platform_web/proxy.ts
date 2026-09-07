@@ -6,6 +6,8 @@ const CSP_HEADER = "Content-Security-Policy";
 const CSP_REPORT_ONLY_HEADER = "Content-Security-Policy-Report-Only";
 const CSP_RESPONSE_HEADER = CSP_HEADER;
 const NONCE_HEADER = "x-nonce";
+const RENDER_PATHNAME_HEADER = "x-platform-render-pathname";
+const RENDER_SEARCH_HEADER = "x-platform-render-search";
 const REPORTING_ENDPOINTS = 'csp-endpoint="/api/v1/security/csp-report"';
 
 function contentSecurityPolicy(nonce: string): string {
@@ -42,6 +44,8 @@ export function proxy(request: NextRequest) {
   requestHeaders.delete(CSP_HEADER);
   requestHeaders.delete(CSP_REPORT_ONLY_HEADER);
   requestHeaders.delete(NONCE_HEADER);
+  requestHeaders.set(RENDER_PATHNAME_HEADER, request.nextUrl.pathname);
+  requestHeaders.set(RENDER_SEARCH_HEADER, request.nextUrl.search);
 
   const nonce = randomBytes(16).toString("base64");
   const policy = contentSecurityPolicy(nonce);
