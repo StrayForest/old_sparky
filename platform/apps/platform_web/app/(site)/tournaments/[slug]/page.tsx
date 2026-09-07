@@ -3,8 +3,9 @@ import { notFound } from "next/navigation";
 import { cookies } from "next/headers";
 import { Hero } from "@/components/layout/hero";
 import { TournamentDetailView } from "@/components/tournaments/tournament-detail-view";
-import { getTournamentWorkspace, PlatformApiError } from "@/lib/platform-api";
+import { PlatformApiError } from "@/lib/platform-api";
 import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
+import { getServerTournamentWorkspace } from "@/lib/server-tournament-workspace";
 import { measureSsrStage, recordSsrStage } from "@/lib/server-ssr-observability";
 import { TournamentInviteGate } from "@/components/tournaments/tournament-invite-gate";
 
@@ -25,7 +26,6 @@ export default async function TournamentDetailPage({
   const inviteCode = resolvedSearchParams?.invite_code?.trim().toUpperCase() || undefined;
   const requestCookies = await cookies();
   const cookieHeader = requestCookies.toString();
-  const requestHeaders: HeadersInit = cookieHeader ? { cookie: cookieHeader } : {};
   const actorUserIdPromise = requestCookies.has(platformSessionCookieName())
     ? measureSsrStage(
       "tournament_detail_auth_bootstrap",
@@ -33,18 +33,13 @@ export default async function TournamentDetailPage({
     )
     : Promise.resolve(null);
 
-  let workspace: Awaited<ReturnType<typeof getTournamentWorkspace>>;
+  let workspace: Awaited<ReturnType<typeof getServerTournamentWorkspace>>;
   let actorUserId: string | null;
   try {
     [workspace, actorUserId] = await Promise.all([
       measureSsrStage(
         "tournament_workspace",
-        () => getTournamentWorkspace(slug, requestHeaders, {
-          participantsLimit: 0,
-          workspaceView: "detail",
-          includeCurrentUser: false,
-          inviteCode
-        })
+        () => getServerTournamentWorkspace(slug, cookieHeader, inviteCode)
       ),
       actorUserIdPromise
     ]);
