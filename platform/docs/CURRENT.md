@@ -86,7 +86,7 @@ the `<1,000 ms` target; the final attribution and next candidate are recorded
 in the blocked
 [`authenticated HTML/TTFB work order`](archive/performance-authenticated-html-ttfb-2026-09-07.md).
 The active one-candidate A/B work order is
-[`authenticated HTML/TTFB candidate`](../performance/active-authenticated-html-ttfb-prefetch-2026-09-07.md).
+[`authenticated HTML/TTFB candidate`](../performance/active-authenticated-html-ttfb-client-boundary-2026-09-07.md).
 The bounded admission/pool-contention candidate was rejected after exact A/B
 run `34137667234`: TTFB p95 was `2356.822 ms` with all 20,000 HTTP responses
 successful and exact cleanup. Production is restored to
@@ -96,10 +96,12 @@ external run `34145804669`: `20,000/20,000` HTTP 200, exact cleanup, but HTML
 TTFB p95 `2527.624 ms`, only `1.605%` below baseline, so it was not accepted
 as the target solution. SSR-only diagnostics in run `34148261104` measured
 post-data unattributed upstream p95 `2340.311 ms` after detail data-ready p95
-`1112.536 ms`; the active second candidate puts the existing detail content
-behind an explicit route-local Suspense boundary to test early Next
-fallback/flush. It still does not change workers, pool sizing, API contracts or
-authoritative session validation. The historical v3 timeout plus anomaly
+`1112.536 ms`; the archived route-local Suspense candidate improved TTFB p95 to
+`2325.559 ms` in exact run `34153656342` but did not close the target. The
+active candidate defers the heavy interactive detail view from SSR while
+retaining server workspace/auth reads and SSR header/hero. It still does not
+change workers, pool sizing, API contracts or authoritative session validation.
+The historical v3 timeout plus anomaly
 `33991798604` remain unexplained transient episodes. No worker/pool increase or
 external Cloudflare root cause is asserted without further evidence.
 

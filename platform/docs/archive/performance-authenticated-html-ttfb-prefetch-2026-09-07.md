@@ -1,11 +1,11 @@
-# Active authenticated HTML/TTFB candidate — 2026-09-07
+# Archived authenticated HTML/TTFB candidate — 2026-09-07
 
-Status: second candidate ready for reviewed production A/B. Owner: Platform
-maintainers.
+Status: rejected as the `<1000 ms` target solution after exact production A/B.
+Owner: Platform maintainers.
 
 This work order continues the open authenticated first-byte target after the
 rejected admission candidate archived in
-[`performance-authenticated-html-ttfb-admission-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-admission-2026-09-07.md).
+[`performance-authenticated-html-ttfb-admission-2026-09-07.md`](performance-authenticated-html-ttfb-admission-2026-09-07.md).
 It owns one bounded web read-path candidate and does not reopen the completed
 13-profile performance matrix.
 
@@ -52,7 +52,7 @@ handling and no-JavaScript output remain authoritative. No API endpoint,
 authorization check, Ready Vote state, DB pool, worker count, admission limit,
 retry policy, cache of session validity, CSP or private/no-store policy changes.
 
-## Current candidate
+## Candidate tested
 
 Keep the previous request overlap, but make the tournament detail page's outer
 server component synchronous and place the existing data-dependent content
@@ -63,6 +63,25 @@ tree completes. The authoritative root-layout auth wait, the shared workspace
 request, private/error handling, no-JavaScript authenticated header, API
 contracts, Ready Vote state, security headers, and backend budgets are
 unchanged.
+
+## Production result
+
+The candidate was deployed at exact source SHA
+`d318e19e36b7356815e874827576f43e1485211a` through the reviewed `dev` chain
+and measured by external run `34153656342`. The unchanged
+`authenticated-page-load-v1` contract returned `20,000/20,000` HTTP 200
+responses, zero errors, zero retries, zero overload responses, PostgreSQL
+backend peak `51`, and exact cleanup. HTML TTFB p95/p99 was
+`2325.559/3069.367 ms` (p50 `1429.945 ms`), a `9.47%` p95 improvement over
+the retained `2568.859 ms` baseline, but still well above the `<1000 ms`
+target. Nginx upstream-header p95 was `1901 ms`; sampled server request p95
+was `1123.092 ms`, with DB SQL p95 `539.006 ms`, pool checkout p95
+`438.047 ms`, and no lock waiters. The candidate is therefore a safe
+incremental improvement, not target closure.
+
+The remaining concrete bottleneck is post-auth/route web response generation
+under load. The next active candidate defers the heavy interactive detail view
+from SSR while retaining server workspace/auth reads and SSR header/hero.
 
 ## Local gates
 
@@ -93,9 +112,8 @@ The candidate is accepted only if the same-contract production run improves
 TTFB and passes all safety gates. The `<1000 ms` target remains open until
 the original authenticated page contract reports TTFB p95 below that value.
 
-## Required follow-up
+## Follow-up
 
-After an accepted candidate, run the targeted Ready Vote SLO, Ready Vote
-saturation-v3 and read-concurrency-ramp regressions. If this candidate is
-rejected, archive this work order and create one new work order for the next
-evidence-backed bottleneck.
+The `<1000 ms` target remains open. This work order is archived in favor of the
+next evidence-backed candidate in
+[`active-authenticated-html-ttfb-client-boundary-2026-09-07.md`](../../performance/active-authenticated-html-ttfb-client-boundary-2026-09-07.md).

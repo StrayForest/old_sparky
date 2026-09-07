@@ -44,24 +44,30 @@ export function RouteLoadingShell({ variant }: { variant: LoadingShellVariant })
       <div className="page-noise" aria-hidden="true" />
       <Hero eyebrow={copy.eyebrow} title={copy.title} subtitle={copy.subtitle} />
       <main className="main">
-        <section className={`panel panel-pad route-loading-shell route-loading-${variant}`} aria-busy="true">
-          <div className="route-loading-head">
-            <span className="loading-dot" aria-hidden="true" />
-            <div>
-              <h2 className="panel-title">Загрузка</h2>
-              <p>Подождите, страница загружается</p>
-            </div>
-          </div>
-          <div className="route-loading-grid" aria-hidden="true">
-            <span className="skeleton-line skeleton-line-wide" />
-            <span className="skeleton-line" />
-            <span className="skeleton-line skeleton-line-short" />
-            <span className="skeleton-card" />
-            <span className="skeleton-card" />
-            <span className="skeleton-card skeleton-card-wide" />
-          </div>
-        </section>
+        <RouteLoadingPanel variant={variant} />
       </main>
     </>
+  );
+}
+
+export function RouteLoadingPanel({ variant }: { variant?: LoadingShellVariant }) {
+  return (
+    <section className={`panel panel-pad route-loading-shell${variant ? ` route-loading-${variant}` : ""}`} aria-busy="true">
+      <div className="route-loading-head">
+        <span className="loading-dot" aria-hidden="true" />
+        <div>
+          <h2 className="panel-title">Загрузка</h2>
+          <p>Подождите, страница загружается</p>
+        </div>
+      </div>
+      <div className="route-loading-grid" aria-hidden="true">
+        <span className="skeleton-line skeleton-line-wide" />
+        <span className="skeleton-line" />
+        <span className="skeleton-line skeleton-line-short" />
+        <span className="skeleton-card" />
+        <span className="skeleton-card" />
+        <span className="skeleton-card skeleton-card-wide" />
+      </div>
+    </section>
   );
 }
