@@ -180,7 +180,7 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
                 "PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED": "true",
                 "PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY": "24",
                 "PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS": "8",
-                "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "2000",
+                "PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS": "250",
             },
         )
         self.assertEqual(

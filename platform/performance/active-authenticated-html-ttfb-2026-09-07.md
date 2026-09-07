@@ -27,7 +27,7 @@ query merging is not this candidate.
 Profile `authenticated-read-admission-24x8` keeps the process-local
 authenticated-read admission enabled, changes the in-flight limit from `32`
 to `24` to match each worker's DB pool, and permits at most `8` bounded
-connection-free waiters with a `2000 ms` timeout. The total
+connection-free waiters with a `250 ms` timeout. The total
 admitted-plus-waiting envelope remains `32`; API workers, DB pool size/overflow,
 pool pre-ping, connection budget, Ready Vote admission and retry policy remain
 unchanged.
