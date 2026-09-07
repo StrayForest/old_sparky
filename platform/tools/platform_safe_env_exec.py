@@ -21,6 +21,9 @@ from typing import Iterable
 
 PRODUCTION_ENV_FILE = Path("/opt/oldsparky/platform/shared/.env.platform")
 PRODUCTION_SHARED_DIR = PRODUCTION_ENV_FILE.parent
+PRODUCTION_RUNTIME_ROOT = Path("/opt/oldsparky/platform")
+ACTIVE_PLATFORM_ROOT = PRODUCTION_RUNTIME_ROOT / "current"
+ACTIVE_PYTHON = PRODUCTION_SHARED_DIR / "venv/bin/python"
 MAX_ENV_BYTES = 256 * 1024
 KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 ALLOWED_PREFIXES = ("PLATFORM_", "NEXT_PUBLIC_PLATFORM_")
@@ -297,7 +300,7 @@ def load_env_file(path: Path) -> dict[str, str]:
 def clean_child_environment(
     values: dict[str, str], *, pythonpath: Path
 ) -> dict[str, str]:
-    if pythonpath != TRUSTED_PLATFORM_ROOT:
+    if pythonpath not in {TRUSTED_PLATFORM_ROOT, ACTIVE_PLATFORM_ROOT}:
         raise SafeEnvError("PYTHONPATH must be the fixed root-controlled checkout")
     child = dict(values)
     child.update(
@@ -314,35 +317,67 @@ def clean_child_environment(
 
 
 def validate_trusted_command(command: list[str], *, pythonpath: Path) -> None:
-    if len(command) < 2 or Path(command[0]) != TRUSTED_PYTHON:
+    if len(command) < 2:
         raise SafeEnvError(
             "clean exec requires the fixed root-controlled Python runtime"
         )
+    python = Path(command[0])
     script = Path(command[1])
-    if (
-        not script.is_absolute()
-        or script.parent != TRUSTED_PLATFORM_ROOT / "tools"
-        or script.name not in TRUSTED_DB_TOOLS
-    ):
+    contours = (
+        (TRUSTED_PLATFORM_ROOT, TRUSTED_PYTHON),
+        (ACTIVE_PLATFORM_ROOT, ACTIVE_PYTHON),
+    )
+    contour = next(
+        (
+            (root, trusted_python)
+            for root, trusted_python in contours
+            if pythonpath == root
+            and python == trusted_python
+            and script.is_absolute()
+            and script.parent == root / "tools"
+            and script.name in TRUSTED_DB_TOOLS
+        ),
+        None,
+    )
+    if contour is None:
         raise SafeEnvError("clean exec target is not an approved live QA DB tool")
-    for path in (TRUSTED_PLATFORM_ROOT, TRUSTED_PYTHON, script):
+    root, trusted_python = contour
+    if root == ACTIVE_PLATFORM_ROOT:
+        validate_active_runtime()
+    else:
+        validate_trusted_runtime()
+    for path in (root, trusted_python, script):
         try:
             resolved = path.resolve(strict=True)
             metadata = path.lstat()
         except OSError as exc:
             raise SafeEnvError("clean exec target is unavailable") from exc
         if metadata.st_uid != 0 or (
-            path != TRUSTED_PYTHON and stat.S_IMODE(metadata.st_mode) & 0o022
+            path not in {TRUSTED_PYTHON, ACTIVE_PYTHON}
+            and stat.S_IMODE(metadata.st_mode) & 0o022
         ):
             raise SafeEnvError("clean exec target ownership is unsafe")
-        if path == TRUSTED_PYTHON:
+        if path in {TRUSTED_PYTHON, ACTIVE_PYTHON}:
             if resolved != TRUSTED_SYSTEM_PYTHON or not resolved.is_file():
                 raise SafeEnvError("clean exec Python target is unsafe")
+        elif path == root and root == ACTIVE_PLATFORM_ROOT:
+            if not stat.S_ISLNK(metadata.st_mode):
+                raise SafeEnvError("active production release path is unsafe")
+            try:
+                resolved.relative_to(PRODUCTION_RUNTIME_ROOT / "releases")
+            except ValueError as exc:
+                raise SafeEnvError("active production release path is unsafe") from exc
+            release_metadata = resolved.lstat()
+            if (
+                not stat.S_ISDIR(release_metadata.st_mode)
+                or release_metadata.st_uid != 0
+                or stat.S_IMODE(release_metadata.st_mode) & 0o022
+            ):
+                raise SafeEnvError("active production release metadata is unsafe")
         elif path == script and (
             stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode)
         ):
             raise SafeEnvError("clean exec script target is unsafe")
-    validate_trusted_runtime()
 
 
 def _validate_root_owned_tree(root: Path) -> None:
@@ -377,7 +412,11 @@ def _validate_root_owned_tree(root: Path) -> None:
                             "root-controlled Python symlink escapes"
                         ) from exc
                 elif not (
-                    root == TRUSTED_PLATFORM_ROOT / ".venv_platform"
+                    root
+                    in {
+                        TRUSTED_PLATFORM_ROOT / ".venv_platform",
+                        PRODUCTION_SHARED_DIR / "venv",
+                    }
                     and target.parent == root / "bin"
                     and target.name in {"python", "python3", "python3.12"}
                 ):
@@ -439,6 +478,54 @@ def validate_trusted_runtime() -> None:
     _validate_root_owned_tree(TRUSTED_PLATFORM_ROOT / "python_packages")
     for name in TRUSTED_DB_TOOLS:
         target = TRUSTED_PLATFORM_ROOT / "tools" / name
+        metadata = target.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
+        ):
+            raise SafeEnvError("approved live QA DB tool metadata is unsafe")
+
+
+def validate_active_runtime() -> None:
+    """Validate the immutable production release and shared QA runtime."""
+
+    for directory in (
+        Path("/opt"),
+        Path("/opt/oldsparky"),
+        PRODUCTION_RUNTIME_ROOT,
+        PRODUCTION_RUNTIME_ROOT / "releases",
+        PRODUCTION_SHARED_DIR,
+        PRODUCTION_SHARED_DIR / "venv",
+    ):
+        metadata = directory.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise SafeEnvError("active production runtime path is unsafe")
+    current_metadata = ACTIVE_PLATFORM_ROOT.lstat()
+    if not stat.S_ISLNK(current_metadata.st_mode) or current_metadata.st_uid != 0:
+        raise SafeEnvError("active production release path is unsafe")
+    resolved_current = ACTIVE_PLATFORM_ROOT.resolve(strict=True)
+    try:
+        resolved_current.relative_to(PRODUCTION_RUNTIME_ROOT / "releases")
+    except ValueError as exc:
+        raise SafeEnvError("active production release path is unsafe") from exc
+    release_metadata = resolved_current.lstat()
+    if (
+        not stat.S_ISDIR(release_metadata.st_mode)
+        or release_metadata.st_uid != 0
+        or stat.S_IMODE(release_metadata.st_mode) & 0o022
+    ):
+        raise SafeEnvError("active production release metadata is unsafe")
+    _validate_root_owned_tree(PRODUCTION_SHARED_DIR / "venv")
+    for name in TRUSTED_DB_TOOLS:
+        target = ACTIVE_PLATFORM_ROOT / "tools" / name
         metadata = target.lstat()
         if (
             stat.S_ISLNK(metadata.st_mode)
