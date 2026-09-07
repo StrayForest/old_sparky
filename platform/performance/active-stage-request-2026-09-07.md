@@ -1,6 +1,10 @@
 # Performance stage request — 2026-09-07
 
-This is the active work order for the follow-up performance stage. The
+Status: completed with explicit follow-up. The canonical closeout and complete
+13-profile production matrix are in
+[`docs/archive/performance-stage-2026-09-07.md`](../docs/archive/performance-stage-2026-09-07.md).
+
+This is the recorded work order for the follow-up performance stage. The
 2026-09-06 production matrix remains historical evidence; it is not rewritten
 by this stage.
 
@@ -10,15 +14,15 @@ Correct the evidence boundary before another production load gate, close the
 transient-failure observability gaps, and measure the current authenticated
 HTML path before accepting a narrowly scoped D9 shell change.
 
-The required sequence is:
+The completed sequence was:
 
 ```text
 validate measurement → isolate bottleneck → one bounded change → targeted retest
 ```
 
 No worker/pool scaling, `max_overflow`, Ready Vote admission rewrite, extra
-retries, wait queue, anonymous authenticated shell, or full production matrix
-is authorized by this work order.
+retries, wait queue or anonymous authenticated shell was introduced by this
+work order.
 
 ## Baseline and ownership
 
@@ -96,9 +100,25 @@ request-session avatar projection to select one preferred ready variant URL and
 returns no full `avatar_media` descriptor to the initial shell. Full profile
 surfaces retain the existing descriptor aggregate.
 
-This candidate is not production-accepted until an unchanged-contract A/B
-proves improvement in authenticated HTML TTFB/total latency and no auth/media
-semantic regression.
+The candidate was measured on the fresh exact-SHA control. It preserved the
+auth/media contract and the workflow passed its stress behavior gate, but the
+run is not a same-window unchanged-code A/B and did not prove improvement over
+the earlier D6 evidence. Authenticated HTML TTFB p95 was `2568.859 ms` and
+total page p95 was `3357.939 ms`; the `<1,000 ms` target remains open.
+
+## Final production matrix
+
+All 13 canonical profiles were rerun against deployed SHA
+`bba3fb278e348906a6942aee8462b758c3d616ef`. Every profile passed its declared
+acceptance and exact cleanup. The complete table, run links, status splits,
+origin-safety peaks and remaining follow-up are in the
+[archived closeout](../docs/archive/performance-stage-2026-09-07.md).
+
+The Ready Vote stress profiles returned only their declared `503`
+`READY_VOTE_OVERLOADED` responses when shedding was required; no unexpected
+status, timeout, 520 or 522 was recorded. The read profiles completed their
+200/304 contract without errors, retries or overload. Backend peaks were
+`51–52`, within the `52` budget, with ownership consistency passing.
 
 ## Verification ledger
 
@@ -111,29 +131,30 @@ semantic regression.
 | Exact release contour for retained loads | First fresh attempt exposed a stale trusted-checkout gate before measurement | A moving release could invalidate evidence or cleanup | Release-contract tests, shared deployment/load lock and exact `RELEASE.json` checks |
 | D9 minimal shell projection | Current `SiteHeader`, auth schema and profile read-model code | Missing avatar variant or auth/no-JS regression | Backend/web tests, then same-contract QA/preprod A/B |
 
-## Required next gates
+## Completed gates and follow-up
 
-1. Run the focused backend/tool/web verification gates and inspect the exact
-   retained failure log if any gate fails.
-2. After the release-contour fix is deployed, rerun the fresh
-   `authenticated-page-load-v1` control and attribute client TTFB through
-   Nginx connect/header/response, Next stages, bootstrap duration, pool wait,
-   SQL and response bytes.
-3. Compare D9 candidate versus unchanged code under the same workload. Keep
-   the target TTFB p95 `<1,000 ms` open unless measured evidence closes it.
-4. Run corrected v1/v2 targeted production gates only after local/CI checks.
-   Require backend peak `<=52`, explained ownership, no timeout/520/522 and
-   separate TCP socket reporting.
-5. Recheck Ready Vote SLO and v3/read-path targeted contracts before any full
-   13-profile production matrix.
+1. Focused tests, the full local platform suite and the exact-SHA CI/build
+   chain passed. The unavailable local Ruff dependency remains a reported
+   `LOCAL GATE BLOCKED`, while the corresponding CI quality gate passed.
+2. The fresh authenticated control, corrected Ready Vote contracts and the
+   full 13-profile production matrix passed with backend peak `<=52`, explained
+   ownership, no timeout/520/522 and separate TCP socket reporting.
+3. Exact cleanup passed for every fresh run. No fixture users, tournaments,
+   sessions or audit rows remained.
+4. The authenticated TTFB p95 target `<1,000 ms` remains an open engineering
+   priority. A future bounded investigation may run a same-contract A/B after
+   isolating the remaining web/API component; this stage does not claim that
+   target is closed.
 
 ## Explicitly not done
 
 - The stale-checkout rejection in run `34067801649` is resolved. Run
   `34089756423` reached the measurement barrier and passed the HTTP response
-  portion, but its cleanup gate failed before fixture deletion; the corrected
-  cleanup must run before the result can be accepted.
+  portion, but its cleanup gate failed before fixture deletion. Corrected
+  cleanup run `34096318760` removed that retained fixture completely.
 - No historical raw artifact was rewritten.
 - No root cause is assigned to the historical 520/522 episodes or anomaly
   `33991798604` without a correlated recurrence.
-- Authenticated TTFB `<1s` is not yet proven.
+- Authenticated TTFB `<1s` is not yet proven; this is the remaining owner-level
+  follow-up, not a production release blocker for the accepted stress/read
+  contracts.
