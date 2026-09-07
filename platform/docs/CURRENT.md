@@ -82,8 +82,11 @@ Branch deletion and force-push remain protected, and exact-SHA CI/build plus
 the automatic production deployment chain remain mandatory.
 
 Remaining performance work is explicit: authenticated page TTFB remains above
-the `<1,000 ms` target and needs a bounded same-contract A/B only after the
-remaining web/API component is isolated. The historical v3 timeout plus
+the `<1,000 ms` target; the final attribution and next candidate are recorded
+in the blocked
+[`authenticated HTML/TTFB work order`](archive/performance-authenticated-html-ttfb-2026-09-07.md).
+A bounded same-contract A/B is allowed only after the remaining web/API
+component is isolated and separately reviewed. The historical v3 timeout plus
 anomaly `33991798604` remain unexplained transient episodes. No worker/pool
 increase or external Cloudflare root cause is asserted without further
 evidence.

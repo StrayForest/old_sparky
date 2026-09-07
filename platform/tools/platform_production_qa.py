@@ -33,7 +33,10 @@ from python_packages.platform_infra.media.hard_delete import (
     MediaCleanupRequired,
     purge_deleted_media_metadata,
 )
-from python_packages.platform_infra.performance import WORKSPACE_PERF_KEYS
+from python_packages.platform_infra.performance import (
+    AUTH_BOOTSTRAP_PERF_KEYS,
+    WORKSPACE_PERF_KEYS,
+)
 from python_packages.platform_infra.models import (
     AuditLog,
     DeadlockDreamSlot,
@@ -1761,6 +1764,7 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
             }
         },
         **{key: float for key in WORKSPACE_PERF_KEYS},
+        **{key: float for key in AUTH_BOOTSTRAP_PERF_KEYS},
     }
     for key, caster in numeric_keys.items():
         if key not in values:
@@ -1821,6 +1825,22 @@ def summarize_request_perf_logs(
         values = [float(row[key]) for row in row_values if isinstance(row.get(key), (int, float))]
         return metric_stats(values)
 
+    def non_sql_after_pool_time(row: dict[str, Any]) -> float:
+        return max(
+            0.0,
+            float(row.get("request_ms", row.get("total_ms")) or 0)
+            - float(row.get("db_sql_ms", row.get("sql_ms")) or 0)
+            - float(row.get("compute_ms") or 0)
+            - float(row.get("pool_checkout_wait_ms", row.get("pool_wait_ms")) or 0),
+        )
+
+    def connection_after_sql_time(row: dict[str, Any]) -> float:
+        return max(
+            0.0,
+            float(row.get("pool_connection_hold_ms") or 0)
+            - float(row.get("db_sql_ms", row.get("sql_ms")) or 0),
+        )
+
     def controller_state_counts(row_values: list[dict[str, Any]]) -> dict[str, int]:
         return dict(
             sorted(
@@ -1866,6 +1886,11 @@ def summarize_request_perf_logs(
     pool_wait_times = [float(row["pool_checkout_wait_ms"]) for row in rows if isinstance(row.get("pool_checkout_wait_ms"), (int, float))]
     pool_hold_times = [float(row["pool_connection_hold_ms"]) for row in rows if isinstance(row.get("pool_connection_hold_ms"), (int, float))]
     admission_wait_times = [float(row["authenticated_read_admission_wait_ms"]) for row in rows if isinstance(row.get("authenticated_read_admission_wait_ms"), (int, float))]
+    auth_bootstrap_stage_values = {
+        key: row_metric_stats(key, rows)
+        for key in AUTH_BOOTSTRAP_PERF_KEYS
+        if any(isinstance(row.get(key), (int, float)) for row in rows)
+    }
     non_sql_times = [
         max(
             0.0,
@@ -1916,6 +1941,12 @@ def summarize_request_perf_logs(
                 3,
             ),
             "non_sql_time": metric_stats(non_sql_times),
+            "non_sql_after_pool_time": metric_stats(
+                [non_sql_after_pool_time(row) for row in row_values]
+            ),
+            "connection_after_sql_ms": metric_stats(
+                [connection_after_sql_time(row) for row in row_values]
+            ),
             "max_sql_time_ms": round(
                 max(
                     [float(row["max_sql_ms"]) for row in row_values if isinstance(row.get("max_sql_ms"), (int, float))]
@@ -1935,6 +1966,11 @@ def summarize_request_perf_logs(
             "ready_vote_controller_state_counts": controller_state_counts(row_values),
             "redis_read_models": read_model_summary(row_values),
             "workspace": workspace_stages,
+            "auth_bootstrap": {
+                key: row_metric_stats(key, row_values)
+                for key in AUTH_BOOTSTRAP_PERF_KEYS
+                if any(isinstance(row.get(key), (int, float)) for row in row_values)
+            },
         }
 
     return {
@@ -1952,6 +1988,14 @@ def summarize_request_perf_logs(
         "pool_checkout_wait_ms": metric_stats(pool_wait_times),
         "pool_connection_hold_ms": metric_stats(pool_hold_times),
         "authenticated_read_admission_wait_ms": metric_stats(admission_wait_times),
+        "non_sql_after_pool_time": metric_stats([
+            non_sql_after_pool_time(row)
+            for row in rows
+        ]),
+        "connection_after_sql_ms": metric_stats(
+            [connection_after_sql_time(row) for row in rows]
+        ),
+        "auth_bootstrap": auth_bootstrap_stage_values,
         "ready_vote": {
             key: row_metric_stats(key, rows)
             for key in READY_VOTE_PERF_KEYS

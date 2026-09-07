@@ -3,7 +3,7 @@
 Status: completed with an explicit authenticated-HTML follow-up. This is the
 canonical closeout for the measurement-correction, D9 candidate and full
 production matrix work order in
-[`active-stage-request-2026-09-07.md`](../../performance/active-stage-request-2026-09-07.md).
+[`performance-stage-request-2026-09-07.md`](performance-stage-request-2026-09-07.md).
 
 ## Scope and release
 

@@ -24,6 +24,7 @@ from python_packages.platform_infra.csrf import clear_csrf_cookie
 from python_packages.platform_infra.db import get_db_session, session_factory
 from python_packages.platform_infra.models import Role, User, UserRole, UserSession
 from python_packages.platform_infra.performance import (
+    measure_auth_bootstrap_stage,
     record_ready_vote_span,
     record_workspace_stage,
 )
@@ -641,31 +642,32 @@ async def get_authenticated_session_for_auth_bootstrap(
             (User.email.is_(None)) | (User.email_verified_at.is_not(None))
         )
 
-    rows = (
-        await db_session.execute(
-            select(
-                User.id.label("user_id"),
-                User.email.label("user_email"),
-                User.display_name.label("user_display_name"),
-                User.status.label("user_status"),
-                User.email_verified_at.label("user_email_verified_at"),
-                User.public_tournament_credits.label("public_tournament_credits"),
-                User.private_tournament_credits.label("private_tournament_credits"),
-                User.created_at.label("user_created_at"),
-                Role.slug.label("role_slug"),
+    with measure_auth_bootstrap_stage("auth_bootstrap_auth_query"):
+        rows = (
+            await db_session.execute(
+                select(
+                    User.id.label("user_id"),
+                    User.email.label("user_email"),
+                    User.display_name.label("user_display_name"),
+                    User.status.label("user_status"),
+                    User.email_verified_at.label("user_email_verified_at"),
+                    User.public_tournament_credits.label("public_tournament_credits"),
+                    User.private_tournament_credits.label("private_tournament_credits"),
+                    User.created_at.label("user_created_at"),
+                    Role.slug.label("role_slug"),
+                )
+                .select_from(UserSession)
+                .join(User, User.id == UserSession.user_id)
+                .outerjoin(UserRole, UserRole.user_id == User.id)
+                .outerjoin(Role, Role.id == UserRole.role_id)
+                .where(
+                    UserSession.token_digest == session_token_digest(token),
+                    UserSession.invalidated_at.is_(None),
+                    UserSession.expires_at > now,
+                    *user_predicates,
+                )
             )
-            .select_from(UserSession)
-            .join(User, User.id == UserSession.user_id)
-            .outerjoin(UserRole, UserRole.user_id == User.id)
-            .outerjoin(Role, Role.id == UserRole.role_id)
-            .where(
-                UserSession.token_digest == session_token_digest(token),
-                UserSession.invalidated_at.is_(None),
-                UserSession.expires_at > now,
-                *user_predicates,
-            )
-        )
-    ).all()
+        ).all()
     if not rows:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session is invalid.")
 
