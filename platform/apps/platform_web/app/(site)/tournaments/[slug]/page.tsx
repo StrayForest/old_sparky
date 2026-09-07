@@ -1,7 +1,9 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { cookies } from "next/headers";
+import { Suspense } from "react";
 import { Hero } from "@/components/layout/hero";
+import { RouteLoadingShell } from "@/components/layout/loading-shells";
 import { TournamentDetailView } from "@/components/tournaments/tournament-detail-view";
 import { PlatformApiError } from "@/lib/platform-api";
 import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
@@ -13,13 +15,23 @@ export const metadata: Metadata = {
   title: "Турнир"
 };
 
-export default async function TournamentDetailPage({
-  params,
-  searchParams
-}: {
+type TournamentDetailPageProps = {
   params: Promise<{ slug: string }>;
   searchParams?: Promise<{ invite_code?: string }>;
-}) {
+};
+
+export default function TournamentDetailPage(props: TournamentDetailPageProps) {
+  return (
+    <Suspense fallback={<RouteLoadingShell variant="tournament-detail" />}>
+      <TournamentDetailContent {...props} />
+    </Suspense>
+  );
+}
+
+async function TournamentDetailContent({
+  params,
+  searchParams
+}: TournamentDetailPageProps) {
   const startedAt = performance.now();
   const { slug } = await params;
   const resolvedSearchParams = await searchParams;

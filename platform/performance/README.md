@@ -94,9 +94,17 @@ the active single-candidate follow-up is in
 [`active-authenticated-html-ttfb-prefetch-2026-09-07.md`](active-authenticated-html-ttfb-prefetch-2026-09-07.md).
 The rejected admission candidate and its exact A/B result are archived in
 [`performance-authenticated-html-ttfb-admission-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-admission-2026-09-07.md).
-The active candidate overlaps the existing detail workspace request with the
-root-layout auth wait on the initial queryless detail route; it does not change
-workers, DB-pool sizing, API contracts or authoritative session validation.
+The first merged overlap candidate was deployed in release
+`4db0079fcddba6fa37bd089d2a96599c04d02768` and measured by exact external run
+`34145804669`: all `20,000/20,000` HTML responses were HTTP 200 with exact
+cleanup, but TTFB p95 was `2527.624 ms`, only `1.605%` below baseline. The
+follow-up SSR-only diagnostic run `34148261104` measured post-data
+unattributed upstream p95 `2340.311 ms` after detail data-ready p95
+`1112.536 ms`; production was restored to ordinary `ready-vote-static-8`.
+The active second candidate puts the existing detail content behind an
+explicit route-local Suspense boundary to test early Next fallback/flush. It
+does not change workers, DB-pool sizing, API contracts or authoritative
+session validation.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.
