@@ -116,4 +116,4 @@ the original authenticated page contract reports TTFB p95 below that value.
 
 The `<1000 ms` target remains open. This work order is archived in favor of the
 next evidence-backed candidate in
-[`active-authenticated-html-ttfb-client-boundary-2026-09-07.md`](../../performance/active-authenticated-html-ttfb-client-boundary-2026-09-07.md).
+[`performance-authenticated-html-ttfb-client-boundary-2026-09-07.md`](performance-authenticated-html-ttfb-client-boundary-2026-09-07.md).

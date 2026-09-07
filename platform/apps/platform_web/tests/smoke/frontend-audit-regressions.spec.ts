@@ -6,15 +6,18 @@ function source(relativePath: string): string {
   return readFileSync(resolve(process.cwd(), relativePath), "utf8");
 }
 
-test("invite-only server pages convert missing workspace proof into invite-code flow", () => {
+test("invite-only pages convert missing workspace proof into invite-code flow", () => {
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
+  const detailClientPage = source("components/tournaments/tournament-detail-client-page.tsx");
   const bracketPage = source("app/(site)/tournaments/[slug]/bracket/page.tsx");
 
-  for (const page of [detailPage, bracketPage]) {
-    expect(page).toContain("PlatformApiError");
-    expect(page).toContain("error.status === 401");
-    expect(page).toContain("invite_code");
-  }
+  expect(detailPage).toContain("TournamentDetailClientPage");
+  expect(detailClientPage).toContain("PlatformApiError");
+  expect(detailClientPage).toContain("error.status === 401");
+  expect(detailClientPage).toContain("TournamentInviteGate");
+  expect(bracketPage).toContain("PlatformApiError");
+  expect(bracketPage).toContain("error.status === 401");
+  expect(bracketPage).toContain("invite_code");
 });
 
 test("private registration is gated by the invite code carried by the room URL", () => {

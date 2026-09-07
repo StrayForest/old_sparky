@@ -91,7 +91,7 @@ attribution for the bounded authenticated HTML/TTFB investigation is archived
 in
 [`performance-authenticated-html-ttfb-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-2026-09-07.md);
 the active single-candidate follow-up is in
-[`active-authenticated-html-ttfb-client-boundary-2026-09-07.md`](active-authenticated-html-ttfb-client-boundary-2026-09-07.md).
+[`active-authenticated-html-ttfb-workspace-client-2026-09-08.md`](active-authenticated-html-ttfb-workspace-client-2026-09-08.md).
 The rejected admission candidate and its exact A/B result are archived in
 [`performance-authenticated-html-ttfb-admission-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-admission-2026-09-07.md).
 The first merged overlap candidate was deployed in release
@@ -103,9 +103,15 @@ unattributed upstream p95 `2340.311 ms` after detail data-ready p95
 `1112.536 ms`; production was restored to ordinary `ready-vote-static-8`.
 The archived route-local Suspense candidate improved TTFB p95 to
 `2325.559 ms` in exact run `34153656342` but did not close the target. The
-active candidate defers the heavy interactive detail view from SSR while
-retaining server workspace/auth reads and SSR header/hero; it does not change
-workers, DB-pool sizing, API contracts or authoritative session validation.
+rejected client detail-boundary candidate was measured by exact external run
+`34159422212`: it returned `20,000/20,000` HTTP 200 responses with exact
+cleanup and TTFB p95 `2270.945 ms`, a safe incremental result that did not
+close the target. The active candidate now defers the tournament workspace
+read itself to the browser while retaining the server-rendered authoritative
+auth/header path; it does not change workers, DB-pool sizing, API contracts or
+authoritative session validation. Its diagnostic attribution repeat is exact
+run `34161768785`; production was restored to `ready-vote-static-8` by
+`34163426494`.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.
