@@ -612,6 +612,10 @@ h1 {
   gap: 12px;
 }
 
+.lobby-team__footer {
+  min-height: 48px;
+}
+
 .lobby-team__header .team-side {
   padding: 0;
   background: transparent;
@@ -649,6 +653,12 @@ h1 {
   border-radius: var(--radius-sm);
   font-size: 20px;
   font-weight: 800;
+}
+
+.lobby-name-field input:disabled {
+  color: var(--text-soft);
+  cursor: default;
+  opacity: 0.72;
 }
 
 .lobby-team-name {

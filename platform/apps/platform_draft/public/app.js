@@ -3,6 +3,7 @@ import {
   BAN_COUNTS,
   DEFAULT_CUSTOM_RULES,
   MAX_BANS_PER_TEAM,
+  MAX_TEAM_NAME_LENGTH,
   TEAM_SIZES,
   TIMER_SECONDS,
   applyLocalAction,
@@ -20,6 +21,7 @@ const SOLO_KEY = "oldsparky:draft:solo";
 const SEAT_KEY_PREFIX = "oldsparky:draft:seat:";
 const INVITE_KEY_PREFIX = "oldsparky:draft:invite:";
 const COPY_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9.5A2.5 2.5 0 0 1 11.5 7h6A2.5 2.5 0 0 1 20 9.5v8a2.5 2.5 0 0 1-2.5 2.5h-6A2.5 2.5 0 0 1 9 17.5z"/><path d="M15 7V6.5A2.5 2.5 0 0 0 12.5 4h-6A2.5 2.5 0 0 0 4 6.5v8A2.5 2.5 0 0 0 6.5 17H9"/></svg>`;
+const teamLabel = (side) => side === "A" ? "А" : "Б";
 
 let createMode = "online";
 let selectedTeamSize = DEFAULT_CUSTOM_RULES.teamSize;
@@ -190,8 +192,8 @@ function renderCreate() {
           <div class="field field--wide">
             <span class="field-title">Первый ход</span>
             <div class="chip-row" role="group" aria-label="Команда первого хода">
-              <button type="button" data-first-move="A" class="${selectedFirstMove === "A" ? "active" : ""}">Команда А</button>
-              <button type="button" data-first-move="B" class="${selectedFirstMove === "B" ? "active" : ""}">Команда Б</button>
+              <button type="button" data-first-move="A" class="${selectedFirstMove === "A" ? "active" : ""}">${teamLabel("A")}</button>
+              <button type="button" data-first-move="B" class="${selectedFirstMove === "B" ? "active" : ""}">${teamLabel("B")}</button>
               <button type="button" data-first-move="random" class="${selectedFirstMove === "random" ? "active" : ""}">Рандом</button>
             </div>
           </div>
@@ -328,21 +330,21 @@ function renderLobby() {
   const lobbyTeam = (side) => {
     const isOwn = ownSide === side;
     const connectedLabel = presence[side] ? (isOwn ? "Вы в комнате" : "Игрок подключён") : "Ожидаем игрока";
-    const nameControl = ready[side] || !isOwn
+    const nameControl = !isOwn
       ? `<h2 class="lobby-team-name">${escapeHtml(room.teamNames[side])}</h2>`
-      : `<label class="lobby-name-field"><span>Название команды</span><input data-team-name="${side}" maxlength="40" value="${escapeAttr(room.teamNames[side])}" autocomplete="off" /></label>`;
+      : `<label class="lobby-name-field"><span>Название команды</span><input data-team-name="${side}" maxlength="${MAX_TEAM_NAME_LENGTH}" value="${escapeAttr(room.teamNames[side])}" autocomplete="off" ${ready[side] ? "disabled" : ""} /></label>`;
     return `
       <section class="lobby-team team-${side.toLowerCase()} ${isOwn ? "lobby-team--own" : ""}">
-        <div class="lobby-team__header"><span class="team-side">КОМАНДА ${side === "A" ? "А" : "Б"}</span><span class="lobby-presence ${presence[side] ? "online" : ""}"><i aria-hidden="true"></i>${connectedLabel}</span></div>
+        <div class="lobby-team__header"><span class="team-side">${teamLabel(side)}</span><span class="lobby-presence ${presence[side] ? "online" : ""}"><i aria-hidden="true"></i>${connectedLabel}</span></div>
         ${nameControl}
         <div class="lobby-team__footer">
           <span class="ready-status ${ready[side] ? "ready" : ""}"><i aria-hidden="true"></i>${ready[side] ? "Готово" : "Ожидаем готовность"}</span>
-          ${isOwn ? `<button type="button" class="${ready[side] ? "secondary-button" : "primary-button"}" id="ready-up" ${ready[side] ? "disabled" : ""}>${ready[side] ? "Готово" : "Готов"}</button>` : ""}
+          ${isOwn && !ready[side] ? `<button type="button" class="primary-button" id="ready-up">Готов</button>` : ""}
         </div>
       </section>
     `;
   };
-  const firstSide = room.rules.firstSide === "B" ? "Команда Б" : "Команда А";
+  const firstSide = teamLabel(room.rules.firstSide);
   app.innerHTML = `
     ${renderBrand()}
     <section class="lobby-shell">
@@ -357,7 +359,7 @@ function renderLobby() {
   app.querySelector("#ready-up")?.addEventListener("click", () => sendRoomMessage({ type: "ready", expectedVersion: room.version }));
   app.querySelector("[data-team-name]")?.addEventListener("change", (event) => {
     const input = event.target;
-    sendRoomMessage({ type: "team-name", expectedVersion: room.version, name: input.value.slice(0, 40) });
+    sendRoomMessage({ type: "team-name", expectedVersion: room.version, name: input.value.slice(0, MAX_TEAM_NAME_LENGTH) });
   });
   app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
 }
@@ -388,7 +390,7 @@ function renderRoom() {
   const canAct = canCurrentSeatAct(step);
   const selectedHero = selectedHeroId ? HERO_BY_ID.get(selectedHeroId) : null;
   const timerText = formatTimer(room);
-  const roleLabel = runtimeMode === "solo" ? "Соло" : seat.role === "host" ? "Команда А" : seat.role === "guest" ? "Команда Б" : "Зритель";
+  const roleLabel = runtimeMode === "solo" ? "Соло" : seat.role === "host" ? teamLabel("A") : seat.role === "guest" ? teamLabel("B") : "Зритель";
   const activeSide = step?.side || null;
   const actionText = step?.action === "ban" ? "БАН" : step?.action === "pick" ? "ПИК" : "ЗАВЕРШЕНО";
   const showHeroes = room.status !== "completed";
@@ -460,7 +462,7 @@ function renderTeamPanel(side) {
     <aside class="panel team-panel team-${side.toLowerCase()}">
       <div class="team-heading">
         <h2 class="team-name">${escapeHtml(room.teamNames[side])}</h2>
-        <span class="team-side" aria-label="Команда ${side === "A" ? "А" : "Б"}"><span class="team-side__full">КОМАНДА ${side === "A" ? "А" : "Б"}</span><span class="team-side__short" aria-hidden="true">${side === "A" ? "А" : "Б"}</span></span>
+        <span class="team-side" aria-label="Сторона ${teamLabel(side)}"><span class="team-side__full">${teamLabel(side)}</span><span class="team-side__short" aria-hidden="true">${teamLabel(side)}</span></span>
       </div>
       <div class="team-block">
         <h3>Пики</h3>
@@ -548,14 +550,14 @@ function renderLiveSequence() {
 }
 
 function renderLiveSequenceTrack(side) {
-  return `<div class="sequence-track sequence-track--${side.toLowerCase()} sequence-track--live"><span class="sequence-track__label">Команда ${side === "A" ? "А" : "Б"}</span>${room.rules.sequence.map((step, index) => {
+  return `<div class="sequence-track sequence-track--${side.toLowerCase()} sequence-track--live"><span class="sequence-track__label">${teamLabel(side)}</span>${room.rules.sequence.map((step, index) => {
     const active = step.side === side;
     const state = active ? step.action : "empty";
     const classes = ["sequence-editor-step", "sequence-editor-step--live", state];
     if (index < room.currentStep) classes.push("done");
     if (index === room.currentStep && room.status === "drafting") classes.push("current");
     const symbol = state === "ban" ? "×" : state === "pick" ? "✓" : "";
-    const label = active ? `${step.action === "ban" ? "Бан" : "Пик"}, Команда ${side === "A" ? "А" : "Б"}, шаг ${index + 1}` : `Пусто, шаг ${index + 1}`;
+    const label = active ? `${step.action === "ban" ? "Бан" : "Пик"}, ${teamLabel(side)}, шаг ${index + 1}` : `Пусто, шаг ${index + 1}`;
     return `<span class="${classes.join(" ")}" role="img" aria-label="${label}"><span aria-hidden="true">${symbol}</span></span>`;
   }).join("")}</div>`;
 }
