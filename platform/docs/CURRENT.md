@@ -118,7 +118,17 @@ users and 40 tournaments with zero remnants. Production was restored to
 `ready-vote-static-8` by deploy `34184805970` for reviewed SHA
 `3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The next candidate is
 diagnostic-first root component-tree work, blocked until origin timings can be
-exported reliably.
+exported reliably. The narrower authenticated-provider-boundary candidate is
+archived in
+[`performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md`](archive/performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md).
+Its reviewed SHA `6e3a6325a0c6bee025297a8c8edb00817faafb75` completed the exact
+20k/40 profile in run `34192721178` with 20,000/20,000 HTTP 200, zero errors,
+zero unexpected/overload/retry responses, backend peak `43/52`, zero lock
+waiters, and exact cleanup. It reduced HTML TTFB p95 to `1341.322 ms`
+(`47.8%` below the unchanged `2568.859 ms` control), but remained `341.322 ms`
+above the `<1,000 ms` target. It was therefore reverted through the reviewed
+`dev` path; production remains on `ready-vote-static-8` pending the next
+diagnostic-first candidate. No capacity-setting change is authorized.
 The historical v3 timeout plus anomaly
 `33991798604` remain unexplained transient episodes. No worker/pool increase or
 external Cloudflare root cause is asserted without further evidence.

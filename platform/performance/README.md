@@ -129,7 +129,22 @@ abort `34186422087` and exact cleanup `34186465537` passed with 20,000 users,
 `3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The next concrete candidate is
 diagnostic-first stable-contour root component-tree work, blocked until the
 diagnostic load exports completed origin timings; no capacity-setting change
-is authorized.
+is authorized. The narrower authenticated-provider-boundary candidate is
+archived in
+[`performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md`](../docs/archive/performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md).
+It moved only `SiteFooter` outside `AuthProvider`, preserving the authoritative
+server-rendered authenticated header and all API, SQL, worker, pool, admission,
+permission and security behavior. Reviewed SHA
+`6e3a6325a0c6bee025297a8c8edb00817faafb75` completed the exact 20k/40 profile
+in [run 34192721178](https://github.com/StrayForest/old_sparky/actions/runs/34192721178):
+20,000/20,000 HTTP 200, zero errors/unexpected/overload/retry responses,
+HTML TTFB p95 `1341.322 ms`, total page p95 `1665.096 ms`, PostgreSQL peak
+`43/52`, zero lock waiters, two workers and exact cleanup. This is a `47.8%`
+TTFB p95 improvement from the unchanged `2568.859 ms` control but still misses
+the `<1,000 ms` target by `341.322 ms`, so the candidate was rejected and
+reverted through the reviewed `dev` path. The next candidate remains
+diagnostic-first root component-tree work; no capacity-setting change is
+authorized.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.
