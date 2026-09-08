@@ -53,15 +53,15 @@ export default async function RootLayout({
       <body>
         <CspNonceProvider nonce={nonce}>
           <CspRouteAnnouncer />
-          <AuthProvider initialStatus={initialAuth.status} initialUser={initialAuth.user}>
-            <I18nProvider>
-              <SiteHeader />
+          <I18nProvider>
+            <SiteHeader initialStatus={initialAuth.status} initialUser={initialAuth.user} />
+            <AuthProvider initialStatus={initialAuth.status} initialUser={initialAuth.user}>
               <Suspense fallback={<div className="page-noise" aria-hidden="true" />}>
                 {children}
               </Suspense>
-              <SiteFooter />
-            </I18nProvider>
-          </AuthProvider>
+            </AuthProvider>
+            <SiteFooter />
+          </I18nProvider>
         </CspNonceProvider>
       </body>
     </html>
