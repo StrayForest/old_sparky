@@ -1,10 +1,8 @@
-"use client";
-
 import Link from "next/link";
-import { usePathname } from "next/navigation";
 import { ExternalLink } from "lucide-react";
 import { BrandMark } from "@/components/layout/brand-mark";
-import { useI18n } from "@/components/i18n-provider";
+import { SiteFooterAccountLinks } from "@/components/layout/site-footer-account-links";
+import { translate } from "@/lib/i18n";
 
 const platformLinks = [
   { href: "/", labelKey: "footer.home" },
@@ -13,12 +11,6 @@ const platformLinks = [
   { href: "/info", labelKey: "footer.info" },
   { href: "/privacy", labelKey: "footer.privacy" },
   { href: "/terms", labelKey: "footer.terms" }
-] as const;
-
-const accountLinks = [
-  { href: "/profile/me", labelKey: "footer.myProfile" },
-  { href: "/auth/login", labelKey: "footer.signIn" },
-  { href: "/auth/register", labelKey: "footer.createAccount" }
 ] as const;
 
 const gameLinks = [
@@ -33,8 +25,6 @@ const gameLinks = [
 ] as const;
 
 export function SiteFooter() {
-  const { t } = useI18n();
-  const pathname = usePathname();
   const currentYear = new Date().getUTCFullYear();
 
   return (
@@ -49,44 +39,30 @@ export function SiteFooter() {
                 <span className="brand-sub">ARENA</span>
               </span>
             </Link>
-            <p>{t("footer.description")}</p>
+            <p>{translate("footer.description")}</p>
           </section>
 
           <nav className="site-footer-nav" aria-labelledby="site-footer-platform-title">
-            <h2 id="site-footer-platform-title">{t("footer.platform")}</h2>
+            <h2 id="site-footer-platform-title">{translate("footer.platform")}</h2>
             <ul>
               {platformLinks.map((item) => (
                 <li key={item.href}>
-                  <Link href={item.href}>{t(item.labelKey)}</Link>
+                  <Link href={item.href}>{translate(item.labelKey)}</Link>
                 </li>
               ))}
             </ul>
           </nav>
 
-          <nav className="site-footer-nav" aria-labelledby="site-footer-account-title">
-            <h2 id="site-footer-account-title">{t("footer.account")}</h2>
-            <ul>
-              {accountLinks.map((item) => (
-                <li key={item.href}>
-                  <Link
-                    href={authHref(item.href, pathname)}
-                    prefetch={!item.href.startsWith("/auth/")}
-                  >
-                    {t(item.labelKey)}
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          </nav>
+          <SiteFooterAccountLinks />
 
           <nav className="site-footer-nav" aria-labelledby="site-footer-game-title">
-            <h2 id="site-footer-game-title">{t("footer.gameResources")}</h2>
+            <h2 id="site-footer-game-title">{translate("footer.gameResources")}</h2>
             <ul>
               {gameLinks.map((item) => (
                 <li key={item.href}>
                   <a href={item.href} rel="noreferrer" target="_blank">
-                    <span>{t(item.labelKey)}</span>
-                    <span className="sr-only">{t("footer.opensNewTab")}</span>
+                    <span>{translate(item.labelKey)}</span>
+                    <span className="sr-only">{translate("footer.opensNewTab")}</span>
                     <ExternalLink aria-hidden="true" size={14} />
                   </a>
                 </li>
@@ -96,17 +72,10 @@ export function SiteFooter() {
         </div>
 
         <div className="site-footer-bottom">
-          <span>{t("footer.copyright", { year: currentYear })}</span>
-          <span>{t("footer.valveDisclaimer")}</span>
+          <span>{translate("footer.copyright", { year: currentYear })}</span>
+          <span>{translate("footer.valveDisclaimer")}</span>
         </div>
       </div>
     </footer>
   );
-}
-
-function authHref(href: string, pathname: string): string {
-  if (!href.startsWith("/auth/") || pathname.startsWith("/auth/")) {
-    return href;
-  }
-  return `${href}?returnTo=${encodeURIComponent(pathname)}`;
 }
