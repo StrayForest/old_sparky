@@ -2,18 +2,12 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { PlusCircle, Shield, User } from "lucide-react";
+import { useAuth } from "@/components/auth/auth-provider";
 import { useI18n } from "@/components/i18n-provider";
 import { BrandMark } from "@/components/layout/brand-mark";
 import { PreparedMedia } from "@/components/media/prepared-media";
-import {
-  registerPlatformAuthStateListener,
-  requestPlatformAuthStateChange,
-  type PlatformAuthState
-} from "@/lib/auth-session-signal";
-import type { PlatformUser } from "@/lib/platform-types";
-import { PlatformApiError, platformApiRequest } from "@/lib/platform-api";
 import { navItems } from "@/lib/routes";
 
 const MOBILE_ACCOUNT_BUTTON =
@@ -27,44 +21,11 @@ const MOBILE_NAV =
 const MOBILE_NAV_LINK =
   "max-[820px]:h-12! max-[820px]:w-full! max-[820px]:justify-center! max-[820px]:px-0! max-[820px]:bg-transparent! max-[820px]:after:left-0! max-[820px]:after:right-0!";
 
-export function SiteHeader({
-  initialStatus = "anonymous",
-  initialUser = null
-}: {
-  initialStatus?: PlatformAuthState["status"];
-  initialUser?: PlatformUser | null;
-} = {}) {
+export function SiteHeader() {
+  const { refreshUser, status, user } = useAuth();
   const { t } = useI18n();
-  const [authState, setAuthState] = useState<PlatformAuthState>({
-    status: initialStatus,
-    user: initialUser
-  });
   const [isRetryingSession, setIsRetryingSession] = useState(false);
-  useEffect(
-    () => registerPlatformAuthStateListener((state) => setAuthState(state)),
-    []
-  );
-  const refreshUser = useCallback(async () => {
-    try {
-      const nextUser = await platformApiRequest<PlatformUser>("/users/me");
-      const nextState: PlatformAuthState = { status: "authenticated", user: nextUser };
-      setAuthState(nextState);
-      requestPlatformAuthStateChange(nextState);
-    } catch (error) {
-      if (error instanceof PlatformApiError && error.status === 401) {
-        const nextState: PlatformAuthState = { status: "anonymous", user: null };
-        setAuthState(nextState);
-        requestPlatformAuthStateChange(nextState);
-        return;
-      }
-      const nextState: PlatformAuthState = { status: "unavailable", user: authState.user };
-      setAuthState(nextState);
-      requestPlatformAuthStateChange(nextState);
-      throw error;
-    }
-  }, [authState.user]);
   const pathname = usePathname();
-  const { status, user } = authState;
   const isCreateTournament = pathname === "/tournaments/new";
   const exactActiveHref = navItems.find((item) => item.href === pathname)?.href;
   const canOpenAdmin = Boolean(user?.roles.includes("admin") || user?.roles.includes("superadmin"));

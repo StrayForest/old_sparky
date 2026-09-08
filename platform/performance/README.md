@@ -142,13 +142,8 @@ HTML TTFB p95 `1341.322 ms`, total page p95 `1665.096 ms`, PostgreSQL peak
 `43/52`, zero lock waiters, two workers and exact cleanup. This is a `47.8%`
 TTFB p95 improvement from the unchanged `2568.859 ms` control but still misses
 the `<1,000 ms` target by `341.322 ms`, so the candidate was rejected and
-reverted through the reviewed `dev` path. A fresh diagnostic deployment/load
-on safe SHA `e59485a278d09b9a00ecee86358df3e8ea1d4175` completed origin fixture
-setup and exact cleanup but did not export a client report, so it is not
-performance evidence. The next active candidate is the bounded global-chrome
-provider boundary in
-[`active-authenticated-html-ttfb-global-chrome-2026-09-08.md`](active-authenticated-html-ttfb-global-chrome-2026-09-08.md).
-Production remains on `ready-vote-static-8`; no capacity-setting change is
+reverted through the reviewed `dev` path. The next candidate remains
+diagnostic-first root component-tree work; no capacity-setting change is
 authorized.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
