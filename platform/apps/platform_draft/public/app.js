@@ -29,7 +29,6 @@ let selectedFirstMove = "A";
 let customSequence = createEditorSequence(createDefaultSequence(selectedTeamSize, selectedBanCount, selectedFirstMove));
 let room = null;
 let selectedHeroId = null;
-let heroSearch = "";
 let runtimeMode = null;
 let roomCode = null;
 let seat = { role: "spectator", token: null };
@@ -50,7 +49,6 @@ function route() {
   stopTimer();
   closeSocket();
   selectedHeroId = null;
-  heroSearch = "";
   lastError = "";
 
   const path = normalizePath(location.pathname);
@@ -354,8 +352,6 @@ function renderLobby() {
       <div class="lobby-meta"><span>${room.rules.teamSize}v${room.rules.teamSize}</span><span>${formatRoomBans(room.rules)}</span><span>${room.rules.timerSeconds}с таймер</span><span>Первый ход: ${firstSide}</span></div>
       ${lastError ? `<div class="error-box">${escapeHtml(lastError)}</div>` : ""}
       <div class="lobby-teams">${lobbyTeam("A")}${lobbyTeam("B")}</div>
-      <p class="lobby-help">Отправь ссылку сопернику. Драфт начнётся, когда оба игрока займут места и нажмут «Готов».</p>
-      <div class="lobby-actions"><button class="icon-button" id="new-draft" type="button">Новый драфт</button></div>
     </section>
   `;
   app.querySelector("#ready-up")?.addEventListener("click", () => sendRoomMessage({ type: "ready", expectedVersion: room.version }));
@@ -364,7 +360,6 @@ function renderLobby() {
     sendRoomMessage({ type: "team-name", expectedVersion: room.version, name: input.value.slice(0, 40) });
   });
   app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
-  app.querySelector("#new-draft")?.addEventListener("click", () => navigate("/draft"));
 }
 
 function formatRoomBans(rules) {
@@ -392,7 +387,6 @@ function renderRoom() {
   const step = currentStep(room);
   const canAct = canCurrentSeatAct(step);
   const selectedHero = selectedHeroId ? HERO_BY_ID.get(selectedHeroId) : null;
-  const filteredHeroes = HEROES.filter((hero) => hero.name.toLocaleLowerCase("ru").includes(heroSearch.toLocaleLowerCase("ru")));
   const timerText = formatTimer(room);
   const roleLabel = runtimeMode === "solo" ? "Соло" : seat.role === "host" ? "Команда А" : seat.role === "guest" ? "Команда Б" : "Зритель";
   const activeSide = step?.side || null;
@@ -400,22 +394,32 @@ function renderRoom() {
   const showHeroes = room.status !== "completed";
 
   app.innerHTML = `
-    ${renderBrand()}
-    <div class="room-shell">
+    <div class="room-view">
+      ${renderBrand()}
+      ${room.status === "drafting" ? `<div class="draft-rotate-notice" role="status">
+        <div class="draft-rotate-notice__icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none"><rect x="15" y="7" width="18" height="34" rx="3" stroke="currentColor" stroke-width="2.5"/><path d="M20 12h8M23 36h2" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/><path d="M7 20c1.7-5 6.1-8.5 11.4-9.1M7 20l-.8-5.7M7 20l5.5-.6M41 28c-1.7 5-6.1 8.5-11.4 9.1M41 28l.8 5.7M41 28l-5.5.6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <p class="eyebrow">Драфт идёт</p>
+        <h2>Поверните телефон</h2>
+      </div>` : ""}
+      <div class="room-shell">
       ${lastError ? `<div class="error-box">${escapeHtml(lastError)}</div>` : ""}
       <div class="room-topbar">
         <div class="room-meta">
           ${runtimeMode === "online" ? `<span class="connection-dot ${connected ? "connected" : ""}" aria-hidden="true"></span>` : ""}
+          <span class="room-team-name room-team-name--a team-a">${escapeHtml(room.teamNames.A)}</span>
           <span class="room-role">${roleLabel}</span>
         </div>
         <div class="turn-center">
           <span class="turn-label ${activeSide === "A" ? "team-a" : activeSide === "B" ? "team-b" : ""}">${activeSide ? `${escapeHtml(room.teamNames[activeSide])} — ${actionText}` : actionText}</span>
           <span class="timer" id="draft-timer">${timerText}</span>
         </div>
+        <span class="mobile-room-mode">${escapeHtml(roleLabel)}</span>
         <div class="room-actions">
+          <span class="room-team-name room-team-name--b team-b">${escapeHtml(room.teamNames.B)}</span>
           ${runtimeMode === "online" && seat.role === "host" ? `<button class="opponent-link opponent-link--compact" id="copy-opponent" type="button">${COPY_ICON}<span>Ссылка сопернику</span></button>` : ""}
           ${runtimeMode === "online" ? `<button class="secondary-button" id="copy-watch" type="button">Ссылка зрителю</button>` : ""}
-          <button class="icon-button" id="new-draft" type="button">Новый</button>
         </div>
       </div>
 
@@ -428,19 +432,18 @@ function renderRoom() {
         ${renderTeamPanel("A")}
         <section class="draft-center-column">
           <section class="panel hero-panel">
-            ${showHeroes ? `<div class="hero-toolbar">
-              <input id="hero-search" class="hero-search" type="search" autocomplete="off" placeholder="Найти героя…" value="${escapeAttr(heroSearch)}" />
-            </div>
-            <div class="hero-grid">
-              ${filteredHeroes.map((hero) => renderHeroCard(hero, canAct)).join("")}
+            ${showHeroes ? `<div class="hero-grid">
+              ${HEROES.map((hero) => renderHeroCard(hero, canAct)).join("")}
             </div>` : `<div class="hero-complete-state"><span class="hero-complete-state__mark">✓</span><strong>Драфт завершён</strong><span>Пики и баны показаны по сторонам</span></div>`}
+            ${room.status === "completed" ? renderCompletedActions("mobile-side") : renderActionBar(selectedHero, step, canAct, "mobile-side")}
           </section>
           ${renderLiveSequence()}
-          ${room.status === "completed" ? renderCompletedActions() : renderActionBar(selectedHero, step, canAct)}
+          ${room.status === "completed" ? renderCompletedActions("desktop") : renderActionBar(selectedHero, step, canAct, "desktop")}
         </section>
         ${renderTeamPanel("B")}
       </div>
       <div class="ad-zone" aria-label="Реклама"></div>
+      </div>
     </div>
   `;
 
@@ -452,23 +455,23 @@ function renderTeamPanel(side) {
   const picks = room.picks[side];
   const bans = room.bans[side];
   const expectedBans = room.rules.sequence.filter((step) => step.action === "ban" && step.side === side).length;
-  const renderSlots = (items, count) => Array.from({ length: count }, (_, index) => items[index] ? renderMiniHero(items[index]) : renderEmptySlot()).join("");
+  const renderSlots = (items, count, kind) => Array.from({ length: count }, (_, index) => items[index] ? renderMiniHero(items[index], kind) : renderEmptySlot(kind)).join("");
   return `
     <aside class="panel team-panel team-${side.toLowerCase()}">
       <div class="team-heading">
         <h2 class="team-name">${escapeHtml(room.teamNames[side])}</h2>
-        <span class="team-side">КОМАНДА ${side === "A" ? "А" : "Б"}</span>
+        <span class="team-side" aria-label="Команда ${side === "A" ? "А" : "Б"}"><span class="team-side__full">КОМАНДА ${side === "A" ? "А" : "Б"}</span><span class="team-side__short" aria-hidden="true">${side === "A" ? "А" : "Б"}</span></span>
       </div>
       <div class="team-block">
         <h3>Пики</h3>
         <div class="mini-list mini-list--slots">
-          ${renderSlots(picks, room.rules.teamSize)}
+          ${renderSlots(picks, room.rules.teamSize, "pick")}
         </div>
       </div>
       <div class="team-block">
         <h3>Баны</h3>
         <div class="mini-list mini-list--slots">
-          ${renderSlots(bans, expectedBans)}
+          ${renderSlots(bans, expectedBans, "ban")}
         </div>
       </div>
     </aside>
@@ -481,14 +484,14 @@ function renderMobileTeam(side) {
   return `<div class="mobile-team-summary"><strong>${escapeHtml(room.teamNames[side])}</strong><span>${escapeHtml(picks)} · ${escapeHtml(bans)}</span></div>`;
 }
 
-function renderMiniHero(heroId) {
+function renderMiniHero(heroId, kind = "pick") {
   const hero = HERO_BY_ID.get(heroId);
   if (!hero) return "";
-  return `<div class="mini-hero" title="${escapeAttr(hero.name)}"><img src="${hero.image}" alt="" width="54" height="54" loading="lazy" /><span class="sr-only">${escapeHtml(hero.name)}</span></div>`;
+  return `<div class="mini-hero mini-hero--${kind}" title="${escapeAttr(hero.name)}"><img src="${hero.image}" alt="" width="54" height="54" loading="lazy" /><span class="sr-only">${escapeHtml(hero.name)}</span></div>`;
 }
 
-function renderEmptySlot() {
-  return `<div class="empty-slot" aria-label="Свободный слот"><span aria-hidden="true"></span></div>`;
+function renderEmptySlot(kind = "pick") {
+  return `<div class="empty-slot empty-slot--${kind}" aria-label="Свободный слот"><span aria-hidden="true"></span></div>`;
 }
 
 function renderHeroCard(hero, canAct) {
@@ -557,8 +560,11 @@ function renderLiveSequenceTrack(side) {
   }).join("")}</div>`;
 }
 
-function renderActionBar(selectedHero, step, canAct) {
+function renderActionBar(selectedHero, step, canAct, variant = "default") {
   const action = step?.action === "ban" ? "ЗАБАНИТЬ" : "ВЫБРАТЬ";
+  const buttonLabel = variant === "mobile-side"
+    ? (step?.action === "ban" ? "БАН" : "ПИК")
+    : selectedHero ? `${action} ${escapeHtml(selectedHero.name)}` : action;
   const unavailableReason = !step
       ? "Нет активного хода"
       : !canAct
@@ -567,36 +573,25 @@ function renderActionBar(selectedHero, step, canAct) {
           ? step.action === "ban" ? "Лимит банов уже исчерпан" : "Лимит пиков уже исчерпан"
         : "Выберите героя";
   return `
-    <div class="action-bar">
+    <div class="action-bar action-bar--${variant}">
       <div class="selected-summary">
         ${selectedHero ? `<img src="${selectedHero.image}" alt="" width="46" height="46" /><div><strong>${escapeHtml(selectedHero.name)}</strong><br /><span>${step?.action === "ban" ? "Будет забанен" : "Будет выбран"}</span></div>` : `<span>${escapeHtml(unavailableReason)}</span>`}
       </div>
-      <button id="confirm-action" class="confirm-button" type="button" ${!selectedHero || !canAct ? "disabled" : ""}>${selectedHero ? `${action} ${escapeHtml(selectedHero.name)}` : action}</button>
+      <button id="${variant === "mobile-side" ? "confirm-action-mobile" : "confirm-action"}" data-confirm-action class="confirm-button" type="button" aria-label="${escapeAttr(selectedHero ? `${action} ${selectedHero.name}` : unavailableReason)}" ${!selectedHero || !canAct ? "disabled" : ""}>${buttonLabel}</button>
     </div>
   `;
 }
 
-function renderCompletedActions() {
+function renderCompletedActions(variant = "default") {
   return `
-    <div class="action-bar">
+    <div class="action-bar action-bar--${variant}">
       <div class="selected-summary"><strong>Драфт завершён</strong></div>
-      <button id="restart-draft" class="confirm-button" type="button">Новый драфт</button>
+      <button id="${variant === "mobile-side" ? "restart-draft-mobile" : "restart-draft"}" data-restart-draft class="confirm-button" type="button">Новый драфт</button>
     </div>
   `;
 }
 
 function attachRoomEvents(canAct) {
-  const search = app.querySelector("#hero-search");
-  if (search) {
-    search.addEventListener("input", (event) => {
-      heroSearch = event.target.value.slice(0, 60);
-      renderRoom();
-      const nextSearch = app.querySelector("#hero-search");
-      nextSearch?.focus({ preventScroll: true });
-      if (nextSearch) nextSearch.setSelectionRange(heroSearch.length, heroSearch.length);
-    });
-  }
-
   app.querySelectorAll("[data-hero]").forEach((button) => {
     button.addEventListener("click", () => {
       if (!canAct || button.disabled) return;
@@ -605,17 +600,15 @@ function attachRoomEvents(canAct) {
     });
   });
 
-  app.querySelector("#confirm-action")?.addEventListener("click", () => void confirmAction());
+  app.querySelectorAll("[data-confirm-action]").forEach((button) => {
+    button.addEventListener("click", () => void confirmAction());
+  });
   app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
   app.querySelector("#copy-watch")?.addEventListener("click", () => void copyText(`${location.origin}/draft/${roomCode}`, "Ссылка зрителя скопирована"));
-  app.querySelector("#new-draft")?.addEventListener("click", () => {
+  app.querySelectorAll("[data-restart-draft]").forEach((button) => button.addEventListener("click", () => {
     if (runtimeMode === "solo") sessionStorage.removeItem(SOLO_KEY);
     navigate("/draft");
-  });
-  app.querySelector("#restart-draft")?.addEventListener("click", () => {
-    if (runtimeMode === "solo") sessionStorage.removeItem(SOLO_KEY);
-    navigate("/draft");
-  });
+  }));
 }
 
 async function confirmAction() {

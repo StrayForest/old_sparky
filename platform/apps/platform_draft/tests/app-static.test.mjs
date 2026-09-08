@@ -64,3 +64,24 @@ test("stateless result routes and link controls are removed", () => {
   assert.doesNotMatch(appSource, /open-result|copy-result|encodeResult|decodeResult|\/draft\/result|#v2\./u);
   assert.doesNotMatch(coreSource, /encodeResult|decodeResult|makeResultPayload/u);
 });
+
+test("mobile draft has a rotate prompt and a dedicated side action control", () => {
+  assert.match(appSource, /draft-rotate-notice/u);
+  assert.doesNotMatch(appSource, /В горизонтальном режиме поле героев/u);
+  assert.doesNotMatch(appSource, /lobby-help|Отправь ссылку сопернику/u);
+  assert.doesNotMatch(appSource, /data-new-draft|mobile-new-draft|lobby-actions/u);
+  assert.match(appSource, /data-restart-draft/u);
+  assert.match(appSource, /confirm-action-mobile/u);
+  assert.match(appSource, /data-confirm-action/u);
+  assert.match(appSource, /team-side__short/u);
+  assert.match(appSource, /mini-hero mini-hero--\$\{kind\}/u);
+  assert.match(appSource, /empty-slot empty-slot--\$\{kind\}/u);
+  assert.doesNotMatch(appSource, /hero-search/u);
+  assert.match(appSource, /renderActionBar\(selectedHero, step, canAct, "mobile-side"\)/u);
+  assert.match(stylesSource, /max-width: 1024px\) and \(orientation: landscape\)/u);
+  assert.match(stylesSource, /\.lobby-title \{\s*flex-direction: column;/u);
+  assert.match(stylesSource, /\.hero-panel \.action-bar--mobile-side/u);
+  assert.match(stylesSource, /grid-template-columns: repeat\(auto-fill, minmax\(clamp\(40px, 8vw, 88px\), 1fr\)\)/u);
+  assert.match(stylesSource, /\.room-view \.sequence-editor--live/u);
+  assert.match(stylesSource, /max-width: 820px\) and \(orientation: portrait\)[\s\S]*?\.room-view \.sequence-editor--live \{\s*display: none;/u);
+});
