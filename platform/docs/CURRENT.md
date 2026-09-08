@@ -85,8 +85,10 @@ Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target; the final attribution and next candidate are recorded
 in the blocked
 [`authenticated HTML/TTFB work order`](archive/performance-authenticated-html-ttfb-2026-09-07.md).
-The active one-candidate A/B work order is
-[`authenticated HTML/TTFB candidate`](../performance/active-authenticated-html-ttfb-workspace-client-2026-09-08.md).
+The browser-workspace candidate is archived in
+[`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](archive/performance-authenticated-html-ttfb-workspace-client-2026-09-08.md),
+and the active one-candidate A/B work order is
+[`authenticated HTML/TTFB avatar candidate`](../performance/active-authenticated-html-ttfb-avatar-defer-2026-09-08.md).
 The bounded admission/pool-contention candidate was rejected after exact A/B
 run `34137667234`: TTFB p95 was `2356.822 ms` with all 20,000 HTTP responses
 successful and exact cleanup. Production is restored to
@@ -101,12 +103,12 @@ post-data unattributed upstream p95 `2340.311 ms` after detail data-ready p95
 rejected client detail-boundary candidate was measured by exact run
 `34159422212`: it returned `20,000/20,000` HTTP 200 responses with exact
 cleanup and TTFB p95 `2270.945 ms`, a safe incremental result that did not
-close the target. The active candidate defers the tournament workspace read
+close the target. The archived candidate deferred the tournament workspace read
 to the browser while retaining the server-rendered authoritative auth/header
-path. It still does not change workers, pool sizing, API contracts or
-authoritative session validation. Fresh diagnostic attribution is in exact
-run `34161768785`; production was restored to `ready-vote-static-8` by
-`34163426494`.
+path. Its exact A/B was `34169435362`; its diagnostic repeat was `34171146327`;
+production was restored to `ready-vote-static-8` by `34172262955`. The active
+follow-up removes only the optional avatar SQL from the blocking bootstrap
+request.
 The historical v3 timeout plus anomaly
 `33991798604` remain unexplained transient episodes. No worker/pool increase or
 external Cloudflare root cause is asserted without further evidence.

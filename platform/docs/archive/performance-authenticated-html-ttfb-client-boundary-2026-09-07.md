@@ -41,4 +41,4 @@ Production was restored to the ordinary `ready-vote-static-8` contour.
 
 The next active candidate moves the tournament workspace read itself to the
 browser while retaining the server-rendered authoritative auth/header path:
-[`active-authenticated-html-ttfb-workspace-client-2026-09-08.md`](../../performance/active-authenticated-html-ttfb-workspace-client-2026-09-08.md).
+[`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](performance-authenticated-html-ttfb-workspace-client-2026-09-08.md).
