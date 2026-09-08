@@ -127,8 +127,18 @@ zero unexpected/overload/retry responses, backend peak `43/52`, zero lock
 waiters, and exact cleanup. It reduced HTML TTFB p95 to `1341.322 ms`
 (`47.8%` below the unchanged `2568.859 ms` control), but remained `341.322 ms`
 above the `<1,000 ms` target. It was therefore reverted through the reviewed
-`dev` path; production remains on `ready-vote-static-8` pending the next
-diagnostic-first candidate. No capacity-setting change is authorized.
+`dev` path. The follow-up global-chrome boundary candidate is archived in
+[`performance-authenticated-html-ttfb-global-chrome-2026-09-08.md`](archive/performance-authenticated-html-ttfb-global-chrome-2026-09-08.md).
+Its reviewed source SHA `0cb0f1fabafa793d0520774a04883b02ad4a2584` completed
+the exact 20k/40 profile in run `34216385147`: all 20,000 responses were HTTP
+200 with zero errors, unexpected statuses, timeouts, overloads or retries;
+HTML TTFB p95 was `1391.415 ms`, page p95 `1704.678 ms`, PostgreSQL peak `44/52`,
+zero lock waiters, two workers and exact cleanup. It passed origin safety but
+missed the target by `391.415 ms` and was worse than the narrower provider
+candidate, so it is rejected. The candidate is being reverted through the
+reviewed `dev` path; production remains on `ready-vote-static-8` pending a
+diagnostic-first root component-tree candidate with exportable SSR timings.
+No capacity-setting change is authorized.
 The historical v3 timeout plus anomaly
 `33991798604` remain unexplained transient episodes. No worker/pool increase or
 external Cloudflare root cause is asserted without further evidence.

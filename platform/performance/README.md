@@ -142,9 +142,19 @@ HTML TTFB p95 `1341.322 ms`, total page p95 `1665.096 ms`, PostgreSQL peak
 `43/52`, zero lock waiters, two workers and exact cleanup. This is a `47.8%`
 TTFB p95 improvement from the unchanged `2568.859 ms` control but still misses
 the `<1,000 ms` target by `341.322 ms`, so the candidate was rejected and
-reverted through the reviewed `dev` path. The next candidate remains
-diagnostic-first root component-tree work; no capacity-setting change is
-authorized.
+reverted through the reviewed `dev` path. The follow-up global-chrome
+boundary candidate is archived in
+[`performance-authenticated-html-ttfb-global-chrome-2026-09-08.md`](../docs/archive/performance-authenticated-html-ttfb-global-chrome-2026-09-08.md).
+Its reviewed source SHA `0cb0f1fabafa793d0520774a04883b02ad4a2584` completed
+the exact 20k/40 profile in [run 34216385147](https://github.com/StrayForest/old_sparky/actions/runs/34216385147):
+20,000/20,000 HTTP 200, zero errors/unexpected/timeouts/overload/retries,
+HTML TTFB p95 `1391.415 ms`, total page p95 `1704.678 ms`, PostgreSQL peak
+`44/52`, zero lock waiters, two workers and exact cleanup. Origin safety passed,
+but the candidate missed the target by `391.415 ms` and was worse than the
+narrower provider-boundary candidate, so it was rejected and is being reverted
+through the reviewed `dev` path. The next candidate remains diagnostic-first
+root component-tree work with exportable SSR timings; no capacity-setting
+change is authorized.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.
