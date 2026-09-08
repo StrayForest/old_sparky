@@ -4,8 +4,8 @@ import { connection } from "next/server";
 import { Suspense, type ReactNode } from "react";
 import { AuthProvider } from "@/components/auth/auth-provider";
 import { I18nProvider } from "@/components/i18n-provider";
+import { SiteFooter } from "@/components/layout/site-footer";
 import { SiteHeader } from "@/components/layout/site-header";
-import { RouteSiteFooter } from "@/components/layout/route-site-footer";
 import { CspNonceProvider } from "@/components/security/csp-nonce-provider";
 import { CspRouteAnnouncer } from "@/components/security/csp-route-announcer";
 import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
@@ -59,7 +59,7 @@ export default async function RootLayout({
               <Suspense fallback={<div className="page-noise" aria-hidden="true" />}>
                 {children}
               </Suspense>
-              <RouteSiteFooter />
+              <SiteFooter />
             </I18nProvider>
           </AuthProvider>
         </CspNonceProvider>
