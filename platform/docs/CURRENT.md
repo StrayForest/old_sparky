@@ -64,8 +64,13 @@ p95 `3357.939 ms` and HTML TTFB p95 `2568.859 ms`. The D9 projection is
 functionally clean and its stress contract passed, but this was not a
 same-window unchanged-code A/B and it did not close the requested authenticated
 TTFB target of `<1,000 ms`. The remaining owner-level priority is a bounded
-authenticated web/API investigation; no worker or pool scaling is authorized
-by this evidence.
+authenticated web investigation; no worker or pool scaling is authorized by
+this evidence. The avatar-defer candidate is archived after exact A/B
+`34174264965` (TTFB p95 `1,512.860 ms`) and fresh origin diagnostic
+`34175851102` (Nginx upstream-header p95 `1,119 ms`, web CPU `95.79%`, zero
+lock waiters). The active one-candidate follow-up is the server-rendered chrome
+boundary work order at
+[`../performance/active-authenticated-html-ttfb-chrome-boundaries-2026-09-08.md`](../performance/active-authenticated-html-ttfb-chrome-boundaries-2026-09-08.md).
 
 The earlier stale-checkout attempt
 ([`34067801649`](https://github.com/StrayForest/old_sparky/actions/runs/34067801649))
@@ -85,8 +90,12 @@ Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target; the final attribution and next candidate are recorded
 in the blocked
 [`authenticated HTML/TTFB work order`](archive/performance-authenticated-html-ttfb-2026-09-07.md).
+The browser-workspace candidate is archived in
+[`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](archive/performance-authenticated-html-ttfb-workspace-client-2026-09-08.md),
+and the avatar-defer candidate is archived in
+[`performance-authenticated-html-ttfb-avatar-defer-2026-09-08.md`](archive/performance-authenticated-html-ttfb-avatar-defer-2026-09-08.md).
 The active one-candidate A/B work order is
-[`authenticated HTML/TTFB candidate`](../performance/active-authenticated-html-ttfb-workspace-client-2026-09-08.md).
+[`authenticated HTML/TTFB chrome candidate`](../performance/active-authenticated-html-ttfb-chrome-boundaries-2026-09-08.md).
 The bounded admission/pool-contention candidate was rejected after exact A/B
 run `34137667234`: TTFB p95 was `2356.822 ms` with all 20,000 HTTP responses
 successful and exact cleanup. Production is restored to
@@ -101,12 +110,12 @@ post-data unattributed upstream p95 `2340.311 ms` after detail data-ready p95
 rejected client detail-boundary candidate was measured by exact run
 `34159422212`: it returned `20,000/20,000` HTTP 200 responses with exact
 cleanup and TTFB p95 `2270.945 ms`, a safe incremental result that did not
-close the target. The active candidate defers the tournament workspace read
+close the target. The archived candidate deferred the tournament workspace read
 to the browser while retaining the server-rendered authoritative auth/header
-path. It still does not change workers, pool sizing, API contracts or
-authoritative session validation. Fresh diagnostic attribution is in exact
-run `34161768785`; production was restored to `ready-vote-static-8` by
-`34163426494`.
+path. Its exact A/B was `34169435362`; its diagnostic repeat was `34171146327`;
+production was restored to `ready-vote-static-8` by `34172262955`. The active
+follow-up removes only the optional avatar SQL from the blocking bootstrap
+request.
 The historical v3 timeout plus anomaly
 `33991798604` remain unexplained transient episodes. No worker/pool increase or
 external Cloudflare root cause is asserted without further evidence.
