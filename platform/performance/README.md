@@ -151,10 +151,17 @@ the exact 20k/40 profile in [run 34216385147](https://github.com/StrayForest/old
 HTML TTFB p95 `1391.415 ms`, total page p95 `1704.678 ms`, PostgreSQL peak
 `44/52`, zero lock waiters, two workers and exact cleanup. Origin safety passed,
 but the candidate missed the target by `391.415 ms` and was worse than the
-narrower provider-boundary candidate, so it was rejected and is being reverted
-through the reviewed `dev` path. The next candidate remains diagnostic-first
-root component-tree work with exportable SSR timings; no capacity-setting
-change is authorized.
+narrower provider-boundary candidate, so it was rejected and reverted through
+the reviewed `dev` path. Production was restored to `ready-vote-static-8` by
+automatic deploy `34234377917` for rollback SHA
+`fe48877e3c7e10549bdd4a50afad5d5a9744b2f6`. The tournament-detail-footer
+candidate is archived in
+[`performance-authenticated-html-ttfb-detail-footer-2026-09-08.md`](../docs/archive/performance-authenticated-html-ttfb-detail-footer-2026-09-08.md).
+Its exact load `34230327945` reached the full 20k/40 fixture but failed closed
+on a client `IncompleteRead` before producing a TTFB report; exact cleanup
+passed with zero remnants. The next candidate remains diagnostic-first root
+component-tree work with exportable SSR timings. No capacity-setting change is
+authorized.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.
