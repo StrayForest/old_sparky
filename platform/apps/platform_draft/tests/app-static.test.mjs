@@ -72,10 +72,11 @@ test("mobile draft has a rotate prompt and a dedicated side action control", () 
   assert.match(appSource, /team-side__short/u);
   assert.match(appSource, /mini-hero mini-hero--\$\{kind\}/u);
   assert.match(appSource, /empty-slot empty-slot--\$\{kind\}/u);
+  assert.doesNotMatch(appSource, /hero-search/u);
   assert.match(appSource, /renderActionBar\(selectedHero, step, canAct, "mobile-side"\)/u);
-  assert.match(stylesSource, /max-width: 900px\) and \(orientation: landscape\)/u);
+  assert.match(stylesSource, /max-width: 1024px\) and \(orientation: landscape\)/u);
   assert.match(stylesSource, /\.hero-panel \.action-bar--mobile-side/u);
-  assert.match(stylesSource, /grid-template-columns: repeat\(10, minmax\(0, 1fr\)\)/u);
+  assert.match(stylesSource, /grid-template-columns: repeat\(auto-fill, minmax\(clamp\(40px, 8vw, 88px\), 1fr\)\)/u);
   assert.match(stylesSource, /\.room-view \.sequence-editor--live/u);
   assert.match(stylesSource, /max-width: 820px\) and \(orientation: portrait\)[\s\S]*?\.room-view \.sequence-editor--live \{\s*display: none;/u);
 });

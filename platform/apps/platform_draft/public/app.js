@@ -29,7 +29,6 @@ let selectedFirstMove = "A";
 let customSequence = createEditorSequence(createDefaultSequence(selectedTeamSize, selectedBanCount, selectedFirstMove));
 let room = null;
 let selectedHeroId = null;
-let heroSearch = "";
 let runtimeMode = null;
 let roomCode = null;
 let seat = { role: "spectator", token: null };
@@ -50,7 +49,6 @@ function route() {
   stopTimer();
   closeSocket();
   selectedHeroId = null;
-  heroSearch = "";
   lastError = "";
 
   const path = normalizePath(location.pathname);
@@ -392,7 +390,6 @@ function renderRoom() {
   const step = currentStep(room);
   const canAct = canCurrentSeatAct(step);
   const selectedHero = selectedHeroId ? HERO_BY_ID.get(selectedHeroId) : null;
-  const filteredHeroes = HEROES.filter((hero) => hero.name.toLocaleLowerCase("ru").includes(heroSearch.toLocaleLowerCase("ru")));
   const timerText = formatTimer(room);
   const roleLabel = runtimeMode === "solo" ? "Соло" : seat.role === "host" ? "Команда А" : seat.role === "guest" ? "Команда Б" : "Зритель";
   const activeSide = step?.side || null;
@@ -419,11 +416,11 @@ function renderRoom() {
           <span class="room-role">${roleLabel}</span>
         </div>
         <div class="turn-center">
-          <span class="mobile-room-mode">${escapeHtml(roleLabel)}</span>
           <span class="turn-label ${activeSide === "A" ? "team-a" : activeSide === "B" ? "team-b" : ""}">${activeSide ? `${escapeHtml(room.teamNames[activeSide])} — ${actionText}` : actionText}</span>
           <span class="timer" id="draft-timer">${timerText}</span>
-          <button class="mobile-new-draft" id="new-draft-mobile" data-new-draft type="button">Новый</button>
         </div>
+        <span class="mobile-room-mode">${escapeHtml(roleLabel)}</span>
+        <button class="mobile-new-draft" id="new-draft-mobile" data-new-draft type="button">Новый</button>
         <div class="room-actions">
           <span class="room-team-name room-team-name--b team-b">${escapeHtml(room.teamNames.B)}</span>
           ${runtimeMode === "online" && seat.role === "host" ? `<button class="opponent-link opponent-link--compact" id="copy-opponent" type="button">${COPY_ICON}<span>Ссылка сопернику</span></button>` : ""}
@@ -441,11 +438,8 @@ function renderRoom() {
         ${renderTeamPanel("A")}
         <section class="draft-center-column">
           <section class="panel hero-panel">
-            ${showHeroes ? `<div class="hero-toolbar">
-              <input id="hero-search" class="hero-search" type="search" autocomplete="off" placeholder="Найти героя…" value="${escapeAttr(heroSearch)}" />
-            </div>
-            <div class="hero-grid">
-              ${filteredHeroes.map((hero) => renderHeroCard(hero, canAct)).join("")}
+            ${showHeroes ? `<div class="hero-grid">
+              ${HEROES.map((hero) => renderHeroCard(hero, canAct)).join("")}
             </div>` : `<div class="hero-complete-state"><span class="hero-complete-state__mark">✓</span><strong>Драфт завершён</strong><span>Пики и баны показаны по сторонам</span></div>`}
             ${room.status === "completed" ? renderCompletedActions("mobile-side") : renderActionBar(selectedHero, step, canAct, "mobile-side")}
           </section>
@@ -604,17 +598,6 @@ function renderCompletedActions(variant = "default") {
 }
 
 function attachRoomEvents(canAct) {
-  const search = app.querySelector("#hero-search");
-  if (search) {
-    search.addEventListener("input", (event) => {
-      heroSearch = event.target.value.slice(0, 60);
-      renderRoom();
-      const nextSearch = app.querySelector("#hero-search");
-      nextSearch?.focus({ preventScroll: true });
-      if (nextSearch) nextSearch.setSelectionRange(heroSearch.length, heroSearch.length);
-    });
-  }
-
   app.querySelectorAll("[data-hero]").forEach((button) => {
     button.addEventListener("click", () => {
       if (!canAct || button.disabled) return;
