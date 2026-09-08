@@ -127,8 +127,14 @@ zero unexpected/overload/retry responses, backend peak `43/52`, zero lock
 waiters, and exact cleanup. It reduced HTML TTFB p95 to `1341.322 ms`
 (`47.8%` below the unchanged `2568.859 ms` control), but remained `341.322 ms`
 above the `<1,000 ms` target. It was therefore reverted through the reviewed
-`dev` path; production remains on `ready-vote-static-8` pending the next
-diagnostic-first candidate. No capacity-setting change is authorized.
+`dev` path. A fresh diagnostic deployment/load on current safe SHA
+`e59485a278d09b9a00ecee86358df3e8ea1d4175` completed origin fixture setup and
+exact cleanup, but did not export a client report; it is not performance
+evidence. The next active candidate is the bounded global-chrome provider
+boundary in
+[`active-authenticated-html-ttfb-global-chrome-2026-09-08.md`](../performance/active-authenticated-html-ttfb-global-chrome-2026-09-08.md).
+Production remains on `ready-vote-static-8`; no capacity-setting change is
+authorized.
 The historical v3 timeout plus anomaly
 `33991798604` remain unexplained transient episodes. No worker/pool increase or
 external Cloudflare root cause is asserted without further evidence.
