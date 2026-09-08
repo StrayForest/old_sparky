@@ -84,8 +84,13 @@ the automatic production deployment chain remain mandatory.
 Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target. The prior blocked attribution is retained in the
 [`authenticated HTML/TTFB archive`](archive/performance-authenticated-html-ttfb-2026-09-07.md),
-and the active next step is the narrow
-[`root component-tree diagnostic work order`](../performance/active-authenticated-html-ttfb-root-component-tree-2026-09-08.md).
+and the root component-tree diagnostic is archived in
+[`performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md`](archive/performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md).
+Its exact run measured 194 correlated requests and identified the largest
+measured pre-body interval as root response serialization/flush scheduling,
+without a server data-ready marker. The active next step is the narrow,
+separately reviewed
+[`root render/flush boundary candidate`](../performance/active-authenticated-html-ttfb-root-render-flush-2026-09-09.md).
 The browser-workspace candidate is archived in
 [`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](archive/performance-authenticated-html-ttfb-workspace-client-2026-09-08.md),
 and the avatar candidate is archived in
