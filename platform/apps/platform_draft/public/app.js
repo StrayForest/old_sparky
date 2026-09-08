@@ -415,16 +415,20 @@ function renderRoom() {
       <div class="room-topbar">
         <div class="room-meta">
           ${runtimeMode === "online" ? `<span class="connection-dot ${connected ? "connected" : ""}" aria-hidden="true"></span>` : ""}
+          <span class="room-team-name room-team-name--a team-a">${escapeHtml(room.teamNames.A)}</span>
           <span class="room-role">${roleLabel}</span>
         </div>
         <div class="turn-center">
+          <span class="mobile-room-mode">${escapeHtml(roleLabel)}</span>
           <span class="turn-label ${activeSide === "A" ? "team-a" : activeSide === "B" ? "team-b" : ""}">${activeSide ? `${escapeHtml(room.teamNames[activeSide])} — ${actionText}` : actionText}</span>
           <span class="timer" id="draft-timer">${timerText}</span>
+          <button class="mobile-new-draft" id="new-draft-mobile" data-new-draft type="button">Новый</button>
         </div>
         <div class="room-actions">
+          <span class="room-team-name room-team-name--b team-b">${escapeHtml(room.teamNames.B)}</span>
           ${runtimeMode === "online" && seat.role === "host" ? `<button class="opponent-link opponent-link--compact" id="copy-opponent" type="button">${COPY_ICON}<span>Ссылка сопернику</span></button>` : ""}
           ${runtimeMode === "online" ? `<button class="secondary-button" id="copy-watch" type="button">Ссылка зрителю</button>` : ""}
-          <button class="icon-button" id="new-draft" type="button">Новый</button>
+          <button class="icon-button" id="new-draft" data-new-draft type="button">Новый</button>
         </div>
       </div>
 
@@ -443,11 +447,12 @@ function renderRoom() {
             <div class="hero-grid">
               ${filteredHeroes.map((hero) => renderHeroCard(hero, canAct)).join("")}
             </div>` : `<div class="hero-complete-state"><span class="hero-complete-state__mark">✓</span><strong>Драфт завершён</strong><span>Пики и баны показаны по сторонам</span></div>`}
+            ${room.status === "completed" ? renderCompletedActions("mobile-side") : renderActionBar(selectedHero, step, canAct, "mobile-side")}
           </section>
           ${renderLiveSequence()}
           ${room.status === "completed" ? renderCompletedActions("desktop") : renderActionBar(selectedHero, step, canAct, "desktop")}
         </section>
-        ${renderTeamPanel("B", { selectedHero, step, canAct })}
+        ${renderTeamPanel("B")}
       </div>
       <div class="ad-zone" aria-label="Реклама"></div>
       </div>
@@ -458,35 +463,29 @@ function renderRoom() {
   attachImageFallbacks();
 }
 
-function renderTeamPanel(side, actionContext = null) {
+function renderTeamPanel(side) {
   const picks = room.picks[side];
   const bans = room.bans[side];
   const expectedBans = room.rules.sequence.filter((step) => step.action === "ban" && step.side === side).length;
-  const renderSlots = (items, count) => Array.from({ length: count }, (_, index) => items[index] ? renderMiniHero(items[index]) : renderEmptySlot()).join("");
-  const mobileAction = side === "B" && actionContext
-    ? room.status === "completed"
-      ? renderCompletedActions("mobile-side")
-      : renderActionBar(actionContext.selectedHero, actionContext.step, actionContext.canAct, "mobile-side")
-    : "";
+  const renderSlots = (items, count, kind) => Array.from({ length: count }, (_, index) => items[index] ? renderMiniHero(items[index], kind) : renderEmptySlot(kind)).join("");
   return `
     <aside class="panel team-panel team-${side.toLowerCase()}">
       <div class="team-heading">
         <h2 class="team-name">${escapeHtml(room.teamNames[side])}</h2>
-        <span class="team-side">КОМАНДА ${side === "A" ? "А" : "Б"}</span>
+        <span class="team-side" aria-label="Команда ${side === "A" ? "А" : "Б"}"><span class="team-side__full">КОМАНДА ${side === "A" ? "А" : "Б"}</span><span class="team-side__short" aria-hidden="true">${side === "A" ? "А" : "Б"}</span></span>
       </div>
       <div class="team-block">
         <h3>Пики</h3>
         <div class="mini-list mini-list--slots">
-          ${renderSlots(picks, room.rules.teamSize)}
+          ${renderSlots(picks, room.rules.teamSize, "pick")}
         </div>
       </div>
       <div class="team-block">
         <h3>Баны</h3>
         <div class="mini-list mini-list--slots">
-          ${renderSlots(bans, expectedBans)}
+          ${renderSlots(bans, expectedBans, "ban")}
         </div>
       </div>
-      ${mobileAction}
     </aside>
   `;
 }
@@ -497,14 +496,14 @@ function renderMobileTeam(side) {
   return `<div class="mobile-team-summary"><strong>${escapeHtml(room.teamNames[side])}</strong><span>${escapeHtml(picks)} · ${escapeHtml(bans)}</span></div>`;
 }
 
-function renderMiniHero(heroId) {
+function renderMiniHero(heroId, kind = "pick") {
   const hero = HERO_BY_ID.get(heroId);
   if (!hero) return "";
-  return `<div class="mini-hero" title="${escapeAttr(hero.name)}"><img src="${hero.image}" alt="" width="54" height="54" loading="lazy" /><span class="sr-only">${escapeHtml(hero.name)}</span></div>`;
+  return `<div class="mini-hero mini-hero--${kind}" title="${escapeAttr(hero.name)}"><img src="${hero.image}" alt="" width="54" height="54" loading="lazy" /><span class="sr-only">${escapeHtml(hero.name)}</span></div>`;
 }
 
-function renderEmptySlot() {
-  return `<div class="empty-slot" aria-label="Свободный слот"><span aria-hidden="true"></span></div>`;
+function renderEmptySlot(kind = "pick") {
+  return `<div class="empty-slot empty-slot--${kind}" aria-label="Свободный слот"><span aria-hidden="true"></span></div>`;
 }
 
 function renderHeroCard(hero, canAct) {
@@ -629,10 +628,10 @@ function attachRoomEvents(canAct) {
   });
   app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
   app.querySelector("#copy-watch")?.addEventListener("click", () => void copyText(`${location.origin}/draft/${roomCode}`, "Ссылка зрителя скопирована"));
-  app.querySelector("#new-draft")?.addEventListener("click", () => {
+  app.querySelectorAll("[data-new-draft]").forEach((button) => button.addEventListener("click", () => {
     if (runtimeMode === "solo") sessionStorage.removeItem(SOLO_KEY);
     navigate("/draft");
-  });
+  }));
   app.querySelectorAll("[data-restart-draft]").forEach((button) => button.addEventListener("click", () => {
     if (runtimeMode === "solo") sessionStorage.removeItem(SOLO_KEY);
     navigate("/draft");

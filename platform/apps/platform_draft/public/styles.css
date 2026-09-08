@@ -715,6 +715,12 @@ h1 {
   font-size: 12px;
 }
 
+.room-team-name,
+.mobile-room-mode,
+.mobile-new-draft {
+  display: none;
+}
+
 .connection-dot {
   width: 8px;
   height: 8px;
@@ -803,6 +809,10 @@ h1 {
   font-size: 10px;
   font-weight: 850;
   letter-spacing: 0.08em;
+}
+
+.team-side__short {
+  display: none;
 }
 
 .team-a .team-side {
@@ -1299,9 +1309,7 @@ h1 {
   }
 
   .room-view .room-shell {
-    display: grid;
-    gap: 0;
-    grid-template-rows: 1fr;
+    display: block;
   }
 
   .room-view .room-shell > .error-box {
@@ -1318,6 +1326,7 @@ h1 {
 
   .room-topbar {
     position: static;
+    display: block;
     z-index: auto;
     width: 0;
     height: 0;
@@ -1349,6 +1358,29 @@ h1 {
     backdrop-filter: blur(12px);
   }
 
+  .room-meta .room-team-name,
+  .room-actions .room-team-name {
+    display: block;
+    max-width: 64px;
+    overflow: hidden;
+    font-size: 9px;
+    font-weight: 850;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .room-meta .room-team-name--a {
+    color: var(--team-a);
+  }
+
+  .room-actions .room-team-name--b {
+    color: var(--team-b);
+  }
+
+  .room-meta .room-role {
+    display: none;
+  }
+
   .room-actions {
     top: 4px;
     right: 6px;
@@ -1361,14 +1393,7 @@ h1 {
   }
 
   .room-actions #new-draft {
-    min-height: 25px;
-    padding: 0 7px;
-    color: var(--text-muted);
-    background: rgba(5, 8, 19, 0.82);
-    border-color: var(--border);
-    border-radius: 999px;
-    font-size: 9px;
-    backdrop-filter: blur(12px);
+    display: none;
   }
 
   .turn-center {
@@ -1378,7 +1403,8 @@ h1 {
     align-items: center;
     justify-content: center;
     gap: 6px;
-    min-width: 108px;
+    min-width: 190px;
+    max-width: calc(100vw - 160px);
     height: 26px;
     padding: 2px 8px;
     transform: translateX(-50%);
@@ -1390,7 +1416,7 @@ h1 {
   }
 
   .turn-label {
-    max-width: 88px;
+    max-width: 78px;
     margin: 0;
     overflow: hidden;
     font-size: 8px;
@@ -1403,9 +1429,36 @@ h1 {
     line-height: 1;
   }
 
+  .mobile-room-mode,
+  .mobile-new-draft {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+  }
+
+  .mobile-room-mode {
+    max-width: 48px;
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: 8px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mobile-new-draft {
+    min-height: 22px;
+    padding: 0 6px;
+    color: var(--text-muted);
+    background: rgba(5, 8, 19, 0.82);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 8px;
+    cursor: pointer;
+  }
+
   .draft-layout {
     display: grid;
-    grid-template-columns: minmax(54px, 72px) minmax(0, 1fr) minmax(54px, 72px);
+    grid-template-columns: minmax(48px, 60px) minmax(0, 1fr) minmax(48px, 60px);
     gap: 5px;
     height: 100%;
     min-height: 0;
@@ -1447,6 +1500,14 @@ h1 {
     font-size: 7px;
   }
 
+  .team-side__full {
+    display: none;
+  }
+
+  .team-side__short {
+    display: inline;
+  }
+
   .team-block {
     min-height: 0;
   }
@@ -1456,9 +1517,11 @@ h1 {
   }
 
   .team-block h3 {
-    margin-bottom: 2px;
-    font-size: 8px;
-    letter-spacing: 0.08em;
+    display: none;
+  }
+
+  .team-name {
+    display: none;
   }
 
   .mini-list--slots {
@@ -1468,11 +1531,25 @@ h1 {
 
   .mini-hero,
   .empty-slot {
-    width: 100%;
+    width: clamp(20px, 7.5svh, 30px);
     height: clamp(20px, 7.5svh, 30px);
     min-width: 0;
     min-height: 0;
+    justify-self: center;
+    aspect-ratio: 1;
     border-radius: 4px;
+  }
+
+  .mini-hero--pick,
+  .empty-slot--pick {
+    border-color: rgba(74, 222, 128, 0.68);
+    box-shadow: inset 0 0 0 1px rgba(74, 222, 128, 0.12);
+  }
+
+  .mini-hero--ban,
+  .empty-slot--ban {
+    border-color: rgba(251, 113, 133, 0.68);
+    box-shadow: inset 0 0 0 1px rgba(251, 113, 133, 0.12);
   }
 
   .draft-center-column {
@@ -1482,6 +1559,7 @@ h1 {
   }
 
   .hero-panel {
+    position: relative;
     display: flex;
     flex-direction: column;
     height: 100%;
@@ -1509,12 +1587,13 @@ h1 {
 
   .hero-grid {
     flex: 1 1 auto;
-    grid-template-columns: repeat(auto-fill, minmax(clamp(34px, 4.5vw, 38px), 1fr));
-    grid-auto-rows: clamp(30px, 10.5svh, 48px);
+    grid-template-columns: repeat(10, minmax(0, 1fr));
+    grid-auto-rows: minmax(0, 1fr);
     gap: 3px;
     min-height: 0;
+    padding-bottom: clamp(34px, 10svh, 42px);
     overflow: hidden;
-    align-content: start;
+    align-content: stretch;
   }
 
   .hero-card {
@@ -1543,12 +1622,14 @@ h1 {
     min-height: 100%;
   }
 
-  .team-panel .action-bar--mobile-side {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 3px;
+  .hero-panel .action-bar--mobile-side {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    z-index: 10;
+    display: block;
+    width: min(180px, 46%);
     min-height: 0;
-    margin-top: auto;
     padding: 0;
     background: transparent;
     border: 0;
@@ -1557,11 +1638,11 @@ h1 {
     backdrop-filter: none;
   }
 
-  .team-panel .action-bar--mobile-side .selected-summary {
+  .hero-panel .action-bar--mobile-side .selected-summary {
     display: none;
   }
 
-  .team-panel .action-bar--mobile-side .confirm-button {
+  .hero-panel .action-bar--mobile-side .confirm-button {
     width: 100%;
     min-width: 0;
     min-height: clamp(30px, 9svh, 40px);
