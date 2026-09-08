@@ -2,6 +2,13 @@
 
 Status: proposed A/B; no implementation. Owner: Platform maintainers.
 
+The production baseline is now Next.js `16.3.4` after the security
+maintenance release. The unchanged control is
+[`authenticated-page-load-v1` run 34287694375](https://github.com/StrayForest/old_sparky/actions/runs/34287694375),
+with HTML TTFB p95 `1725.436 ms`, full-page p95 `2279.541 ms`, 20,000/20,000
+HTTP 200 responses and exact cleanup. The earlier 16.2.12 measurement is not
+a control for this candidate.
+
 The completed root component-tree diagnostic found no server
 `data-ready` marker because the tournament workspace is client-deferred. On
 194 correlated production requests, the largest measured pre-body interval

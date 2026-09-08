@@ -131,7 +131,12 @@ diagnostic is archived in
 [the measured root component-tree report](../docs/archive/performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md).
 The active next step is the narrow [root render/flush boundary candidate](active-authenticated-html-ttfb-root-render-flush-2026-09-09.md);
 it is proposed for a separate A/B and has no implementation yet. No
-capacity-setting change is authorized. The narrower authenticated-provider-boundary candidate is
+capacity-setting change is authorized. The Next.js 16.3.4 security baseline
+and its new unchanged control are archived in
+[`security-web-dependencies-next-2026-09-09.md`](../docs/archive/security-web-dependencies-next-2026-09-09.md).
+The control is run `34287694375` with TTFB p95 `1725.436 ms` and full-page
+p95 `2279.541 ms`; it replaces the historical 16.2.12 result as the only
+valid control for a future A/B. The narrower authenticated-provider-boundary candidate is
 archived in
 [`performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md`](../docs/archive/performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md).
 It moved only `SiteFooter` outside `AuthProvider`, preserving the authoritative

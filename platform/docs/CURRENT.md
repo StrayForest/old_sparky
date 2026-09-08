@@ -91,6 +91,16 @@ measured pre-body interval as root response serialization/flush scheduling,
 without a server data-ready marker. The active next step is the narrow,
 separately reviewed
 [`root render/flush boundary candidate`](../performance/active-authenticated-html-ttfb-root-render-flush-2026-09-09.md).
+The security maintenance release upgraded Next.js to `16.3.4`, with its
+exact-SHA CI and production evidence archived in
+[`security-web-dependencies-next-2026-09-09.md`](archive/security-web-dependencies-next-2026-09-09.md).
+Because framework and streaming behavior can change across that upgrade, the
+new unchanged Next.js 16.3.4 control is
+[`authenticated-page-load-v1` run 34287694375](https://github.com/StrayForest/old_sparky/actions/runs/34287694375):
+20,000/20,000 HTTP 200, TTFB p95 `1725.436 ms`, full-page p95
+`2279.541 ms`, PostgreSQL max `41/52`, and exact cleanup with zero remnants.
+The old `1325.095 ms` TTFB result remains historical diagnostic evidence and
+must not be used as the A/B control for the next candidate.
 The browser-workspace candidate is archived in
 [`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](archive/performance-authenticated-html-ttfb-workspace-client-2026-09-08.md),
 and the avatar candidate is archived in
