@@ -9,17 +9,11 @@ import {
   useMemo,
   useState
 } from "react";
-import {
-  notifyPlatformAuthStateChanged,
-  registerPlatformAuthStateRequestHandler,
-  registerPlatformUnauthorizedHandler,
-  type PlatformAuthStatus,
-  type PlatformAuthState
-} from "@/lib/auth-session-signal";
+import { registerPlatformUnauthorizedHandler } from "@/lib/auth-session-signal";
 import { PlatformApiError, platformApiRequest } from "@/lib/platform-api";
 import type { PlatformUser } from "@/lib/platform-types";
 
-export type AuthStatus = PlatformAuthStatus;
+export type AuthStatus = "authenticated" | "anonymous" | "unavailable";
 
 type AuthUserPatch = Partial<PlatformUser> | ((user: PlatformUser) => PlatformUser);
 
@@ -77,17 +71,6 @@ export function AuthProvider({
     () => registerPlatformUnauthorizedHandler(clearUser),
     [clearUser]
   );
-  useEffect(
-    () => registerPlatformAuthStateRequestHandler(({ status: nextStatus, user: nextUser }) => {
-      setUser(nextUser);
-      setStatus(nextStatus);
-    }),
-    []
-  );
-  useEffect(() => {
-    const state: PlatformAuthState = { status, user };
-    notifyPlatformAuthStateChanged(state);
-  }, [status, user]);
   const value = useMemo(
     () => ({ status, user, clearUser, refreshUser, setUser: replaceUser, updateUser }),
     [clearUser, refreshUser, replaceUser, status, updateUser, user]
