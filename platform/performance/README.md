@@ -121,9 +121,15 @@ sampled root component-tree p95 `96.373 ms`; production was restored to
 optional avatar SQL from the blocking bootstrap request. The chrome-boundary
 candidate was rejected after exact runs `34181055402` and `34182385484` both
 failed to complete the 20k/40 client load; both fixtures were cleaned by
-guarded abort/cleanup workflows. The next concrete candidate is
-diagnostic-first stable-contour root component-tree work after rollback; no
-capacity-setting change is authorized.
+guarded abort/cleanup workflows. A post-rollback diagnostic deployment
+`34185100223` and load `34185320306` repeated the pre-report stall; guarded
+abort `34186422087` and exact cleanup `34186465537` passed with 20,000 users,
+40 tournaments and zero remnants. Production was restored to
+`ready-vote-static-8` by deploy `34184805970` for reviewed SHA
+`3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The next concrete candidate is
+diagnostic-first stable-contour root component-tree work, blocked until the
+diagnostic load exports completed origin timings; no capacity-setting change
+is authorized.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.

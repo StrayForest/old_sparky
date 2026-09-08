@@ -49,8 +49,10 @@ Both runs were cleaned through the guarded abort and exact cleanup workflows:
 Each cleanup reported `ok=true`, one marker, `20,000` users deleted,
 `40` tournaments deleted, and zero remaining users, tournaments, sessions or
 audit rows. The candidate was then reverted through the reviewed `dev` path;
-production is being returned to the last safe SHA
-`72e4c5df7af10d3d69c13ca4df938fbdb201e778`.
+production was restored to the last safe code contour by deploy
+[`34184805970`](https://github.com/StrayForest/old_sparky/actions/runs/34184805970)
+for reviewed SHA `3d7aca0e832bac3c79e1b391e7817b74e5695b03`, with the
+`ready-vote-static-8` profile.
 
 ## Attribution and follow-up
 
@@ -61,7 +63,25 @@ auth/bootstrap stage time as the primary tail: upstream-header p95 was
 and PostgreSQL lock waiters were zero. Its client report was invalid because
 of one `IncompleteRead`, so it was not an A/B.
 
-The next concrete candidate is a diagnostic-first stable-contour run after
-rollback, followed by one measured reduction in `layout.tsx`/root component
-tree work. It must capture completed origin stage timings before any further
-production A/B; no worker, pool, admission or timeout change is authorized.
+The post-rollback diagnostic deployment
+[`34185100223`](https://github.com/StrayForest/old_sparky/actions/runs/34185100223)
+enabled `web-ssr-diagnostics` on the reviewed rollback SHA. Its unchanged
+20k/40 load [`34185320306`](https://github.com/StrayForest/old_sparky/actions/runs/34185320306)
+again stalled before producing a client report. The guarded abort
+[`34186422087`](https://github.com/StrayForest/old_sparky/actions/runs/34186422087)
+matched only that run's fixture supervisor and observer tree; exact cleanup
+[`34186465537`](https://github.com/StrayForest/old_sparky/actions/runs/34186465537)
+reported `ok=true`, one marker, `20,000` users deleted, `40` tournaments
+deleted, and zero remaining users, tournaments, sessions or audit rows. This
+attempt is operational evidence only, not a latency A/B, and did not produce a
+usable new server timing artifact. The latest usable component attribution
+therefore remains the fresh last-safe-contour diagnostic
+[`34175851102`](https://github.com/StrayForest/old_sparky/actions/runs/34175851102):
+upstream-header p95 `1,119 ms`, sampled root stages about `80 ms`, web CPU
+`95.79%` average, and zero PostgreSQL lock waiters.
+
+The next concrete candidate is a diagnostic-first stable-contour reduction in
+`layout.tsx`/root component-tree work, but it is blocked until the diagnostic
+load can complete or export origin timings reliably. No further production A/B
+should run without completed stage timings; no worker, pool, admission or
+timeout change is authorized.
