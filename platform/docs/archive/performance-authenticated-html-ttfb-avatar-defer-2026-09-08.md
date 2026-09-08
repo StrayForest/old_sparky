@@ -21,50 +21,41 @@ The exact production A/B on source SHA
 | HTML TTFB | 20,000 | 1,512.860 | 1,728.350 |
 
 All `20,000/20,000` responses were HTTP 200, with zero errors, unexpected
-statuses, retries, 520/522 responses and shedding. The exact cleanup removed
-all `20,000` users and `40` tournaments; remaining users, tournaments,
-sessions and audit rows were zero. Relative to the retained baseline TTFB p95
+statuses, retries, 520/522 responses and shedding. Exact cleanup removed all
+`20,000` users and `40` tournaments; remaining users, tournaments, sessions
+and audit rows were zero. Relative to the retained baseline TTFB p95
 `2,568.859 ms`, this is a `1,055.999 ms` (`41.10%`) reduction, but it remains
 `512.860 ms` above the `<1,000 ms` target.
 
 ## Fresh origin attribution
 
-The same source was deployed with sampled `web-ssr-diagnostics` and measured
-by [`34175851102`](https://github.com/StrayForest/old_sparky/actions/runs/34175851102).
+The same source was measured with sampled diagnostics in
+[`34175851102`](https://github.com/StrayForest/old_sparky/actions/runs/34175851102).
 The client runner reached an `IncompleteRead` on one chunked response and did
 not produce a valid full-population client report, so that workflow correctly
-failed its external acceptance gate. This is rejected as a client acceptance
-result, not used as a TTFB A/B. Exact cleanup still passed: all `20,000` users
-and `40` tournaments were removed with zero remnants.
+failed its external acceptance gate. Exact cleanup still passed: all `20,000`
+users and `40` tournaments were removed with zero remnants.
 
-The origin observer captured all `20,000` HTML Nginx records during the
-diagnostic window:
+The origin observer captured all `20,000` HTML Nginx records:
 
 - upstream connect p95: `1 ms`;
 - upstream header p95: `1,119 ms`;
 - total upstream/request p95: `1,552 ms`;
-- sampled `auth_bootstrap_fetch` p95: `78.425 ms`;
-- sampled `root_layout_auth_bootstrap` p95: `79.438 ms`;
-- sampled `root_layout_component_tree` p95: `80.228 ms`;
+- sampled auth/bootstrap and root component stages: about `80 ms`;
 - event-loop p95/max p95: `57.377/168.126 ms`;
 - `deadlock-web` CPU: `95.79%` average, `128.21%` max;
-- API CPU: `38.97%` average; PostgreSQL CPU: `6.03%` average;
-- PostgreSQL backends peaked at `43`, lock waiters at `0`, ungranted locks at
-  `0`; Gunicorn remained at two workers and listen overflow/drop deltas were
-  zero.
+- PostgreSQL backends peaked at `43`, lock waiters at `0`, and ungranted locks
+  at `0`; Gunicorn remained at two workers and listen overflow/drop deltas
+  were zero.
 
-This rejects another auth-query/avatar/SQL hypothesis as the primary remaining
-tail. The evidence now points to CPU/queue pressure in the single Next.js web
-process after Nginx and API/DB connection time are excluded. The next bounded
-candidate is the active server/client chrome boundary split.
+The result rejects another auth/avatar/SQL/DB hypothesis as the primary
+remaining tail. The follow-up was the rejected chrome-boundary candidate; its
+production attempts are archived separately.
 
-## Production recovery record
+## Production recovery
 
 The diagnostic profile was restored to `ready-vote-static-8` on the exact SHA
 by successful deploy
-[`34177592468`](https://github.com/StrayForest/old_sparky/actions/runs/34177592468).
-The first restore was correctly stopped by stale backup freshness, and the
-next attempt was stopped by the release lock; a guarded recovery confirmed no
-durable pending release receipt. A fresh restore-verified backup was created
-by [`34177273416`](https://github.com/StrayForest/old_sparky/actions/runs/34177273416)
-before the successful retry. No manual lock or service bypass was used.
+[`34177592468`](https://github.com/StrayForest/old_sparky/actions/runs/34177592468)
+after a fresh restore-verified backup. No manual lock or service bypass was
+used.
