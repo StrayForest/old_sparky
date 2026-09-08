@@ -112,9 +112,13 @@ candidate then removed only the optional avatar SQL and measured TTFB p95
 `34175851102`. The chrome boundary candidate is archived in
 [`performance-authenticated-html-ttfb-chrome-boundaries-2026-09-08.md`](archive/performance-authenticated-html-ttfb-chrome-boundaries-2026-09-08.md):
 both exact 20k/40 attempts failed to complete the client load and were cleaned
-successfully. Production is being restored to the last safe
-`ready-vote-static-8` contour; the next candidate is diagnostic-first root
-component-tree work.
+successfully. A post-rollback diagnostic load also stalled before a client
+report; guarded abort and exact cleanup passed for its one marker, 20,000
+users and 40 tournaments with zero remnants. Production was restored to
+`ready-vote-static-8` by deploy `34184805970` for reviewed SHA
+`3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The next candidate is
+diagnostic-first root component-tree work, blocked until origin timings can be
+exported reliably.
 The historical v3 timeout plus anomaly
 `33991798604` remain unexplained transient episodes. No worker/pool increase or
 external Cloudflare root cause is asserted without further evidence.
