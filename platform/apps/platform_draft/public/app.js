@@ -352,7 +352,6 @@ function renderLobby() {
       <div class="lobby-meta"><span>${room.rules.teamSize}v${room.rules.teamSize}</span><span>${formatRoomBans(room.rules)}</span><span>${room.rules.timerSeconds}с таймер</span><span>Первый ход: ${firstSide}</span></div>
       ${lastError ? `<div class="error-box">${escapeHtml(lastError)}</div>` : ""}
       <div class="lobby-teams">${lobbyTeam("A")}${lobbyTeam("B")}</div>
-      <p class="lobby-help">Отправь ссылку сопернику. Драфт начнётся, когда оба игрока займут места и нажмут «Готов».</p>
       <div class="lobby-actions"><button class="icon-button" id="new-draft" type="button">Новый драфт</button></div>
     </section>
   `;

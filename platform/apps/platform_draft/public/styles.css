@@ -657,14 +657,6 @@ h1 {
   font-size: clamp(22px, 3vw, 34px);
 }
 
-.lobby-help {
-  max-width: 620px;
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
 .lobby-actions {
   margin-top: 4px;
 }
@@ -1232,6 +1224,17 @@ h1 {
 
   .lobby-shell {
     margin-top: 3vh;
+  }
+
+  .lobby-title {
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+  }
+
+  .lobby-title em {
+    font-size: 0.3em;
+    line-height: 1;
   }
 
   .lobby-teams {
