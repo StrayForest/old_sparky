@@ -8,6 +8,7 @@ const CSP_RESPONSE_HEADER = CSP_HEADER;
 const NONCE_HEADER = "x-nonce";
 const SSR_TRACE_HEADER = "x-platform-ssr-trace";
 const SSR_PROXY_START_HEADER = "x-platform-ssr-proxy-start-ms";
+const SSR_REQUEST_START_HEADER = "x-platform-ssr-request-start-ms";
 const REPORTING_ENDPOINTS = 'csp-endpoint="/api/v1/security/csp-report"';
 
 function boundedSampleRate(): number {
@@ -26,6 +27,11 @@ function sampleRequest(requestId: string, rate: number): boolean {
 
 function ssrDiagnosticsEnabled(): boolean {
   return process.env.PLATFORM_SSR_PERF_LOG_ENABLED === "true";
+}
+
+function safeEpochMilliseconds(value: string | null): number | null {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
 function contentSecurityPolicy(nonce: string): string {
@@ -64,15 +70,21 @@ export function proxy(request: NextRequest) {
   requestHeaders.delete(NONCE_HEADER);
   requestHeaders.delete(SSR_TRACE_HEADER);
   requestHeaders.delete(SSR_PROXY_START_HEADER);
+  requestHeaders.delete(SSR_REQUEST_START_HEADER);
   if (ssrDiagnosticsEnabled()) {
     const sampleKey = request.headers.get("x-request-id")
       || request.headers.get("cf-ray")
       || "unknown";
+    const requestStartedAtMs = safeEpochMilliseconds(
+      request.headers.get(SSR_REQUEST_START_HEADER)
+    ) ?? Date.now();
+    const proxyStartedAtMs = Date.now();
     requestHeaders.set(
       SSR_TRACE_HEADER,
       sampleRequest(sampleKey, boundedSampleRate()) ? "1" : "0"
     );
-    requestHeaders.set(SSR_PROXY_START_HEADER, String(Date.now()));
+    requestHeaders.set(SSR_REQUEST_START_HEADER, String(requestStartedAtMs));
+    requestHeaders.set(SSR_PROXY_START_HEADER, String(proxyStartedAtMs));
   }
 
   const nonce = randomBytes(16).toString("base64");

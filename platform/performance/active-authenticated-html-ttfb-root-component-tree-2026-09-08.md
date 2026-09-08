@@ -49,32 +49,46 @@ labels only.
 The root timeline stages are:
 
 ```text
-proxy_to_root_layout_start
+http_request_start
+→ request_to_proxy
+→ proxy_start
+→ proxy_to_root_layout_start
 → root_layout_start
 → auth_bootstrap
-→ authenticated_provider
-→ global_chrome_header
-→ route_layout
 → page_component
-→ global_chrome_footer
+→ react_render_unattributed_start
 → response_stream_start
-→ first_chunk_emitted
+→ first_body_write_attempt
+→ response_finish / response_close / response_error
 ```
 
-`authenticated_provider`, global chrome and route layout are server boundary
-assembly spans. They do not pretend to measure execution inside a client
-component. `ssr_stream` records are emitted by the Node response hook without
-reading response bodies. Internal server auth requests forward only the
-validated `X-Request-ID` and `CF-Ray` labels, allowing their existing
-`request_perf` records to correlate with the HTML request. Browser workspace
-requests remain a separate post-first-byte request population.
+The Node preload injects a bounded internal HTTP-request-start epoch before
+Next proxy execution. Proxy and root entry epochs are normalized to the root
+layout origin; stream elapsed values are normalized with the same
+request-start anchor. `ssr_stream` records are emitted by the Node response
+hook without reading response bodies. They distinguish a body write attempt
+from `response_finish`, `response_close`, and `response_error`, and carry only
+bounded write-count/byte totals and writable-finished state.
+
+`AuthProvider`, global chrome and `TournamentDetailClientPage` are client
+components on this contour, so they receive no fake server-render timings.
+`react_render_unattributed_start` marks the separate interval from completion
+of the measured server component functions to the first body write; it is an
+upper bound that includes React serialization/flush and cannot identify a
+client descendant. The route has no custom route layout on this contour.
+Internal server auth requests forward only the validated `X-Request-ID` and
+`CF-Ray` labels, allowing their existing `request_perf` records to correlate
+with the HTML request. Browser workspace requests remain a separate
+post-first-byte request population.
 On this contour the server does not emit `tournament_workspace_readiness` or
 `render_after_data_ready`; both are intentionally absent rather than inferred
 from client hydration or browser API timing.
 
 The observer joins sampled `ssr_perf`, `ssr_stream`, Nginx access records and
 matching API `request_perf` records. It exports one sanitized per-request
-`correlated_html.timeline` ordered by the measured offsets. Quantiles remain
+`correlated_html.timeline` ordered by the normalized root offsets. A timeline
+is emitted only when its request-start anchor is present; otherwise stream
+events remain in the separate stream-integrity population. Quantiles remain
 separate summaries; independent p95 values must not be added as a latency
 decomposition.
 
@@ -82,7 +96,7 @@ decomposition.
 
 Before any production action:
 
-- run the focused SSR parser and stream-hook tests;
+- run the focused SSR parser, clock-alignment, disabled-path and stream-hook tests;
 - run web typecheck/lint/build and web-hermetic tests;
 - run the backend/security/build, documentation and verification-contract
   gates required by the reviewed dev path;
@@ -121,9 +135,10 @@ reliability. Origin-only timings are not evidence of a TTFB improvement.
 The archived diagnostic report must contain:
 
 1. the measured root/component boundary tree and its sampled population;
-2. correlated per-request timelines showing root start, auth/provider,
-   component stages, data boundary where applicable, render-ready marker,
-   response stream start and first chunk;
+2. correlated per-request timelines showing the request/proxy/root anchors,
+   measured server functions, the unattributed React-render interval, data
+   boundary where applicable, render-ready marker, response stream lifecycle
+   and first body-write attempt;
 3. one largest blocking stage after the measured data boundary, with evidence
    from the same request timeline and its matching Nginx/API records;
 4. one minimal candidate for a later, separately reviewed A/B;

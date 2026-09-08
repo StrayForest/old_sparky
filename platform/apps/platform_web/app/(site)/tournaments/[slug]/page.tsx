@@ -1,6 +1,9 @@
 import type { Metadata } from "next";
 import { TournamentDetailClientPage } from "@/components/tournaments/tournament-detail-client-page";
-import { recordSsrStage } from "@/lib/server-ssr-observability";
+import {
+  isSsrDiagnosticsEnabled,
+  recordSsrStage
+} from "@/lib/server-ssr-observability";
 
 export const metadata: Metadata = {
   title: "Турнир"
@@ -21,6 +24,8 @@ export default async function TournamentDetailPage({
   const inviteCode = resolvedSearchParams?.invite_code?.trim().toUpperCase() || undefined;
 
   const rendered = <TournamentDetailClientPage slug={slug} inviteCode={inviteCode} />;
-  await recordSsrStage("page_component", performance.now() - startedAt);
+  if (isSsrDiagnosticsEnabled()) {
+    await recordSsrStage("page_component", performance.now() - startedAt);
+  }
   return rendered;
 }

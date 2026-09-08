@@ -8,6 +8,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -2317,6 +2318,11 @@ def parse_ssr_perf_line(line: str) -> dict[str, Any] | None:
         if key in values:
             with suppress(ValueError):
                 values[key] = float(values[key])
+    if any(
+        isinstance(values.get(key), float) and not math.isfinite(values[key])
+        for key in ("start_ms", "end_ms", "duration_ms")
+    ):
+        return None
     if not values.get("request_id") or not values.get("stage"):
         return None
     return values
@@ -2332,11 +2338,16 @@ def parse_ssr_stream_line(line: str) -> dict[str, Any] | None:
             continue
         key, raw_value = token.split("=", 1)
         values[key] = raw_value
-    for key in ("elapsed_ms", "status"):
+    for key in ("elapsed_ms", "status", "writable_finished", "write_count", "body_bytes", "response_error"):
         if key not in values:
             continue
         with suppress(ValueError):
             values[key] = float(values[key]) if key == "elapsed_ms" else int(values[key])
+    if (
+        isinstance(values.get("elapsed_ms"), float)
+        and not math.isfinite(values["elapsed_ms"])
+    ):
+        return None
     if (
         not values.get("request_id")
         or not values.get("stage")
@@ -2608,20 +2619,20 @@ def summarize_ssr_observability(
         upstream_ms = row.get("upstream_ms")
         if isinstance(data_ready, (int, float)) and isinstance(upstream_ms, (int, float)):
             row["unattributed_upstream_after_data_ms"] = max(0.0, upstream_ms - data_ready)
-        proxy_to_root_ms = next(
+        request_to_root_ms = next(
             (
-                float(event["duration_ms"])
+                max(0.0, -float(event["start_ms"]))
                 for event in by_request_events.get(request_id, [])
-                if event["stage"] == "proxy_to_root_layout_start"
+                if event["stage"] == "http_request_start"
             ),
-            0.0,
+            None,
         )
         timeline = list(by_request_events.get(request_id, []))
-        for stream_event in stream_events:
-            elapsed_ms = float(stream_event["elapsed_ms"])
-            root_relative_ms = elapsed_ms - proxy_to_root_ms
-            timeline.append(
-                {
+        if request_to_root_ms is not None:
+            for stream_event in stream_events:
+                elapsed_ms = float(stream_event["elapsed_ms"])
+                root_relative_ms = elapsed_ms - request_to_root_ms
+                timeline_event: dict[str, Any] = {
                     "source": "stream",
                     "stage": str(stream_event["stage"]),
                     "start_ms": root_relative_ms,
@@ -2629,11 +2640,21 @@ def summarize_ssr_observability(
                     "duration_ms": 0.0,
                     "outcome": "ok",
                 }
-            )
-        row["timeline"] = sorted(
-            timeline,
-            key=lambda event: (float(event["start_ms"]), float(event["end_ms"]), event["stage"]),
+                for key in ("status", "writable_finished", "write_count", "body_bytes", "response_error"):
+                    value = stream_event.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        timeline_event[key] = value
+                timeline.append(timeline_event)
+        ordered_timeline = sorted(
+            enumerate(timeline),
+            key=lambda item: (
+                float(item[1]["start_ms"]),
+                float(item[1]["end_ms"]),
+                item[0],
+            ),
         )
+        row["timeline"] = [event for _order, event in ordered_timeline]
+        row["stream_clock_aligned"] = request_to_root_ms is not None
         if api_perf_by_request.get(request_id):
             row["api_request_perf"] = api_perf_by_request[request_id]
         correlated_rows.append(row)
@@ -2654,6 +2675,58 @@ def summarize_ssr_observability(
             if any(event["stage"] == stage for event in row.get("timeline", []))
         )
         for stage in sorted({str(row["stage"]) for row in stream_rows})
+    }
+
+    stream_by_request = {
+        request_id: rows
+        for request_id, rows in by_request_stream.items()
+    }
+
+    def stream_request_metric(key: str) -> dict[str, Any]:
+        return metric_stats(
+            [
+                float(max(
+                    float(row[key])
+                    for row in rows
+                    if isinstance(row.get(key), (int, float))
+                    and not isinstance(row.get(key), bool)
+                ))
+                for rows in stream_by_request.values()
+                if any(
+                    isinstance(row.get(key), (int, float))
+                    and not isinstance(row.get(key), bool)
+                    for row in rows
+                )
+            ]
+        )
+
+    def has_stream_stage(rows: list[dict[str, Any]], stage: str) -> bool:
+        return any(str(row.get("stage")) == stage for row in rows)
+
+    def has_stream_error(rows: list[dict[str, Any]]) -> bool:
+        return any(
+            str(row.get("stage")) == "response_error"
+            or row.get("response_error") == 1
+            for row in rows
+        )
+
+    stream_integrity = {
+        "response_finish_requests": sum(
+            has_stream_stage(rows, "response_finish") for rows in stream_by_request.values()
+        ),
+        "response_close_requests": sum(
+            has_stream_stage(rows, "response_close") for rows in stream_by_request.values()
+        ),
+        "response_error_requests": sum(
+            has_stream_error(rows) for rows in stream_by_request.values()
+        ),
+        "close_without_finish_requests": sum(
+            has_stream_stage(rows, "response_close")
+            and not has_stream_stage(rows, "response_finish")
+            for rows in stream_by_request.values()
+        ),
+        "write_count": stream_request_metric("write_count"),
+        "body_bytes": stream_request_metric("body_bytes"),
     }
 
     api_groups: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
@@ -2713,6 +2786,7 @@ def summarize_ssr_observability(
                 stage: sum(1 for row in stream_rows if row["stage"] == stage)
                 for stage in sorted({str(row["stage"]) for row in stream_rows})
             },
+            "integrity": stream_integrity,
         },
         "nginx_html": {
             "requests": len(html_records),
@@ -2757,6 +2831,7 @@ def summarize_ssr_observability(
                     "request_ms": row.get("request_ms"),
                     "upstream_header_ms": row.get("upstream_header_ms"),
                     "upstream_ms": row.get("upstream_ms"),
+                    "stream_clock_aligned": row.get("stream_clock_aligned", False),
                     "timeline": row.get("timeline", []),
                     "api_request_perf": row.get("api_request_perf", []),
                 }

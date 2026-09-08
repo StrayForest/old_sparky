@@ -9,6 +9,8 @@ type SsrTrace = {
   cfRay: string;
   sampled: boolean;
   startedAt: number;
+  rootStartedAtMs: number;
+  requestStartedAtMs: number | null;
   proxyStartedAtMs: number | null;
 };
 
@@ -21,8 +23,13 @@ const sampleRate = boundedNumber(
 );
 const SSR_TRACE_HEADER = "x-platform-ssr-trace";
 const SSR_PROXY_START_HEADER = "x-platform-ssr-proxy-start-ms";
+const SSR_REQUEST_START_HEADER = "x-platform-ssr-request-start-ms";
 type RequestHeaderSource = Pick<Headers, "get">;
 const traceStorage = new AsyncLocalStorage<SsrTrace>();
+
+export function isSsrDiagnosticsEnabled(): boolean {
+  return enabled;
+}
 
 function boundedNumber(
   rawValue: string | undefined,
@@ -52,6 +59,7 @@ function epochMilliseconds(value: string | null | undefined): number | null {
 
 function createTrace(
   startedAt: number,
+  rootStartedAtMs: number,
   requestHeaders: RequestHeaderSource
 ): SsrTrace {
   const traceMarker = requestHeaders.get(SSR_TRACE_HEADER);
@@ -65,6 +73,8 @@ function createTrace(
     cfRay: safeToken(requestHeaders.get("cf-ray"), "unknown"),
     sampled,
     startedAt,
+    rootStartedAtMs,
+    requestStartedAtMs: epochMilliseconds(requestHeaders.get(SSR_REQUEST_START_HEADER)),
     proxyStartedAtMs: epochMilliseconds(requestHeaders.get(SSR_PROXY_START_HEADER))
   };
 }
@@ -88,18 +98,19 @@ const getSsrTrace = cache(async (): Promise<SsrTrace | null> => {
     // Build-time and non-request invocations have no request headers. Keep the
     // diagnostic optional rather than making SSR depend on observability.
   }
-  return createTrace(performance.now(), requestHeaders ?? new Headers());
+  return createTrace(performance.now(), Date.now(), requestHeaders ?? new Headers());
 });
 
 export async function runWithSsrTrace<T>(
   startedAt: number,
+  rootStartedAtMs: number,
   requestHeaders: RequestHeaderSource,
   operation: () => Promise<T>
 ): Promise<T> {
   if (!enabled || traceStorage.getStore()) {
     return operation();
   }
-  const trace = createTrace(startedAt, requestHeaders);
+  const trace = createTrace(startedAt, rootStartedAtMs, requestHeaders);
   return traceStorage.run(trace, async () => {
     // Seed React's request-local cache while the trace context is available.
     await getSsrTrace();
@@ -124,14 +135,14 @@ export async function getServerRequestCorrelationHeaders(): Promise<Headers> {
   return correlationHeaders;
 }
 
-async function recordSsrSpan(
+function recordSsrSpan(
   trace: SsrTrace,
   stage: string,
   startMs: number,
   endMs: number,
   durationMs: number,
   outcome: "ok" | "error"
-): Promise<void> {
+): void {
   if (!trace.sampled) {
     return;
   }
@@ -149,13 +160,16 @@ export async function recordSsrStage(
   durationMs: number,
   outcome: "ok" | "error" = "ok"
 ): Promise<void> {
+  if (!enabled) {
+    return;
+  }
   const trace = await getSsrTrace();
   if (!trace) {
     return;
   }
   const endMs = Math.max(0, performance.now() - trace.startedAt);
   const boundedDurationMs = Math.max(0, Number(durationMs) || 0);
-  await recordSsrSpan(
+  recordSsrSpan(
     trace,
     stage,
     Math.max(0, endMs - boundedDurationMs),
@@ -170,6 +184,9 @@ export async function recordSsrPoint(
   offsetMs?: number,
   outcome: "ok" | "error" = "ok"
 ): Promise<void> {
+  if (!enabled) {
+    return;
+  }
   const trace = await getSsrTrace();
   if (!trace) {
     return;
@@ -177,23 +194,58 @@ export async function recordSsrPoint(
   const pointMs = offsetMs === undefined
     ? Math.max(0, performance.now() - trace.startedAt)
     : Math.max(0, offsetMs);
-  await recordSsrSpan(trace, stage, pointMs, pointMs, 0, outcome);
+  recordSsrSpan(trace, stage, pointMs, pointMs, 0, outcome);
 }
 
-export async function recordSsrProxyToRootStart(): Promise<void> {
+export async function recordSsrRequestTimeline(): Promise<void> {
   const trace = await getSsrTrace();
-  if (!trace || trace.proxyStartedAtMs === null) {
+  if (!trace || !trace.sampled) {
     return;
   }
-  const durationMs = Math.max(0, Date.now() - trace.proxyStartedAtMs);
-  await recordSsrSpan(
-    trace,
-    "proxy_to_root_layout_start",
-    -durationMs,
-    0,
-    durationMs,
-    "ok"
-  );
+  const requestOffsetMs = trace.requestStartedAtMs === null
+    ? null
+    : trace.requestStartedAtMs - trace.rootStartedAtMs;
+  const proxyOffsetMs = trace.proxyStartedAtMs === null
+    ? null
+    : trace.proxyStartedAtMs - trace.rootStartedAtMs;
+  if (requestOffsetMs !== null) {
+    recordSsrSpan(
+      trace,
+      "http_request_start",
+      requestOffsetMs,
+      requestOffsetMs,
+      0,
+      "ok"
+    );
+  }
+  if (proxyOffsetMs !== null) {
+    recordSsrSpan(
+      trace,
+      "proxy_start",
+      proxyOffsetMs,
+      proxyOffsetMs,
+      0,
+      "ok"
+    );
+    recordSsrSpan(
+      trace,
+      "proxy_to_root_layout_start",
+      proxyOffsetMs,
+      0,
+      Math.max(0, -proxyOffsetMs),
+      "ok"
+    );
+  }
+  if (requestOffsetMs !== null && proxyOffsetMs !== null) {
+    recordSsrSpan(
+      trace,
+      "request_to_proxy",
+      requestOffsetMs,
+      proxyOffsetMs,
+      Math.max(0, proxyOffsetMs - requestOffsetMs),
+      "ok"
+    );
+  }
 }
 
 export async function measureSsrStage<T>(

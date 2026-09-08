@@ -14,6 +14,9 @@ const ssrStreamDiagnosticsEnabled = process.env.PLATFORM_SSR_PERF_LOG_ENABLED ==
 const ssrStreamState = Symbol.for("old-sparky.ssr-stream-state");
 const ssrStreamInstallState = Symbol.for("old-sparky.ssr-stream-installed");
 const ssrRequestStart = Symbol.for("old-sparky.ssr-request-start");
+const ssrRequestStartHeader = "x-platform-ssr-request-start-ms";
+const maxStreamWrites = 100_000;
+const maxStreamBytes = 100_000_000;
 
 function sampleRate() {
   const value = Number(process.env.PLATFORM_SSR_PERF_SAMPLE_RATE);
@@ -75,12 +78,44 @@ function logStreamStage(response, stage) {
   if (!request) {
     return;
   }
+  const state = response[ssrStreamState];
   console.info(
     `ssr_stream request_id=${safeToken(request.headers["x-request-id"], "unknown")}`
       + ` cf_ray=${safeToken(request.headers["cf-ray"], "unknown")}`
       + ` stage=${stage} elapsed_ms=${elapsedSinceRequestStart(request)}`
       + ` status=${Number(response.statusCode) || 0}`
+      + ` writable_finished=${response.writableFinished ? 1 : 0}`
+      + ` write_count=${state ? state.writeCount : 0}`
+      + ` body_bytes=${state ? state.bodyBytes : 0}`
+      + ` response_error=${state && state.responseError ? 1 : 0}`
   );
+}
+
+function attachResponseLifecycle(response) {
+  response.once("finish", () => {
+    const state = response[ssrStreamState];
+    if (!state || state.finishLogged) {
+      return;
+    }
+    state.finishLogged = true;
+    logStreamStage(response, "response_finish");
+  });
+  response.once("close", () => {
+    const state = response[ssrStreamState];
+    if (!state || state.closeLogged) {
+      return;
+    }
+    state.closeLogged = true;
+    logStreamStage(response, "response_close");
+  });
+  response.once("error", () => {
+    const state = response[ssrStreamState];
+    if (!state) {
+      return;
+    }
+    state.responseError = true;
+    logStreamStage(response, "response_error");
+  });
 }
 
 function streamStateFor(response) {
@@ -90,8 +125,14 @@ function streamStateFor(response) {
   if (!response[ssrStreamState]) {
     response[ssrStreamState] = {
       responseStarted: false,
-      firstChunkEmitted: false,
+      firstBodyWriteAttempt: false,
+      finishLogged: false,
+      closeLogged: false,
+      responseError: false,
+      writeCount: 0,
+      bodyBytes: 0,
     };
+    attachResponseLifecycle(response);
   }
   return response[ssrStreamState];
 }
@@ -105,20 +146,33 @@ function markResponseStreamStart(response) {
   logStreamStage(response, "response_stream_start");
 }
 
-function hasBody(chunk) {
-  return chunk !== null
-    && chunk !== undefined
-    && (typeof chunk === "string" ? chunk.length > 0 : chunk.length > 0);
+function chunkBytes(chunk) {
+  if (chunk === null || chunk === undefined) {
+    return 0;
+  }
+  if (typeof chunk === "string") {
+    return Math.min(maxStreamBytes, Buffer.byteLength(chunk));
+  }
+  const byteLength = Number(chunk.byteLength ?? chunk.length ?? 0);
+  return Number.isFinite(byteLength)
+    ? Math.min(maxStreamBytes, Math.max(0, byteLength))
+    : 0;
 }
 
-function markFirstChunk(response, chunk) {
+function markBodyWriteAttempt(response, chunk) {
   const state = streamStateFor(response);
-  if (!state || state.firstChunkEmitted || !hasBody(chunk)) {
+  if (!state) {
+    return;
+  }
+  const bytes = chunkBytes(chunk);
+  state.writeCount = Math.min(maxStreamWrites, state.writeCount + 1);
+  state.bodyBytes = Math.min(maxStreamBytes, state.bodyBytes + bytes);
+  if (state.firstBodyWriteAttempt || bytes === 0) {
     return;
   }
   markResponseStreamStart(response);
-  state.firstChunkEmitted = true;
-  logStreamStage(response, "first_chunk_emitted");
+  state.firstBodyWriteAttempt = true;
+  logStreamStage(response, "first_body_write_attempt");
 }
 
 function installSsrStreamDiagnostics() {
@@ -139,6 +193,10 @@ function installSsrStreamDiagnostics() {
     serverPrototype.emit = function (event, request, response, ...args) {
       if (event === "request" && request && typeof request === "object") {
         request[ssrRequestStart] = Date.now();
+        if (request.headers && typeof request.headers === "object") {
+          request.headers[ssrRequestStartHeader] = String(request[ssrRequestStart]);
+        }
+        streamStateFor(response);
       }
       return originalEmit.call(this, event, request, response, ...args);
     };
@@ -152,13 +210,13 @@ function installSsrStreamDiagnostics() {
 
   const originalWrite = responsePrototype.write;
   responsePrototype.write = function (chunk, ...args) {
-    markFirstChunk(this, chunk);
+    markBodyWriteAttempt(this, chunk);
     return originalWrite.call(this, chunk, ...args);
   };
 
   const originalEnd = responsePrototype.end;
   responsePrototype.end = function (chunk, ...args) {
-    markFirstChunk(this, chunk);
+    markBodyWriteAttempt(this, chunk);
     return originalEnd.call(this, chunk, ...args);
   };
 }

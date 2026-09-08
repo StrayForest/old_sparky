@@ -4,6 +4,7 @@ import { cache } from "react";
 import type { PlatformAuthBootstrap, PlatformUser } from "@/lib/platform-types";
 import {
   getServerRequestCorrelationHeaders,
+  isSsrDiagnosticsEnabled,
   measureSsrStage
 } from "@/lib/server-ssr-observability";
 
@@ -56,9 +57,13 @@ export const getServerCurrentUser = cache(async (
   }
   return measureSsrStage("auth_current_user_fetch", async () => {
     try {
-      const requestHeaders = await getServerRequestCorrelationHeaders();
-      requestHeaders.set("accept", "application/json");
-      requestHeaders.set("cookie", cookieHeader);
+      const requestHeaders = isSsrDiagnosticsEnabled()
+        ? await getServerRequestCorrelationHeaders()
+        : { accept: "application/json", cookie: cookieHeader };
+      if (requestHeaders instanceof Headers) {
+        requestHeaders.set("accept", "application/json");
+        requestHeaders.set("cookie", cookieHeader);
+      }
       const response = await fetch(`${baseUrl}/users/me`, {
         headers: requestHeaders,
         cache: "no-store",
@@ -95,9 +100,13 @@ export const getServerAuthBootstrap = cache(async (
   }
   return measureSsrStage("auth_bootstrap_fetch", async () => {
     try {
-      const requestHeaders = await getServerRequestCorrelationHeaders();
-      requestHeaders.set("accept", "application/json");
-      requestHeaders.set("cookie", cookieHeader);
+      const requestHeaders = isSsrDiagnosticsEnabled()
+        ? await getServerRequestCorrelationHeaders()
+        : { accept: "application/json", cookie: cookieHeader };
+      if (requestHeaders instanceof Headers) {
+        requestHeaders.set("accept", "application/json");
+        requestHeaders.set("cookie", cookieHeader);
+      }
       const response = await fetch(`${baseUrl}/auth/bootstrap`, {
         headers: requestHeaders,
         cache: "no-store",

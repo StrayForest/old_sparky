@@ -23,6 +23,11 @@ class SsrObservabilityTests(unittest.TestCase):
         self.assertEqual(row["stage"], "tournament_workspace")
         self.assertEqual(row["duration_ms"], 123.456)
         self.assertIsNone(parse_ssr_perf_line("ssr_perf stage=missing-request duration_ms=1"))
+        self.assertIsNone(
+            parse_ssr_perf_line(
+                "ssr_perf request_id=req-1 stage=bad duration_ms=NaN"
+            )
+        )
         self.assertEqual(
             parse_ssr_event_loop_line(
                 "ssr_event_loop p50_ms=1.000 p95_ms=4.000 max_ms=8.000 mean_ms=2.000"
@@ -30,12 +35,21 @@ class SsrObservabilityTests(unittest.TestCase):
             4.0,
         )
         stream = parse_ssr_stream_line(
-            "ssr_stream request_id=req-1 cf_ray=ray-1 stage=first_chunk_emitted "
-            "elapsed_ms=123 status=200"
+            "ssr_stream request_id=req-1 cf_ray=ray-1 stage=first_body_write_attempt "
+            "elapsed_ms=123 status=200 writable_finished=0 write_count=1 "
+            "body_bytes=42 response_error=0"
         )
         self.assertEqual(stream["elapsed_ms"], 123.0)
         self.assertEqual(stream["status"], 200)
+        self.assertEqual(stream["writable_finished"], 0)
+        self.assertEqual(stream["write_count"], 1)
+        self.assertEqual(stream["body_bytes"], 42)
         self.assertIsNone(parse_ssr_stream_line("ssr_stream stage=missing-request elapsed_ms=1"))
+        self.assertIsNone(
+            parse_ssr_stream_line(
+                "ssr_stream request_id=req-1 stage=bad elapsed_ms=Infinity"
+            )
+        )
 
     def test_ssr_summary_correlates_sampled_stages_without_serializing_ids_or_uris(self) -> None:
         web_lines = [
@@ -106,14 +120,26 @@ class SsrObservabilityTests(unittest.TestCase):
 
     def test_ssr_summary_retains_correlated_timeline_and_api_metrics(self) -> None:
         web_lines = [
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=http_request_start "
+            "start_ms=-12.000 end_ms=-12.000 duration_ms=0.000 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=proxy_start "
+            "start_ms=-7.000 end_ms=-7.000 duration_ms=0.000 outcome=ok",
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=proxy_to_root_layout_start "
-            "start_ms=-12.000 end_ms=0.000 duration_ms=12.000 outcome=ok",
+            "start_ms=-7.000 end_ms=0.000 duration_ms=7.000 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=request_to_proxy "
+            "start_ms=-12.000 end_ms=-7.000 duration_ms=5.000 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=root_layout_start "
+            "start_ms=0.000 end_ms=0.000 duration_ms=0.000 outcome=ok",
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=root_layout "
-            "start_ms=0.000 end_ms=20.000 duration_ms=20.000 outcome=ok",
+            "start_ms=0.000 end_ms=4.000 duration_ms=4.000 outcome=ok",
             "ssr_stream request_id=req-1 cf_ray=ray-1 stage=response_stream_start "
-            "elapsed_ms=40 status=200",
-            "ssr_stream request_id=req-1 cf_ray=ray-1 stage=first_chunk_emitted "
-            "elapsed_ms=41 status=200",
+            "elapsed_ms=21 status=200 writable_finished=0 write_count=0 body_bytes=0 response_error=0",
+            "ssr_stream request_id=req-1 cf_ray=ray-1 stage=first_body_write_attempt "
+            "elapsed_ms=23 status=200 writable_finished=0 write_count=1 body_bytes=42 response_error=0",
+            "ssr_stream request_id=req-1 cf_ray=ray-1 stage=response_finish "
+            "elapsed_ms=25 status=200 writable_finished=1 write_count=2 body_bytes=48 response_error=0",
+            "ssr_stream request_id=req-1 cf_ray=ray-1 stage=response_close "
+            "elapsed_ms=25 status=200 writable_finished=1 write_count=2 body_bytes=48 response_error=0",
         ]
         api_lines = [
             "request_perf request_id=req-1 method=GET path=/api/v1/auth/bootstrap "
@@ -139,19 +165,61 @@ class SsrObservabilityTests(unittest.TestCase):
 
         correlated = summary["correlated_html"]
         self.assertEqual(correlated["requests"], 1)
-        self.assertEqual(correlated["stream_stage_presence"]["first_chunk_emitted"], 1)
+        self.assertEqual(correlated["stream_stage_presence"]["first_body_write_attempt"], 1)
+        self.assertTrue(correlated["timeline"][0]["stream_clock_aligned"])
         timeline = correlated["timeline"][0]["timeline"]
         self.assertEqual(
             [event["stage"] for event in timeline],
-            ["proxy_to_root_layout_start", "root_layout", "response_stream_start", "first_chunk_emitted"],
+            [
+                "http_request_start",
+                "request_to_proxy",
+                "proxy_start",
+                "proxy_to_root_layout_start",
+                "root_layout_start",
+                "root_layout",
+                "response_stream_start",
+                "first_body_write_attempt",
+                "response_finish",
+                "response_close",
+            ],
         )
-        self.assertEqual(timeline[2]["start_ms"], 28.0)
+        self.assertEqual(timeline[7]["start_ms"], 11.0)
+        self.assertEqual(summary["ssr_stream"]["integrity"]["response_finish_requests"], 1)
+        self.assertEqual(summary["ssr_stream"]["integrity"]["close_without_finish_requests"], 0)
+        self.assertEqual(summary["ssr_stream"]["integrity"]["body_bytes"]["p50_ms"], 48.0)
         self.assertEqual(
             correlated["timeline"][0]["api_request_perf"][0]["route_class"],
             "auth_bootstrap",
         )
         serialized = json.dumps(summary)
         self.assertNotIn("req-1", serialized)
+
+    def test_ssr_summary_marks_close_without_finish_as_response_integrity_failure(self) -> None:
+        summary = summarize_ssr_observability(
+            [
+                "ssr_perf request_id=req-2 cf_ray=ray-2 stage=http_request_start "
+                "start_ms=-10.000 end_ms=-10.000 duration_ms=0.000 outcome=ok",
+                "ssr_stream request_id=req-2 cf_ray=ray-2 stage=response_close "
+                "elapsed_ms=10 status=200 writable_finished=0 write_count=1 "
+                "body_bytes=4 response_error=1",
+            ],
+            [
+                {
+                    "request_id": "req-2",
+                    "method": "GET",
+                    "uri": "/tournaments/fixture",
+                    "status": 200,
+                    "request_time": "0.020",
+                    "upstream_header_time": "0.010",
+                    "upstream_time": "0.015",
+                }
+            ],
+        )
+
+        integrity = summary["ssr_stream"]["integrity"]
+        self.assertEqual(integrity["response_error_requests"], 1)
+        self.assertEqual(integrity["close_without_finish_requests"], 1)
+        self.assertEqual(summary["correlated_html"]["timeline"][0]["timeline"][1]["writable_finished"], 0)
 
     def test_nginx_numeric_request_time_is_reported(self) -> None:
         summary = summarize_ssr_observability(
