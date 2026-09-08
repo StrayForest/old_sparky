@@ -458,6 +458,7 @@ async def async_main() -> int:
         "server_ssr_observability": summarize_ssr_observability(
             web_journal_lines,
             nginx_access_records,
+            request_perf_lines,
         ),
         "cpu_profile": {
             **cpu_profile_summary(profile_dir),

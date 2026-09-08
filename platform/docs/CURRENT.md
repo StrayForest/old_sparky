@@ -82,9 +82,10 @@ Branch deletion and force-push remain protected, and exact-SHA CI/build plus
 the automatic production deployment chain remain mandatory.
 
 Remaining performance work is explicit: authenticated page TTFB remains above
-the `<1,000 ms` target; the final attribution and next candidate are recorded
-in the blocked
-[`authenticated HTML/TTFB work order`](archive/performance-authenticated-html-ttfb-2026-09-07.md).
+the `<1,000 ms` target. The prior blocked attribution is retained in the
+[`authenticated HTML/TTFB archive`](archive/performance-authenticated-html-ttfb-2026-09-07.md),
+and the active next step is the narrow
+[`root component-tree diagnostic work order`](../performance/active-authenticated-html-ttfb-root-component-tree-2026-09-08.md).
 The browser-workspace candidate is archived in
 [`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](archive/performance-authenticated-html-ttfb-workspace-client-2026-09-08.md),
 and the avatar candidate is archived in
@@ -116,9 +117,9 @@ successfully. A post-rollback diagnostic load also stalled before a client
 report; guarded abort and exact cleanup passed for its one marker, 20,000
 users and 40 tournaments with zero remnants. Production was restored to
 `ready-vote-static-8` by deploy `34184805970` for reviewed SHA
-`3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The next candidate is
-diagnostic-first root component-tree work, blocked until origin timings can be
-exported reliably. The narrower authenticated-provider-boundary candidate is
+`3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The active diagnostic work order
+above is now the only next performance step; the narrower
+authenticated-provider-boundary candidate is
 archived in
 [`performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md`](archive/performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md).
 Its reviewed SHA `6e3a6325a0c6bee025297a8c8edb00817faafb75` completed the exact
@@ -142,9 +143,8 @@ The tournament-detail-footer candidate is archived in
 [`performance-authenticated-html-ttfb-detail-footer-2026-09-08.md`](archive/performance-authenticated-html-ttfb-detail-footer-2026-09-08.md).
 Its exact load `34230327945` reached the full 20k/40 fixture but failed closed
 on a client `IncompleteRead` before producing a TTFB report; exact cleanup
-passed with zero remnants. The next candidate remains diagnostic-first root
-component-tree work with exportable SSR timings. No capacity-setting change is
-authorized.
+passed with zero remnants. No capacity-setting change is authorized while the
+active diagnostic work order is incomplete.
 The historical v3 timeout plus anomaly
 `33991798604` remain unexplained transient episodes. No worker/pool increase or
 external Cloudflare root cause is asserted without further evidence.

@@ -2,7 +2,11 @@ import "server-only";
 
 import { cache } from "react";
 import type { PlatformAuthBootstrap, PlatformUser } from "@/lib/platform-types";
-import { measureSsrStage } from "@/lib/server-ssr-observability";
+import {
+  getServerRequestCorrelationHeaders,
+  isSsrDiagnosticsEnabled,
+  measureSsrStage
+} from "@/lib/server-ssr-observability";
 
 export type ServerAuthSnapshot = {
   status: "authenticated" | "anonymous" | "unavailable";
@@ -53,11 +57,15 @@ export const getServerCurrentUser = cache(async (
   }
   return measureSsrStage("auth_current_user_fetch", async () => {
     try {
+      const requestHeaders = isSsrDiagnosticsEnabled()
+        ? await getServerRequestCorrelationHeaders()
+        : { accept: "application/json", cookie: cookieHeader };
+      if (requestHeaders instanceof Headers) {
+        requestHeaders.set("accept", "application/json");
+        requestHeaders.set("cookie", cookieHeader);
+      }
       const response = await fetch(`${baseUrl}/users/me`, {
-        headers: {
-          accept: "application/json",
-          cookie: cookieHeader
-        },
+        headers: requestHeaders,
         cache: "no-store",
         signal: AbortSignal.timeout(serverAuthTimeoutMs)
       });
@@ -92,11 +100,15 @@ export const getServerAuthBootstrap = cache(async (
   }
   return measureSsrStage("auth_bootstrap_fetch", async () => {
     try {
+      const requestHeaders = isSsrDiagnosticsEnabled()
+        ? await getServerRequestCorrelationHeaders()
+        : { accept: "application/json", cookie: cookieHeader };
+      if (requestHeaders instanceof Headers) {
+        requestHeaders.set("accept", "application/json");
+        requestHeaders.set("cookie", cookieHeader);
+      }
       const response = await fetch(`${baseUrl}/auth/bootstrap`, {
-        headers: {
-          accept: "application/json",
-          cookie: cookieHeader
-        },
+        headers: requestHeaders,
         cache: "no-store",
         signal: AbortSignal.timeout(serverAuthTimeoutMs)
       });

@@ -6,7 +6,33 @@ const CSP_HEADER = "Content-Security-Policy";
 const CSP_REPORT_ONLY_HEADER = "Content-Security-Policy-Report-Only";
 const CSP_RESPONSE_HEADER = CSP_HEADER;
 const NONCE_HEADER = "x-nonce";
+const SSR_TRACE_HEADER = "x-platform-ssr-trace";
+const SSR_PROXY_START_HEADER = "x-platform-ssr-proxy-start-ms";
+const SSR_REQUEST_START_HEADER = "x-platform-ssr-request-start-ms";
 const REPORTING_ENDPOINTS = 'csp-endpoint="/api/v1/security/csp-report"';
+
+function boundedSampleRate(): number {
+  const value = Number(process.env.PLATFORM_SSR_PERF_SAMPLE_RATE);
+  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0.01;
+}
+
+function sampleRequest(requestId: string, rate: number): boolean {
+  let hash = 2166136261;
+  for (const character of requestId) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash / 0x1_0000_0000 < rate;
+}
+
+function ssrDiagnosticsEnabled(): boolean {
+  return process.env.PLATFORM_SSR_PERF_LOG_ENABLED === "true";
+}
+
+function safeEpochMilliseconds(value: string | null): number | null {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
 
 function contentSecurityPolicy(nonce: string): string {
   return [
@@ -42,6 +68,24 @@ export function proxy(request: NextRequest) {
   requestHeaders.delete(CSP_HEADER);
   requestHeaders.delete(CSP_REPORT_ONLY_HEADER);
   requestHeaders.delete(NONCE_HEADER);
+  requestHeaders.delete(SSR_TRACE_HEADER);
+  requestHeaders.delete(SSR_PROXY_START_HEADER);
+  requestHeaders.delete(SSR_REQUEST_START_HEADER);
+  if (ssrDiagnosticsEnabled()) {
+    const sampleKey = request.headers.get("x-request-id")
+      || request.headers.get("cf-ray")
+      || "unknown";
+    const requestStartedAtMs = safeEpochMilliseconds(
+      request.headers.get(SSR_REQUEST_START_HEADER)
+    ) ?? Date.now();
+    const proxyStartedAtMs = Date.now();
+    requestHeaders.set(
+      SSR_TRACE_HEADER,
+      sampleRequest(sampleKey, boundedSampleRate()) ? "1" : "0"
+    );
+    requestHeaders.set(SSR_REQUEST_START_HEADER, String(requestStartedAtMs));
+    requestHeaders.set(SSR_PROXY_START_HEADER, String(proxyStartedAtMs));
+  }
 
   const nonce = randomBytes(16).toString("base64");
   const policy = contentSecurityPolicy(nonce);

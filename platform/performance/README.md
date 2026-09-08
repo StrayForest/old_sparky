@@ -126,10 +126,10 @@ guarded abort/cleanup workflows. A post-rollback diagnostic deployment
 abort `34186422087` and exact cleanup `34186465537` passed with 20,000 users,
 40 tournaments and zero remnants. Production was restored to
 `ready-vote-static-8` by deploy `34184805970` for reviewed SHA
-`3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The next concrete candidate is
-diagnostic-first stable-contour root component-tree work, blocked until the
-diagnostic load exports completed origin timings; no capacity-setting change
-is authorized. The narrower authenticated-provider-boundary candidate is
+`3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The active next step is the
+narrow [root component-tree diagnostic work order](active-authenticated-html-ttfb-root-component-tree-2026-09-08.md);
+it is diagnostic-only and must first export complete origin timings. No
+capacity-setting change is authorized. The narrower authenticated-provider-boundary candidate is
 archived in
 [`performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md`](../docs/archive/performance-authenticated-html-ttfb-provider-boundary-2026-09-08.md).
 It moved only `SiteFooter` outside `AuthProvider`, preserving the authoritative
@@ -159,9 +159,8 @@ candidate is archived in
 [`performance-authenticated-html-ttfb-detail-footer-2026-09-08.md`](../docs/archive/performance-authenticated-html-ttfb-detail-footer-2026-09-08.md).
 Its exact load `34230327945` reached the full 20k/40 fixture but failed closed
 on a client `IncompleteRead` before producing a TTFB report; exact cleanup
-passed with zero remnants. The next candidate remains diagnostic-first root
-component-tree work with exportable SSR timings. No capacity-setting change is
-authorized.
+passed with zero remnants. The active diagnostic work order above remains the
+only next performance step; no capacity-setting change is authorized.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.

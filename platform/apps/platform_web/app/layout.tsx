@@ -9,7 +9,14 @@ import { SiteHeader } from "@/components/layout/site-header";
 import { CspNonceProvider } from "@/components/security/csp-nonce-provider";
 import { CspRouteAnnouncer } from "@/components/security/csp-route-announcer";
 import { getServerAuthBootstrap, platformSessionCookieName } from "@/lib/server-auth";
-import { measureSsrStage, recordSsrStage } from "@/lib/server-ssr-observability";
+import {
+  isSsrDiagnosticsEnabled,
+  measureSsrStage,
+  recordSsrPoint,
+  recordSsrRequestTimeline,
+  recordSsrStage,
+  runWithSsrTrace
+} from "@/lib/server-ssr-observability";
 import "./globals.css";
 import "./theme-modern.css";
 import "@/components/profile/account-identities.css";
@@ -28,17 +35,16 @@ export default async function RootLayout({
 }: Readonly<{
   children: ReactNode;
 }>) {
-  const startedAt = performance.now();
+  const diagnosticsEnabled = isSsrDiagnosticsEnabled();
+  const startedAt = diagnosticsEnabled ? performance.now() : 0;
+  const rootStartedAtMs = diagnosticsEnabled ? Date.now() : 0;
   await connection();
   const [requestHeaders, requestCookies] = await Promise.all([headers(), cookies()]);
-  const nonce = requestHeaders.get("x-nonce");
-  const cookieHeader = requestCookies.toString();
-  const initialAuth = requestCookies.has(platformSessionCookieName())
-    ? await measureSsrStage("root_layout_auth_bootstrap", () => getServerAuthBootstrap(cookieHeader))
-    : { status: "anonymous" as const, user: null };
-  const adsenseEnabled = process.env.PLATFORM_ADSENSE_ENABLED !== "false";
-
-  const rendered = (
+  const renderRoot = (
+    nonce: string | null,
+    initialAuth: Awaited<ReturnType<typeof getServerAuthBootstrap>>,
+    adsenseEnabled: boolean
+  ) => (
     <html lang="ru">
       <head>
         {adsenseEnabled ? (
@@ -66,6 +72,29 @@ export default async function RootLayout({
       </body>
     </html>
   );
-  await recordSsrStage("root_layout_component_tree", performance.now() - startedAt);
-  return rendered;
+
+  if (!diagnosticsEnabled) {
+    const nonce = requestHeaders.get("x-nonce");
+    const cookieHeader = requestCookies.toString();
+    const initialAuth = requestCookies.has(platformSessionCookieName())
+      ? await measureSsrStage("auth_bootstrap", () => getServerAuthBootstrap(cookieHeader))
+      : { status: "anonymous" as const, user: null };
+    const adsenseEnabled = process.env.PLATFORM_ADSENSE_ENABLED !== "false";
+    return renderRoot(nonce, initialAuth, adsenseEnabled);
+  }
+
+  return runWithSsrTrace(startedAt, rootStartedAtMs, requestHeaders, async () => {
+    await recordSsrRequestTimeline();
+    await recordSsrPoint("root_layout_start", 0);
+    const nonce = requestHeaders.get("x-nonce");
+    const cookieHeader = requestCookies.toString();
+    const initialAuth = requestCookies.has(platformSessionCookieName())
+      ? await measureSsrStage("auth_bootstrap", () => getServerAuthBootstrap(cookieHeader))
+      : { status: "anonymous" as const, user: null };
+    const adsenseEnabled = process.env.PLATFORM_ADSENSE_ENABLED !== "false";
+    const rendered = renderRoot(nonce, initialAuth, adsenseEnabled);
+    await recordSsrStage("root_layout", performance.now() - startedAt);
+    await recordSsrPoint("react_render_unattributed_start");
+    return rendered;
+  });
 }
