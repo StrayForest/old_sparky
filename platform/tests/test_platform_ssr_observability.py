@@ -8,6 +8,7 @@ from tools.platform_production_qa import (
     collect_nginx_access_records,
     parse_ssr_event_loop_line,
     parse_ssr_perf_line,
+    parse_ssr_stream_line,
     summarize_ssr_observability,
 )
 
@@ -28,6 +29,13 @@ class SsrObservabilityTests(unittest.TestCase):
             )["p95_ms"],
             4.0,
         )
+        stream = parse_ssr_stream_line(
+            "ssr_stream request_id=req-1 cf_ray=ray-1 stage=first_chunk_emitted "
+            "elapsed_ms=123 status=200"
+        )
+        self.assertEqual(stream["elapsed_ms"], 123.0)
+        self.assertEqual(stream["status"], 200)
+        self.assertIsNone(parse_ssr_stream_line("ssr_stream stage=missing-request elapsed_ms=1"))
 
     def test_ssr_summary_correlates_sampled_stages_without_serializing_ids_or_uris(self) -> None:
         web_lines = [
@@ -95,6 +103,55 @@ class SsrObservabilityTests(unittest.TestCase):
         ]
         summary = summarize_ssr_observability([], records)
         self.assertEqual(summary["nginx_html"]["requests"], 0)
+
+    def test_ssr_summary_retains_correlated_timeline_and_api_metrics(self) -> None:
+        web_lines = [
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=proxy_to_root_layout_start "
+            "start_ms=-12.000 end_ms=0.000 duration_ms=12.000 outcome=ok",
+            "ssr_perf request_id=req-1 cf_ray=ray-1 stage=root_layout "
+            "start_ms=0.000 end_ms=20.000 duration_ms=20.000 outcome=ok",
+            "ssr_stream request_id=req-1 cf_ray=ray-1 stage=response_stream_start "
+            "elapsed_ms=40 status=200",
+            "ssr_stream request_id=req-1 cf_ray=ray-1 stage=first_chunk_emitted "
+            "elapsed_ms=41 status=200",
+        ]
+        api_lines = [
+            "request_perf request_id=req-1 method=GET path=/api/v1/auth/bootstrap "
+            "route=/api/v1/auth/bootstrap status=200 total_ms=18.5 sql_ms=2.5 "
+            "sql_count=2 pool_checkout_wait_ms=1.5 pool_connection_hold_ms=3.5 "
+            "compute_ms=4.5 response_bytes=120",
+        ]
+        summary = summarize_ssr_observability(
+            web_lines,
+            [
+                {
+                    "request_id": "req-1",
+                    "method": "GET",
+                    "uri": "/tournaments/fixture",
+                    "status": 200,
+                    "request_time": "0.050",
+                    "upstream_header_time": "0.040",
+                    "upstream_time": "0.045",
+                }
+            ],
+            api_lines,
+        )
+
+        correlated = summary["correlated_html"]
+        self.assertEqual(correlated["requests"], 1)
+        self.assertEqual(correlated["stream_stage_presence"]["first_chunk_emitted"], 1)
+        timeline = correlated["timeline"][0]["timeline"]
+        self.assertEqual(
+            [event["stage"] for event in timeline],
+            ["proxy_to_root_layout_start", "root_layout", "response_stream_start", "first_chunk_emitted"],
+        )
+        self.assertEqual(timeline[2]["start_ms"], 28.0)
+        self.assertEqual(
+            correlated["timeline"][0]["api_request_perf"][0]["route_class"],
+            "auth_bootstrap",
+        )
+        serialized = json.dumps(summary)
+        self.assertNotIn("req-1", serialized)
 
     def test_nginx_numeric_request_time_is_reported(self) -> None:
         summary = summarize_ssr_observability(

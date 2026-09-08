@@ -44,6 +44,44 @@ class PlatformWebShutdownGuardTests(unittest.TestCase):
         self.assertIn("--require", runner)
         self.assertIn("server-shutdown-guard.cjs", runner)
 
+    def test_ssr_stream_diagnostics_records_headers_and_first_chunk_only(self) -> None:
+        env = os.environ.copy()
+        env["PLATFORM_SSR_PERF_LOG_ENABLED"] = "true"
+        env["PLATFORM_SSR_PERF_SAMPLE_RATE"] = "1"
+        completed = subprocess.run(
+            ["node", "--require", str(GUARD_PATH), "-e", """
+const http = require('node:http');
+const server = http.createServer((request, response) => {
+  response.writeHead(200, {'content-type': 'text/html'});
+  response.write('<html>');
+  response.end('</html>');
+});
+server.listen(0, '127.0.0.1', async () => {
+  const port = server.address().port;
+  const response = await fetch('http://127.0.0.1:' + port + '/tournaments/private-slug', {
+    headers: {
+      accept: 'text/html',
+      'x-request-id': 'request-1',
+      'cf-ray': 'ray-1',
+    },
+  });
+  await response.text();
+  server.close();
+});
+"""],
+            capture_output=True,
+            check=False,
+            env=env,
+            text=True,
+            timeout=8,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.count("stage=response_stream_start"), 1)
+        self.assertEqual(completed.stdout.count("stage=first_chunk_emitted"), 1)
+        self.assertIn("request_id=request-1", completed.stdout)
+        self.assertIn("cf_ray=ray-1", completed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
