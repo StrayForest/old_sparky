@@ -67,6 +67,7 @@ test("stateless result routes and link controls are removed", () => {
 
 test("mobile draft has a rotate prompt and a dedicated side action control", () => {
   assert.match(appSource, /draft-rotate-notice/u);
+  assert.doesNotMatch(appSource, /В горизонтальном режиме поле героев/u);
   assert.match(appSource, /confirm-action-mobile/u);
   assert.match(appSource, /data-confirm-action/u);
   assert.match(appSource, /team-side__short/u);

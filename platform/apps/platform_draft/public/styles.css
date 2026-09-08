@@ -1672,13 +1672,6 @@ h1 {
     letter-spacing: -0.03em;
   }
 
-  .draft-rotate-notice > p:last-child {
-    max-width: 290px;
-    margin: 0;
-    color: var(--text-soft);
-    font-size: 13px;
-    line-height: 1.45;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {

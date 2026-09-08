@@ -405,7 +405,6 @@ function renderRoom() {
         </div>
         <p class="eyebrow">Драфт идёт</p>
         <h2>Поверните телефон</h2>
-        <p>В горизонтальном режиме поле героев и команды поместятся на одном экране.</p>
       </div>` : ""}
       <div class="room-shell">
       ${lastError ? `<div class="error-box">${escapeHtml(lastError)}</div>` : ""}
