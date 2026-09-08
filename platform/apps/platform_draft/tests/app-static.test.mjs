@@ -69,6 +69,8 @@ test("mobile draft has a rotate prompt and a dedicated side action control", () 
   assert.match(appSource, /draft-rotate-notice/u);
   assert.doesNotMatch(appSource, /В горизонтальном режиме поле героев/u);
   assert.doesNotMatch(appSource, /lobby-help|Отправь ссылку сопернику/u);
+  assert.doesNotMatch(appSource, /data-new-draft|mobile-new-draft|lobby-actions/u);
+  assert.match(appSource, /data-restart-draft/u);
   assert.match(appSource, /confirm-action-mobile/u);
   assert.match(appSource, /data-confirm-action/u);
   assert.match(appSource, /team-side__short/u);

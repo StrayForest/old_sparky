@@ -352,7 +352,6 @@ function renderLobby() {
       <div class="lobby-meta"><span>${room.rules.teamSize}v${room.rules.teamSize}</span><span>${formatRoomBans(room.rules)}</span><span>${room.rules.timerSeconds}с таймер</span><span>Первый ход: ${firstSide}</span></div>
       ${lastError ? `<div class="error-box">${escapeHtml(lastError)}</div>` : ""}
       <div class="lobby-teams">${lobbyTeam("A")}${lobbyTeam("B")}</div>
-      <div class="lobby-actions"><button class="icon-button" id="new-draft" type="button">Новый драфт</button></div>
     </section>
   `;
   app.querySelector("#ready-up")?.addEventListener("click", () => sendRoomMessage({ type: "ready", expectedVersion: room.version }));
@@ -361,7 +360,6 @@ function renderLobby() {
     sendRoomMessage({ type: "team-name", expectedVersion: room.version, name: input.value.slice(0, 40) });
   });
   app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
-  app.querySelector("#new-draft")?.addEventListener("click", () => navigate("/draft"));
 }
 
 function formatRoomBans(rules) {
@@ -418,12 +416,10 @@ function renderRoom() {
           <span class="timer" id="draft-timer">${timerText}</span>
         </div>
         <span class="mobile-room-mode">${escapeHtml(roleLabel)}</span>
-        <button class="mobile-new-draft" id="new-draft-mobile" data-new-draft type="button">Новый</button>
         <div class="room-actions">
           <span class="room-team-name room-team-name--b team-b">${escapeHtml(room.teamNames.B)}</span>
           ${runtimeMode === "online" && seat.role === "host" ? `<button class="opponent-link opponent-link--compact" id="copy-opponent" type="button">${COPY_ICON}<span>Ссылка сопернику</span></button>` : ""}
           ${runtimeMode === "online" ? `<button class="secondary-button" id="copy-watch" type="button">Ссылка зрителю</button>` : ""}
-          <button class="icon-button" id="new-draft" data-new-draft type="button">Новый</button>
         </div>
       </div>
 
@@ -609,10 +605,6 @@ function attachRoomEvents(canAct) {
   });
   app.querySelector("#copy-opponent")?.addEventListener("click", () => void copyOpponentLink());
   app.querySelector("#copy-watch")?.addEventListener("click", () => void copyText(`${location.origin}/draft/${roomCode}`, "Ссылка зрителя скопирована"));
-  app.querySelectorAll("[data-new-draft]").forEach((button) => button.addEventListener("click", () => {
-    if (runtimeMode === "solo") sessionStorage.removeItem(SOLO_KEY);
-    navigate("/draft");
-  }));
   app.querySelectorAll("[data-restart-draft]").forEach((button) => button.addEventListener("click", () => {
     if (runtimeMode === "solo") sessionStorage.removeItem(SOLO_KEY);
     navigate("/draft");
