@@ -92,8 +92,10 @@ in
 [`performance-authenticated-html-ttfb-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-2026-09-07.md);
 the browser-workspace candidate is archived in
 [`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](../docs/archive/performance-authenticated-html-ttfb-workspace-client-2026-09-08.md),
-and the active single-candidate follow-up is in
-[`active-authenticated-html-ttfb-avatar-defer-2026-09-08.md`](active-authenticated-html-ttfb-avatar-defer-2026-09-08.md).
+the avatar-defer candidate is archived in
+[`performance-authenticated-html-ttfb-avatar-defer-2026-09-08.md`](../docs/archive/performance-authenticated-html-ttfb-avatar-defer-2026-09-08.md),
+and the rejected chrome-boundary candidate is archived in
+[`performance-authenticated-html-ttfb-chrome-boundaries-2026-09-08.md`](../docs/archive/performance-authenticated-html-ttfb-chrome-boundaries-2026-09-08.md).
 The rejected admission candidate and its exact A/B result are archived in
 [`performance-authenticated-html-ttfb-admission-2026-09-07.md`](../docs/archive/performance-authenticated-html-ttfb-admission-2026-09-07.md).
 The first merged overlap candidate was deployed in release
@@ -115,8 +117,13 @@ auth/header path. Its exact external A/B `34169435362` measured HTML TTFB p95
 diagnostic repeat `34171146327` measured upstream-header p95 `1,141 ms`,
 upstream-connect p95 `1 ms`, sampled root auth-bootstrap p95 `95.222 ms` and
 sampled root component-tree p95 `96.373 ms`; production was restored to
-`ready-vote-static-8` by `34172262955`. The active follow-up removes only the
-optional avatar SQL from the blocking bootstrap request.
+`ready-vote-static-8` by `34172262955`. The avatar candidate removed only the
+optional avatar SQL from the blocking bootstrap request. The chrome-boundary
+candidate was rejected after exact runs `34181055402` and `34182385484` both
+failed to complete the 20k/40 client load; both fixtures were cleaned by
+guarded abort/cleanup workflows. The next concrete candidate is
+diagnostic-first stable-contour root component-tree work after rollback; no
+capacity-setting change is authorized.
 The execution record remains available in
 [the archived 2026-09-07 work order](../docs/archive/performance-stage-request-2026-09-07.md), now closed
 with that explicit follow-up.
