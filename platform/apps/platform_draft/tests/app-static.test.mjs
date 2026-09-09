@@ -5,6 +5,7 @@ import test from "node:test";
 const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const stylesSource = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 const coreSource = await readFile(new URL("../public/draft-core.js", import.meta.url), "utf8");
+const workerSource = await readFile(new URL("../worker.js", import.meta.url), "utf8");
 const createSource = appSource.slice(appSource.indexOf("function renderCreate()"), appSource.indexOf("function resetCreateSequence()"));
 const sequenceSource = appSource.slice(appSource.indexOf("function renderSequenceEditor()"), appSource.indexOf("function renderCreate()"));
 const liveSequenceSource = appSource.slice(appSource.indexOf("function renderLiveSequence()"), appSource.indexOf("function renderActionBar("));
@@ -42,11 +43,27 @@ test("create showcase markup and styles are removed", () => {
 });
 
 test("draft controls use team A/B labels and finite timers", () => {
-  assert.match(createSource, /Команда А/u);
-  assert.match(createSource, /Команда Б/u);
+  assert.match(createSource, /data-first-move="A"[^>]*>\$\{teamLabel\("A"\)\}<\/button>/u);
+  assert.match(createSource, /data-first-move="B"[^>]*>\$\{teamLabel\("B"\)\}<\/button>/u);
   assert.doesNotMatch(createSource, /Выкл/u);
   assert.match(appSource, /sequence-editor--live/u);
   assert.doesNotMatch(appSource, /ROOM <strong>/u);
+});
+
+test("team names are limited to 15 characters and ready controls stay stable", () => {
+  assert.match(coreSource, /MAX_TEAM_NAME_LENGTH = 15/u);
+  assert.match(appSource, /maxlength="\$\{MAX_TEAM_NAME_LENGTH\}"/u);
+  assert.match(appSource, /input\.value\.slice\(0, MAX_TEAM_NAME_LENGTH\)/u);
+  assert.doesNotMatch(appSource, /maxlength="40"|slice\(0, 40\)/u);
+  assert.match(appSource, /isOwn && !ready\[side\]/u);
+  assert.match(appSource, /ready\[side\] \? "disabled" : ""/u);
+  assert.match(stylesSource, /\.lobby-team__footer \{[\s\S]*min-height: 48px;/u);
+});
+
+test("stale room state is synchronized without the technical notice", () => {
+  assert.doesNotMatch(appSource, /Состояние(?: комнаты)? изменилось[\s\S]*актуальное состояние/u);
+  assert.doesNotMatch(workerSource, /Состояние(?: комнаты)? изменилось[\s\S]*актуальное состояние/u);
+  assert.match(workerSource, /this\.sendState\(ws, room\);/u);
 });
 
 test("live sequence frames the active column without quota counters", () => {

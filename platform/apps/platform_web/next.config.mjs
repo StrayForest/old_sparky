@@ -4,6 +4,11 @@ const apiProxyBaseUrl = (process.env.PLATFORM_API_BASE_URL ?? "http://127.0.0.1:
 const nextConfig = {
   output: "standalone",
   poweredByHeader: false,
+  // Keep compression enabled by default. Operators can build an explicitly
+  // comparable diagnostic artifact with PLATFORM_WEB_NEXT_COMPRESSION=false;
+  // this is intentionally build-time so a runtime profile cannot silently
+  // claim to have changed a compiled Next.js server.
+  compress: process.env.PLATFORM_WEB_NEXT_COMPRESSION !== "false",
   reactStrictMode: true,
   allowedDevOrigins: ["127.0.0.1", "localhost"],
   async headers() {

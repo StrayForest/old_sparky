@@ -258,6 +258,19 @@ test("online room creation preserves the submitted custom sequence", async () =>
   });
 });
 
+test("room team names are capped at fifteen characters", async () => {
+  const longName = "12345678901234567890";
+  const { response, environment } = await createRoom({
+    presetId: "standard",
+    timerSeconds: 30,
+    teamNames: { A: longName, B: longName }
+  });
+
+  assert.equal(response.status, 201);
+  assert.equal(environment.created[0].teamNames.A, longName.slice(0, 15));
+  assert.equal(environment.created[0].teamNames.B, longName.slice(0, 15));
+});
+
 test("online room creation rejects custom settings the browser would otherwise normalize", async () => {
   const { response, environment } = await createRoom({
     presetId: "standard",
@@ -337,6 +350,11 @@ test("online room stays in lobby until both seats are ready and syncs team names
   assert.equal(room.status, "waiting");
   assert.equal(room.teamNames.A, "Alpha");
 
+  await draft.webSocketMessage(host, JSON.stringify({ type: "team-name", expectedVersion: 2, name: "1234567890123456" }));
+  room = await storage.get("room");
+  assert.equal(room.teamNames.A, "Alpha");
+  assert.equal(host.messages.at(-1).error, "Название команды слишком длинное");
+
   await draft.webSocketMessage(host, JSON.stringify({ type: "ready", expectedVersion: 2 }));
   room = await storage.get("room");
   assert.equal(room.status, "waiting");
@@ -353,6 +371,18 @@ test("online room stays in lobby until both seats are ready and syncs team names
   assert.deepEqual(room.ready, { A: true, B: true });
   assert.equal(room.currentStep, 0);
   assert.ok(host.messages.some((message) => message.type === "state" && message.room.status === "drafting"));
+});
+
+test("stale lobby commands resync the room without an error notice", async () => {
+  const { draft, storage, sockets } = await seedDraftRoom();
+  const host = new FakeSocket({ role: "host", authenticated: true, count: 0, windowStartedAt: Date.now() });
+  sockets.push(host);
+
+  await draft.webSocketMessage(host, JSON.stringify({ type: "ready", expectedVersion: 0 }));
+  const room = await storage.get("room");
+  assert.equal(room.version, 1);
+  assert.equal(host.messages.at(-1).type, "state");
+  assert.equal(host.messages.at(-1).error, undefined);
 });
 
 test("ready lobby starts after a captain reconnects", async () => {

@@ -61,6 +61,16 @@ The measured HTTP generator runs only on the GitHub-hosted runner. The
 production origin may prepare marked fixtures, collect lightweight pressure
 evidence and perform exact cleanup; it must not execute the measured client.
 
+The authenticated HTML transport diagnostic records the full hop boundary:
+Next.js direct, local Nginx and public Cloudflare. Source-level Nginx policy
+disables response buffering only in the dynamic HTML proxy location and emits
+encoding/transfer/buffering headers into the existing JSON access log. The
+`web-ssr-diagnostics` profile also reports interval event-loop delay p50/p95/p99,
+ELU, process CPU and GC time. These diagnostics are not a production result
+until the unchanged control and the exact external profile are rerun in the
+same window. The bounded operator probe is
+`tools/platform_ttfb_probe.py`; it does not replace the external load gate.
+
 Current resource-safety semantics are explicit: `max_postgres_backend_connections`
 is evaluated from the observer's `pg_stat_activity` backend count and grouped
 `postgres_backend_ownership`; `postgres_tcp_established_connections` is a

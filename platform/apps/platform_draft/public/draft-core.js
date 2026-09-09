@@ -1,5 +1,6 @@
 export const TEAM_SIZES = Object.freeze([6, 4, 2]);
 export const MAX_BANS_PER_TEAM = 3;
+export const MAX_TEAM_NAME_LENGTH = 15;
 export const BAN_COUNTS = Object.freeze([0, 1, 2, 3]);
 export const TIMER_SECONDS = Object.freeze([30, 45, 60, 90]);
 
@@ -195,8 +196,8 @@ export function createLocalRoom(rules, teamNames) {
     version: 1,
     rules,
     teamNames: {
-      A: cleanTeamName(teamNames?.A, "Команда А"),
-      B: cleanTeamName(teamNames?.B, "Команда Б")
+      A: cleanTeamName(teamNames?.A, "А"),
+      B: cleanTeamName(teamNames?.B, "Б")
     },
     currentStep: 0,
     picks: { A: [], B: [] },
@@ -249,7 +250,7 @@ export function currentStep(room) {
 }
 
 export function cleanTeamName(value, fallback) {
-  const text = String(value || "").trim().slice(0, 40);
+  const text = String(value || "").trim().slice(0, MAX_TEAM_NAME_LENGTH);
   return text || fallback;
 }
 

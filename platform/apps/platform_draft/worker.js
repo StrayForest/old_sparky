@@ -1,4 +1,4 @@
-import { buildRules, DEFAULT_CUSTOM_RULES, MAX_BANS_PER_TEAM, validateSequence } from "./public/draft-core.js";
+import { buildRules, DEFAULT_CUSTOM_RULES, MAX_BANS_PER_TEAM, MAX_TEAM_NAME_LENGTH, validateSequence } from "./public/draft-core.js";
 import { HERO_BY_ID } from "./public/heroes.js";
 
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
@@ -72,8 +72,8 @@ export class DraftRoom {
       version: 1,
       rules: validateRules(payload.rules),
       teamNames: {
-        A: cleanTeamName(payload.teamNames?.A, "Команда А"),
-        B: cleanTeamName(payload.teamNames?.B, "Команда Б")
+        A: cleanTeamName(payload.teamNames?.A, "А"),
+        B: cleanTeamName(payload.teamNames?.B, "Б")
       },
       currentStep: 0,
       picks: { A: [], B: [] },
@@ -201,7 +201,7 @@ export class DraftRoom {
       return;
     }
     if (!Number.isInteger(message.expectedVersion) || message.expectedVersion !== room.version) {
-      this.sendError(ws, "Состояние комнаты изменилось — обновлено актуальное состояние", room);
+      this.sendState(ws, room);
       return;
     }
     const side = attachment.role === "host" ? "A" : "B";
@@ -227,10 +227,10 @@ export class DraftRoom {
       return;
     }
     if (!Number.isInteger(message.expectedVersion) || message.expectedVersion !== room.version) {
-      this.sendError(ws, "Состояние комнаты изменилось — обновлено актуальное состояние", room);
+      this.sendState(ws, room);
       return;
     }
-    if (typeof message.name !== "string" || message.name.length > 40) {
+    if (typeof message.name !== "string" || message.name.length > MAX_TEAM_NAME_LENGTH) {
       this.sendError(ws, "Название команды слишком длинное", room);
       return;
     }
@@ -239,7 +239,7 @@ export class DraftRoom {
       this.sendError(ws, "После готовности название команды изменить нельзя", room);
       return;
     }
-    room.teamNames[side] = cleanTeamName(message.name, side === "A" ? "Команда А" : "Команда Б");
+    room.teamNames[side] = cleanTeamName(message.name, side === "A" ? "А" : "Б");
     room.version += 1;
     await this.saveAndBroadcast(room);
   }
@@ -255,7 +255,7 @@ export class DraftRoom {
       return;
     }
     if (!Number.isInteger(message.expectedVersion) || message.expectedVersion !== room.version) {
-      this.sendError(ws, "Состояние изменилось — обновлено актуальное состояние", room);
+      this.sendState(ws, room);
       return;
     }
     const step = room.rules.sequence[room.currentStep];
@@ -435,8 +435,8 @@ async function createRoom(request, env) {
     return json({ error: "Некорректные правила" }, 400);
   }
   const teamNames = {
-    A: cleanTeamName(payload?.teamNames?.A, "Команда А"),
-    B: cleanTeamName(payload?.teamNames?.B, "Команда Б")
+    A: cleanTeamName(payload?.teamNames?.A, "А"),
+    B: cleanTeamName(payload?.teamNames?.B, "Б")
   };
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -617,7 +617,7 @@ function resolveFirstSide(value) {
 }
 
 function cleanTeamName(value, fallback) {
-  const text = String(value || "").replace(/[\u0000-\u001f\u007f]/gu, "").trim().slice(0, 40);
+  const text = String(value || "").replace(/[\u0000-\u001f\u007f]/gu, "").trim().slice(0, MAX_TEAM_NAME_LENGTH);
   return text || fallback;
 }
 

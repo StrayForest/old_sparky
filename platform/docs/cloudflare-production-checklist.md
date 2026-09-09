@@ -86,6 +86,13 @@ details are in
   `stale-while-revalidate=30`, bypass for `Authorization` or the production
   session cookie, and no match for `/api/v1/tournaments/mine`, other `/api/`
   routes or HTML. Do not enable Cache Everything on the apex.
+- VERIFY: inspect the read-only audit entries
+  `response-buffering-zone-setting` and `response-body-buffering-rules`. The
+  former reports the legacy Enterprise zone setting; the latter reports
+  per-request Configuration Rules. Keep response-body buffering disabled only
+  for the measured authenticated HTML path after confirming that the path does
+  not require response-body inspection by WAF/Bot Management. No global edge
+  setting is changed by the audit.
 - TODO: purge/revalidate pre-2026-08-08 `old-sparky.com/assets/*` responses that
   retain pre-security-header metadata.
 - DO NOT ENABLE without a measured need: Cache Reserve, Images transforms,
