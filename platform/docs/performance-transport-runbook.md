@@ -126,7 +126,8 @@ gh workflow run platform-production-web-runtime-diagnostics.yml \
   -f until_utc=2026-09-09T09:54:00Z
 ```
 
-Inspect systemd exit/result, restart count, memory peak and the sanitized
-service/kernel journal. Do not raise `MemoryMax`, scale workers or alter the
-database pool until the restart cause is identified and a focused rollback
+Inspect systemd exit/result, restart count, memory peak/current, the sanitized
+service/kernel journal, and any filesystem/inode/mount facts captured by a
+candidate activation failure. Do not raise `MemoryMax`, scale workers or alter
+the database pool until the restart cause is identified and a focused rollback
 plan exists. A web restart can create both 502s and secondary TTFB queueing.

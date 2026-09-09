@@ -239,6 +239,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("candidate_activation_failure", workflow)
+        self.assertIn("df -hT -- \"$path\"", workflow)
+        self.assertIn("df -i -- \"$path\"", workflow)
+        self.assertIn("findmnt --target \"$path\"", workflow)
+        self.assertIn("candidate_api_sandbox", workflow)
+        self.assertIn("PrivateTmp", workflow)
         self.assertIn('systemctl show "$service"', workflow)
         self.assertIn('journalctl -u "$service"', workflow)
         self.assertIn(
