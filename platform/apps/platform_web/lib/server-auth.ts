@@ -1,5 +1,7 @@
 import "server-only";
 
+import * as http from "node:http";
+import * as https from "node:https";
 import { cache } from "react";
 import type { PlatformAuthBootstrap, PlatformUser } from "@/lib/platform-types";
 import {
@@ -18,6 +20,23 @@ const serverApiBaseUrl = (
   ?? `${process.env.PLATFORM_API_INTERNAL_ORIGIN ?? "http://127.0.0.1:8010"}/api/v1`
 ).replace(/\/$/u, "");
 const serverAuthTimeoutMs = 2_000;
+const serverAuthResponseMaxBytes = 256 * 1024;
+const serverAuthHttpAgent = new http.Agent({
+  keepAlive: true,
+  maxFreeSockets: 16,
+  maxSockets: 128,
+});
+const serverAuthHttpsAgent = new https.Agent({
+  keepAlive: true,
+  maxFreeSockets: 16,
+  maxSockets: 128,
+});
+
+type ServerJsonResponse = {
+  status: number;
+  ok: boolean;
+  json: () => Promise<unknown>;
+};
 
 export function platformSessionCookieName(): string {
   return process.env.PLATFORM_SESSION_COOKIE_NAME?.trim()
@@ -64,11 +83,7 @@ export const getServerCurrentUser = cache(async (
         requestHeaders.set("accept", "application/json");
         requestHeaders.set("cookie", cookieHeader);
       }
-      const response = await fetch(`${baseUrl}/users/me`, {
-        headers: requestHeaders,
-        cache: "no-store",
-        signal: AbortSignal.timeout(serverAuthTimeoutMs)
-      });
+      const response = await requestServerJson(`${baseUrl}/users/me`, requestHeaders);
       if (response.status === 401 || response.status === 403) {
         return { status: "anonymous", user: null };
       }
@@ -107,11 +122,7 @@ export const getServerAuthBootstrap = cache(async (
         requestHeaders.set("accept", "application/json");
         requestHeaders.set("cookie", cookieHeader);
       }
-      const response = await fetch(`${baseUrl}/auth/bootstrap`, {
-        headers: requestHeaders,
-        cache: "no-store",
-        signal: AbortSignal.timeout(serverAuthTimeoutMs)
-      });
+      const response = await requestServerJson(`${baseUrl}/auth/bootstrap`, requestHeaders);
       if (response.status === 401 || response.status === 403) {
         return { status: "anonymous", user: null };
       }
@@ -128,6 +139,94 @@ export const getServerAuthBootstrap = cache(async (
     }
   });
 });
+
+function requestServerJson(
+  input: string,
+  headers: HeadersInit,
+): Promise<ServerJsonResponse> {
+  const url = new URL(input);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return Promise.reject(new Error("Unsupported server API protocol."));
+  }
+
+  return new Promise<ServerJsonResponse>((resolve, reject) => {
+    let settled = false;
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => {
+      abortController.abort();
+    }, serverAuthTimeoutMs);
+    const settle = (operation: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      operation();
+    };
+
+    function settleResponse(response: http.IncomingMessage): void {
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      const contentLength = Number(response.headers["content-length"]);
+      if (Number.isFinite(contentLength) && contentLength > serverAuthResponseMaxBytes) {
+        response.resume();
+        settle(() => reject(new Error("Server auth response exceeded its size limit.")));
+        return;
+      }
+      response.on("data", (chunk: Buffer | string) => {
+        const bytes = Buffer.byteLength(chunk);
+        totalBytes += bytes;
+        if (totalBytes > serverAuthResponseMaxBytes) {
+          response.destroy(new Error("Server auth response exceeded its size limit."));
+          settle(() => reject(new Error("Server auth response exceeded its size limit.")));
+          return;
+        }
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      response.on("end", () => {
+        settle(() => {
+          try {
+            const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+            const status = response.statusCode ?? 0;
+            resolve({
+              status,
+              ok: status >= 200 && status < 300,
+              json: async () => payload,
+            });
+          } catch (error) {
+            reject(error instanceof Error ? error : new Error("Invalid server auth response."));
+          }
+        });
+      });
+      response.on("error", (error) => {
+        settle(() => reject(error));
+      });
+    }
+
+    const requestHeaders: Record<string, string> = {};
+    new Headers(headers).forEach((value, key) => {
+      requestHeaders[key] = value;
+    });
+    requestHeaders["accept-encoding"] = "identity";
+    const requestOptions = {
+      hostname: url.hostname.replace(/^\[|\]$/gu, ""),
+      method: "GET" as const,
+      path: `${url.pathname}${url.search}`,
+      port: url.port || undefined,
+      headers: requestHeaders,
+      signal: abortController.signal,
+    };
+    const request = url.protocol === "https:"
+      ? https.request({ ...requestOptions, agent: serverAuthHttpsAgent }, settleResponse)
+      : http.request({ ...requestOptions, agent: serverAuthHttpAgent }, settleResponse);
+    request.on("error", (error) => {
+      settle(() => reject(error));
+    });
+    request.end();
+  });
+}
 
 function isPlatformAuthBootstrap(value: unknown): value is PlatformAuthBootstrap {
   if (!value || typeof value !== "object") {
