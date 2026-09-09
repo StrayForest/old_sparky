@@ -99,9 +99,17 @@ same-source compression-off A/B
 worsened TTFB p95 to `2,829.887 ms` and added client timeouts, so compression
 remains enabled after restore
 [`34340974394`](https://github.com/StrayForest/old_sparky/actions/runs/34340974394).
-The remaining owner-level priority is to collect the exact systemd/journal and
-kernel evidence for the web restarts before changing runtime limits or SSR.
-Full evidence is in the [transport investigation archive](archive/performance-authenticated-html-ttfb-transport-2026-09-09.md).
+The read-only runtime diagnostics
+[`34344738197`](https://github.com/StrayForest/old_sparky/actions/runs/34344738197)
+confirmed two systemd cgroup OOM kills of `next-server` at approximately
+`1,029,412 KiB` and `1,029,144 KiB` under `MemoryMax=1G`; the resulting
+automatic restarts explain the 502s and secondary queueing. Full evidence is in
+the [transport investigation archive](archive/performance-authenticated-html-ttfb-transport-2026-09-09.md).
+The active code candidate is a bounded direct Node HTTP transport for the two
+loopback server-auth GETs, avoiding Next.js' patched server `fetch` while
+preserving the existing auth policy and validators. It remains unaccepted
+until the canonical same-window external load proves no OOM/restarts, no
+unexpected statuses, exact cleanup and a TTFB improvement toward `<1,000 ms`.
 
 Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target. The prior blocked attribution is retained in the
@@ -114,10 +122,9 @@ without a server data-ready marker. The active next step is the narrow,
 separately reviewed transport investigation in
 [`performance-transport-runbook.md`](performance-transport-runbook.md). Cloudflare
 body buffering and the same-source Next.js compression candidate have now been
-checked; the latter was rejected. The next action is exact systemd/journal and
-kernel evidence for the two `deadlock-web` process replacements. The root
-render/flush boundary remains a frozen candidate until the restart cause and
-the remaining origin queueing are understood.
+checked; the latter was rejected. The root render/flush boundary remains a
+frozen candidate until the auth transport A/B and remaining origin queueing are
+understood.
 The browser-workspace candidate is archived in
 [`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](archive/performance-authenticated-html-ttfb-workspace-client-2026-09-08.md),
 and the avatar candidate is archived in

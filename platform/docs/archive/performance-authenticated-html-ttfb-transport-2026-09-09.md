@@ -25,8 +25,14 @@ The full server evidence was collected after the control window. It showed no
 database lock contention, PostgreSQL backend ownership within the existing
 budget, and no SSR diagnostics because the runtime profile was clean. Nginx
 records for successful HTML responses had upstream-header p95 `1,924 ms` and
-upstream/request p95 `2,619 ms`; the direct cause of the web-process churn was
-not captured by the current observer.
+upstream/request p95 `2,619 ms`. The read-only runtime diagnostics
+[34344738197](https://github.com/StrayForest/old_sparky/actions/runs/34344738197)
+then identified the direct cause: the `deadlock-web` systemd cgroup has
+`MemoryMax=1G`, and the kernel killed `next-server` twice at approximately
+`1,029,412 KiB` and `1,029,144 KiB` resident memory. systemd recorded
+`Result=oom-kill`, status `9/KILL`, followed by two automatic restarts. The
+restart churn therefore explains the 502s and secondary queueing; it is not a
+Cloudflare or Nginx buffering finding.
 
 ## Transport and compression decisions
 
@@ -47,10 +53,19 @@ is rejected. Production was restored to the default compressed artifact by
 [34340974394](https://github.com/StrayForest/old_sparky/actions/runs/34340974394),
 with preflight and live smoke checks passing.
 
-## Remaining bottleneck investigation
+## Runtime candidate
 
-The next measurement must identify why `deadlock-web` restarts during the
-authenticated load. The bounded read-only workflow
+The restart cause is confirmed, but the retained-memory owner still needs an
+A/B. Do not raise `MemoryMax`, add workers, scale database pools or change the
+React root flush boundary based on this evidence. The first focused candidate
+is to bypass Next.js' patched server `fetch` for the two loopback auth GETs
+used by the server-rendered shell. The candidate keeps the same trusted
+loopback `/api/v1` URL policy, cookie and correlation headers, a total
+2-second timeout, identity content encoding, a 256 KiB response limit and
+bounded keep-alive agents (`maxSockets=128`, `maxFreeSockets=16`); existing
+status handling and response validators remain unchanged.
+
+The bounded read-only workflow
 `platform-production-web-runtime-diagnostics.yml` collects, for an exact
 UTC window and deployed SHA:
 
@@ -59,8 +74,7 @@ UTC window and deployed SHA:
 - sanitized `deadlock-web` journal lines; and
 - kernel OOM/cgroup kill events.
 
-Until that evidence is collected, do not change `MemoryMax`, worker counts,
-database pool limits, Cloudflare response buffering or the React root flush
-boundary. A web crash/restart or its health-check behavior can account for
-the 502s and queueing, while the compression A/B already rules out the narrow
-first-chunk compression hypothesis as a fix.
+The OOM evidence is now collected; the auth transport candidate must first
+pass build, security, correctness, capacity and exact cleanup gates, then be
+measured in the same canonical external profile. Compression remains enabled
+because the same-source A/B already rejected disabling it.
