@@ -517,6 +517,9 @@ jobs:
                 --apply \
                 --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
                 --profile baseline \
+                --only PLATFORM_LOG_LEVEL \
+                --only PLATFORM_PERF_LOG_ENABLED \
+                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED \
                 --only PLATFORM_API_WORKERS \
                 --only PLATFORM_DB_POOL_SIZE \
                 --only PLATFORM_DB_MAX_OVERFLOW \
@@ -550,6 +553,9 @@ jobs:
                 --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
                 --only PLATFORM_WEB_WORKERS
                 --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT
+                --only PLATFORM_LOG_LEVEL
+                --only PLATFORM_PERF_LOG_ENABLED
+                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
                 --only PLATFORM_SSR_PERF_LOG_ENABLED
                 --only PLATFORM_SSR_PERF_SAMPLE_RATE
                 --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
@@ -592,6 +598,9 @@ jobs:
                   --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
                   --only PLATFORM_WEB_WORKERS
                   --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT
+                  --only PLATFORM_LOG_LEVEL
+                  --only PLATFORM_PERF_LOG_ENABLED
+                  --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
                   --only PLATFORM_SSR_PERF_LOG_ENABLED
                   --only PLATFORM_SSR_PERF_SAMPLE_RATE
                   --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
@@ -644,6 +653,9 @@ jobs:
                 --only PLATFORM_READY_VOTE_ADMISSION_CPU_EWMA_ALPHA \
                 --only PLATFORM_READY_VOTE_ADMISSION_RECOVERY_SAMPLES \
                 --only PLATFORM_READY_VOTE_ADMISSION_CONTROL_INTERVAL_SECONDS \
+                --only PLATFORM_LOG_LEVEL \
+                --only PLATFORM_PERF_LOG_ENABLED \
+                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED \
                 --only PLATFORM_SSR_PERF_LOG_ENABLED \
                 --only PLATFORM_SSR_PERF_SAMPLE_RATE \
                 --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
@@ -666,6 +678,9 @@ jobs:
                   --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
                   --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
                   --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY \
+                  --only PLATFORM_LOG_LEVEL \
+                  --only PLATFORM_PERF_LOG_ENABLED \
+                  --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED \
                   --only PLATFORM_SSR_PERF_LOG_ENABLED \
                   --only PLATFORM_SSR_PERF_SAMPLE_RATE \
                   --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
@@ -689,6 +704,8 @@ jobs:
               web_ssr_profile_args=(
                 --only PLATFORM_WEB_WORKERS
                 --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT
+                --only PLATFORM_LOG_LEVEL
+                --only PLATFORM_PERF_LOG_ENABLED
                 --only PLATFORM_SSR_PERF_LOG_ENABLED
                 --only PLATFORM_SSR_PERF_SAMPLE_RATE
                 --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
@@ -699,6 +716,13 @@ jobs:
                 --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
                 --profile "$runtime_profile" \
                 "${web_ssr_profile_args[@]}"
+              api_env="$runtime/shared/env/api.env"
+              grep -qx 'PLATFORM_LOG_LEVEL=INFO' "$api_env" \
+                || fail "web SSR diagnostic API env did not select INFO log level"
+              grep -qx 'PLATFORM_PERF_LOG_ENABLED=true' "$api_env" \
+                || fail "web SSR diagnostic API perf logging is not enabled"
+              grep -qx 'PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=true' "$api_env" \
+                || fail "web SSR diagnostic API auth bootstrap log gate is not enabled"
               if ! restart_api_and_wait; then
                 "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
                   --apply \
@@ -769,6 +793,9 @@ jobs:
                 --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
                 --only PLATFORM_PERF_SLOW_REQUEST_MS
                 --only PLATFORM_PERF_LOG_MUTATIONS
+                --only PLATFORM_LOG_LEVEL
+                --only PLATFORM_PERF_LOG_ENABLED
+                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
                 --only PLATFORM_SSR_PERF_LOG_ENABLED
                 --only PLATFORM_SSR_PERF_SAMPLE_RATE
                 --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
@@ -819,7 +846,10 @@ jobs:
                 --only PLATFORM_API_WORKERS \
                 --only PLATFORM_DB_POOL_SIZE \
                 --only PLATFORM_DB_MAX_OVERFLOW \
-                --only PLATFORM_DB_CONNECTION_BUDGET
+                --only PLATFORM_DB_CONNECTION_BUDGET \
+                --only PLATFORM_LOG_LEVEL \
+                --only PLATFORM_PERF_LOG_ENABLED \
+                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
               systemctl restart deadlock-api
               api_ready=false
               for _ in $(seq 1 30); do
@@ -839,7 +869,10 @@ jobs:
                   --only PLATFORM_API_WORKERS \
                   --only PLATFORM_DB_POOL_SIZE \
                   --only PLATFORM_DB_MAX_OVERFLOW \
-                  --only PLATFORM_DB_CONNECTION_BUDGET
+                  --only PLATFORM_DB_CONNECTION_BUDGET \
+                  --only PLATFORM_LOG_LEVEL \
+                  --only PLATFORM_PERF_LOG_ENABLED \
+                  --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
                 systemctl restart deadlock-api
                 api_ready=false
                 for _ in $(seq 1 30); do
@@ -864,7 +897,10 @@ jobs:
                 --only PLATFORM_API_WORKERS \
                 --only PLATFORM_DB_POOL_SIZE \
                 --only PLATFORM_DB_MAX_OVERFLOW \
-                --only PLATFORM_DB_CONNECTION_BUDGET
+                --only PLATFORM_DB_CONNECTION_BUDGET \
+                --only PLATFORM_LOG_LEVEL \
+                --only PLATFORM_PERF_LOG_ENABLED \
+                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
               systemctl restart deadlock-api
               api_ready=false
               for _ in $(seq 1 30); do
@@ -884,7 +920,10 @@ jobs:
                   --only PLATFORM_API_WORKERS \
                   --only PLATFORM_DB_POOL_SIZE \
                   --only PLATFORM_DB_MAX_OVERFLOW \
-                  --only PLATFORM_DB_CONNECTION_BUDGET
+                  --only PLATFORM_DB_CONNECTION_BUDGET \
+                  --only PLATFORM_LOG_LEVEL \
+                  --only PLATFORM_PERF_LOG_ENABLED \
+                  --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
                 systemctl restart deadlock-api
                 api_ready=false
                 for _ in $(seq 1 30); do

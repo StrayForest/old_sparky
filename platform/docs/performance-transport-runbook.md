@@ -23,7 +23,9 @@ and client encoding, transfer and buffering headers.
 ## Correlated SSR and auth/API diagnostic
 
 The `web-ssr-diagnostics` profile enables the existing sampled SSR trace and a
-separate API log gate. For the same sampled requests, Next.js sends
+separate API log gate. It also selects the public `INFO` log level and global
+performance logging flag in the API environment, so fast diagnostic rows are
+not hidden by stale startup configuration. For the same sampled requests, Next.js sends
 `x-platform-ssr-trace: 1` with the request and Cloudflare correlation IDs to
 `GET /api/v1/auth/bootstrap`. The API then emits its existing bounded
 `request_perf` record even when the request is faster than the normal slow
@@ -50,8 +52,11 @@ canonical external authenticated-page profile. It does not change workers,
 transport, compression, database pools or capacity limits. If the observer
 records a web restart or any unexpected status, treat the window as diagnostic
 evidence rather than a clean latency result and follow [Web restart evidence](#web-restart-evidence).
-Restore `ready-vote-static-8` after the window so both diagnostic keys return to
-their baseline values.
+Restore `ready-vote-static-8` after the window so the diagnostic keys and API
+logging selectors return to their baseline values
+(`PLATFORM_SSR_PERF_LOG_ENABLED=false`,
+`PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=false`, `PLATFORM_LOG_LEVEL=INFO` and
+`PLATFORM_PERF_LOG_ENABLED=true`).
 
 ## Same-request hop probe
 
