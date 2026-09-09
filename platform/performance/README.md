@@ -139,9 +139,17 @@ abort `34186422087` and exact cleanup `34186465537` passed with 20,000 users,
 `3d7aca0e832bac3c79e1b391e7817b74e5695b03`. The root component-tree
 diagnostic is archived in
 [the measured root component-tree report](../docs/archive/performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md).
-The active next step is the narrow [root render/flush boundary candidate](active-authenticated-html-ttfb-root-render-flush-2026-09-09.md);
-it is proposed for a separate A/B and has no implementation yet. No
-capacity-setting change is authorized. The Next.js 16.3.4 security baseline
+The root render/flush boundary candidate
+[`active-authenticated-html-ttfb-root-render-flush-2026-09-09.md`](active-authenticated-html-ttfb-root-render-flush-2026-09-09.md)
+is frozen pending transport evidence; no capacity-setting change is
+authorized. The reviewed transport-observability package is deployed at
+source SHA `1d25ae335f3eb749ce36b4fe97f868d5f357803c` through production deploy
+[`34325036735`](https://github.com/StrayForest/old_sparky/actions/runs/34325036735).
+Its Nginx policy, Node event-loop/CPU/GC diagnostics and bounded hop probe are
+diagnostic instrumentation only until the unchanged authenticated external
+control is rerun. The active next step is the
+[`authenticated HTML transport runbook`](../docs/performance-transport-runbook.md).
+The Next.js 16.3.4 security baseline
 and its new unchanged control are archived in
 [`security-web-dependencies-next-2026-09-09.md`](../docs/archive/security-web-dependencies-next-2026-09-09.md).
 The control is run `34287694375` with TTFB p95 `1725.436 ms` and full-page
