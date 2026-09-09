@@ -119,6 +119,10 @@ export async function runWithSsrTrace<T>(
 }
 
 export async function getServerRequestCorrelationHeaders(): Promise<Headers> {
+  const trace = await getSsrTrace();
+  if (!trace?.sampled) {
+    return new Headers();
+  }
   let requestHeaders: Awaited<ReturnType<typeof headers>> | null = null;
   try {
     requestHeaders = await headers();
@@ -132,6 +136,7 @@ export async function getServerRequestCorrelationHeaders(): Promise<Headers> {
       correlationHeaders.set(name, value);
     }
   }
+  correlationHeaders.set(SSR_TRACE_HEADER, "1");
   return correlationHeaders;
 }
 

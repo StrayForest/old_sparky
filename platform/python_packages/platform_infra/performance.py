@@ -518,6 +518,12 @@ class RequestPerformanceMiddleware:
             metrics.method.upper() == "POST"
             and str(route_path).endswith("/deadlock/ready-check/vote")
         )
+        is_sampled_ssr_auth_bootstrap = (
+            settings.platform_perf_auth_bootstrap_log_enabled
+            and metrics.method.upper() == "GET"
+            and str(route_path).endswith("/auth/bootstrap")
+            and _header_from_scope(scope, b"x-platform-ssr-trace") == "1"
+        )
         should_log = (
             status_code >= 500
             or (
@@ -540,6 +546,7 @@ class RequestPerformanceMiddleware:
                 and metrics.ready_vote_admission_wait_ms >= 25.0
             )
             or metrics.pool_connection_hold_seconds >= 0.5
+            or is_sampled_ssr_auth_bootstrap
             or metrics.authenticated_read_admission_shed
             or any(
                 event["outcome"] in {"error", "fallback_db"}
