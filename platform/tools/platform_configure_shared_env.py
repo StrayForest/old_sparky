@@ -53,6 +53,7 @@ PUBLIC_BASELINE = {
     "PLATFORM_DB_CONNECTION_BUDGET": "52",
     "PLATFORM_WEB_BIND_HOST": "127.0.0.1",
     "PLATFORM_WEB_PORT": "3000",
+    "PLATFORM_WEB_WORKERS": "1",
     "PLATFORM_API_FORWARDED_ALLOW_IPS": "127.0.0.1",
     "PLATFORM_LOAD_TEST_SOURCE_IPS": "95.217.190.107,2a01:4f9:c012:8011::1",
     "PLATFORM_SHARED_DIR": "/opt/oldsparky/platform/shared",
@@ -214,6 +215,13 @@ RUNTIME_PROFILES = {
         "PLATFORM_SSR_PERF_LOG_ENABLED": "true",
         "PLATFORM_SSR_PERF_SAMPLE_RATE": "0.01",
         "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
+    },
+    # Two bounded Next.js processes share the existing loopback listener via
+    # Node cluster. This is a web CPU-queue candidate only: API workers,
+    # PostgreSQL pools, the 1 GiB cgroup limit and all admission budgets stay
+    # unchanged.
+    "web-ssr-workers-2": {
+        "PLATFORM_WEB_WORKERS": "2",
     },
     "uvicorn-classic": {
         "PLATFORM_UVICORN_LOOP": "asyncio",

@@ -43,6 +43,17 @@ class PlatformWebShutdownGuardTests(unittest.TestCase):
 
         self.assertIn("--require", runner)
         self.assertIn("server-shutdown-guard.cjs", runner)
+        self.assertIn("PLATFORM_WEB_WORKERS", runner)
+        self.assertIn("server-cluster.cjs", runner)
+
+    def test_cluster_runner_is_bounded_to_two_workers(self) -> None:
+        runner = (PLATFORM_ROOT / "apps" / "platform_web" / "server-cluster.cjs").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("workerCount < 2 || workerCount > 2", runner)
+        self.assertIn("maxWorkerRestartsPerMinute = 4", runner)
+        self.assertIn("cluster.fork()", runner)
 
     def test_ssr_stream_diagnostics_records_headers_and_lifecycle(self) -> None:
         env = os.environ.copy()
