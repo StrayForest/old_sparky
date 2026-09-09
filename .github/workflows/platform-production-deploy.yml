@@ -32,6 +32,7 @@ on:
           - authenticated-read-admission-24x8
           - pool-pre-ping-off
           - web-ssr-diagnostics
+          - web-ssr-workers-2
           - uvicorn-classic
           - uvicorn-optimized
           - api-pool-12
@@ -510,6 +511,7 @@ jobs:
                 --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
                 --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
                 --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY \
+                --only PLATFORM_WEB_WORKERS \
                 --only PLATFORM_SSR_PERF_LOG_ENABLED \
                 --only PLATFORM_SSR_PERF_SAMPLE_RATE \
                 --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
@@ -532,6 +534,7 @@ jobs:
                 --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY
                 --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY
                 --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                --only PLATFORM_WEB_WORKERS
                 --only PLATFORM_SSR_PERF_LOG_ENABLED
                 --only PLATFORM_SSR_PERF_SAMPLE_RATE
                 --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
@@ -572,6 +575,7 @@ jobs:
                   --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY
                   --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY
                   --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
+                  --only PLATFORM_WEB_WORKERS
                   --only PLATFORM_SSR_PERF_LOG_ENABLED
                   --only PLATFORM_SSR_PERF_SAMPLE_RATE
                   --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
@@ -667,6 +671,7 @@ jobs:
               ;;
             web-ssr-diagnostics)
               web_ssr_profile_args=(
+                --only PLATFORM_WEB_WORKERS
                 --only PLATFORM_SSR_PERF_LOG_ENABLED
                 --only PLATFORM_SSR_PERF_SAMPLE_RATE
                 --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
@@ -708,6 +713,14 @@ jobs:
                   || fail "web SSR diagnostic profile health check failed; baseline restore failed"
                 fail "web SSR diagnostic profile health check failed; baseline restored"
               fi
+              ;;
+            web-ssr-workers-2)
+              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+                --apply \
+                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                --profile "$runtime_profile" \
+                --only PLATFORM_WEB_WORKERS
+              restart_web_and_wait
               ;;
             read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24)
               candidate_profile_args=(

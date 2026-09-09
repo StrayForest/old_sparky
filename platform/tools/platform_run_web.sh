@@ -25,6 +25,12 @@ export PLATFORM_API_INTERNAL_ORIGIN="${PLATFORM_API_INTERNAL_ORIGIN:-http://127.
 export HOSTNAME="${PLATFORM_WEB_BIND_HOST:-127.0.0.1}"
 export PORT="${PLATFORM_WEB_PORT:-${PORT:-3000}}"
 
+if [[ "${PLATFORM_WEB_WORKERS:-1}" == "2" ]]; then
+  exec "$PLATFORM_NODE_BIN" \
+    --require "$PLATFORM_ROOT_DIR/apps/platform_web/server-shutdown-guard.cjs" \
+    server-cluster.cjs
+fi
+
 exec "$PLATFORM_NODE_BIN" \
   --require "$PLATFORM_ROOT_DIR/apps/platform_web/server-shutdown-guard.cjs" \
   .next/standalone/server.js

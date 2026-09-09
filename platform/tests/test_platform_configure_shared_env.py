@@ -195,6 +195,11 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
                 "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
             },
         )
+        self.assertEqual(
+            configure.RUNTIME_PROFILES["web-ssr-workers-2"],
+            {"PLATFORM_WEB_WORKERS": "2"},
+        )
+        self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_WEB_WORKERS"], "1")
         for pool_size in (12, 16, 20, 24):
             self.assertEqual(
                 configure.RUNTIME_PROFILES[f"api-pool-{pool_size}"][
