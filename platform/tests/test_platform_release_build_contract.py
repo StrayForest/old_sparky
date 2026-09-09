@@ -101,6 +101,17 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         ):
             self.assertIn(f"--only {key}", baseline_branch)
 
+    def test_ssr_runtime_profiles_restart_the_web_process(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text()
+        self.assertIn("restart_web_and_wait()", workflow)
+        self.assertIn(
+            'baseline|ready-vote-static-*|ready-vote-cprofile|ready-vote-adaptive-v2',
+            workflow,
+        )
+        self.assertIn("deadlock-web did not recover after runtime profile", workflow)
+
     def test_auto_deploy_preserves_static_eight_runtime_profile(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
