@@ -7,8 +7,9 @@
 
 ## Result
 
-The `<1,000 ms` authenticated HTML TTFB target remains open. The two new
-experiments did not produce an accepted optimization:
+The `<1,000 ms` authenticated HTML TTFB target remains open. The transport
+investigation identified the production failure mode and measured one bounded
+candidate, but did not produce an accepted target-closing optimization:
 
 - The unchanged `ready-vote-static-8` control, run
   [34334229164](https://github.com/StrayForest/old_sparky/actions/runs/34334229164),
@@ -20,6 +21,22 @@ experiments did not produce an accepted optimization:
   twice, at approximately `09:36:26–09:36:30` and `09:39:37–09:39:42 UTC`.
   The observer recorded two missing and two new web processes. The control is
   therefore diagnostic evidence, not a successful latency acceptance run.
+- The direct Node auth transport plus bounded two-worker web candidate was
+  deployed in source SHA `e5860246` and measured by
+  [34357443978](https://github.com/StrayForest/old_sparky/actions/runs/34357443978).
+  It returned `20,000/20,000` HTTP 200 responses with zero client errors,
+  zero process replacements and exact cleanup. TTFB p95/p99 was
+  `1173.196/1359.348 ms`; Nginx upstream-header p95 was `899 ms`. Web RSS
+  peaked at about `249 MB`, while the two host CPUs averaged about `88%`.
+  The run passed its declared stress acceptance but missed the `<1,000 ms`
+  target by `173.196 ms`, so the candidate is not production default.
+- Production runtime was returned to `ready-vote-static-8` by
+  [34359770524](https://github.com/StrayForest/old_sparky/actions/runs/34359770524),
+  and follow-up source SHA `9c5ac7e5` made the direct transport explicitly
+  opt-in. The automatic production deployment
+  [34362338793](https://github.com/StrayForest/old_sparky/actions/runs/34362338793)
+  now leaves ordinary production on the standard `fetch` transport; the
+  `web-ssr-workers-2` profile remains an experiment only.
 
 The full server evidence was collected after the control window. It showed no
 database lock contention, PostgreSQL backend ownership within the existing
@@ -53,17 +70,25 @@ is rejected. Production was restored to the default compressed artifact by
 [34340974394](https://github.com/StrayForest/old_sparky/actions/runs/34340974394),
 with preflight and live smoke checks passing.
 
-## Runtime candidate
+## Measured runtime candidate
 
-The restart cause is confirmed, but the retained-memory owner still needs an
-A/B. Do not raise `MemoryMax`, add workers, scale database pools or change the
-React root flush boundary based on this evidence. The first focused candidate
-is to bypass Next.js' patched server `fetch` for the two loopback auth GETs
-used by the server-rendered shell. The candidate keeps the same trusted
-loopback `/api/v1` URL policy, cookie and correlation headers, a total
-2-second timeout, identity content encoding, a 256 KiB response limit and
-bounded keep-alive agents (`maxSockets=128`, `maxFreeSockets=16`); existing
-status handling and response validators remain unchanged.
+The restart cause is confirmed. Do not raise `MemoryMax`, scale database
+pools or change the React root flush boundary based on this evidence. The
+measured candidate bypassed Next.js' patched server `fetch` for the two
+loopback auth GETs used by the server-rendered shell and ran two bounded
+Next.js processes behind a Node cluster. It kept the trusted loopback
+`/api/v1` URL policy, cookie and correlation headers, a total 2-second
+timeout, identity content encoding, a 256 KiB response limit and bounded
+keep-alive agents (`maxSockets=128`, `maxFreeSockets=16`); status handling and
+response validators remained unchanged.
+
+The candidate removed the OOM/restart failure observed in the control, but its
+`1173.196 ms` TTFB p95 shows that CPU/queueing remains the principal origin
+bottleneck. Nginx upstream-header p95 of `899 ms` and no Cloudflare/Nginx
+buffering finding make another buffering toggle an unsupported next step. The
+candidate remains available only through the explicit `web-ssr-workers-2`
+profile, while baseline/static/diagnostic profiles use the ordinary `fetch`
+transport.
 
 The bounded read-only workflow
 `platform-production-web-runtime-diagnostics.yml` collects, for an exact
@@ -74,7 +99,8 @@ UTC window and deployed SHA:
 - sanitized `deadlock-web` journal lines; and
 - kernel OOM/cgroup kill events.
 
-The OOM evidence is now collected; the auth transport candidate must first
-pass build, security, correctness, capacity and exact cleanup gates, then be
-measured in the same canonical external profile. Compression remains enabled
-because the same-source A/B already rejected disabling it.
+The OOM evidence and the auth transport A/B are now collected. Compression
+remains enabled because the same-source A/B already rejected disabling it. The
+next experiment should use the safe default transport with SSR/event-loop/CPU
+correlation to separate API auth work from Node scheduling before changing the
+root render/flush boundary.
