@@ -81,9 +81,9 @@ The GitHub `Protect dev` ruleset no longer requires PR approval for merge.
 Branch deletion and force-push remain protected, and exact-SHA CI/build plus
 the automatic production deployment chain remain mandatory.
 
-The reviewed transport-observability package is deployed at source SHA
-`2a37698f4eab937ba6e06558ecd34fa40f334e5b` through production deploy
-[`34340974394`](https://github.com/StrayForest/old_sparky/actions/runs/34340974394).
+The reviewed transport-observability package is now part of deployed source
+SHA `9c5ac7e59466e021bc5ce8142721e4027500407e` through automatic production
+deploy [`34362338793`](https://github.com/StrayForest/old_sparky/actions/runs/34362338793).
 It scopes Nginx response-buffering changes to the dynamic HTML location,
 records upstream/client transport headers, adds opt-in Node event-loop/CPU/GC
 diagnostics, provides the bounded same-request hop probe, and exposes a
@@ -105,11 +105,19 @@ confirmed two systemd cgroup OOM kills of `next-server` at approximately
 `1,029,412 KiB` and `1,029,144 KiB` under `MemoryMax=1G`; the resulting
 automatic restarts explain the 502s and secondary queueing. Full evidence is in
 the [transport investigation archive](archive/performance-authenticated-html-ttfb-transport-2026-09-09.md).
-The active code candidate is a bounded direct Node HTTP transport for the two
-loopback server-auth GETs, avoiding Next.js' patched server `fetch` while
-preserving the existing auth policy and validators. It remains unaccepted
-until the canonical same-window external load proves no OOM/restarts, no
-unexpected statuses, exact cleanup and a TTFB improvement toward `<1,000 ms`.
+The bounded direct Node HTTP transport was measured only as an opt-in candidate,
+together with a bounded two-worker Node cluster, by external run
+[`34357443978`](https://github.com/StrayForest/old_sparky/actions/runs/34357443978):
+20,000/20,000 HTTP 200, zero client errors, no web process churn and exact
+cleanup. TTFB p95/p99 was `1173.196/1359.348 ms`; Nginx upstream-header p95 was
+`899 ms`, web RSS peaked at about `249 MB`, and the two host CPUs averaged about
+`88%`. The candidate passed the declared stress contract and materially reduced
+the OOM/queueing failure mode, but it missed the `<1,000 ms` target by `173.196
+ms`, so it is not the production default. The direct transport is now gated by
+`PLATFORM_WEB_SERVER_AUTH_TRANSPORT=node` and the two-worker profile; ordinary
+baseline/static/diagnostic profiles explicitly use `fetch`. Production was
+restored to `ready-vote-static-8` for source SHA `9c5ac7e5` by automatic deploy
+[`34362338793`](https://github.com/StrayForest/old_sparky/actions/runs/34362338793).
 
 Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target. The prior blocked attribution is retained in the
@@ -122,9 +130,11 @@ without a server data-ready marker. The active next step is the narrow,
 separately reviewed transport investigation in
 [`performance-transport-runbook.md`](performance-transport-runbook.md). Cloudflare
 body buffering and the same-source Next.js compression candidate have now been
-checked; the latter was rejected. The root render/flush boundary remains a
-frozen candidate until the auth transport A/B and remaining origin queueing are
-understood.
+checked; the latter was rejected. The transport A/B also showed that the
+remaining latency is concentrated in the origin/Node queue rather than Nginx
+buffering. The root render/flush boundary remains frozen; the next owner-level
+step is a safe-profile diagnostic window that correlates auth/API CPU and SSR
+stages without enabling the rejected transport by default.
 The security maintenance release upgraded Next.js to `16.3.4`, with its
 exact-SHA CI and production evidence archived in
 [`security-web-dependencies-next-2026-09-09.md`](archive/security-web-dependencies-next-2026-09-09.md).
