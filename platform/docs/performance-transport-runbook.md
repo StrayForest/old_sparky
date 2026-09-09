@@ -43,13 +43,19 @@ add its single-request values to external-load p95s.
 
 ## Compression A/B
 
-Next compression is a build-time switch, not a runtime env toggle. Keep the
-default artifact compressed, then build a separately named candidate from the
-same source with:
+Next compression is a build-time switch, not a runtime profile toggle. The
+production deploy workflow exposes `web_compression=enabled|disabled`; it
+defaults to `enabled`, passes the choice through the sanitized CI build
+environment, and records the resulting choice in `RELEASE.json`. Keep the
+default artifact compressed, then deploy a separately named candidate from the
+same reviewed source SHA with `web_compression=disabled`:
 
 ```bash
-PLATFORM_WEB_NEXT_COMPRESSION=false \
-  tools/platform_web_npm.sh --prefix apps/platform_web run build
+gh workflow run platform-production-deploy.yml \
+  --ref dev \
+  -f mode=deploy \
+  -f runtime_profile=ready-vote-static-8 \
+  -f web_compression=disabled
 ```
 
 Run the same control/candidate request shape and hop probe. Retain compression

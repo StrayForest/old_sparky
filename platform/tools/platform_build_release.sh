@@ -5,6 +5,14 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 OUTPUT_DIR="${PLATFORM_RELEASE_OUTPUT_DIR:-$ROOT_DIR/dist/releases}"
+WEB_NEXT_COMPRESSION="${PLATFORM_WEB_NEXT_COMPRESSION:-true}"
+case "$WEB_NEXT_COMPRESSION" in
+  true|false) ;;
+  *)
+    echo "PLATFORM_WEB_NEXT_COMPRESSION must be true or false." >&2
+    exit 1
+    ;;
+esac
 DEPENDENCY_BASELINE=""
 RELEASE_REF_RAW="workspace"
 RELEASE_REF_SET=0
@@ -486,6 +494,7 @@ fi
     NEXT_TELEMETRY_DISABLED=1 \
     PATH="$PINNED_NODE_HOME/bin:/usr/bin:/bin" \
     PLATFORM_NODE_BIN="$PLATFORM_NODE_BIN" \
+    PLATFORM_WEB_NEXT_COMPRESSION="$WEB_NEXT_COMPRESSION" \
     "$PLATFORM_NODE_BIN" "$NPM_CLI" run typecheck
   /usr/bin/env -i \
     CI=1 \
@@ -494,6 +503,7 @@ fi
     NEXT_TELEMETRY_DISABLED=1 \
     PATH="$PINNED_NODE_HOME/bin:/usr/bin:/bin" \
     PLATFORM_NODE_BIN="$PLATFORM_NODE_BIN" \
+    PLATFORM_WEB_NEXT_COMPRESSION="$WEB_NEXT_COMPRESSION" \
     "$PLATFORM_NODE_BIN" "$NPM_CLI" run build
   rm -rf .next/standalone/.next/static
   mkdir -p .next/standalone/.next

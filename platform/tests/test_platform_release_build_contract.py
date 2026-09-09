@@ -85,6 +85,37 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             workflow.index("Mark production deployment pending"),
         )
 
+    def test_production_web_compression_is_explicit_and_enabled_by_default(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text()
+        build_script = BUILD_SCRIPT.read_text()
+        self.assertIn("web_compression:", workflow)
+        self.assertIn("default: enabled", workflow)
+        self.assertIn("- disabled", workflow)
+        self.assertIn(
+            "PLATFORM_WEB_NEXT_COMPRESSION: ${{ inputs.web_compression == 'disabled' && 'false' || 'true' }}",
+            workflow,
+        )
+        self.assertIn(
+            'PLATFORM_WEB_NEXT_COMPRESSION="$PLATFORM_WEB_NEXT_COMPRESSION"',
+            workflow,
+        )
+        self.assertIn(
+            'WEB_NEXT_COMPRESSION="${PLATFORM_WEB_NEXT_COMPRESSION:-true}"',
+            build_script,
+        )
+        self.assertIn(
+            'PLATFORM_WEB_NEXT_COMPRESSION="$WEB_NEXT_COMPRESSION"',
+            build_script,
+        )
+
+    def test_auto_deploy_keeps_compression_enabled(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
+        ).read_text()
+        self.assertIn('"web_compression":"enabled"', workflow)
+
     def test_baseline_runtime_profile_restores_ready_vote_admission_limits(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
