@@ -131,7 +131,7 @@ class ReleaseHardeningContractTests(unittest.TestCase):
 
 
     def test_all_production_ssh_workflows_pin_host_identity(self) -> None:
-        workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-as12-proof.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-diagnostics.yml', 'platform-production-external-load.yml', 'platform-production-retained-load-cleanup.yml', 'platform-production-retained-load-abort.yml', 'platform-production-web-runtime-diagnostics.yml')
+        workflow_names = ('platform-live-launch.yml', 'platform-live-user-qa.yml', 'platform-media-migration-diagnostics.yml', 'platform-patch-translation-qa.yml', 'platform-production-as12-proof.yml', 'platform-production-content-diagnostics.yml', 'platform-production-deploy.yml', 'platform-production-diagnostics.yml', 'platform-production-external-load.yml', 'platform-production-retained-load-cleanup.yml', 'platform-production-retained-load-abort.yml', 'platform-production-storage-diagnostics.yml', 'platform-production-web-runtime-diagnostics.yml')
         expected_fingerprint = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
         for name in workflow_names:
             workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")
@@ -143,6 +143,20 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 workflow,
                 name,
             )
+
+    def test_storage_diagnostics_are_read_only(self) -> None:
+        workflow = (
+            WORKFLOW_DIR / "platform-production-storage-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("expected_sha", workflow)
+        self.assertIn("platform_storage_maintenance.py\" --json", workflow)
+        self.assertIn("df -hT -- \"$path\"", workflow)
+        self.assertIn("df -i -- \"$path\"", workflow)
+        self.assertIn("journalctl --disk-usage", workflow)
+        self.assertIn("du -x -h -d 1", workflow)
+        self.assertNotIn("--apply", workflow)
+        self.assertNotIn("systemctl restart", workflow)
+        self.assertNotIn("rm -rf", workflow)
 
     def test_as12_proof_is_read_only_and_sha_locked(self) -> None:
         proof = (WORKFLOW_DIR / "platform-production-as12-proof.yml").read_text(
