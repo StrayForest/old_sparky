@@ -38,6 +38,14 @@ on:
           - api-pool-16
           - api-pool-20
           - api-pool-24
+      web_compression:
+        description: "Build the Next.js artifact with response compression enabled or disabled"
+        required: true
+        default: enabled
+        type: choice
+        options:
+          - enabled
+          - disabled
 
 permissions:
   actions: read
@@ -65,6 +73,7 @@ jobs:
       TARGET_SHA: ${{ github.sha }}
       DEPLOY_MODE: ${{ inputs.mode }}
       RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
+      PLATFORM_WEB_NEXT_COMPRESSION: ${{ inputs.web_compression == 'disabled' && 'false' || 'true' }}
       RELEASE_SLUG: gha-${{ github.run_id }}-${{ github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -165,6 +174,7 @@ jobs:
           sudo install -d -o root -g root -m 0755 "$ci_build_root/platform/dist/releases"
           sudo -EH env \
             PLATFORM_RELEASE_OUTPUT_DIR="$ci_build_root/platform/dist/releases" \
+            PLATFORM_WEB_NEXT_COMPRESSION="$PLATFORM_WEB_NEXT_COMPRESSION" \
             "$ci_build_root/platform/tools/platform_build_release.sh" "$RELEASE_SLUG"
           release_archive="$(sudo find "$ci_build_root/platform/dist/releases" -maxdepth 1 -type f -name "${RELEASE_SLUG}-*.tar.gz" -print -quit)"
           test -n "$release_archive" || { echo "CI release artifact was not produced" >&2; exit 1; }
@@ -874,6 +884,7 @@ jobs:
             echo
             echo "- Commit: \`$TARGET_SHA\`"
             echo "- Mode: \`$DEPLOY_MODE\`"
+            echo "- Web compression: \`$PLATFORM_WEB_NEXT_COMPRESSION\`"
             echo "- Status: passed"
           } >> "$GITHUB_STEP_SUMMARY"
 
