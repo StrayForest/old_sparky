@@ -123,15 +123,14 @@ export async function getServerRequestCorrelationHeaders(): Promise<Headers> {
   if (!trace?.sampled) {
     return new Headers();
   }
-  let requestHeaders: Awaited<ReturnType<typeof headers>> | null = null;
-  try {
-    requestHeaders = await headers();
-  } catch {
-    // Build-time and non-request invocations have no request headers.
-  }
+
+  // Use the trace identity directly so direct API fetches and SSR records
+  // join on the same request ID, even if headers() is resolved separately.
   const correlationHeaders = new Headers();
-  for (const name of ["x-request-id", "cf-ray"]) {
-    const value = safeToken(requestHeaders?.get(name), "unknown");
+  for (const [name, value] of [
+    ["x-request-id", trace.requestId],
+    ["cf-ray", trace.cfRay]
+  ] as const) {
     if (value !== "unknown") {
       correlationHeaders.set(name, value);
     }
