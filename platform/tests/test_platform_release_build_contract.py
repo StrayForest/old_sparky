@@ -143,6 +143,26 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         )
         self.assertIn("deadlock-web did not recover after runtime profile", workflow)
 
+    def test_ssr_diagnostics_restarts_api_after_applying_api_log_gate(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text()
+        self.assertIn("restart_api_and_wait()", workflow)
+        self.assertIn("http://127.0.0.1:8010/api/v1/health/ready", workflow)
+        diagnostics_start = workflow.index("            web-ssr-diagnostics)")
+        diagnostics_end = workflow.index(
+            "            web-ssr-workers-2)", diagnostics_start
+        )
+        diagnostics_branch = workflow[diagnostics_start:diagnostics_end]
+        self.assertGreaterEqual(
+            diagnostics_branch.count("restart_api_and_wait"),
+            2,
+        )
+        self.assertIn(
+            "--only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED",
+            diagnostics_branch,
+        )
+
     def test_auto_deploy_preserves_static_eight_runtime_profile(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"

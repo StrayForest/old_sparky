@@ -27,9 +27,11 @@ separate API log gate. For the same sampled requests, Next.js sends
 `x-platform-ssr-trace: 1` with the request and Cloudflare correlation IDs to
 `GET /api/v1/auth/bootstrap`. The API then emits its existing bounded
 `request_perf` record even when the request is faster than the normal slow
-request threshold. The marker is not accepted as a standalone production
-switch: the API gate is disabled in the baseline and the route/method check is
-mandatory.
+request threshold. Applying the profile restarts both `deadlock-api` and
+`deadlock-web` with readiness checks because the API gate is read at process
+startup; restoring `ready-vote-static-8` returns both services to baseline.
+The marker is not accepted as a standalone production switch: the API gate is
+disabled in the baseline and the route/method check is mandatory.
 
 The production observer joins these records by `request_id`; for the direct
 internal API hop it falls back to the same request's `cf_ray` when the API
