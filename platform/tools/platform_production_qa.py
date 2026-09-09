@@ -357,6 +357,28 @@ def metric_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
+def scalar_stats(values: list[float]) -> dict[str, Any]:
+    """Summarize a dimensionless or non-millisecond diagnostic scalar."""
+
+    if not values:
+        return {
+            "count": 0,
+            "avg": None,
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+        }
+    return {
+        "count": len(values),
+        "avg": round(sum(values) / len(values), 6),
+        "p50": round(percentile(values, 50) or 0, 6),
+        "p95": round(percentile(values, 95) or 0, 6),
+        "p99": round(percentile(values, 99) or 0, 6),
+        "max": round(max(values), 6),
+    }
+
+
 def byte_stats(values: list[int]) -> dict[str, Any]:
     if not values:
         return {
@@ -2612,6 +2634,17 @@ def summarize_ssr_observability(
             "upstream_connect_ms": _nginx_seconds(record.get("upstream_connect_time")),
             "upstream_header_ms": _nginx_seconds(record.get("upstream_header_time")),
             "upstream_ms": _nginx_seconds(record.get("upstream_time")),
+            "transport": {
+                key: str(record.get(key) or "").strip() or "none"
+                for key in (
+                    "upstream_content_encoding",
+                    "content_encoding",
+                    "upstream_transfer_encoding",
+                    "transfer_encoding",
+                    "upstream_x_accel_buffering",
+                    "x_accel_buffering",
+                )
+            },
         }
         for stage, durations in stages.items():
             row[stage] = sum(durations)
@@ -2767,8 +2800,23 @@ def summarize_ssr_observability(
             "p95_ms": metric_stats(
                 [float(row["p95_ms"]) for row in event_loop_rows]
             ),
+            "p99_ms": metric_stats(
+                [float(row["p99_ms"]) for row in event_loop_rows if isinstance(row.get("p99_ms"), (int, float))]
+            ),
             "max_ms": metric_stats(
                 [float(row["max_ms"]) for row in event_loop_rows if isinstance(row.get("max_ms"), (int, float))]
+            ),
+            "elu": scalar_stats(
+                [float(row["elu"]) for row in event_loop_rows if isinstance(row.get("elu"), (int, float))]
+            ),
+            "cpu_pct": scalar_stats(
+                [float(row["cpu_pct"]) for row in event_loop_rows if isinstance(row.get("cpu_pct"), (int, float))]
+            ),
+            "gc_duration_ms": metric_stats(
+                [float(row["gc_duration_ms"]) for row in event_loop_rows if isinstance(row.get("gc_duration_ms"), (int, float))]
+            ),
+            "gc_count": scalar_stats(
+                [float(row["gc_count"]) for row in event_loop_rows if isinstance(row.get("gc_count"), (int, float))]
             ),
         },
         "ssr_stages": {
@@ -2802,6 +2850,20 @@ def summarize_ssr_observability(
             "upstream_time_ms": metric_stats(
                 [value for record in html_records if (value := _nginx_seconds(record.get("upstream_time"))) is not None]
             ),
+            "transport": {
+                key: dict(sorted(Counter(
+                    str(record.get(key) or "").strip() or "none"
+                    for record in html_records
+                ).items()))
+                for key in (
+                    "upstream_content_encoding",
+                    "content_encoding",
+                    "upstream_transfer_encoding",
+                    "transfer_encoding",
+                    "upstream_x_accel_buffering",
+                    "x_accel_buffering",
+                )
+            },
         },
         "nginx_api": {
             "requests": len(api_records),
@@ -2831,6 +2893,7 @@ def summarize_ssr_observability(
                     "request_ms": row.get("request_ms"),
                     "upstream_header_ms": row.get("upstream_header_ms"),
                     "upstream_ms": row.get("upstream_ms"),
+                    "transport": row.get("transport", {}),
                     "stream_clock_aligned": row.get("stream_clock_aligned", False),
                     "timeline": row.get("timeline", []),
                     "api_request_perf": row.get("api_request_perf", []),

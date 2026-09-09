@@ -67,6 +67,23 @@ class PlatformInstallNginxTests(unittest.TestCase):
         self.assertNotIn("proxy_set_header Upgrade $http_upgrade;", vhost)
         self.assertNotIn("proxy_set_header Connection $platform_connection_upgrade;", vhost)
 
+    def test_html_proxy_disables_response_buffering_and_exposes_transport_boundary(self) -> None:
+        vhost = MODULE.DEFAULT_SOURCE.read_text(encoding="utf-8")
+        html_location = vhost[vhost.index("    location / {"):]
+
+        self.assertIn("proxy_buffering off;", html_location)
+        self.assertIn('add_header X-Accel-Buffering "no" always;', html_location)
+        for field in (
+            '"upstream_content_encoding":"$upstream_http_content_encoding"',
+            '"content_encoding":"$sent_http_content_encoding"',
+            '"upstream_transfer_encoding":"$upstream_http_transfer_encoding"',
+            '"x_accel_buffering":"$sent_http_x_accel_buffering"',
+        ):
+            self.assertIn(field, vhost)
+
+        api_location = vhost[vhost.index("    location /api/ "):vhost.index("    location /_next/static/")]
+        self.assertNotIn("proxy_buffering off;", api_location)
+
     def test_access_log_keeps_upstream_connect_and_header_timing(self) -> None:
         vhost = MODULE.DEFAULT_SOURCE.read_text(encoding="utf-8")
 

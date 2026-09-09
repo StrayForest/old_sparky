@@ -30,10 +30,19 @@ class SsrObservabilityTests(unittest.TestCase):
         )
         self.assertEqual(
             parse_ssr_event_loop_line(
-                "ssr_event_loop p50_ms=1.000 p95_ms=4.000 max_ms=8.000 mean_ms=2.000"
+                "ssr_event_loop p50_ms=1.000 p95_ms=4.000 p99_ms=6.000 max_ms=8.000 "
+                "mean_ms=2.000 elu=0.910000 cpu_pct=87.500 gc_count=2 gc_duration_ms=3.250"
             )["p95_ms"],
             4.0,
         )
+        event_loop = parse_ssr_event_loop_line(
+            "ssr_event_loop p50_ms=1.000 p95_ms=4.000 p99_ms=6.000 max_ms=8.000 "
+            "mean_ms=2.000 elu=0.910000 cpu_pct=87.500 gc_count=2 gc_duration_ms=3.250"
+        )
+        self.assertEqual(event_loop["p99_ms"], 6.0)
+        self.assertEqual(event_loop["elu"], 0.91)
+        self.assertEqual(event_loop["cpu_pct"], 87.5)
+        self.assertEqual(event_loop["gc_count"], 2.0)
         stream = parse_ssr_stream_line(
             "ssr_stream request_id=req-1 cf_ray=ray-1 stage=first_body_write_attempt "
             "elapsed_ms=123 status=200 writable_finished=0 write_count=1 "
@@ -57,6 +66,8 @@ class SsrObservabilityTests(unittest.TestCase):
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=tournament_workspace duration_ms=80.000 outcome=ok",
             "ssr_perf request_id=req-1 cf_ray=ray-1 stage=tournament_detail_data_ready duration_ms=90.000 outcome=ok",
             "ssr_event_loop p50_ms=1.000 p95_ms=4.000 max_ms=8.000 mean_ms=2.000",
+            "ssr_event_loop p50_ms=1.000 p95_ms=4.000 p99_ms=6.000 max_ms=8.000 "
+            "mean_ms=2.000 elu=0.910000 cpu_pct=87.500 gc_count=2 gc_duration_ms=3.250",
         ]
         records = [
             {
@@ -76,6 +87,10 @@ class SsrObservabilityTests(unittest.TestCase):
         serialized = json.dumps(summary)
         correlated = summary["correlated_html"]
         self.assertEqual(correlated["requests"], 1)
+        self.assertEqual(summary["event_loop"]["p99_ms"]["p95_ms"], 6.0)
+        self.assertEqual(summary["event_loop"]["elu"]["p95"], 0.91)
+        self.assertEqual(summary["event_loop"]["cpu_pct"]["p95"], 87.5)
+        self.assertEqual(summary["event_loop"]["gc_count"]["p95"], 2.0)
         self.assertEqual(correlated["upstream_time_ms"]["p50_ms"], 110.0)
         self.assertEqual(correlated["upstream_connect_time_ms"]["p50_ms"], 2.0)
         self.assertEqual(correlated["upstream_header_time_ms"]["p50_ms"], 50.0)

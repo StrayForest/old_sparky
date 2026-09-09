@@ -161,6 +161,7 @@ def ruleset_summary(result: ApiResult) -> dict[str, Any]:
                     "edge_ttl",
                     "serve_stale",
                     "matched_data",
+                    "response_body_buffering",
                 )
                 if key in parameters
             }
@@ -421,10 +422,24 @@ def run_audit(token: str, account_id: str) -> dict[str, Any]:
         "managed-waf-entrypoint": "http_request_firewall_managed",
         "edge-rate-limits": "http_ratelimit",
     }
+    response_body_buffering_rules: list[dict[str, Any]] = []
     for check_id, phase in phases.items():
         result = api_get(token, f"/zones/{zone_id}/rulesets/phases/{phase}/entrypoint")
         status = "PASS" if result.ok else ("REVIEW" if result.status in {400, 404} else "UNAVAILABLE")
         summary = ruleset_summary(result)
+        for rule in summary.get("rules", []) if isinstance(summary.get("rules"), list) else []:
+            parameters = rule.get("action_parameters") if isinstance(rule, dict) else None
+            if isinstance(parameters, dict) and "response_body_buffering" in parameters:
+                response_body_buffering_rules.append(
+                    {
+                        "phase": phase,
+                        "id": rule.get("id"),
+                        "ref": rule.get("ref"),
+                        "expression": rule.get("expression"),
+                        "enabled": rule.get("enabled"),
+                        "response_body_buffering": parameters["response_body_buffering"],
+                    }
+                )
         if check_id in {"cache-rules", "edge-rate-limits"} and result.ok:
             status = "REVIEW"
         record(
@@ -434,6 +449,34 @@ def run_audit(token: str, account_id: str) -> dict[str, Any]:
             f"Read the {phase} entrypoint ruleset; intent and runtime compatibility still need correlation.",
             summary,
         )
+
+    response_buffering = api_get(token, f"/zones/{zone_id}/settings/response_buffering")
+    response_buffering_value = response_result(response_buffering)
+    response_buffering_value = (
+        response_buffering_value.get("value")
+        if isinstance(response_buffering_value, dict)
+        else None
+    )
+    record(
+        report,
+        "response-buffering-zone-setting",
+        "PASS"
+        if response_buffering.ok and response_buffering_value == "off"
+        else ("REVIEW" if response_buffering.ok else "UNAVAILABLE"),
+        "Read the legacy zone response_buffering setting; no Cloudflare setting was changed.",
+        {
+            **api_evidence(response_buffering),
+            "value": response_buffering_value,
+            "note": "Configuration Rules may still override buffering per request; inspect the ruleset evidence below.",
+        },
+    )
+    record(
+        report,
+        "response-body-buffering-rules",
+        "REVIEW" if response_body_buffering_rules else "PASS",
+        "Collected Configuration Rules that explicitly set response_body_buffering; inspect enabled state in the evidence.",
+        {"rules": response_body_buffering_rules},
+    )
 
     bot_management = api_get(token, f"/zones/{zone_id}/bot_management")
     bot_result = response_result(bot_management)
