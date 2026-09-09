@@ -86,11 +86,13 @@ jobs:
         run: |
           set -euo pipefail
           remote_report="$RUNNER_TEMP/platform-production-web-runtime-diagnostics.txt"
+          # StrictHostKeyChecking yes is enforced with the explicit value
+          # form below so OpenSSH receives the option as one argument.
           if ! ssh \
             -F /dev/null \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking yes \
+            -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
             -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=3 \
