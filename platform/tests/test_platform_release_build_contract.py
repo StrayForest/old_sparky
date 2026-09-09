@@ -126,11 +126,24 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         )
         baseline_branch = workflow[baseline_start:static_start]
         for key in (
+            "PLATFORM_LOG_LEVEL",
+            "PLATFORM_PERF_LOG_ENABLED",
+            "PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED",
             "PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY",
             "PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY",
             "PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY",
         ):
             self.assertIn(f"--only {key}", baseline_branch)
+        adaptive_start = workflow.index(
+            "            ready-vote-adaptive-v2)", static_start
+        )
+        static_branch = workflow[static_start:adaptive_start]
+        for key in (
+            "PLATFORM_LOG_LEVEL",
+            "PLATFORM_PERF_LOG_ENABLED",
+            "PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED",
+        ):
+            self.assertIn(f"--only {key}", static_branch)
 
     def test_ssr_runtime_profiles_restart_the_web_process(self) -> None:
         workflow = (
@@ -160,6 +173,20 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         )
         self.assertIn(
             "--only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED",
+            diagnostics_branch,
+        )
+        self.assertIn("--only PLATFORM_LOG_LEVEL", diagnostics_branch)
+        self.assertIn("--only PLATFORM_PERF_LOG_ENABLED", diagnostics_branch)
+        self.assertIn(
+            "grep -qx 'PLATFORM_LOG_LEVEL=INFO' \"$api_env\"",
+            diagnostics_branch,
+        )
+        self.assertIn(
+            "grep -qx 'PLATFORM_PERF_LOG_ENABLED=true' \"$api_env\"",
+            diagnostics_branch,
+        )
+        self.assertIn(
+            "grep -qx 'PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=true' \"$api_env\"",
             diagnostics_branch,
         )
 
