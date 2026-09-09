@@ -20,6 +20,9 @@ const serverApiBaseUrl = (
   ?? `${process.env.PLATFORM_API_INTERNAL_ORIGIN ?? "http://127.0.0.1:8010"}/api/v1`
 ).replace(/\/$/u, "");
 const serverAuthTimeoutMs = 2_000;
+const serverAuthTransport = process.env.PLATFORM_WEB_SERVER_AUTH_TRANSPORT?.trim().toLowerCase() === "node"
+  ? "node"
+  : "fetch";
 const serverAuthResponseMaxBytes = 256 * 1024;
 const serverAuthHttpAgent = new http.Agent({
   keepAlive: true,
@@ -83,7 +86,7 @@ export const getServerCurrentUser = cache(async (
         requestHeaders.set("accept", "application/json");
         requestHeaders.set("cookie", cookieHeader);
       }
-      const response = await requestServerJson(`${baseUrl}/users/me`, requestHeaders);
+      const response = await requestServerAuthJson(`${baseUrl}/users/me`, requestHeaders);
       if (response.status === 401 || response.status === 403) {
         return { status: "anonymous", user: null };
       }
@@ -122,7 +125,7 @@ export const getServerAuthBootstrap = cache(async (
         requestHeaders.set("accept", "application/json");
         requestHeaders.set("cookie", cookieHeader);
       }
-      const response = await requestServerJson(`${baseUrl}/auth/bootstrap`, requestHeaders);
+      const response = await requestServerAuthJson(`${baseUrl}/auth/bootstrap`, requestHeaders);
       if (response.status === 401 || response.status === 403) {
         return { status: "anonymous", user: null };
       }
@@ -139,6 +142,20 @@ export const getServerAuthBootstrap = cache(async (
     }
   });
 });
+
+function requestServerAuthJson(
+  input: string,
+  headers: HeadersInit,
+): Promise<Response | ServerJsonResponse> {
+  if (serverAuthTransport === "node") {
+    return requestServerJson(input, headers);
+  }
+  return fetch(input, {
+    headers,
+    cache: "no-store",
+    signal: AbortSignal.timeout(serverAuthTimeoutMs),
+  });
+}
 
 function requestServerJson(
   input: string,
