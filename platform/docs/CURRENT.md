@@ -81,6 +81,16 @@ The GitHub `Protect dev` ruleset no longer requires PR approval for merge.
 Branch deletion and force-push remain protected, and exact-SHA CI/build plus
 the automatic production deployment chain remain mandatory.
 
+The reviewed transport-observability package is deployed at source SHA
+`1d25ae335f3eb749ce36b4fe97f868d5f357803c` through production deploy
+[`34325036735`](https://github.com/StrayForest/old_sparky/actions/runs/34325036735).
+It scopes Nginx response-buffering changes to the dynamic HTML location,
+records upstream/client transport headers, adds opt-in Node event-loop/CPU/GC
+diagnostics, and provides the bounded same-request hop probe. This is an
+instrumentation and transport-policy deployment, not an accepted TTFB result:
+the unchanged authenticated external control and exact Cloudflare/Nginx/Next
+hop evidence still have to be collected before claiming improvement.
+
 Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target. The prior blocked attribution is retained in the
 [`authenticated HTML/TTFB archive`](archive/performance-authenticated-html-ttfb-2026-09-07.md),
@@ -89,8 +99,12 @@ and the root component-tree diagnostic is archived in
 Its exact run measured 194 correlated requests and identified the largest
 measured pre-body interval as root response serialization/flush scheduling,
 without a server data-ready marker. The active next step is the narrow,
-separately reviewed
-[`root render/flush boundary candidate`](../performance/active-authenticated-html-ttfb-root-render-flush-2026-09-09.md).
+separately reviewed transport investigation in
+[`performance-transport-runbook.md`](performance-transport-runbook.md): first
+capture the same authenticated request at Next.js, local Nginx and public
+Cloudflare, then compare compression and event-loop evidence. The root
+render/flush boundary remains a frozen candidate until those hops prove that
+the missing latency is inside the application process.
 The browser-workspace candidate is archived in
 [`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](archive/performance-authenticated-html-ttfb-workspace-client-2026-09-08.md),
 and the avatar candidate is archived in
