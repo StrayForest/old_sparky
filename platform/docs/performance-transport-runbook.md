@@ -72,3 +72,23 @@ Configuration Rules. Do not change either setting from this repository. A
 `none` response-body rule is acceptable only after confirming that the scoped
 authenticated HTML path does not require response-body inspection by WAF or
 Bot Management.
+
+## Web restart evidence
+
+If an external-load observer records a missing/new `deadlock-web` process, do
+not accept the latency result as a clean control or candidate. Dispatch the
+read-only `Platform production web runtime diagnostics` workflow from `dev`
+with the exact deployed SHA and the observer's UTC window:
+
+```bash
+gh workflow run platform-production-web-runtime-diagnostics.yml \
+  --ref dev \
+  -f expected_sha=<deployed-sha> \
+  -f since_utc=2026-09-09T09:33:00Z \
+  -f until_utc=2026-09-09T09:54:00Z
+```
+
+Inspect systemd exit/result, restart count, memory peak and the sanitized
+service/kernel journal. Do not raise `MemoryMax`, scale workers or alter the
+database pool until the restart cause is identified and a focused rollback
+plan exists. A web restart can create both 502s and secondary TTFB queueing.

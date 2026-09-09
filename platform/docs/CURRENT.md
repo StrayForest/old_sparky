@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-08
+- Last reviewed: 2026-09-09
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -82,14 +82,26 @@ Branch deletion and force-push remain protected, and exact-SHA CI/build plus
 the automatic production deployment chain remain mandatory.
 
 The reviewed transport-observability package is deployed at source SHA
-`1d25ae335f3eb749ce36b4fe97f868d5f357803c` through production deploy
-[`34325036735`](https://github.com/StrayForest/old_sparky/actions/runs/34325036735).
+`2a37698f4eab937ba6e06558ecd34fa40f334e5b` through production deploy
+[`34340974394`](https://github.com/StrayForest/old_sparky/actions/runs/34340974394).
 It scopes Nginx response-buffering changes to the dynamic HTML location,
 records upstream/client transport headers, adds opt-in Node event-loop/CPU/GC
-diagnostics, and provides the bounded same-request hop probe. This is an
-instrumentation and transport-policy deployment, not an accepted TTFB result:
-the unchanged authenticated external control and exact Cloudflare/Nginx/Next
-hop evidence still have to be collected before claiming improvement.
+diagnostics, provides the bounded same-request hop probe, and exposes a
+read-only exact-window web-runtime journal collector. This is an
+instrumentation and transport-policy deployment, not an accepted TTFB result.
+
+The clean control
+[`34334229164`](https://github.com/StrayForest/old_sparky/actions/runs/34334229164)
+recorded two `deadlock-web` process replacements during the 20,000-request
+window and ended with `3,539` HTTP 502 responses; exact cleanup passed. The
+same-source compression-off A/B
+[`34339014480`](https://github.com/StrayForest/old_sparky/actions/runs/34339014480)
+worsened TTFB p95 to `2,829.887 ms` and added client timeouts, so compression
+remains enabled after restore
+[`34340974394`](https://github.com/StrayForest/old_sparky/actions/runs/34340974394).
+The remaining owner-level priority is to collect the exact systemd/journal and
+kernel evidence for the web restarts before changing runtime limits or SSR.
+Full evidence is in the [transport investigation archive](archive/performance-authenticated-html-ttfb-transport-2026-09-09.md).
 
 Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target. The prior blocked attribution is retained in the
@@ -100,11 +112,12 @@ Its exact run measured 194 correlated requests and identified the largest
 measured pre-body interval as root response serialization/flush scheduling,
 without a server data-ready marker. The active next step is the narrow,
 separately reviewed transport investigation in
-[`performance-transport-runbook.md`](performance-transport-runbook.md): first
-capture the same authenticated request at Next.js, local Nginx and public
-Cloudflare, then compare compression and event-loop evidence. The root
-render/flush boundary remains a frozen candidate until those hops prove that
-the missing latency is inside the application process.
+[`performance-transport-runbook.md`](performance-transport-runbook.md). Cloudflare
+body buffering and the same-source Next.js compression candidate have now been
+checked; the latter was rejected. The next action is exact systemd/journal and
+kernel evidence for the two `deadlock-web` process replacements. The root
+render/flush boundary remains a frozen candidate until the restart cause and
+the remaining origin queueing are understood.
 The browser-workspace candidate is archived in
 [`performance-authenticated-html-ttfb-workspace-client-2026-09-08.md`](archive/performance-authenticated-html-ttfb-workspace-client-2026-09-08.md),
 and the avatar candidate is archived in

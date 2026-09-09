@@ -1,0 +1,181 @@
+name: Platform production web runtime diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Exact source SHA currently deployed on the production VPS"
+        required: true
+        type: string
+      since_utc:
+        description: "UTC window start, for example 2026-09-09T09:33:00Z"
+        required: true
+        type: string
+      until_utc:
+        description: "UTC window end, for example 2026-09-09T09:54:00Z"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    name: Collect read-only web restart evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      SINCE_UTC: ${{ inputs.since_utc }}
+      UNTIL_UTC: ${{ inputs.until_utc }}
+      WORKFLOW_SHA: ${{ github.sha }}
+    steps:
+      - name: Validate exact-SHA diagnostic inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Production runtime diagnostics must run from dev." >&2; exit 1; }
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "expected_sha must be a 40-character commit SHA." >&2; exit 1; }
+          test "$EXPECTED_SHA" = "$WORKFLOW_SHA" \
+            || { echo "diagnostic workflow source and expected production SHA differ." >&2; exit 1; }
+          [[ "$SINCE_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+            || { echo "since_utc must be an RFC3339 UTC second timestamp." >&2; exit 1; }
+          [[ "$UNTIL_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+            || { echo "until_utc must be an RFC3339 UTC second timestamp." >&2; exit 1; }
+          since_epoch="$(date -u -d "$SINCE_UTC" +%s)"
+          until_epoch="$(date -u -d "$UNTIL_UTC" +%s)"
+          (( since_epoch < until_epoch )) \
+            || { echo "diagnostic window must have positive duration." >&2; exit 1; }
+          (( until_epoch - since_epoch <= 7200 )) \
+            || { echo "diagnostic window must not exceed two hours." >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
+
+      - name: Configure pinned production SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-web-runtime-diagnostics-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 host key." >&2; exit 1; }
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
+            || { echo "Expected exactly one production ED25519 host key." >&2; exit 1; }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" \
+            || { echo "Production SSH host fingerprint mismatch." >&2; exit 1; }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Collect exact-window read-only evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_report="$RUNNER_TEMP/platform-production-web-runtime-diagnostics.txt"
+          if ! ssh \
+            -F /dev/null \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking yes \
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts" \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$EXPECTED_SHA" "$SINCE_UTC" "$UNTIL_UTC" > "$remote_report" <<'REMOTE'
+          set -Eeuo pipefail
+
+          expected_sha="$1"
+          since_utc="$2"
+          until_utc="$3"
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          guard="$current/tools/platform_release_lock_exec.sh"
+
+          test "$(id -u)" -eq 0 || { echo "Production diagnostics must run as root." >&2; exit 1; }
+          test -x "$guard" || { echo "Production mutation guard is missing." >&2; exit 1; }
+
+          /bin/bash "$guard" \
+            --app-dir "$runtime" \
+            --expected-sha "$expected_sha" \
+            -- /bin/bash -s -- "$since_utc" "$until_utc" <<'LOCKED'
+          set -Eeuo pipefail
+
+          since_utc="$1"
+          until_utc="$2"
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+
+          printf 'active_release=%s\n' "$(readlink -f "$current")"
+          printf 'window_since=%s\n' "$since_utc"
+          printf 'window_until=%s\n' "$until_utc"
+          echo '=== systemd_properties ==='
+          systemctl show deadlock-web \
+            --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,ExecMainStartTimestamp,ExecMainExitTimestamp,NRestarts,Restart,RestartUSec,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec,OOMPolicy,WatchdogUSec \
+            --no-pager
+
+          echo '=== web_journal_sanitized ==='
+          journalctl -u deadlock-web \
+            --since "$since_utc" \
+            --until "$until_utc" \
+            --utc \
+            --no-pager \
+            --output short-iso-precise \
+            -n 600 \
+            | sed -E \
+                -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[EMAIL]/g' \
+                -e 's/(cookie|authorization|token|secret|password|session)[=:][^[:space:]]+/\1=[REDACTED]/Ig' \
+                -e 's/(set-cookie:|cookie:|authorization:)[^[:space:]]+/\1 [REDACTED]/Ig' \
+                -e 's/[A-Za-z0-9+\/_=-]{48,}/[LONG_VALUE_REDACTED]/g' \
+            | tail -n 600
+
+          echo '=== kernel_oom_events ==='
+          journalctl -k \
+            --since "$since_utc" \
+            --until "$until_utc" \
+            --utc \
+            --no-pager \
+            --output short-iso-precise \
+            | grep -Ei 'out of memory|oom-kill|oom_reaper|killed process|memory cgroup|invoked oom-killer' \
+            | tail -n 200 \
+            || true
+
+          echo '=== web_cgroup_status ==='
+          (systemctl status deadlock-web --no-pager --full 2>&1 || true) \
+            | sed -E \
+                -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[EMAIL]/g' \
+                -e 's/(cookie|authorization|token|secret|password|session)[=:][^[:space:]]+/\1=[REDACTED]/Ig' \
+                -e 's/[A-Za-z0-9+\/_=-]{48,}/[LONG_VALUE_REDACTED]/g' \
+            | tail -n 120
+          LOCKED
+          REMOTE
+          then
+            echo "Remote diagnostic collection failed." >&2
+            cat "$remote_report" >&2 || true
+            exit 1
+          fi
+          cat "$remote_report"
+          cp "$remote_report" "$RUNNER_TEMP/platform-production-web-runtime-diagnostics-artifact.txt"
+
+      - name: Upload sanitized diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-production-web-runtime-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/platform-production-web-runtime-diagnostics-artifact.txt
+          if-no-files-found: ignore
