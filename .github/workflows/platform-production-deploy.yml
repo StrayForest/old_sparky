@@ -511,6 +511,19 @@ jobs:
             --edge-host old-sparky.com \
             --expected-csp-mode enforce; then
             echo '=== candidate_activation_failure ===' >&2
+            echo '=== candidate_filesystem ===' >&2
+            for path in / /tmp /var/tmp /usr/tmp; do
+              echo "--- ${path}.filesystem ---" >&2
+              df -hT -- "$path" >&2 || true
+              df -i -- "$path" >&2 || true
+              stat -c 'path=%n mode=%a owner=%u:%g type=%F' -- "$path" >&2 || true
+              findmnt --target "$path" --noheadings \
+                --output TARGET,SOURCE,FSTYPE,OPTIONS >&2 || true
+            done
+            echo '=== candidate_api_sandbox ===' >&2
+            systemctl show deadlock-api \
+              --property=User,Group,PrivateTmp,ProtectSystem,ProtectHome,ReadWritePaths,RuntimeDirectory,RuntimeDirectoryMode,TemporaryFileSystem,InaccessiblePaths \
+              --no-pager >&2 || true
             for service in deadlock-api deadlock-worker deadlock-web; do
               echo "--- ${service}.properties ---" >&2
               systemctl show "$service" \
