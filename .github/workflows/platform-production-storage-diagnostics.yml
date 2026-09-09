@@ -1,0 +1,173 @@
+name: Platform production storage diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Exact source SHA currently deployed on the production VPS"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    name: Collect read-only storage evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+    steps:
+      - name: Validate diagnostic inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Production storage diagnostics must run from dev." >&2; exit 1; }
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "expected_sha must be a 40-character commit SHA." >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
+
+      - name: Configure pinned production SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 host key." >&2; exit 1; }
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
+            || { echo "Expected exactly one production ED25519 host key." >&2; exit 1; }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" \
+            || { echo "Production SSH host fingerprint mismatch." >&2; exit 1; }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Collect read-only storage evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_report="$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$EXPECTED_SHA" > "$remote_report" <<'REMOTE'
+          set -Eeuo pipefail
+
+          expected_sha="$1"
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          python_bin="$runtime/shared/venv/bin/python"
+
+          test "$(id -u)" -eq 0 || { echo "Production diagnostics must run as root." >&2; exit 1; }
+          test -L "$current" || { echo "Current release symlink is missing." >&2; exit 1; }
+          test -x "$python_bin" || { echo "Shared Python runtime is missing." >&2; exit 1; }
+
+          active_sha="$(/usr/bin/python3 -I - "$current/RELEASE.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print(payload.get("source_git_commit") or "")
+          PY
+          )"
+          test "$active_sha" = "$expected_sha" \
+            || { echo "active release SHA differs from expected_sha." >&2; exit 1; }
+
+          printf 'active_release=%s\n' "$(readlink -f "$current")"
+          printf 'active_source_sha=%s\n' "$active_sha"
+
+          echo '=== filesystem_usage ==='
+          for path in / /tmp /var/tmp /opt/oldsparky/platform /var/log; do
+            echo "--- ${path} ---"
+            df -hT -- "$path" || true
+            df -i -- "$path" || true
+            stat -c 'path=%n mode=%a owner=%u:%g type=%F' -- "$path" || true
+            findmnt --target "$path" --noheadings \
+              --output TARGET,SOURCE,FSTYPE,OPTIONS || true
+          done
+
+          echo '=== journal_usage ==='
+          journalctl --disk-usage || true
+
+          echo '=== service_sandbox ==='
+          for service in deadlock-api deadlock-worker deadlock-web; do
+            echo "--- ${service} ---"
+            systemctl show "$service" \
+              --property=User,Group,PrivateTmp,ProtectSystem,ProtectHome,ReadWritePaths,RuntimeDirectory,RuntimeDirectoryMode,MemoryCurrent,MemoryMax,TasksCurrent,TasksMax \
+              --no-pager || true
+          done
+
+          echo '=== top_level_usage ==='
+          timeout 90s du -x -h -d 1 -- \
+            /opt/oldsparky/platform /var/log /tmp /var/tmp /home /root 2>/dev/null \
+            | sort -h | tail -n 80 || true
+
+          echo '=== storage_retention_dry_run ==='
+          retention_report="$(
+            "$python_bin" "$current/tools/platform_storage_maintenance.py" --json \
+              2>/dev/null || true
+          )"
+          /usr/bin/python3 - "$retention_report" <<'PY'
+          import json
+          import sys
+
+          raw = sys.argv[1]
+          try:
+              report = json.loads(raw)
+          except json.JSONDecodeError:
+              print("retention_report=invalid")
+              raise SystemExit(0)
+
+          print("retention_ok=" + str(bool(report.get("ok"))).lower())
+          for key in ("production_releases", "source_release_artifacts", "live_qa_runtime_caches"):
+              section = report.get(key) or {}
+              print(
+                  f"{key}_deleted={len(section.get('deleted') or [])}"
+                  f" reclaimable_bytes={section.get('reclaimable_bytes', 0)}"
+              )
+          transient = report.get("transient") or {}
+          print("transient_reclaimable_bytes=" + str(transient.get("reclaimable_bytes") or {}))
+          disk_after = report.get("disk_after") or {}
+          print("retention_disk_free_bytes=" + str(disk_after.get("free_bytes", "")))
+          print("retention_disk_used_percent=" + str(disk_after.get("used_percent", "")))
+          PY
+          REMOTE
+          cat "$remote_report"
+          cp "$remote_report" "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+
+      - name: Upload storage diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-production-storage-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/platform-production-storage-diagnostics-artifact.txt
+          if-no-files-found: ignore

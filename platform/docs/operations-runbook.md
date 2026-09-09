@@ -109,6 +109,10 @@ systemctl status deadlock-maintenance.timer --no-pager
 journalctl -u deadlock-maintenance.service --since -2days --no-pager
 ```
 
+When a release activation reports a full filesystem or unusable temporary directory, collect bounded read-only evidence before cleanup:
+`gh workflow run platform-production-storage-diagnostics.yml --repo StrayForest/old_sparky --ref dev -f expected_sha=<exact-source-sha-currently-deployed>`
+It reports blocks/inodes, mounts, journald, service sandbox, top-level usage and retention candidates; it does not delete files or apply runtime settings.
+
 Preview storage cleanup without backup or deletion:
 
 ```bash
