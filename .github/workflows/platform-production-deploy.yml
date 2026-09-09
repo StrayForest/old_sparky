@@ -387,6 +387,19 @@ jobs:
             fail "deadlock-web did not recover after runtime profile"
           }
 
+          restart_api_and_wait() {
+            systemctl restart deadlock-api || return 1
+            for _ in $(seq 1 30); do
+              if systemctl is-active --quiet deadlock-api \
+                && curl --fail --silent --show-error --max-time 2 \
+                  http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+
           # Keep immutable release activation out of an active retained-load
           # window.  The load supervisor and its cleanup use this same lock,
           # so the exact current release remains stable for both measurement
@@ -686,6 +699,16 @@ jobs:
                 --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
                 --profile "$runtime_profile" \
                 "${web_ssr_profile_args[@]}"
+              if ! restart_api_and_wait; then
+                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+                  --apply \
+                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                  --profile baseline \
+                  "${web_ssr_profile_args[@]}"
+                restart_api_and_wait \
+                  || fail "web SSR diagnostic API health check failed; baseline restore failed"
+                fail "web SSR diagnostic API health check failed; baseline restored"
+              fi
               systemctl restart deadlock-web
               web_ready=false
               for _ in $(seq 1 30); do
@@ -703,6 +726,8 @@ jobs:
                   --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
                   --profile baseline \
                   "${web_ssr_profile_args[@]}"
+                restart_api_and_wait \
+                  || fail "web SSR diagnostic profile health check failed; API baseline restore failed"
                 systemctl restart deadlock-web
                 web_ready=false
                 for _ in $(seq 1 30); do
