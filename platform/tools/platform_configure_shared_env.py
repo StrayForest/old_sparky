@@ -142,6 +142,7 @@ PUBLIC_BASELINE = {
     "PLATFORM_PERF_SLOW_REQUEST_MS": "1000",
     "PLATFORM_PERF_SLOW_DB_MS": "500",
     "PLATFORM_PERF_SQL_COUNT_THRESHOLD": "25",
+    "PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED": "false",
     "PLATFORM_PERF_LOG_MUTATIONS": "false",
     "PLATFORM_READY_VOTE_CPU_PROFILE_DIR": "",
     # Disabled by default. The web SSR diagnostic profile enables bounded
@@ -216,6 +217,7 @@ RUNTIME_PROFILES = {
         "PLATFORM_SSR_PERF_LOG_ENABLED": "true",
         "PLATFORM_SSR_PERF_SAMPLE_RATE": "0.01",
         "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
+        "PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED": "true",
     },
     # Two bounded Next.js processes share the existing loopback listener via
     # Node cluster. This is a web CPU-queue candidate only: API workers,

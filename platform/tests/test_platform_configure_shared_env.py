@@ -94,6 +94,10 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_GUNICORN_ACCESS_LOG"], "false")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_WORKER_LOG_LEVEL"], "WARNING")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_PERF_LOG_MUTATIONS"], "false")
+        self.assertEqual(
+            configure.PUBLIC_BASELINE["PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED"],
+            "false",
+        )
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_DB_POOL_PRE_PING"], "true")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_SSR_PERF_LOG_ENABLED"], "false")
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_SSR_PERF_SAMPLE_RATE"], "0.01")
@@ -193,6 +197,7 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
                 "PLATFORM_SSR_PERF_LOG_ENABLED": "true",
                 "PLATFORM_SSR_PERF_SAMPLE_RATE": "0.01",
                 "PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS": "5",
+                "PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED": "true",
             },
         )
         self.assertEqual(

@@ -20,6 +20,34 @@ proxy location and emits `X-Accel-Buffering: no`. API and static locations keep
 their existing buffering/cache contracts. The JSON access log records upstream
 and client encoding, transfer and buffering headers.
 
+## Correlated SSR and auth/API diagnostic
+
+The `web-ssr-diagnostics` profile enables the existing sampled SSR trace and a
+separate API log gate. For the same sampled requests, Next.js sends
+`x-platform-ssr-trace: 1` with the request and Cloudflare correlation IDs to
+`GET /api/v1/auth/bootstrap`. The API then emits its existing bounded
+`request_perf` record even when the request is faster than the normal slow
+request threshold. The marker is not accepted as a standalone production
+switch: the API gate is disabled in the baseline and the route/method check is
+mandatory.
+
+The production observer joins these records by `request_id`. Read
+`correlated_html.timeline[].api_request_perf[]` together with the SSR stages:
+
+- `total_ms`/`request_ms`, `sql_ms`, pool wait and the
+  `auth_bootstrap_*_ms` fields measure auth/API work inside FastAPI.
+- `auth_bootstrap_fetch`, `root_layout` and `first_body_write_attempt` measure
+  the surrounding Node SSR path. Compare their gaps with event-loop p95/p99,
+  ELU, process CPU and GC duration to identify scheduling/queueing.
+
+Run this only as one explicitly reviewed `web-ssr-diagnostics` window using the
+canonical external authenticated-page profile. It does not change workers,
+transport, compression, database pools or capacity limits. If the observer
+records a web restart or any unexpected status, treat the window as diagnostic
+evidence rather than a clean latency result and follow [Web restart evidence](#web-restart-evidence).
+Restore `ready-vote-static-8` after the window so both diagnostic keys return to
+their baseline values.
+
 ## Same-request hop probe
 
 Run from an operator host or the origin. The probe reads the cookie, measures

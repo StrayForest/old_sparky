@@ -679,6 +679,7 @@ jobs:
                 --only PLATFORM_SSR_PERF_LOG_ENABLED
                 --only PLATFORM_SSR_PERF_SAMPLE_RATE
                 --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
+                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
               )
               "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
                 --apply \

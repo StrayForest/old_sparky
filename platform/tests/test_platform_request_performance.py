@@ -7,12 +7,18 @@ from python_packages.platform_infra import performance
 
 
 class RequestPerformanceMiddlewareTests(unittest.TestCase):
-    def settings(self, *, log_mutations: bool = True) -> SimpleNamespace:
+    def settings(
+        self,
+        *,
+        log_mutations: bool = True,
+        auth_bootstrap_log_enabled: bool = False,
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             platform_perf_log_mutations=log_mutations,
             platform_perf_slow_request_ms=1000,
             platform_perf_slow_db_ms=500,
             platform_perf_sql_count_threshold=25,
+            platform_perf_auth_bootstrap_log_enabled=auth_bootstrap_log_enabled,
         )
 
     def metrics(self, *, method: str) -> performance.RequestPerformanceMetrics:
@@ -202,6 +208,49 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
         self.assertIn("auth_bootstrap_auth_query_ms=12.00", rendered)
         self.assertIn("auth_bootstrap_avatar_query_ms=34.00", rendered)
         self.assertIn("auth_bootstrap_response_build_ms=5.00", rendered)
+
+    def test_sampled_ssr_auth_bootstrap_is_logged_when_fast(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        metrics = self.metrics(method="GET")
+        metrics.path = "/api/v1/auth/bootstrap"
+        with (
+            patch.object(
+                performance,
+                "get_settings",
+                return_value=self.settings(auth_bootstrap_log_enabled=True),
+            ),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            middleware._log_if_slow(
+                {
+                    "headers": [(b"x-platform-ssr-trace", b"1")],
+                    "route": SimpleNamespace(path="/auth/bootstrap"),
+                },
+                metrics,
+                200,
+            )
+
+        log_info.assert_called_once()
+
+    def test_fast_auth_bootstrap_requires_the_ssr_sample_marker(self) -> None:
+        middleware = performance.RequestPerformanceMiddleware(app=None)
+        metrics = self.metrics(method="GET")
+        metrics.path = "/api/v1/auth/bootstrap"
+        with (
+            patch.object(
+                performance,
+                "get_settings",
+                return_value=self.settings(auth_bootstrap_log_enabled=True),
+            ),
+            patch.object(performance.logger, "info") as log_info,
+        ):
+            middleware._log_if_slow(
+                {"route": SimpleNamespace(path="/auth/bootstrap")},
+                metrics,
+                200,
+            )
+
+        log_info.assert_not_called()
 
     def test_workspace_stages_are_recorded_on_the_existing_request_metrics(self) -> None:
         token = performance.start_request_metrics(

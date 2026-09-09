@@ -202,6 +202,9 @@ class PlatformSettings(BaseSettings):
     platform_perf_slow_request_ms: int = Field(default=1000, ge=0)
     platform_perf_slow_db_ms: int = Field(default=500, ge=0)
     platform_perf_sql_count_threshold: int = Field(default=25, ge=0)
+    # Fast successful auth bootstrap records are enabled only for the bounded
+    # SSR diagnostic profile and only when the web sample marker is present.
+    platform_perf_auth_bootstrap_log_enabled: bool = False
     # Mutation request performance is still captured when slow, contended or
     # failed.  Logging every successful mutation in production adds more I/O
     # and CPU precisely during the bursts we need to measure.
