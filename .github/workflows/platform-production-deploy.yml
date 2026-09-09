@@ -363,6 +363,19 @@ jobs:
             exit 1
           }
 
+          restart_web_and_wait() {
+            systemctl restart deadlock-web
+            for _ in $(seq 1 30); do
+              if systemctl is-active --quiet deadlock-web \
+                && curl --fail --silent --show-error --max-time 2 \
+                  http://127.0.0.1:3000/ >/dev/null; then
+                return 0
+              fi
+              sleep 1
+            done
+            fail "deadlock-web did not recover after runtime profile"
+          }
+
           # Keep immutable release activation out of an active retained-load
           # window.  The load supervisor and its cleanup use this same lock,
           # so the exact current release remains stable for both measurement
@@ -836,6 +849,16 @@ jobs:
               ;;
             *)
               fail "unsupported runtime profile: $runtime_profile"
+              ;;
+          esac
+
+          # SSR diagnostics are read by the Next.js process at startup. Several
+          # API-oriented runtime profiles also write those keys while updating
+          # their own limits, so a successful API restart alone can leave the
+          # web process on the previous diagnostic state.
+          case "$runtime_profile" in
+            baseline|ready-vote-static-*|ready-vote-cprofile|ready-vote-adaptive-v2|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-*)
+              restart_web_and_wait
               ;;
           esac
 
