@@ -31,7 +31,10 @@ request threshold. The marker is not accepted as a standalone production
 switch: the API gate is disabled in the baseline and the route/method check is
 mandatory.
 
-The production observer joins these records by `request_id`. Read
+The production observer joins these records by `request_id`; for the direct
+internal API hop it falls back to the same request's `cf_ray` when the API
+server does not preserve the incoming request ID. The report exposes the join
+method without serializing either identifier. Read
 `correlated_html.timeline[].api_request_perf[]` together with the SSR stages:
 
 - `total_ms`/`request_ms`, `sql_ms`, pool wait and the

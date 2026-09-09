@@ -2595,34 +2595,41 @@ def summarize_ssr_observability(
         by_request_stream[request_id].append(row)
 
     api_perf_by_request: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    api_perf_by_cf_ray: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    api_perf_rows = 0
     for line in api_journal_lines or []:
         row = parse_request_perf_line(line)
         if row is None or not row.get("request_id"):
             continue
-        api_perf_by_request[str(row["request_id"])].append(
-            {
-                "route_class": _safe_request_perf_route_class(row),
-                **{
-                    key: row[key]
-                    for key in (
-                        "total_ms",
-                        "request_ms",
-                        "sql_ms",
-                        "sql_count",
-                        "pool_checkout_wait_ms",
-                        "pool_connection_hold_ms",
-                        "compute_ms",
-                        "response_bytes",
-                    )
-                    if isinstance(row.get(key), (int, float))
-                    and not isinstance(row.get(key), bool)
-                },
-            }
-        )
+        api_row = {
+            "route_class": _safe_request_perf_route_class(row),
+            **{
+                key: row[key]
+                for key in (
+                    "total_ms",
+                    "request_ms",
+                    "sql_ms",
+                    "sql_count",
+                    "pool_checkout_wait_ms",
+                    "pool_connection_hold_ms",
+                    "compute_ms",
+                    "response_bytes",
+                )
+                if isinstance(row.get(key), (int, float))
+                and not isinstance(row.get(key), bool)
+            },
+        }
+        api_perf_rows += 1
+        api_perf_by_request[str(row["request_id"])].append(api_row)
+        cf_ray = str(row.get("cf_ray") or "").strip()
+        if cf_ray and cf_ray not in {"-", "unknown"}:
+            api_perf_by_cf_ray[cf_ray].append(api_row)
 
     html_records = _nginx_html_records(nginx_records)
     api_records = _nginx_api_records(nginx_records)
     correlated_rows: list[dict[str, Any]] = []
+    api_join_by_request_id = 0
+    api_join_by_cf_ray = 0
     for record in html_records:
         request_id = str(record.get("request_id") or "")
         stages = by_request.get(request_id)
@@ -2688,8 +2695,20 @@ def summarize_ssr_observability(
         )
         row["timeline"] = [event for _order, event in ordered_timeline]
         row["stream_clock_aligned"] = request_to_root_ms is not None
-        if api_perf_by_request.get(request_id):
-            row["api_request_perf"] = api_perf_by_request[request_id]
+        api_rows = api_perf_by_request.get(request_id)
+        api_join_method = None
+        if api_rows:
+            api_join_by_request_id += len(api_rows)
+            api_join_method = "request_id"
+        else:
+            cf_ray = str(record.get("cf_ray") or "").strip()
+            api_rows = api_perf_by_cf_ray.get(cf_ray)
+            if api_rows:
+                api_join_by_cf_ray += len(api_rows)
+                api_join_method = "cf_ray"
+        if api_rows:
+            row["api_request_perf"] = api_rows
+            row["api_request_perf_correlation"] = api_join_method
         correlated_rows.append(row)
 
     def metric_for_rows(key: str) -> dict[str, Any]:
@@ -2897,9 +2916,17 @@ def summarize_ssr_observability(
                     "stream_clock_aligned": row.get("stream_clock_aligned", False),
                     "timeline": row.get("timeline", []),
                     "api_request_perf": row.get("api_request_perf", []),
+                    "api_request_perf_correlation": row.get(
+                        "api_request_perf_correlation"
+                    ),
                 }
                 for row in correlated_rows
             ],
+            "api_request_perf_join": {
+                "api_rows": api_perf_rows,
+                "matched_by_request_id": api_join_by_request_id,
+                "matched_by_cf_ray": api_join_by_cf_ray,
+            },
         },
     }
 
