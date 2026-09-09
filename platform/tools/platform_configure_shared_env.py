@@ -54,6 +54,7 @@ PUBLIC_BASELINE = {
     "PLATFORM_WEB_BIND_HOST": "127.0.0.1",
     "PLATFORM_WEB_PORT": "3000",
     "PLATFORM_WEB_WORKERS": "1",
+    "PLATFORM_WEB_SERVER_AUTH_TRANSPORT": "fetch",
     "PLATFORM_API_FORWARDED_ALLOW_IPS": "127.0.0.1",
     "PLATFORM_LOAD_TEST_SOURCE_IPS": "95.217.190.107,2a01:4f9:c012:8011::1",
     "PLATFORM_SHARED_DIR": "/opt/oldsparky/platform/shared",
@@ -222,6 +223,7 @@ RUNTIME_PROFILES = {
     # unchanged.
     "web-ssr-workers-2": {
         "PLATFORM_WEB_WORKERS": "2",
+        "PLATFORM_WEB_SERVER_AUTH_TRANSPORT": "node",
     },
     "uvicorn-classic": {
         "PLATFORM_UVICORN_LOOP": "asyncio",
