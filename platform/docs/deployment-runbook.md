@@ -131,6 +131,10 @@ Cloudflare and maintenance timers, and installs the off-site-backup unit/timer
 without silently enabling off-site backup before its manual restore-drill gate.
 Never print service environments or secrets.
 
+If candidate activation fails, the workflow records a sanitized systemd snapshot
+and the last three minutes of API, worker and web journals before retaining the
+receipt for the documented recovery decision.
+
 Use `release-state-machine.md` for phase-specific recovery. A retained state
 after migration is an operator decision point, not an automatic rollback.
 

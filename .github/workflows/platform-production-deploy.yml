@@ -504,12 +504,34 @@ jobs:
 
           candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"
           test -x "$candidate_deploy" || fail "candidate release deploy tool is missing"
-          LC_ALL=C.UTF-8 "$candidate_deploy" \
+          if ! LC_ALL=C.UTF-8 "$candidate_deploy" \
             --artifact "$artifact_path" \
             --app-dir "$runtime" \
             --edge-origin https://127.0.0.1 \
             --edge-host old-sparky.com \
-            --expected-csp-mode enforce
+            --expected-csp-mode enforce; then
+            echo '=== candidate_activation_failure ===' >&2
+            for service in deadlock-api deadlock-worker deadlock-web; do
+              echo "--- ${service}.properties ---" >&2
+              systemctl show "$service" \
+                --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,ExecMainStartTimestamp,ExecMainExitTimestamp,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec \
+                --no-pager >&2 || true
+              echo "--- ${service}.journal ---" >&2
+              journalctl -u "$service" \
+                --since '-3 minutes' \
+                --utc \
+                --no-pager \
+                --output short-iso-precise \
+                -n 120 \
+                | sed -E \
+                    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[EMAIL]/g' \
+                    -e 's/(cookie|authorization|token|secret|password|session)[=:][^[:space:]]+/\1=[REDACTED]/Ig' \
+                    -e 's/(set-cookie:|cookie:|authorization:)[^[:space:]]+/\1 [REDACTED]/Ig' \
+                    -e 's/[A-Za-z0-9+\/_=-]{48,}/[LONG_VALUE_REDACTED]/g' \
+                | tail -n 120 >&2 || true
+            done
+            fail "candidate release activation failed; diagnostics collected"
+          fi
 
           case "$runtime_profile" in
             baseline)

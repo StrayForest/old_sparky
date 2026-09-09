@@ -238,6 +238,13 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             'candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"',
             workflow,
         )
+        self.assertIn("candidate_activation_failure", workflow)
+        self.assertIn('systemctl show "$service"', workflow)
+        self.assertIn('journalctl -u "$service"', workflow)
+        self.assertIn(
+            'fail "candidate release activation failed; diagnostics collected"',
+            workflow,
+        )
         remote_start = workflow.index("<<'REMOTE'")
         remote_script = workflow[remote_start:]
         self.assertNotIn("platform_build_release.sh", remote_script)
