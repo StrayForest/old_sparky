@@ -105,11 +105,13 @@ confirmed two systemd cgroup OOM kills of `next-server` at approximately
 `1,029,412 KiB` and `1,029,144 KiB` under `MemoryMax=1G`; the resulting
 automatic restarts explain the 502s and secondary queueing. Full evidence is in
 the [transport investigation archive](archive/performance-authenticated-html-ttfb-transport-2026-09-09.md).
-The active code candidate is a bounded direct Node HTTP transport for the two
-loopback server-auth GETs, avoiding Next.js' patched server `fetch` while
-preserving the existing auth policy and validators. It remains unaccepted
-until the canonical same-window external load proves no OOM/restarts, no
-unexpected statuses, exact cleanup and a TTFB improvement toward `<1,000 ms`.
+The direct Node HTTP server-auth candidate was deployed and measured in
+[`34347250365`](https://github.com/StrayForest/old_sparky/actions/runs/34347250365):
+it held `19,966` HTTP 200 responses, had `34` client timeouts, reduced TTFB
+p95 to `1,263.064 ms`, and had no web OOM/restarts; exact cleanup passed. It is
+rejected as the acceptance result because the canonical gate requires zero
+unexpected statuses/timeouts and TTFB `<1,000 ms`; production is restored to
+the compressed `2a37698f` release.
 
 Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target. The prior blocked attribution is retained in the
@@ -123,8 +125,8 @@ separately reviewed transport investigation in
 [`performance-transport-runbook.md`](performance-transport-runbook.md). Cloudflare
 body buffering and the same-source Next.js compression candidate have now been
 checked; the latter was rejected. The root render/flush boundary remains a
-frozen candidate until the auth transport A/B and remaining origin queueing are
-understood.
+frozen candidate until the event-loop/SSR queueing is measured without the
+previous OOM confounder.
 The security maintenance release upgraded Next.js to `16.3.4`, with its
 exact-SHA CI and production evidence archived in
 [`security-web-dependencies-next-2026-09-09.md`](archive/security-web-dependencies-next-2026-09-09.md).

@@ -53,28 +53,38 @@ is rejected. Production was restored to the default compressed artifact by
 [34340974394](https://github.com/StrayForest/old_sparky/actions/runs/34340974394),
 with preflight and live smoke checks passing.
 
-## Runtime candidate
+## Runtime candidate result
 
-The restart cause is confirmed, but the retained-memory owner still needs an
-A/B. Do not raise `MemoryMax`, add workers, scale database pools or change the
-React root flush boundary based on this evidence. The first focused candidate
-is to bypass Next.js' patched server `fetch` for the two loopback auth GETs
-used by the server-rendered shell. The candidate keeps the same trusted
-loopback `/api/v1` URL policy, cookie and correlation headers, a total
-2-second timeout, identity content encoding, a 256 KiB response limit and
-bounded keep-alive agents (`maxSockets=128`, `maxFreeSockets=16`); existing
-status handling and response validators remain unchanged.
+The direct Node HTTP server-auth transport candidate was deployed at source
+SHA `7eeb8efe91ca6c38ec57ff833e695c8dba5a21a6` and measured by external run
+[34347250365](https://github.com/StrayForest/old_sparky/actions/runs/34347250365).
+The run completed its HTTP stage and exact cleanup, but the acceptance gate
+failed:
 
-The bounded read-only workflow
-`platform-production-web-runtime-diagnostics.yml` collects, for an exact
-UTC window and deployed SHA:
+- `19,966` HTTP 200 responses and `34` client `TimeoutError` results out of
+  20,000 requests;
+- TTFB p50/p90/p95/p99 `902.675/1,151.921/1,263.064/6,891.457 ms`;
+- web RSS averaged `229.09 MB` and peaked at `244.48 MB`;
+- `deadlock-web` had zero missing or new processes, and no OOM was recorded;
+- exact cleanup passed with zero remaining users, tournaments, sessions or
+  audit rows.
+
+This confirms that bypassing Next.js' patched server `fetch` removes the
+observed cgroup-OOM/restart failure mode and materially improves TTFB, but it
+does not close the `<1,000 ms` target or the zero-error contract. The candidate
+is rejected and production is restored to the compressed `2a37698f` release.
+
+The next measurement should profile event-loop/SSR queueing with the OOM
+confounder removed. The bounded read-only workflow
+`platform-production-web-runtime-diagnostics.yml` remains available for an
+exact UTC window and deployed SHA and collects:
 
 - systemd `Result`, exit status, restart count, memory peak/current and task
   limits;
 - sanitized `deadlock-web` journal lines; and
 - kernel OOM/cgroup kill events.
 
-The OOM evidence is now collected; the auth transport candidate must first
-pass build, security, correctness, capacity and exact cleanup gates, then be
-measured in the same canonical external profile. Compression remains enabled
-because the same-source A/B already rejected disabling it.
+Do not raise `MemoryMax`, add workers, scale database pools, change Cloudflare
+response buffering or move the React root flush boundary based on this result.
+The next candidate must preserve the same capacity, security and exact cleanup
+contracts.
