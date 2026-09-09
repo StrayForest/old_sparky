@@ -209,6 +209,44 @@ class SsrObservabilityTests(unittest.TestCase):
         serialized = json.dumps(summary)
         self.assertNotIn("req-1", serialized)
 
+    def test_ssr_summary_falls_back_to_cf_ray_for_direct_api_hop(self) -> None:
+        summary = summarize_ssr_observability(
+            [
+                "ssr_perf request_id=req-1 cf_ray=ray-1 stage=http_request_start "
+                "start_ms=-10.000 end_ms=-10.000 duration_ms=0.000 outcome=ok",
+            ],
+            [
+                {
+                    "request_id": "req-1",
+                    "cf_ray": "ray-1",
+                    "method": "GET",
+                    "uri": "/tournaments/fixture",
+                    "status": 200,
+                    "request_time": "0.050",
+                    "upstream_header_time": "0.040",
+                    "upstream_time": "0.045",
+                }
+            ],
+            [
+                "request_perf request_id=api-generated method=GET "
+                "path=/api/v1/auth/bootstrap route=/api/v1/auth/bootstrap "
+                "status=200 cf_ray=ray-1 total_ms=18.5 sql_ms=2.5",
+            ],
+        )
+
+        correlated = summary["correlated_html"]
+        self.assertEqual(correlated["api_request_perf_join"]["api_rows"], 1)
+        self.assertEqual(correlated["api_request_perf_join"]["matched_by_request_id"], 0)
+        self.assertEqual(correlated["api_request_perf_join"]["matched_by_cf_ray"], 1)
+        self.assertEqual(
+            correlated["timeline"][0]["api_request_perf_correlation"],
+            "cf_ray",
+        )
+        self.assertEqual(
+            correlated["timeline"][0]["api_request_perf"][0]["route_class"],
+            "auth_bootstrap",
+        )
+
     def test_ssr_summary_marks_close_without_finish_as_response_integrity_failure(self) -> None:
         summary = summarize_ssr_observability(
             [
