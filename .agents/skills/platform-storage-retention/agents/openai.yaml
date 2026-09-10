@@ -1,0 +1,4 @@
+interface:
+  display_name: "Platform Storage Retention"
+  short_description: "Safely clean post-run platform artifacts"
+  default_prompt: "Use $platform-storage-retention to clean post-run artifacts safely and verify the production runtime."

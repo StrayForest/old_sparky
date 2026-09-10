@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-09
+- Last reviewed: 2026-09-10
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -140,12 +140,14 @@ instrumentation is now present in reviewed `dev` SHA
 activation retained the baseline after `/dev/sda1` reached `100%` usage and the
 API could not create a temporary directory. Read-only storage evidence from
 [`34419729503`](https://github.com/StrayForest/old_sparky/actions/runs/34419729503)
-shows only `282 MiB` available, `39%` inode use, `80 MiB` of journald and
-approximately `9.44 GB` reclaimable from 35 old known release candidates.
-Production is restored to source SHA `e6cabe57134df31e36deb7b3d28947a3b57edba0`
-and the public check returned HTTP 200. The next load remains paused until the
-storage candidates are reviewed and an authorized cleanup or external disk
-remediation restores a safe free-space margin; no optimization is authorized.
+identified approximately `9.44 GB` in 35 old known release candidates. After
+explicit operator authorization, the identity-checked retention tool removed
+those candidates on 2026-09-10; `current` and `previous` remained unchanged.
+The subsequent maintenance run created a restore-verified backup with 36
+restored platform tables and left the host at `72%` usage with approximately
+`10 GiB` free. API, worker and web services remained active, local health
+checks passed, and the public check returned HTTP 200. The next step is the
+safe-profile correlated diagnostic window; no optimization is authorized.
 The security maintenance release upgraded Next.js to `16.3.4`, with its
 exact-SHA CI and production evidence archived in
 [`security-web-dependencies-next-2026-09-09.md`](archive/security-web-dependencies-next-2026-09-09.md).
