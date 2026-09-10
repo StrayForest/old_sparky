@@ -536,7 +536,7 @@ verifies that the shared load lock is free:
 gh workflow run platform-production-retained-load-abort.yml \
   --repo StrayForest/old_sparky --ref dev \
   -f confirmation=ABORT-PRODUCTION-RETAINED-LOAD \
-  -f load_run_id=<canceled-load-run-id>
+  -f load_run_id=<canceled-load-run-id> -f target_sha=<active-production-source-sha>
 gh run watch <abort-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
