@@ -26,6 +26,10 @@ NGINX_TIMEOUT_POLICY = {
     "send_timeout_seconds": 30,
     "source": "platform/deploy/nginx/deadlock-platform.conf",
 }
+# ``$time_iso8601`` in the access log has second-level precision.  Keep a
+# one-second safety margin before claiming that the origin request started
+# after the client timeout.
+NGINX_TIMESTAMP_PRECISION_MS = 1_000.0
 
 
 def parse_timestamp(value: object) -> datetime | None:
@@ -102,7 +106,13 @@ def safe_system_sample(sample: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
-def classify_timeout(server_row: dict[str, Any] | None) -> tuple[str, str]:
+def classify_timeout(
+    server_row: dict[str, Any] | None,
+    *,
+    origin_request_started_after_client_timeout: bool = False,
+    origin_completed_after_client_timeout: bool = False,
+    origin_completed_before_client_timeout: bool = False,
+) -> tuple[str, str]:
     if server_row is None:
         return (
             "before_origin_observed",
@@ -111,6 +121,24 @@ def classify_timeout(server_row: dict[str, Any] | None) -> tuple[str, str]:
     next_row = server_row.get("next") if isinstance(server_row.get("next"), dict) else {}
     ssr_row = server_row.get("ssr") if isinstance(server_row.get("ssr"), dict) else {}
     api_row = server_row.get("api") if isinstance(server_row.get("api"), dict) else {}
+    if origin_request_started_after_client_timeout and next_row.get("upstream_completed"):
+        return (
+            "client_or_edge_before_origin",
+            "The client timed out before the origin request could have started; "
+            "Nginx later completed the correlated upstream request.",
+        )
+    if origin_completed_after_client_timeout and next_row.get("upstream_completed"):
+        return (
+            "origin_completion_after_client_timeout",
+            "Nginx recorded a completed upstream request after the client timeout, "
+            "but access-log precision leaves the origin start ordering ambiguous.",
+        )
+    if origin_completed_before_client_timeout and next_row.get("upstream_completed"):
+        return (
+            "client_or_edge_after_origin",
+            "Nginx recorded a completed upstream request before the client timeout, "
+            "but the client did not receive an HTTP response.",
+        )
     if not next_row.get("accepted"):
         return (
             "nginx_or_edge_before_next",
@@ -168,11 +196,12 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
     api_matches = 0
     post_timeout_completions = 0
     upstream_post_timeout_completions = 0
+    origin_started_after_timeout = 0
+    origin_start_timing_ambiguous = 0
+    origin_completed_before_timeout = 0
     for client_row in client_rows:
         diagnostic_id = str(client_row["diagnostic_id"])
         origin_row = origin_rows.get(diagnostic_id)
-        classification, reason = classify_timeout(origin_row)
-        classifications[classification] += 1
         timeout_at = parse_timestamp(client_row.get("exception_at") or client_row.get("finished_at"))
         server_timestamp = parse_timestamp(origin_row.get("nginx_recorded_at")) if origin_row else None
         server_after_timeout = bool(
@@ -180,9 +209,42 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
             and server_timestamp is not None
             and server_timestamp >= timeout_at
         )
+        next_row = origin_row.get("next") if origin_row and isinstance(origin_row.get("next"), dict) else {}
+        request_time_ms = next_row.get("request_time_ms")
+        origin_start_delta_ms: float | None = None
+        if timeout_at is not None and server_timestamp is not None and isinstance(request_time_ms, (int, float)):
+            origin_start_delta_ms = (
+                (server_timestamp - timeout_at).total_seconds() * 1000
+                - float(request_time_ms)
+            )
+        origin_request_started_after_client_timeout = bool(
+            origin_start_delta_ms is not None
+            and origin_start_delta_ms >= NGINX_TIMESTAMP_PRECISION_MS
+        )
+        origin_start_is_ambiguous = bool(
+            origin_start_delta_ms is not None
+            and -NGINX_TIMESTAMP_PRECISION_MS < origin_start_delta_ms < NGINX_TIMESTAMP_PRECISION_MS
+        )
+        origin_timestamp_before_timeout = bool(
+            server_timestamp is not None
+            and timeout_at is not None
+            and server_timestamp < timeout_at
+        )
+        if origin_request_started_after_client_timeout:
+            origin_started_after_timeout += 1
+        elif origin_start_is_ambiguous:
+            origin_start_timing_ambiguous += 1
+        elif origin_timestamp_before_timeout:
+            origin_completed_before_timeout += 1
+        classification, reason = classify_timeout(
+            origin_row,
+            origin_request_started_after_client_timeout=origin_request_started_after_client_timeout,
+            origin_completed_after_client_timeout=server_after_timeout,
+            origin_completed_before_client_timeout=origin_timestamp_before_timeout,
+        )
+        classifications[classification] += 1
         if origin_row is not None:
             nginx_matches += 1
-        next_row = origin_row.get("next") if origin_row and isinstance(origin_row.get("next"), dict) else {}
         if next_row.get("accepted"):
             next_matches += 1
         api_row = origin_row.get("api") if origin_row and isinstance(origin_row.get("api"), dict) else {}
@@ -208,6 +270,13 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
                 "origin": origin_row,
                 "server_completed_at_or_after_client_timeout": server_after_timeout,
                 "upstream_completed_at_or_after_client_timeout": upstream_completed_after_timeout,
+                "estimated_origin_request_start_delta_ms": (
+                    round(origin_start_delta_ms, 3)
+                    if origin_start_delta_ms is not None
+                    else None
+                ),
+                "origin_request_started_after_client_timeout": origin_request_started_after_client_timeout,
+                "origin_request_start_timing_ambiguous": origin_start_is_ambiguous,
                 "nearest_system_sample": safe_system_sample(system_sample),
                 "nearest_event_loop_sample": event_loop_sample,
             }
@@ -233,6 +302,9 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
             "api_completed_matches": api_matches,
             "server_completed_at_or_after_client_timeout": post_timeout_completions,
             "upstream_completed_at_or_after_client_timeout": upstream_post_timeout_completions,
+            "origin_requests_started_after_client_timeout": origin_started_after_timeout,
+            "origin_request_start_timing_ambiguous": origin_start_timing_ambiguous,
+            "origin_completed_before_client_timeout": origin_completed_before_timeout,
             "classifications": dict(sorted(classifications.items())),
             "origin_event_loop_samples": event_loop.get("samples", 0) if isinstance(event_loop, dict) else 0,
         },
