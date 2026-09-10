@@ -272,6 +272,91 @@ async def _count_ids(db_session, model: Any, ids: set[str]) -> int:
     )
 
 
+async def _already_cleaned_manifest_result(
+    db_session: Any,
+    manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Confirm that a leftover exact run root contains no live fixture data.
+
+    A prior cleanup can commit its durable ``PreprodTestRun`` state and lose
+    the final filesystem removal. In that narrow case the normal cleanup must
+    still be able to remove only the exact, already-verified run root. Any
+    mixed or incomplete durable state remains fail-closed.
+    """
+
+    markers = set(manifest["markers"])
+    runs = list(
+        (
+            await db_session.scalars(
+                select(PreprodTestRun)
+                .where(PreprodTestRun.marker.in_(markers))
+                .with_for_update()
+            )
+        ).all()
+    )
+    if {run.marker for run in runs} != markers:
+        raise RuntimeError("database run markers do not exactly match the matrix manifest")
+
+    cleaned_flags = [
+        str(run.status or "").lower() == "cleaned" or bool(run.cleanup_state)
+        for run in runs
+    ]
+    if not any(cleaned_flags):
+        return None
+    if not all(cleaned_flags):
+        raise RuntimeError("database cleanup state is mixed for the matrix manifest")
+
+    report_by_marker = {row["marker"]: row for row in manifest["rows"]}
+    for run in runs:
+        row = report_by_marker[run.marker]
+        stored_report = dict(run.report or {})
+        if (
+            run.origin != EXPECTED_ORIGIN
+            or run.report_path != row["report_path"]
+            or stored_report.get("marker") != run.marker
+            or stored_report.get("report_path") != row["report_path"]
+        ):
+            raise RuntimeError("database run provenance does not match the matrix report")
+        cleanup_state = dict(run.cleanup_state or {})
+        if (
+            str(run.status or "").lower() != "cleaned"
+            or cleanup_state.get("ok") is not True
+            or cleanup_state.get("cleaned_by")
+            != "platform_cleanup_retained_matrix.py"
+            or str(cleanup_state.get("control_account_preserved") or "").lower()
+            != str(manifest["control_email"]).lower()
+        ):
+            raise RuntimeError("database run cleanup state is not complete")
+
+    user_ids = set(manifest["user_ids"])
+    tournament_ids = set(manifest["tournament_ids"])
+    remaining_users = await _count_ids(db_session, User, user_ids)
+    remaining_tournaments = await _count_ids(db_session, Tournament, tournament_ids)
+    control_remaining = int(
+        await db_session.scalar(
+            select(func.count())
+            .select_from(User)
+            .where(func.lower(User.email) == str(manifest["control_email"]).lower())
+        )
+        or 0
+    )
+    if remaining_users or remaining_tournaments or control_remaining != 1:
+        raise RuntimeError("database cleanup state does not match the empty fixture boundary")
+
+    return {
+        "ok": True,
+        "already_cleaned": True,
+        "markers": len(markers),
+        "users_deleted": 0,
+        "tournaments_deleted": 0,
+        "control_account_preserved": manifest["control_email"],
+        "remaining_users": 0,
+        "remaining_tournaments": 0,
+        "remaining_sessions": 0,
+        "remaining_audit_logs": 0,
+    }
+
+
 def _merge_recovered_marker_tournaments(
     row: dict[str, Any],
     candidate_rows: list[Any],
@@ -331,6 +416,10 @@ async def cleanup_manifest(
     tournament_ids = set(manifest["tournament_ids"])
     control_email = str(manifest["control_email"])
     async with session_factory()() as db_session:
+        already_cleaned = await _already_cleaned_manifest_result(db_session, manifest)
+        if already_cleaned is not None:
+            return already_cleaned
+
         recovered_tournament_ids: dict[str, set[str]] = {}
         if manifest["mode"] in {"read-mix", "write-burst"}:
             for row in manifest["rows"]:
