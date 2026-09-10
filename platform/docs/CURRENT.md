@@ -6,6 +6,48 @@
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
+## Verified checkpoint — 2026-09-10
+
+- Production is on the standard `ready-vote-static-8` runtime with compression
+  enabled and the normal `fetch` auth transport. The latest verified restore is
+  [`34514855344`](https://github.com/StrayForest/old_sparky/actions/runs/34514855344)
+  at source SHA `08862794fe84becc664ba4b6dae5b9d920e06723`. The Google Ads
+  approval release remains in place; the experimental Node transport is still
+  opt-in only.
+- The reviewed diagnostic join fix is merged in [PR #86](https://github.com/StrayForest/old_sparky/pull/86).
+  The corrected diagnostic run
+  [`34512252295`](https://github.com/StrayForest/old_sparky/actions/runs/34512252295)
+  produced `1,393` non-zero SSR↔API diagnostic joins, but is invalid as a
+  performance baseline because it returned `15,504` HTTP 200 and `4,496` HTTP
+  502 responses and replaced the web process twice. Its event-loop ELU was
+  approximately `1.0` and web CPU averaged approximately `99%`; these are
+  diagnostic-pressure signals, not an optimization result.
+- The narrow timeout-only run
+  [`34515991086`](https://github.com/StrayForest/old_sparky/actions/runs/34515991086)
+  kept the standard runtime and exact `20,000 / 40 / c64 / no-retry` load
+  contract. It recorded `49` client `TimeoutError` results. All `49/49` had
+  a correlated Nginx record with status `200`, Next upstream status `200` and
+  completed upstream processing; Nginx connect time was at most `4 ms` and
+  origin request time at most `1,173 ms`. The client received no HTTP response
+  or CF-Ray for any of these timeouts, while Nginx recorded a CF-Ray for every
+  matching origin request. Derived from the second-precision Nginx timestamp,
+  `43` origin requests started after the client timeout, `5` have ambiguous
+  start ordering, and `1` origin request completed before the timeout.
+- This localizes the reproduced timeout path outside the completed origin
+  request, at the client↔Cloudflare delivery/forwarding boundary; the artifact
+  cannot further split client socket behavior from Cloudflare edge behavior
+  because no client response headers exist for a timed-out request. The
+  timeout-only contour intentionally left SSR/event-loop and API request logs
+  off, so Node scheduling is not proven as the cause of these client timeouts.
+  No performance optimization or full correlated performance run is authorized
+  until an unchanged baseline passes its declared contract.
+- Exact fixture cleanup passed in the timeout-only run. Bounded storage
+  maintenance [`34515587266`](https://github.com/StrayForest/old_sparky/actions/runs/34515587266)
+  and final diagnostics
+  [`34515762041`](https://github.com/StrayForest/old_sparky/actions/runs/34515762041)
+  left the retained-load lock unlocked, no reclaimable release artifacts, and
+  the active/previous release protection intact.
+
 ## Production baseline
 
 - Public origin: `https://old-sparky.com` behind Cloudflare Full(strict) and Nginx Origin CA. The canonical public-host policy is apex-only; `www.old-sparky.com` is intentionally unsupported and has no DNS alias.
@@ -116,9 +158,9 @@ the OOM/queueing failure mode, but it missed the `<1,000 ms` target by `173.196
 ms`, so it is not the production default. The direct transport is now gated by
 `PLATFORM_WEB_SERVER_AUTH_TRANSPORT=node` and the two-worker profile; ordinary
 baseline/static/diagnostic profiles explicitly use `fetch`. The current
-production release is the retained Google Ads approval release at source SHA
-`dfa3e665400a93ddb782bec1a2d464a65f8d27b0`, deployed by automatic release
-[`34472934163`](https://github.com/StrayForest/old_sparky/actions/runs/34472934163).
+standard production runtime is the retained Google Ads approval release,
+restored at source SHA `08862794fe84becc664ba4b6dae5b9d920e06723` by
+[`34514855344`](https://github.com/StrayForest/old_sparky/actions/runs/34514855344).
 
 Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target. The prior blocked attribution is retained in the
@@ -127,17 +169,14 @@ and the root component-tree diagnostic is archived in
 [`performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md`](archive/performance-authenticated-html-ttfb-root-component-tree-2026-09-08.md).
 Its exact run measured 194 correlated requests and identified the largest
 measured pre-body interval as root response serialization/flush scheduling,
-without a server data-ready marker. The active next step is the narrow,
-separately reviewed transport investigation in
+without a server data-ready marker. The completed transport investigation and
+timeout-path diagnosis are documented in
 [`performance-transport-runbook.md`](performance-transport-runbook.md). Cloudflare
 body buffering and the same-source Next.js compression candidate have now been
-checked; the latter was rejected. The transport A/B also showed that the
-remaining latency is concentrated in the origin/Node queue rather than Nginx
-buffering. The root render/flush boundary remains frozen; the next owner-level
-step is a safe-profile diagnostic window that correlates auth/API CPU and SSR
-stages without enabling the rejected transport by default. The correlation
-instrumentation is present in reviewed `dev` SHA
-`91fac252a1598f50f223ed9f7ee505a550bcd5c7`. The first safe-profile diagnostic
+checked; the latter was rejected. The transport A/B remains directional
+evidence, not a reason to change production. The root render/flush boundary
+remains frozen. The correlation instrumentation is present in reviewed `dev`
+SHA `08862794fe84becc664ba4b6dae5b9d920e06723`. The first safe-profile diagnostic
 load [`34448478660`](https://github.com/StrayForest/old_sparky/actions/runs/34448478660)
 was invalid for latency attribution because it returned `2,783` HTTP 502s and
 its sampled SSR/API join was `0/0`; exact cleanup still removed all `20,000`
@@ -167,12 +206,10 @@ The unchanged baseline on the current release was rerun as external workflow
 with the fixed authenticated-page contract: `19,948` HTTP 200 responses and
 `52` client `TimeoutError` results, with zero 502s, OOMs or web restarts. Client
 TTFB p95 was `2679.517 ms`; web CPU averaged `91.66%`, while PostgreSQL showed
-no lock waiters or connection-budget contention. Diagnostics were off, so the
-remaining cause is not yet localized to client/edge/Nginx/Next/API/DB. The
-active next step is the timeout-path diagnostic window in
-[`performance-transport-runbook.md`](performance-transport-runbook.md), which
-must collect per-timeout evidence and restore the standard runtime before any
-optimization or correlated performance run.
+no lock waiters or connection-budget contention. Diagnostics were off, so this
+run had no per-request IDs. The timeout-only follow-up is the current evidence
+for the reproduced timeout path; its non-zero 502/timeout result is not a valid
+baseline and must not be used to justify optimization.
 The security maintenance release upgraded Next.js to `16.3.4`, with its
 exact-SHA CI and production evidence archived in
 [`security-web-dependencies-next-2026-09-09.md`](archive/security-web-dependencies-next-2026-09-09.md).

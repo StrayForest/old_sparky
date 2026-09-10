@@ -32,9 +32,9 @@ only for the marked diagnostic hop. The API then emits its existing bounded
 `request_perf` record even when the request is faster than the normal slow
 request threshold. In the separate timeout-path mode below, only requests
 marked by the external runner's bounded diagnostic ID are promoted from the
-sampled trace to full SSR/API lifecycle evidence; the load shape remains
-unchanged. Applying the profile restarts both `deadlock-api` and
-`deadlock-web` with readiness checks because the API gate is read at process
+sampled trace to full SSR/API lifecycle evidence when this profile is active;
+the load shape remains unchanged. Applying the profile restarts both
+`deadlock-api` and `deadlock-web` with readiness checks because the API gate is read at process
 startup; restoring `ready-vote-static-8` returns both services to baseline.
 The marker is not accepted as a standalone production switch: the API gate is
 disabled in the baseline and the route/method check is mandatory.
@@ -74,32 +74,22 @@ semantics, Nginx/Cloudflare behavior or application logic.
 
 The external runner assigns one bounded `tdiag-<workflow-run-id>-<user-index>`
 ID to each page request and records UTC start, timeout/exception and finish
-times. The opt-in header is retained in the Nginx access record. During the
-window, Next.js and the internal auth/API request carry that same diagnostic
-ID; the API emits a start and completion record, while the web observer joins
-SSR stream lifecycle, Nginx upstream status/timings, timestamped event-loop
-samples, web CPU/active diagnostic requests and PostgreSQL wait/connection
-state. The report keeps Nginx's own request ID separately so the two identities
-cannot be confused.
+times. The opt-in header is retained in the Nginx access record. The first,
+low-overhead timeout contour keeps the pre-window runtime unchanged: it joins
+the client timeout population to Nginx's upstream status/timings and the
+nearest system/CPU/PostgreSQL samples, but intentionally leaves SSR/event-loop
+and API request logging off. Therefore an absent SSR/API row in this contour
+means “not instrumented”, not “not called”. The optional full diagnostic
+profile promotes marked requests to SSR/API lifecycle evidence and event-loop
+samples, but must be treated as a diagnostic-pressure window if it creates
+restarts or unexpected statuses. The report keeps Nginx's own request ID
+separately so the two identities cannot be confused.
 
-Run sequencing is deliberately four-step:
+Run sequencing is deliberately three-step:
 
-1. Record the current release, runtime profile and `MemoryMax`; enable the
-   existing `web-ssr-diagnostics` operator profile through the production
-   deploy workflow. For the reviewed source on `dev`, the operator command is:
-
-   ```bash
-   gh workflow run platform-production-deploy.yml \
-     --repo StrayForest/old_sparky --ref dev \
-     -f mode=deploy -f runtime_profile=web-ssr-diagnostics \
-     -f web_compression=enabled
-   gh run watch <diagnostic-profile-deploy-run-id> \
-     --repo StrayForest/old_sparky --exit-status
-   ```
-
-   This only enables temporary bounded logs and restarts the two services with
-   readiness checks.
-2. Run the external workflow with the dedicated timeout confirmation:
+1. Record the current release, runtime profile and `MemoryMax`; keep the
+   pre-window profile active for the minimal contour. Run the external workflow
+   with the dedicated timeout confirmation:
 
    ```bash
    gh workflow run platform-production-external-load.yml \
@@ -111,14 +101,24 @@ Run sequencing is deliberately four-step:
    gh run watch <diagnostic-run-id> --repo StrayForest/old_sparky --exit-status
    ```
 
-3. Read `timeout-diagnostics.json` per diagnostic ID. Missing Nginx evidence
+   Do not enable `web-ssr-diagnostics` for this first pass: its marked-request
+   trace adds per-request SSR/API/event-loop logging and can change the failure
+   mode. If the minimal contour leaves an origin-localized timeout unresolved,
+   run the full profile as a separately identified diagnostic window, then
+   restore the pre-window profile.
+2. Read `timeout-diagnostics.json` per diagnostic ID. Missing Nginx evidence
    means only “not observed at origin” (client vs Cloudflare is unresolved),
    not proof that an edge layer was healthy. API start without completion
    means the API accepted the call but completion was not observed. A later
-   Nginx completion is explicitly marked when it occurs at or after the
-   client timeout. Compare each row with the nearest event-loop/CPU/system
-   sample; do not infer CPU saturation from aggregate CPU alone.
-4. Restore the exact pre-window runtime profile through the production deploy
+   Nginx completion is explicitly marked when it occurs at or after the client
+   timeout. When `request_time` is present, the report also derives the
+   approximate origin-start delta by subtracting that duration from the
+   second-precision Nginx completion timestamp; only a delta greater than one
+   second is called “origin started after client timeout”. Compare each row
+   with the nearest system sample; event-loop evidence is available only when
+   the full diagnostic profile was active. Do not infer CPU saturation from
+   aggregate CPU alone.
+3. Restore the exact pre-window runtime profile through the production deploy
    workflow (substitute the recorded profile in the assignment below), for
    example:
 
