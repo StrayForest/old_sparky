@@ -134,7 +134,18 @@ checked; the latter was rejected. The transport A/B also showed that the
 remaining latency is concentrated in the origin/Node queue rather than Nginx
 buffering. The root render/flush boundary remains frozen; the next owner-level
 step is a safe-profile diagnostic window that correlates auth/API CPU and SSR
-stages without enabling the rejected transport by default.
+stages without enabling the rejected transport by default. The correlation
+instrumentation is now present in reviewed `dev` SHA
+`a7d5b4e79b503deb72ea6ee7ce5315f106f19473`, but no diagnostic load has run:
+activation retained the baseline after `/dev/sda1` reached `100%` usage and the
+API could not create a temporary directory. Read-only storage evidence from
+[`34419729503`](https://github.com/StrayForest/old_sparky/actions/runs/34419729503)
+shows only `282 MiB` available, `39%` inode use, `80 MiB` of journald and
+approximately `9.44 GB` reclaimable from 35 old known release candidates.
+Production is restored to source SHA `e6cabe57134df31e36deb7b3d28947a3b57edba0`
+and the public check returned HTTP 200. The next load remains paused until the
+storage candidates are reviewed and an authorized cleanup or external disk
+remediation restores a safe free-space margin; no optimization is authorized.
 The security maintenance release upgraded Next.js to `16.3.4`, with its
 exact-SHA CI and production evidence archived in
 [`security-web-dependencies-next-2026-09-09.md`](archive/security-web-dependencies-next-2026-09-09.md).
