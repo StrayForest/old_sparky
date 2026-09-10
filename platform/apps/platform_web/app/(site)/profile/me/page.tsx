@@ -12,6 +12,7 @@ import { platformSessionCookieName } from "@/lib/server-auth";
 
 export const metadata: Metadata = {
   title: "Мой профиль",
+  robots: { index: false, follow: false }
 };
 
 export default async function MyProfilePage({

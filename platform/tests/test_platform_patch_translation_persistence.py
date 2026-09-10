@@ -213,6 +213,132 @@ class PatchTranslationPersistenceTests(PlatformIsolatedAsyncioTestCase):
         self.assertEqual(result["enqueued"], 0)
         enqueue.assert_not_called()
 
+    async def test_three_completed_existing_and_one_new_patch_enqueue_one_job(self) -> None:
+        patches = {
+            patch_id: {**_patch_detail(), "id": patch_id}
+            for patch_id in ("2002", "2003", "2004", "2005")
+        }
+        registry = {}
+        for patch_id in ("2002", "2003", "2004"):
+            registry[(patch_id, runtime.translation_source_hash(patches[patch_id]))] = SimpleNamespace(
+                id=f"translation-{patch_id}",
+                status=runtime.TRANSLATION_STATUS_COMPLETED,
+                last_enqueued_at=None,
+                processing_started_at=None,
+            )
+        enqueue = Mock(return_value="celery-task-new")
+
+        async def select_record(_session, *, patch_id, source_hash, **_kwargs):
+            return registry.setdefault(
+                (patch_id, source_hash),
+                SimpleNamespace(
+                    id=f"translation-{patch_id}",
+                    status=runtime.TRANSLATION_STATUS_PENDING,
+                    last_enqueued_at=None,
+                    processing_started_at=None,
+                ),
+            )
+
+        db_session = _FakeDbSession(None)
+        settings = PlatformSettings(platform_openai_model="test-model")
+        with (
+            patch.object(runtime, "get_settings", return_value=settings),
+            patch.object(runtime, "session_factory", return_value=lambda: _SessionContext(db_session)),
+            patch.object(runtime, "_select_translation_record", new=select_record),
+            patch.object(runtime, "_enqueue_translation_task", enqueue),
+        ):
+            result = await runtime.ensure_patch_translation_records(patches)
+
+        self.assertEqual(result["enqueued"], 1)
+        enqueue.assert_called_once_with(
+            "2005",
+            runtime.translation_source_hash(patches["2005"]),
+            model="test-model",
+        )
+
+    async def test_all_four_completed_unchanged_patches_enqueue_no_jobs(self) -> None:
+        patches = {
+            patch_id: {**_patch_detail(), "id": patch_id}
+            for patch_id in ("3001", "3002", "3003", "3004")
+        }
+        registry = {
+            (patch_id, runtime.translation_source_hash(patch)): SimpleNamespace(
+                id=f"translation-{patch_id}",
+                status=runtime.TRANSLATION_STATUS_COMPLETED,
+                last_enqueued_at=None,
+                processing_started_at=None,
+            )
+            for patch_id, patch in patches.items()
+        }
+        enqueue = Mock()
+
+        async def select_record(_session, *, patch_id, source_hash, **_kwargs):
+            return registry[(patch_id, source_hash)]
+
+        db_session = _FakeDbSession(None)
+        with (
+            patch.object(runtime, "session_factory", return_value=lambda: _SessionContext(db_session)),
+            patch.object(runtime, "_select_translation_record", new=select_record),
+            patch.object(runtime, "_enqueue_translation_task", enqueue),
+        ):
+            result = await runtime.ensure_patch_translation_records(patches)
+
+        self.assertEqual(result["enqueued"], 0)
+        enqueue.assert_not_called()
+
+    async def test_existing_patch_with_new_source_hash_registers_and_enqueues_new_version(self) -> None:
+        old_patch = {**_patch_detail(), "id": "4004", "sections": [{
+            "kind": "general",
+            "title": "Общие изменения",
+            "hero_name": None,
+            "changes": ["Damage increased from 9 to 10"],
+            "abilities": [],
+        }]}
+        new_patch = {**old_patch, "sections": [{
+            "kind": "general",
+            "title": "Общие изменения",
+            "hero_name": None,
+            "changes": ["Damage increased from 10 to 12"],
+            "abilities": [],
+        }]}
+        old_hash = runtime.translation_source_hash(old_patch)
+        new_hash = runtime.translation_source_hash(new_patch)
+        self.assertNotEqual(old_hash, new_hash)
+        registry = {
+            ("4004", old_hash): SimpleNamespace(
+                id="translation-D-old",
+                status=runtime.TRANSLATION_STATUS_COMPLETED,
+                last_enqueued_at=None,
+                processing_started_at=None,
+            )
+        }
+        enqueue = Mock(return_value="celery-task-new-version")
+
+        async def select_record(_session, *, patch_id, source_hash, **_kwargs):
+            return registry.setdefault(
+                (patch_id, source_hash),
+                SimpleNamespace(
+                    id="translation-D-new",
+                    status=runtime.TRANSLATION_STATUS_PENDING,
+                    last_enqueued_at=None,
+                    processing_started_at=None,
+                ),
+            )
+
+        db_session = _FakeDbSession(None)
+        settings = PlatformSettings(platform_openai_model="test-model")
+        with (
+            patch.object(runtime, "get_settings", return_value=settings),
+            patch.object(runtime, "session_factory", return_value=lambda: _SessionContext(db_session)),
+            patch.object(runtime, "_select_translation_record", new=select_record),
+            patch.object(runtime, "_enqueue_translation_task", enqueue),
+        ):
+            result = await runtime.ensure_patch_translation_records({"4004": new_patch})
+
+        self.assertEqual(result["enqueued"], 1)
+        self.assertIn(("4004", new_hash), registry)
+        enqueue.assert_called_once_with("4004", new_hash, model="test-model")
+
     async def test_worker_passes_source_hash_to_translation_task(self) -> None:
         patch_detail = _patch_detail()
         translated = {"ok": True, "status": "translated", "patch_id": "123"}

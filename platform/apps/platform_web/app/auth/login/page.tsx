@@ -3,7 +3,8 @@ import { AuthForm } from "@/components/auth/auth-form";
 import { Hero } from "@/components/layout/hero";
 
 export const metadata: Metadata = {
-  title: "Вход"
+  title: "Вход",
+  robots: { index: false, follow: false }
 };
 
 export default async function LoginPage({

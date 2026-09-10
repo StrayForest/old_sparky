@@ -54,6 +54,7 @@ const sections: readonly LegalSection[] = [
 export default function TermsPage() {
   return (
     <LegalDocumentPage
+      lastUpdated="13 августа 2026 года"
       sections={sections}
       subtitle="Правила аккаунта, участия в турнирах, публикации материалов и модерации."
       title="Условия использования"
