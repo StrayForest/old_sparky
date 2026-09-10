@@ -130,7 +130,7 @@ Preview live-QA runtime cache retention (also machine-locked and idle-gated):
 
 The subcommand is dry-run unless `--apply` is explicit and takes the release
 lock before the live-QA lock. Daily storage maintenance runs the nested apply
-form only after its restore-verified backup step succeeds.
+form only after its restore-verified backup step succeeds; after every production load or QA run, use `.agents/skills/platform-storage-retention/SKILL.md` to complete exact fixture and bounded storage cleanup before another run; do not replace either step with broad filesystem or database deletion.
 
 ## Prepared media and R2
 
