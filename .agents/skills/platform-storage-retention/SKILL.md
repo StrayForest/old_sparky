@@ -52,16 +52,21 @@ calling the task complete.
      --json
    ```
 
-3. Apply the bounded sweep through the installed service. It creates a fresh
-   restore-verified backup before deleting release candidates, source build
-   artifacts, bounded browser artifacts, screenshots, and stale live-QA
-   runtime caches:
+3. Apply the bounded sweep through the installed service using the reviewed
+   production workflow. It creates a fresh restore-verified backup before
+   deleting release candidates, source build artifacts, bounded browser
+   artifacts, screenshots, and stale live-QA runtime caches:
 
    ```bash
-   systemctl start deadlock-maintenance.service
-   systemctl status deadlock-maintenance.service --no-pager
-   journalctl -u deadlock-maintenance.service -n 120 --no-pager
+   gh workflow run platform-production-storage-maintenance.yml \
+     --repo StrayForest/old_sparky --ref dev \
+     -f confirmation=APPLY-PRODUCTION-STORAGE-MAINTENANCE \
+     -f expected_sha=<exact-source-sha-currently-deployed>
+   gh run watch <maintenance-run-id> --repo StrayForest/old_sparky --exit-status
    ```
+
+   The workflow holds the retained-load barrier, verifies the active release,
+   starts `deadlock-maintenance.service`, and publishes bounded evidence.
 
    The service keeps five newest production releases plus `current` and
    `previous`; it retains one live-QA runtime cache and applies age/pattern
