@@ -578,13 +578,14 @@ gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 The cleanup supervisor holds the same host lock as the load, validates the
 selected run's summary and ownership against production markers, deletes only
 the exact fixture graph, verifies zero remaining fixture users, tournaments,
-sessions and audit rows, and only then removes the VPS report directory. A
-failed cleanup keeps the data and report directory in place for operator
-recovery; do not run broad cleanup against production. A durable cleaned row permits exact-ID artifact-only removal after provenance, empty-fixture and root ownership/mode/symlink revalidation; mixed state fails closed.
+sessions and audit rows, and only then removes the VPS report directory and
+matching external export directory. A failed cleanup keeps the data and report
+directory in place for operator recovery; do not run broad cleanup against
+production. A durable cleaned row permits exact-ID artifact-only removal after
+provenance, empty-fixture and root ownership/mode/symlink revalidation; mixed
+state fails closed.
 
-The external-load workflow always invokes this supervisor, even when the
-filesystem run root is missing. In that case it uses the durable
-`PreprodTestRun` orphan path; a missing directory is not proof that the database fixture is absent.
+The external-load workflow always invokes this supervisor, even when the filesystem run root is missing. In that case it uses the durable `PreprodTestRun` orphan path; a missing directory is not proof that the database fixture is absent.
 
 ## Alert thresholds
 
@@ -593,7 +594,6 @@ filesystem run root is missing. In that case it uses the durable
 - newest backup older than 24 hours or not restore-verified;
 - sustained Celery queue growth or retry exhaustion;
 - repeated 5xx/security delivery errors;
-- sustained API 429/5xx responses or timeouts outside expected abusive traffic,
-  especially with API/Redis resource pressure;
+- sustained API 429/5xx responses or timeouts outside expected abusive traffic, especially with API/Redis resource pressure;
 - p95 breach correlated with CPU, DB wait or lock evidence;
 - Origin CA expiry inside the monitor threshold.

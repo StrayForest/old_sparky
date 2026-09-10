@@ -147,6 +147,17 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
                 control_email="control@example.com",
             )
 
+    def test_allows_complete_inventory_for_already_cleaned_artifact_cleanup(self) -> None:
+        manifest = cleanup.build_durable_manifest(
+            self._run(status="cleaned"),
+            load_run_id="12345",
+            control_email="control@example.com",
+            allow_already_cleaned=True,
+        )
+        self.assertEqual(manifest["user_ids"], {
+            "00000000-0000-0000-0000-000000000001"
+        })
+
 
 if __name__ == "__main__":
     unittest.main()
