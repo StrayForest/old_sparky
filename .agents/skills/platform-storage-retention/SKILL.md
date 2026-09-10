@@ -76,7 +76,8 @@ calling the task complete.
    `cleaned` but lost only the final filesystem removal, rerun the exact-ID
    cleanup workflow for that load run. The supervisor verifies the durable
    cleanup identity, confirms the synthetic fixture boundary is empty, and
-   removes only that run's root; mixed or incomplete state remains fail-closed.
+  removes only that run's root and matching external export directory; mixed or
+  incomplete state remains fail-closed.
 
 4. If the full sweep cannot create its backup because the filesystem is
    already full, first use the identity-checked production retention tool

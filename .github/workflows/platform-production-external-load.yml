@@ -323,7 +323,7 @@ jobs:
               -o IdentitiesOnly=yes \
               -i "$SSH_DIR/id_ed25519" \
               "$PROD_SSH_USER@$PROD_SSH_HOST" \
-              "rm -f -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/complete /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/ready /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix-summary.json /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/server-observability.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/qa-command.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/timeout-diagnostic-ids.json && rmdir -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID 2>/dev/null || true" \
+              "rm -f -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/complete /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/ready /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/manifest.json /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix-summary.json /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/server-observability.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/qa-command.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/timeout-diagnostic-ids.json && rmdir -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID 2>/dev/null || true" \
               >/dev/null 2>&1 || true
             ssh \
               -F "$SSH_DIR/config" \

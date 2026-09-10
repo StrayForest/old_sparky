@@ -51,6 +51,33 @@ cleanup_run_id="$5"
   exit 1
 }
 
+export_uid="${SUDO_UID:-0}"
+export_gid="${SUDO_GID:-0}"
+[[ "$export_uid" =~ ^[0-9]+$ && "$export_gid" =~ ^[0-9]+$ ]] || {
+  echo "Unable to determine the SSH caller identity for cleanup export." >&2
+  exit 1
+}
+
+external_load_export_dir="/tmp/old-sparky-production-retained-load-$load_run_id"
+remove_external_load_export() {
+  if [[ ! -e "$external_load_export_dir" && ! -L "$external_load_export_dir" ]]; then
+    return 0
+  fi
+  if [[ -L "$external_load_export_dir" || ! -d "$external_load_export_dir" ]]; then
+    echo "Refusing external retained-load export removal with an unexpected path type." >&2
+    return 1
+  fi
+  if find "$external_load_export_dir" -xdev \
+    \( -type l -o ! \( -type f -o -type d \) \
+      -o ! \( -user "$export_uid" -o -user 0 \) \
+      -o -perm /022 -o \( -type f ! -links 1 \) \) \
+    -print -quit | grep -q .; then
+    echo "Refusing external retained-load export removal with unexpected ownership, mode, inode, or symlink." >&2
+    return 1
+  fi
+  rm -rf -- "$external_load_export_dir"
+}
+
 test -x "$QA_PYTHON" || {
   echo "Production cleanup Python runtime is missing." >&2
   exit 1
@@ -90,12 +117,6 @@ if [[ -L "$run_root" ]]; then
 fi
 if [[ ! -e "$run_root" ]]; then
   export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
-  export_uid="${SUDO_UID:-0}"
-  export_gid="${SUDO_GID:-0}"
-  [[ "$export_uid" =~ ^[0-9]+$ && "$export_gid" =~ ^[0-9]+$ ]] || {
-    echo "Unable to determine the SSH caller identity for cleanup export." >&2
-    exit 1
-  }
   rm -rf -- "$export_dir"
   install -d -o root -g root -m 0700 "$export_dir"
   log_path="$export_dir/cleanup.log"
@@ -121,6 +142,9 @@ if [[ ! -e "$run_root" ]]; then
       echo "Orphan cleanup returned success without a result manifest." >&2
       cleanup_status=1
     }
+  fi
+  if [[ "$cleanup_status" == "0" ]] && ! remove_external_load_export; then
+    cleanup_status=1
   fi
   chown -R "$export_uid:$export_gid" "$export_dir"
   chmod 0700 "$export_dir"
@@ -190,13 +214,8 @@ if (( recovery_needed == 1 )) || {
       echo "The selected partial retained load run contains an unexpected symlink." >&2
       exit 1
     fi
+    remove_external_load_export
     rm -rf -- "$run_root"
-    partial_export_uid="${SUDO_UID:-0}"
-    partial_export_gid="${SUDO_GID:-0}"
-    [[ "$partial_export_uid" =~ ^[0-9]+$ && "$partial_export_gid" =~ ^[0-9]+$ ]] || {
-      echo "Unable to determine the SSH caller identity for partial cleanup export." >&2
-      exit 1
-    }
     partial_export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
     rm -rf -- "$partial_export_dir"
     install -d -o root -g root -m 0700 "$partial_export_dir"
@@ -204,7 +223,7 @@ if (( recovery_needed == 1 )) || {
       > "$partial_export_dir/cleanup.log"
     printf '%s\n' '{"ok":true,"markers":0,"users_deleted":0,"tournaments_deleted":0,"control_account_preserved":true,"partial_run_root_removed":true}' \
       > "$partial_export_dir/cleanup-summary.json"
-    chown -R "$partial_export_uid:$partial_export_gid" "$partial_export_dir"
+    chown -R "$export_uid:$export_gid" "$partial_export_dir"
     chmod 0700 "$partial_export_dir"
     chmod 0600 "$partial_export_dir/cleanup.log" "$partial_export_dir/cleanup-summary.json"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=%s\n' "$partial_export_dir"
@@ -275,6 +294,11 @@ fi
 if [[ "$cleanup_status" == "0" ]]; then
   if find "$run_root" -xdev \( -type l -o ! -user 0 -o -perm /022 \) -print -quit | grep -q .; then
     echo "Refusing retained run root removal with unexpected ownership, mode, or symlink." >&2
+    cleanup_status=1
+  fi
+fi
+if [[ "$cleanup_status" == "0" ]]; then
+  if ! remove_external_load_export; then
     cleanup_status=1
   fi
 fi

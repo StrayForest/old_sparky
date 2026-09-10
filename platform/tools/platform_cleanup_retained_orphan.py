@@ -78,6 +78,7 @@ def build_durable_manifest(
     load_run_id: str,
     control_email: str,
     resolved_user_ids: list[str] | None = None,
+    allow_already_cleaned: bool = False,
 ) -> dict[str, Any]:
     """Build the exact cleanup manifest from one durable QA row."""
 
@@ -112,7 +113,10 @@ def build_durable_manifest(
     marker = str(run.marker or stored.get("marker") or "")
     if not MARKER_PATTERN.fullmatch(marker) or stored.get("marker") != marker:
         raise RuntimeError("durable QA marker is not canonical")
-    if str(run.status or "").lower() == "cleaned" or run.cleanup_state:
+    if (
+        not allow_already_cleaned
+        and (str(run.status or "").lower() == "cleaned" or run.cleanup_state)
+    ):
         raise RuntimeError("durable QA row already records cleanup")
     user_ids = _uuid_list(
         stored.get("user_ids") if resolved_user_ids is None else resolved_user_ids,
@@ -246,12 +250,30 @@ async def clean_orphan(args: argparse.Namespace) -> dict[str, Any]:
         )
         if len(rows) != 1:
             raise RuntimeError("exactly one durable QA row is required for the orphan run")
-        resolved_user_ids, was_compact = await _resolve_user_ids(db_session, rows[0])
+        stored_user_ids = (rows[0].report or {}).get("user_ids")
+        already_cleaned = (
+            str(rows[0].status or "").lower() == "cleaned"
+            or bool(rows[0].cleanup_state)
+        )
+        if already_cleaned:
+            if not isinstance(stored_user_ids, list):
+                raise RuntimeError(
+                    "already-cleaned durable QA row lacks a complete user inventory"
+                )
+            resolved_user_ids = _uuid_list(
+                stored_user_ids,
+                field=f"{rows[0].marker}.user_ids",
+                allow_empty=False,
+            )
+            was_compact = False
+        else:
+            resolved_user_ids, was_compact = await _resolve_user_ids(db_session, rows[0])
         manifest = build_durable_manifest(
             rows[0],
             load_run_id=args.load_run_id,
             control_email=control_email,
             resolved_user_ids=resolved_user_ids,
+            allow_already_cleaned=already_cleaned,
         )
     recovered_user_ids = (
         {str(rows[0].marker): set(resolved_user_ids)} if was_compact else None
