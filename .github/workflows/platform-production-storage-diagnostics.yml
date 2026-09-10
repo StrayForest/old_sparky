@@ -105,6 +105,23 @@ jobs:
           printf 'active_release=%s\n' "$(readlink -f "$current")"
           printf 'active_source_sha=%s\n' "$active_sha"
 
+          echo '=== retained_load_lock ==='
+          retained_load_lock=/run/lock/oldsparky-retained-load-matrix.lock
+          exec 9>"$retained_load_lock"
+          if flock -n 9; then
+            echo 'state=unlocked'
+            flock -u 9
+          else
+            echo 'state=held'
+            /usr/bin/lslocks --noheadings --output PID,COMMAND,PATH \
+              | awk -v lock="$retained_load_lock" '$3 == lock {print}' \
+              || true
+            /usr/bin/fuser --verbose "$retained_load_lock" 2>/dev/null \
+              | awk 'NR > 1 {print}' \
+              || true
+          fi
+          exec 9>&-
+
           echo '=== filesystem_usage ==='
           for path in / /tmp /var/tmp /opt/oldsparky/platform /var/log; do
             echo "--- ${path} ---"
