@@ -135,19 +135,31 @@ remaining latency is concentrated in the origin/Node queue rather than Nginx
 buffering. The root render/flush boundary remains frozen; the next owner-level
 step is a safe-profile diagnostic window that correlates auth/API CPU and SSR
 stages without enabling the rejected transport by default. The correlation
-instrumentation is now present in reviewed `dev` SHA
-`a7d5b4e79b503deb72ea6ee7ce5315f106f19473`, but no diagnostic load has run:
-activation retained the baseline after `/dev/sda1` reached `100%` usage and the
-API could not create a temporary directory. Read-only storage evidence from
-[`34419729503`](https://github.com/StrayForest/old_sparky/actions/runs/34419729503)
-identified approximately `9.44 GB` in 35 old known release candidates. After
-explicit operator authorization, the identity-checked retention tool removed
-those candidates on 2026-09-10; `current` and `previous` remained unchanged.
-The subsequent maintenance run created a restore-verified backup with 36
-restored platform tables and left the host at `72%` usage with approximately
-`10 GiB` free. API, worker and web services remained active, local health
-checks passed, and the public check returned HTTP 200. The next step is the
-safe-profile correlated diagnostic window; no optimization is authorized.
+instrumentation is present in reviewed `dev` SHA
+`91fac252a1598f50f223ed9f7ee505a550bcd5c7`. The first safe-profile diagnostic
+load [`34448478660`](https://github.com/StrayForest/old_sparky/actions/runs/34448478660)
+was invalid for latency attribution because it returned `2,783` HTTP 502s and
+its sampled SSR/API join was `0/0`; exact cleanup still removed all `20,000`
+users and `40` tournaments. After an explicit diagnostic-only correlation
+bridge was reviewed and deployed, the repeat
+[`34461377765`](https://github.com/StrayForest/old_sparky/actions/runs/34461377765)
+returned `18,289` HTTP 200 and `1,711` HTTP 502 responses, so its stress
+acceptance is also invalid. The observer completed without timeout and recorded
+`188` sampled SSR requests (`187` correlated HTML rows), but the auth/API join
+remained `0/0`. It measured auth bootstrap p95 `68.933 ms`, API sampled
+request p95 `194.753 ms` with pool checkout p95 `157.572 ms`, and Node
+event-loop CPU/GC pressure; these are directional aggregate signals, not a
+per-request split. A synthetic loopback probe confirmed that the explicit
+headers reach the API and are selected by its diagnostic middleware, so no
+auth-path, SSR-cost or scheduling optimization is authorized until the real
+load join is non-zero.
+The baseline was restored to `ready-vote-static-8` by
+[`34464396511`](https://github.com/StrayForest/old_sparky/actions/runs/34464396511)
+on the same SHA with `fetch` transport and both diagnostic log gates disabled.
+All services and health checks returned 200. Exact fixture cleanup left no
+retained load data, and the subsequent maintenance run produced a
+restore-verified backup while bounded release retention left approximately
+`9.8 GiB` free; `current` and `previous` remained protected.
 The security maintenance release upgraded Next.js to `16.3.4`, with its
 exact-SHA CI and production evidence archived in
 [`security-web-dependencies-next-2026-09-09.md`](archive/security-web-dependencies-next-2026-09-09.md).
