@@ -580,12 +580,11 @@ selected run's summary and ownership against production markers, deletes only
 the exact fixture graph, verifies zero remaining fixture users, tournaments,
 sessions and audit rows, and only then removes the VPS report directory. A
 failed cleanup keeps the data and report directory in place for operator
-recovery; do not run broad cleanup against production.
+recovery; do not run broad cleanup against production. A durable cleaned row permits exact-ID artifact-only removal after provenance, empty-fixture and root ownership/mode/symlink revalidation; mixed state fails closed.
 
 The external-load workflow always invokes this supervisor, even when the
-filesystem run root is missing. In that case the supervisor uses the durable
-`PreprodTestRun` orphan path; a missing directory is not treated as proof that
-the database fixture is absent.
+filesystem run root is missing. In that case it uses the durable
+`PreprodTestRun` orphan path; a missing directory is not proof that the database fixture is absent.
 
 ## Alert thresholds
 

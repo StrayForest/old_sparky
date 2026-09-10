@@ -72,6 +72,12 @@ calling the task complete.
    `previous`; it retains one live-QA runtime cache and applies age/pattern
    bounds to other known artifact directories.
 
+   If a prior exact retained-load cleanup committed `PreprodTestRun` as
+   `cleaned` but lost only the final filesystem removal, rerun the exact-ID
+   cleanup workflow for that load run. The supervisor verifies the durable
+   cleanup identity, confirms the synthetic fixture boundary is empty, and
+   removes only that run's root; mixed or incomplete state remains fail-closed.
+
 4. If the full sweep cannot create its backup because the filesystem is
    already full, first use the identity-checked production retention tool
    after an explicit operator decision and a read-only candidate review:

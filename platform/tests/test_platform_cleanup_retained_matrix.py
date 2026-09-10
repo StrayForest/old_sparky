@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -210,6 +211,55 @@ class RetainedMatrixManifestTests(unittest.TestCase):
             self.assertEqual(manifest["mode"], "read-mix")
             self.assertEqual(manifest["user_ids"], {user_id})
             self.assertEqual(manifest["tournament_ids"], set())
+
+    def test_already_cleaned_state_is_only_an_artifact_cleanup_result(self) -> None:
+        report_path = "/opt/oldsparky/platform/shared/production-retained-matrix/gha-12345/read-mix/read-mix.json"
+        marker = "preprod260824120000abcd"
+        user_id = "00000000-0000-0000-0000-000000000001"
+        manifest = {
+            "markers": {marker},
+            "control_email": "control@example.com",
+            "user_ids": {user_id},
+            "tournament_ids": set(),
+            "rows": [{"marker": marker, "report_path": report_path}],
+        }
+        run = type(
+            "Run",
+            (),
+            {
+                "marker": marker,
+                "origin": cleanup.EXPECTED_ORIGIN,
+                "report_path": report_path,
+                "report": {"marker": marker, "report_path": report_path},
+                "status": "cleaned",
+                "cleanup_state": {
+                    "ok": True,
+                    "cleaned_by": "platform_cleanup_retained_matrix.py",
+                    "control_account_preserved": "control@example.com",
+                },
+            },
+        )()
+
+        class ScalarResult:
+            def all(self):
+                return [run]
+
+        class Session:
+            def __init__(self):
+                self.values = iter((0, 1))
+
+            async def scalars(self, statement):
+                return ScalarResult()
+
+            async def scalar(self, statement):
+                return next(self.values)
+
+        result = asyncio.run(
+            cleanup._already_cleaned_manifest_result(Session(), manifest)
+        )
+        self.assertIsNotNone(result)
+        self.assertTrue(result["already_cleaned"])
+        self.assertEqual(result["remaining_users"], 0)
 
 
 if __name__ == "__main__":

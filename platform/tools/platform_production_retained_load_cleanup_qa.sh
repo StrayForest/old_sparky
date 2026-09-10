@@ -273,6 +273,12 @@ if [[ "$cleanup_status" == "0" ]]; then
   }
 fi
 if [[ "$cleanup_status" == "0" ]]; then
+  if find "$run_root" -xdev \( -type l -o ! -user 0 -o -perm /022 \) -print -quit | grep -q .; then
+    echo "Refusing retained run root removal with unexpected ownership, mode, or symlink." >&2
+    cleanup_status=1
+  fi
+fi
+if [[ "$cleanup_status" == "0" ]]; then
   rm -rf -- "$run_root"
 fi
 chown -R "$export_uid:$export_gid" "$export_dir"
