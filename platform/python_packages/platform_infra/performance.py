@@ -177,6 +177,19 @@ def _header_from_scope(scope: dict[str, Any], name: bytes) -> str | None:
     return None
 
 
+def _request_identity_from_scope(scope: dict[str, Any]) -> tuple[str | None, str | None]:
+    request_id = _header_from_scope(scope, b"x-request-id")
+    cf_ray = _header_from_scope(scope, b"cf-ray")
+    if _header_from_scope(scope, b"x-platform-ssr-trace") == "1":
+        diagnostic_request_id = _header_from_scope(scope, b"x-platform-ssr-request-id")
+        diagnostic_cf_ray = _header_from_scope(scope, b"x-platform-ssr-cf-ray")
+        if diagnostic_request_id and diagnostic_request_id not in {"unknown", "-"}:
+            request_id = diagnostic_request_id
+        if diagnostic_cf_ray and diagnostic_cf_ray not in {"unknown", "-"}:
+            cf_ray = diagnostic_cf_ray
+    return request_id, cf_ray
+
+
 def _client_fingerprint(scope: dict[str, Any]) -> str | None:
     client = scope.get("client")
     if not client or not client[0]:
@@ -465,12 +478,13 @@ class RequestPerformanceMiddleware:
             await self.app(scope, receive, send)
             return
 
+        request_id, cf_ray = _request_identity_from_scope(scope)
         token = start_request_metrics(
             method=str(scope.get("method") or "GET"),
             path=str(scope.get("path") or ""),
             qa_phase=qa_phase_from_scope(scope),
-            request_id=_header_from_scope(scope, b"x-request-id"),
-            cf_ray=_header_from_scope(scope, b"cf-ray"),
+            request_id=request_id,
+            cf_ray=cf_ray,
             client_fingerprint=_client_fingerprint(scope),
         )
         metrics = current_request_metrics()

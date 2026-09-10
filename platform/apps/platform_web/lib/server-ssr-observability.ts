@@ -22,6 +22,8 @@ const sampleRate = boundedNumber(
   1
 );
 const SSR_TRACE_HEADER = "x-platform-ssr-trace";
+const SSR_REQUEST_ID_HEADER = "x-platform-ssr-request-id";
+const SSR_CF_RAY_HEADER = "x-platform-ssr-cf-ray";
 const SSR_PROXY_START_HEADER = "x-platform-ssr-proxy-start-ms";
 const SSR_REQUEST_START_HEADER = "x-platform-ssr-request-start-ms";
 type RequestHeaderSource = Pick<Headers, "get">;
@@ -126,8 +128,12 @@ export async function getServerRequestCorrelationHeaders(): Promise<Headers> {
 
   // Use the trace identity directly so direct API fetches and SSR records
   // join on the same request ID, even if headers() is resolved separately.
+  // Keep an explicit diagnostic copy because framework/loopback handling can
+  // normalize or drop the generic proxy identity headers on direct fetches.
   const correlationHeaders = new Headers();
   for (const [name, value] of [
+    [SSR_REQUEST_ID_HEADER, trace.requestId],
+    [SSR_CF_RAY_HEADER, trace.cfRay],
     ["x-request-id", trace.requestId],
     ["cf-ray", trace.cfRay]
   ] as const) {

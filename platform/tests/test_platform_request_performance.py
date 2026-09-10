@@ -232,6 +232,37 @@ class RequestPerformanceMiddlewareTests(unittest.TestCase):
 
         log_info.assert_called_once()
 
+    def test_sampled_ssr_identity_prefers_explicit_diagnostic_headers(self) -> None:
+        scope = {
+            "headers": [
+                (b"x-request-id", b"proxy-request"),
+                (b"cf-ray", b"proxy-ray"),
+                (b"x-platform-ssr-trace", b"1"),
+                (b"x-platform-ssr-request-id", b"ssr-request"),
+                (b"x-platform-ssr-cf-ray", b"ssr-ray"),
+            ]
+        }
+
+        self.assertEqual(
+            performance._request_identity_from_scope(scope),
+            ("ssr-request", "ssr-ray"),
+        )
+
+    def test_non_sampled_identity_keeps_proxy_headers(self) -> None:
+        scope = {
+            "headers": [
+                (b"x-request-id", b"proxy-request"),
+                (b"cf-ray", b"proxy-ray"),
+                (b"x-platform-ssr-request-id", b"ssr-request"),
+                (b"x-platform-ssr-cf-ray", b"ssr-ray"),
+            ]
+        }
+
+        self.assertEqual(
+            performance._request_identity_from_scope(scope),
+            ("proxy-request", "proxy-ray"),
+        )
+
     def test_fast_auth_bootstrap_requires_the_ssr_sample_marker(self) -> None:
         middleware = performance.RequestPerformanceMiddleware(app=None)
         metrics = self.metrics(method="GET")
