@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 
 from tools.platform_production_qa import (
     collect_nginx_access_records,
+    parse_request_perf_start_line,
     parse_ssr_event_loop_line,
     parse_ssr_perf_line,
     parse_ssr_stream_line,
@@ -45,11 +46,12 @@ class SsrObservabilityTests(unittest.TestCase):
         self.assertEqual(event_loop["gc_count"], 2.0)
         stream = parse_ssr_stream_line(
             "ssr_stream request_id=req-1 cf_ray=ray-1 stage=first_body_write_attempt "
-            "elapsed_ms=123 status=200 writable_finished=0 write_count=1 "
+            "elapsed_ms=123 status=200 active_requests=7 writable_finished=0 write_count=1 "
             "body_bytes=42 response_error=0"
         )
         self.assertEqual(stream["elapsed_ms"], 123.0)
         self.assertEqual(stream["status"], 200)
+        self.assertEqual(stream["active_requests"], 7)
         self.assertEqual(stream["writable_finished"], 0)
         self.assertEqual(stream["write_count"], 1)
         self.assertEqual(stream["body_bytes"], 42)
@@ -58,6 +60,15 @@ class SsrObservabilityTests(unittest.TestCase):
             parse_ssr_stream_line(
                 "ssr_stream request_id=req-1 stage=bad elapsed_ms=Infinity"
             )
+        )
+
+        self.assertEqual(
+            parse_request_perf_start_line(
+                "2026-09-10T10:00:01.123456+00:00 api[1]: "
+                "request_perf_start request_id=tdiag-123-00001 "
+                "diagnostic_id=tdiag-123-00001 method=GET path=/api/v1/auth/bootstrap"
+            )["diagnostic_id"],
+            "tdiag-123-00001",
         )
 
     def test_ssr_summary_correlates_sampled_stages_without_serializing_ids_or_uris(self) -> None:
@@ -273,6 +284,63 @@ class SsrObservabilityTests(unittest.TestCase):
         self.assertEqual(integrity["response_error_requests"], 1)
         self.assertEqual(integrity["close_without_finish_requests"], 1)
         self.assertEqual(summary["correlated_html"]["timeline"][0]["timeline"][1]["writable_finished"], 0)
+
+    def test_timeout_summary_joins_diagnostic_id_to_next_ssr_api_and_event_loop(self) -> None:
+        diagnostic_id = "tdiag-123-00001"
+        summary = summarize_ssr_observability(
+            [
+                f"2026-09-10T10:00:01.200000+00:00 web[1]: ssr_perf request_id={diagnostic_id} "
+                "cf_ray=ray-1 stage=root_layout_start start_ms=0.000 end_ms=0.000 "
+                "duration_ms=0.000 outcome=ok",
+                f"2026-09-10T10:00:01.300000+00:00 web[1]: ssr_stream request_id={diagnostic_id} "
+                "cf_ray=ray-1 stage=request_start elapsed_ms=2 status=200 active_requests=7 "
+                "writable_finished=0 write_count=0 body_bytes=0 response_error=0",
+                "2026-09-10T10:00:01.400000+00:00 web[1]: ssr_event_loop p50_ms=1.000 "
+                "p95_ms=18.000 p99_ms=25.000 max_ms=30.000 mean_ms=2.000 "
+                "elu=0.920000 cpu_pct=91.000 gc_count=1 gc_duration_ms=2.000",
+            ],
+            [
+                {
+                    "time": "2026-09-10T10:00:31+00:00",
+                    "request_id": "nginx-1",
+                    "timeout_diagnostic_id": diagnostic_id,
+                    "cf_ray": "ray-1",
+                    "method": "GET",
+                    "uri": "/tournaments/fixture",
+                    "status": 200,
+                    "request_completion": "OK",
+                    "request_time": "30.100",
+                    "upstream_connect_time": "0.002",
+                    "upstream_header_time": "30.000",
+                    "upstream_time": "30.050",
+                    "upstream_status": "200",
+                    "upstream_addr": "127.0.0.1:3000",
+                }
+            ],
+            [
+                "2026-09-10T10:00:01.250000+00:00 api[1]: request_perf_start "
+                f"request_id={diagnostic_id} diagnostic_id={diagnostic_id} method=GET "
+                "path=/api/v1/auth/bootstrap",
+                "2026-09-10T10:00:01.500000+00:00 api[1]: request_perf "
+                f"request_id={diagnostic_id} diagnostic_id={diagnostic_id} method=GET "
+                "path=/api/v1/auth/bootstrap route=/api/v1/auth/bootstrap status=200 "
+                "total_ms=18.5 sql_ms=2.5 sql_count=2 pool_checkout_wait_ms=1.5 "
+                "pool_connection_hold_ms=3.5 compute_ms=4.5 response_bytes=120",
+            ],
+            timeout_diagnostic_ids={diagnostic_id},
+        )
+
+        timeout = summary["timeout_diagnostics"]
+        self.assertEqual(timeout["requested_ids"], 1)
+        self.assertEqual(timeout["nginx_records"], 1)
+        row = timeout["rows"][0]
+        self.assertTrue(row["next"]["accepted"])
+        self.assertTrue(row["next"]["upstream_completed"])
+        self.assertTrue(row["ssr"]["started_observed"])
+        self.assertEqual(row["ssr"]["stream_events"][0]["active_requests"], 7)
+        self.assertTrue(row["api"]["call_started_observed"])
+        self.assertTrue(row["api"]["call_completed_observed"])
+        self.assertEqual(summary["event_loop"]["samples_detail"][0]["cpu_pct"], 91.0)
 
     def test_nginx_numeric_request_time_is_reported(self) -> None:
         summary = summarize_ssr_observability(

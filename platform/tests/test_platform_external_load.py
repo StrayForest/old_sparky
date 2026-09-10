@@ -203,6 +203,59 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(result.retry_after, "60")
         self.assertEqual(len(result.cf_error_type or ""), 128)
 
+    def test_diagnostic_request_carries_id_and_monotonic_timestamps_on_timeout(self) -> None:
+        user = VirtualUser("user-00000001", "qa-tournament", "s" * 64, "c" * 64)
+        captured: list[object] = []
+
+        def fail(request: object, *, timeout: float) -> object:
+            captured.append(request)
+            raise TimeoutError("timed out")
+
+        with patch("tools.platform_external_load.urlopen", side_effect=fail):
+            result = _request(
+                "https://old-sparky.com",
+                user,
+                method="GET",
+                path="/tournaments/qa-tournament",
+                phase="diagnostic",
+                timeout=1.0,
+                session_cookie_name="session",
+                csrf_cookie_name="csrf",
+                diagnostic_id="tdiag-123-00001",
+            )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            captured[0].get_header("X-platform-timeout-diagnostic-id"),
+            "tdiag-123-00001",
+        )
+        self.assertEqual(result.error_kind, "TimeoutError")
+        self.assertEqual(result.status, 0)
+        self.assertIsNotNone(result.started_at_utc)
+        self.assertIsNotNone(result.exception_at_utc)
+        self.assertIsNotNone(result.finished_at_utc)
+
+    def test_diagnostic_summary_keeps_every_failed_request_not_only_error_sample_cap(self) -> None:
+        results = [
+            RequestResult(
+                phase="diagnostic",
+                method="GET",
+                path=f"/tournaments/qa-{index}",
+                status=0,
+                elapsed_ms=30_000.0,
+                ok=False,
+                response_bytes=0,
+                error_kind="TimeoutError",
+                diagnostic_id=f"tdiag-123-{index:05d}",
+            )
+            for index in range(26)
+        ]
+
+        summary = summarize_results(results)
+
+        self.assertEqual(len(summary["error_samples"]), 25)
+        self.assertEqual(len(summary["timeout_diagnostics"]), 26)
+
     def test_ready_vote_retries_only_explicit_overload_and_reports_logical_latency(self) -> None:
         _, users = load_manifest_from_payload(manifest_payload())
         responses = [
@@ -579,6 +632,58 @@ class ExternalLoadTests(unittest.TestCase):
             18.0,
         )
         self.assertEqual(report["overall"]["response_bytes"]["max_bytes"], 12_000)
+
+    def test_page_load_diagnostic_mode_assigns_stable_per_user_ids(self) -> None:
+        payload = manifest_payload()
+        _, users = load_manifest_from_payload(payload)
+        diagnostic_ids: list[str | None] = []
+
+        def fake_page_request(
+            origin: str,
+            user: VirtualUser,
+            phase: str,
+            timeout: float,
+            *,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+            diagnostic_id: str | None = None,
+        ) -> RequestResult:
+            diagnostic_ids.append(diagnostic_id)
+            return RequestResult(
+                phase=phase,
+                method="GET",
+                path=f"/tournaments/{user.tournament_slug}",
+                status=200,
+                elapsed_ms=40.0,
+                ok=True,
+                response_bytes=12_000,
+                time_to_first_byte_ms=18.0,
+                diagnostic_id=diagnostic_id,
+            )
+
+        with patch("tools.platform_external_load._page_request", side_effect=fake_page_request):
+            report = run_load(
+                payload,
+                users,
+                mode="page-load",
+                spread_seconds=0,
+                concurrency=1,
+                timeout=1,
+                duplicate_count=0,
+                manual_refresh_count=0,
+                p95_budget_ms=1000,
+                p99_budget_ms=2000,
+                timeout_diagnostics_run_id="123",
+            )
+
+        self.assertEqual(
+            diagnostic_ids,
+            ["tdiag-123-00000", "tdiag-123-00001"],
+        )
+        self.assertEqual(
+            report["timeout_path_diagnostics"],
+            {"enabled": True, "request_count": 2},
+        )
 
     def test_concurrency_ramp_marks_latency_knee_as_operator_candidate(self) -> None:
         def stage(p95: float, rps: float) -> dict[str, object]:

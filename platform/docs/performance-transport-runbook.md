@@ -30,7 +30,10 @@ not hidden by stale startup configuration. For the same sampled requests, Next.j
 correlation headers to `GET /api/v1/auth/bootstrap`; the API uses those headers
 only for the marked diagnostic hop. The API then emits its existing bounded
 `request_perf` record even when the request is faster than the normal slow
-request threshold. Applying the profile restarts both `deadlock-api` and
+request threshold. In the separate timeout-path mode below, only requests
+marked by the external runner's bounded diagnostic ID are promoted from the
+sampled trace to full SSR/API lifecycle evidence; the load shape remains
+unchanged. Applying the profile restarts both `deadlock-api` and
 `deadlock-web` with readiness checks because the API gate is read at process
 startup; restoring `ready-vote-static-8` returns both services to baseline.
 The marker is not accepted as a standalone production switch: the API gate is
@@ -58,6 +61,87 @@ logging selectors return to their baseline values
 (`PLATFORM_SSR_PERF_LOG_ENABLED=false`,
 `PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=false`, `PLATFORM_LOG_LEVEL=INFO` and
 `PLATFORM_PERF_LOG_ENABLED=true`).
+
+## Timeout-path diagnostic window
+
+Use this narrow window when the unchanged
+`authenticated-page-load-v1` baseline has client `TimeoutError` results but
+no 502/OOM evidence. It is a cause-localization run, not a clean baseline,
+performance result or optimization A/B. Keep the load contract unchanged
+(20,000 users, 40 tournaments, HTTP concurrency 64, no retries) and do not
+change workers, pools, admission, timeout values, auth/cache/security
+semantics, Nginx/Cloudflare behavior or application logic.
+
+The external runner assigns one bounded `tdiag-<workflow-run-id>-<user-index>`
+ID to each page request and records UTC start, timeout/exception and finish
+times. The opt-in header is retained in the Nginx access record. During the
+window, Next.js and the internal auth/API request carry that same diagnostic
+ID; the API emits a start and completion record, while the web observer joins
+SSR stream lifecycle, Nginx upstream status/timings, timestamped event-loop
+samples, web CPU/active diagnostic requests and PostgreSQL wait/connection
+state. The report keeps Nginx's own request ID separately so the two identities
+cannot be confused.
+
+Run sequencing is deliberately four-step:
+
+1. Record the current release, runtime profile and `MemoryMax`; enable the
+   existing `web-ssr-diagnostics` operator profile through the production
+   deploy workflow. For the reviewed source on `dev`, the operator command is:
+
+   ```bash
+   gh workflow run platform-production-deploy.yml \
+     --repo StrayForest/old_sparky --ref dev \
+     -f mode=deploy -f runtime_profile=web-ssr-diagnostics \
+     -f web_compression=enabled
+   gh run watch <diagnostic-profile-deploy-run-id> \
+     --repo StrayForest/old_sparky --exit-status
+   ```
+
+   This only enables temporary bounded logs and restarts the two services with
+   readiness checks.
+2. Run the external workflow with the dedicated timeout confirmation:
+
+   ```bash
+   gh workflow run platform-production-external-load.yml \
+     --repo StrayForest/old_sparky --ref dev \
+     -f confirmation=RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS \
+     -f control_email=<existing-production-account-email> \
+     -f profile_id=authenticated-page-load-v1 \
+     -f timeout_diagnostics=true
+   gh run watch <diagnostic-run-id> --repo StrayForest/old_sparky --exit-status
+   ```
+
+3. Read `timeout-diagnostics.json` per diagnostic ID. Missing Nginx evidence
+   means only “not observed at origin” (client vs Cloudflare is unresolved),
+   not proof that an edge layer was healthy. API start without completion
+   means the API accepted the call but completion was not observed. A later
+   Nginx completion is explicitly marked when it occurs at or after the
+   client timeout. Compare each row with the nearest event-loop/CPU/system
+   sample; do not infer CPU saturation from aggregate CPU alone.
+4. Restore the exact pre-window runtime profile through the production deploy
+   workflow (substitute the recorded profile in the assignment below), for
+   example:
+
+   ```bash
+   PRE_WINDOW_PROFILE="ready-vote-static-8"
+   gh workflow run platform-production-deploy.yml \
+     --repo StrayForest/old_sparky --ref dev \
+     -f mode=deploy -f "runtime_profile=$PRE_WINDOW_PROFILE" \
+     -f web_compression=enabled
+   gh run watch <restore-run-id> --repo StrayForest/old_sparky --exit-status
+   ```
+
+   Verify both services are ready, confirm diagnostics are off and confirm
+   `MemoryMax` is unchanged; this workflow must not be used to tune the
+   memory ceiling. The supervisor always performs exact
+   fixture cleanup; its temporary manifest and diagnostic-ID handoff are
+   removed at the barrier. Do not delete the retained diagnostic artifact
+   until the evidence review is complete, then apply the normal bounded
+   storage-retention procedure.
+
+Only after the evidence identifies a reversible bottleneck may an operator
+propose a separate fix for approval. Do not rerun the full 20,000/20,000
+acceptance baseline or the correlated performance run as part of this window.
 
 ## Same-request hop probe
 

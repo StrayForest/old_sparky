@@ -19,6 +19,7 @@ QA_PHASE_RE = re.compile(
     r"auto|assignment|post|teammate|opponent|bracket|mixed|tournament|"
     r"completed|match|initial)_[a-z0-9_]{1,63}$"
 )
+TIMEOUT_DIAGNOSTIC_ID_RE = re.compile(r"^tdiag-[0-9]{1,32}-[0-9]{5}$")
 WORKSPACE_PERF_KEYS = (
     "workspace_auth_ms",
     "workspace_conditional_preflight_ms",
@@ -188,6 +189,11 @@ def _request_identity_from_scope(scope: dict[str, Any]) -> tuple[str | None, str
         if diagnostic_cf_ray and diagnostic_cf_ray not in {"unknown", "-"}:
             cf_ray = diagnostic_cf_ray
     return request_id, cf_ray
+
+
+def _timeout_diagnostic_id_from_scope(scope: dict[str, Any]) -> str | None:
+    value = _header_from_scope(scope, b"x-platform-timeout-diagnostic-id")
+    return value if value and TIMEOUT_DIAGNOSTIC_ID_RE.fullmatch(value) else None
 
 
 def _client_fingerprint(scope: dict[str, Any]) -> str | None:
@@ -488,6 +494,15 @@ class RequestPerformanceMiddleware:
             client_fingerprint=_client_fingerprint(scope),
         )
         metrics = current_request_metrics()
+        timeout_diagnostic_id = _timeout_diagnostic_id_from_scope(scope)
+        if timeout_diagnostic_id is not None:
+            logger.info(
+                "request_perf_start request_id=%s diagnostic_id=%s method=%s path=%s",
+                metrics.request_id if metrics is not None else "unknown",
+                timeout_diagnostic_id,
+                str(scope.get("method") or "GET"),
+                str(scope.get("path") or ""),
+            )
         status_code = 500
 
         async def send_wrapper(message: dict[str, Any]) -> None:
@@ -523,6 +538,7 @@ class RequestPerformanceMiddleware:
         status_code: int,
     ) -> None:
         settings = get_settings()
+        timeout_diagnostic_id = _timeout_diagnostic_id_from_scope(scope)
         total_seconds = perf_counter() - metrics.started_at
         total_ms = total_seconds * 1000
         sql_ms = metrics.sql_time_seconds * 1000
@@ -561,6 +577,7 @@ class RequestPerformanceMiddleware:
             )
             or metrics.pool_connection_hold_seconds >= 0.5
             or is_sampled_ssr_auth_bootstrap
+            or timeout_diagnostic_id is not None
             or metrics.authenticated_read_admission_shed
             or any(
                 event["outcome"] in {"error", "fallback_db"}
@@ -579,7 +596,7 @@ class RequestPerformanceMiddleware:
 
         log_method = logger.warning if status_code >= 500 else logger.info
         log_method(
-            "request_perf request_id=%s method=%s path=%s route=%s status=%s "
+            "request_perf request_id=%s diagnostic_id=%s method=%s path=%s route=%s status=%s "
             "total_ms=%.2f request_ms=%.2f sql_ms=%.2f db_sql_ms=%.2f "
             "sql_count=%s max_sql_ms=%.2f "
             "pool_checkout_wait_ms=%.2f pool_connection_hold_ms=%.2f "
@@ -619,6 +636,7 @@ class RequestPerformanceMiddleware:
             "response_bytes=%s qa_phase=%s "
             "pool_wait_ms=%.2f cf_ray=%s client=%s",
             metrics.request_id,
+            timeout_diagnostic_id or "-",
             metrics.method,
             metrics.path,
             route_path,

@@ -537,7 +537,13 @@ def _source_git_sha() -> str:
     return candidate
 
 
-def run_profile(profile: Mapping[str, Any], manifest_path: Path, report_path: Path) -> int:
+def run_profile(
+    profile: Mapping[str, Any],
+    manifest_path: Path,
+    report_path: Path,
+    *,
+    timeout_diagnostics_run_id: str | None = None,
+) -> int:
     if profile.get("mode") == "tournament-lifecycle":
         raise LoadProfileError(
             "tournament-lifecycle profiles run through platform_production_qa.py; "
@@ -580,6 +586,7 @@ def run_profile(profile: Mapping[str, Any], manifest_path: Path, report_path: Pa
         concurrency_stages=traffic.get("concurrency_stages") or None,
         scenario_kind=str(acceptance.get("kind") or "slo"),
         acceptance_contract=acceptance,
+        timeout_diagnostics_run_id=timeout_diagnostics_run_id,
     )
     report["source_git_sha"] = _source_git_sha()
     report["load_contract"] = contract
@@ -713,6 +720,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument("--profile", dest="profile_id", required=True)
     run_parser.add_argument("--manifest", type=Path, required=True)
     run_parser.add_argument("--report-path", type=Path, required=True)
+    run_parser.add_argument(
+        "--timeout-diagnostics-run-id",
+        help=(
+            "Enable bounded per-request timeout-path evidence for an authenticated "
+            "page-load run; value must be the numeric external workflow run id."
+        ),
+    )
 
     evaluate_parser = subparsers.add_parser("evaluate")
     evaluate_parser.add_argument("--profile", dest="profile_id", required=True)
@@ -760,7 +774,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "evaluate":
         return evaluate_report(profile, args.report, args.server_observability)
-    return run_profile(profile, args.manifest, args.report_path)
+    return run_profile(
+        profile,
+        args.manifest,
+        args.report_path,
+        timeout_diagnostics_run_id=args.timeout_diagnostics_run_id,
+    )
 
 
 if __name__ == "__main__":

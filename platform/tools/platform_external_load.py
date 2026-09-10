@@ -74,6 +74,10 @@ class RequestResult:
     error_kind: str | None = None
     response_json: Any = None
     attempt_number: int = 1
+    diagnostic_id: str | None = None
+    started_at_utc: str | None = None
+    exception_at_utc: str | None = None
+    finished_at_utc: str | None = None
 
 
 @dataclass(slots=True)
@@ -262,6 +266,7 @@ def _request(
     extra_headers: dict[str, str] | None = None,
     attempt_number: int = 1,
     url_prefix: str = "/api/v1",
+    diagnostic_id: str | None = None,
 ) -> RequestResult:
     body = None
     headers = {
@@ -277,6 +282,8 @@ def _request(
     }
     if extra_headers:
         headers.update(extra_headers)
+    if diagnostic_id:
+        headers["X-Platform-Timeout-Diagnostic-ID"] = diagnostic_id
     if json_payload is not None:
         body = json.dumps(json_payload, separators=(",", ":")).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -287,6 +294,7 @@ def _request(
         headers=headers,
     )
     started_at = time.monotonic()
+    started_at_utc = datetime.now(UTC).isoformat()
     status = 0
     response_bytes = 0
     cf_ray: str | None = None
@@ -297,6 +305,7 @@ def _request(
     cf_error_type: str | None = None
     cf_error_origin: str | None = None
     retry_after: str | None = None
+    exception_at_utc: str | None = None
 
     def diagnostic_headers(headers: Any) -> tuple[str | None, str | None, str | None]:
         if status < 400:
@@ -343,8 +352,10 @@ def _request(
             except (UnicodeDecodeError, json.JSONDecodeError):
                 response_json = None
     except (URLError, TimeoutError, OSError) as exc:
+        exception_at_utc = datetime.now(UTC).isoformat()
         error_kind = type(exc).__name__
     elapsed_ms = (time.monotonic() - started_at) * 1000
+    finished_at_utc = datetime.now(UTC).isoformat()
     ok = status in expected_statuses
     if not ok and error_kind is None:
         error_kind = "unexpected_status"
@@ -365,6 +376,10 @@ def _request(
         response_json=response_json,
         time_to_first_byte_ms=time_to_first_byte_ms,
         attempt_number=attempt_number,
+        diagnostic_id=diagnostic_id,
+        started_at_utc=started_at_utc if diagnostic_id else None,
+        exception_at_utc=exception_at_utc if diagnostic_id else None,
+        finished_at_utc=finished_at_utc if diagnostic_id else None,
     )
 
 
@@ -376,6 +391,7 @@ def _page_request(
     *,
     session_cookie_name: str,
     csrf_cookie_name: str,
+    diagnostic_id: str | None = None,
 ) -> RequestResult:
     """Measure the real Next.js HTML response, including server TTFB."""
 
@@ -391,6 +407,7 @@ def _page_request(
         expected_statuses=frozenset({200}),
         extra_headers={"Accept": "text/html"},
         url_prefix="",
+        diagnostic_id=diagnostic_id,
     )
 
 
@@ -484,6 +501,7 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
     cf_error_types: Counter[str] = Counter()
     cf_error_origins: Counter[str] = Counter()
     error_samples: list[dict[str, Any]] = []
+    timeout_diagnostics: list[dict[str, Any]] = []
     first_byte_times: list[float] = []
     response_sizes: list[int] = []
     changed = Counter()
@@ -503,8 +521,26 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
             kind = result.error_kind or "unexpected"
             error_kinds[kind] += 1
             if len(error_samples) < ERROR_SAMPLE_LIMIT:
-                error_samples.append(
+                error_sample = {
+                    "phase": result.phase,
+                    "method": result.method,
+                    "path": result.path.split("?", 1)[0],
+                    "status": result.status,
+                    "error_kind": kind,
+                    "cf_ray": result.cf_ray,
+                    "cf_error_type": result.cf_error_type,
+                    "cf_error_origin": result.cf_error_origin,
+                    "retry_after": result.retry_after,
+                    "ttfb": result.time_to_first_byte_ms,
+                    "total_time": result.elapsed_ms,
+                }
+                if result.diagnostic_id:
+                    error_sample["diagnostic_id"] = result.diagnostic_id
+                error_samples.append(error_sample)
+            if result.diagnostic_id and kind == "TimeoutError":
+                timeout_diagnostics.append(
                     {
+                        "diagnostic_id": result.diagnostic_id,
                         "phase": result.phase,
                         "method": result.method,
                         "path": result.path.split("?", 1)[0],
@@ -514,8 +550,11 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
                         "cf_error_type": result.cf_error_type,
                         "cf_error_origin": result.cf_error_origin,
                         "retry_after": result.retry_after,
-                        "ttfb": result.time_to_first_byte_ms,
-                        "total_time": result.elapsed_ms,
+                        "ttfb_ms": result.time_to_first_byte_ms,
+                        "elapsed_ms": result.elapsed_ms,
+                        "started_at": result.started_at_utc,
+                        "exception_at": result.exception_at_utc,
+                        "finished_at": result.finished_at_utc,
                     }
                 )
             if result.cf_error_type:
@@ -564,6 +603,7 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         },
         "cf_ray_count": len({result.cf_ray for result in results if result.cf_ray}),
         "error_samples": error_samples,
+        "timeout_diagnostics": timeout_diagnostics,
     }
 
 
@@ -793,6 +833,7 @@ def run_load(
     concurrency_stages: list[int] | tuple[int, ...] | None = None,
     scenario_kind: str = "slo",
     acceptance_contract: dict[str, Any] | None = None,
+    timeout_diagnostics_run_id: str | None = None,
 ) -> dict[str, Any]:
     if manual_refresh_count < 0:
         raise ExternalLoadError("manual_refresh_count must not be negative")
@@ -813,6 +854,11 @@ def run_load(
             if not 1 <= stage <= MAX_CONCURRENCY or stage <= previous_stage:
                 raise ExternalLoadError("concurrency_stages must be strictly ascending within bounds")
             previous_stage = stage
+    if timeout_diagnostics_run_id is not None:
+        if not re.fullmatch(r"[0-9]{1,32}", timeout_diagnostics_run_id):
+            raise ExternalLoadError("timeout diagnostics run id must be numeric")
+        if mode != "page-load":
+            raise ExternalLoadError("timeout diagnostics are only supported for page-load")
     read_concurrency_stages = tuple(concurrency_stages or (concurrency,))
     origin = str(manifest["origin"]).rstrip("/")
     session_cookie_name = str(manifest["session_cookie_name"])
@@ -1043,19 +1089,28 @@ def run_load(
             and phase_results["state"]["errors"] == 0
         )
     elif mode == "page-load":
+        user_indexes = {user.user_id: index for index, user in enumerate(users)}
+
         def page_builder(
             origin_value: str,
             user: VirtualUser,
             phase: str,
             request_timeout: float,
         ) -> RequestResult:
+            request_kwargs: dict[str, Any] = {
+                "session_cookie_name": session_cookie_name,
+                "csrf_cookie_name": csrf_cookie_name,
+            }
+            if timeout_diagnostics_run_id:
+                request_kwargs["diagnostic_id"] = (
+                    f"tdiag-{timeout_diagnostics_run_id}-{user_indexes[user.user_id]:05d}"
+                )
             return _page_request(
                 origin_value,
                 user,
                 phase,
                 request_timeout,
-                session_cookie_name=session_cookie_name,
-                csrf_cookie_name=csrf_cookie_name,
+                **request_kwargs,
             )
 
         page_results = run_phase(
@@ -1258,6 +1313,10 @@ def run_load(
             3,
         ) if mode == "ready-vote" else None,
         "trace": trace,
+        "timeout_path_diagnostics": {
+            "enabled": timeout_diagnostics_run_id is not None,
+            "request_count": len(all_results) if timeout_diagnostics_run_id else 0,
+        },
         "phases": phase_results,
         "overall": overall,
         "raw_http": raw_http_summary,

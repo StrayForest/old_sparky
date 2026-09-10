@@ -6,6 +6,7 @@ import { cache } from "react";
 
 type SsrTrace = {
   requestId: string;
+  diagnosticId: string | null;
   cfRay: string;
   sampled: boolean;
   startedAt: number;
@@ -26,6 +27,8 @@ const SSR_REQUEST_ID_HEADER = "x-platform-ssr-request-id";
 const SSR_CF_RAY_HEADER = "x-platform-ssr-cf-ray";
 const SSR_PROXY_START_HEADER = "x-platform-ssr-proxy-start-ms";
 const SSR_REQUEST_START_HEADER = "x-platform-ssr-request-start-ms";
+const TIMEOUT_DIAGNOSTIC_ID_HEADER = "x-platform-timeout-diagnostic-id";
+const TIMEOUT_DIAGNOSTIC_ID_RE = /^tdiag-[0-9]{1,32}-[0-9]{5}$/u;
 type RequestHeaderSource = Pick<Headers, "get">;
 const traceStorage = new AsyncLocalStorage<SsrTrace>();
 
@@ -50,6 +53,11 @@ function safeToken(value: string | null | undefined, fallback: string): string {
   return /^[A-Za-z0-9._:-]{1,128}$/u.test(normalized) ? normalized : fallback;
 }
 
+function timeoutDiagnosticId(value: string | null | undefined): string | null {
+  const normalized = value?.trim() || "";
+  return TIMEOUT_DIAGNOSTIC_ID_RE.test(normalized) ? normalized : null;
+}
+
 function formatDuration(value: number): string {
   return Number.isFinite(value) ? value.toFixed(3) : "0.000";
 }
@@ -65,13 +73,17 @@ function createTrace(
   requestHeaders: RequestHeaderSource
 ): SsrTrace {
   const traceMarker = requestHeaders.get(SSR_TRACE_HEADER);
+  const diagnosticId = timeoutDiagnosticId(
+    requestHeaders.get(TIMEOUT_DIAGNOSTIC_ID_HEADER)
+  );
   const sampled = traceMarker === "1"
     ? true
     : traceMarker === "0"
       ? false
       : Math.random() < sampleRate;
   return {
-    requestId: safeToken(requestHeaders.get("x-request-id"), "unknown"),
+    requestId: diagnosticId || safeToken(requestHeaders.get("x-request-id"), "unknown"),
+    diagnosticId,
     cfRay: safeToken(requestHeaders.get("cf-ray"), "unknown"),
     sampled,
     startedAt,
@@ -140,6 +152,9 @@ export async function getServerRequestCorrelationHeaders(): Promise<Headers> {
     if (value !== "unknown") {
       correlationHeaders.set(name, value);
     }
+  }
+  if (trace.diagnosticId) {
+    correlationHeaders.set(TIMEOUT_DIAGNOSTIC_ID_HEADER, trace.diagnosticId);
   }
   correlationHeaders.set(SSR_TRACE_HEADER, "1");
   return correlationHeaders;

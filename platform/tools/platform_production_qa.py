@@ -88,9 +88,13 @@ UUID_RE = re.compile(
 )
 NUMERIC_PATH_RE = re.compile(r"/\d+(?=/|$)")
 REQUEST_PERF_RE = re.compile(r"\brequest_perf\b(?P<body>.*)$")
+REQUEST_PERF_START_RE = re.compile(r"\brequest_perf_start\b(?P<body>.*)$")
 SSR_PERF_RE = re.compile(r"\bssr_perf\b(?P<body>.*)$")
 SSR_STREAM_RE = re.compile(r"\bssr_stream\b(?P<body>.*)$")
 SSR_EVENT_LOOP_RE = re.compile(r"\bssr_event_loop\b(?P<body>.*)$")
+JOURNAL_TIMESTAMP_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))\b"
+)
 NGINX_ACCESS_LOG_PATH = Path("/var/log/nginx/platform-access.log")
 READY_VOTE_PERF_KEYS = (
     "ready_vote_auth_ms",
@@ -1795,6 +1799,27 @@ def parse_request_perf_line(line: str) -> dict[str, Any] | None:
             continue
         with suppress(ValueError):
             values[key] = caster(values[key])
+    journal_timestamp = _journal_timestamp(line)
+    if journal_timestamp is not None:
+        values["journal_timestamp"] = journal_timestamp
+    return values
+
+
+def parse_request_perf_start_line(line: str) -> dict[str, Any] | None:
+    match = REQUEST_PERF_START_RE.search(line)
+    if match is None:
+        return None
+    values: dict[str, Any] = {}
+    for token in match.group("body").strip().split():
+        if "=" not in token:
+            continue
+        key, raw_value = token.split("=", 1)
+        values[key] = raw_value
+    journal_timestamp = _journal_timestamp(line)
+    if journal_timestamp is not None:
+        values["journal_timestamp"] = journal_timestamp
+    if not values.get("request_id") or not values.get("diagnostic_id"):
+        return None
     return values
 
 
@@ -2291,7 +2316,13 @@ def summarize_bottleneck_evidence(
     }
 
 
-def _collect_journal_lines(unit: str, since: str, until: str) -> list[str]:
+def _collect_journal_lines(
+    unit: str,
+    since: str,
+    until: str,
+    *,
+    with_timestamps: bool = False,
+) -> list[str]:
     try:
         result = subprocess.run(
             [
@@ -2304,7 +2335,7 @@ def _collect_journal_lines(unit: str, since: str, until: str) -> list[str]:
                 until,
                 "--no-pager",
                 "-o",
-                "cat",
+                "short-iso-precise" if with_timestamps else "cat",
             ],
             check=False,
             capture_output=True,
@@ -2318,12 +2349,32 @@ def _collect_journal_lines(unit: str, since: str, until: str) -> list[str]:
     return result.stdout.splitlines()
 
 
-def collect_api_journal_lines(since: str, until: str) -> list[str]:
-    return _collect_journal_lines("deadlock-api", since, until)
+def collect_api_journal_lines(
+    since: str,
+    until: str,
+    *,
+    with_timestamps: bool = False,
+) -> list[str]:
+    return _collect_journal_lines(
+        "deadlock-api",
+        since,
+        until,
+        with_timestamps=with_timestamps,
+    )
 
 
-def collect_web_journal_lines(since: str, until: str) -> list[str]:
-    return _collect_journal_lines("deadlock-web", since, until)
+def collect_web_journal_lines(
+    since: str,
+    until: str,
+    *,
+    with_timestamps: bool = False,
+) -> list[str]:
+    return _collect_journal_lines(
+        "deadlock-web",
+        since,
+        until,
+        with_timestamps=with_timestamps,
+    )
 
 
 def parse_ssr_perf_line(line: str) -> dict[str, Any] | None:
@@ -2345,6 +2396,9 @@ def parse_ssr_perf_line(line: str) -> dict[str, Any] | None:
         for key in ("start_ms", "end_ms", "duration_ms")
     ):
         return None
+    journal_timestamp = _journal_timestamp(line)
+    if journal_timestamp is not None:
+        values["journal_timestamp"] = journal_timestamp
     if not values.get("request_id") or not values.get("stage"):
         return None
     return values
@@ -2360,7 +2414,15 @@ def parse_ssr_stream_line(line: str) -> dict[str, Any] | None:
             continue
         key, raw_value = token.split("=", 1)
         values[key] = raw_value
-    for key in ("elapsed_ms", "status", "writable_finished", "write_count", "body_bytes", "response_error"):
+    for key in (
+        "elapsed_ms",
+        "status",
+        "active_requests",
+        "writable_finished",
+        "write_count",
+        "body_bytes",
+        "response_error",
+    ):
         if key not in values:
             continue
         with suppress(ValueError):
@@ -2370,6 +2432,9 @@ def parse_ssr_stream_line(line: str) -> dict[str, Any] | None:
         and not math.isfinite(values["elapsed_ms"])
     ):
         return None
+    journal_timestamp = _journal_timestamp(line)
+    if journal_timestamp is not None:
+        values["journal_timestamp"] = journal_timestamp
     if (
         not values.get("request_id")
         or not values.get("stage")
@@ -2390,9 +2455,22 @@ def parse_ssr_event_loop_line(line: str) -> dict[str, Any] | None:
         key, raw_value = token.split("=", 1)
         with suppress(ValueError):
             values[key] = float(raw_value)
+    journal_timestamp = _journal_timestamp(line)
+    if journal_timestamp is not None:
+        values["journal_timestamp"] = journal_timestamp
     if not isinstance(values.get("p95_ms"), (int, float)):
         return None
     return values
+
+
+def _journal_timestamp(line: str) -> str | None:
+    match = JOURNAL_TIMESTAMP_RE.match(line.strip())
+    if match is None:
+        return None
+    try:
+        return datetime.fromisoformat(match.group("timestamp").replace("Z", "+00:00")).astimezone(UTC).isoformat()
+    except ValueError:
+        return None
 
 
 def _nginx_record_timestamp(raw_value: object) -> datetime | None:
@@ -2537,6 +2615,7 @@ def summarize_ssr_observability(
     web_journal_lines: list[str],
     nginx_records: list[dict[str, Any]],
     api_journal_lines: list[str] | None = None,
+    timeout_diagnostic_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Join sampled SSR/stream stages with Nginx and API timings.
 
@@ -2585,6 +2664,11 @@ def summarize_ssr_observability(
                 "end_ms": float(end_ms),
                 "duration_ms": float(duration),
                 "outcome": str(row.get("outcome") or "ok"),
+                **(
+                    {"journal_timestamp": row["journal_timestamp"]}
+                    if row.get("journal_timestamp")
+                    else {}
+                ),
             }
         )
 
@@ -2596,13 +2680,40 @@ def summarize_ssr_observability(
 
     api_perf_by_request: dict[str, list[dict[str, Any]]] = defaultdict(list)
     api_perf_by_cf_ray: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    api_start_by_request: dict[str, list[dict[str, Any]]] = defaultdict(list)
     api_perf_rows = 0
     for line in api_journal_lines or []:
+        start_row = parse_request_perf_start_line(line)
+        if start_row is not None:
+            api_start_by_request[str(start_row["request_id"])].append(
+                {
+                    key: start_row[key]
+                    for key in (
+                        "request_id",
+                        "diagnostic_id",
+                        "method",
+                        "path",
+                        "journal_timestamp",
+                    )
+                    if key in start_row
+                }
+            )
+            continue
         row = parse_request_perf_line(line)
         if row is None or not row.get("request_id"):
             continue
         api_row = {
             "route_class": _safe_request_perf_route_class(row),
+            **(
+                {"diagnostic_id": row["diagnostic_id"]}
+                if row.get("diagnostic_id")
+                else {}
+            ),
+            **(
+                {"server_logged_at": row["journal_timestamp"]}
+                if row.get("journal_timestamp")
+                else {}
+            ),
             **{
                 key: row[key]
                 for key in (
@@ -2729,6 +2840,108 @@ def summarize_ssr_observability(
         for stage in sorted({str(row["stage"]) for row in stream_rows})
     }
 
+    timeout_diagnostic_rows: list[dict[str, Any]] = []
+    for record in nginx_records:
+        diagnostic_id = str(record.get("timeout_diagnostic_id") or "").strip()
+        if not diagnostic_id or (
+            timeout_diagnostic_ids is not None
+            and diagnostic_id not in timeout_diagnostic_ids
+        ):
+            continue
+        upstream_addr = str(record.get("upstream_addr") or "").strip()
+        upstream_status = str(record.get("upstream_status") or "").strip()
+        request_id = diagnostic_id
+        stages = by_request.get(request_id, {})
+        stream_events = by_request_stream.get(request_id, [])
+        api_rows = api_perf_by_request.get(request_id, [])
+        api_start_rows = api_start_by_request.get(request_id, [])
+        if not api_rows:
+            cf_ray = str(record.get("cf_ray") or "").strip()
+            api_rows = api_perf_by_cf_ray.get(cf_ray, [])
+        timeout_diagnostic_rows.append(
+            {
+                "diagnostic_id": diagnostic_id,
+                "nginx_recorded_at": str(record.get("time") or "") or None,
+                "nginx_request_id": str(record.get("request_id") or "") or None,
+                "cf_ray": str(record.get("cf_ray") or "") or None,
+                "method": str(record.get("method") or "") or None,
+                "status": record.get("status"),
+                "request_completion": str(record.get("request_completion") or "") or None,
+                "next": {
+                    "accepted": ":3000" in upstream_addr,
+                    "upstream_addr": upstream_addr or None,
+                    "upstream_status": upstream_status or None,
+                    "upstream_completed": upstream_status == "200",
+                    "request_time_ms": _nginx_seconds(record.get("request_time")),
+                    "upstream_connect_ms": _nginx_seconds(record.get("upstream_connect_time")),
+                    "upstream_header_ms": _nginx_seconds(record.get("upstream_header_time")),
+                    "upstream_ms": _nginx_seconds(record.get("upstream_time")),
+                },
+                "ssr": {
+                    "started_observed": bool(stages or stream_events),
+                    "stage_events": [
+                        {
+                            key: event[key]
+                            for key in (
+                                "stage",
+                                "start_ms",
+                                "end_ms",
+                                "duration_ms",
+                                "outcome",
+                                "journal_timestamp",
+                            )
+                            if key in event
+                        }
+                        for event in by_request_events.get(request_id, [])
+                    ],
+                    "stream_events": [
+                        {
+                            key: event[key]
+                            for key in (
+                                "stage",
+                                "elapsed_ms",
+                                "active_requests",
+                                "status",
+                                "writable_finished",
+                                "write_count",
+                                "body_bytes",
+                                "response_error",
+                                "journal_timestamp",
+                            )
+                            if key in event
+                        }
+                        for event in stream_events
+                    ],
+                },
+                "api": {
+                    "call_started_observed": bool(api_start_rows or api_rows),
+                    "request_perf_start": api_start_rows,
+                    "call_completed_observed": bool(api_rows),
+                    "request_perf": api_rows,
+                },
+            }
+        )
+
+    event_loop_details = [
+        {
+            key: row[key]
+            for key in (
+                "journal_timestamp",
+                "p50_ms",
+                "p95_ms",
+                "p99_ms",
+                "max_ms",
+                "mean_ms",
+                "elu",
+                "cpu_pct",
+                "gc_count",
+                "gc_duration_ms",
+            )
+            if key in row
+        }
+        for row in event_loop_rows
+    ]
+
     stream_by_request = {
         request_id: rows
         for request_id, rows in by_request_stream.items()
@@ -2816,6 +3029,7 @@ def summarize_ssr_observability(
         },
         "event_loop": {
             "samples": len(event_loop_rows),
+            "samples_detail": event_loop_details,
             "p95_ms": metric_stats(
                 [float(row["p95_ms"]) for row in event_loop_rows]
             ),
@@ -2927,6 +3141,11 @@ def summarize_ssr_observability(
                 "matched_by_request_id": api_join_by_request_id,
                 "matched_by_cf_ray": api_join_by_cf_ray,
             },
+        },
+        "timeout_diagnostics": {
+            "requested_ids": len(timeout_diagnostic_ids or set()),
+            "nginx_records": len(timeout_diagnostic_rows),
+            "rows": timeout_diagnostic_rows,
         },
     }
 

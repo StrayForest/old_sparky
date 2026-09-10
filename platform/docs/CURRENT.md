@@ -81,7 +81,7 @@ The GitHub `Protect dev` ruleset no longer requires PR approval for merge.
 Branch deletion and force-push remain protected, and exact-SHA CI/build plus
 the automatic production deployment chain remain mandatory.
 
-The reviewed transport-observability package is now part of deployed source
+The reviewed transport-observability package was introduced in deployed source
 SHA `9c5ac7e59466e021bc5ce8142721e4027500407e` through automatic production
 deploy [`34362338793`](https://github.com/StrayForest/old_sparky/actions/runs/34362338793).
 It scopes Nginx response-buffering changes to the dynamic HTML location,
@@ -115,9 +115,10 @@ cleanup. TTFB p95/p99 was `1173.196/1359.348 ms`; Nginx upstream-header p95 was
 the OOM/queueing failure mode, but it missed the `<1,000 ms` target by `173.196
 ms`, so it is not the production default. The direct transport is now gated by
 `PLATFORM_WEB_SERVER_AUTH_TRANSPORT=node` and the two-worker profile; ordinary
-baseline/static/diagnostic profiles explicitly use `fetch`. Production was
-restored to `ready-vote-static-8` for source SHA `9c5ac7e5` by automatic deploy
-[`34362338793`](https://github.com/StrayForest/old_sparky/actions/runs/34362338793).
+baseline/static/diagnostic profiles explicitly use `fetch`. The current
+production release is the retained Google Ads approval release at source SHA
+`dfa3e665400a93ddb782bec1a2d464a65f8d27b0`, deployed by automatic release
+[`34472934163`](https://github.com/StrayForest/old_sparky/actions/runs/34472934163).
 
 Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target. The prior blocked attribution is retained in the
@@ -160,6 +161,18 @@ All services and health checks returned 200. Exact fixture cleanup left no
 retained load data, and the subsequent maintenance run produced a
 restore-verified backup while bounded release retention left approximately
 `9.8 GiB` free; `current` and `previous` remained protected.
+
+The unchanged baseline on the current release was rerun as external workflow
+[`34478322962`](https://github.com/StrayForest/old_sparky/actions/runs/34478322962)
+with the fixed authenticated-page contract: `19,948` HTTP 200 responses and
+`52` client `TimeoutError` results, with zero 502s, OOMs or web restarts. Client
+TTFB p95 was `2679.517 ms`; web CPU averaged `91.66%`, while PostgreSQL showed
+no lock waiters or connection-budget contention. Diagnostics were off, so the
+remaining cause is not yet localized to client/edge/Nginx/Next/API/DB. The
+active next step is the timeout-path diagnostic window in
+[`performance-transport-runbook.md`](performance-transport-runbook.md), which
+must collect per-timeout evidence and restore the standard runtime before any
+optimization or correlated performance run.
 The security maintenance release upgraded Next.js to `16.3.4`, with its
 exact-SHA CI and production evidence archived in
 [`security-web-dependencies-next-2026-09-09.md`](archive/security-web-dependencies-next-2026-09-09.md).

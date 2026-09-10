@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import time
 from pstats import Stats
@@ -30,6 +31,9 @@ from platform_production_qa import (
 from python_packages.platform_infra.db import session_factory
 
 
+TIMEOUT_DIAGNOSTIC_ID_RE = re.compile(r"^tdiag-[0-9]{1,32}-[0-9]{5}$")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Observe one external load window on the origin.")
     parser.add_argument("--env-file", type=Path, required=True)
@@ -37,7 +41,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-file", type=Path, required=True)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--max-runtime", type=float, default=9_000.0)
+    parser.add_argument("--diagnostic-id-file", type=Path)
     return parser.parse_args()
+
+
+def load_timeout_diagnostic_ids(path: Path | None) -> set[str] | None:
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(payload, list) or len(payload) > 20_000:
+        return set()
+    return {
+        value
+        for value in payload
+        if isinstance(value, str) and TIMEOUT_DIAGNOSTIC_ID_RE.fullmatch(value)
+    }
 
 
 def signal_api_workers(signum: signal.Signals) -> list[int]:
@@ -400,9 +421,18 @@ async def async_main() -> int:
 
     finished_at = datetime.now(UTC)
     journal_until = finished_at.strftime("%Y-%m-%d %H:%M:%S UTC")
-    request_perf_lines = collect_api_journal_lines(journal_since, journal_until)
-    web_journal_lines = collect_web_journal_lines(journal_since, journal_until)
+    request_perf_lines = collect_api_journal_lines(
+        journal_since,
+        journal_until,
+        with_timestamps=True,
+    )
+    web_journal_lines = collect_web_journal_lines(
+        journal_since,
+        journal_until,
+        with_timestamps=True,
+    )
     nginx_access_records = collect_nginx_access_records(started_at, finished_at)
+    timeout_diagnostic_ids = load_timeout_diagnostic_ids(args.diagnostic_id_file)
 
     system_summary = sampler.summary()
     system_summary["timeline"] = [
@@ -428,6 +458,7 @@ async def async_main() -> int:
             "postgres_waits": sample.get("postgres_waits"),
             "celery_backlog": sample.get("celery_backlog"),
             "api_process": (sample.get("processes") or {}).get("deadlock-api"),
+            "web_process": (sample.get("processes") or {}).get("deadlock-web"),
         }
         for sample in sampler.samples
     ]
@@ -450,6 +481,7 @@ async def async_main() -> int:
                 "is in the external load runner report. API paths are emitted only "
                 "as safe route classes."
             ),
+            "timeout_diagnostics": bool(args.diagnostic_id_file),
         },
         "server_request_perf_logs": summarize_request_perf_logs(
             request_perf_lines,
@@ -459,6 +491,7 @@ async def async_main() -> int:
             web_journal_lines,
             nginx_access_records,
             request_perf_lines,
+            timeout_diagnostic_ids=timeout_diagnostic_ids,
         ),
         "cpu_profile": {
             **cpu_profile_summary(profile_dir),
