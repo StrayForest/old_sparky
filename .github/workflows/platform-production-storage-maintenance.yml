@@ -1,0 +1,209 @@
+name: Platform production storage maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type APPLY-PRODUCTION-STORAGE-MAINTENANCE after reviewing the storage inventory"
+        required: true
+        type: string
+      expected_sha:
+        description: "Exact source SHA currently deployed on the production VPS"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    name: Apply bounded production storage retention
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    env:
+      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+    steps:
+      - name: Validate explicit maintenance confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Production storage maintenance must run from dev." >&2; exit 1; }
+          test "$CONFIRMATION" = "APPLY-PRODUCTION-STORAGE-MAINTENANCE" \
+            || { echo "Refusing storage deletion without exact confirmation." >&2; exit 1; }
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "expected_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
+
+      - name: Configure pinned production SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-storage-maintenance-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 host key." >&2; exit 1; }
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
+            || { echo "Expected exactly one production ED25519 host key." >&2; exit 1; }
+          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
+          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" \
+            || { echo "Production SSH host fingerprint mismatch." >&2; exit 1; }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Run installed bounded maintenance service
+        id: maintenance
+        shell: bash
+        run: |
+          set -u
+          artifact_dir="$RUNNER_TEMP/platform-production-storage-maintenance-artifacts"
+          install -d -m 700 "$artifact_dir"
+          remote_log="$artifact_dir/maintenance.log"
+          set +e
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=10 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            bash -s -- "$EXPECTED_SHA" "$CONFIRMATION" > "$remote_log" 2>&1 <<'REMOTE'
+          set -Eeuo pipefail
+
+          expected_sha="$1"
+          confirmation="$2"
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          shared="$runtime/shared"
+          report_dir="$shared/maintenance"
+          retained_load_lock=/run/lock/oldsparky-retained-load-matrix.lock
+
+          fail() {
+            printf 'ERROR: %s\n' "$*" >&2
+            exit 1
+          }
+
+          test "$(id -u)" -eq 0 || fail "Production maintenance must run as root."
+          test "$confirmation" = "APPLY-PRODUCTION-STORAGE-MAINTENANCE" \
+            || fail "Maintenance confirmation mismatch."
+          test -L "$current" || fail "Current release symlink is missing."
+          test -d "$shared" && test ! -L "$shared" || fail "Shared directory is unsafe."
+
+          active_sha="$(/usr/bin/python3 -I - "$current/RELEASE.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("source_git_commit") or "")
+          PY
+          )"
+          test "$active_sha" = "$expected_sha" || fail "Active release SHA differs from expected_sha."
+          test -x "$current/tools/platform_storage_maintenance.py" \
+            || fail "Installed storage maintenance tool is missing."
+
+          current_before="$(readlink -f "$current")"
+          previous_before="$(readlink -f "$runtime/previous")"
+          test ! -e "$shared/.release-operation.json" \
+            || fail "A release transaction is already pending."
+
+          exec 9>"$retained_load_lock"
+          flock -n 9 || fail "A retained production load or cleanup is active."
+
+          printf 'active_release=%s\n' "$current_before"
+          printf 'active_source_sha=%s\n' "$active_sha"
+          printf 'current_before=%s\n' "$current_before"
+          printf 'previous_before=%s\n' "$previous_before"
+          printf 'retained_load_lock=held-by-maintenance\n'
+
+          set +e
+          systemctl start deadlock-maintenance.service
+          service_status=$?
+          set -e
+          systemctl show deadlock-maintenance.service \
+            --property=ActiveState,SubState,Result,ExecMainStatus,ExecMainStartTimestamp,ExecMainExitTimestamp \
+            --no-pager || true
+          journalctl -u deadlock-maintenance.service -n 120 --no-pager || true
+          test "$service_status" -eq 0 || fail "deadlock-maintenance.service failed."
+
+          test "$(readlink -f "$current")" = "$current_before" \
+            || fail "Current release target changed during maintenance."
+          test "$(readlink -f "$runtime/previous")" = "$previous_before" \
+            || fail "Previous release target changed during maintenance."
+          test ! -e "$shared/.release-operation.json" \
+            || fail "A release transaction remains after maintenance."
+
+          latest_report="$(find "$report_dir" -maxdepth 1 -type f -name 'platform-maintenance-*.json' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)"
+          test -n "$latest_report" && test ! -L "$latest_report" || fail "Maintenance report is missing or unsafe."
+          /usr/bin/python3 -I - "$latest_report" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          backup = report.get("backup") or {}
+          if report.get("mode") != "apply" or not report.get("ok"):
+              raise SystemExit("maintenance report is not successful")
+          if backup.get("status") != "completed" or backup.get("restore_verified") is not True:
+              raise SystemExit("maintenance backup was not restore-verified")
+          print("maintenance_report_ok=true")
+          print("backup_restore_verified=true")
+          print("production_releases_deleted=" + str(len((report.get("production_releases") or {}).get("deleted") or [])))
+          print("source_release_artifacts_deleted=" + str(len((report.get("source_release_artifacts") or {}).get("deleted") or [])))
+          print("live_qa_runtime_caches_deleted=" + str(len((report.get("live_qa_runtime_caches") or {}).get("deleted") or [])))
+          print("transient_reclaimed_bytes=" + str(report.get("transient", {}).get("reclaimable_bytes", {})))
+          PY
+
+          for service in deadlock-api deadlock-worker deadlock-web nginx; do
+            systemctl is-active --quiet "$service" || fail "$service is not active after maintenance."
+          done
+          curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8010/api/v1/health/live >/dev/null
+          curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8010/api/v1/health/ready >/dev/null
+          curl --fail --silent --show-error --max-time 10 http://127.0.0.1:3000/ >/dev/null
+          df -hT /
+          df -ih /
+          printf 'health=passed\n'
+          REMOTE
+          remote_status=$?
+          set -e
+          cat "$remote_log"
+          echo "remote_status=$remote_status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Publish maintenance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: platform-production-storage-maintenance-${{ github.run_id }}
+          path: ${{ runner.temp }}/platform-production-storage-maintenance-artifacts/maintenance.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce maintenance result
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.maintenance.outputs.remote_status }}" = "0" \
+            || { echo "Production storage maintenance failed." >&2; exit 1; }

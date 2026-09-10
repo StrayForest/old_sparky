@@ -101,12 +101,12 @@ reuse still recomputes and compares the full tree digest before execution.
 Deletion first renames a revalidated cache to a strict hidden tombstone; the
 next maintenance run validates and reclaims a tombstone left by interruption.
 
+Apply the bounded sweep through the reviewed workflow after reviewing the read-only candidate inventory:
+
 ```bash
-cd /opt/oldsparky/platform/current
-tools/platform_install_maintenance.sh
-systemctl start deadlock-maintenance.service
-systemctl status deadlock-maintenance.timer --no-pager
-journalctl -u deadlock-maintenance.service --since -2days --no-pager
+gh workflow run platform-production-storage-maintenance.yml --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=APPLY-PRODUCTION-STORAGE-MAINTENANCE -f expected_sha=<exact-source-sha-currently-deployed>
+gh run watch <maintenance-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
 When a release activation reports a full filesystem or unusable temporary directory, collect bounded read-only evidence before cleanup:
