@@ -92,6 +92,7 @@ REQUEST_PERF_START_RE = re.compile(r"\brequest_perf_start\b(?P<body>.*)$")
 SSR_PERF_RE = re.compile(r"\bssr_perf\b(?P<body>.*)$")
 SSR_STREAM_RE = re.compile(r"\bssr_stream\b(?P<body>.*)$")
 SSR_EVENT_LOOP_RE = re.compile(r"\bssr_event_loop\b(?P<body>.*)$")
+TIMEOUT_DIAGNOSTIC_ID_RE = re.compile(r"^tdiag-[0-9]{1,32}-[0-9]{5}$")
 JOURNAL_TIMESTAMP_RE = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))\b"
 )
@@ -2592,6 +2593,25 @@ def _nginx_api_records(records: list[dict[str, Any]]) -> list[tuple[str, str, in
     return selected
 
 
+def _nginx_request_correlation_keys(record: dict[str, Any]) -> tuple[str, ...]:
+    """Return safe identities that can join one Nginx record to app logs.
+
+    Nginx owns ``request_id`` while the diagnostic hop deliberately promotes
+    the bounded diagnostic ID to the Next.js/API request identity. Keep both
+    identities available: the diagnostic ID is the primary key for marked
+    requests, and the Nginx request ID preserves the normal sampled contour.
+    """
+
+    keys: list[str] = []
+    diagnostic_id = str(record.get("timeout_diagnostic_id") or "").strip()
+    if TIMEOUT_DIAGNOSTIC_ID_RE.fullmatch(diagnostic_id):
+        keys.append(diagnostic_id)
+    request_id = str(record.get("request_id") or "").strip()
+    if request_id and request_id not in keys:
+        keys.append(request_id)
+    return tuple(keys)
+
+
 def _safe_request_perf_route_class(row: dict[str, Any]) -> str:
     """Map a request_perf route to the same bounded class as Nginx data."""
 
@@ -2740,14 +2760,23 @@ def summarize_ssr_observability(
     api_records = _nginx_api_records(nginx_records)
     correlated_rows: list[dict[str, Any]] = []
     api_join_by_request_id = 0
+    api_join_by_diagnostic_id = 0
     api_join_by_cf_ray = 0
     for record in html_records:
-        request_id = str(record.get("request_id") or "")
-        stages = by_request.get(request_id)
-        stream_events = by_request_stream.get(request_id, [])
+        correlation_keys = _nginx_request_correlation_keys(record)
+        diagnostic_id = str(record.get("timeout_diagnostic_id") or "").strip()
+        if not TIMEOUT_DIAGNOSTIC_ID_RE.fullmatch(diagnostic_id):
+            diagnostic_id = ""
+        stages: dict[str, list[float]] = defaultdict(list)
+        stream_events: list[dict[str, Any]] = []
+        for correlation_key in correlation_keys:
+            for stage, durations in by_request.get(correlation_key, {}).items():
+                stages[stage].extend(durations)
+            stream_events.extend(by_request_stream.get(correlation_key, []))
         if not stages and not stream_events:
             continue
         row: dict[str, Any] = {
+            **({"diagnostic_id": diagnostic_id} if diagnostic_id else {}),
             "request_ms": _nginx_seconds(record.get("request_time")),
             "upstream_connect_ms": _nginx_seconds(record.get("upstream_connect_time")),
             "upstream_header_ms": _nginx_seconds(record.get("upstream_header_time")),
@@ -2773,12 +2802,17 @@ def summarize_ssr_observability(
         request_to_root_ms = next(
             (
                 max(0.0, -float(event["start_ms"]))
-                for event in by_request_events.get(request_id, [])
+                for correlation_key in correlation_keys
+                for event in by_request_events.get(correlation_key, [])
                 if event["stage"] == "http_request_start"
             ),
             None,
         )
-        timeline = list(by_request_events.get(request_id, []))
+        timeline = [
+            event
+            for correlation_key in correlation_keys
+            for event in by_request_events.get(correlation_key, [])
+        ]
         if request_to_root_ms is not None:
             for stream_event in stream_events:
                 elapsed_ms = float(stream_event["elapsed_ms"])
@@ -2806,12 +2840,21 @@ def summarize_ssr_observability(
         )
         row["timeline"] = [event for _order, event in ordered_timeline]
         row["stream_clock_aligned"] = request_to_root_ms is not None
-        api_rows = api_perf_by_request.get(request_id)
+        api_rows: list[dict[str, Any]] | None = None
         api_join_method = None
-        if api_rows:
-            api_join_by_request_id += len(api_rows)
-            api_join_method = "request_id"
-        else:
+        for correlation_key in correlation_keys:
+            candidate_rows = api_perf_by_request.get(correlation_key)
+            if not candidate_rows:
+                continue
+            api_rows = candidate_rows
+            if correlation_key == diagnostic_id:
+                api_join_by_diagnostic_id += len(api_rows)
+                api_join_method = "diagnostic_id"
+            else:
+                api_join_by_request_id += len(api_rows)
+                api_join_method = "request_id"
+            break
+        if not api_rows:
             cf_ray = str(record.get("cf_ray") or "").strip()
             api_rows = api_perf_by_cf_ray.get(cf_ray)
             if api_rows:
@@ -2850,11 +2893,17 @@ def summarize_ssr_observability(
             continue
         upstream_addr = str(record.get("upstream_addr") or "").strip()
         upstream_status = str(record.get("upstream_status") or "").strip()
-        request_id = diagnostic_id
-        stages = by_request.get(request_id, {})
-        stream_events = by_request_stream.get(request_id, [])
-        api_rows = api_perf_by_request.get(request_id, [])
-        api_start_rows = api_start_by_request.get(request_id, [])
+        correlation_keys = _nginx_request_correlation_keys(record)
+        stages: dict[str, list[float]] = defaultdict(list)
+        stream_events: list[dict[str, Any]] = []
+        api_rows: list[dict[str, Any]] = []
+        api_start_rows: list[dict[str, Any]] = []
+        for correlation_key in correlation_keys:
+            for stage, durations in by_request.get(correlation_key, {}).items():
+                stages[stage].extend(durations)
+            stream_events.extend(by_request_stream.get(correlation_key, []))
+            api_rows.extend(api_perf_by_request.get(correlation_key, []))
+            api_start_rows.extend(api_start_by_request.get(correlation_key, []))
         if not api_rows:
             cf_ray = str(record.get("cf_ray") or "").strip()
             api_rows = api_perf_by_cf_ray.get(cf_ray, [])
@@ -2892,7 +2941,8 @@ def summarize_ssr_observability(
                             )
                             if key in event
                         }
-                        for event in by_request_events.get(request_id, [])
+                        for correlation_key in correlation_keys
+                        for event in by_request_events.get(correlation_key, [])
                     ],
                     "stream_events": [
                         {
@@ -3123,6 +3173,11 @@ def summarize_ssr_observability(
             },
             "timeline": [
                 {
+                    **(
+                        {"diagnostic_id": row["diagnostic_id"]}
+                        if row.get("diagnostic_id")
+                        else {}
+                    ),
                     "request_ms": row.get("request_ms"),
                     "upstream_header_ms": row.get("upstream_header_ms"),
                     "upstream_ms": row.get("upstream_ms"),
@@ -3139,6 +3194,7 @@ def summarize_ssr_observability(
             "api_request_perf_join": {
                 "api_rows": api_perf_rows,
                 "matched_by_request_id": api_join_by_request_id,
+                "matched_by_diagnostic_id": api_join_by_diagnostic_id,
                 "matched_by_cf_ray": api_join_by_cf_ray,
             },
         },

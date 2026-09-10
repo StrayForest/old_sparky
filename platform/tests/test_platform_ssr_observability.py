@@ -258,6 +258,40 @@ class SsrObservabilityTests(unittest.TestCase):
             "auth_bootstrap",
         )
 
+    def test_ssr_summary_joins_diagnostic_identity_to_nginx_and_api(self) -> None:
+        diagnostic_id = "tdiag-123-00001"
+        summary = summarize_ssr_observability(
+            [
+                f"ssr_perf request_id={diagnostic_id} cf_ray=ray-1 "
+                "stage=root_layout duration_ms=4.000 outcome=ok",
+            ],
+            [
+                {
+                    "request_id": "nginx-owned-id",
+                    "timeout_diagnostic_id": diagnostic_id,
+                    "cf_ray": "ray-1",
+                    "method": "GET",
+                    "uri": "/tournaments/fixture",
+                    "status": 200,
+                    "request_time": "0.050",
+                    "upstream_header_time": "0.040",
+                    "upstream_time": "0.045",
+                }
+            ],
+            [
+                "request_perf request_id=tdiag-123-00001 method=GET "
+                "path=/api/v1/auth/bootstrap route=/api/v1/auth/bootstrap "
+                "status=200 total_ms=18.5 sql_ms=2.5",
+            ],
+        )
+
+        correlated = summary["correlated_html"]
+        self.assertEqual(correlated["requests"], 1)
+        self.assertEqual(correlated["api_request_perf_join"]["matched_by_diagnostic_id"], 1)
+        self.assertEqual(correlated["api_request_perf_join"]["matched_by_request_id"], 0)
+        self.assertEqual(correlated["timeline"][0]["diagnostic_id"], diagnostic_id)
+        self.assertEqual(correlated["timeline"][0]["api_request_perf_correlation"], "diagnostic_id")
+
     def test_ssr_summary_marks_close_without_finish_as_response_integrity_failure(self) -> None:
         summary = summarize_ssr_observability(
             [
