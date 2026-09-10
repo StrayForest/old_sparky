@@ -509,6 +509,15 @@ const server = createServer((request, response) => {
     });
     return;
   }
+  if (path === "/api/v1/content/patch-index") {
+    json(response, 200, {
+      patches: Array.from({ length: 4 }, (_, index) => ({
+        id: index === 0 ? "1836506165584438" : `183650616558443${index}`,
+        published_at: `2026-07-${String(9 - index).padStart(2, "0")}T12:00:00Z`
+      }))
+    }, { "cache-control": "public, max-age=60, stale-while-revalidate=300" });
+    return;
+  }
   if (path === "/api/v1/content/patches/1836506165584438") {
     json(response, 200, {
       id: "1836506165584438",

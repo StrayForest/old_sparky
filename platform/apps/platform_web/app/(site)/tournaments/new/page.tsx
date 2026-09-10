@@ -8,7 +8,8 @@ import { getServerCurrentUser, platformSessionCookieName } from "@/lib/server-au
 
 export const metadata: Metadata = {
   title: "Создать турнир",
-  description: "Создание турнира Deadlock в Old Sparky Arena."
+  description: "Создание турнира Deadlock в Old Sparky Arena.",
+  robots: { index: false, follow: false }
 };
 
 export default async function NewTournamentPage() {

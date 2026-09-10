@@ -38,6 +38,18 @@ class HomeContentResponse(BaseModel):
     videos_available: bool = False
 
 
+class PatchSitemapEntryResponse(BaseModel):
+    id: str = Field(pattern=r"^\d+$", min_length=1, max_length=32)
+    published_at: datetime
+
+
+class PatchSitemapIndexResponse(BaseModel):
+    patches: list[PatchSitemapEntryResponse] = Field(
+        default_factory=list,
+        max_length=4,
+    )
+
+
 class DeadlockGameAssetResponse(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     image_url: str = Field(min_length=1, max_length=1000)

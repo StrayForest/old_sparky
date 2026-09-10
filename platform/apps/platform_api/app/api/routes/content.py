@@ -9,6 +9,7 @@ from fastapi.responses import RedirectResponse
 
 from apps.platform_api.app.api.schemas import (
     HomeContentResponse,
+    PatchSitemapIndexResponse,
     DeadlockGameAssetsResponse,
     PatchDetailResponse,
     SupportMessageRequest,
@@ -17,6 +18,7 @@ from apps.platform_api.app.api.schemas import (
 )
 from apps.platform_api.app.services.home_content import (
     public_deadlock_game_assets,
+    read_patch_sitemap_index,
     resolve_deadlock_hero_image,
     resolve_deadlock_rank_image,
 )
@@ -43,6 +45,14 @@ async def home_content(response: Response) -> HomeContentResponse:
     payload = await refresh_home_content()
     response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=900"
     return HomeContentResponse.model_validate(payload)
+
+
+@router.get("/patch-index", response_model=PatchSitemapIndexResponse)
+async def patch_sitemap_index(response: Response) -> PatchSitemapIndexResponse:
+    """Return the current bounded patch projection without refreshing content."""
+
+    response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
+    return PatchSitemapIndexResponse(patches=await read_patch_sitemap_index())
 
 
 @router.get("/game-assets", response_model=DeadlockGameAssetsResponse)

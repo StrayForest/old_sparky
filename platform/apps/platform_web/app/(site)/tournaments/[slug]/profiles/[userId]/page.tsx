@@ -8,7 +8,8 @@ import { PublicProfileView } from "@/components/profile/public-profile-view";
 import { getTournamentPlayerProfile } from "@/lib/platform-api";
 
 export const metadata: Metadata = {
-  title: "Профиль участника"
+  title: "Профиль участника",
+  robots: { index: false, follow: false }
 };
 
 export default async function TournamentPlayerProfilePage({

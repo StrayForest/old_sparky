@@ -441,11 +441,19 @@ test("public discovery documents expose the canonical origin without publishing 
   ]);
 
   expect(robots.ok()).toBe(true);
-  expect(await robots.text()).toContain("Sitemap: https://old-sparky.com/sitemap.xml");
+  const robotsBody = await robots.text();
+  expect(robotsBody).toContain("User-Agent: *");
+  expect(robotsBody).toContain("Allow: /");
+  expect(robotsBody).toContain("Sitemap: https://old-sparky.com/sitemap.xml");
+  expect(robotsBody).not.toMatch(/(?:admin|auth|profile|api|reset-password)/iu);
   expect(sitemap.ok()).toBe(true);
   const sitemapBody = await sitemap.text();
   expect(sitemapBody).toContain("https://old-sparky.com/privacy");
   expect(sitemapBody).toContain("https://old-sparky.com/terms");
+  const sitemapUrls = [...sitemapBody.matchAll(/<loc>([^<]+)<\/loc>/gu)].map((match) => match[1]);
+  expect(new Set(sitemapUrls).size).toBe(sitemapUrls.length);
+  expect(sitemapUrls.filter((url) => url.includes("/patches/")).length).toBe(4);
+  expect(sitemapBody).toContain("https://old-sparky.com/patches/1836506165584438");
   expect(manifest.ok()).toBe(true);
   expect((await manifest.json()).name).toBe("Old Sparky Arena");
   expect(security.ok()).toBe(true);
@@ -531,10 +539,35 @@ test("legal documents cover Steam identity and optional email", async ({ page },
   test.skip(testInfo.project.name !== "desktop", "Legal auth copy is viewport-independent.");
   await page.goto("/privacy");
   await expect(page.getByText(/подтверждённый SteamID64 и факт привязки Steam/u)).toBeVisible();
-  await expect(page.getByText("Последнее обновление: 13 августа 2026 года")).toBeVisible();
+  await expect(page.getByText("Последнее обновление: 10 сентября 2026 года")).toBeVisible();
+  await expect(page.getByText(/Google AdSense/u)).toBeVisible();
+  await expect(page.getByText(/Google CMP/u)).toBeVisible();
+  await expect(page.getByRole("link", { name: /как Google использует данные/u })).toHaveAttribute(
+    "href",
+    "https://policies.google.com/technologies/partner-sites?hl=ru",
+  );
+  await expect(page.getByRole("link", { name: "управление рекламными предпочтениями" })).toHaveAttribute(
+    "href",
+    "https://adssettings.google.com/",
+  );
+  await expect(page.getByText(/Мы не используем рекламные cookie/u)).toHaveCount(0);
 
   await page.goto("/terms");
   await expect(page.getByText(/Для аккаунта, созданного через Steam, email не обязателен/u)).toBeVisible();
+  await expect(page.getByText("Последнее обновление: 13 августа 2026 года")).toBeVisible();
+});
+
+test("service-only pages use metadata noindex while public profiles stay discoverable", async ({ page }) => {
+  for (const path of ["/auth/login", "/auth/register", "/profile/me", "/tournaments/new", "/tournaments/night-veil-open-5/profiles/u_lisalexy"]) {
+    await page.goto(path);
+    const robotsValues = await page.locator('meta[name="robots"]').evaluateAll((elements) => (
+      elements.map((element) => element.getAttribute("content") || "")
+    ));
+    expect(robotsValues.some((content) => /noindex, ?nofollow/u.test(content))).toBe(true);
+  }
+
+  await page.goto("/profile/lisalexy");
+  await expect(page.locator('meta[name="robots"]')).toHaveCount(0);
 });
 
 test("site pages keep the same space between hero and working area", async ({ page }, testInfo) => {

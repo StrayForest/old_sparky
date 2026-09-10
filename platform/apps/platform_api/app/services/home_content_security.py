@@ -159,6 +159,7 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
                     ex=base.PATCH_DETAIL_TTL_SECONDS,
                 )
             await pipeline.execute()
+        translation_registration_succeeded = True
         if patch_details:
             try:
                 translation_registration = await ensure_patch_translation_records(
@@ -172,9 +173,16 @@ async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
                         translation_registration["enqueue_failures"],
                     )
             except Exception:
+                translation_registration_succeeded = False
                 logger.exception(
                     "home_content_translation_registration_failed"
                 )
+        if (
+            translation_registration_succeeded
+            and not isinstance(steam_result, Exception)
+            and patch_details
+        ):
+            await base.publish_patch_sitemap_index(patches)
         return payload
     finally:
         if acquired:

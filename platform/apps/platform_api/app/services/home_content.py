@@ -36,6 +36,7 @@ HOME_CONTENT_STALE_KEY = "platform:home-content:stale:v4"
 HOME_CONTENT_LOCK_KEY = "platform:home-content:refresh-lock:v4"
 PATCH_DETAIL_KEY_PREFIX = "platform:home-content:patch:v6:"
 PATCH_ASSET_CATALOG_KEY = "platform:home-content:patch-assets:v4"
+PATCH_SITEMAP_INDEX_KEY = "platform:seo:patch-index:v1"
 PATCH_DETAIL_TTL_SECONDS = 30 * 24 * 60 * 60
 PATCH_ASSET_CATALOG_TTL_SECONDS = 6 * 60 * 60
 REFRESH_LOCK_SECONDS = 30
@@ -811,6 +812,83 @@ async def _read_json(client: Any, key: str) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def patch_sitemap_entries(patches: Any) -> list[dict[str, str]]:
+    """Build the bounded sitemap projection from the current home patches."""
+
+    if not isinstance(patches, list):
+        return []
+    entries: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for patch in patches:
+        if len(entries) >= HOME_PATCH_LIMIT:
+            break
+        if not isinstance(patch, dict):
+            continue
+        patch_id = str(patch.get("id") or "").strip()
+        if not patch_id.isdigit() or len(patch_id) > 32 or patch_id in seen_ids:
+            continue
+        try:
+            published_at = _source_datetime(patch.get("published_at"))
+        except (TypeError, ValueError):
+            continue
+        seen_ids.add(patch_id)
+        entries.append({"id": patch_id, "published_at": published_at.isoformat()})
+    return entries
+
+
+def _decode_patch_sitemap_index(raw_value: Any) -> list[dict[str, str]] | None:
+    if raw_value is None:
+        return None
+    try:
+        value = json.loads(raw_value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, list):
+        return None
+    return patch_sitemap_entries(value)
+
+
+async def read_patch_sitemap_index() -> list[dict[str, str]]:
+    """Read only the ready sitemap projection; never trigger a content refresh."""
+
+    cache = redis_client()
+    try:
+        index = _decode_patch_sitemap_index(await cache.get(PATCH_SITEMAP_INDEX_KEY))
+        if index is not None:
+            return index
+        for home_key in (HOME_CONTENT_KEY, HOME_CONTENT_STALE_KEY):
+            payload = await _read_json(cache, home_key)
+            if payload is None or not isinstance(payload.get("patches"), list):
+                continue
+            return patch_sitemap_entries(payload["patches"])
+        return []
+    except Exception:  # noqa: BLE001
+        logger.warning("patch_sitemap_index_read_failed")
+        return []
+    finally:
+        await cache.aclose()
+
+
+async def publish_patch_sitemap_index(patches: Any) -> bool:
+    """Replace the current bounded projection without deleting its prior value."""
+
+    entries = patch_sitemap_entries(patches)
+    if not entries:
+        return False
+    cache = redis_client()
+    try:
+        await cache.set(
+            PATCH_SITEMAP_INDEX_KEY,
+            json.dumps(entries, ensure_ascii=False, separators=(",", ":")),
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("patch_sitemap_index_write_failed")
+        return False
+    finally:
+        await cache.aclose()
 
 
 async def refresh_home_content(*, force: bool = False) -> dict[str, Any]:
