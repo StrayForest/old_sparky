@@ -9,12 +9,15 @@ const graceMs = Number.isFinite(configuredGraceMs)
   : 10_000;
 
 let shutdownScheduled = false;
+let activeSsrRequests = 0;
 
 const ssrStreamDiagnosticsEnabled = process.env.PLATFORM_SSR_PERF_LOG_ENABLED === "true";
 const ssrStreamState = Symbol.for("old-sparky.ssr-stream-state");
 const ssrStreamInstallState = Symbol.for("old-sparky.ssr-stream-installed");
 const ssrRequestStart = Symbol.for("old-sparky.ssr-request-start");
 const ssrRequestStartHeader = "x-platform-ssr-request-start-ms";
+const timeoutDiagnosticIdHeader = "x-platform-timeout-diagnostic-id";
+const timeoutDiagnosticIdPattern = /^tdiag-[0-9]{1,32}-[0-9]{5}$/;
 const maxStreamWrites = 100_000;
 const maxStreamBytes = 100_000_000;
 
@@ -43,11 +46,28 @@ function requestFor(response) {
     : null;
 }
 
+function requestCorrelationId(request) {
+  const diagnosticId = request
+    && request.headers
+    && request.headers[timeoutDiagnosticIdHeader];
+  return safeToken(
+    timeoutDiagnosticIdPattern.test(typeof diagnosticId === "string" ? diagnosticId.trim() : "")
+      ? diagnosticId
+      : "",
+    safeToken(request && request.headers && request.headers["x-request-id"], "unknown")
+  );
+}
+
 function shouldTrace(response) {
   if (!ssrStreamDiagnosticsEnabled) {
     return false;
   }
   const request = requestFor(response);
+  const diagnosticId = request
+    && request.headers
+    && request.headers[timeoutDiagnosticIdHeader];
+  const validDiagnosticId = typeof diagnosticId === "string"
+    && timeoutDiagnosticIdPattern.test(diagnosticId.trim());
   const sampleKey = request && (
     request.headers["x-request-id"]
     || request.headers["cf-ray"]
@@ -56,7 +76,7 @@ function shouldTrace(response) {
   if (
     !request
     || request.method !== "GET"
-    || !sampleRequest(sampleKey, sampleRate())
+    || (!validDiagnosticId && !sampleRequest(sampleKey, sampleRate()))
   ) {
     return false;
   }
@@ -80,15 +100,35 @@ function logStreamStage(response, stage) {
   }
   const state = response[ssrStreamState];
   console.info(
-    `ssr_stream request_id=${safeToken(request.headers["x-request-id"], "unknown")}`
+    `ssr_stream request_id=${requestCorrelationId(request)}`
       + ` cf_ray=${safeToken(request.headers["cf-ray"], "unknown")}`
       + ` stage=${stage} elapsed_ms=${elapsedSinceRequestStart(request)}`
+      + ` active_requests=${activeSsrRequests}`
       + ` status=${Number(response.statusCode) || 0}`
       + ` writable_finished=${response.writableFinished ? 1 : 0}`
       + ` write_count=${state ? state.writeCount : 0}`
       + ` body_bytes=${state ? state.bodyBytes : 0}`
       + ` response_error=${state && state.responseError ? 1 : 0}`
   );
+}
+
+function markRequestStart(response) {
+  const state = streamStateFor(response);
+  if (!state || state.requestStarted) {
+    return;
+  }
+  state.requestStarted = true;
+  activeSsrRequests += 1;
+  logStreamStage(response, "request_start");
+}
+
+function releaseRequest(response) {
+  const state = response[ssrStreamState];
+  if (!state || state.requestReleased) {
+    return;
+  }
+  state.requestReleased = true;
+  activeSsrRequests = Math.max(0, activeSsrRequests - 1);
 }
 
 function attachResponseLifecycle(response) {
@@ -107,6 +147,7 @@ function attachResponseLifecycle(response) {
     }
     state.closeLogged = true;
     logStreamStage(response, "response_close");
+    releaseRequest(response);
   });
   response.once("error", () => {
     const state = response[ssrStreamState];
@@ -124,6 +165,8 @@ function streamStateFor(response) {
   }
   if (!response[ssrStreamState]) {
     response[ssrStreamState] = {
+      requestStarted: false,
+      requestReleased: false,
       responseStarted: false,
       firstBodyWriteAttempt: false,
       finishLogged: false,
@@ -196,7 +239,7 @@ function installSsrStreamDiagnostics() {
         if (request.headers && typeof request.headers === "object") {
           request.headers[ssrRequestStartHeader] = String(request[ssrRequestStart]);
         }
-        streamStateFor(response);
+        markRequestStart(response);
       }
       return originalEmit.call(this, event, request, response, ...args);
     };

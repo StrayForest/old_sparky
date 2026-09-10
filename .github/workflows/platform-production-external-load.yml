@@ -31,6 +31,11 @@ on:
           - read-mix-stress-v2
           - read-mix-concurrency-ramp-v1
           - authenticated-page-load-v1
+      timeout_diagnostics:
+        description: "Enable bounded per-timeout client/edge/Next/API evidence (diagnostic-only)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -52,6 +57,7 @@ jobs:
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       CONTROL_EMAIL: ${{ inputs.control_email }}
       PROFILE_ID: ${{ inputs.profile_id }}
+      TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       TARGET_SHA: ${{ github.sha }}
       SOURCE_GIT_SHA: ${{ github.sha }}
 
@@ -65,8 +71,15 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "External production load must run from dev." >&2; exit 1; }
-          test "$QA_CONFIRMATION" = "RUN-PRODUCTION-EXTERNAL-LOAD" \
-            || { echo "Refusing external production load without exact confirmation." >&2; exit 1; }
+          if [[ "$TIMEOUT_DIAGNOSTICS" == "true" ]]; then
+            test "$PROFILE_ID" = "authenticated-page-load-v1" \
+              || { echo "Timeout diagnostics require authenticated-page-load-v1." >&2; exit 1; }
+            test "$QA_CONFIRMATION" = "RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS" \
+              || { echo "Timeout diagnostics require their dedicated confirmation." >&2; exit 1; }
+          else
+            test "$QA_CONFIRMATION" = "RUN-PRODUCTION-EXTERNAL-LOAD" \
+              || { echo "Refusing external production load without exact confirmation." >&2; exit 1; }
+          fi
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
@@ -141,6 +154,7 @@ jobs:
             bash -s -- \
               "$QA_CONFIRMATION" "$TARGET_SHA" "$CONTROL_EMAIL" "$SETUP_CONCURRENCY" \
               "$GITHUB_RUN_ID" external-vote "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
+              "$TIMEOUT_DIAGNOSTICS" \
             > "$remote_log" 2>&1 <<'REMOTE' &
           set -Eeuo pipefail
           sudo -n -- /opt/oldsparky/platform/current/tools/platform_production_external_fixture_qa.sh "$@"
@@ -170,13 +184,48 @@ jobs:
 
           if [[ "$manifest_ready" == "1" ]]; then
             chmod 600 "$manifest_path"
-            set +e
-            python3 platform/tools/platform_load.py run \
-              --profile "$PROFILE_ID" \
-              --manifest "$manifest_path" \
+            load_args=(
+              python3 platform/tools/platform_load.py run
+              --profile "$PROFILE_ID"
+              --manifest "$manifest_path"
               --report-path "$client_report"
+            )
+            if [[ "$TIMEOUT_DIAGNOSTICS" == "true" ]]; then
+              load_args+=(--timeout-diagnostics-run-id "$GITHUB_RUN_ID")
+            fi
+            set +e
+            "${load_args[@]}"
             load_status="$?"
             set -e
+            if [[ "$TIMEOUT_DIAGNOSTICS" == "true" ]]; then
+              diagnostic_ids="$artifact_dir/timeout-diagnostic-ids.json"
+              /usr/bin/python3 - "$client_report" "$diagnostic_ids" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          summary = report.get("overall") or report.get("raw_http") or {}
+          ids = sorted({
+              row["diagnostic_id"]
+              for row in summary.get("timeout_diagnostics") or []
+              if (
+                  isinstance(row, dict)
+                  and row.get("error_kind") == "TimeoutError"
+                  and isinstance(row.get("diagnostic_id"), str)
+              )
+          })
+          Path(sys.argv[2]).write_text(json.dumps(ids) + "\n", encoding="utf-8")
+          PY
+              if ! scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+                -i "$SSH_DIR/id_ed25519" \
+                "$diagnostic_ids" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/timeout-diagnostic-ids.json" \
+                >/dev/null 2>&1; then
+                echo "Timeout diagnostic ID handoff to the origin failed." >&2
+                load_status=1
+              fi
+            fi
             ssh \
               -F "$SSH_DIR/config" \
               -o BatchMode=yes \
@@ -203,7 +252,17 @@ jobs:
               :
             fi
           done
-          if [[ -s "$client_report" && -s "$artifact_dir/server-observability.log" ]]; then
+          if [[ "$TIMEOUT_DIAGNOSTICS" == "true" \
+            && -s "$client_report" \
+            && -s "$artifact_dir/server-observability.log" ]]; then
+            python3 platform/tools/platform_timeout_diagnostics.py \
+              --client-report "$client_report" \
+              --server-observability "$artifact_dir/server-observability.log" \
+              --output "$artifact_dir/timeout-diagnostics.json"
+          fi
+          if [[ "$TIMEOUT_DIAGNOSTICS" != "true" \
+            && -s "$client_report" \
+            && -s "$artifact_dir/server-observability.log" ]]; then
             set +e
             python3 platform/tools/platform_load.py evaluate \
               --profile "$PROFILE_ID" \
@@ -264,7 +323,7 @@ jobs:
               -o IdentitiesOnly=yes \
               -i "$SSH_DIR/id_ed25519" \
               "$PROD_SSH_USER@$PROD_SSH_HOST" \
-              "rm -f -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/complete /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/ready /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix-summary.json /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/server-observability.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/qa-command.log && rmdir -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID 2>/dev/null || true" \
+              "rm -f -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/complete /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/ready /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix-summary.json /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/server-observability.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/qa-command.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/timeout-diagnostic-ids.json && rmdir -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID 2>/dev/null || true" \
               >/dev/null 2>&1 || true
             ssh \
               -F "$SSH_DIR/config" \
@@ -288,6 +347,7 @@ jobs:
             ${{ runner.temp }}/platform-external-load-artifacts/matrix-summary.json
             ${{ runner.temp }}/platform-external-load-artifacts/matrix.log
             ${{ runner.temp }}/platform-external-load-artifacts/server-observability.log
+            ${{ runner.temp }}/platform-external-load-artifacts/timeout-diagnostics.json
             ${{ runner.temp }}/platform-external-load-remote.log
             ${{ runner.temp }}/platform-external-load-cleanup.json
             ${{ runner.temp }}/platform-external-load-cleanup.log
@@ -318,9 +378,12 @@ jobs:
               logical_latency = logical.get("end_to_end_latency") or {}
               acceptance = payload.get("acceptance") or {}
               contract = payload.get("load_contract") or {}
+              diagnostic_mode = (payload.get("timeout_path_diagnostics") or {}).get("enabled", False)
               print(f"- Profile: **{contract.get('profile_id')}** v{contract.get('profile_version')}; digest: `{contract.get('profile_digest')}`")
               print(f"- Source SHA: `{payload.get('source_git_sha')}`; runner: {((payload.get('runner') or {}).get('location'))}")
               print(f"- Mode: **{payload.get('mode')}**")
+              if diagnostic_mode:
+                  print("- Mode note: **timeout-path diagnostics only**; acceptance is intentionally not evaluated.")
               print(f"- Fixture: {payload.get('users')} users / {payload.get('tournaments')} tournaments")
               print(f"- Raw HTTP attempts: {overall.get('requests')}; errors: {overall.get('errors')}; overloads: {overall.get('temporary_overload_responses', 0)}")
               print(f"- Raw attempt p50/p95/p99: {latency.get('p50_ms')} / {latency.get('p95_ms')} / {latency.get('p99_ms')} ms")
@@ -343,8 +406,13 @@ jobs:
             || { echo "External fixture never reached the barrier." >&2; exit 1; }
           test "${{ steps.external-run.outputs.remote_status }}" = "0" \
             || { echo "Origin external-load supervisor failed." >&2; exit 1; }
-          test "${{ steps.external-run.outputs.load_status }}" = "0" \
-            || { echo "External load acceptance failed." >&2; exit 1; }
+          if [[ "$TIMEOUT_DIAGNOSTICS" == "true" ]]; then
+            test -s "$RUNNER_TEMP/platform-external-load-artifacts/timeout-diagnostics.json" \
+              || { echo "Timeout diagnostic evidence was not produced." >&2; exit 1; }
+          else
+            test "${{ steps.external-run.outputs.load_status }}" = "0" \
+              || { echo "External load acceptance failed." >&2; exit 1; }
+          fi
           test "${{ steps.cleanup.outputs.cleanup_status }}" = "0" \
             || { echo "Exact external-load cleanup failed." >&2; exit 1; }
 

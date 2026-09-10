@@ -9,6 +9,8 @@ const NONCE_HEADER = "x-nonce";
 const SSR_TRACE_HEADER = "x-platform-ssr-trace";
 const SSR_PROXY_START_HEADER = "x-platform-ssr-proxy-start-ms";
 const SSR_REQUEST_START_HEADER = "x-platform-ssr-request-start-ms";
+const TIMEOUT_DIAGNOSTIC_ID_HEADER = "x-platform-timeout-diagnostic-id";
+const TIMEOUT_DIAGNOSTIC_ID_RE = /^tdiag-[0-9]{1,32}-[0-9]{5}$/u;
 const REPORTING_ENDPOINTS = 'csp-endpoint="/api/v1/security/csp-report"';
 
 function boundedSampleRate(): number {
@@ -27,6 +29,10 @@ function sampleRequest(requestId: string, rate: number): boolean {
 
 function ssrDiagnosticsEnabled(): boolean {
   return process.env.PLATFORM_SSR_PERF_LOG_ENABLED === "true";
+}
+
+function hasTimeoutDiagnosticId(value: string | null): boolean {
+  return value !== null && TIMEOUT_DIAGNOSTIC_ID_RE.test(value.trim());
 }
 
 function safeEpochMilliseconds(value: string | null): number | null {
@@ -72,6 +78,9 @@ export function proxy(request: NextRequest) {
   requestHeaders.delete(SSR_PROXY_START_HEADER);
   requestHeaders.delete(SSR_REQUEST_START_HEADER);
   if (ssrDiagnosticsEnabled()) {
+    const hasDiagnosticId = hasTimeoutDiagnosticId(
+      request.headers.get(TIMEOUT_DIAGNOSTIC_ID_HEADER)
+    );
     const sampleKey = request.headers.get("x-request-id")
       || request.headers.get("cf-ray")
       || "unknown";
@@ -81,7 +90,7 @@ export function proxy(request: NextRequest) {
     const proxyStartedAtMs = Date.now();
     requestHeaders.set(
       SSR_TRACE_HEADER,
-      sampleRequest(sampleKey, boundedSampleRate()) ? "1" : "0"
+      hasDiagnosticId || sampleRequest(sampleKey, boundedSampleRate()) ? "1" : "0"
     );
     requestHeaders.set(SSR_REQUEST_START_HEADER, String(requestStartedAtMs));
     requestHeaders.set(SSR_PROXY_START_HEADER, String(proxyStartedAtMs));

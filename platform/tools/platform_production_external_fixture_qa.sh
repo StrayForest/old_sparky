@@ -14,6 +14,7 @@ QA_PYTHON="$RUNTIME_ROOT/shared/venv/bin/python"
 OUTPUT_ROOT_BASE="$RUNTIME_ROOT/shared/production-retained-matrix"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"
+TIMEOUT_DIAGNOSTICS_CONFIRMATION="RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS"
 LOCK_PATH="/run/lock/oldsparky-retained-load-matrix.lock"
 EXPECTED_ORIGIN="https://old-sparky.com"
 MAX_RUNTIME="180m"
@@ -31,8 +32,8 @@ flock -n 9 || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
-if (( $# != 8 )); then
-  echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament>" >&2
+if (( $# != 8 && $# != 9 )); then
+  echo "Usage: $0 $EXTERNAL_CONFIRMATION <target-sha> <control-email> <concurrency> <run-id> external-vote <tournament-count> <users-per-tournament> [timeout-path]" >&2
   exit 2
 fi
 
@@ -44,11 +45,8 @@ run_id="$5"
 profile="$6"
 external_vote_tournament_count="$7"
 external_vote_users_per_tournament="$8"
+timeout_diagnostics="${9:-false}"
 
-[[ "$confirmation" == "$EXTERNAL_CONFIRMATION" ]] || {
-  echo "External-load fixture requires the dedicated external-load confirmation." >&2
-  exit 1
-}
 [[ "$profile" == "external-vote" ]] || {
   echo "External-load fixture supports only the external-vote profile." >&2
   exit 1
@@ -77,6 +75,21 @@ external_vote_users_per_tournament="$8"
   echo "External vote users per tournament must be between 14 and 500." >&2
   exit 1
 }
+[[ "$timeout_diagnostics" == "true" || "$timeout_diagnostics" == "false" ]] || {
+  echo "Timeout diagnostics mode must be true or false." >&2
+  exit 1
+}
+if [[ "$timeout_diagnostics" == "true" ]]; then
+  [[ "$confirmation" == "$TIMEOUT_DIAGNOSTICS_CONFIRMATION" ]] || {
+    echo "Timeout diagnostics require the dedicated timeout-diagnostics confirmation." >&2
+    exit 1
+  }
+else
+  [[ "$confirmation" == "$EXTERNAL_CONFIRMATION" ]] || {
+    echo "External-load fixture requires the dedicated external-load confirmation." >&2
+    exit 1
+  }
+fi
 
 test -x "$QA_PYTHON" || {
   echo "Production QA Python runtime is missing." >&2
@@ -140,6 +153,7 @@ external_vote_complete="$export_dir/complete"
 external_vote_ready="$export_dir/ready"
 external_vote_observer_output="$external_vote_root/server-observability.json"
 external_vote_observer_log="$external_vote_root/server-observer.log"
+timeout_diagnostic_ids_path="$export_dir/timeout-diagnostic-ids.json"
 
 set +e
 timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
@@ -225,14 +239,20 @@ if [[ "$qa_status" == "0" && -s "$external_vote_manifest" ]]; then
   rm -f -- "$external_vote_complete" "$external_vote_ready"
 
   set +e
+  observer_args=(
+    "$TOOLS_DIR/platform_external_load_observer.py"
+    --env-file "$RUNTIME_ROOT/shared/.env.platform"
+    --output "$external_vote_observer_output"
+    --stop-file "$external_vote_complete"
+    --interval 1
+    --max-runtime 10_800
+  )
+  if [[ "$timeout_diagnostics" == "true" ]]; then
+    observer_args+=(--diagnostic-id-file "$timeout_diagnostic_ids_path")
+  fi
   timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
     env PLATFORM_RUNTIME_SERVICE=observer \
-    "$QA_PYTHON" "$TOOLS_DIR/platform_external_load_observer.py" \
-      --env-file "$RUNTIME_ROOT/shared/.env.platform" \
-      --output "$external_vote_observer_output" \
-      --stop-file "$external_vote_complete" \
-      --interval 1 \
-      --max-runtime 10_800 \
+    "$QA_PYTHON" "${observer_args[@]}" \
       > "$external_vote_observer_log" 2>&1 &
   observer_pid="$!"
   set -e
@@ -274,7 +294,7 @@ if [[ "$qa_status" == "0" && -s "$external_vote_manifest" ]]; then
     cp "$external_vote_observer_log" "$server_observability_log"
   fi
   # No credential-bearing manifest should survive the measurement barrier.
-  rm -f -- "$external_vote_manifest" "$export_dir/manifest.json" "$external_vote_ready"
+  rm -f -- "$external_vote_manifest" "$export_dir/manifest.json" "$export_dir/timeout-diagnostic-ids.json" "$external_vote_ready"
 fi
 
 shopt -s nullglob
