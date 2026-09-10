@@ -11,6 +11,10 @@ on:
         description: "GitHub run ID of the canceled production retained-load workflow"
         required: true
         type: string
+      target_sha:
+        description: "Exact source SHA currently deployed on the production VPS"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -31,7 +35,7 @@ jobs:
       PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       LOAD_RUN_ID: ${{ inputs.load_run_id }}
-      TARGET_SHA: ${{ github.sha }}
+      TARGET_SHA: ${{ inputs.target_sha }}
 
     steps:
       - name: Validate explicit abort confirmation
@@ -44,6 +48,8 @@ jobs:
             || { echo "Refusing abort without exact confirmation." >&2; exit 1; }
           [[ "$LOAD_RUN_ID" =~ ^[0-9]+$ ]] \
             || { echo "load_run_id must be numeric." >&2; exit 1; }
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "target_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
