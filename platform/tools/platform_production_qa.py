@@ -2455,7 +2455,9 @@ def parse_ssr_event_loop_line(line: str) -> dict[str, Any] | None:
             continue
         key, raw_value = token.split("=", 1)
         with suppress(ValueError):
-            values[key] = float(raw_value)
+            value = float(raw_value)
+            if math.isfinite(value):
+                values[key] = value
     journal_timestamp = _journal_timestamp(line)
     if journal_timestamp is not None:
         values["journal_timestamp"] = journal_timestamp
@@ -2977,6 +2979,7 @@ def summarize_ssr_observability(
             key: row[key]
             for key in (
                 "journal_timestamp",
+                "pid",
                 "p50_ms",
                 "p95_ms",
                 "p99_ms",
@@ -2986,6 +2989,11 @@ def summarize_ssr_observability(
                 "cpu_pct",
                 "gc_count",
                 "gc_duration_ms",
+                "rss_bytes",
+                "heap_total_bytes",
+                "heap_used_bytes",
+                "external_bytes",
+                "array_buffers_bytes",
             )
             if key in row
         }
@@ -3071,6 +3079,31 @@ def summarize_ssr_observability(
             ),
         }
 
+    event_loop_by_pid: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in event_loop_rows:
+        pid = row.get("pid")
+        if isinstance(pid, (int, float)) and math.isfinite(float(pid)):
+            event_loop_by_pid[str(int(pid))].append(row)
+
+    def event_loop_memory(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            key: scalar_stats(
+                [
+                    float(row[key])
+                    for row in rows
+                    if isinstance(row.get(key), (int, float))
+                    and not isinstance(row.get(key), bool)
+                ]
+            )
+            for key in (
+                "rss_bytes",
+                "heap_total_bytes",
+                "heap_used_bytes",
+                "external_bytes",
+                "array_buffers_bytes",
+            )
+        }
+
     return {
         "scope": {
             "kind": "diagnostic_sample",
@@ -3101,6 +3134,16 @@ def summarize_ssr_observability(
             "gc_count": scalar_stats(
                 [float(row["gc_count"]) for row in event_loop_rows if isinstance(row.get("gc_count"), (int, float))]
             ),
+            "memory": {
+                **event_loop_memory(event_loop_rows),
+            },
+            "by_pid": {
+                pid: {
+                    "samples": len(rows),
+                    "memory": event_loop_memory(rows),
+                }
+                for pid, rows in sorted(event_loop_by_pid.items())
+            },
         },
         "ssr_stages": {
             "logged_stages": len(stage_rows),

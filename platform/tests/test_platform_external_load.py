@@ -125,6 +125,41 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(summary["errors"], 0)
         self.assertNotIn(secret, serialized)
 
+    def test_summary_reports_explicit_client_transport_and_phase_timings(self) -> None:
+        result = RequestResult(
+            phase="authenticated_page_load",
+            method="GET",
+            path="/tournaments/qa-tournament",
+            status=200,
+            elapsed_ms=40.0,
+            ok=True,
+            response_bytes=120,
+            time_to_first_byte_ms=18.0,
+            transport_timing={
+                "transport": "http1-keepalive",
+                "http_version": "1.1",
+                "connection_reused": True,
+                "dns_ms": 1.0,
+                "tcp_connect_ms": 2.0,
+                "tls_handshake_ms": 3.0,
+                "request_write_ms": 4.0,
+                "edge_wait_ms": 5.0,
+                "ttfb_ms": 18.0,
+                "body_receive_ms": 22.0,
+                "total_ms": 40.0,
+            },
+        )
+
+        summary = summarize_results([result])
+
+        self.assertEqual(summary["transport"]["names"], {"http1-keepalive": 1})
+        self.assertEqual(summary["transport"]["http_versions"], {"1.1": 1})
+        self.assertEqual(summary["transport"]["connection_reused"], 1)
+        self.assertEqual(
+            summary["transport"]["phase_timings"]["ttfb_ms"]["p95_ms"],
+            18.0,
+        )
+
     def test_summary_keeps_only_bounded_cloudflare_failure_diagnostics(self) -> None:
         result = RequestResult(
             phase="write_external_vote",
@@ -632,6 +667,86 @@ class ExternalLoadTests(unittest.TestCase):
             18.0,
         )
         self.assertEqual(report["overall"]["response_bytes"]["max_bytes"], 12_000)
+
+    def test_page_load_passes_explicit_transport_and_retains_phase_evidence(self) -> None:
+        payload = manifest_payload()
+        _, users = load_manifest_from_payload(payload)
+        transports: list[str] = []
+
+        def fake_trace(origin: str, timeout: float) -> dict[str, str]:
+            return {"status": "200", "ip": "192.0.2.10", "colo": "TEST"}
+
+        def fake_page_request(
+            origin: str,
+            user: VirtualUser,
+            phase: str,
+            timeout: float,
+            *,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+            transport: str = "urllib-http1-close",
+        ) -> RequestResult:
+            transports.append(transport)
+            return RequestResult(
+                phase=phase,
+                method="GET",
+                path=f"/tournaments/{user.tournament_slug}",
+                status=200,
+                elapsed_ms=40.0,
+                ok=True,
+                response_bytes=12_000,
+                time_to_first_byte_ms=18.0,
+                transport_timing={
+                    "transport": transport,
+                    "http_version": "1.1",
+                    "connection_reused": len(transports) > 1,
+                    "dns_ms": 1.0,
+                    "tcp_connect_ms": 2.0,
+                    "tls_handshake_ms": 3.0,
+                    "request_write_ms": 4.0,
+                    "edge_wait_ms": 5.0,
+                    "ttfb_ms": 18.0,
+                    "body_receive_ms": 22.0,
+                    "total_ms": 40.0,
+                },
+            )
+
+        with (
+            patch("tools.platform_external_load._trace", side_effect=fake_trace),
+            patch("tools.platform_external_load._page_request", side_effect=fake_page_request),
+        ):
+            report = run_load(
+                payload,
+                users,
+                mode="page-load",
+                spread_seconds=0,
+                concurrency=1,
+                timeout=1,
+                duplicate_count=0,
+                manual_refresh_count=0,
+                p95_budget_ms=1000,
+                p99_budget_ms=2000,
+                client_transport="http1-keepalive",
+                acceptance_contract={
+                    "kind": "stress",
+                    "accepted_request_latency": {
+                        "p50_ms": 100,
+                        "p90_ms": 100,
+                        "p95_ms": 100,
+                        "p99_ms": 100,
+                    },
+                    "logical_latency": {"p95_ms": 100, "p99_ms": 100},
+                    "max_shed_percent": 0,
+                    "max_retry_amplification_percent": 0,
+                },
+            )
+
+        self.assertEqual(transports, ["http1-keepalive", "http1-keepalive"])
+        self.assertEqual(report["client_transport"], "http1-keepalive")
+        self.assertEqual(
+            report["overall"]["transport"]["phase_timings"]["ttfb_ms"]["p95_ms"],
+            18.0,
+        )
 
     def test_page_load_diagnostic_mode_assigns_stable_per_user_ids(self) -> None:
         payload = manifest_payload()

@@ -207,6 +207,10 @@ class PlatformConfigureSharedEnvTests(unittest.TestCase):
                 "PLATFORM_WEB_SERVER_AUTH_TRANSPORT": "node",
             },
         )
+        self.assertEqual(
+            configure.RUNTIME_PROFILES["web-ssr-native-transport"],
+            {"PLATFORM_WEB_SERVER_AUTH_TRANSPORT": "node"},
+        )
         self.assertEqual(configure.PUBLIC_BASELINE["PLATFORM_WEB_WORKERS"], "1")
         self.assertEqual(
             configure.PUBLIC_BASELINE["PLATFORM_WEB_SERVER_AUTH_TRANSPORT"],

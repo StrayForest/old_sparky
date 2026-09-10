@@ -65,8 +65,10 @@ export async function register(): Promise<void> {
     const cpuUserMs = cpuUsage.user / 1_000;
     const cpuSystemMs = cpuUsage.system / 1_000;
     const cpuPercent = ((cpuUserMs + cpuSystemMs) / elapsedMs) * 100;
+    const memoryUsage = nodeProcess.memoryUsage();
     console.info(
-      `ssr_event_loop p50_ms=${milliseconds(histogram.percentile(50))}`
+      `ssr_event_loop pid=${nodeProcess.pid}`
+        + ` p50_ms=${milliseconds(histogram.percentile(50))}`
         + ` p95_ms=${milliseconds(histogram.percentile(95))}`
         + ` p99_ms=${milliseconds(histogram.percentile(99))}`
         + ` max_ms=${milliseconds(histogram.max)}`
@@ -77,6 +79,11 @@ export async function register(): Promise<void> {
         + ` cpu_system_ms=${cpuSystemMs.toFixed(3)}`
         + ` gc_count=${gcCount}`
         + ` gc_duration_ms=${gcDurationMs.toFixed(3)}`
+        + ` rss_bytes=${memoryUsage.rss}`
+        + ` heap_total_bytes=${memoryUsage.heapTotal}`
+        + ` heap_used_bytes=${memoryUsage.heapUsed}`
+        + ` external_bytes=${memoryUsage.external}`
+        + ` array_buffers_bytes=${memoryUsage.arrayBuffers}`
     );
     histogram.reset();
     gcCount = 0;

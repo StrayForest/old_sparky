@@ -36,6 +36,11 @@ class SsrObservabilityTests(unittest.TestCase):
             )["p95_ms"],
             4.0,
         )
+        self.assertIsNone(
+            parse_ssr_event_loop_line(
+                "ssr_event_loop p50_ms=1.000 p95_ms=NaN"
+            )
+        )
         event_loop = parse_ssr_event_loop_line(
             "ssr_event_loop p50_ms=1.000 p95_ms=4.000 p99_ms=6.000 max_ms=8.000 "
             "mean_ms=2.000 elu=0.910000 cpu_pct=87.500 gc_count=2 gc_duration_ms=3.250"
@@ -115,6 +120,31 @@ class SsrObservabilityTests(unittest.TestCase):
         )
         self.assertNotIn("private-fixture-slug", serialized)
         self.assertNotIn("req-1", serialized)
+
+    def test_ssr_summary_includes_opt_in_memory_telemetry(self) -> None:
+        summary = summarize_ssr_observability(
+            [
+                "ssr_event_loop pid=1234 p50_ms=1.000 p95_ms=4.000 p99_ms=6.000 "
+                "max_ms=8.000 mean_ms=2.000 elu=0.910000 cpu_pct=87.500 "
+                "gc_count=2 gc_duration_ms=3.250 rss_bytes=100000 "
+                "heap_total_bytes=80000 heap_used_bytes=50000 "
+                "external_bytes=25000 array_buffers_bytes=12000",
+            ],
+            [],
+        )
+
+        self.assertEqual(
+            summary["event_loop"]["memory"]["rss_bytes"]["p95"],
+            100000.0,
+        )
+        self.assertEqual(
+            summary["event_loop"]["memory"]["array_buffers_bytes"]["p95"],
+            12000.0,
+        )
+        self.assertEqual(
+            summary["event_loop"]["by_pid"]["1234"]["memory"]["rss_bytes"]["p95"],
+            100000.0,
+        )
 
     def test_nginx_collection_filters_records_to_requested_window(self) -> None:
         with TemporaryDirectory() as directory:

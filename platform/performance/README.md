@@ -71,6 +71,23 @@ until the unchanged control and the exact external profile are rerun in the
 same window. The bounded operator probe is
 `tools/platform_ttfb_probe.py`; it does not replace the external load gate.
 
+The authenticated page-load client is versioned separately from the production
+runtime. `authenticated-page-load-v1` remains the canonical historical control
+and uses the existing urllib HTTP/1.1 connection-close behavior. The explicit
+`authenticated-page-load-v2` candidate uses one bounded HTTP/1.1 keep-alive
+connection per external-runner worker and records DNS, TCP, TLS, request-write,
+header-wait, TTFB, body and total timings, plus HTTP version and reuse counts.
+It is a controlled client-transport A/B, not a browser or HTTP/2 simulation:
+compare v1 and v2 only on the same reviewed source, runtime profile and clean
+fixture window. The v2 transport does not change application authentication,
+cookies, validation, retry policy, origin routing or production defaults.
+
+When `web-ssr-diagnostics` is explicitly active, each interval event-loop line
+also exposes the Node PID, process RSS, V8 heap total/used, external memory and
+ArrayBuffer bytes. The retained observer summary places aggregate values under
+`event_loop.memory` and per-worker values under `event_loop.by_pid`; missing
+fields remain an absence of opt-in telemetry, not zero memory.
+
 Current resource-safety semantics are explicit: `max_postgres_backend_connections`
 is evaluated from the observer's `pg_stat_activity` backend count and grouped
 `postgres_backend_ownership`; `postgres_tcp_established_connections` is a
@@ -149,6 +166,11 @@ Its Nginx policy, Node event-loop/CPU/GC diagnostics and bounded hop probe are
 diagnostic instrumentation only until the unchanged authenticated external
 control is rerun. The active next step is the
 [`authenticated HTML transport runbook`](../docs/performance-transport-runbook.md).
+The source also exposes the isolated operator profile
+`web-ssr-native-transport`, which changes only the trusted loopback auth GET
+transport while retaining the one-worker baseline contour. The existing
+`web-ssr-workers-2` profile remains a combined worker-plus-transport candidate;
+neither profile is the production default without a clean, same-contour A/B.
 The Next.js 16.3.4 security baseline
 and its new unchanged control are archived in
 [`security-web-dependencies-next-2026-09-09.md`](../docs/archive/security-web-dependencies-next-2026-09-09.md).

@@ -69,6 +69,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 "read-mix-stress-v2",
                 "read-mix-concurrency-ramp-v1",
                 "authenticated-page-load-v1",
+                "authenticated-page-load-v2",
                 "tournament-lifecycle-capacity-v1",
                 "tournament-lifecycle-scale-v1",
                 "tournament-lifecycle-slo-v1",
@@ -81,6 +82,16 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertEqual(
             profile["acceptance"]["accepted_request_latency"],
             {"p50_ms": 250, "p90_ms": 400, "p95_ms": 600, "p99_ms": 1000},
+        )
+        self.assertEqual(
+            get_profile("authenticated-page-load-v1").get(
+                "client_transport", "urllib-http1-close"
+            ),
+            "urllib-http1-close",
+        )
+        self.assertEqual(
+            get_profile("authenticated-page-load-v2")["client_transport"],
+            "http1-keepalive",
         )
 
     def test_stress_and_capacity_profiles_have_distinct_semantics(self) -> None:

@@ -227,6 +227,12 @@ RUNTIME_PROFILES = {
         "PLATFORM_WEB_WORKERS": "2",
         "PLATFORM_WEB_SERVER_AUTH_TRANSPORT": "node",
     },
+    # Isolate the direct loopback auth transport while retaining the standard
+    # one-worker web contour. This is an A/B candidate only; it does not alter
+    # API workers, pools, memory limits or admission budgets.
+    "web-ssr-native-transport": {
+        "PLATFORM_WEB_SERVER_AUTH_TRANSPORT": "node",
+    },
     "uvicorn-classic": {
         "PLATFORM_UVICORN_LOOP": "asyncio",
         "PLATFORM_UVICORN_HTTP": "h11",

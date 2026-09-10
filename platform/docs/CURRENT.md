@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-10
+- Last reviewed: 2026-09-11
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -14,6 +14,11 @@ Read this file for the current production baseline and next engineering priority
   at source SHA `08862794fe84becc664ba4b6dae5b9d920e06723`. The Google Ads
   approval release remains in place; the experimental Node transport is still
   opt-in only.
+- The external-load harness now keeps `authenticated-page-load-v1` as the
+  canonical control and adds versioned `authenticated-page-load-v2` HTTP/1.1
+  keep-alive timing evidence. The isolated `web-ssr-native-transport` server
+  profile changes only the trusted loopback auth transport with one worker;
+  both remain operator candidates and do not change the production default.
 - The reviewed diagnostic join fix is merged in [PR #86](https://github.com/StrayForest/old_sparky/pull/86).
   The corrected diagnostic run
   [`34512252295`](https://github.com/StrayForest/old_sparky/actions/runs/34512252295)

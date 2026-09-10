@@ -15,19 +15,23 @@ from collections import Counter, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import http.client
 import json
 import math
 from pathlib import Path
 import random
 import re
+import threading
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
+    from tools.platform_http_transport import HTTP11KeepAliveClient
     from tools.platform_load_acceptance import evaluate_acceptance
 except ModuleNotFoundError:  # Direct execution from platform/tools.
+    from platform_http_transport import HTTP11KeepAliveClient
     from platform_load_acceptance import evaluate_acceptance
 
 
@@ -39,6 +43,11 @@ MAX_CONCURRENCY = 512
 RESPONSE_BODY_LIMIT = 2 * 1024 * 1024
 ERROR_SAMPLE_LIMIT = 25
 DIAGNOSTIC_HEADER_LIMIT = 128
+DEFAULT_CLIENT_TRANSPORT = "urllib-http1-close"
+HTTP11_KEEPALIVE_TRANSPORT = "http1-keepalive"
+SUPPORTED_PAGE_TRANSPORTS = frozenset(
+    {DEFAULT_CLIENT_TRANSPORT, HTTP11_KEEPALIVE_TRANSPORT}
+)
 MARKER_RE = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,139}$")
 COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$")
@@ -78,6 +87,7 @@ class RequestResult:
     started_at_utc: str | None = None
     exception_at_utc: str | None = None
     finished_at_utc: str | None = None
+    transport_timing: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -392,8 +402,22 @@ def _page_request(
     session_cookie_name: str,
     csrf_cookie_name: str,
     diagnostic_id: str | None = None,
+    transport: str = DEFAULT_CLIENT_TRANSPORT,
 ) -> RequestResult:
     """Measure the real Next.js HTML response, including server TTFB."""
+
+    if transport == HTTP11_KEEPALIVE_TRANSPORT:
+        return _page_request_http11_keepalive(
+            origin,
+            user,
+            phase,
+            timeout,
+            session_cookie_name=session_cookie_name,
+            csrf_cookie_name=csrf_cookie_name,
+            diagnostic_id=diagnostic_id,
+        )
+    if transport != DEFAULT_CLIENT_TRANSPORT:
+        raise ExternalLoadError(f"unsupported page-load transport: {transport}")
 
     return _request(
         origin,
@@ -409,6 +433,107 @@ def _page_request(
         url_prefix="",
         diagnostic_id=diagnostic_id,
     )
+
+
+_page_transport_local = threading.local()
+
+
+def _http11_keepalive_client(origin: str, timeout: float) -> HTTP11KeepAliveClient:
+    client = getattr(_page_transport_local, "client", None)
+    if (
+        not isinstance(client, HTTP11KeepAliveClient)
+        or client.origin != origin.rstrip("/")
+    ):
+        client = HTTP11KeepAliveClient(
+            origin,
+            timeout=timeout,
+            max_response_bytes=RESPONSE_BODY_LIMIT,
+        )
+        _page_transport_local.client = client
+    return client
+
+
+def _page_request_http11_keepalive(
+    origin: str,
+    user: VirtualUser,
+    phase: str,
+    timeout: float,
+    *,
+    session_cookie_name: str,
+    csrf_cookie_name: str,
+    diagnostic_id: str | None = None,
+) -> RequestResult:
+    """Measure a page request over explicit HTTP/1.1 per-thread keep-alive."""
+
+    path = f"/tournaments/{user.tournament_slug}"
+    request_headers = {
+        "Accept": "text/html",
+        "Origin": origin,
+        "User-Agent": "old-sparky-external-load/2",
+        "Cookie": (
+            f"{session_cookie_name}={user.session_token}; "
+            f"{csrf_cookie_name}={user.csrf_token}"
+        ),
+        "X-CSRF-Token": user.csrf_token,
+        "X-Platform-QA-Phase": phase,
+    }
+    client = _http11_keepalive_client(origin, timeout)
+    started_at_utc = datetime.now(UTC).isoformat()
+    try:
+        response = client.get(path, headers=request_headers)
+        status = response.status
+        error_kind = None if status == 200 else "unexpected_status"
+        cf_error_type = response.headers.get("cf-error-type") or None
+        cf_error_origin = response.headers.get("cf-error-origin") or None
+        retry_after = response.headers.get("retry-after") or None
+        return RequestResult(
+            phase=phase,
+            method="GET",
+            path=path,
+            status=status,
+            elapsed_ms=float(response.timing.get("total_ms") or 0.0),
+            ok=status == 200,
+            response_bytes=len(response.body),
+            time_to_first_byte_ms=(
+                float(response.timing["ttfb_ms"])
+                if isinstance(response.timing.get("ttfb_ms"), (int, float))
+                else None
+            ),
+            cf_ray=response.headers.get("cf-ray") or None,
+            cf_error_type=cf_error_type,
+            cf_error_origin=cf_error_origin,
+            retry_after=retry_after,
+            response_etag=response.headers.get("etag") or None,
+            error_kind=error_kind,
+            diagnostic_id=diagnostic_id,
+            started_at_utc=started_at_utc if diagnostic_id else None,
+            finished_at_utc=datetime.now(UTC).isoformat() if diagnostic_id else None,
+            transport_timing=response.timing,
+        )
+    except (http.client.HTTPException, OSError, TimeoutError, ValueError) as error:
+        timing = dict(client.last_timing)
+        finished_at_utc = datetime.now(UTC).isoformat()
+        ttfb_ms = timing.get("ttfb_ms")
+        return RequestResult(
+            phase=phase,
+            method="GET",
+            path=path,
+            status=0,
+            elapsed_ms=float(timing.get("total_ms") or 0.0),
+            ok=False,
+            response_bytes=0,
+            time_to_first_byte_ms=(
+                float(ttfb_ms)
+                if isinstance(ttfb_ms, (int, float))
+                else None
+            ),
+            error_kind=type(error).__name__,
+            diagnostic_id=diagnostic_id,
+            started_at_utc=started_at_utc if diagnostic_id else None,
+            exception_at_utc=finished_at_utc if diagnostic_id else None,
+            finished_at_utc=finished_at_utc if diagnostic_id else None,
+            transport_timing=timing or None,
+        )
 
 
 def _route_for_read(index: int, slug: str) -> str:
@@ -505,6 +630,11 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
     first_byte_times: list[float] = []
     response_sizes: list[int] = []
     changed = Counter()
+    transport_names: Counter[str] = Counter()
+    transport_http_versions: Counter[str] = Counter()
+    transport_reused = 0
+    transport_new = 0
+    transport_phase_values: dict[str, list[float]] = defaultdict(list)
     for result in results:
         status_counts[str(result.status)] += 1
         route = f"{result.method} {result.path.split('?', 1)[0]}"
@@ -513,6 +643,31 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         response_sizes.append(result.response_bytes)
         if result.time_to_first_byte_ms is not None:
             first_byte_times.append(result.time_to_first_byte_ms)
+        if result.transport_timing:
+            transport = result.transport_timing
+            transport_name = transport.get("transport")
+            if isinstance(transport_name, str):
+                transport_names[transport_name] += 1
+            http_version = transport.get("http_version")
+            if isinstance(http_version, str):
+                transport_http_versions[http_version] += 1
+            if transport.get("connection_reused") is True:
+                transport_reused += 1
+            elif transport.get("connection_reused") is False:
+                transport_new += 1
+            for key in (
+                "dns_ms",
+                "tcp_connect_ms",
+                "tls_handshake_ms",
+                "request_write_ms",
+                "edge_wait_ms",
+                "ttfb_ms",
+                "body_receive_ms",
+                "total_ms",
+            ):
+                value = transport.get(key)
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    transport_phase_values[key].append(float(value))
         retry_attempts += int(result.attempt_number > 1)
         if _ready_vote_overload(result) or _authenticated_read_overload(result):
             temporary_overloads += 1
@@ -592,6 +747,16 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
             if response_sizes
             else None,
             "max_bytes": max(response_sizes) if response_sizes else None,
+        },
+        "transport": {
+            "names": dict(sorted(transport_names.items())),
+            "http_versions": dict(sorted(transport_http_versions.items())),
+            "connection_reused": transport_reused,
+            "connection_new": transport_new,
+            "phase_timings": {
+                key: metric_stats(values)
+                for key, values in sorted(transport_phase_values.items())
+            },
         },
         "by_route": {
             route: metric_stats(values)
@@ -834,6 +999,7 @@ def run_load(
     scenario_kind: str = "slo",
     acceptance_contract: dict[str, Any] | None = None,
     timeout_diagnostics_run_id: str | None = None,
+    client_transport: str = DEFAULT_CLIENT_TRANSPORT,
 ) -> dict[str, Any]:
     if manual_refresh_count < 0:
         raise ExternalLoadError("manual_refresh_count must not be negative")
@@ -859,6 +1025,12 @@ def run_load(
             raise ExternalLoadError("timeout diagnostics run id must be numeric")
         if mode != "page-load":
             raise ExternalLoadError("timeout diagnostics are only supported for page-load")
+    if client_transport not in SUPPORTED_PAGE_TRANSPORTS:
+        raise ExternalLoadError(f"unsupported client transport: {client_transport}")
+    if mode != "page-load" and client_transport != DEFAULT_CLIENT_TRANSPORT:
+        raise ExternalLoadError(
+            "non-default client transports are only supported for page-load"
+        )
     read_concurrency_stages = tuple(concurrency_stages or (concurrency,))
     origin = str(manifest["origin"]).rstrip("/")
     session_cookie_name = str(manifest["session_cookie_name"])
@@ -1105,6 +1277,8 @@ def run_load(
                 request_kwargs["diagnostic_id"] = (
                     f"tdiag-{timeout_diagnostics_run_id}-{user_indexes[user.user_id]:05d}"
                 )
+            if client_transport != DEFAULT_CLIENT_TRANSPORT:
+                request_kwargs["transport"] = client_transport
             return _page_request(
                 origin_value,
                 user,
@@ -1299,6 +1473,7 @@ def run_load(
         "wall_seconds": round(wall_seconds, 3),
         "opening_spread_seconds": spread_seconds,
         "scenario_kind": scenario_kind,
+        "client_transport": client_transport,
         "manual_refresh_count": manual_refresh_count,
         "concurrency": concurrency,
         "concurrency_stages": (
@@ -1347,6 +1522,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p95-budget-ms", type=float, required=True)
     parser.add_argument("--p99-budget-ms", type=float, required=True)
     parser.add_argument("--failure-budget-percent", type=float, required=True)
+    parser.add_argument(
+        "--client-transport",
+        choices=tuple(sorted(SUPPORTED_PAGE_TRANSPORTS)),
+        default=DEFAULT_CLIENT_TRANSPORT,
+    )
     return parser.parse_args()
 
 
@@ -1384,6 +1564,7 @@ def main() -> int:
             p95_budget_ms=max(0.0, args.p95_budget_ms),
             p99_budget_ms=max(0.0, args.p99_budget_ms),
             failure_budget_percent=max(0.0, args.failure_budget_percent),
+            client_transport=args.client_transport,
         )
     except Exception as exc:
         report = {

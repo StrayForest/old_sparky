@@ -32,6 +32,7 @@ on:
           - authenticated-read-admission-24x8
           - pool-pre-ping-off
           - web-ssr-diagnostics
+          - web-ssr-native-transport
           - web-ssr-workers-2
           - uvicorn-classic
           - uvicorn-optimized
@@ -802,6 +803,14 @@ jobs:
                   || fail "web SSR diagnostic profile health check failed; baseline restore failed"
                 fail "web SSR diagnostic profile health check failed; baseline restored"
               fi
+              ;;
+            web-ssr-native-transport)
+              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+                --apply \
+                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
+                --profile "$runtime_profile" \
+                --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT
+              restart_web_and_wait
               ;;
             web-ssr-workers-2)
               "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \

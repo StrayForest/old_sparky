@@ -29,6 +29,8 @@ SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 ALLOWED_MODES = {"ready-vote", "read-mix", "page-load", "tournament-lifecycle"}
 ALLOWED_CATEGORIES = {"load", "stress", "spike", "soak", "capacity"}
 MAX_CONCURRENCY = 512
+DEFAULT_CLIENT_TRANSPORT = "urllib-http1-close"
+ALLOWED_PAGE_TRANSPORTS = {DEFAULT_CLIENT_TRANSPORT, "http1-keepalive"}
 
 
 class LoadProfileError(ValueError):
@@ -250,6 +252,13 @@ def validate_profile(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise LoadProfileError("ready-vote profiles cannot define manual refresh actions")
     if mode == "read-mix" and duplicate_count:
         raise LoadProfileError("read-mix profiles cannot define duplicate vote actions")
+    client_transport = payload.get("client_transport", DEFAULT_CLIENT_TRANSPORT)
+    if not isinstance(client_transport, str) or client_transport not in ALLOWED_PAGE_TRANSPORTS:
+        raise LoadProfileError("profile client_transport is unsupported")
+    if mode != "page-load" and client_transport != DEFAULT_CLIENT_TRANSPORT:
+        raise LoadProfileError(
+            "non-default client_transport is only supported for page-load profiles"
+        )
     workspace_users = sum(index % 10 < 5 for index in range(total_users))
     if manual_refresh_count > workspace_users:
         raise LoadProfileError("profile manual refresh count exceeds the workspace cohort")
@@ -468,6 +477,7 @@ def profile_contract(profile: Mapping[str, Any]) -> dict[str, Any]:
         "profile_digest": profile_digest(profile),
         "category": profile["category"],
         "mode": profile["mode"],
+        "client_transport": profile.get("client_transport", DEFAULT_CLIENT_TRANSPORT),
         "purpose": profile["purpose"],
         "description": profile["description"],
         "fixture": {
@@ -561,6 +571,7 @@ def run_profile(
     manifest, users = load_manifest(manifest_path)
     traffic = profile["traffic"]
     acceptance = profile["acceptance"]
+    client_transport = str(profile.get("client_transport", DEFAULT_CLIENT_TRANSPORT))
     report = run_load(
         manifest,
         users,
@@ -587,6 +598,7 @@ def run_profile(
         scenario_kind=str(acceptance.get("kind") or "slo"),
         acceptance_contract=acceptance,
         timeout_diagnostics_run_id=timeout_diagnostics_run_id,
+        client_transport=client_transport,
     )
     report["source_git_sha"] = _source_git_sha()
     report["load_contract"] = contract

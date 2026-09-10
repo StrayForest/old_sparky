@@ -143,6 +143,57 @@ Only after the evidence identifies a reversible bottleneck may an operator
 propose a separate fix for approval. Do not rerun the full 20,000/20,000
 acceptance baseline or the correlated performance run as part of this window.
 
+## Explicit client transport A/B
+
+Use this procedure when the question is whether the load generator's HTTP
+connection behavior is contributing to the public authenticated HTML result.
+The application and its production runtime remain unchanged. Run the canonical
+v1 control and the v2 candidate from the same reviewed source SHA, with the
+same `20,000` users, `40` tournaments, concurrency `64`, timeout and no-retry
+contract. Require the v1 window to be clean before treating v2 as comparable.
+
+The control is `authenticated-page-load-v1`; it retains the historical urllib
+HTTP/1.1 connection-close client. The candidate is
+`authenticated-page-load-v2`; it uses a bounded HTTP/1.1 keep-alive connection
+per external-runner worker. Its report must show the selected transport,
+HTTP-version counts, connection reuse/new counts and finite phase timings for
+DNS, TCP, TLS, request write, header wait, TTFB, body receive and total time.
+The candidate is not browser-equivalent and does not claim HTTP/2 or HTTP/3
+behavior. Do not change the acceptance thresholds, auth cookies, retry policy,
+origin routing or server runtime while making this comparison.
+
+The current release toolchain is pinned to Node `26.3.1` by the build,
+artifact and live-QA guards. A Node 24 versus Node 26 A/B therefore requires a
+separately reviewed pinned Node 24 archive, provenance and release/preflight
+support; do not bypass those guards or infer a runtime comparison from a local
+unmanaged Node binary.
+
+Run the two normal external-load workflow windows sequentially:
+
+```bash
+gh workflow run platform-production-external-load.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
+  -f control_email=<existing-production-account-email> \
+  -f profile_id=authenticated-page-load-v1 \
+  -f timeout_diagnostics=false
+gh run watch <v1-run-id> --repo StrayForest/old_sparky --exit-status
+
+gh workflow run platform-production-external-load.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f confirmation=RUN-PRODUCTION-EXTERNAL-LOAD \
+  -f control_email=<existing-production-account-email> \
+  -f profile_id=authenticated-page-load-v2 \
+  -f timeout_diagnostics=false
+gh run watch <v2-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+The workflow owns fixture creation and exact cleanup. If either window has
+unexpected statuses, client errors, a web restart, incomplete observer data or
+cleanup failure, retain it as diagnostic evidence and do not promote the
+transport. Restore/verify `ready-vote-static-8` if an operator runtime profile
+was used for any adjacent server-side A/B.
+
 ## Same-request hop probe
 
 Run from an operator host or the origin. The probe reads the cookie, measures
