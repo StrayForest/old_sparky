@@ -194,6 +194,38 @@ cleanup failure, retain it as diagnostic evidence and do not promote the
 transport. Restore/verify `ready-vote-static-8` if an operator runtime profile
 was used for any adjacent server-side A/B.
 
+## Observed production window — 2026-09-11
+
+The reviewed implementation was measured from source SHA
+`0700b7402ecdd182fe0cfba4feae14f15fb68243` with the unchanged
+`20,000 / 40 / c64 / 30s / no-retry` contract. Exact fixture cleanup removed
+all `20,000` users and `40` tournaments after every window, and the final
+storage-maintenance run verified backup restore and service health.
+
+| Window | Runtime/client | HTTP result | Decision |
+| --- | --- | ---: | --- |
+| [`34542019146`](https://github.com/StrayForest/old_sparky/actions/runs/34542019146) | baseline / v1 connection-close | 18,077 200; 1,923 502; 9.615% failure | control failed stress acceptance |
+| [`34543832582`](https://github.com/StrayForest/old_sparky/actions/runs/34543832582) | baseline / v2 HTTP/1.1 keep-alive | 15,938 200; 4,061 502; 1 no response | do not promote client transport |
+| [`34545960967`](https://github.com/StrayForest/old_sparky/actions/runs/34545960967) | one worker / native loopback transport | 17,549 200; 2,451 502 | do not promote runtime profile |
+| [`34548935025`](https://github.com/StrayForest/old_sparky/actions/runs/34548935025) | two workers / native loopback transport | 14,762 200; 5,238 502 | do not promote runtime profile |
+
+The v2 report confirmed HTTP/1.1 reuse (`19,935` reused connections and `65`
+new connections), so the client-side comparison was instrumented, but it did
+not improve the public result. Every pressure window observed web-process
+replacement with peak RSS near the `1 GiB` cgroup limit. PostgreSQL ownership,
+lock-waiter and cleanup safety checks passed, so the evidence points to the
+web memory/render-pressure path rather than a database ownership failure.
+Production was restored to `ready-vote-static-8` with `fetch` authentication
+and compression enabled by
+[`34550534777`](https://github.com/StrayForest/old_sparky/actions/runs/34550534777),
+followed by launch QA
+[`34550849736`](https://github.com/StrayForest/old_sparky/actions/runs/34550849736)
+and storage maintenance
+[`34551221016`](https://github.com/StrayForest/old_sparky/actions/runs/34551221016).
+The next optimization should target bounded HTML render/memory behavior; do
+not change the memory ceiling, bypass the Node `26.3.1` release guard or
+promote either experimental profile from this evidence.
+
 ## Same-request hop probe
 
 Run from an operator host or the origin. The probe reads the cookie, measures

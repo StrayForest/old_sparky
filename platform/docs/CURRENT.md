@@ -6,19 +6,21 @@
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
-## Verified checkpoint — 2026-09-10
+## Verified checkpoint — 2026-09-11
 
 - Production is on the standard `ready-vote-static-8` runtime with compression
-  enabled and the normal `fetch` auth transport. The latest verified restore is
-  [`34514855344`](https://github.com/StrayForest/old_sparky/actions/runs/34514855344)
-  at source SHA `08862794fe84becc664ba4b6dae5b9d920e06723`. The Google Ads
-  approval release remains in place; the experimental Node transport is still
-  opt-in only.
-- The external-load harness now keeps `authenticated-page-load-v1` as the
-  canonical control and adds versioned `authenticated-page-load-v2` HTTP/1.1
-  keep-alive timing evidence. The isolated `web-ssr-native-transport` server
-  profile changes only the trusted loopback auth transport with one worker;
-  both remain operator candidates and do not change the production default.
+  enabled, the normal `fetch` auth transport and Node `26.3.1`. The latest
+  behavior-bearing restore is
+  [`34550534777`](https://github.com/StrayForest/old_sparky/actions/runs/34550534777)
+  at source SHA `0700b7402ecdd182fe0cfba4feae14f15fb68243`; its launch QA and
+  post-run storage maintenance passed. A later documentation-only publication
+  must preserve this runtime profile.
+- The authenticated HTML follow-up compared the unchanged v1 control, the
+  HTTP/1.1 keep-alive client, the one-worker native server transport and the
+  two-worker native profile. All pressure windows observed web-process
+  replacement near the `1 GiB` cgroup limit and failed the declared stress
+  acceptance; the detailed evidence and decision are in the
+  [performance transport runbook](performance-transport-runbook.md).
 - The reviewed diagnostic join fix is merged in [PR #86](https://github.com/StrayForest/old_sparky/pull/86).
   The corrected diagnostic run
   [`34512252295`](https://github.com/StrayForest/old_sparky/actions/runs/34512252295)
@@ -163,9 +165,19 @@ the OOM/queueing failure mode, but it missed the `<1,000 ms` target by `173.196
 ms`, so it is not the production default. The direct transport is now gated by
 `PLATFORM_WEB_SERVER_AUTH_TRANSPORT=node` and the two-worker profile; ordinary
 baseline/static/diagnostic profiles explicitly use `fetch`. The current
-standard production runtime is the retained Google Ads approval release,
-restored at source SHA `08862794fe84becc664ba4b6dae5b9d920e06723` by
-[`34514855344`](https://github.com/StrayForest/old_sparky/actions/runs/34514855344).
+standard production runtime is the restored `ready-vote-static-8` baseline,
+with compression enabled and Node `26.3.1`, validated by
+[`34550534777`](https://github.com/StrayForest/old_sparky/actions/runs/34550534777)
+from behavior-bearing SHA `0700b7402ecdd182fe0cfba4feae14f15fb68243`.
+
+The 2026-09-11 authenticated HTML follow-up did not produce a promotion
+candidate. The unchanged v1 control returned `18,077/20,000` HTTP 200 and
+`1,923` HTTP 502 responses (`9.615%` final failure); the v2 keep-alive client
+returned `15,938` HTTP 200, `4,061` HTTP 502 and one client no-response result;
+the one-worker native transport returned `17,549` HTTP 200 and `2,451` HTTP
+502; and the two-worker native profile returned `14,762` HTTP 200 and `5,238`
+HTTP 502. Database ownership/lock safety checks passed in every window, while
+the web process was replaced and RSS approached the `1 GiB` cgroup limit.
 
 Remaining performance work is explicit: authenticated page TTFB remains above
 the `<1,000 ms` target. The prior blocked attribution is retained in the
