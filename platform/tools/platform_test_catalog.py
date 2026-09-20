@@ -36,7 +36,10 @@ VERIFICATION_CONTOUR = "verification-contract"
 # CI uses one inexpensive DB-free job for the first, second and fifth contours,
 # while the two serial contours remain isolated jobs.  Keep this metadata next
 # to the ownership catalog so the workflow and the executable registry cannot
-# quietly disagree about service or privilege boundaries.
+# quietly disagree about service or privilege boundaries.  The privileged
+# contour owns release/install and root-identity contracts even when their
+# fixtures are otherwise hermetic: those tests exercise production paths that
+# deliberately refuse an unprivileged caller or require root-owned metadata.
 CONTOUR_METADATA: Mapping[str, Mapping[str, object]] = {
     BACKEND_AGGREGATE: {
         "local_safe": True,
@@ -308,7 +311,16 @@ PRIVILEGED_MODULES = frozenset(
         "test_platform_provision_live_csp_qa",
         "test_platform_recover_live_user_qa",
         "test_platform_recover_retained_report",
+        "test_platform_release_audit_hardening",
+        "test_platform_release_build_contract",
+        "test_platform_release_recovery_boundaries",
+        "test_platform_release_retention",
+        "test_platform_release_systemd_state",
+        "test_platform_release_venv_rollback",
+        "test_platform_remote_workflow_guards",
         "test_platform_safe_env_exec",
+        "test_platform_storage_maintenance",
+        "test_platform_validate_release_artifact",
     }
 )
 
@@ -325,8 +337,8 @@ TOOL_MODULES = frozenset(
         "test_platform_configure_shared_env",
         "test_platform_configure_ufw",
         "test_platform_deploy_smoke",
-        "test_platform_docs",
         "test_platform_evidence_privacy",
+        "test_platform_docs",
         "test_platform_external_load_workflow_contract",
         "test_platform_install_nginx",
         "test_platform_media_hard_delete",
@@ -343,22 +355,13 @@ TOOL_MODULES = frozenset(
         "test_platform_production_config",
         "test_platform_production_qa_contract",
         "test_platform_r2_smoke",
-        "test_platform_release_audit_hardening",
-        "test_platform_release_build_contract",
-        "test_platform_release_recovery_boundaries",
-        "test_platform_release_retention",
-        "test_platform_release_systemd_state",
-        "test_platform_release_venv_rollback",
-        "test_platform_remote_workflow_guards",
         "test_platform_secret_artifact_boundary",
         "test_platform_secret_scan",
         "test_platform_secret_job_isolation",
         "test_platform_security_reports",
-        "test_platform_storage_maintenance",
         "test_platform_storage_evidence_privacy",
         "test_platform_update_shared_env",
         "test_platform_validate_edge_policy",
-        "test_platform_validate_release_artifact",
         "test_platform_validate_wheelhouse",
         "test_platform_web_shutdown_guard",
         "test_platform_web_hermetic_browsers",
@@ -441,14 +444,65 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 154,
     "module_digest": "dca5e370c29b823a833a6678c5c64043721ce7cee3ecf3afa2c0e39083c1a81e",
-    "test_count": 1265,
-    "test_id_digest": "a366f42a325b214967790580947cc0d098373504476694aed7910786191f0094",
-    "backend_test_count": 1233,
-    "backend_test_id_digest": "493365d7c873281f99d7de8705b6e56c6a720fae8fcb3980cb554add80e06781",
-    "verification_test_count": 32,
-    "verification_test_id_digest": "fcf8c752f41f7fafbcedc97d874a05952ba3864bdbebc46288d0e41571c5e5e4",
+    "test_count": 1274,
+    "test_id_digest": "ebb60b2837e27f8c9f90e2a940506937373c5bdcea56e2a8acff9824d9253450",
+    "backend_test_count": 1236,
+    "backend_test_id_digest": "8efbb4bc9e05b500d5054ed591ffe86343c5b8c654ebe5603c4940ea46311998",
+    "verification_test_count": 38,
+    "verification_test_id_digest": "f1f744432f143656877de118455b530b65898fe793ddd862068a65e4fa2cea06",
     "verification_classifier_test_count": 17,
     "verification_classifier_test_id_digest": "a5aafa60f6cc1195e65df4d6f6d83b8ee9bcc7537f12c39474299fd875bc8356",
+}
+# Keep each executable contour's boundary independently snapshotted.  The
+# aggregate snapshot proves total ownership, while these entries make a
+# seemingly harmless module move fail closed instead of silently changing the
+# privilege/resource contract.  Rationale is part of the machine-readable
+# registry so a future owner change must explain itself in the same change.
+CONTOUR_RATIONALE: Mapping[str, str] = {
+    "backend-unit": "pure unit/domain/backend behavior without external operator resources",
+    "backend-tool-contract": "hermetic repository tools and contract tests without root-owned host state",
+    "backend-integration": "PostgreSQL/Redis workflows and concurrency behavior",
+    "backend-privileged": "root/service-identity, release/install/systemd, artifact ownership and privileged wrappers",
+    "performance-contract": "deterministic load, observer and acceptance contracts",
+    VERIFICATION_CONTOUR: "registry, workflow and profile ownership self-tests",
+}
+EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
+    "backend-unit": {
+        "module_count": 47,
+        "module_digest": "e77e33f73d1f13d0175f2f90b2b069905a6105b11373005d0a67143728488a67",
+        "test_count": 285,
+        "test_id_digest": "72b3ea9d8e640aab58e23d40092dc1e58853197b6b89723a280dd67ca5b11ddb",
+    },
+    "backend-tool-contract": {
+        "module_count": 42,
+        "module_digest": "7a78266159ea34c377d4c2afbc18f82457380d2e2091bf0da64cd63328302f39",
+        "test_count": 286,
+        "test_id_digest": "9b795218fa710056e8750b1420bdfc9f0b5f803506ade108262d376089bcd90e",
+    },
+    "backend-integration": {
+        "module_count": 41,
+        "module_digest": "c5547c1d61ed9824ad5d58b11a7f5b08a409c50e1cfd47a2a44107c22ee0e6ee",
+        "test_count": 252,
+        "test_id_digest": "411315f9d37a3d56602fc98050deaaa86dc2206c7ca94298522dade78173dc6c",
+    },
+    "backend-privileged": {
+        "module_count": 21,
+        "module_digest": "a671daef37f23599d9231140a05b21c8c9b236dc42cbcd82ff742d011aa1d1b2",
+        "test_count": 285,
+        "test_id_digest": "22d5d9cc4f86358fcebdbe02d6135181f38796f798142c019fed8d2b0d09b22b",
+    },
+    "performance-contract": {
+        "module_count": 10,
+        "module_digest": "5135af80b8695bc35d28c0670ce787c21f34ad541652cb9bedd2d3dd8ff17c4d",
+        "test_count": 128,
+        "test_id_digest": "0979bcd5ed908ea22ae92c8022e377c6eaf7a8df0e9d4f8127085d0c2cd33b0a",
+    },
+    VERIFICATION_CONTOUR: {
+        "module_count": 2,
+        "module_digest": "b2a31b179b655a3aafcfd5c2ebc5dd0f09645024663d5985815355c2a2b984ee",
+        "test_count": 38,
+        "test_id_digest": "f1f744432f143656877de118455b530b65898fe793ddd862068a65e4fa2cea06",
+    },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])
 EXPECTED_MODULE_DIGEST = str(EXPECTED_SNAPSHOT["module_digest"])
@@ -640,6 +694,22 @@ def cases_for_contour(
     raise ValueError(f"unknown backend contour: {contour}")
 
 
+def contour_snapshot(
+    contour: str,
+    cases: Iterable[TestCase] | None = None,
+) -> dict[str, object]:
+    """Return stable ownership facts for one executable contour."""
+
+    selected = cases_for_contour(contour, cases)
+    modules = {case.module for case in selected}
+    return {
+        "module_count": len(modules),
+        "module_digest": module_digest(modules),
+        "test_count": len(selected),
+        "test_id_digest": test_id_digest(case.test_id for case in selected),
+    }
+
+
 def catalog_issues(
     cases: Iterable[TestCase] | None = None,
     *,
@@ -739,6 +809,15 @@ def catalog_issues(
                 issues.append(
                     f"{field} snapshot changed: expected {expected_value}, got {expected}"
                 )
+        for contour, expected in EXPECTED_CONTOUR_SNAPSHOT.items():
+            actual = contour_snapshot(contour, selected)
+            for field, expected_value in expected.items():
+                actual_value = actual[field]
+                if actual_value != expected_value:
+                    issues.append(
+                        f"{contour} {field} snapshot changed: "
+                        f"expected {expected_value}, got {actual_value}"
+                    )
     contours = {case.contour for case in selected}
     missing = sorted(set(BACKEND_CONTOURS) - contours)
     if missing:
@@ -811,7 +890,8 @@ def registry_payload() -> dict[str, object]:
                 "timeout_class": "short" if contour in {"backend-unit", "backend-tool-contract", "performance-contract"} else "long",
                 "timeout_seconds": CONTOUR_TIMEOUT_SECONDS[contour],
                 **dict(contour_metadata[contour]),
-                "test_count": len(cases_for_contour(contour, selected)),
+                **contour_snapshot(contour, selected),
+                "rationale": CONTOUR_RATIONALE[contour],
             }
             for contour in BACKEND_CONTOURS
         ],
@@ -823,7 +903,8 @@ def registry_payload() -> dict[str, object]:
                 "runner": "tools/platform_test_runner.py",
                 "timeout_seconds": CONTOUR_TIMEOUT_SECONDS[VERIFICATION_CONTOUR],
                 **dict(contour_metadata[VERIFICATION_CONTOUR]),
-                "test_count": len(cases_for_contour(VERIFICATION_CONTOUR, selected)),
+                **contour_snapshot(VERIFICATION_CONTOUR, selected),
+                "rationale": CONTOUR_RATIONALE[VERIFICATION_CONTOUR],
             }
         ],
     }

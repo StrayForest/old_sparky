@@ -44,9 +44,9 @@ these five catalog contours:
 | Catalog contour | Timeout | Shared-resource execution | Ownership boundary |
 | --- | ---: | --- | --- |
 | `backend-unit` | 300s | not serial-resource constrained | unit/domain/backend tests with no external operator contour |
-| `backend-tool-contract` | 600s | not serial-resource constrained | repository tool and contract tests |
+| `backend-tool-contract` | 600s | not serial-resource constrained | repository tool and contract tests that are hermetic and do not require root-owned host metadata |
 | `backend-integration` | 1200s | serial | PostgreSQL/Redis integration tests and real workflow races |
-| `backend-privileged` | 1200s | serial | root/service-identity, media and privileged wrapper tests |
+| `backend-privileged` | 1200s | serial | root/service-identity, media, release/install/systemd, root-owned artifact metadata and privileged wrapper tests |
 | `performance-contract` | 900s | not serial-resource constrained | deterministic load/observer/acceptance contracts |
 | `backend` (aggregate) | 3600s | serial orchestration | disjoint union of the five contours |
 
@@ -78,21 +78,37 @@ instruction to run the migration gate, so an already-cleaned disposable
 database cannot produce a misleading cascade of HTTP 503 test failures.
 `backend-integration` and `backend-privileged` are serial because they use
 shared database, Redis or host-identity resources; the aggregate preserves
-that serial boundary.
+that serial boundary. Release/install and systemd contract modules remain in
+the privileged contour even when their fixtures are temporary directories:
+their production paths intentionally enforce root ownership, fixed release
+paths or systemd state. Tests must mock subprocess contracts rather than
+requiring a real mount namespace or `CAP_SYS_ADMIN` on the CI runner.
+Privileged release-lock tests hold a serial test guard and use unique
+root-owned files directly beneath `/run/lock`; cleanup removes only the exact
+test-prefixed regular file and never the production canonical lock.
 
-Local/canonical invocations that use the host test services also hold the
-exact `oldsparky-platformdb-test.lock` pathname under the validated
-`XDG_RUNTIME_DIR` (mode `700`) or root-owned sticky `/tmp` (mode `1777`). The
-lock file is a mode-`600`, single-link regular file; acquisition validates its
-PID, device/inode identity and owner marker, uses non-blocking `flock`, and
-fails closed on contention, stale metadata, symlinks or any path/metadata
-change. Normal completion and handled termination signals release the marker
-and lock. DB-free contours do not acquire this resource, so local verification
-does not become globally serial. GitHub jobs retain parallelism because each
-database/Redis service container is isolated per job.
+Local/canonical invocations that use the host test services hold one global
+cross-UID lock at the fixed
+`/run/lock/oldsparky-platform-verification/oldsparky-platformdb-test.lock`
+pathname. Root provisions its parent (exact mode `755`) and the root-owned
+read-only lock file (exact mode `444`) atomically before CI; missing or
+misowned/wrong-mode provisioning is a `LOCAL GATE BLOCKED` refusal. The
+acquirer validates every parent component and the lock's device/inode, owner,
+link count and mode before and after opening and after taking a non-blocking
+`flock`. It never trusts or writes a marker, and therefore a non-root caller
+cannot replace, chmod or truncate the lock identity. Normal completion and
+handled termination signals release the lock. DB-free contours do not acquire
+this resource, so local verification does not become globally serial. GitHub
+jobs retain parallelism because each database/Redis service container is
+isolated per job; the migration, integration and privileged CI jobs all
+provision this same fixed lock before invoking their guarded runners.
+Root-required runner contours reject a non-root caller before configuration or
+resource validation, lock acquisition, catalog discovery or cleanup; the
+aggregate component-manifest verifier is the explicit DB-free exception.
 
-The privileged preflight is fail-closed: the aggregate and
-`backend-privileged` require the root test user. Media-processor cases also
+The privileged preflight is fail-closed: normal aggregate execution and
+`backend-privileged` require the root test user; aggregate component-manifest
+verification is the DB-free exception. Media-processor cases also
 require Pillow, `/usr/bin/runuser`, `/usr/bin/test` and the `oldsparky-media`
 group. Wrapper cases additionally require `/usr/bin/setpriv`. Missing
 prerequisites are blocked before tests start and must not be converted into

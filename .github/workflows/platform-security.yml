@@ -266,23 +266,18 @@ jobs:
           cache-dependency-path: platform/requirements-ci.lock.txt
       - name: Install canonical hash-locked Python CI environment
         run: platform/tools/platform_install_ci_python.sh
-      - name: Prepare root-owned verification runtime directory
+      - name: Provision fixed root-owned global verification lock
         run: |
           set -euo pipefail
-          runtime_dir="$RUNNER_TEMP/platform-verification-runtime"
-          test ! -L "$runtime_dir"
-          sudo install -d -o root -g root -m 700 "$runtime_dir"
-          test ! -L "$runtime_dir"
-          test "$(stat -c '%u' "$runtime_dir")" -eq 0
-          test "$(stat -c '%a' "$runtime_dir")" = 700
-          echo "PLATFORM_VERIFICATION_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+          sudo -n "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python" \
+            "$GITHUB_WORKSPACE/platform/tools/platform_verification_lock.py" --provision
       - name: Migrate isolated CI database
         run: >-
-          sudo -EH env XDG_RUNTIME_DIR= PLATFORM_VERIFICATION_RUNTIME_DIR="$PLATFORM_VERIFICATION_RUNTIME_DIR" bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
           .venv_platform/bin/python -m alembic upgrade head"
       - name: Run serial backend integration contour exactly once
         run: >-
-          sudo -EH env XDG_RUNTIME_DIR= PLATFORM_VERIFICATION_RUNTIME_DIR="$PLATFORM_VERIFICATION_RUNTIME_DIR" bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
           .venv_platform/bin/python tools/platform_verify.py backend-integration
           --manifest ci-backend/backend-integration/manifest.json
           --summary ci-backend/backend-integration/summary.json --quiet"
@@ -320,16 +315,11 @@ jobs:
           cache-dependency-path: platform/requirements-ci.lock.txt
       - name: Install canonical hash-locked Python CI environment
         run: platform/tools/platform_install_ci_python.sh
-      - name: Prepare root-owned verification runtime directory
+      - name: Provision fixed root-owned global verification lock
         run: |
           set -euo pipefail
-          runtime_dir="$RUNNER_TEMP/platform-verification-runtime"
-          test ! -L "$runtime_dir"
-          sudo install -d -o root -g root -m 700 "$runtime_dir"
-          test ! -L "$runtime_dir"
-          test "$(stat -c '%u' "$runtime_dir")" -eq 0
-          test "$(stat -c '%a' "$runtime_dir")" = 700
-          echo "PLATFORM_VERIFICATION_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+          sudo -n "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python" \
+            "$GITHUB_WORKSPACE/platform/tools/platform_verification_lock.py" --provision
       - name: Check root Pillow runuser setpriv and media-group prerequisites
         run: |
           set -euo pipefail
@@ -356,7 +346,7 @@ jobs:
           getent group oldsparky-media
       - name: Run serial privileged catalog contour exactly once as root
         run: >-
-          sudo -EH env XDG_RUNTIME_DIR= PLATFORM_VERIFICATION_RUNTIME_DIR="$PLATFORM_VERIFICATION_RUNTIME_DIR" bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
           .venv_platform/bin/python tools/platform_verify.py backend-privileged
           --manifest ci-backend/backend-privileged/manifest.json
           --summary ci-backend/backend-privileged/summary.json --quiet"
@@ -530,6 +520,11 @@ jobs:
           cache-dependency-path: platform/requirements-ci.lock.txt
       - name: Install canonical hash-locked Python CI environment
         run: platform/tools/platform_install_ci_python.sh
+      - name: Provision fixed root-owned global verification lock
+        run: |
+          set -euo pipefail
+          sudo -n "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python" \
+            "$GITHUB_WORKSPACE/platform/tools/platform_verification_lock.py" --provision
       - name: Run populated legacy migration scenario
         run: >-
           cd platform &&

@@ -12,6 +12,8 @@ import sys
 import tempfile
 import unittest
 
+from tests import platform_test_lock_support as lock_support
+
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = PLATFORM_ROOT / "tools"
@@ -53,6 +55,31 @@ class SafeEnvironmentTests(unittest.TestCase):
 class ReleaseHardeningContractTests(unittest.TestCase):
     def read_tool(self, name: str) -> str:
         return (TOOLS_DIR / name).read_text(encoding="utf-8")
+
+    @contextlib.contextmanager
+    def isolated_release_lock(self, root: Path):
+        """Yield a unique root-owned test lock, never the production pathname."""
+
+        test_lock = lock_support.create_test_lock("audit")
+        lock_path = test_lock.path
+        try:
+            tools = root / "release-tools"
+            tools.mkdir()
+            helper = tools / "platform_release_lock.sh"
+            helper_text = self.read_tool("platform_release_lock.sh").replace(
+                "/run/lock/oldsparky-platform-release.lock", str(lock_path)
+            )
+            helper.write_text(helper_text, encoding="utf-8")
+            helper.chmod(0o755)
+            guard = tools / "platform_release_lock_exec.sh"
+            guard_text = self.read_tool(guard.name).replace(
+                "/run/lock/oldsparky-platform-release.lock", str(lock_path)
+            )
+            guard.write_text(guard_text, encoding="utf-8")
+            guard.chmod(0o755)
+            yield lock_path, helper, guard
+        finally:
+            test_lock.cleanup()
 
     def test_runtime_loader_never_sources_env_file(self) -> None:
         runtime_common = self.read_tool("platform_runtime_common.sh")
@@ -265,31 +292,28 @@ class ReleaseHardeningContractTests(unittest.TestCase):
     def test_test_environment_cannot_bypass_canonical_release_lock(self) -> None:
         """A test-looking environment must not redirect a production guard."""
 
-        guard = TOOLS_DIR / "platform_release_lock_exec.sh"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            lock_root = root / "run-lock"
-            lock_root.mkdir(mode=0o700)
-            app_dir = root / "platform-app"
-            (app_dir / "shared").mkdir(parents=True, mode=0o700)
-            (app_dir / "releases").mkdir(mode=0o700)
-            release = app_dir / "releases" / "release-under-test"
-            release.mkdir(mode=0o700)
-            (release / "RELEASE.json").write_text("{}\n", encoding="utf-8")
-            (app_dir / "current").symlink_to("releases/release-under-test")
-            marker = root / "production-body-ran"
-            attacker_lock = app_dir / "attacker.lock"
-            runner = root / "run-bypass-regression.sh"
-            runner.write_text(
+            with self.isolated_release_lock(root) as (lock_path, _helper, guard):
+                app_dir = root / "platform-app"
+                (app_dir / "shared").mkdir(parents=True, mode=0o700)
+                (app_dir / "releases").mkdir(mode=0o700)
+                release = app_dir / "releases" / "release-under-test"
+                release.mkdir(mode=0o700)
+                (release / "RELEASE.json").write_text("{}\n", encoding="utf-8")
+                (app_dir / "current").symlink_to("releases/release-under-test")
+                marker = root / "production-body-ran"
+                attacker_lock = app_dir / "attacker.lock"
+                runner = root / "run-bypass-regression.sh"
+                runner.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -Eeuo pipefail\n"
-                "lock_root=$1\napp_dir=$2\nguard=$3\n"
-                "marker=$4\nattacker_lock=$5\n"
-                "mount --bind \"$lock_root\" /run/lock\n"
+                "app_dir=$1\nguard=$2\n"
+                "marker=$3\nattacker_lock=$4\nlock_path=$5\n"
                 "export PLATFORM_ENVIRONMENT=test PLATFORM_TESTING=1\n"
                 "export PLATFORM_TEST_RELEASE_LOCK_PATH=\"$attacker_lock\"\n"
                 "set +e\n"
-                "/usr/bin/flock -n --close /run/lock/oldsparky-platform-release.lock "
+                "/usr/bin/flock -n --close \"$lock_path\" "
                 "/bin/bash -c '\n"
                 "  set +e\n"
                 "  \"$1\" --app-dir \"$2\" -- /usr/bin/touch \"$3\"\n"
@@ -301,21 +325,17 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 "[[ ! -e \"$marker\" ]] || exit 42\n"
                 "exit \"$status\"\n",
                 encoding="utf-8",
-            )
-            runner.chmod(0o755)
-            result = subprocess.run(
-                [
-                    "/usr/bin/unshare",
-                    "-m",
-                    "--propagation",
-                    "private",
-                    str(runner),
-                    str(lock_root),
-                    str(app_dir),
-                    str(guard),
-                    str(marker),
-                    str(attacker_lock),
-                ],
+                )
+                runner.chmod(0o755)
+                result = subprocess.run(
+                    [
+                        str(runner),
+                        str(app_dir),
+                        str(guard),
+                        str(marker),
+                        str(attacker_lock),
+                        str(lock_path),
+                    ],
                 cwd=root,
                 env={
                     **os.environ,
@@ -326,68 +346,56 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
-            )
-            self.assertEqual(result.returncode, 3, result.stderr)
-            self.assertFalse(marker.exists(), result.stderr)
-            self.assertFalse((root / "9").exists(), result.stderr)
+                )
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertFalse(marker.exists(), result.stderr)
+                self.assertFalse((root / "9").exists(), result.stderr)
 
     def test_shared_flock_is_not_accepted_as_release_supervisor(self) -> None:
-        helper = TOOLS_DIR / "platform_release_lock.sh"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            lock_root = root / "run-lock"
-            lock_root.mkdir(mode=0o700)
-            runner = root / "run-shared-lock-regression.sh"
-            runner.write_text(
-                "#!/usr/bin/env bash\n"
-                "set -Eeuo pipefail\n"
-                "lock_root=$1\nhelper=$2\n"
-                "mount --bind \"$lock_root\" /run/lock\n"
-                "/usr/bin/flock -n -s --close /run/lock/oldsparky-platform-release.lock "
-                "/bin/bash -c '\n"
-                "  set -Eeuo pipefail\n"
-                "  source \"$1\"\n"
-                "  if platform_release_lock_supervisor_holds; then exit 42; fi\n"
-                "' bash \"$helper\"\n",
-                encoding="utf-8",
-            )
-            runner.chmod(0o755)
-            result = subprocess.run(
-                [
-                    "/usr/bin/unshare",
-                    "-m",
-                    "--propagation",
-                    "private",
-                    str(runner),
-                    str(lock_root),
-                    str(helper),
-                ],
-                cwd=root,
-                env={
-                    **os.environ,
-                    "PLATFORM_ENVIRONMENT": "test",
-                    "PLATFORM_TESTING": "1",
-                },
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse((root / "9").exists(), result.stderr)
+            with self.isolated_release_lock(root) as (lock_path, helper, _guard):
+                runner = root / "run-shared-lock-regression.sh"
+                runner.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "set -Eeuo pipefail\n"
+                    "helper=$1\nlock_path=$2\n"
+                    "/usr/bin/flock -n -s --close \"$lock_path\" "
+                    "/bin/bash -c '\n"
+                    "  set -Eeuo pipefail\n"
+                    "  source \"$1\"\n"
+                    "  if platform_release_lock_supervisor_holds; then exit 42; fi\n"
+                    "' bash \"$helper\"\n",
+                    encoding="utf-8",
+                )
+                runner.chmod(0o755)
+                result = subprocess.run(
+                    [str(runner), str(helper), str(lock_path)],
+                    cwd=root,
+                    env={
+                        **os.environ,
+                        "PLATFORM_ENVIRONMENT": "test",
+                        "PLATFORM_TESTING": "1",
+                    },
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((root / "9").exists(), result.stderr)
 
     def test_pathname_supervisor_body_has_no_release_fd(self) -> None:
-        helper = TOOLS_DIR / "platform_release_lock.sh"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            lock_root = root / "run-lock"
-            lock_root.mkdir(mode=0o700)
+            lock_scope = self.isolated_release_lock(root)
+            lock_path, helper, _guard = lock_scope.__enter__()
+            self.addCleanup(lock_scope.__exit__, None, None, None)
             runner = root / "run-fd-regression.sh"
             runner.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -Eeuo pipefail\n"
-                "lock_root=$1\nhelper=$2\n"
-                "mount --bind \"$lock_root\" /run/lock\n"
+                "helper=$1\n"
                 "/usr/bin/env -u PLATFORM_RELEASE_LOCK_FD \\\n"
                 "  \"$helper\" --run /bin/bash -c '\n"
                 "    set -Eeuo pipefail\n"
@@ -401,15 +409,16 @@ class ReleaseHardeningContractTests(unittest.TestCase):
                 "  ' bash \"$helper\"\n",
                 encoding="utf-8",
             )
+            runner.write_text(
+                runner.read_text(encoding="utf-8").replace(
+                    "/run/lock/oldsparky-platform-release.lock", str(lock_path)
+                ),
+                encoding="utf-8",
+            )
             runner.chmod(0o755)
             result = subprocess.run(
                 [
-                    "/usr/bin/unshare",
-                    "-m",
-                    "--propagation",
-                    "private",
                     str(runner),
-                    str(lock_root),
                     str(helper),
                 ],
                 cwd=root,

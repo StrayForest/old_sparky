@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import fcntl
 import os
 from pathlib import Path
 import shlex
@@ -10,6 +9,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+
+from tests import platform_test_lock_support as lock_support
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -25,21 +26,32 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
-        # Test-only lock isolation lives in a private mount namespace.  The
-        # production helper has no environment-controlled lock pathname.
-        self.lock_root = self.root / "run-lock"
-        self.lock_root.mkdir(mode=0o700)
-        self.release_lock_path = self.lock_root / "oldsparky-platform-release.lock"
-        self.app_dir = self.root / "platform-app"
-        self.releases = self.app_dir / "releases"
-        self.shared = self.app_dir / "shared"
-        self.releases.mkdir(parents=True)
-        self.shared.mkdir()
-        (self.shared / ".env.platform").write_text("PLATFORM_TESTING=1\n")
-        (self.shared / ".env.platform").chmod(0o600)
+        self._release_lock = None
+        try:
+            self._release_lock = lock_support.create_test_lock("recovery")
+            self.release_lock_path = self._release_lock.path
+            self.tools_dir = self.root / "tools"
+            shutil.copytree(REPO_ROOT / "platform/tools", self.tools_dir)
+            self.install_test_lock_helper(self.tools_dir / "platform_release_lock.sh")
+            self.app_dir = self.root / "platform-app"
+            self.releases = self.app_dir / "releases"
+            self.shared = self.app_dir / "shared"
+            self.releases.mkdir(parents=True)
+            self.shared.mkdir()
+            (self.shared / ".env.platform").write_text("PLATFORM_TESTING=1\n")
+            (self.shared / ".env.platform").chmod(0o600)
+        except BaseException:
+            if self._release_lock is not None:
+                self._release_lock.cleanup()
+            self.temp_dir.cleanup()
+            raise
 
     def tearDown(self) -> None:
-        self.temp_dir.cleanup()
+        try:
+            if self._release_lock is not None:
+                self._release_lock.cleanup()
+        finally:
+            self.temp_dir.cleanup()
 
     def test_resume_activation_committed_cleans_receipt(self) -> None:
         current, previous, candidate = self.prepare_install_state()
@@ -47,8 +59,14 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.switch_pointer("previous", current)
         self.switch_pointer("current", candidate)
 
+        resume = self.copy_deploy_script_with_fault(
+            "deploy-resume-activation-committed.sh",
+            None,
+            None,
+            self.write_fake_systemctl(),
+        )
         result = self.run_script(
-            DEPLOY_SCRIPT,
+            resume,
             "--resume",
             "--app-dir",
             str(self.app_dir),
@@ -386,8 +404,14 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.state_phase(), "activation-committed")
+        resume = self.copy_deploy_script_with_fault(
+            "deploy-resume-after-activation-commit.sh",
+            None,
+            None,
+            systemctl,
+        )
         result = self.run_script(
-            DEPLOY_SCRIPT,
+            resume,
             "--resume",
             "--app-dir",
             str(self.app_dir),
@@ -769,9 +793,9 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             '  "$INSTALL_TOOL" --stage-only "$ARTIFACT" "$APP_DIR"\n',
             "  /bin/false\n",
         )
-        lock_fd = os.open(self.release_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        assert self._release_lock is not None
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._release_lock.acquire(nonblocking=True)
             result = self.run_script(
                 failed,
                 "--artifact",
@@ -781,8 +805,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 check=False,
             )
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+            self._release_lock.release()
 
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertFalse((self.shared / STATE_NAME).exists())
@@ -797,8 +820,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
     ) -> None:
         """The lock supervisor must close the descriptor before body children run."""
         helper = self.root / "platform_release_lock.sh"
-        shutil.copy2(REPO_ROOT / "platform/tools/platform_release_lock.sh", helper)
-        helper.chmod(0o755)
+        self.install_test_lock_helper(helper)
         child_pid_file = self.root / "child.pid"
         script = self.root / "lock-body-kill.sh"
         script.write_text(
@@ -814,8 +836,6 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             encoding="utf-8",
         )
         script.chmod(0o755)
-        lock_path = self.release_lock_path
-        lock_path.touch(mode=0o600)
         env = {
             "PLATFORM_ENVIRONMENT": "test",
             "PLATFORM_TESTING": "1",
@@ -825,11 +845,9 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             result = self.run_script(script, env=env, check=False)
             self.assertNotEqual(result.returncode, 0)
             child_pid = int(child_pid_file.read_text(encoding="ascii").strip())
-            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            finally:
-                os.close(descriptor)
+            assert self._release_lock is not None
+            self._release_lock.acquire(nonblocking=True)
+            self._release_lock.release()
         finally:
             if child_pid is not None:
                 try:
@@ -844,8 +862,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
 
     def test_inherited_release_fd_is_rejected_without_root_path_or_body(self) -> None:
         helper = self.root / "platform_release_lock.sh"
-        shutil.copy2(REPO_ROOT / "platform/tools/platform_release_lock.sh", helper)
-        helper.chmod(0o755)
+        self.install_test_lock_helper(helper)
         child_pid_file = self.root / "inherited-child.pid"
         script = self.root / "inherited-lock-body-kill.sh"
         script.write_text(
@@ -861,26 +878,15 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             encoding="utf-8",
         )
         script.chmod(0o755)
-        lock_path = self.release_lock_path
         env = {"PLATFORM_ENVIRONMENT": "test", "PLATFORM_TESTING": "1"}
-        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        assert self._release_lock is not None
+        lock_fd = self._release_lock.fd
         child_pid = None
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._release_lock.acquire(nonblocking=True)
             env["PLATFORM_RELEASE_LOCK_FD"] = str(lock_fd)
             result = subprocess.run(
-                [
-                    "/usr/bin/unshare",
-                    "-m",
-                    "--propagation",
-                    "private",
-                    "/bin/bash",
-                    "-c",
-                    'mount --bind "$1" /run/lock && shift && exec "$@"',
-                    "release-lock-test",
-                    str(self.lock_root),
-                    str(script),
-                ],
+                [str(script)],
                 cwd=REPO_ROOT,
                 env={**os.environ, **env},
                 pass_fds=(lock_fd,),
@@ -892,14 +898,10 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stderr)
             self.assertFalse(child_pid_file.exists(), result.stderr)
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+            self._release_lock.release()
         try:
-            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            finally:
-                os.close(descriptor)
+            self._release_lock.acquire(nonblocking=True)
+            self._release_lock.release()
         finally:
             if child_pid is not None:
                 try:
@@ -1064,9 +1066,9 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             }
         )
         abort = self.copy_abort_script_with_systemctl(systemctl)
-        lock_fd = os.open(self.release_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        assert self._release_lock is not None
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._release_lock.acquire(nonblocking=True)
             result = self.run_script(
                 abort,
                 "--abort-retained",
@@ -1076,8 +1078,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 check=False,
             )
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+            self._release_lock.release()
 
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertEqual(self.state_phase(), "migration-failed")
@@ -1158,11 +1159,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         target = self.root / name
         target.write_text(script.replace(needle, replacement, 1))
         target.chmod(0o755)
-        shutil.copy2(
-            REPO_ROOT / "platform/tools/platform_release_lock.sh",
-            target.parent / "platform_release_lock.sh",
-        )
-        (target.parent / "platform_release_lock.sh").chmod(0o755)
+        self.install_test_lock_helper(target.parent / "platform_release_lock.sh")
         shutil.copy2(
             REPO_ROOT / "platform/tools/platform_release_systemd_state.py",
             target.parent / "platform_release_systemd_state.py",
@@ -1606,7 +1603,20 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         script = source.read_text()
         needle = 'TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"'
         self.assertIn(needle, script)
-        return script.replace(needle, f'TOOLS_DIR="{source.parent}"', 1)
+        return script.replace(needle, f'TOOLS_DIR="{self.tools_dir}"', 1)
+
+    def install_test_lock_helper(self, destination: Path) -> None:
+        """Install a test-local helper while retaining production validation."""
+
+        helper = (REPO_ROOT / "platform/tools/platform_release_lock.sh").read_text(
+            encoding="utf-8"
+        )
+        helper = helper.replace(
+            "/run/lock/oldsparky-platform-release.lock",
+            str(self.release_lock_path),
+        )
+        destination.write_text(helper, encoding="utf-8")
+        destination.chmod(0o755)
 
     def run_script(
         self,
@@ -1620,19 +1630,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         command_env["PLATFORM_TESTING"] = "1"
         command_env.update(env or {})
         result = subprocess.run(
-            [
-                "/usr/bin/unshare",
-                "-m",
-                "--propagation",
-                "private",
-                "/bin/bash",
-                "-c",
-                'mount --bind "$1" /run/lock && shift && exec "$@"',
-                "release-lock-test",
-                str(self.lock_root),
-                str(script),
-                *args,
-            ],
+            [str(script), *args],
             cwd=REPO_ROOT,
             env=command_env,
             text=True,

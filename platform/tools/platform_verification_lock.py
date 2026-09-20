@@ -1,37 +1,45 @@
 #!/usr/bin/env python3
-"""Fail-closed lock for local verification contours sharing test services.
+"""Fail-closed global lock for verification contours sharing test services.
 
-The lock is deliberately a small, host-local resource guard.  It is not a
-database lock: migration resets the schema and backend integration tears down
-the same database/Redis resources, so the wrapper must exclude both before
-either process connects to them.
+The lock is a host-local guard, not a database lock.  Migration resets the
+schema and backend integration tears down the same database/Redis resources,
+so every process must lock the same inode before it connects to them.
+
+The pathname is intentionally fixed and is never selected from the
+environment.  Root provisions it once in a root-owned, non-writable parent;
+all users then open the root-owned read-only file and contend on its inode
+with ``flock``.  The file has no writable owner marker: lock contents are not
+security identity and must not be trusted or modified by a less privileged
+caller.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
+import argparse
 import errno
 import fcntl
-import json
 import os
 from pathlib import Path
 import signal
 import stat
-import time
+import sys
 from typing import Iterator
 
 
 LOCK_NAME = "oldsparky-platformdb-test.lock"
-RUNTIME_DIR_ENV = "PLATFORM_VERIFICATION_RUNTIME_DIR"
-RUNTIME_DIR_PREFIX = ".oldsparky-platform-verification-"
+LOCK_PARENT = Path("/run/lock/oldsparky-platform-verification")
+LOCK_PATH = LOCK_PARENT / LOCK_NAME
 LOCK_CONTOURS = frozenset(
     {"migration", "backend", "backend-integration", "backend-privileged"}
 )
-LOCK_CONTENTION_EXIT_CODE = 75
+ROOT_UID = 0
+ROOT_DIR_MODE = 0o755
+LOCK_FILE_MODE = 0o444
 
 
 class VerificationLockError(RuntimeError):
-    """Raised when the local shared-resource lock cannot be trusted/acquired."""
+    """Raised when the global verification lock cannot be trusted/acquired."""
 
 
 class _LockSignal(BaseException):
@@ -40,104 +48,75 @@ class _LockSignal(BaseException):
         super().__init__(f"verification lock interrupted by signal {signum}")
 
 
-def _no_symlink_path(path: Path, *, include_leaf: bool) -> bool:
-    """Return whether existing components of *path* are ordinary directories."""
+def _lstat_directory(path: Path, *, expected_mode: int | None = None) -> os.stat_result:
+    """Return a validated directory identity without following symlinks."""
 
-    current = path if include_leaf else path.parent
-    components = current.parts
-    if not path.is_absolute():
-        return False
-    cursor = Path(components[0])
-    for component in components[1:]:
-        cursor /= component
-        try:
-            info = os.lstat(cursor)
-        except OSError:
-            return False
-        if stat.S_ISLNK(info.st_mode):
-            return False
-    return True
-
-
-def _validate_runtime_dir(root: Path) -> Path:
-    """Validate one explicit runtime directory for the effective test user."""
-
-    if (
-        not root.is_absolute()
-        or not _no_symlink_path(root, include_leaf=True)
-        or not root.is_dir()
-    ):
-        raise VerificationLockError(
-            "verification lock runtime directory is missing, unsafe or a symlink"
-        )
-    info = os.stat(root, follow_symlinks=False)
-    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
-        raise VerificationLockError(
-            "verification lock runtime directory must be mode 700 and owned by the test user"
-        )
-    return root
-
-
-def _safe_tmp_root() -> Path:
-    root = Path("/tmp")
-    if not _no_symlink_path(root, include_leaf=True) or not root.is_dir():
-        raise VerificationLockError("verification lock /tmp directory is missing or unsafe")
-    info = os.stat(root, follow_symlinks=False)
-    mode = stat.S_IMODE(info.st_mode)
-    if info.st_uid != 0 or mode != 0o1777:
-        raise VerificationLockError("verification lock /tmp directory is not root-owned sticky mode")
-    return root
-
-
-def _per_user_runtime_dir() -> Path:
-    """Create the stable private fallback directory for this effective UID."""
-
-    parent = _safe_tmp_root()
-    root = parent / f"{RUNTIME_DIR_PREFIX}{os.geteuid()}"
     try:
-        os.mkdir(root, 0o700)
-    except FileExistsError:
-        # Never repair or chmod an existing path: validate its identity below so
-        # a pre-created file/directory/symlink cannot become the lock root.
-        pass
-    return _validate_runtime_dir(root)
+        info = os.lstat(path)
+    except OSError as exc:
+        raise VerificationLockError(
+            f"verification lock parent is unavailable: {path}"
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise VerificationLockError(f"verification lock parent is not a directory: {path}")
+    if info.st_uid != ROOT_UID:
+        raise VerificationLockError(
+            f"verification lock parent has the wrong owner: {path}"
+        )
+    mode = stat.S_IMODE(info.st_mode)
+    if expected_mode is not None and mode != expected_mode:
+        raise VerificationLockError(
+            f"verification lock parent has the wrong mode: {path}"
+        )
+    if expected_mode is None and mode & 0o022:
+        raise VerificationLockError(
+            f"verification lock parent is writable by a non-root identity: {path}"
+        )
+    return info
 
 
-def _runtime_root() -> Path:
-    # CI that crosses a sudo boundary must provide a directory owned by the
-    # effective user.  This explicit variable prevents a runner-owned
-    # XDG_RUNTIME_DIR from being inherited by a root test process.
-    explicit = os.environ.get(RUNTIME_DIR_ENV)
-    if explicit:
-        return _validate_runtime_dir(Path(explicit))
+def _parent_chain(path: Path) -> tuple[tuple[Path, int, int], ...]:
+    """Validate every component up to the fixed lock parent.
 
-    configured = os.environ.get("XDG_RUNTIME_DIR")
-    if configured:
-        root = Path(configured)
-        if not root.is_absolute() or not _no_symlink_path(root, include_leaf=True):
-            raise VerificationLockError(
-                "verification lock runtime directory is missing, unsafe or a symlink"
-            )
-        if not root.is_dir():
-            raise VerificationLockError(
-                "verification lock runtime directory is missing, unsafe or a symlink"
-            )
-        info = os.stat(root, follow_symlinks=False)
-        if info.st_uid == os.geteuid():
-            return _validate_runtime_dir(root)
-        # A sudo invocation commonly retains the caller's XDG directory.  It
-        # is safe to ignore that directory and create a stable per-UID root;
-        # using it would either fail the ownership check or mix lock files
-        # between effective users.
-        return _per_user_runtime_dir()
+    ``/run/lock`` is a standard root-owned sticky runtime anchor and is the
+    only writable component permitted by this contract.  The lock's own
+    parent is exact mode 0755, so a non-root user cannot pre-create, replace,
+    chmod or unlink the lock pathname.
+    """
 
-    return _per_user_runtime_dir()
+    if not path.is_absolute():
+        raise VerificationLockError("verification lock path must be absolute")
+    parent = path.parent
+    components = parent.parts
+    current = Path(components[0])
+    identities: list[tuple[Path, int, int]] = []
+    root_info = _lstat_directory(current, expected_mode=0o755)
+    identities.append((current, root_info.st_dev, root_info.st_ino))
+    for component in components[1:]:
+        current /= component
+        expected_mode = 0o1777 if current in {Path("/run/lock"), Path("/tmp")} else None
+        info = _lstat_directory(current, expected_mode=expected_mode)
+        identities.append((current, info.st_dev, info.st_ino))
+    if parent == LOCK_PARENT:
+        _lstat_directory(parent, expected_mode=ROOT_DIR_MODE)
+    else:
+        # The alternate path is used only by focused tests after monkeypatching
+        # LOCK_PATH.  It obeys the same root-owned/non-writable rule.
+        _lstat_directory(parent, expected_mode=ROOT_DIR_MODE)
+    return tuple(identities)
 
 
-def default_lock_path() -> Path:
-    """Return the exact lock pathname for the current safe runtime root."""
+def _validate_existing_chain(path: Path) -> None:
+    """Validate an existing directory and every ancestor without following links."""
 
-    return _runtime_root() / LOCK_NAME
+    if not path.is_absolute() or not path.parts:
+        raise VerificationLockError("verification lock parent must be absolute")
+    current = Path(path.parts[0])
+    _lstat_directory(current, expected_mode=0o755)
+    for component in path.parts[1:]:
+        current /= component
+        expected_mode = 0o1777 if current in {Path("/run/lock"), Path("/tmp")} else None
+        _lstat_directory(current, expected_mode=expected_mode)
 
 
 def _validate_lock_file(path: Path, fd: int) -> tuple[int, int]:
@@ -151,107 +130,161 @@ def _validate_lock_file(path: Path, fd: int) -> tuple[int, int]:
     if path_info.st_dev != fd_info.st_dev or path_info.st_ino != fd_info.st_ino:
         raise VerificationLockError("verification lock pathname/inode changed during open")
     if (
-        fd_info.st_uid != os.geteuid()
+        fd_info.st_uid != ROOT_UID
         or fd_info.st_nlink != 1
-        or stat.S_IMODE(fd_info.st_mode) != 0o600
+        or stat.S_IMODE(fd_info.st_mode) != LOCK_FILE_MODE
     ):
-        raise VerificationLockError("verification lock ownership, link count or mode is unsafe")
+        raise VerificationLockError(
+            "verification lock ownership, link count or mode is unsafe"
+        )
     return fd_info.st_dev, fd_info.st_ino
 
 
-def _pid_is_alive(pid: int) -> bool:
-    if pid <= 1:
-        return False
+def default_lock_path() -> Path:
+    """Return the fixed global lock pathname.
+
+    This function deliberately does not consult ``XDG_RUNTIME_DIR``,
+    ``RUNNER_TEMP`` or any other caller-controlled environment variable.
+    """
+
+    return LOCK_PATH
+
+
+def _ensure_provision_parent() -> None:
+    if os.geteuid() != ROOT_UID:
+        raise VerificationLockError(
+            "verification lock provisioning requires root; run the CI provisioning step"
+        )
+    # Validate the anchor before creating anything below it.  /run/lock is
+    # sticky, but an attacker may still pre-create the fixed child path.
+    _validate_existing_chain(LOCK_PARENT.parent)
+    parent = LOCK_PATH.parent
+    created_parent = False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+        os.mkdir(parent, ROOT_DIR_MODE)
+        created_parent = True
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise VerificationLockError(
+            f"unable to provision verification lock parent: {parent}"
+        ) from exc
+    # Never repair an existing path.  A wrong owner/mode is an explicit gate
+    # failure, not an invitation to chmod a path an attacker may have swapped.
+    if created_parent:
+        # Make the owner and mode explicit even when the root process has a
+        # restrictive umask.  This is only done for the path just created;
+        # pre-existing paths are validated and never repaired.
+        os.chown(parent, ROOT_UID, ROOT_UID)
+        os.chmod(parent, ROOT_DIR_MODE)
+    _lstat_directory(parent, expected_mode=ROOT_DIR_MODE)
 
 
-def _read_marker(fd: int, *, expected_inode: int) -> dict[str, object] | None:
-    os.lseek(fd, 0, os.SEEK_SET)
-    raw = os.read(fd, 4096)
-    if not raw:
-        return None
+def provision_verification_lock() -> Path:
+    """Atomically provision and validate the root-owned global lock file."""
+
+    _ensure_provision_parent()
+    lock_path = LOCK_PATH
+    before = _parent_chain(lock_path)
+    flags = os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    created_file = False
     try:
-        marker = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise VerificationLockError("verification lock contains an invalid owner marker") from exc
-    if not isinstance(marker, dict):
-        raise VerificationLockError("verification lock owner marker is not an object")
-    if marker.get("schema") != 1 or marker.get("inode") != expected_inode:
-        raise VerificationLockError("verification lock owner marker is stale or unsafe")
-    pid = marker.get("pid")
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
-        raise VerificationLockError("verification lock owner marker has an invalid PID")
-    if _pid_is_alive(pid):
-        raise VerificationLockError("verification lock is already held by another verification contour")
-    raise VerificationLockError("verification lock has a stale owner marker")
+        fd = os.open(lock_path, flags, LOCK_FILE_MODE)
+        created_file = True
+    except FileExistsError:
+        # Existing files are never replaced or repaired.  Open below only
+        # validates the identity and explicit root-owned mode.
+        try:
+            fd = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as exc:
+            raise VerificationLockError(
+                f"unable to validate provisioned verification lock: {lock_path}"
+            ) from exc
+    except OSError as exc:
+        raise VerificationLockError(
+            f"unable to provision verification lock: {lock_path}"
+        ) from exc
+    try:
+        if created_file:
+            os.fchown(fd, ROOT_UID, ROOT_UID)
+            os.fchmod(fd, LOCK_FILE_MODE)
+        _validate_lock_file(lock_path, fd)
+        if before != _parent_chain(lock_path):
+            raise VerificationLockError(
+                "verification lock parent identity changed during provisioning"
+            )
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return lock_path
 
 
-def _write_marker(fd: int, *, inode: int, contour: str) -> None:
-    marker = {
-        "schema": 1,
-        "pid": os.getpid(),
-        "inode": inode,
-        "contour": contour,
-        "created_at": time.time(),
-    }
-    payload = (json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    os.ftruncate(fd, 0)
-    os.lseek(fd, 0, os.SEEK_SET)
-    os.write(fd, payload)
-    os.fsync(fd)
+def _open_validated_lock(lock_path: Path) -> tuple[int, tuple[tuple[Path, int, int], ...], int, int]:
+    """Open the preprovisioned file and revalidate path identity after open."""
+
+    try:
+        before = _parent_chain(lock_path)
+    except VerificationLockError as exc:
+        if not lock_path.parent.exists():
+            raise VerificationLockError(
+                "LOCAL GATE BLOCKED: verification lock is not provisioned; "
+                f"run the root provisioning step for {lock_path}"
+            ) from exc
+        raise
+    try:
+        fd = os.open(
+            lock_path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError as exc:
+        raise VerificationLockError(
+            "LOCAL GATE BLOCKED: verification lock is not provisioned; "
+            f"run the root provisioning step for {lock_path}"
+        ) from exc
+    except OSError as exc:
+        raise VerificationLockError(f"unable to open verification lock: {exc}") from exc
+    try:
+        _dev, inode = _validate_lock_file(lock_path, fd)
+        after = _parent_chain(lock_path)
+        if before != after:
+            raise VerificationLockError(
+                "verification lock parent identity changed during open"
+            )
+        return fd, after, _dev, inode
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 @contextmanager
-def verification_resource_lock(
-    contour: str,
-    *,
-    path: Path | None = None,
-) -> Iterator[None]:
-    """Exclusively run one schema/resource-mutating verification contour.
-
-    ``path`` exists only for isolated unit tests.  Production callers use the
-    exact runtime/tmp pathname returned by :func:`default_lock_path`.
-    """
+def verification_resource_lock(contour: str) -> Iterator[None]:
+    """Exclusively run one schema/resource-mutating verification contour."""
 
     if contour not in LOCK_CONTOURS:
         yield
         return
-    lock_path = default_lock_path() if path is None else Path(path)
-    if not lock_path.is_absolute() or not _no_symlink_path(lock_path.parent, include_leaf=True):
-        raise VerificationLockError("verification lock path or parent is unsafe")
-    if not lock_path.parent.is_dir():
-        raise VerificationLockError("verification lock parent directory is unavailable")
-    fd = -1
+    lock_path = default_lock_path()
+    fd, parent_identity, _dev, _inode = _open_validated_lock(lock_path)
     locked = False
-    marker_written = False
     original_handlers: dict[int, object] = {}
     try:
-        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(lock_path, flags, 0o600)
-        except OSError as exc:
-            raise VerificationLockError(f"unable to open verification lock: {exc}") from exc
-        _dev, inode = _validate_lock_file(lock_path, fd)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             if exc.errno in (errno.EACCES, errno.EAGAIN):
                 raise VerificationLockError(
-                    "verification lock contention; refusing concurrent resource contours"
+                    "verification lock contention; refusing concurrent resource contours "
+                    f"({lock_path})"
                 ) from exc
             raise VerificationLockError("unable to acquire verification lock") from exc
         locked = True
-        _read_marker(fd, expected_inode=inode)
-        _write_marker(fd, inode=inode, contour=contour)
-        marker_written = True
+        # Revalidate after acquisition as well as after open.  No mutable
+        # marker is written: the root-owned inode is the only security identity.
+        if parent_identity != _parent_chain(lock_path):
+            raise VerificationLockError(
+                "verification lock parent identity changed before acquisition"
+            )
+        _validate_lock_file(lock_path, fd)
 
         def _signal_handler(signum: int, _frame: object) -> None:
             raise _LockSignal(signum)
@@ -263,18 +296,34 @@ def verification_resource_lock(
     finally:
         for signum, handler in original_handlers.items():
             signal.signal(signum, handler)
-        if fd >= 0:
-            if marker_written and locked:
-                try:
-                    _validate_lock_file(lock_path, fd)
-                    os.ftruncate(fd, 0)
-                    os.fsync(fd)
-                except OSError:
-                    # The process must never unlink or overwrite a path whose
-                    # identity changed while the lock was held.
-                    pass
-                except VerificationLockError:
-                    pass
-            if locked:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+        if locked:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--provision",
+        action="store_true",
+        help="atomically provision the fixed root-owned global lock (root only)",
+    )
+    args = parser.parse_args()
+    if not args.provision:
+        parser.error("--provision is required")
+    try:
+        path = provision_verification_lock()
+    except VerificationLockError as exc:
+        print(f"LOCAL GATE BLOCKED: {exc}", file=sys.stderr)
+        return 2
+    info = os.stat(path, follow_symlinks=False)
+    print(
+        f"Provisioned verification lock: {path} "
+        f"(device={info.st_dev} inode={info.st_ino} owner={info.st_uid} "
+        f"mode={stat.S_IMODE(info.st_mode):04o})"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

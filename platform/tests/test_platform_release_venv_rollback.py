@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-import fcntl
 import os
 import shutil
 import stat
@@ -13,6 +12,7 @@ import tempfile
 import unittest
 import zipfile
 
+from tests import platform_test_lock_support as lock_support
 from tools import platform_validate_release_artifact
 from tools import platform_validate_wheelhouse
 
@@ -31,33 +31,44 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
-        # Isolate the canonical production pathname in a test-only mount
-        # namespace; production code has no test lock-path override.
-        self.lock_root = self.root / "run-lock"
-        self.lock_root.mkdir(mode=0o700)
-        self.release_lock_path = self.lock_root / "oldsparky-platform-release.lock"
-        self.app_dir = self.root / "platform-app"
-        self.releases_dir = self.app_dir / "releases"
-        self.shared_dir = self.app_dir / "shared"
-        self.releases_dir.mkdir(parents=True)
-        self.shared_dir.mkdir()
-        (self.shared_dir / ".env.platform").write_text("PLATFORM_TESTING=1\n")
-        (self.shared_dir / ".env.platform").chmod(0o600)
-        self.fake_systemctl = self.root / "systemctl"
-        self.fake_systemctl.write_text(
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "case \"${1:-}\" in\n"
-            "  is-active) echo active; exit 0 ;;\n"
-            "  is-enabled) echo enabled; exit 0 ;;\n"
-            "  enable|disable|start|stop|restart|daemon-reload|reload) exit 0 ;;\n"
-            "  *) exit 0 ;;\n"
-            "esac\n"
-        )
-        self.fake_systemctl.chmod(0o755)
+        self._release_lock = None
+        try:
+            self._release_lock = lock_support.create_test_lock("venv-rollback")
+            self.release_lock_path = self._release_lock.path
+            self.tools_dir = self.root / "tools"
+            shutil.copytree(REPO_ROOT / "platform" / "tools", self.tools_dir)
+            self.install_test_lock_helper(self.tools_dir / "platform_release_lock.sh")
+            self.app_dir = self.root / "platform-app"
+            self.releases_dir = self.app_dir / "releases"
+            self.shared_dir = self.app_dir / "shared"
+            self.releases_dir.mkdir(parents=True)
+            self.shared_dir.mkdir()
+            (self.shared_dir / ".env.platform").write_text("PLATFORM_TESTING=1\n")
+            (self.shared_dir / ".env.platform").chmod(0o600)
+            self.fake_systemctl = self.root / "systemctl"
+            self.fake_systemctl.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "case \"${1:-}\" in\n"
+                "  is-active) echo active; exit 0 ;;\n"
+                "  is-enabled) echo enabled; exit 0 ;;\n"
+                "  enable|disable|start|stop|restart|daemon-reload|reload) exit 0 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n"
+            )
+            self.fake_systemctl.chmod(0o755)
+        except BaseException:
+            if self._release_lock is not None:
+                self._release_lock.cleanup()
+            self.temp_dir.cleanup()
+            raise
 
     def tearDown(self) -> None:
-        self.temp_dir.cleanup()
+        try:
+            if self._release_lock is not None:
+                self._release_lock.cleanup()
+        finally:
+            self.temp_dir.cleanup()
 
     def test_fresh_offline_venv_is_retained_for_release_rollback(self) -> None:
         previous_release = self.add_installed_release("previous-release")
@@ -454,9 +465,9 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         artifact = self.root / "lock-test.tar.gz"
         artifact.write_bytes(b"unused while the lock is held")
         Path(f"{artifact}.sha256").write_text(f"{'0' * 64}  {artifact.name}\n")
-        lock_fd = os.open(self.release_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        assert self._release_lock is not None
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._release_lock.acquire(nonblocking=True)
             install = self.run_script(
                 INSTALL_SCRIPT,
                 str(artifact),
@@ -478,8 +489,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 check=False,
             )
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+            self._release_lock.release()
 
         self.assertEqual(install.returncode, 3)
         self.assertEqual(rollback.returncode, 3)
@@ -646,11 +656,9 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             )
         )
         interrupted_runtime.chmod(0o755)
-        shutil.copy2(
-            REPO_ROOT / "platform" / "tools" / "platform_release_lock.sh",
-            interrupted_runtime.parent / "platform_release_lock.sh",
+        self.install_test_lock_helper(
+            interrupted_runtime.parent / "platform_release_lock.sh"
         )
-        (interrupted_runtime.parent / "platform_release_lock.sh").chmod(0o755)
         shutil.copy2(
             REPO_ROOT / "platform" / "tools" / "platform_release_systemd_state.py",
             interrupted_runtime.parent / "platform_release_systemd_state.py",
@@ -771,10 +779,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         )
         shutil.copy2(systemd_state_tool, release_tools / systemd_state_tool.name)
         (release_tools / systemd_state_tool.name).chmod(0o755)
-        shutil.copy2(
-            REPO_ROOT / "platform" / "tools" / "platform_release_lock.sh",
-            release_tools / "platform_release_lock.sh",
-        )
+        self.install_test_lock_helper(release_tools / "platform_release_lock.sh")
         shutil.copy2(RECOVERY_SHIM_SCRIPT, release_tools / RECOVERY_SHIM_SCRIPT.name)
         invoked_through_current = (
             self.app_dir / "current" / "tools" / ROLLBACK_SCRIPT.name
@@ -821,8 +826,21 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             index for index, line in enumerate(lines) if line.startswith('TOOLS_DIR="')
         ]
         self.assertEqual(len(tools_lines), 1)
-        lines[tools_lines[0]] = f'TOOLS_DIR="{source.parent}"\n'
+        lines[tools_lines[0]] = f'TOOLS_DIR="{self.tools_dir}"\n'
         return "".join(lines)
+
+    def install_test_lock_helper(self, destination: Path) -> None:
+        """Install a test-local helper while retaining production validation."""
+
+        helper = (REPO_ROOT / "platform" / "tools" / "platform_release_lock.sh").read_text(
+            encoding="utf-8"
+        )
+        helper = helper.replace(
+            "/run/lock/oldsparky-platform-release.lock",
+            str(self.release_lock_path),
+        )
+        destination.write_text(helper, encoding="utf-8")
+        destination.chmod(0o755)
 
     def write_injected_script(
         self,
@@ -1098,35 +1116,23 @@ raise SystemExit("unsupported fake pip invocation: " + repr(arguments))
         command_env["PLATFORM_ENVIRONMENT"] = "test"
         command_env["PLATFORM_TESTING"] = "1"
         command_script = script
-        if "platform_release_rollback" in script.name:
+        if script in (INSTALL_SCRIPT, ROLLBACK_SCRIPT) or "platform_release_rollback" in script.name:
             command_script = self.root / f".{script.stem}.systemctl.sh"
             script_text = script.read_text()
             tools_needle = 'TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"'
             if tools_needle in script_text:
-                # The wrapper lives outside the release tree. Keep the
-                # original tool directory so the lock/helper paths remain
-                # production-faithful while systemctl is test-substituted.
+                tools_dir = self.tools_dir
+                if script not in (INSTALL_SCRIPT, ROLLBACK_SCRIPT) and script.parent != self.root:
+                    tools_dir = script.parent.resolve()
                 script_text = script_text.replace(
-                    tools_needle, f'TOOLS_DIR="{script.parent.resolve()}"', 1
+                    tools_needle, f'TOOLS_DIR="{tools_dir}"', 1
                 )
             command_script.write_text(
                 script_text.replace("/usr/bin/systemctl", str(self.fake_systemctl))
             )
             command_script.chmod(0o755)
         result = subprocess.run(
-            [
-                "/usr/bin/unshare",
-                "-m",
-                "--propagation",
-                "private",
-                "/bin/bash",
-                "-c",
-                'mount --bind "$1" /run/lock && shift && exec "$@"',
-                "release-lock-test",
-                str(self.lock_root),
-                str(command_script),
-                *args,
-            ],
+            [str(command_script), *args],
             cwd=cwd or REPO_ROOT,
             text=True,
             stdout=subprocess.PIPE,

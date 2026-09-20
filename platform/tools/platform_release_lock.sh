@@ -8,7 +8,8 @@
 # There is intentionally no environment-controlled test pathname here.  A
 # production entrypoint must not be able to replace the canonical lock by
 # setting PLATFORM_ENVIRONMENT/PLATFORM_TESTING (or any other ambient value).
-# Tests isolate /run/lock in their own mount namespace instead.
+# Privileged tests use a serial guard and unique root-owned files directly
+# beneath /run/lock; the production canonical pathname remains unchanged.
 
 PLATFORM_RELEASE_LOCK_CANONICAL_PATH="/run/lock/oldsparky-platform-release.lock"
 PLATFORM_RELEASE_LOCK_PATH="$PLATFORM_RELEASE_LOCK_CANONICAL_PATH"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import unittest
@@ -47,9 +48,11 @@ from tools.platform_test_runner import (
     verify_backend_components,
 )
 from tools.platform_verification_lock import (
-    RUNTIME_DIR_ENV,
+    LOCK_FILE_MODE,
+    LOCK_PATH,
     VerificationLockError,
-    _runtime_root,
+    default_lock_path,
+    provision_verification_lock,
     verification_resource_lock,
 )
 from tools.platform_verify_contract import (
@@ -231,6 +234,115 @@ class PlatformVerificationContractTests(unittest.TestCase):
         preflight.assert_not_called()
         teardown.assert_not_called()
 
+    def test_privileged_contour_blocks_non_root_before_loading_tests_or_resources(self) -> None:
+        """A non-root privileged launch must fail before unittest/resource imports."""
+
+        repo_root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Keep this probe runnable when the test itself is root-owned (for
+            # example in a local container): the non-root child must be able to
+            # traverse an accessible synthetic checkout, while the catalog
+            # still sees the complete AST test inventory.
+            synthetic_platform = root / "platform"
+            synthetic_tools = synthetic_platform / "tools"
+            synthetic_tests = synthetic_platform / "tests"
+            synthetic_tools.mkdir(parents=True)
+            synthetic_tests.mkdir()
+            for name in (
+                "platform_test_catalog.py",
+                "platform_test_runner.py",
+                "platform_verification_lock.py",
+            ):
+                destination = synthetic_tools / name
+                shutil.copy2(repo_root / "platform/tools" / name, destination)
+                destination.chmod(0o755)
+            for source in (repo_root / "platform/tests").glob("test_*.py"):
+                destination = synthetic_tests / source.name
+                shutil.copy2(source, destination)
+                destination.chmod(0o644)
+            root.chmod(0o755)
+            synthetic_platform.chmod(0o755)
+            synthetic_tools.chmod(0o755)
+            synthetic_tests.chmod(0o755)
+
+            marker_dir = root / "markers"
+            marker_dir.mkdir(mode=0o733)
+            marker = marker_dir / "imported"
+            probe = root / "probe.py"
+            runner = synthetic_tools / "platform_test_runner.py"
+            probe.write_text(
+                "import builtins\n"
+                "from pathlib import Path\n"
+                "import runpy\n"
+                "import sys\n"
+                f"marker = Path({str(marker)!r})\n"
+                "real_import = builtins.__import__\n"
+                "def record_import(name, *args, **kwargs):\n"
+                "    if name == 'tests' or name.startswith('tests.') or name.split('.')[0] in {'sqlalchemy', 'redis', 'asyncpg', 'psycopg'}:\n"
+                "        marker.write_text(name, encoding='utf-8')\n"
+                "    return real_import(name, *args, **kwargs)\n"
+                "builtins.__import__ = record_import\n"
+                "import tools.platform_verification_lock as verification_lock\n"
+                f"verification_lock.LOCK_PATH = Path({str(root / 'missing-global.lock')!r})\n"
+                f"sys.argv = [{str(runner)!r}, '--contour', 'backend-privileged', '--quiet']\n"
+                "runpy.run_path(str(sys.argv[0]), run_name='__main__')\n",
+                encoding="utf-8",
+            )
+
+            environment = {
+                **os.environ,
+                "PLATFORM_ENVIRONMENT": "test",
+                "PLATFORM_DB_SCHEMA": "platform",
+                "PLATFORM_DATABASE_URL": (
+                    "postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test"
+                ),
+                "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+                "PYTHONPATH": os.pathsep.join((str(root), str(synthetic_platform))),
+                "XDG_RUNTIME_DIR": "",
+            }
+            if os.geteuid() == 0:
+                launcher = [
+                    shutil.which("runuser") or "/usr/bin/runuser",
+                    "-u",
+                    "nobody",
+                    "--",
+                    "/usr/bin/python3",
+                    str(probe),
+                ]
+            else:
+                launcher = [sys.executable, str(probe)]
+            blocked = subprocess.run(
+                launcher,
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertNotEqual(blocked.returncode, 0, blocked.stdout + blocked.stderr)
+            self.assertIn("backend-privileged requires the root test user", blocked.stderr)
+            self.assertFalse(
+                marker.exists(),
+                "non-root preflight imported tests/resources: "
+                + (marker.read_text() if marker.exists() else "<unknown>"),
+            )
+            for contour in ("backend", "backend-integration", "backend-privileged"):
+                with self.subTest(contour=contour):
+                    with (
+                        patch("tools.platform_test_runner.os.geteuid", return_value=1234),
+                        patch("tools.platform_test_runner._require_test_environment") as validator,
+                        patch("tools.platform_test_runner.verification_resource_lock") as lock,
+                    ):
+                        with self.assertRaisesRegex(
+                            SystemExit,
+                            rf"LOCAL GATE BLOCKED: {contour} requires the root test user",
+                        ):
+                            test_runner_main(["--contour", contour, "--list"])
+                    validator.assert_not_called()
+                    lock.assert_not_called()
+
     def test_aggregate_only_workflow_env_reaches_runner_boundary(self) -> None:
         """The aggregate job must provide every value the pure validator requires."""
 
@@ -318,12 +430,25 @@ class PlatformVerificationContractTests(unittest.TestCase):
         """A local migration cannot reset resources during integration tests."""
 
         with tempfile.TemporaryDirectory() as directory:
-            lock_path = Path(directory) / "platformdb-test.lock"
+            root = Path(directory)
+            root.chmod(0o755)
+            lock_path = root / "platformdb-test.lock"
+            lock_path.touch(mode=LOCK_FILE_MODE)
+            if os.geteuid() != 0:
+                # A non-root test process cannot manufacture the root-owned
+                # production identity.  Prove the validator fails on owner
+                # before attempting to exercise flock instead of weakening it.
+                with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
+                    with self.assertRaisesRegex(VerificationLockError, "wrong owner"):
+                        with verification_resource_lock("backend-integration"):
+                            pass
+                return
             holder_code = """
 from pathlib import Path
 import sys
-from tools.platform_verification_lock import verification_resource_lock
-with verification_resource_lock("backend-integration", path=Path(sys.argv[1])):
+import tools.platform_verification_lock as lock
+lock.LOCK_PATH = Path(sys.argv[1])
+with lock.verification_resource_lock("backend-integration"):
     print("ready", flush=True)
     sys.stdin.readline()
 """
@@ -339,11 +464,12 @@ with verification_resource_lock("backend-integration", path=Path(sys.argv[1])):
             contender_code = """
 from pathlib import Path
 import sys
-from tools.platform_verification_lock import VerificationLockError, verification_resource_lock
+import tools.platform_verification_lock as lock
+lock.LOCK_PATH = Path(sys.argv[1])
 try:
-    with verification_resource_lock("migration", path=Path(sys.argv[1])):
+    with lock.verification_resource_lock("migration"):
         raise SystemExit("migration unexpectedly entered integration contour")
-except VerificationLockError as exc:
+except lock.VerificationLockError as exc:
     print(exc)
     raise SystemExit(75)
 """
@@ -367,91 +493,235 @@ except VerificationLockError as exc:
             self.assertEqual(holder.returncode, 0, stderr or stdout)
             self.assertEqual(lock_path.read_text(encoding="utf-8"), "")
 
-    def test_shared_resource_lock_rejects_stale_marker_and_symlink(self) -> None:
+    def test_shared_resource_lock_rejects_wrong_mode_and_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            root.chmod(0o755)
             lock_path = root / "platformdb-test.lock"
             lock_path.touch(mode=0o600)
-            lock_path.write_text(
-                '{"contour":"migration","inode":%d,"pid":999999,"schema":1}\n'
-                % lock_path.stat().st_ino,
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(VerificationLockError, "stale"):
-                with verification_resource_lock("migration", path=lock_path):
-                    pass
+            if os.geteuid() != 0:
+                with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
+                    with self.assertRaisesRegex(VerificationLockError, "wrong owner"):
+                        with verification_resource_lock("migration"):
+                            pass
+                return
+            with self.assertRaisesRegex(VerificationLockError, "mode is unsafe"):
+                with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
+                    with verification_resource_lock("migration"):
+                        pass
+            lock_path.chmod(LOCK_FILE_MODE)
             link = root / "unsafe.lock"
             link.symlink_to(lock_path)
-            with self.assertRaises(VerificationLockError):
-                with verification_resource_lock("migration", path=link):
-                    pass
+            with patch("tools.platform_verification_lock.LOCK_PATH", link):
+                with self.assertRaises(VerificationLockError):
+                    with verification_resource_lock("migration"):
+                        pass
 
-    def test_verification_runtime_requires_explicit_private_directory(self) -> None:
+    def test_global_lock_serializes_root_and_non_root_on_same_inode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "runtime"
-            root.mkdir(mode=0o700)
-            with patch.dict(
-                os.environ,
-                {RUNTIME_DIR_ENV: str(root), "XDG_RUNTIME_DIR": "/unsafe/inherited"},
-                clear=False,
-            ):
-                self.assertEqual(_runtime_root(), root)
-
+            root = Path(directory)
             root.chmod(0o755)
-            with patch.dict(os.environ, {RUNTIME_DIR_ENV: str(root)}, clear=False):
-                with self.assertRaisesRegex(VerificationLockError, "mode 700"):
-                    _runtime_root()
+            lock_path = root / "platformdb-test.lock"
+            lock_path.touch(mode=LOCK_FILE_MODE)
+            if os.geteuid() != 0:
+                with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
+                    with self.assertRaisesRegex(VerificationLockError, "wrong owner"):
+                        with verification_resource_lock("backend-integration"):
+                            pass
+                return
+            if shutil.which("runuser") is None:
+                with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
+                    with verification_resource_lock("backend-integration"):
+                        pass
+                return
+            module_dir = root / "module"
+            module_dir.mkdir(mode=0o755)
+            package_dir = module_dir / "tools"
+            package_dir.mkdir(mode=0o755)
+            (package_dir / "__init__.py").write_text("", encoding="utf-8")
+            (package_dir / "platform_verification_lock.py").write_bytes(
+                Path(__file__).resolve().parents[1].joinpath(
+                    "tools/platform_verification_lock.py"
+                ).read_bytes()
+            )
+            holder_code = """
+from pathlib import Path
+import sys
+import tools.platform_verification_lock as lock
+lock.LOCK_PATH = Path(sys.argv[1])
+with lock.verification_resource_lock("backend-integration"):
+    info = lock.os.stat(lock.LOCK_PATH, follow_symlinks=False)
+    print(f"ready:{info.st_dev}:{info.st_ino}", flush=True)
+    sys.stdin.readline()
+"""
+            holder = subprocess.Popen(
+                [
+                    shutil.which("runuser") or "/usr/bin/runuser",
+                    "-u",
+                    "nobody",
+                    "--",
+                    "/usr/bin/python3",
+                    "-c",
+                    holder_code,
+                    str(lock_path),
+                ],
+                cwd=module_dir,
+                env={"PYTHONPATH": str(module_dir), "PATH": os.environ.get("PATH", "")},
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert holder.stdout is not None
+            ready = holder.stdout.readline().strip()
+            self.assertTrue(ready.startswith("ready:"), ready)
+            _tag, holder_device, holder_inode = ready.split(":")
+            contender_code = """
+from pathlib import Path
+import sys
+import tools.platform_verification_lock as lock
+lock.LOCK_PATH = Path(sys.argv[1])
+try:
+    with lock.verification_resource_lock("migration"):
+        raise SystemExit("root unexpectedly entered non-root contour")
+except lock.VerificationLockError as exc:
+    print(exc)
+    raise SystemExit(75)
+"""
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    contender_code,
+                    str(lock_path),
+                ],
+                cwd=module_dir,
+                env={"PYTHONPATH": str(module_dir), "PATH": os.environ.get("PATH", "")},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(contender.returncode, 75, contender.stderr)
+            self.assertIn("contention", contender.stdout)
+            assert holder.stdin is not None
+            holder.stdin.write("release\n")
+            holder.stdin.close()
+            holder.wait(timeout=5)
+            holder_stderr = holder.stderr.read()
+            holder.stdout.close()
+            holder.stderr.close()
+            self.assertEqual(holder.returncode, 0, holder_stderr)
+            current = os.stat(lock_path)
+            self.assertEqual(int(holder_device), current.st_dev)
+            self.assertEqual(int(holder_inode), current.st_ino)
 
-            root.chmod(0o700)
+    def test_global_lock_fails_closed_on_missing_or_unsafe_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o755)
+            missing = root / "missing" / "platformdb-test.lock"
+            if os.geteuid() != 0:
+                parent = root / "non-root-parent"
+                parent.mkdir(mode=0o755)
+                lock_path = parent / "platformdb-test.lock"
+                lock_path.touch(mode=LOCK_FILE_MODE)
+                with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
+                    with self.assertRaisesRegex(VerificationLockError, "wrong owner"):
+                        with verification_resource_lock("migration"):
+                            pass
+                return
+            with patch("tools.platform_verification_lock.LOCK_PATH", missing):
+                with self.assertRaisesRegex(VerificationLockError, "LOCAL GATE BLOCKED"):
+                    with verification_resource_lock("migration"):
+                        pass
+
+            parent = root / "secure-parent"
+            parent.mkdir(mode=0o755)
+            lock_path = parent / "platformdb-test.lock"
+            lock_path.touch(mode=LOCK_FILE_MODE)
+            parent.chmod(0o775)
+            with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
+                with self.assertRaisesRegex(VerificationLockError, "writable"):
+                    with verification_resource_lock("migration"):
+                        pass
+            parent.chmod(0o755)
+            if os.geteuid() == 0:
+                os.chown(parent, 65534, 65534)
+                with patch("tools.platform_verification_lock.LOCK_PATH", lock_path):
+                    with self.assertRaisesRegex(VerificationLockError, "wrong owner"):
+                        with verification_resource_lock("migration"):
+                            pass
+                os.chown(parent, 0, 0)
+            link = root / "parent-link"
+            link.symlink_to(parent, target_is_directory=True)
+            linked_lock = link / "platformdb-test.lock"
+            with patch("tools.platform_verification_lock.LOCK_PATH", linked_lock):
+                with self.assertRaisesRegex(VerificationLockError, "not a directory"):
+                    with verification_resource_lock("migration"):
+                        pass
+
+            # A parent replacement between the path check and open is a
+            # security failure even when the leaf itself still looks valid.
+            stable = root / "stable"
+            stable.mkdir(mode=0o755)
+            stable_lock = stable / "platformdb-test.lock"
+            stable_lock.touch(mode=LOCK_FILE_MODE)
             with (
-                patch.dict(os.environ, {RUNTIME_DIR_ENV: str(root)}, clear=False),
+                patch("tools.platform_verification_lock.LOCK_PATH", stable_lock),
                 patch(
-                    "tools.platform_verification_lock.os.geteuid",
-                    return_value=os.geteuid() + 1,
+                    "tools.platform_verification_lock._parent_chain",
+                    side_effect=[((stable, 1, 2),), ((stable, 1, 3),)],
                 ),
             ):
-                with self.assertRaisesRegex(VerificationLockError, "owned by the test user"):
-                    _runtime_root()
+                with self.assertRaisesRegex(VerificationLockError, "identity changed"):
+                    with verification_resource_lock("migration"):
+                        pass
 
-    def test_verification_runtime_rejects_explicit_symlink(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "runtime"
-            root.mkdir(mode=0o700)
-            link = Path(directory) / "runtime-link"
-            link.symlink_to(root, target_is_directory=True)
-            with patch.dict(os.environ, {RUNTIME_DIR_ENV: str(link)}, clear=False):
-                with self.assertRaisesRegex(VerificationLockError, "unsafe or a symlink"):
-                    _runtime_root()
+    def test_verification_lock_is_fixed_and_ignores_sudo_inheritance(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "XDG_RUNTIME_DIR": "/runner-controlled/runtime",
+                "RUNNER_TEMP": "/runner-controlled/temp",
+                "PLATFORM_VERIFICATION_RUNTIME_DIR": "/runner-controlled/override",
+            },
+            clear=False,
+        ):
+            self.assertEqual(default_lock_path(), LOCK_PATH)
+            self.assertEqual(default_lock_path().parent, Path("/run/lock/oldsparky-platform-verification"))
 
-    def test_verification_runtime_does_not_reuse_runner_directory_after_sudo(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            inherited = Path(directory) / "runner-runtime"
-            inherited.mkdir(mode=0o700)
-            fallback = Path(directory) / "effective-runtime"
-            with (
-                patch.dict(
-                    os.environ,
-                    {"XDG_RUNTIME_DIR": str(inherited)},
-                    clear=True,
-                ),
-                patch("tools.platform_verification_lock._per_user_runtime_dir", return_value=fallback),
-                patch("tools.platform_verification_lock.os.geteuid", return_value=1234),
-            ):
-                self.assertEqual(_runtime_root(), fallback)
+    def test_root_provisioning_has_explicit_identity_and_mode(self) -> None:
+        if os.geteuid() != 0:
+            with self.assertRaisesRegex(VerificationLockError, "requires root"):
+                provision_verification_lock()
+            return
+        path = provision_verification_lock()
+        info = os.stat(path, follow_symlinks=False)
+        parent = os.stat(path.parent, follow_symlinks=False)
+        self.assertEqual(info.st_uid, 0)
+        self.assertEqual(info.st_nlink, 1)
+        self.assertEqual(info.st_mode & 0o777, LOCK_FILE_MODE)
+        self.assertEqual(parent.st_uid, 0)
+        self.assertEqual(parent.st_mode & 0o777, 0o755)
 
     def test_ci_root_contours_provision_effective_user_runtime_lock_root(self) -> None:
         workflow = (
             Path(__file__).resolve().parents[2] / ".github/workflows/platform-security.yml"
         ).read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("name: Prepare root-owned verification runtime directory"), 2)
-        self.assertEqual(workflow.count('sudo install -d -o root -g root -m 700 "$runtime_dir"'), 2)
-        self.assertNotIn("sudo -EH bash -lc", workflow)
-        self.assertEqual(
-            workflow.count(
-                'sudo -EH env XDG_RUNTIME_DIR= PLATFORM_VERIFICATION_RUNTIME_DIR="$PLATFORM_VERIFICATION_RUNTIME_DIR" bash -lc'
-            ),
-            3,
+        self.assertEqual(workflow.count("name: Provision fixed root-owned global verification lock"), 3)
+        self.assertEqual(workflow.count("platform/tools/platform_verification_lock.py\" --provision"), 3)
+        self.assertNotIn("RUNNER_TEMP/platform-verification-runtime", workflow)
+        self.assertNotIn("PLATFORM_VERIFICATION_RUNTIME_DIR", workflow)
+        self.assertNotIn("sudo install -d", workflow)
+        self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 3)
+        verification_block = re.search(
+            r"^  verification-contract:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow,
+            re.MULTILINE | re.DOTALL,
         )
+        self.assertIsNotNone(verification_block)
+        assert verification_block is not None
+        self.assertNotIn("Provision fixed root-owned global verification lock", verification_block.group("body"))
 
     def test_registry_exposes_deterministic_and_workflow_only_contours(self) -> None:
         self.assertEqual(set(CI_GATE_IDS), set(DETERMINISTIC_GATE_IDS))

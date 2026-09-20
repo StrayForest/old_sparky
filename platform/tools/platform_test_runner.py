@@ -64,9 +64,12 @@ except ModuleNotFoundError:  # Import as tools.platform_test_runner in tests.
     )
 
 try:
-    from platform_verification_lock import verification_resource_lock
+    from platform_verification_lock import VerificationLockError, verification_resource_lock
 except ModuleNotFoundError:  # Import as tools.platform_test_runner in tests.
-    from tools.platform_verification_lock import verification_resource_lock  # type: ignore[no-redef]
+    from tools.platform_verification_lock import (  # type: ignore[no-redef]
+        VerificationLockError,
+        verification_resource_lock,
+    )
 
 
 TEST_ENV_CONTOURS = frozenset((BACKEND_AGGREGATE, *BACKEND_CONTOURS))
@@ -609,11 +612,7 @@ def _load_suite(test_ids: Sequence[str]) -> unittest.TestSuite:
 def _privileged_preflight(cases: Sequence[TestCase]) -> None:
     if not cases:
         return
-    if os.geteuid() != 0:
-        raise SystemExit(
-            "LOCAL GATE BLOCKED: backend-privileged requires the root test user; "
-            "it must not be converted into a skip."
-        )
+    _require_root_identity("backend-privileged")
     modules = {case.module for case in cases}
     if "test_platform_media_processor" in modules:
         if importlib.util.find_spec("PIL") is None:
@@ -637,6 +636,30 @@ def _privileged_preflight(cases: Sequence[TestCase]) -> None:
         raise SystemExit(
             "LOCAL GATE BLOCKED: backend-privileged wrapper tests require /usr/bin/setpriv."
         )
+
+
+def _require_root_identity(contour: str) -> None:
+    """Fail before any resource validation, lock acquisition or test discovery."""
+
+    if os.geteuid() != 0:
+        raise SystemExit(
+            f"LOCAL GATE BLOCKED: {contour} requires the root test user; "
+            "it must not be converted into a skip."
+        )
+
+
+def _requires_root_before_resources(args: argparse.Namespace) -> bool:
+    """Return whether this invocation executes a root-owned contour.
+
+    The aggregate artifact-verification path is deliberately exempt: it only
+    reads component manifests and is the DB-free backend job.  A normal
+    aggregate run still owns the root-required catalog and must fail before
+    touching the shared test resources.
+    """
+
+    if not CONTOUR_METADATA[args.contour].get("requires_root"):
+        return False
+    return not (args.contour == BACKEND_AGGREGATE and args.component_dir is not None)
 
 
 def _write_json(path: Path | None, payload: dict[str, object]) -> None:
@@ -1186,6 +1209,11 @@ def _run_contour(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    # Root-owned contours must reject an unprivileged caller before config
+    # validation, lock acquisition, integration preflight, catalog discovery
+    # or any cleanup path can touch shared resources.
+    if _requires_root_before_resources(args):
+        _require_root_identity(args.contour)
     _require_test_environment(args.contour)
     # Aggregate execution and both resource-bearing sub-contours must share
     # one host-level boundary.  DB-free contours intentionally stay outside
@@ -1195,14 +1223,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.component_dir is None and not args.list_ids
         else nullcontext()
     )
-    with lock_context:
-        if (
-            args.component_dir is None
-            and not args.list_ids
-            and args.contour in {BACKEND_AGGREGATE, "backend-integration"}
-        ):
-            _require_integration_resources_ready()
-        return _run_contour(args)
+    try:
+        with lock_context:
+            if (
+                args.component_dir is None
+                and not args.list_ids
+                and args.contour in {BACKEND_AGGREGATE, "backend-integration"}
+            ):
+                _require_integration_resources_ready()
+            return _run_contour(args)
+    except VerificationLockError as exc:
+        raise SystemExit(f"LOCAL GATE BLOCKED: {exc}") from exc
 
 
 if __name__ == "__main__":

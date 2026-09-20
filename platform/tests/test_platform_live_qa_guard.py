@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
 import grp
 import hashlib
 import importlib.util
@@ -19,6 +18,8 @@ import unittest
 from unittest import mock
 from uuid import uuid4
 import zipfile
+
+from tests import platform_test_lock_support as lock_support
 
 
 SCRIPT_PATH = (
@@ -830,20 +831,27 @@ class LiveQaGuardTests(unittest.TestCase):
                 app_dir, current=current, previous=previous
             )
             lock_path = base / "liveqa.lock"
+            release_lock = lock_support.create_test_lock(
+                "liveqa-retention-release", root=base
+            )
             with (
                 mock.patch.object(guard, "MACHINE_LOCK_PATH", lock_path),
+                mock.patch.object(guard, "RELEASE_LOCK_PATH", release_lock.path),
                 mock.patch.object(guard, "_liveqa_cgroup_process_ids", return_value=()),
                 mock.patch.object(guard, "_liveqa_process_ids", return_value=()),
                 mock.patch.object(
                     guard, "_open_machine_lock", wraps=guard._open_machine_lock
                 ) as opened_lock,
             ):
-                plan = guard.prune_runtime_cache(
-                    apply=False,
-                    keep=1,
-                    root=root,
-                    app_dir=app_dir,
-                )
+                try:
+                    plan = guard.prune_runtime_cache(
+                        apply=False,
+                        keep=1,
+                        root=root,
+                        app_dir=app_dir,
+                    )
+                finally:
+                    release_lock.cleanup()
             opened_lock.assert_called_once_with()
             self.assertEqual([entry.path for entry in plan.retained], [newest])
             self.assertEqual([entry.path for entry in plan.candidates], [old])
@@ -872,26 +880,32 @@ class LiveQaGuardTests(unittest.TestCase):
             base = Path(temporary)
             root = base / "cache"
             root.mkdir(mode=0o755)
-            descriptor = os.open(base / "lock", os.O_RDWR | os.O_CREAT, 0o600)
-            with (
-                mock.patch.object(
-                    guard, "_open_machine_lock", return_value=descriptor
-                ),
-                mock.patch.object(
-                    guard,
-                    "assert_liveqa_idle",
-                    side_effect=guard.GuardError(
-                        "dedicated oldsparky-liveqa system account is unavailable"
+            machine_lock = lock_support.create_test_lock(
+                "liveqa-machine", root=base
+            )
+            try:
+                descriptor = os.dup(machine_lock.fd)
+                with (
+                    mock.patch.object(
+                        guard, "_open_machine_lock", return_value=descriptor
                     ),
-                ),
-                self.assertRaisesRegex(guard.GuardError, "account is unavailable"),
-            ):
-                guard.prune_runtime_cache_release_lock_held(
-                    apply=False,
-                    keep=1,
-                    root=root,
-                    app_dir=Path("/opt/oldsparky/platform"),
-                )
+                    mock.patch.object(
+                        guard,
+                        "assert_liveqa_idle",
+                        side_effect=guard.GuardError(
+                            "dedicated oldsparky-liveqa system account is unavailable"
+                        ),
+                    ),
+                    self.assertRaisesRegex(guard.GuardError, "account is unavailable"),
+                ):
+                    guard.prune_runtime_cache_release_lock_held(
+                        apply=False,
+                        keep=1,
+                        root=root,
+                        app_dir=Path("/opt/oldsparky/platform"),
+                    )
+            finally:
+                machine_lock.cleanup()
 
     def test_runtime_retention_cli_is_dry_run_by_default(self) -> None:
         args = guard._parser().parse_args(["prune-runtime-cache"])
@@ -949,23 +963,21 @@ class LiveQaGuardTests(unittest.TestCase):
             app_dir = Path(temporary) / "platform"
             shared = app_dir / "shared"
             shared.mkdir(parents=True)
-            descriptor = os.open(
-                guard.RELEASE_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600
-            )
+            release_lock = lock_support.create_test_lock("liveqa-contention")
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                with self.assertRaisesRegex(
-                    guard.GuardError, "another platform release operation"
-                ):
-                    guard.prune_runtime_cache(
-                        apply=False,
-                        keep=1,
-                        root=Path(temporary) / "missing-cache",
-                        app_dir=app_dir,
-                    )
+                release_lock.acquire(nonblocking=True)
+                with mock.patch.object(guard, "RELEASE_LOCK_PATH", release_lock.path):
+                    with self.assertRaisesRegex(
+                        guard.GuardError, "another platform release operation"
+                    ):
+                        guard.prune_runtime_cache(
+                            apply=False,
+                            keep=1,
+                            root=Path(temporary) / "missing-cache",
+                            app_dir=app_dir,
+                        )
             finally:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
+                release_lock.cleanup()
 
     @unittest.skipUnless(os.geteuid() == 0, "root-owned cache contract")
     def test_interrupted_deletion_is_reclaimed_from_a_validated_tombstone(

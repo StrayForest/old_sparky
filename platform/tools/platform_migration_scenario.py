@@ -35,7 +35,7 @@ from tools.platform_tournament_list_read_model_recovery import (
     repair_indexes_async,
     validate_projection_async,
 )
-from tools.platform_verification_lock import verification_resource_lock
+from tools.platform_verification_lock import VerificationLockError, verification_resource_lock
 
 
 TARGET_REVISION = "20260821_0039"
@@ -755,8 +755,11 @@ async def _main() -> None:
     database_name = urlsplit(settings.platform_database_url).path.lstrip("/")
     if settings.platform_environment != "test" or database_name != "platformdb_test":
         raise RuntimeError("Migration scenario requires PLATFORM_ENVIRONMENT=test and platformdb_test")
-    with verification_resource_lock("migration"):
-        await _migration_body()
+    try:
+        with verification_resource_lock("migration"):
+            await _migration_body()
+    except VerificationLockError as exc:
+        raise SystemExit(f"LOCAL GATE BLOCKED: {exc}") from exc
 
 
 if __name__ == "__main__":

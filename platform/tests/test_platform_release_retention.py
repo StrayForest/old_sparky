@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-import fcntl
-import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+from uuid import UUID
 
+from tests import platform_test_lock_support as lock_support
+from tools import platform_release_retention as retention
 from tools.platform_release_retention import (
     apply_plan,
     build_retention_plan,
@@ -14,20 +16,45 @@ from tools.platform_release_retention import (
 )
 
 
-RELEASE_LOCK_PATH = Path("/run/lock/oldsparky-platform-release.lock")
-
-
 class PlatformReleaseRetentionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.app_dir = Path(self.temp_dir.name) / "platform"
-        self.releases_dir = self.app_dir / "releases"
-        self.releases_dir.mkdir(parents=True)
-        (self.app_dir / "shared").mkdir()
-        self.now = datetime(2026, 6, 11, tzinfo=UTC)
+        self._lock_guard = None
+        self._release_lock = None
+        self.original_release_lock_path = retention.RELEASE_LOCK_PATH
+        try:
+            self._lock_guard = lock_support.create_test_lock("retention-guard")
+            self._lock_guard.acquire()
+            self._release_lock = lock_support.create_test_lock("retention-release")
+            self.release_lock_path = self._release_lock.path
+            retention.RELEASE_LOCK_PATH = self.release_lock_path
+            self.app_dir = Path(self.temp_dir.name) / "platform"
+            self.releases_dir = self.app_dir / "releases"
+            self.releases_dir.mkdir(parents=True)
+            (self.app_dir / "shared").mkdir()
+            self.now = datetime(2026, 6, 11, tzinfo=UTC)
+        except BaseException:
+            retention.RELEASE_LOCK_PATH = self.original_release_lock_path
+            for lock in (self._release_lock, self._lock_guard):
+                if lock is not None:
+                    lock.cleanup()
+            self.temp_dir.cleanup()
+            raise
 
     def tearDown(self) -> None:
-        self.temp_dir.cleanup()
+        cleanup_errors: list[BaseException] = []
+        try:
+            retention.RELEASE_LOCK_PATH = self.original_release_lock_path
+        finally:
+            self.temp_dir.cleanup()
+            for lock in (self._release_lock, self._lock_guard):
+                if lock is not None:
+                    try:
+                        lock.cleanup()
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
     def add_release(self, name: str, *, age_days: int, size: int = 16) -> Path:
         release = self.releases_dir / name
@@ -188,14 +215,55 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
                 self.fail("pending transaction unexpectedly acquired retention lock")
 
     def test_release_lock_contention_fails_closed(self) -> None:
-        descriptor = os.open(RELEASE_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert self._release_lock is not None
+            self._release_lock.acquire(nonblocking=True)
             with self.assertRaisesRegex(
                 RuntimeError, "holds the platform release lock"
             ):
                 with release_operation_lock(self.app_dir):
                     self.fail("contended retention lock was acquired")
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+            assert self._release_lock is not None
+            self._release_lock.release()
+
+    def test_test_lock_creation_rejects_precreated_symlink(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            fixed_uuid = UUID("11111111-1111-1111-1111-111111111111")
+            candidate = root / f"{lock_support.TEST_LOCK_PREFIX}symlink-{fixed_uuid.hex}.lock"
+            victim = root / "victim"
+            victim.write_bytes(b"must remain unchanged")
+            candidate.symlink_to(victim)
+            with mock.patch.object(lock_support, "uuid4", return_value=fixed_uuid):
+                with self.assertRaises(FileExistsError):
+                    lock_support.create_test_lock("symlink", root=root)
+            self.assertEqual(victim.read_bytes(), b"must remain unchanged")
+
+    def test_test_lock_cleanup_refuses_identity_swap(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            lock = lock_support.create_test_lock("identity", root=Path(temporary))
+            replacement = lock.path
+            replacement.unlink()
+            replacement.write_bytes(b"replacement")
+            replacement.chmod(0o600)
+            with self.assertRaisesRegex(AssertionError, "identity changed"):
+                lock.cleanup()
+            self.assertEqual(replacement.read_bytes(), b"replacement")
+            replacement.unlink()
+
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            fixed_uuid = UUID("22222222-2222-2222-2222-222222222222")
+            candidate = root / f"{lock_support.TEST_LOCK_PREFIX}metadata-{fixed_uuid.hex}.lock"
+            with (
+                mock.patch.object(lock_support, "uuid4", return_value=fixed_uuid),
+                mock.patch.object(
+                    lock_support,
+                    "_assert_lock_metadata",
+                    side_effect=AssertionError("metadata validation failed"),
+                ),
+                self.assertRaisesRegex(AssertionError, "metadata validation failed"),
+            ):
+                lock_support.create_test_lock("metadata", root=root)
+            self.assertFalse(candidate.exists() or candidate.is_symlink())

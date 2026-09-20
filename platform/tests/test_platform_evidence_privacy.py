@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from io import BytesIO, StringIO
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -650,7 +651,14 @@ class EvidencePrivacyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with mock.patch("tools.platform_abort_retained_load.RUN_ROOT_BASE", root / "runs"), \
-                mock.patch("tools.platform_abort_retained_load.ABORT_EXPORT_BASE", export_root):
+                mock.patch("tools.platform_abort_retained_load.ABORT_EXPORT_BASE", export_root), \
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "SUDO_UID": str(os.geteuid()),
+                        "SUDO_GID": str(os.getegid()),
+                    },
+                ):
                 exported = export_abort_evidence("123", '{"schema":1,"process_count":1}\n')
             payload = json.loads((exported / "server-observability.json").read_text(encoding="utf-8"))
             output = serialized(payload)

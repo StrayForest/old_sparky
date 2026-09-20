@@ -69,6 +69,26 @@ class PlatformBackendTestCatalogTests(unittest.TestCase):
             self.assertIn(item["timeout_class"], {"short", "long"})
             self.assertGreater(item["timeout_seconds"], 0)
 
+    def test_each_contour_has_stable_boundary_snapshot_and_rationale(self) -> None:
+        payload = catalog.registry_payload()
+        entries = {
+            item["id"]: item
+            for item in (*payload["contours"], *payload["external_contours"])
+        }
+        expected_contours = {
+            *catalog.BACKEND_CONTOURS,
+            catalog.VERIFICATION_CONTOUR,
+        }
+        self.assertEqual(set(entries), expected_contours)
+        for contour in expected_contours:
+            entry = entries[contour]
+            expected = catalog.EXPECTED_CONTOUR_SNAPSHOT[contour]
+            self.assertEqual(
+                {field: entry[field] for field in expected},
+                dict(expected),
+            )
+            self.assertEqual(entry["rationale"], catalog.CONTOUR_RATIONALE[contour])
+
     def test_focus_selector_can_be_resolved_without_importing_the_database(self) -> None:
         selected = catalog.cases_for_contour(
             "backend-unit",

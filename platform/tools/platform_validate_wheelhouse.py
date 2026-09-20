@@ -26,6 +26,10 @@ MAX_WHEELHOUSE_BYTES = 1024 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_WHEELS = 2048
+# Production invocation remains root-only below.  Keeping the ownership
+# identity explicit lets hermetic contract tests substitute their effective
+# user without weakening the production metadata boundary.
+REQUIRED_OWNER_UID = 0
 
 
 class WheelhouseError(RuntimeError):
@@ -52,7 +56,7 @@ def _safe_regular_file(
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
-        or metadata.st_uid != 0
+        or metadata.st_uid != REQUIRED_OWNER_UID
         or mode & 0o022
         or (expected_mode is not None and mode != expected_mode)
         or metadata.st_size > max_bytes
@@ -165,7 +169,7 @@ def _wheel_files(wheelhouse: Path, *, expected_mode: int | None) -> list[Path]:
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != 0
+        or metadata.st_uid != REQUIRED_OWNER_UID
         or resolved != wheelhouse.absolute()
         or mode & 0o022
         or (expected_mode is not None and mode != expected_mode)
