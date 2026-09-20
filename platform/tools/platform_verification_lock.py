@@ -22,6 +22,8 @@ from typing import Iterator
 
 
 LOCK_NAME = "oldsparky-platformdb-test.lock"
+RUNTIME_DIR_ENV = "PLATFORM_VERIFICATION_RUNTIME_DIR"
+RUNTIME_DIR_PREFIX = ".oldsparky-platform-verification-"
 LOCK_CONTOURS = frozenset(
     {"migration", "backend", "backend-integration", "backend-privileged"}
 )
@@ -57,25 +59,26 @@ def _no_symlink_path(path: Path, *, include_leaf: bool) -> bool:
     return True
 
 
-def _runtime_root() -> Path:
-    configured = os.environ.get("XDG_RUNTIME_DIR")
-    if configured:
-        root = Path(configured)
-        if (
-            not root.is_absolute()
-            or not _no_symlink_path(root, include_leaf=True)
-            or not root.is_dir()
-        ):
-            raise VerificationLockError(
-                "verification lock runtime directory is missing, unsafe or a symlink"
-            )
-        info = os.stat(root, follow_symlinks=False)
-        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
-            raise VerificationLockError(
-                "verification lock runtime directory must be mode 700 and owned by the test user"
-            )
-        return root
+def _validate_runtime_dir(root: Path) -> Path:
+    """Validate one explicit runtime directory for the effective test user."""
 
+    if (
+        not root.is_absolute()
+        or not _no_symlink_path(root, include_leaf=True)
+        or not root.is_dir()
+    ):
+        raise VerificationLockError(
+            "verification lock runtime directory is missing, unsafe or a symlink"
+        )
+    info = os.stat(root, follow_symlinks=False)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise VerificationLockError(
+            "verification lock runtime directory must be mode 700 and owned by the test user"
+        )
+    return root
+
+
+def _safe_tmp_root() -> Path:
     root = Path("/tmp")
     if not _no_symlink_path(root, include_leaf=True) or not root.is_dir():
         raise VerificationLockError("verification lock /tmp directory is missing or unsafe")
@@ -84,6 +87,51 @@ def _runtime_root() -> Path:
     if info.st_uid != 0 or mode != 0o1777:
         raise VerificationLockError("verification lock /tmp directory is not root-owned sticky mode")
     return root
+
+
+def _per_user_runtime_dir() -> Path:
+    """Create the stable private fallback directory for this effective UID."""
+
+    parent = _safe_tmp_root()
+    root = parent / f"{RUNTIME_DIR_PREFIX}{os.geteuid()}"
+    try:
+        os.mkdir(root, 0o700)
+    except FileExistsError:
+        # Never repair or chmod an existing path: validate its identity below so
+        # a pre-created file/directory/symlink cannot become the lock root.
+        pass
+    return _validate_runtime_dir(root)
+
+
+def _runtime_root() -> Path:
+    # CI that crosses a sudo boundary must provide a directory owned by the
+    # effective user.  This explicit variable prevents a runner-owned
+    # XDG_RUNTIME_DIR from being inherited by a root test process.
+    explicit = os.environ.get(RUNTIME_DIR_ENV)
+    if explicit:
+        return _validate_runtime_dir(Path(explicit))
+
+    configured = os.environ.get("XDG_RUNTIME_DIR")
+    if configured:
+        root = Path(configured)
+        if not root.is_absolute() or not _no_symlink_path(root, include_leaf=True):
+            raise VerificationLockError(
+                "verification lock runtime directory is missing, unsafe or a symlink"
+            )
+        if not root.is_dir():
+            raise VerificationLockError(
+                "verification lock runtime directory is missing, unsafe or a symlink"
+            )
+        info = os.stat(root, follow_symlinks=False)
+        if info.st_uid == os.geteuid():
+            return _validate_runtime_dir(root)
+        # A sudo invocation commonly retains the caller's XDG directory.  It
+        # is safe to ignore that directory and create a stable per-UID root;
+        # using it would either fail the ownership check or mix lock files
+        # between effective users.
+        return _per_user_runtime_dir()
+
+    return _per_user_runtime_dir()
 
 
 def default_lock_path() -> Path:

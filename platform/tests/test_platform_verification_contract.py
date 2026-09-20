@@ -46,7 +46,12 @@ from tools.platform_test_runner import (
     validate_test_resource_configuration,
     verify_backend_components,
 )
-from tools.platform_verification_lock import VerificationLockError, verification_resource_lock
+from tools.platform_verification_lock import (
+    RUNTIME_DIR_ENV,
+    VerificationLockError,
+    _runtime_root,
+    verification_resource_lock,
+)
 from tools.platform_verify_contract import (
     ALLOWED_ACTION_OWNERS,
     SECURITY_WORKFLOW,
@@ -380,6 +385,73 @@ except VerificationLockError as exc:
             with self.assertRaises(VerificationLockError):
                 with verification_resource_lock("migration", path=link):
                     pass
+
+    def test_verification_runtime_requires_explicit_private_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runtime"
+            root.mkdir(mode=0o700)
+            with patch.dict(
+                os.environ,
+                {RUNTIME_DIR_ENV: str(root), "XDG_RUNTIME_DIR": "/unsafe/inherited"},
+                clear=False,
+            ):
+                self.assertEqual(_runtime_root(), root)
+
+            root.chmod(0o755)
+            with patch.dict(os.environ, {RUNTIME_DIR_ENV: str(root)}, clear=False):
+                with self.assertRaisesRegex(VerificationLockError, "mode 700"):
+                    _runtime_root()
+
+            root.chmod(0o700)
+            with (
+                patch.dict(os.environ, {RUNTIME_DIR_ENV: str(root)}, clear=False),
+                patch(
+                    "tools.platform_verification_lock.os.geteuid",
+                    return_value=os.geteuid() + 1,
+                ),
+            ):
+                with self.assertRaisesRegex(VerificationLockError, "owned by the test user"):
+                    _runtime_root()
+
+    def test_verification_runtime_rejects_explicit_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runtime"
+            root.mkdir(mode=0o700)
+            link = Path(directory) / "runtime-link"
+            link.symlink_to(root, target_is_directory=True)
+            with patch.dict(os.environ, {RUNTIME_DIR_ENV: str(link)}, clear=False):
+                with self.assertRaisesRegex(VerificationLockError, "unsafe or a symlink"):
+                    _runtime_root()
+
+    def test_verification_runtime_does_not_reuse_runner_directory_after_sudo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            inherited = Path(directory) / "runner-runtime"
+            inherited.mkdir(mode=0o700)
+            fallback = Path(directory) / "effective-runtime"
+            with (
+                patch.dict(
+                    os.environ,
+                    {"XDG_RUNTIME_DIR": str(inherited)},
+                    clear=True,
+                ),
+                patch("tools.platform_verification_lock._per_user_runtime_dir", return_value=fallback),
+                patch("tools.platform_verification_lock.os.geteuid", return_value=1234),
+            ):
+                self.assertEqual(_runtime_root(), fallback)
+
+    def test_ci_root_contours_provision_effective_user_runtime_lock_root(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/platform-security.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("name: Prepare root-owned verification runtime directory"), 2)
+        self.assertEqual(workflow.count('sudo install -d -o root -g root -m 700 "$runtime_dir"'), 2)
+        self.assertNotIn("sudo -EH bash -lc", workflow)
+        self.assertEqual(
+            workflow.count(
+                'sudo -EH env XDG_RUNTIME_DIR= PLATFORM_VERIFICATION_RUNTIME_DIR="$PLATFORM_VERIFICATION_RUNTIME_DIR" bash -lc'
+            ),
+            3,
+        )
 
     def test_registry_exposes_deterministic_and_workflow_only_contours(self) -> None:
         self.assertEqual(set(CI_GATE_IDS), set(DETERMINISTIC_GATE_IDS))
