@@ -4,58 +4,42 @@ from tools.platform_timeout_diagnostics import join_reports
 
 
 class TimeoutDiagnosticsTests(unittest.TestCase):
-    def test_join_marks_origin_completion_after_client_timeout_and_keeps_nearest_samples(self) -> None:
-        diagnostic_id = "tdiag-123-00001"
+    def test_join_keeps_bounded_origin_metrics_without_correlator_values(self) -> None:
         report = join_reports(
             {
                 "source_git_sha": "a" * 40,
                 "load_contract": {"profile_id": "authenticated-page-load-v1"},
-                "started_at": "2026-09-10T10:00:00+00:00",
-                "finished_at": "2026-09-10T10:01:00+00:00",
                 "overall": {
                     "timeout_diagnostics": [
                         {
-                            "diagnostic_id": diagnostic_id,
+                            "diagnostic_id": "secret-correlator",
                             "error_kind": "TimeoutError",
-                            "started_at": "2026-09-10T10:00:00+00:00",
-                            "exception_at": "2026-09-10T10:00:30+00:00",
-                            "finished_at": "2026-09-10T10:00:30+00:00",
+                            "method": "GET",
+                            "path": "/tournaments/private-slug/workspace?invite=secret",
+                            "elapsed_ms": 30_000.0,
                         }
                     ]
                 },
             },
             {
-                "started_at": "2026-09-10T10:00:00+00:00",
-                "finished_at": "2026-09-10T10:01:10+00:00",
-                "system": {
-                    "timeline": [
-                        {
-                            "timestamp": "2026-09-10T10:00:30+00:00",
-                            "web_process": {"cpu_percent": 91.0},
-                        }
-                    ]
-                },
                 "server_ssr_observability": {
-                    "event_loop": {
-                        "samples": 1,
-                        "samples_detail": [
-                            {
-                                "journal_timestamp": "2026-09-10T10:00:30+00:00",
-                                "p95_ms": 18.0,
-                                "cpu_pct": 91.0,
-                            }
-                        ],
-                    },
                     "timeout_diagnostics": {
                         "rows": [
                             {
-                                "diagnostic_id": diagnostic_id,
-                                "nginx_recorded_at": "2026-09-10T10:00:31+00:00",
+                                "diagnostic_id": "secret-correlator",
+                                "method": "GET",
+                                "uri": "/tournaments/private-slug/workspace?token=secret",
+                                "route_class": "tournament_workspace",
+                                "status": 504,
                                 "next": {
                                     "accepted": True,
                                     "upstream_completed": True,
+                                    "request_time_ms": 30_000.0,
                                 },
-                                "ssr": {"started_observed": True},
+                                "ssr": {
+                                    "started_observed": True,
+                                    "stage_events": [{"stage": "secret-stage"}],
+                                },
                                 "api": {
                                     "call_started_observed": False,
                                     "call_completed_observed": False,
@@ -68,18 +52,23 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
         )
 
         self.assertEqual(report["summary"]["next_accepted_matches"], 1)
-        self.assertEqual(
-            report["summary"]["upstream_completed_at_or_after_client_timeout"],
-            1,
-        )
+        self.assertEqual(report["summary"]["nginx_matches"], 1)
         row = report["rows"][0]
-        self.assertEqual(row["classification"], "origin_completion_after_client_timeout")
-        self.assertTrue(row["server_completed_at_or_after_client_timeout"])
-        self.assertEqual(row["nearest_event_loop_sample"]["cpu_pct"], 91.0)
+        self.assertEqual(row["classification"], "next_ssr_or_node_queue")
+        self.assertEqual(row["origin"]["route_class"], "tournament_workspace")
+        self.assertEqual(row["origin"]["next"]["request_time_ms"], 30_000.0)
+        serialized = str(report)
+        self.assertNotIn("secret-correlator", serialized)
+        self.assertNotIn("private-slug", serialized)
+        self.assertNotIn("invite=secret", serialized)
+        self.assertNotIn("secret-stage", serialized)
+        self.assertNotIn("diagnostic_id", serialized)
+        self.assertNotIn("request_id", serialized)
+        self.assertNotIn("path", row["client"])
+        self.assertNotIn("uri", row["origin"])
         self.assertEqual(report["nginx_timeout_policy"]["proxy_read_timeout_seconds"], 30)
 
-    def test_join_distinguishes_timeout_before_origin_request_from_coarse_timestamp(self) -> None:
-        diagnostic_id = "tdiag-123-00002"
+    def test_join_does_not_infer_order_from_removed_timestamps(self) -> None:
         report = join_reports(
             {
                 "source_git_sha": "a" * 40,
@@ -87,9 +76,11 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
                 "overall": {
                     "timeout_diagnostics": [
                         {
-                            "diagnostic_id": diagnostic_id,
+                            "diagnostic_id": "secret-correlator",
                             "error_kind": "TimeoutError",
-                            "exception_at": "2026-09-10T10:00:30+00:00",
+                            "phase": "write_burst",
+                            "method": "POST",
+                            "route_class": "ready_vote",
                         }
                     ]
                 },
@@ -99,8 +90,10 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
                     "timeout_diagnostics": {
                         "rows": [
                             {
-                                "diagnostic_id": diagnostic_id,
-                                "nginx_recorded_at": "2026-09-10T10:00:42+00:00",
+                                "diagnostic_id": "secret-correlator",
+                                "route_class": "ready_vote",
+                                "method": "POST",
+                                "status": 504,
                                 "next": {
                                     "accepted": True,
                                     "upstream_completed": True,
@@ -119,11 +112,11 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(
             report["summary"]["classifications"],
-            {"client_or_edge_before_origin": 1},
+            {"next_accept_or_node_queue": 1},
         )
-        self.assertEqual(report["summary"]["origin_requests_started_after_client_timeout"], 1)
-        self.assertEqual(report["rows"][0]["estimated_origin_request_start_delta_ms"], 11500.0)
-        self.assertTrue(report["rows"][0]["origin_request_started_after_client_timeout"])
+        self.assertEqual(report["summary"]["origin_requests_started_after_client_timeout"], 0)
+        self.assertIsNone(report["rows"][0]["estimated_origin_request_start_delta_ms"])
+        self.assertFalse(report["rows"][0]["origin_request_started_after_client_timeout"])
 
     def test_join_keeps_missing_origin_as_unresolved_edge_or_client(self) -> None:
         report = join_reports(
@@ -137,8 +130,9 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
                         {
                             "diagnostic_id": "tdiag-123-00001",
                             "error_kind": "TimeoutError",
-                            "started_at": "2026-09-10T10:00:30+00:00",
-                            "exception_at": "2026-09-10T10:01:00+00:00",
+                            "phase": "page_load",
+                            "method": "GET",
+                            "route_class": "tournament_page",
                         }
                     ]
                 },

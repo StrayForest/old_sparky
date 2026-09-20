@@ -18,21 +18,54 @@ from datetime import UTC, datetime
 import http.client
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
 import threading
 import time
+from collections.abc import Mapping
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
     from tools.platform_http_transport import HTTP11KeepAliveClient
-    from tools.platform_load_acceptance import evaluate_acceptance
+    from tools.platform_load_acceptance import (
+        derive_expected_phase_plan,
+        evaluate_acceptance,
+        timing_summary_is_complete,
+    )
 except ModuleNotFoundError:  # Direct execution from platform/tools.
     from platform_http_transport import HTTP11KeepAliveClient
-    from platform_load_acceptance import evaluate_acceptance
+    from platform_load_acceptance import (
+        derive_expected_phase_plan,
+        evaluate_acceptance,
+        timing_summary_is_complete,
+    )
+
+try:
+    from tools.platform_evidence_sanitizer import (
+        finite_number,
+        safe_cf_error_class,
+        safe_error_class,
+        safe_method,
+        safe_phase,
+        safe_route_class,
+        safe_route_key,
+        safe_status,
+    )
+except ModuleNotFoundError:  # Direct execution from platform/tools.
+    from platform_evidence_sanitizer import (
+        finite_number,
+        safe_cf_error_class,
+        safe_error_class,
+        safe_method,
+        safe_phase,
+        safe_route_class,
+        safe_route_key,
+        safe_status,
+    )
 
 
 EXPECTED_ORIGIN = "https://old-sparky.com"
@@ -43,6 +76,7 @@ MAX_CONCURRENCY = 512
 RESPONSE_BODY_LIMIT = 2 * 1024 * 1024
 ERROR_SAMPLE_LIMIT = 25
 DIAGNOSTIC_HEADER_LIMIT = 128
+MAX_MEASUREMENT = 1_000_000_000_000.0
 DEFAULT_CLIENT_TRANSPORT = "urllib-http1-close"
 HTTP11_KEEPALIVE_TRANSPORT = "http1-keepalive"
 SUPPORTED_PAGE_TRANSPORTS = frozenset(
@@ -51,6 +85,10 @@ SUPPORTED_PAGE_TRANSPORTS = frozenset(
 MARKER_RE = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,139}$")
 COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,128}$")
+SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
+PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]+$")
+PROFILE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ExternalLoadError(RuntimeError):
@@ -88,6 +126,17 @@ class RequestResult:
     exception_at_utc: str | None = None
     finished_at_utc: str | None = None
     transport_timing: dict[str, Any] | None = None
+    # Monotonic timestamps are intentionally kept out of the JSON report.  The
+    # runner uses them to separate generator scheduling/queueing from the
+    # service time reported by the HTTP client.
+    scheduled_at_monotonic: float | None = None
+    enqueued_at_monotonic: float | None = None
+    started_at_monotonic: float | None = None
+    finished_at_monotonic: float | None = None
+    executor_queue_wait_ms: float | None = None
+    schedule_delay_ms: float | None = None
+    late_start_ms: float | None = None
+    user_observed_elapsed_ms: float | None = None
 
 
 @dataclass(slots=True)
@@ -97,6 +146,14 @@ class LogicalRequestResult:
     attempts: list[RequestResult]
     elapsed_ms: float
     user_id: str | None = None
+    scheduled_at_monotonic: float | None = None
+    enqueued_at_monotonic: float | None = None
+    started_at_monotonic: float | None = None
+    finished_at_monotonic: float | None = None
+    executor_queue_wait_ms: float | None = None
+    schedule_delay_ms: float | None = None
+    late_start_ms: float | None = None
+    user_observed_elapsed_ms: float | None = None
 
     @property
     def final(self) -> RequestResult:
@@ -120,7 +177,29 @@ def percentile(values: list[float], percent: float) -> float | None:
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
 
+def _finite_nonnegative_measurement(value: Any) -> float | None:
+    """Parse a producer measurement without bool/string/overflow coercion."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return (
+        numeric
+        if math.isfinite(numeric) and 0 <= numeric <= MAX_MEASUREMENT
+        else None
+    )
+
+
 def metric_stats(values: list[float]) -> dict[str, Any]:
+    valid_values: list[float] = []
+    for value in values:
+        numeric = _finite_nonnegative_measurement(value)
+        if numeric is not None:
+            valid_values.append(numeric)
+    values = valid_values
     if not values:
         return {
             "count": 0,
@@ -142,6 +221,271 @@ def metric_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
+def _annotate_timing(
+    result: Any,
+    *,
+    scheduled_at: float,
+    enqueued_at: float,
+    fallback_started_at: float | None = None,
+    fallback_finished_at: float | None = None,
+) -> Any:
+    """Attach queue/schedule timing without changing request semantics.
+
+    A worker can start after its intended arrival time when the executor is
+    saturated.  That delay must remain visible instead of disappearing from a
+    service-time-only percentile.  Fake builders used by focused tests may not
+    expose monotonic timestamps; those samples are retained but explicitly
+    counted as missing timing context.
+    """
+
+    if isinstance(result, LogicalRequestResult):
+        attempts = [attempt for attempt in result.attempts if isinstance(attempt, RequestResult)]
+        for attempt in attempts:
+            if attempt.started_at_monotonic is None:
+                attempt.started_at_monotonic = fallback_started_at
+            if attempt.finished_at_monotonic is None:
+                attempt.finished_at_monotonic = fallback_finished_at
+        started_values = [
+            attempt.started_at_monotonic
+            for attempt in attempts
+            if attempt.started_at_monotonic is not None
+        ]
+        finished_values = [
+            attempt.finished_at_monotonic
+            for attempt in attempts
+            if attempt.finished_at_monotonic is not None
+        ]
+        result.scheduled_at_monotonic = scheduled_at
+        result.enqueued_at_monotonic = enqueued_at
+        result.started_at_monotonic = (
+            min(started_values)
+            if started_values
+            else fallback_started_at
+        )
+        result.finished_at_monotonic = (
+            max(finished_values)
+            if finished_values
+            else fallback_finished_at
+        )
+        result.executor_queue_wait_ms = (
+            max(0.0, (result.started_at_monotonic - enqueued_at) * 1000)
+            if result.started_at_monotonic is not None
+            else None
+        )
+        result.schedule_delay_ms = (
+            (result.started_at_monotonic - scheduled_at) * 1000
+            if result.started_at_monotonic is not None
+            else None
+        )
+        result.late_start_ms = (
+            max(0.0, result.schedule_delay_ms)
+            if result.schedule_delay_ms is not None
+            else None
+        )
+        result.user_observed_elapsed_ms = (
+            max(0.0, (result.finished_at_monotonic - scheduled_at) * 1000)
+            if result.finished_at_monotonic is not None
+            else None
+        )
+        for attempt in attempts:
+            _annotate_timing(
+                attempt,
+                scheduled_at=scheduled_at,
+                enqueued_at=enqueued_at,
+            )
+        return result
+    if not isinstance(result, RequestResult):
+        return result
+    result.scheduled_at_monotonic = scheduled_at
+    result.enqueued_at_monotonic = enqueued_at
+    if result.started_at_monotonic is None:
+        result.started_at_monotonic = fallback_started_at
+    if result.finished_at_monotonic is None:
+        result.finished_at_monotonic = fallback_finished_at
+    if result.started_at_monotonic is not None:
+        result.executor_queue_wait_ms = max(
+            0.0, (result.started_at_monotonic - enqueued_at) * 1000
+        )
+        result.schedule_delay_ms = (result.started_at_monotonic - scheduled_at) * 1000
+        result.late_start_ms = max(0.0, result.schedule_delay_ms)
+    if result.finished_at_monotonic is not None:
+        result.user_observed_elapsed_ms = max(
+            0.0, (result.finished_at_monotonic - scheduled_at) * 1000
+        )
+    return result
+
+
+def _timing_summary(
+    results: list[Any],
+    *,
+    unit: str,
+    expected_count: int | None = None,
+    submitted_count: int | None = None,
+) -> dict[str, Any]:
+    """Return additive arrival/queue/user-observed measurements.
+
+    ``unit`` is either ``requests`` or ``logical_actions`` and only affects
+    the names of the throughput fields.  Existing ``latency`` fields remain
+    service/end-to-end compatibility fields; callers can opt into this
+    measurement schema explicitly.
+    """
+
+    def finite_timestamp(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            numeric = float(value)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(numeric) or not 0 <= numeric <= MAX_MEASUREMENT:
+            return None
+        return numeric
+
+    def finite_elapsed(value: Any) -> float | None:
+        numeric = finite_timestamp(value)
+        return numeric
+
+    observed: list[float] = []
+    queue_wait: list[float] = []
+    schedule_delay: list[float] = []
+    late_start: list[float] = []
+    starts: list[float] = []
+    finishes: list[float] = []
+    scheduled: list[float] = []
+    started = 0
+    response_completions = 0
+    user_observed_count = 0
+    scheduled_count = 0
+    missing_schedule_context = 0
+    missing_timing_context = 0
+    invalid_timing_context = 0
+    service_latency: list[float] = []
+    for result in results:
+        service_value = _finite_nonnegative_measurement(
+            getattr(result, "elapsed_ms", None)
+        )
+        if service_value is not None:
+            service_latency.append(service_value)
+        scheduled_at = finite_timestamp(getattr(result, "scheduled_at_monotonic", None))
+        enqueued_at = finite_timestamp(getattr(result, "enqueued_at_monotonic", None))
+        started_at = finite_timestamp(getattr(result, "started_at_monotonic", None))
+        finished_at = finite_timestamp(getattr(result, "finished_at_monotonic", None))
+        user_observed = finite_elapsed(getattr(result, "user_observed_elapsed_ms", None))
+
+        if scheduled_at is None or enqueued_at is None:
+            missing_schedule_context += 1
+        else:
+            scheduled_count += 1
+            scheduled.append(scheduled_at)
+        if started_at is not None:
+            started += 1
+            starts.append(started_at)
+        if finished_at is not None:
+            response_completions += 1
+            finishes.append(finished_at)
+        if user_observed is not None:
+            user_observed_count += 1
+            observed.append(user_observed)
+
+        queue = finite_elapsed(getattr(result, "executor_queue_wait_ms", None))
+        if queue is not None:
+            queue_wait.append(queue)
+        delay = finite_elapsed(getattr(result, "schedule_delay_ms", None))
+        if delay is not None:
+            schedule_delay.append(delay)
+        late = finite_elapsed(getattr(result, "late_start_ms", None))
+        if late is not None:
+            late_start.append(late)
+
+        if any(value is None for value in (scheduled_at, enqueued_at, started_at, finished_at, user_observed)):
+            missing_timing_context += 1
+        elif finished_at < started_at:
+            invalid_timing_context += 1
+    arrival_window = (
+        max(0.001, max(starts) - min(starts))
+        if len(starts) >= 2
+        else (0.001 if starts else None)
+    )
+    requests_per_second = (
+        started / arrival_window if arrival_window is not None else None
+    )
+    offered_window = (
+        max(0.001, max(scheduled) - min(scheduled))
+        if len(scheduled) >= 2
+        else (0.001 if scheduled else None)
+    )
+    offered_per_second = (
+        len(scheduled) / offered_window if offered_window is not None else None
+    )
+    completion_window = (
+        max(0.001, max(finishes) - min(finishes))
+        if len(finishes) >= 2
+        else (0.001 if finishes else None)
+    )
+    completed_count = len(results)
+    expected = completed_count if expected_count is None else max(0, int(expected_count))
+    submitted = completed_count if submitted_count is None else max(0, int(submitted_count))
+    dropped_work = max(0, expected - started)
+    timing_counts = (
+        expected,
+        submitted,
+        completed_count,
+        scheduled_count,
+        started,
+        response_completions,
+        user_observed_count,
+    )
+    partial = (
+        len(set(timing_counts)) != 1
+        or missing_schedule_context > 0
+        or missing_timing_context > 0
+        or invalid_timing_context > 0
+        or dropped_work != 0
+    )
+    return {
+        "timing_schema": 2,
+        "service_latency": metric_stats(service_latency),
+        "user_observed_latency": metric_stats(observed),
+        "executor_queue_wait": metric_stats(queue_wait),
+        "schedule_delay": metric_stats(schedule_delay),
+        "late_start": metric_stats(late_start),
+        "late_start_count": sum(value > 0 for value in late_start),
+        "late_start_percent": round(
+            sum(value > 0 for value in late_start) * 100 / max(1, len(results)),
+            4,
+        ),
+        "expected_count": expected,
+        "submitted_count": submitted,
+        "completed_count": completed_count,
+        "partial": partial,
+        "scheduled_count": scheduled_count,
+        "started_count": started,
+        "actual_request_start_count": started,
+        "actual_start_count": started,
+        "response_completion_count": response_completions,
+        "user_observed_count": user_observed_count,
+        "response_completion_window_seconds": (
+            round(completion_window, 6) if completion_window is not None else None
+        ),
+        "dropped_work": dropped_work,
+        "missing_schedule_context": missing_schedule_context,
+        "missing_timing_context": missing_timing_context,
+        "invalid_timing_context": invalid_timing_context,
+        "actual_arrival_window_seconds": (
+            round(arrival_window, 6) if arrival_window is not None else None
+        ),
+        "offered_arrival_window_seconds": (
+            round(offered_window, 6) if offered_window is not None else None
+        ),
+        f"offered_{unit}_per_second": (
+            round(offered_per_second, 3) if offered_per_second is not None else None
+        ),
+        f"actual_arrival_{unit}_per_second": (
+            round(requests_per_second, 3) if requests_per_second is not None else None
+        ),
+    }
+
+
 def spread_offsets(count: int, spread_seconds: float) -> list[float]:
     """Return deterministic starts in [0, spread_seconds) for a phase."""
 
@@ -153,15 +497,62 @@ def spread_offsets(count: int, spread_seconds: float) -> list[float]:
     return [round(index * step, 6) for index in range(count)]
 
 
+def planned_http_attempts(
+    *,
+    mode: str,
+    user_count: int,
+    tournament_count: int,
+    duplicate_count: int,
+    manual_refresh_count: int,
+    phase_plan: list[dict[str, Any]] | None,
+    concurrency_stages: list[int] | tuple[int, ...] | None,
+    retry_policy: dict[str, Any] | None,
+) -> int | None:
+    """Bound all requests before the first external request is submitted."""
+
+    phases = phase_plan or []
+    primary_actions = (
+        sum(int(phase.get("logical_actions") or 0) for phase in phases)
+        if phases
+        else user_count
+    )
+    max_retries = 2 if retry_policy is None else int(retry_policy.get("max_retries") or 0)
+    if mode == "ready-vote":
+        return (
+            (primary_actions + int(duplicate_count)) * (max_retries + 1)
+            + int(tournament_count)
+        )
+    if mode == "read-mix":
+        stages = concurrency_stages or (1,)
+        return user_count * len(stages) + int(manual_refresh_count)
+    if mode == "page-load":
+        return user_count
+    return None
+
+
 def _required_text(value: Any, *, field: str, min_length: int = 1) -> str:
     if not isinstance(value, str) or len(value) < min_length:
         raise ExternalLoadError(f"manifest {field} is invalid")
     return value
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate JSON object members instead of silently overwriting."""
+
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ExternalLoadError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
 def load_manifest(path: Path) -> tuple[dict[str, Any], list[VirtualUser]]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ExternalLoadError("external load manifest is not valid JSON") from exc
     if not isinstance(payload, dict):
@@ -191,11 +582,12 @@ def load_manifest(path: Path) -> tuple[dict[str, Any], list[VirtualUser]]:
         slug = _required_text(raw_tournament.get("slug"), field="tournament.slug")
         if SLUG_RE.fullmatch(slug) is None or slug in tournament_slugs:
             raise ExternalLoadError("manifest tournament slug is invalid or duplicated")
-        try:
-            expected_count = int(raw_tournament.get("user_count"))
-        except (TypeError, ValueError) as exc:
-            raise ExternalLoadError("manifest tournament user_count is invalid") from exc
-        if expected_count <= 0:
+        expected_count = raw_tournament.get("user_count")
+        if (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count <= 0
+        ):
             raise ExternalLoadError("manifest tournament user_count must be positive")
         tournament_slugs.add(slug)
         tournament_expected_counts[slug] = expected_count
@@ -248,17 +640,13 @@ def _trace(origin: str, timeout: float) -> dict[str, Any]:
         # The origin is validated against a fixed HTTPS allowlist before this
         # function is called; no user-controlled URL is accepted here.
         with urlopen(request, timeout=timeout) as response:  # nosec B310
-            raw = response.read(16_384).decode("utf-8", errors="replace")
-            values: dict[str, str] = {}
-            for line in raw.splitlines():
-                key, separator, value = line.partition("=")
-                if separator and key in {"ip", "colo", "loc", "http", "tls"}:
-                    values[key] = value[:128]
-            values["status"] = str(response.status)
-            values["cf_ray"] = response.headers.get("cf-ray", "")[:128]
-            return values
+            # Read and discard the body.  It contains edge IP, location and
+            # other unique request metadata which is useful only transiently
+            # while debugging a live request.
+            response.read(16_384)
+            return {"available": True, "status": safe_status(response.status)}
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        return {"error": type(exc).__name__}
+        return {"available": False, "status": 0, "error_class": safe_error_class(type(exc).__name__)}
 
 
 def _request(
@@ -364,7 +752,8 @@ def _request(
     except (URLError, TimeoutError, OSError) as exc:
         exception_at_utc = datetime.now(UTC).isoformat()
         error_kind = type(exc).__name__
-    elapsed_ms = (time.monotonic() - started_at) * 1000
+    finished_at = time.monotonic()
+    elapsed_ms = (finished_at - started_at) * 1000
     finished_at_utc = datetime.now(UTC).isoformat()
     ok = status in expected_statuses
     if not ok and error_kind is None:
@@ -390,6 +779,9 @@ def _request(
         started_at_utc=started_at_utc if diagnostic_id else None,
         exception_at_utc=exception_at_utc if diagnostic_id else None,
         finished_at_utc=finished_at_utc if diagnostic_id else None,
+        started_at_monotonic=started_at,
+        finished_at_monotonic=finished_at,
+        user_observed_elapsed_ms=elapsed_ms,
     )
 
 
@@ -478,9 +870,11 @@ def _page_request_http11_keepalive(
         "X-Platform-QA-Phase": phase,
     }
     client = _http11_keepalive_client(origin, timeout)
+    started_at = time.monotonic()
     started_at_utc = datetime.now(UTC).isoformat()
     try:
         response = client.get(path, headers=request_headers)
+        finished_at = time.monotonic()
         status = response.status
         error_kind = None if status == 200 else "unexpected_status"
         cf_error_type = response.headers.get("cf-error-type") or None
@@ -509,9 +903,13 @@ def _page_request_http11_keepalive(
             started_at_utc=started_at_utc if diagnostic_id else None,
             finished_at_utc=datetime.now(UTC).isoformat() if diagnostic_id else None,
             transport_timing=response.timing,
+            started_at_monotonic=started_at,
+            finished_at_monotonic=finished_at,
+            user_observed_elapsed_ms=max(0.0, finished_at - started_at) * 1000,
         )
     except (http.client.HTTPException, OSError, TimeoutError, ValueError) as error:
         timing = dict(client.last_timing)
+        finished_at = time.monotonic()
         finished_at_utc = datetime.now(UTC).isoformat()
         ttfb_ms = timing.get("ttfb_ms")
         return RequestResult(
@@ -533,6 +931,9 @@ def _page_request_http11_keepalive(
             exception_at_utc=finished_at_utc if diagnostic_id else None,
             finished_at_utc=finished_at_utc if diagnostic_id else None,
             transport_timing=timing or None,
+            started_at_monotonic=started_at,
+            finished_at_monotonic=finished_at,
+            user_observed_elapsed_ms=max(0.0, finished_at - started_at) * 1000,
         )
 
 
@@ -572,7 +973,27 @@ def run_phase(
             delay = phase_started_at + offset - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
-            futures.append(executor.submit(request_builder, origin, user, phase, timeout))
+            enqueued_at = time.monotonic()
+            scheduled_at = phase_started_at + offset
+
+            def invoke(
+                *,
+                user: VirtualUser = user,
+                scheduled_at: float = scheduled_at,
+                enqueued_at: float = enqueued_at,
+            ) -> Any:
+                fallback_started_at = time.monotonic()
+                result = request_builder(origin, user, phase, timeout)
+                fallback_finished_at = time.monotonic()
+                return _annotate_timing(
+                    result,
+                    scheduled_at=scheduled_at,
+                    enqueued_at=enqueued_at,
+                    fallback_started_at=fallback_started_at,
+                    fallback_finished_at=fallback_finished_at,
+                )
+
+            futures.append(executor.submit(invoke))
         for future in as_completed(futures):
             results.append(future.result())
     return results
@@ -604,7 +1025,26 @@ def run_rate_phase(
             if first_submission_at is None:
                 first_submission_at = submitted_at
             last_submission_at = submitted_at
-            futures.append(executor.submit(request_builder, origin, user, phase, timeout))
+            scheduled_at = phase_started_at + offset
+
+            def invoke(
+                *,
+                user: VirtualUser = user,
+                scheduled_at: float = scheduled_at,
+                enqueued_at: float = submitted_at,
+            ) -> Any:
+                fallback_started_at = time.monotonic()
+                result = request_builder(origin, user, phase, timeout)
+                fallback_finished_at = time.monotonic()
+                return _annotate_timing(
+                    result,
+                    scheduled_at=scheduled_at,
+                    enqueued_at=enqueued_at,
+                    fallback_started_at=fallback_started_at,
+                    fallback_finished_at=fallback_finished_at,
+                )
+
+            futures.append(executor.submit(invoke))
         results = [future.result() for future in as_completed(futures)]
     if first_submission_at is None or last_submission_at is None:
         submission_window_seconds = 0.001
@@ -615,7 +1055,12 @@ def run_rate_phase(
     return results, submission_window_seconds
 
 
-def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
+def summarize_results(
+    results: list[RequestResult],
+    *,
+    expected_count: int | None = None,
+    submitted_count: int | None = None,
+) -> dict[str, Any]:
     status_counts: Counter[str] = Counter()
     by_route: dict[str, list[float]] = defaultdict(list)
     latencies: list[float] = []
@@ -636,21 +1081,32 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
     transport_new = 0
     transport_phase_values: dict[str, list[float]] = defaultdict(list)
     for result in results:
-        status_counts[str(result.status)] += 1
-        route = f"{result.method} {result.path.split('?', 1)[0]}"
-        by_route[route].append(result.elapsed_ms)
-        latencies.append(result.elapsed_ms)
-        response_sizes.append(result.response_bytes)
+        status_counts[str(safe_status(result.status))] += 1
+        route = safe_route_key(result.method, result.path)
+        elapsed = _finite_nonnegative_measurement(result.elapsed_ms)
+        if elapsed is not None:
+            by_route[route].append(elapsed)
+            latencies.append(elapsed)
+        if (
+            isinstance(result.response_bytes, int)
+            and not isinstance(result.response_bytes, bool)
+            and result.response_bytes >= 0
+        ):
+            response_sizes.append(result.response_bytes)
         if result.time_to_first_byte_ms is not None:
             first_byte_times.append(result.time_to_first_byte_ms)
         if result.transport_timing:
             transport = result.transport_timing
             transport_name = transport.get("transport")
-            if isinstance(transport_name, str):
-                transport_names[transport_name] += 1
+            if transport_name in SUPPORTED_PAGE_TRANSPORTS:
+                transport_names[str(transport_name)] += 1
+            elif transport_name is not None:
+                transport_names["other"] += 1
             http_version = transport.get("http_version")
-            if isinstance(http_version, str):
-                transport_http_versions[http_version] += 1
+            if http_version in {"1.0", "1.1", "2", "3"}:
+                transport_http_versions[str(http_version)] += 1
+            elif http_version is not None:
+                transport_http_versions["other"] += 1
             if transport.get("connection_reused") is True:
                 transport_reused += 1
             elif transport.get("connection_reused") is False:
@@ -665,59 +1121,57 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
                 "body_receive_ms",
                 "total_ms",
             ):
-                value = transport.get(key)
-                if isinstance(value, (int, float)) and math.isfinite(float(value)):
-                    transport_phase_values[key].append(float(value))
-        retry_attempts += int(result.attempt_number > 1)
+                value = _finite_nonnegative_measurement(transport.get(key))
+                if value is not None:
+                    transport_phase_values[key].append(value)
+        if (
+            isinstance(result.attempt_number, int)
+            and not isinstance(result.attempt_number, bool)
+            and result.attempt_number > 1
+        ):
+            retry_attempts += 1
         if _ready_vote_overload(result) or _authenticated_read_overload(result):
             temporary_overloads += 1
-        if not result.ok:
+        if result.ok is not True:
             errors += 1
-            kind = result.error_kind or "unexpected"
+            kind = safe_error_class(result.error_kind or "unexpected", status=result.status)
             error_kinds[kind] += 1
             if len(error_samples) < ERROR_SAMPLE_LIMIT:
                 error_sample = {
-                    "phase": result.phase,
-                    "method": result.method,
-                    "path": result.path.split("?", 1)[0],
-                    "status": result.status,
-                    "error_kind": kind,
-                    "cf_ray": result.cf_ray,
-                    "cf_error_type": result.cf_error_type,
-                    "cf_error_origin": result.cf_error_origin,
-                    "retry_after": result.retry_after,
-                    "ttfb": result.time_to_first_byte_ms,
-                    "total_time": result.elapsed_ms,
+                    "phase": safe_phase(result.phase),
+                    "method": safe_method(result.method),
+                    "route_class": safe_route_class(result.path),
+                    "status": safe_status(result.status),
+                    "error_class": kind,
+                    "cf_error_class": safe_cf_error_class(result.cf_error_type),
+                    "cf_error_origin_class": safe_cf_error_class(result.cf_error_origin),
+                    "ttfb_ms": finite_number(result.time_to_first_byte_ms),
+                    "elapsed_ms": finite_number(result.elapsed_ms),
                 }
-                if result.diagnostic_id:
-                    error_sample["diagnostic_id"] = result.diagnostic_id
                 error_samples.append(error_sample)
-            if result.diagnostic_id and kind == "TimeoutError":
+            if result.diagnostic_id and kind == "timeout":
                 timeout_diagnostics.append(
                     {
-                        "diagnostic_id": result.diagnostic_id,
-                        "phase": result.phase,
-                        "method": result.method,
-                        "path": result.path.split("?", 1)[0],
-                        "status": result.status,
-                        "error_kind": kind,
-                        "cf_ray": result.cf_ray,
-                        "cf_error_type": result.cf_error_type,
-                        "cf_error_origin": result.cf_error_origin,
-                        "retry_after": result.retry_after,
-                        "ttfb_ms": result.time_to_first_byte_ms,
-                        "elapsed_ms": result.elapsed_ms,
-                        "started_at": result.started_at_utc,
-                        "exception_at": result.exception_at_utc,
-                        "finished_at": result.finished_at_utc,
+                        "phase": safe_phase(result.phase),
+                        "method": safe_method(result.method),
+                        "route_class": safe_route_class(result.path),
+                        "status": safe_status(result.status),
+                        "error_class": "timeout",
+                        "cf_error_class": safe_cf_error_class(result.cf_error_type),
+                        "cf_error_origin_class": safe_cf_error_class(result.cf_error_origin),
+                        "ttfb_ms": finite_number(result.time_to_first_byte_ms),
+                        "elapsed_ms": finite_number(result.elapsed_ms),
                     }
                 )
             if result.cf_error_type:
-                cf_error_types[result.cf_error_type] += 1
+                cf_error_types[safe_cf_error_class(result.cf_error_type)] += 1
             if result.cf_error_origin:
-                cf_error_origins[result.cf_error_origin] += 1
-        if isinstance(result.response_json, dict) and "changed" in result.response_json:
-            changed[str(bool(result.response_json.get("changed")))] += 1
+                cf_error_origins[safe_cf_error_class(result.cf_error_origin)] += 1
+        if (
+            isinstance(result.response_json, dict)
+            and type(result.response_json.get("changed")) is bool
+        ):
+            changed[str(result.response_json["changed"])] += 1
     return {
         "scope": "full_population",
         "requests": len(results),
@@ -733,6 +1187,11 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
             4,
         ),
         "retry_attempts": retry_attempts,
+        "total_retries": retry_attempts,
+        "retry_amplification_percent": round(
+            retry_attempts * 100 / max(1, len(results) - retry_attempts),
+            4,
+        ),
         "unexpected_statuses": max(0, errors - temporary_overloads),
         "status_counts": dict(sorted(status_counts.items())),
         "error_kinds": dict(sorted(error_kinds.items())),
@@ -740,6 +1199,12 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         "cf_error_origin_counts": dict(sorted(cf_error_origins.items())),
         "changed_counts": dict(sorted(changed.items())),
         "latency": metric_stats(latencies),
+        "timing": _timing_summary(
+            results,
+            unit="requests",
+            expected_count=expected_count,
+            submitted_count=submitted_count,
+        ),
         "time_to_first_byte": metric_stats(first_byte_times),
         "response_bytes": {
             "count": len(response_sizes),
@@ -770,6 +1235,21 @@ def summarize_results(results: list[RequestResult]) -> dict[str, Any]:
         "error_samples": error_samples,
         "timeout_diagnostics": timeout_diagnostics,
     }
+
+
+def _add_measured_goodput(summary: dict[str, Any], wall_seconds: float) -> None:
+    """Attach the canonical useful-response goodput measurement to a summary."""
+
+    if not isinstance(wall_seconds, (int, float)) or isinstance(wall_seconds, bool):
+        raise ExternalLoadError("summary wall time must be numeric")
+    wall = float(wall_seconds)
+    if not math.isfinite(wall) or wall <= 0:
+        raise ExternalLoadError("summary wall time must be finite and positive")
+    summary["wall_seconds"] = round(wall, 6)
+    successful = summary.get("successful_responses")
+    if isinstance(successful, bool) or not isinstance(successful, int) or successful < 0:
+        raise ExternalLoadError("summary successful response count is invalid")
+    summary["successful_goodput_actions_per_second"] = round(successful / wall, 3)
 
 
 def analyze_concurrency_ramp(
@@ -932,10 +1412,14 @@ def _ready_vote_action(
         time.sleep(
             _ready_vote_retry_delay_ms(result, retry_index, retry_policy) / 1000
         )
+    finished_at = time.monotonic()
     return LogicalRequestResult(
         attempts=attempts,
-        elapsed_ms=(time.monotonic() - started_at) * 1000,
+        elapsed_ms=(finished_at - started_at) * 1000,
         user_id=user.user_id,
+        started_at_monotonic=started_at,
+        finished_at_monotonic=finished_at,
+        user_observed_elapsed_ms=(finished_at - started_at) * 1000,
     )
 
 
@@ -943,15 +1427,20 @@ def _flatten_logical_results(results: list[LogicalRequestResult]) -> list[Reques
     return [attempt for result in results for attempt in result.attempts]
 
 
-def summarize_logical_results(results: list[LogicalRequestResult]) -> dict[str, Any]:
+def summarize_logical_results(
+    results: list[LogicalRequestResult],
+    *,
+    expected_count: int | None = None,
+    submitted_count: int | None = None,
+) -> dict[str, Any]:
     finals = [result.final for result in results if result.attempts]
-    successful = [result for result in results if result.final.ok]
+    successful = [result for result in results if result.final.ok is True]
     accepted_request_latencies = [result.final.elapsed_ms for result in successful]
     changed = Counter(
-        str(bool(result.final.response_json.get("changed")))
+        str(result.final.response_json["changed"])
         for result in results
         if isinstance(result.final.response_json, dict)
-        and "changed" in result.final.response_json
+        and type(result.final.response_json.get("changed")) is bool
     )
     return {
         "scope": "logical_user_actions",
@@ -977,7 +1466,37 @@ def summarize_logical_results(results: list[LogicalRequestResult]) -> dict[str, 
         "changed_counts": dict(sorted(changed.items())),
         "end_to_end_latency": metric_stats([result.elapsed_ms for result in results]),
         "accepted_request_latency": metric_stats(accepted_request_latencies),
+        "timing": _timing_summary(
+            results,
+            unit="logical_actions",
+            expected_count=expected_count,
+            submitted_count=submitted_count,
+        ),
     }
+
+
+def _has_partial_timing(value: Any) -> bool:
+    """Find missing or incomplete timing populations recursively."""
+
+    found = False
+
+    def visit(item: Any) -> bool:
+        nonlocal found
+        if isinstance(item, dict):
+            if "timing" in item:
+                found = True
+                if not timing_summary_is_complete(item.get("timing")):
+                    return True
+            return any(visit(child) for key, child in item.items() if key != "timing")
+        if isinstance(item, list):
+            return any(visit(child) for child in item)
+        return False
+
+    incomplete = visit(value)
+    # A current canonical run always has at least one timing summary.  Treat a
+    # missing entire timing tree as incomplete instead of allowing an empty or
+    # legacy-shaped report to become green through zero-valued metrics.
+    return incomplete or not found
 
 
 def run_load(
@@ -998,9 +1517,95 @@ def run_load(
     concurrency_stages: list[int] | tuple[int, ...] | None = None,
     scenario_kind: str = "slo",
     acceptance_contract: dict[str, Any] | None = None,
+    require_exact_observer_binding: bool = False,
+    authoritative_binding: Mapping[str, Any] | None = None,
+    expected_profile_id: str | None = None,
+    expected_profile_version: int | None = None,
+    expected_profile_digest: str | None = None,
+    expected_primary_action_count: int | None = None,
+    expected_total_logical_action_count: int | None = None,
+    expected_state_read_count: int | None = None,
+    expected_stage_action_counts: Mapping[str, Any] | None = None,
     timeout_diagnostics_run_id: str | None = None,
     client_transport: str = DEFAULT_CLIENT_TRANSPORT,
+    max_http_attempts: int | None = None,
 ) -> dict[str, Any]:
+    for value, field in (
+        (duplicate_count, "duplicate_count"),
+        (manual_refresh_count, "manual_refresh_count"),
+        (concurrency, "concurrency"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ExternalLoadError(f"{field} must be an integer")
+    for value, field, minimum, maximum in (
+        (spread_seconds, "spread_seconds", 0.0, 3_600.0),
+        (timeout, "timeout", 0.1, 300.0),
+        (p95_budget_ms, "p95_budget_ms", 0.0, 1_000_000.0),
+        (p99_budget_ms, "p99_budget_ms", 0.0, 1_000_000.0),
+    ):
+        try:
+            numeric = float(value)
+        except (OverflowError, TypeError, ValueError):
+            numeric = float("nan")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(numeric)
+            or not minimum <= numeric <= maximum
+        ):
+            raise ExternalLoadError(f"{field} must be finite and within bounds")
+    if failure_budget_percent is not None:
+        try:
+            failure_budget = float(failure_budget_percent)
+        except (OverflowError, TypeError, ValueError):
+            failure_budget = float("nan")
+        if (
+            isinstance(failure_budget_percent, bool)
+            or not isinstance(failure_budget_percent, (int, float))
+            or not math.isfinite(failure_budget)
+            or not 0 <= failure_budget <= 100
+        ):
+            raise ExternalLoadError(
+                "failure_budget_percent must be finite and between 0 and 100"
+            )
+    if not 1 <= concurrency <= MAX_CONCURRENCY:
+        raise ExternalLoadError(f"concurrency must be between 1 and {MAX_CONCURRENCY}")
+    if duplicate_count < 0:
+        raise ExternalLoadError("duplicate_count must not be negative")
+    if duplicate_count > len(users):
+        raise ExternalLoadError("duplicate_count exceeds the manifest user population")
+    if expected_primary_action_count is not None and (
+        isinstance(expected_primary_action_count, bool)
+        or not isinstance(expected_primary_action_count, int)
+        or expected_primary_action_count < 0
+    ):
+        raise ExternalLoadError("expected_primary_action_count must be a non-negative integer")
+    if expected_primary_action_count is None and mode == "ready-vote":
+        expected_primary_action_count = (
+            sum(int(phase.get("logical_actions") or 0) for phase in phase_plan)
+            if phase_plan
+            else len(users)
+        )
+    for value, field in (
+        (expected_total_logical_action_count, "expected_total_logical_action_count"),
+        (expected_state_read_count, "expected_state_read_count"),
+    ):
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+        ):
+            raise ExternalLoadError(f"{field} must be a non-negative integer")
+    if expected_stage_action_counts is not None:
+        if not isinstance(expected_stage_action_counts, Mapping):
+            raise ExternalLoadError("expected_stage_action_counts must be an object")
+        for stage_name, value in expected_stage_action_counts.items():
+            if not isinstance(stage_name, str) or not stage_name:
+                raise ExternalLoadError("expected_stage_action_counts has an invalid stage name")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ExternalLoadError(
+                    "expected_stage_action_counts values must be non-negative integers"
+                )
     if manual_refresh_count < 0:
         raise ExternalLoadError("manual_refresh_count must not be negative")
     if mode == "ready-vote" and manual_refresh_count:
@@ -1021,7 +1626,7 @@ def run_load(
                 raise ExternalLoadError("concurrency_stages must be strictly ascending within bounds")
             previous_stage = stage
     if timeout_diagnostics_run_id is not None:
-        if not re.fullmatch(r"[0-9]{1,32}", timeout_diagnostics_run_id):
+        if not re.fullmatch(r"[1-9][0-9]{0,31}", timeout_diagnostics_run_id):
             raise ExternalLoadError("timeout diagnostics run id must be numeric")
         if mode != "page-load":
             raise ExternalLoadError("timeout diagnostics are only supported for page-load")
@@ -1031,7 +1636,137 @@ def run_load(
         raise ExternalLoadError(
             "non-default client transports are only supported for page-load"
         )
+    planned_attempts = planned_http_attempts(
+        mode=mode,
+        user_count=len(users),
+        tournament_count=len(manifest.get("tournaments") or []),
+        duplicate_count=duplicate_count,
+        manual_refresh_count=manual_refresh_count,
+        phase_plan=phase_plan,
+        concurrency_stages=concurrency_stages,
+        retry_policy=retry_policy,
+    )
+    if (
+        max_http_attempts is not None
+        and planned_attempts is not None
+        and planned_attempts > max_http_attempts
+    ):
+        raise ExternalLoadError(
+            f"planned HTTP attempts {planned_attempts} exceed "
+            f"max_http_attempts {max_http_attempts}"
+        )
     read_concurrency_stages = tuple(concurrency_stages or (concurrency,))
+    planned_primary_action_count = (
+        sum(int(phase.get("logical_actions") or 0) for phase in (phase_plan or []))
+        if mode == "ready-vote" and phase_plan
+        else len(users) * len(read_concurrency_stages)
+        if mode == "read-mix"
+        else len(users)
+        if mode == "page-load"
+        else None
+    )
+    if expected_primary_action_count is None:
+        expected_primary_action_count = planned_primary_action_count
+    elif planned_primary_action_count is not None and (
+        expected_primary_action_count != planned_primary_action_count
+    ):
+        raise ExternalLoadError(
+            "expected_primary_action_count does not match the selected workload plan"
+        )
+    planned_total_logical_action_count = (
+        expected_primary_action_count
+        + duplicate_count
+        + (manual_refresh_count if mode == "read-mix" else 0)
+        if expected_primary_action_count is not None
+        else None
+    )
+    if expected_total_logical_action_count is None:
+        expected_total_logical_action_count = planned_total_logical_action_count
+    elif planned_total_logical_action_count is not None and (
+        expected_total_logical_action_count != planned_total_logical_action_count
+    ):
+        raise ExternalLoadError(
+            "expected_total_logical_action_count does not match the selected workload plan"
+        )
+    planned_state_read_count = (
+        len(manifest.get("tournaments") or []) if mode == "ready-vote" else 0
+    )
+    if expected_state_read_count is None:
+        expected_state_read_count = planned_state_read_count
+    elif expected_state_read_count != planned_state_read_count:
+        raise ExternalLoadError(
+            "expected_state_read_count does not match the selected fixture plan"
+        )
+    if mode == "read-mix" and expected_stage_action_counts is not None:
+        planned_stage_counts = {
+            str(stage): len(users) for stage in read_concurrency_stages
+        }
+        actual_stage_counts = {
+            str(stage): value for stage, value in expected_stage_action_counts.items()
+        }
+        if actual_stage_counts != planned_stage_counts:
+            raise ExternalLoadError(
+                "expected_stage_action_counts does not match the selected fixture plan"
+            )
+    if mode == "ready-vote":
+        expected_phase_action_counts: dict[str, int] = {
+            str(phase.get("name")): int(phase.get("logical_actions") or 0)
+            for phase in (phase_plan or [])
+        }
+        expected_phase_action_counts.update(
+            {
+                "primary": expected_primary_action_count,
+                "duplicate": duplicate_count,
+            }
+        )
+    elif mode == "read-mix":
+        expected_phase_action_counts = {
+            "read_mix": expected_primary_action_count,
+            **(
+                {"manual_refresh": manual_refresh_count}
+                if manual_refresh_count > 0
+                else {}
+            ),
+        }
+    elif mode == "page-load":
+        expected_phase_action_counts = {
+            "authenticated_page_load": expected_primary_action_count,
+        }
+    else:
+        expected_phase_action_counts = {}
+    acceptance_phase_plan = derive_expected_phase_plan(
+        mode=mode,
+        authored_phase_plan=phase_plan,
+        expected_phase_action_counts=expected_phase_action_counts,
+    )
+    expected_max_retries = (
+        2
+        if retry_policy is None
+        else int(retry_policy.get("max_retries") or 0)
+    )
+    binding = authoritative_binding if isinstance(authoritative_binding, Mapping) else {}
+    binding_is_authoritative = (
+        acceptance_contract is not None
+        and expected_profile_id is not None
+        and expected_profile_version is not None
+        and expected_profile_digest is not None
+        and binding.get("profile_id") == expected_profile_id
+        and binding.get("profile_version") == expected_profile_version
+        and binding.get("profile_digest") == expected_profile_digest
+        and isinstance(binding.get("profile_id"), str)
+        and PROFILE_ID_RE.fullmatch(binding["profile_id"]) is not None
+        and isinstance(binding.get("profile_version"), int)
+        and not isinstance(binding.get("profile_version"), bool)
+        and binding["profile_version"] > 0
+        and isinstance(binding.get("profile_digest"), str)
+        and PROFILE_DIGEST_RE.fullmatch(binding["profile_digest"]) is not None
+        and isinstance(binding.get("source_git_sha"), str)
+        and SOURCE_SHA_RE.fullmatch(binding["source_git_sha"]) is not None
+        and binding["source_git_sha"] == os.environ.get("SOURCE_GIT_SHA", "").strip()
+        and isinstance(binding.get("external_run_id"), str)
+        and RUN_ID_RE.fullmatch(binding["external_run_id"]) is not None
+        and binding["external_run_id"] == os.environ.get("GITHUB_RUN_ID", "").strip()
+    )
     origin = str(manifest["origin"]).rstrip("/")
     session_cookie_name = str(manifest["session_cookie_name"])
     csrf_cookie_name = str(manifest["csrf_cookie_name"])
@@ -1097,11 +1832,20 @@ def run_load(
                 phase_attempts = _flatten_logical_results(phase_results_for_users)
                 phase_wall_seconds = max(0.001, time.monotonic() - phase_started)
                 phase_finished_at_utc = datetime.now(UTC)
-                phase_logical = summarize_logical_results(phase_results_for_users)
-                phase_logical["wall_seconds"] = round(phase_wall_seconds, 3)
+                phase_logical = summarize_logical_results(
+                    phase_results_for_users,
+                    expected_count=action_count,
+                    submitted_count=len(phase_results_for_users),
+                )
+                phase_logical["wall_seconds"] = round(phase_wall_seconds, 6)
                 phase_logical["target_logical_actions_per_second"] = target_rate
                 phase_logical["offered_logical_actions_per_second"] = round(
                     action_count / phase_submission_window, 3
+                )
+                phase_logical["actual_arrival_logical_actions_per_second"] = (
+                    phase_logical.get("timing", {}).get(
+                        "actual_arrival_logical_actions_per_second"
+                    )
                 )
                 phase_logical["successful_goodput_actions_per_second"] = round(
                     float(phase_logical.get("final_successes") or 0)
@@ -1109,11 +1853,22 @@ def run_load(
                     3,
                 )
                 phase_raw = summarize_results(phase_attempts)
+                _add_measured_goodput(phase_raw, phase_wall_seconds)
                 phase_raw["attempts_per_second"] = round(
                     float(phase_raw.get("requests") or 0) / phase_submission_window,
                     3,
                 )
                 planned_phases[phase_name] = {
+                    "configured_actions": action_count,
+                    "submitted_actions": len(phase_results_for_users),
+                    "missing_actions": max(
+                        0, action_count - len(phase_results_for_users)
+                    ),
+                    "complete": (
+                        len(phase_results_for_users) == action_count
+                        and timing_summary_is_complete(phase_logical.get("timing"))
+                        and timing_summary_is_complete(phase_raw.get("timing"))
+                    ),
                     "target_logical_actions_per_second": target_rate,
                     "duration_seconds": duration_seconds,
                     "started_at": phase_started_at_utc.isoformat(),
@@ -1141,8 +1896,16 @@ def run_load(
             )
         primary_attempts = _flatten_logical_results(primary)
         primary_wall_seconds = max(0.001, time.monotonic() - primary_started_at)
-        primary_logical = summarize_logical_results(primary)
-        primary_logical["wall_seconds"] = round(primary_wall_seconds, 3)
+        primary_logical = summarize_logical_results(
+            primary,
+            expected_count=(
+                sum(int(phase.get("logical_actions") or 0) for phase in phase_plan)
+                if phase_plan
+                else len(users)
+            ),
+            submitted_count=len(primary),
+        )
+        primary_logical["wall_seconds"] = round(primary_wall_seconds, 6)
         primary_logical["successful_goodput_actions_per_second"] = round(
             float(primary_logical.get("final_successes") or 0) / primary_wall_seconds,
             3,
@@ -1152,8 +1915,10 @@ def run_load(
                 len(primary) / max(0.001, offered_window_seconds),
                 3,
             )
+        primary_raw = summarize_results(primary_attempts)
+        _add_measured_goodput(primary_raw, primary_wall_seconds)
         phase_results["primary"] = {
-            "raw_http": summarize_results(primary_attempts),
+            "raw_http": primary_raw,
             "logical": primary_logical,
         }
         all_results.extend(primary_attempts)
@@ -1161,46 +1926,106 @@ def run_load(
         successful_primary_ids = {
             result.user_id
             for result in primary
-            if result.attempts and result.final.ok and result.user_id
+            if result.attempts and result.final.ok is True and result.user_id
         }
-        duplicate_candidates = (
-            [user for user in primary_users if user.user_id in successful_primary_ids]
-            if scenario_kind in {"stress", "spike"}
-            else primary_users
-        )
+        # Idempotency checks are meaningful only for actions that completed
+        # successfully.  Bind the duplicate candidate pool to that exact
+        # primary population for every scenario, including normal SLO runs.
+        duplicate_candidates = [
+            user for user in primary_users if user.user_id in successful_primary_ids
+        ]
+        # A duplicate is meaningful only for a primary action that reached the
+        # service.  Under stress/spike shedding can therefore leave fewer
+        # eligible candidates than the configured duplicate count.  Never
+        # shrink the configured workload and call that a pass: run every
+        # available candidate, retain the configured expected population, and
+        # mark the phase incomplete when any duplicate action is missing.
         duplicate_users = duplicate_candidates[:duplicate_count]
-        if duplicate_users:
-            duplicates = run_phase(
-                origin,
-                duplicate_users,
-                phase="write_external_vote_duplicate",
-                spread_seconds=min(spread_seconds, 5.0),
-                concurrency=concurrency,
-                timeout=timeout,
-                request_builder=vote_builder,
-            )
-            duplicate_attempts = _flatten_logical_results(duplicates)
-            phase_results["duplicate"] = {
-                "raw_http": summarize_results(duplicate_attempts),
-                "logical": summarize_logical_results(duplicates),
-            }
-            all_results.extend(duplicate_attempts)
+        duplicate_started_at = time.monotonic()
+        duplicates = run_phase(
+            origin,
+            duplicate_users,
+            phase="write_external_vote_duplicate",
+            spread_seconds=min(spread_seconds, 5.0),
+            concurrency=concurrency,
+            timeout=timeout,
+            request_builder=vote_builder,
+        )
+        duplicate_attempts = _flatten_logical_results(duplicates)
+        duplicate_logical = summarize_logical_results(
+            duplicates,
+            expected_count=duplicate_count,
+            submitted_count=len(duplicates),
+        )
+        duplicate_wall_seconds = max(0.001, time.monotonic() - duplicate_started_at)
+        duplicate_logical["wall_seconds"] = round(duplicate_wall_seconds, 6)
+        duplicate_logical["successful_goodput_actions_per_second"] = round(
+            float(duplicate_logical.get("final_successes") or 0)
+            / duplicate_wall_seconds,
+            3,
+        )
+        duplicate_raw = summarize_results(duplicate_attempts)
+        _add_measured_goodput(duplicate_raw, duplicate_wall_seconds)
+        duplicate_raw["configured_logical_actions"] = duplicate_count
+        duplicate_raw["submitted_logical_actions"] = len(duplicates)
+        duplicate_raw["missing_logical_actions"] = max(
+            0, duplicate_count - len(duplicates)
+        )
+        duplicate_phase_complete = (
+            len(duplicate_users) == duplicate_count
+            and timing_summary_is_complete(duplicate_logical.get("timing"))
+        )
+        phase_results["duplicate"] = {
+            "configured_actions": duplicate_count,
+            "candidate_actions": len(duplicate_candidates),
+            "submitted_actions": len(duplicates),
+            "completed_actions": int(
+                (duplicate_logical.get("timing") or {}).get("completed_count") or 0
+            ),
+            "missing_actions": max(0, duplicate_count - len(duplicates)),
+            "complete": duplicate_phase_complete,
+            "status": "complete" if duplicate_phase_complete else "incomplete",
+            "incomplete_reason": (
+                "primary_successes_below_duplicate_count"
+                if len(duplicate_candidates) < duplicate_count
+                else "duplicate_timing_incomplete"
+                if len(duplicate_users) == duplicate_count
+                else "duplicate_actions_not_submitted"
+            ) if not duplicate_phase_complete else None,
+            "raw_http": duplicate_raw,
+            "logical": duplicate_logical,
+        }
+        all_results.extend(duplicate_attempts)
 
+        # State reads are planned per manifest tournament, not merely for the
+        # subset that happened to receive a primary action in a capacity
+        # phase.  Keep untouched tournaments in the evidence with an expected
+        # ready count of zero so the state-read population remains exactly
+        # bound to the selected fixture plan.
         users_by_slug: dict[str, VirtualUser] = {}
         expected_by_slug: Counter[str] = Counter()
         successful_primary_by_slug: Counter[str] = Counter()
         for result in primary:
-            if result.attempts and result.final.ok:
+            if result.attempts and result.final.ok is True:
                 slug = result.final.path.split("/", 3)[2]
                 successful_primary_by_slug[slug] += 1
-        for user in primary_users:
+        for user in users:
             users_by_slug.setdefault(user.tournament_slug, user)
             expected_by_slug[user.tournament_slug] = successful_primary_by_slug.get(
                 user.tournament_slug,
                 0,
             )
         state_results: list[RequestResult] = []
-        for slug, user in sorted(users_by_slug.items()):
+        # Slugs are needed transiently to select the request fixture, but they
+        # must never become evidence keys.  The acceptance contract only needs
+        # a one-to-one bounded map, so expose deterministic numeric slots.
+        expected_state_ready_counts: dict[str, int] = {}
+        observed_state_ready_counts: dict[str, int | None] = {}
+        state_ready_count_mismatches = 0
+        for state_slot, (slug, user) in enumerate(sorted(users_by_slug.items())):
+            evidence_key = str(state_slot)
+            state_scheduled_at = time.monotonic()
+            state_started_at = state_scheduled_at
             result = _request(
                 origin,
                 user,
@@ -1211,21 +2036,69 @@ def run_load(
                 session_cookie_name=session_cookie_name,
                 csrf_cookie_name=csrf_cookie_name,
             )
+            result = _annotate_timing(
+                result,
+                scheduled_at=state_scheduled_at,
+                enqueued_at=state_scheduled_at,
+                fallback_started_at=state_started_at,
+                fallback_finished_at=time.monotonic(),
+            )
             expected_count = expected_by_slug[slug]
+            expected_state_ready_counts[evidence_key] = expected_count
             active_round = (
                 result.response_json.get("active_round")
                 if isinstance(result.response_json, dict)
                 else None
             )
-            result.ok = bool(
-                result.ok
-                and isinstance(active_round, dict)
-                and int(active_round.get("ready_count") or 0) == expected_count
+            observed_ready_count = (
+                active_round.get("ready_count")
+                if isinstance(active_round, dict)
+                else None
+            )
+            if (
+                isinstance(observed_ready_count, bool)
+                or not isinstance(observed_ready_count, int)
+                or observed_ready_count < 0
+            ):
+                observed_ready_count = None
+            observed_state_ready_counts[evidence_key] = observed_ready_count
+            if observed_ready_count != expected_count:
+                state_ready_count_mismatches += 1
+            result.ok = (
+                result.ok is True
+                and observed_ready_count is not None
+                and observed_ready_count == expected_count
             )
             if not result.ok and result.error_kind is None:
                 result.error_kind = "authoritative_state_mismatch"
             state_results.append(result)
-        phase_results["state"] = summarize_results(state_results)
+        state_summary = summarize_results(
+            state_results,
+            expected_count=len(users_by_slug),
+            submitted_count=len(state_results),
+        )
+        state_summary.update(
+            {
+                "configured_reads": len(users_by_slug),
+                "submitted_reads": len(state_results),
+                "completed_reads": len(state_results),
+                "missing_reads": max(0, len(users_by_slug) - len(state_results)),
+                "complete": (
+                    len(state_results) == len(users_by_slug)
+                    and timing_summary_is_complete(state_summary.get("timing"))
+                    and state_ready_count_mismatches == 0
+                ),
+                "authoritative": True,
+                "ready_count_evidence": {
+                    "complete": state_ready_count_mismatches == 0
+                    and all(value is not None for value in observed_state_ready_counts.values()),
+                    "expected": expected_state_ready_counts,
+                    "observed": observed_state_ready_counts,
+                    "mismatches": state_ready_count_mismatches,
+                },
+            }
+        )
+        phase_results["state"] = state_summary
         all_results.extend(state_results)
         primary_summary = phase_results["primary"]["logical"]
         duplicate_summary = phase_results.get("duplicate", {}).get("logical", {})
@@ -1237,13 +2110,16 @@ def run_load(
         duplicate_failures = int(duplicate_summary.get("final_failures", 0))
         duplicate_raw = phase_results.get("duplicate", {}).get("raw_http", {})
         duplicate_correctness = (
-            duplicate_failures == 0
-            and int(duplicate_changed.get("False", 0)) == len(duplicate_users)
+            duplicate_phase_complete
+            and duplicate_failures == 0
+            and int(duplicate_changed.get("False", 0)) == duplicate_count
             if strict_duplicate_contract
             else (
                 # Stress may shed a duplicate with the same bounded 503 as a
                 # primary action. Every duplicate that is accepted must still
                 # be an idempotent noop, and no unexpected status is allowed.
+                duplicate_phase_complete
+                and
                 int(duplicate_changed.get("False", 0)) == duplicate_successes
                 and int(duplicate_raw.get("unexpected_statuses") or 0) == 0
             )
@@ -1287,6 +2163,7 @@ def run_load(
                 **request_kwargs,
             )
 
+        page_started_at = time.monotonic()
         page_results = run_phase(
             origin,
             users,
@@ -1296,7 +2173,18 @@ def run_load(
             timeout=timeout,
             request_builder=page_builder,
         )
-        phase_results["authenticated_page_load"] = summarize_results(page_results)
+        page_summary = summarize_results(
+            page_results,
+            expected_count=len(users),
+            submitted_count=len(page_results),
+        )
+        page_wall_seconds = max(0.001, time.monotonic() - page_started_at)
+        page_summary["wall_seconds"] = round(page_wall_seconds, 6)
+        page_summary["successful_goodput_actions_per_second"] = round(
+            float(page_summary.get("successful_responses") or 0) / page_wall_seconds,
+            3,
+        )
+        phase_results["authenticated_page_load"] = page_summary
         all_results.extend(page_results)
         page_summary = phase_results["authenticated_page_load"]
         contract_ok = (
@@ -1325,6 +2213,7 @@ def run_load(
             return result
 
         read_results: list[RequestResult] = []
+        read_started_at = time.monotonic()
         ramp_stages: dict[str, dict[str, Any]] = {}
         for stage_concurrency in read_concurrency_stages:
             stage_started_at = time.monotonic()
@@ -1338,15 +2227,35 @@ def run_load(
                 request_builder=read_builder,
             )
             read_results.extend(stage_results)
-            stage_summary = summarize_results(stage_results)
+            stage_summary = summarize_results(
+                stage_results,
+                expected_count=len(users),
+                submitted_count=len(stage_results),
+            )
             stage_wall_seconds = max(0.001, time.monotonic() - stage_started_at)
-            stage_summary["wall_seconds"] = round(stage_wall_seconds, 3)
+            stage_summary["wall_seconds"] = round(stage_wall_seconds, 6)
             stage_summary["requests_per_second"] = round(
                 float(stage_summary.get("requests") or 0) / stage_wall_seconds,
                 3,
             )
+            stage_summary["successful_goodput_actions_per_second"] = round(
+                float(stage_summary.get("successful_responses") or 0)
+                / stage_wall_seconds,
+                3,
+            )
             ramp_stages[str(stage_concurrency)] = stage_summary
-        phase_results["read_mix"] = summarize_results(read_results)
+        read_summary = summarize_results(
+            read_results,
+            expected_count=len(users) * len(read_concurrency_stages),
+            submitted_count=len(read_results),
+        )
+        read_wall_seconds = max(0.001, time.monotonic() - read_started_at)
+        read_summary["wall_seconds"] = round(read_wall_seconds, 6)
+        read_summary["successful_goodput_actions_per_second"] = round(
+            float(read_summary.get("successful_responses") or 0) / read_wall_seconds,
+            3,
+        )
+        phase_results["read_mix"] = read_summary
         if concurrency_stages is not None:
             phase_results["capacity_ramp"] = {
                 "concurrency_stages": list(read_concurrency_stages),
@@ -1393,6 +2302,7 @@ def run_load(
                     extra_headers={"If-None-Match": etag},
                 )
 
+            refresh_started_at = time.monotonic()
             refresh_results = run_phase(
                 origin,
                 refresh_users,
@@ -1402,7 +2312,19 @@ def run_load(
                 timeout=timeout,
                 request_builder=refresh_builder,
             )
-            phase_results["manual_refresh"] = summarize_results(refresh_results)
+            refresh_summary = summarize_results(
+                refresh_results,
+                expected_count=manual_refresh_count,
+                submitted_count=len(refresh_results),
+            )
+            refresh_wall_seconds = max(0.001, time.monotonic() - refresh_started_at)
+            refresh_summary["wall_seconds"] = round(refresh_wall_seconds, 6)
+            refresh_summary["successful_goodput_actions_per_second"] = round(
+                float(refresh_summary.get("successful_responses") or 0)
+                / refresh_wall_seconds,
+                3,
+            )
+            phase_results["manual_refresh"] = refresh_summary
             all_results.extend(refresh_results)
         read_mix_summary = phase_results["read_mix"]
         strict_read_contract = scenario_kind not in {"stress", "spike"}
@@ -1427,28 +2349,116 @@ def run_load(
             )
         )
 
+    partial_work = _has_partial_timing(phase_results)
+    if partial_work:
+        # Never turn a partial result set into a green experiment merely
+        # because the rows that did complete met their latency thresholds.
+        contract_ok = False
     overall = summarize_results(all_results)
-    logical_summary = (
-        phase_results.get("primary", {}).get("logical", {})
-        if mode == "ready-vote"
-        else overall
-    )
+    if mode == "ready-vote":
+        primary_logical_result = phase_results.get("primary", {}).get("logical", {})
+        duplicate_logical_result = phase_results.get("duplicate", {}).get("logical", {})
+        primary_action_results = primary
+        duplicate_action_results = duplicates
+        logical_summary = summarize_logical_results(
+            primary_action_results + duplicate_action_results,
+            expected_count=(
+                int(
+                    (primary_logical_result.get("timing") or {}).get(
+                        "expected_count"
+                    )
+                    or len(primary)
+                )
+                + duplicate_count
+            ),
+            submitted_count=len(primary_action_results) + len(duplicate_action_results),
+        )
+        logical_summary["primary_actions"] = len(primary_action_results)
+        logical_summary["duplicate_actions"] = len(duplicate_action_results)
+        logical_summary["configured_duplicate_actions"] = duplicate_count
+        logical_summary["duplicate_phase_complete"] = bool(
+            phase_results.get("duplicate", {}).get("complete")
+        )
+        logical_summary["duplicate_offered_logical_actions_per_second"] = (
+            (duplicate_logical_result.get("timing") or {}).get(
+                "offered_logical_actions_per_second"
+            )
+        )
+        logical_summary["offered_logical_actions_per_second"] = (
+            primary_logical_result.get("offered_logical_actions_per_second")
+        )
+        action_attempts = primary_attempts + duplicate_attempts
+        raw_http_summary = summarize_results(action_attempts)
+        raw_http_summary["configured_duplicate_actions"] = duplicate_count
+        raw_http_summary["submitted_duplicate_actions"] = len(duplicate_action_results)
+        raw_http_summary["missing_duplicate_actions"] = max(
+            0, duplicate_count - len(duplicate_action_results)
+        )
+    else:
+        logical_summary = overall
+        raw_http_summary = overall
+        if mode == "read-mix":
+            logical_summary["primary_actions"] = len(read_results)
+            logical_summary["manual_refresh_actions"] = len(refresh_results)
+        elif mode == "page-load":
+            logical_summary["primary_actions"] = len(page_results)
     finished_at = datetime.now(UTC)
     wall_seconds = max(0.001, (finished_at - started_at).total_seconds())
-    raw_http_summary = (
-        phase_results.get("primary", {}).get("raw_http", overall)
-        if mode == "ready-vote"
-        else overall
-    )
-    raw_http_summary["wall_seconds"] = round(wall_seconds, 3)
+    _add_measured_goodput(overall, wall_seconds)
+    _add_measured_goodput(raw_http_summary, wall_seconds)
     raw_http_summary["requests_per_second"] = round(
         float(raw_http_summary.get("requests") or 0) / wall_seconds,
         3,
     )
-    raw_http_summary["successful_goodput_actions_per_second"] = round(
-        float(raw_http_summary.get("successful_responses") or 0) / wall_seconds,
-        3,
+    if mode == "ready-vote":
+        # The aggregate logical population and raw HTTP population share this
+        # one measured run window.  Persist it on the logical scope so the
+        # evaluator never has to infer a different timing window for
+        # successful logical goodput.
+        logical_summary["wall_seconds"] = round(wall_seconds, 6)
+        logical_summary["successful_goodput_actions_per_second"] = round(
+            float(logical_summary.get("final_successes") or 0) / wall_seconds,
+            3,
+        )
+        raw_http_summary["state_read_requests"] = len(state_results)
+        raw_http_summary["total_requests_including_state"] = int(
+            overall.get("requests") or 0
+        )
+    logical_timing = logical_summary.get("timing") or {}
+    raw_timing = raw_http_summary.get("timing") or {}
+    dropped_work_value = logical_timing.get("dropped_work")
+    if not isinstance(dropped_work_value, int):
+        dropped_work_value = raw_timing.get("dropped_work")
+    if not isinstance(dropped_work_value, int):
+        dropped_work_value = None
+    acceptance_phase_summaries = (
+        ((phase_results.get("ramp") or {}).get("phases") or {}).copy()
+        if mode == "ready-vote" and isinstance(phase_results.get("ramp"), dict)
+        else {}
     )
+    if mode == "ready-vote":
+        acceptance_phase_summaries["primary"] = phase_results["primary"]
+        acceptance_phase_summaries["duplicate"] = phase_results["duplicate"]
+        acceptance_phase_summaries["state"] = phase_results["state"]
+    elif mode == "read-mix":
+        ramp = phase_results.get("capacity_ramp")
+        if isinstance(ramp, dict):
+            acceptance_phase_summaries["capacity_ramp"] = ramp
+        for phase_name in ("read_mix", "manual_refresh"):
+            phase = phase_results.get(phase_name)
+            if isinstance(phase, dict):
+                acceptance_phase_summaries[phase_name] = {
+                    "logical": phase,
+                    "raw_http": phase,
+                }
+    elif mode == "page-load":
+        phase = phase_results.get("authenticated_page_load")
+        if isinstance(phase, dict):
+            acceptance_phase_summaries["authenticated_page_load"] = {
+                "logical": phase,
+                "raw_http": phase,
+            }
+    allowed_phase_names = set(acceptance_phase_summaries)
     acceptance = evaluate_acceptance(
         contract_ok=contract_ok,
         logical_summary=logical_summary,
@@ -1459,21 +2469,54 @@ def run_load(
         ),
         raw_http_summary=raw_http_summary,
         acceptance_contract=acceptance_contract,
+        phase_summaries=acceptance_phase_summaries or None,
+        require_exact_observer_binding=require_exact_observer_binding,
+        canonical_evidence=binding_is_authoritative,
+        expected_logical_scope=(
+            "logical_user_actions" if mode == "ready-vote" else "full_population"
+        ),
+        allowed_phase_names=allowed_phase_names,
+        expected_phase_plan=acceptance_phase_plan,
+        expected_duplicate_count=duplicate_count if mode == "ready-vote" else None,
+        expected_primary_action_count=expected_primary_action_count,
+        expected_total_logical_action_count=expected_total_logical_action_count,
+        expected_stage_action_counts=expected_stage_action_counts,
+        expected_phase_action_counts=expected_phase_action_counts,
+        expected_state_read_count=expected_state_read_count if mode == "ready-vote" else None,
+        max_retries=expected_max_retries,
     )
+    if acceptance_contract is not None and not binding_is_authoritative:
+        acceptance = {
+            **acceptance,
+            "passed": False,
+            "decision": "LEGACY DIAGNOSTIC NON-AUTHORITATIVE",
+            "authoritative": False,
+            "dispatchable": False,
+            "checks": {
+                **(acceptance.get("checks") or {}),
+                "authoritative_binding": False,
+            },
+        }
     return {
         "schema": 1,
+        "measurement_schema": 2,
+        "timing_schema": 1,
         "scope": "full_population",
         "mode": mode,
-        "origin": origin,
+        # The origin is used transiently for requests, but the persisted load
+        # envelope carries only its closed deployment class.  A full URL could
+        # include a host/path/query when this runner is reused outside CI.
+        "origin_class": "production_origin",
         "fixture_marker": manifest["marker"],
         "users": len(users),
         "tournaments": len(manifest["tournaments"]),
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
-        "wall_seconds": round(wall_seconds, 3),
+        "wall_seconds": round(wall_seconds, 6),
         "opening_spread_seconds": spread_seconds,
         "scenario_kind": scenario_kind,
         "client_transport": client_transport,
+        "duplicate_count": duplicate_count,
         "manual_refresh_count": manual_refresh_count,
         "concurrency": concurrency,
         "concurrency_stages": (
@@ -1487,6 +2530,32 @@ def run_load(
             else float(logical_summary.get("actions") or 0) / wall_seconds,
             3,
         ) if mode == "ready-vote" else None,
+        "actual_arrival_logical_actions_per_second": (
+            (logical_summary.get("timing") or {}).get(
+                "actual_arrival_logical_actions_per_second"
+            )
+            if mode == "ready-vote"
+            else None
+        ),
+        "actual_arrival_requests_per_second": (
+            (raw_http_summary.get("timing") or {}).get(
+                "actual_arrival_requests_per_second"
+            )
+        ),
+        "offered_requests_per_second": (
+            (raw_http_summary.get("timing") or {}).get(
+                "offered_requests_per_second"
+            )
+        ),
+        "late_start_count": int(
+            (logical_summary.get("timing") or {}).get("late_start_count")
+            or (raw_http_summary.get("timing") or {}).get("late_start_count")
+            or 0
+        ),
+        "dropped_work": int(
+            dropped_work_value
+        ) if dropped_work_value is not None else None,
+        "partial_work": partial_work,
         "trace": trace,
         "timeout_path_diagnostics": {
             "enabled": timeout_diagnostics_run_id is not None,
@@ -1495,8 +2564,14 @@ def run_load(
         "phases": phase_results,
         "overall": overall,
         "raw_http": raw_http_summary,
-        "logical": logical_summary if mode == "ready-vote" else None,
+        # Keep an explicit logical envelope for every dispatchable workload.
+        # Read/page profiles use the full HTTP population as their logical
+        # action population, but the field must not be inferred by the
+        # evaluator from ``overall`` or substituted into ``raw_http``.
+        "logical": logical_summary,
         "acceptance": acceptance,
+        "authoritative": binding_is_authoritative,
+        "dispatchable": binding_is_authoritative,
     }
 
 
@@ -1534,14 +2609,31 @@ def main() -> int:
     args = parse_args()
     report: dict[str, Any]
     try:
-        if not 0 <= args.spread_seconds <= 3_600:
+        if not math.isfinite(args.spread_seconds) or not 0 <= args.spread_seconds <= 3_600:
             raise ExternalLoadError("spread-seconds must be between 0 and 3600")
         if not 1 <= args.concurrency <= MAX_CONCURRENCY:
             raise ExternalLoadError(f"concurrency must be between 1 and {MAX_CONCURRENCY}")
-        if args.timeout <= 0 or args.timeout > 300:
+        if (
+            not math.isfinite(args.timeout)
+            or args.timeout <= 0
+            or args.timeout > 300
+        ):
             raise ExternalLoadError("timeout must be between 0 and 300 seconds")
+        for value, field in (
+            (args.p95_budget_ms, "p95-budget-ms"),
+            (args.p99_budget_ms, "p99-budget-ms"),
+            (args.failure_budget_percent, "failure-budget-percent"),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ExternalLoadError(f"{field} must be finite and non-negative")
         manifest, users = load_manifest(args.manifest)
-        duplicate_count = max(0, min(args.duplicate_count, len(users)))
+        if args.duplicate_count < 0:
+            raise ExternalLoadError("duplicate-count must not be negative")
+        if args.duplicate_count > len(users):
+            raise ExternalLoadError(
+                "duplicate-count exceeds the manifest user population"
+            )
+        duplicate_count = args.duplicate_count
         if args.manual_refresh_count < 0:
             raise ExternalLoadError("manual-refresh-count must not be negative")
         if args.mode == "ready-vote" and args.manual_refresh_count:
@@ -1561,17 +2653,30 @@ def main() -> int:
             timeout=args.timeout,
             duplicate_count=duplicate_count,
             manual_refresh_count=manual_refresh_count,
-            p95_budget_ms=max(0.0, args.p95_budget_ms),
-            p99_budget_ms=max(0.0, args.p99_budget_ms),
-            failure_budget_percent=max(0.0, args.failure_budget_percent),
+            p95_budget_ms=args.p95_budget_ms,
+            p99_budget_ms=args.p99_budget_ms,
+            failure_budget_percent=args.failure_budget_percent,
             client_transport=args.client_transport,
         )
     except Exception as exc:
+        error_class = safe_error_class(type(exc).__name__)
         report = {
             "schema": 1,
+            "measurement_schema": 2,
+            "timing_schema": 1,
             "mode": args.mode,
             "passed": False,
-            "error": f"{type(exc).__name__}: {exc}",
+            "authoritative": False,
+            "dispatchable": False,
+            "error_class": error_class,
+            "acceptance": {
+                "passed": False,
+                "decision": "LOAD RUN FAILED",
+                "authoritative": False,
+                "dispatchable": False,
+                "contract_ok": False,
+                "error_class": error_class,
+            },
         }
     args.report_path.parent.mkdir(parents=True, exist_ok=True)
     args.report_path.write_text(

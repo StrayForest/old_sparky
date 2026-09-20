@@ -2,7 +2,7 @@
 
 - Status: Active how-to and reference
 - Owner: Production operator
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-11
 
 ## Runtime checks
 
@@ -49,15 +49,19 @@ Maintenance keeps:
 | production releases | newest 5; always protect `current` and `previous` |
 | local release artifacts | newest 5 matching release groups |
 | verified DB backups | newest 14 |
-| Playwright results | 7 days |
-| live-QA runtime caches | protect current/previous source commits; keep exactly the newest additional fallback |
+| Playwright results on the production/pre-production host | 7 days |
+| GitHub Actions Playwright and CI evidence artifacts | 14 days |
+| trusted live-QA generations | protect the active/current/previous source SHAs; remove only older inactive generations after exact identity checks |
+| legacy live-QA runtime caches | protect current/previous source commits; keep exactly the newest additional fallback |
 | maintenance reports | newest 30 |
 | systemd journal | 30 days, 256 MiB, 32 MiB files, preserve 5 GiB free |
 | Nginx/system text logs | rotate at 50 MiB, keep 7 compressed files |
 | failed-login `btmp` | rotate at 16 MiB, keep 2 uncompressed files |
 
 It never deletes shared env/runtimes, upload staging, current/previous releases,
-live-QA caches for the current/previous source commits, business rows or
+the active trusted live-QA generation, trusted generations for current/previous
+source commits, legacy live-QA caches for the current/previous source commits,
+business rows or
 canonical retained reports. Backup failure stops pruning. Live-QA cache pruning
 also takes the machine-wide live-QA lock, requires the dedicated browser cgroup
 and user identity to be idle, accepts only root-owned non-symlink
@@ -65,6 +69,7 @@ and user identity to be idle, accepts only root-owned non-symlink
 contract, and always retains at least the newest valid unprotected fallback.
 The keep count is a hard cap for unprotected caches, not an age window.
 Maintenance fails below 5 GiB free or above 85% disk use.
+The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it.
 
 Application services write structured JSON to journald. Nginx remains the
 request-log owner, so the production Gunicorn access stream is disabled to
@@ -167,15 +172,11 @@ response. Ready Check transitions are local timer updates; the grid shows
 passive bracket changes after a manual page reload. Explicit bracket mutations
 may refetch the authoritative response needed to display the result.
 
-When investigating stale tournament data, inspect the ordinary API request
-latency/status logs and ask the user to reload the page. There is no background
-tournament update mechanism to restore or tune.
+When investigating stale tournament data, inspect ordinary API latency/status logs and ask the user to reload the page; there is no background tournament update mechanism to restore or tune.
 
-Approved load generators may be listed in the exact-address setting
-`PLATFORM_LOAD_TEST_SOURCE_IPS`. The allowlist skips only per-source/IP
-throttles for authentication, invite and media paths; account, authenticated
-user, byte, application-global and Nginx capacity limits remain active. It
-accepts individual IPv4/IPv6 addresses only, never a CIDR or wildcard.
+Detailed retained-load cleanup, hermetic web verification and the exact source
+address allowlist are maintained in the [retained-load and web verification
+reference](retained-load-and-web-verification.md).
 
 ## Performance
 
@@ -192,25 +193,17 @@ worker lifecycle. Use
 `tools/platform_production_qa.py --collect-performance` and
 `tools/platform_performance_audit.py`; detailed JSON stays under shared storage.
 
-For read-path diagnosis, keep these timings separate: checkout wait is the
-time before a connection is acquired, connection hold is checkout-to-checkin,
-`db_sql_ms` is SQL execution time, and request time is the complete HTTP
-request. A high hold/request ratio means the connection lease, rather than
-PostgreSQL execution, is the next investigation target. The workspace and
-`/users/me` routes release their session after their response model has been
-materialized; any exception still follows normal dependency teardown.
+For read-path diagnosis, distinguish checkout wait, connection hold, SQL and complete request time; see the [performance transport runbook](performance-transport-runbook.md) for attribution. Workspace and `/users/me` release the session after materialization; exceptions still follow normal dependency teardown.
 
-The reviewed production load profiles are the JSON contracts under
-`platform/performance/profiles/`. They are separated by scenario category and
-are selected by profile ID in `platform-production-external-load.yml`. This
-runbook defines the operator procedure and evidence collection; it does not
-restate profile parameters or acceptance thresholds.
+Reviewed production load profiles are JSON contracts under
+`platform/performance/profiles/`, selected by ID in
+`platform-production-external-load.yml`; this runbook covers procedure and
+evidence, not profile parameters or acceptance thresholds.
 
-Use a small smoke run first, then an average/human-shaped run, stress or
-breakpoint runs only in an approved low-traffic window, and a separate soak
-run when connection or memory leaks are suspected. Keep functional success
-and performance thresholds separate in the report; a functionally correct run
-may still fail its latency/resource gate.
+Use a small smoke run first, then an average/human-shaped run; run stress or
+breakpoint only in an approved low-traffic window and soak when leaks are
+suspected. Keep functional success separate from thresholds; correctness can
+still fail the latency/resource gate.
 
 Do not increase Gunicorn/Celery workers, add PgBouncer, install exporters or
 introduce a cache/schema rewrite without retained evidence. If both VPS cores
@@ -226,6 +219,10 @@ GitHub-hosted runner outside Cloudflare's origin network. It supports the
 current `ready-vote`, `read-mix` and authenticated `page-load` profiles and collects a
 parallel origin observer report. Temporary session/CSRF credentials are never
 published as an artifact.
+
+The external-load workflow's complete fail-closed barrier and privacy-bounded
+evidence contract are maintained in the [retained-load and web verification
+reference](retained-load-and-web-verification.md).
 
 ```bash
 gh workflow run platform-production-external-load.yml \
@@ -265,9 +262,11 @@ Before attributing a transport result to Nginx, record `nginx -v` and run
 `nginx -t`. The named `platform_api` and `platform_web` upstreams have explicit
 loopback keepalive; the HTML route clears `Connection` and does not advertise a
 WebSocket upgrade. For database evidence,
-collect `pg_stat_statements` top normalized-query calls, total/mean execution
-time, rows and buffer hits/reads. The external observer excludes only its own
-diagnostic queries, so SSR/read runs expose their actual top statements. Also
+collect `pg_stat_statements` query IDs, allowlisted statement categories,
+total/mean execution time, rows and buffer hits/reads. Raw SQL text and
+`pg_stat_activity.query` are never retained. The external observer excludes
+only its own diagnostic queries, so SSR/read runs expose their actual numeric
+top-statement aggregates. Also
 record `pg_stat_activity.application_name` ownership totals for
 `oldsparky-api`, `oldsparky-worker`, `oldsparky-qa`, `oldsparky-observer` and
 `oldsparky-maintenance`; compare those totals to the 52 safety budget before
@@ -344,10 +343,6 @@ If the workflow is canceled, perform the exact retained-load abort/cleanup
 procedure with the same run ID before another load. The temporary manifest
 must not be copied to Actions artifacts.
 
-The public external-load workflow owns the production capacity test. It keeps
-fixture preparation, observation and exact cleanup on the origin while the
-measured HTTP client runs on a GitHub-hosted runner outside the VPS.
-
 ### Retained Ready Vote result
 
 The reviewed reference is `ready-vote-static-8`: per worker its admission
@@ -382,10 +377,9 @@ fast run. Do not infer zero server work from absent spans.
 
 ### External fixture cleanup and runtime baseline
 
-Run the external workflow only in a low-traffic maintenance window. It uses
-the production SSH environment for fixture preparation, observation and exact
-cleanup, while the measured HTTP client runs on a GitHub-hosted runner outside
-the VPS.
+Run external workflows only in a low-traffic maintenance window; origin-side
+fixture preparation, observation and exact cleanup remain separate from the
+GitHub-hosted HTTP client described above.
 
 The selected Ready Vote profile measures real vote POST contention after the
 server-known window. It reports accepted/rejected votes, response latency,
@@ -560,9 +554,7 @@ ownership scope recorded for that run. Any malformed marker match or ownership
 outside the manifest remains a fail-closed cleanup error; this recovery never
 broadens deletion to a generic historical search.
 
-The cleanup command also disposes its async database engine in the same event
-loop as validation/deletion; cross-loop asyncpg errors in a successful cleanup
-log are treated as a regression and must not be ignored.
+The cleanup command delegates disposal and zero-residual read-model checks to the [retained-load cleanup contract](#retained-load-cleanup-and-hermetic-web-verification); cross-loop asyncpg or Redis disposal errors in a successful cleanup log are a regression and must not be ignored.
 
 When the external load completes, clean only the exact load workflow run:
 
@@ -575,15 +567,13 @@ gh workflow run platform-production-retained-load-cleanup.yml \
 gh run watch <cleanup-run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The cleanup supervisor holds the same host lock as the load, validates the
-selected run's summary and ownership against production markers, deletes only
-the exact fixture graph, verifies zero remaining fixture users, tournaments,
-sessions and audit rows, and only then removes the VPS report directory and
-matching external export directory. A failed cleanup keeps the data and report
-directory in place for operator recovery; do not run broad cleanup against
-production. A durable cleaned row permits exact-ID artifact-only removal after
-provenance, empty-fixture and root ownership/mode/symlink revalidation; mixed
-state fails closed.
+The cleanup supervisor holds the load's host lock, validates its summary and
+production ownership, then delegates exact fixture/database/Redis checks to
+the [retained-load cleanup contract](#retained-load-cleanup-and-hermetic-web-verification)
+before removing matching report/export directories. Failed cleanup retains
+data and reports for recovery; never run broad production cleanup. A durable
+cleaned row permits exact-ID artifact removal only after provenance, empty-
+fixture and root ownership/mode/symlink revalidation; mixed state fails closed.
 
 The external-load workflow always invokes this supervisor, even when the filesystem run root is missing. In that case it uses the durable `PreprodTestRun` orphan path; a missing directory is not proof that the database fixture is absent.
 

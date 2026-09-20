@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -41,25 +42,86 @@ WEB_PROFILE_NAMES = frozenset(
     }
 )
 
+PUBLIC_ERROR_CLASSES = frozenset(
+    {
+        "none",
+        "argument",
+        "cloudflare_fetch",
+        "nginx_input",
+        "ufw_command",
+        "baseline",
+        "policy",
+        "internal",
+    }
+)
+
+
+class EdgePolicyError(RuntimeError):
+    """Validation failure with a closed, public error classification."""
+
+    def __init__(self, message: str, *, error_class: str) -> None:
+        super().__init__(message)
+        self.error_class = (
+            error_class
+            if isinstance(error_class, str) and error_class in PUBLIC_ERROR_CLASSES
+            else "internal"
+        )
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    """Reject malformed operator input without echoing the input value."""
+
+    def error(self, _message: str) -> None:
+        raise EdgePolicyError(
+            "Edge policy arguments are invalid.",
+            error_class="argument",
+        )
+
 
 def desired_ranges(timeout: float) -> set[str]:
-    ipv4 = parse_ranges(fetch_text(IPV4_URL, timeout), 4)
-    ipv6 = parse_ranges(fetch_text(IPV6_URL, timeout), 6)
+    try:
+        ipv4 = parse_ranges(fetch_text(IPV4_URL, timeout), 4)
+        ipv6 = parse_ranges(fetch_text(IPV6_URL, timeout), 6)
+    except Exception:
+        raise EdgePolicyError(
+            "Cloudflare range data is unavailable or invalid.",
+            error_class="cloudflare_fetch",
+        ) from None
     return {str(network) for network in (*ipv4, *ipv6)}
 
 
 def nginx_ranges(path: Path) -> set[str]:
     if not path.is_file() or path.is_symlink():
-        raise RuntimeError(f"Nginx Cloudflare include is missing or unsafe: {path}")
+        raise EdgePolicyError(
+            "Nginx Cloudflare include is missing or unsafe.",
+            error_class="nginx_input",
+        )
     ranges: set[str] = set()
-    for raw_line in path.read_text(encoding="ascii").splitlines():
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError):
+        raise EdgePolicyError(
+            "Nginx Cloudflare include cannot be read.",
+            error_class="nginx_input",
+        ) from None
+    for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         prefix = "set_real_ip_from "
         if not line.startswith(prefix) or not line.endswith(";"):
-            raise RuntimeError("Nginx Cloudflare include contains an unexpected directive.")
-        ranges.add(str(ipaddress.ip_network(line[len(prefix):-1].strip(), strict=True)))
+            raise EdgePolicyError(
+                "Nginx Cloudflare include contains an unexpected directive.",
+                error_class="nginx_input",
+            )
+        try:
+            network = ipaddress.ip_network(line[len(prefix) : -1].strip(), strict=True)
+        except ValueError:
+            raise EdgePolicyError(
+                "Nginx Cloudflare include contains an invalid range.",
+                error_class="nginx_input",
+            ) from None
+        ranges.add(str(network))
     return ranges
 
 
@@ -115,19 +177,27 @@ def ufw_ranges(
         if not web_ports:
             continue
         if "Anywhere" in line:
-            raise RuntimeError("UFW contains a broad public HTTP/S rule.")
+            raise EdgePolicyError(
+                "UFW contains a broad public HTTP/S rule.",
+                error_class="policy",
+            )
         if MANAGED_COMMENT not in line:
-            raise RuntimeError(
-                "UFW contains an unmanaged inbound HTTP/S rule: " f"{line.strip()}"
+            raise EdgePolicyError(
+                "UFW contains an unmanaged inbound HTTP/S rule.",
+                error_class="policy",
             )
         networks = _rule_networks(line)
         if len(networks) != 1:
-            raise RuntimeError(
-                "Managed UFW HTTP/S rules must name exactly one source network."
+            raise EdgePolicyError(
+                "Managed UFW HTTP/S rules must name exactly one source network.",
+                error_class="policy",
             )
         network = next(iter(networks))
         if network not in desired:
-            raise RuntimeError(f"UFW contains an unexpected managed range: {network}")
+            raise EdgePolicyError(
+                "UFW contains an unexpected managed range.",
+                error_class="policy",
+            )
         ranges.add(network)
         for port in web_ports:
             web_rules.setdefault((network, port), []).append(line)
@@ -135,19 +205,26 @@ def ufw_ranges(
         for port in WEB_PORTS:
             matching = web_rules.get((network, port), [])
             if len(matching) != 1:
-                raise RuntimeError(
-                    f"UFW must contain exactly one managed {port}/tcp rule for {network}."
+                raise EdgePolicyError(
+                    f"UFW must contain exactly one managed {port}/tcp rule.",
+                    error_class="policy",
                 )
     return ranges
 
 
 def run_ufw(ufw_bin: str, *arguments: str) -> str:
-    completed = subprocess.run(
-        [ufw_bin, *arguments],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            [ufw_bin, *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise EdgePolicyError(
+            "UFW command failed.",
+            error_class="ufw_command",
+        ) from None
     return completed.stdout
 
 
@@ -175,13 +252,19 @@ def ufw_profile_ports(ufw_bin: str) -> dict[str, set[int]]:
 
 def validate_ufw_baseline(status: str) -> None:
     if "Status: active" not in status:
-        raise RuntimeError("UFW must be active for production edge validation.")
+        raise EdgePolicyError(
+            "UFW must be active for production edge validation.",
+            error_class="baseline",
+        )
     if "Default: deny (incoming)" not in status:
-        raise RuntimeError("UFW incoming policy must default to deny.")
+        raise EdgePolicyError(
+            "UFW incoming policy must default to deny.",
+            error_class="baseline",
+        )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = _SafeArgumentParser(
         description="Read-only Cloudflare/Nginx/UFW range parity proof."
     )
     parser.add_argument("--nginx-include", type=Path, default=DEFAULT_NGINX_INCLUDE)
@@ -192,45 +275,104 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
-    if args.timeout <= 0 or args.timeout > 60:
-        raise ValueError("--timeout must be greater than zero and at most 60 seconds.")
-    desired = desired_ranges(args.timeout)
-    nginx = nginx_ranges(args.nginx_include)
-    if nginx != desired:
-        raise RuntimeError(
-            f"Nginx Cloudflare range parity failed: expected={len(desired)} actual={len(nginx)}."
+    desired_count = 0
+    nginx_count = 0
+    ufw_count = 0
+    args = argparse.Namespace(as_json="--json" in sys.argv[1:])
+    try:
+        args = parse_args()
+        if (
+            not math.isfinite(args.timeout)
+            or args.timeout <= 0
+            or args.timeout > 60
+        ):
+            raise EdgePolicyError(
+                "Edge policy timeout is outside the allowed range.",
+                error_class="argument",
+            )
+        desired = desired_ranges(args.timeout)
+        desired_count = len(desired)
+        nginx = nginx_ranges(args.nginx_include)
+        nginx_count = len(nginx)
+        if nginx != desired:
+            raise EdgePolicyError(
+                "Nginx Cloudflare range parity failed.",
+                error_class="policy",
+            )
+        validate_ufw_baseline(run_ufw(args.ufw_bin, "status", "verbose"))
+        ufw = ufw_ranges(
+            run_ufw(args.ufw_bin, "status", "numbered"),
+            desired,
+            profile_ports=ufw_profile_ports(args.ufw_bin),
         )
-    validate_ufw_baseline(run_ufw(args.ufw_bin, "status", "verbose"))
-    ufw = ufw_ranges(
-        run_ufw(args.ufw_bin, "status", "numbered"),
-        desired,
-        profile_ports=ufw_profile_ports(args.ufw_bin),
-    )
-    if ufw != desired:
-        raise RuntimeError(
-            f"UFW Cloudflare range parity failed: expected={len(desired)} actual={len(ufw)}."
+        ufw_count = len(ufw)
+        if ufw != desired:
+            raise EdgePolicyError(
+                "UFW Cloudflare range parity failed.",
+                error_class="policy",
+            )
+    except EdgePolicyError as exc:
+        error_class = exc.error_class
+        result = {
+            "schema": 1,
+            "ok": False,
+            "status": "failed",
+            "error_class": error_class,
+            "cloudflare_ranges": desired_count,
+            "nginx_ranges": nginx_count,
+            "ufw_ranges": ufw_count,
+            "read_only": True,
+        }
+        if args.as_json:
+            print(json.dumps(result, sort_keys=True))
+        print(
+            "EDGE_POLICY status=failed "
+            f"error_class={error_class} cloudflare_ranges={desired_count} "
+            f"nginx_ranges={nginx_count} ufw_ranges={ufw_count}",
+            file=sys.stderr,
         )
+        return 1
+    except Exception:
+        result = {
+            "schema": 1,
+            "ok": False,
+            "status": "failed",
+            "error_class": "internal",
+            "cloudflare_ranges": desired_count,
+            "nginx_ranges": nginx_count,
+            "ufw_ranges": ufw_count,
+            "read_only": True,
+        }
+        if args.as_json:
+            print(json.dumps(result, sort_keys=True))
+        print(
+            "EDGE_POLICY status=failed "
+            f"error_class=internal cloudflare_ranges={desired_count} "
+            f"nginx_ranges={nginx_count} ufw_ranges={ufw_count}",
+            file=sys.stderr,
+        )
+        return 1
+
     result = {
+        "schema": 1,
         "ok": True,
-        "cloudflare_ranges": len(desired),
-        "nginx_ranges": len(nginx),
-        "ufw_ranges": len(ufw),
+        "status": "passed",
+        "error_class": "none",
+        "cloudflare_ranges": desired_count,
+        "nginx_ranges": nginx_count,
+        "ufw_ranges": ufw_count,
         "read_only": True,
     }
     if args.as_json:
         print(json.dumps(result, sort_keys=True))
     else:
         print(
-            "Cloudflare/Nginx/UFW parity passed: "
-            f"ranges={len(desired)}; read_only=true."
+            "EDGE_POLICY status=passed error_class=none "
+            f"cloudflare_ranges={desired_count} nginx_ranges={nginx_count} "
+            f"ufw_ranges={ufw_count}"
         )
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as exc:
-        print(f"Edge policy validation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+    raise SystemExit(main())

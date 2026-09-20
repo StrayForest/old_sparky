@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import type { Page, Route } from "@playwright/test";
+import type { Page, Route, TestInfo } from "@playwright/test";
 import { validateLiveQaOrigin } from "../support/live-qa-origin";
 
 async function authenticateTestUser(page: Page, extraCookies: Array<{ name: string; value: string }> = []) {
@@ -22,6 +22,65 @@ async function expectNoHorizontalOverflow(page: Page) {
 
 function expectOriginOnlyAuthRequest(route: Route) {
   expect(route.request().headers()["x-csrf-token"]).toBeUndefined();
+}
+
+function isNextPrefetchRequest(route: Route): boolean {
+  const headers = route.request().headers();
+  return headers["next-router-prefetch"] === "1"
+    || headers["next-router-segment-prefetch"] === "1"
+    || headers.purpose === "prefetch";
+}
+
+function ssrCountScope(testInfo: TestInfo): string {
+  return [
+    testInfo.project.name,
+    testInfo.testId,
+    testInfo.repeatEachIndex,
+    testInfo.workerIndex,
+    testInfo.retry,
+  ].join("-").replace(/[^A-Za-z0-9_-]/gu, "_");
+}
+
+async function resetSsrRequestCounts(page: Page, scope: string) {
+  const response = await page.request.post(
+    "http://127.0.0.1:3199/__test/request-count/reset",
+    { params: { scope } }
+  );
+  expect(response.ok()).toBe(true);
+}
+
+async function readSsrRequestCount(page: Page, scope: string, path: string): Promise<number> {
+  const response = await page.request.get(
+    "http://127.0.0.1:3199/__test/request-count",
+    { params: { path, scope } }
+  );
+  expect(response.ok()).toBe(true);
+  return (await response.json()).count as number;
+}
+
+async function expectRobotsTag(page: Page, expected: RegExp | null) {
+  const robots = page.locator('meta[name="robots"]');
+  await expect(robots).toHaveCount(expected ? 1 : 0);
+  if (expected) {
+    await expect(robots).toHaveAttribute("content", expected);
+  }
+}
+
+async function expectRawRobots(
+  page: Page,
+  path: string,
+  expectedStatus: number,
+  expectedRobots: RegExp | null,
+) {
+  const response = await page.request.get(path);
+  expect(response.status()).toBe(expectedStatus);
+  const html = await response.text();
+  const robotsTags = html.match(/<meta\b[^>]*\bname=["']robots["'][^>]*>/giu) ?? [];
+  expect(robotsTags).toHaveLength(expectedRobots ? 1 : 0);
+  if (expectedRobots) {
+    const content = robotsTags[0]?.match(/\bcontent=["']([^"']+)["']/iu)?.[1] ?? "";
+    expect(content).toMatch(expectedRobots);
+  }
 }
 
 async function trackCsrfTokenRequests(page: Page) {
@@ -378,22 +437,32 @@ for (const route of routes) {
 }
 
 test("public navigation does not prefetch auth documents or Turnstile", async ({ page }) => {
-  const forbiddenRequests: string[] = [];
-  page.on("request", (request) => {
-    const parsed = new URL(request.url());
+  let forbiddenRequestCount = 0;
+  await page.route("**/*", async (route) => {
+    const parsed = new URL(route.request().url());
     if (
       parsed.hostname === "challenges.cloudflare.com"
-      || ["/auth/login", "/auth/register"].includes(parsed.pathname)
+      || [
+        "/auth/login",
+        "/auth/register",
+        "/platform-ops",
+        "/profile/me",
+        "/reset-password",
+        "/tournaments/new"
+      ].includes(parsed.pathname)
     ) {
-      forbiddenRequests.push(`${request.method()} ${parsed.origin}${parsed.pathname}`);
+      forbiddenRequestCount += 1;
+      await route.abort();
+      return;
     }
+    await route.continue();
   });
 
   await page.goto("/");
   await expect(page.getByRole("banner").getByRole("link", { name: "Войти", exact: true })).toBeVisible();
-  await page.waitForTimeout(1_000);
+  await page.waitForLoadState("networkidle");
 
-  expect(forbiddenRequests).toEqual([]);
+  expect(forbiddenRequestCount).toBe(0);
 });
 
 test("site footer exposes valid navigation and project attribution", async ({ page }) => {
@@ -487,7 +556,7 @@ test("header marks only the selected tournament navigation item", async ({ page 
 });
 
 test("mobile authenticated header keeps compact icon actions beside the brand", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== "mobile", "Compact authenticated header is owned by the phone viewport.");
+  test.skip(testInfo.project.name !== "mobile-layout", "Compact authenticated header is owned by the phone viewport.");
   await page.setViewportSize({ width: 320, height: 900 });
   await authenticateTestUser(page);
   await page.goto("/tournaments");
@@ -558,16 +627,203 @@ test("legal documents cover Steam identity and optional email", async ({ page },
 });
 
 test("service-only pages use metadata noindex while public profiles stay discoverable", async ({ page }) => {
-  for (const path of ["/auth/login", "/auth/register", "/profile/me", "/tournaments/new", "/tournaments/night-veil-open-5/profiles/u_lisalexy"]) {
+  for (const path of ["/auth/login", "/auth/register", "/profile/me", "/tournaments/new"]) {
     await page.goto(path);
-    const robotsValues = await page.locator('meta[name="robots"]').evaluateAll((elements) => (
-      elements.map((element) => element.getAttribute("content") || "")
-    ));
-    expect(robotsValues.some((content) => /noindex, ?nofollow/u.test(content))).toBe(true);
+    await expectRobotsTag(page, /noindex,? ?nofollow/u);
   }
 
+  for (const path of ["/platform-ops", "/tournaments/night-veil-open-5/profiles/u_lisalexy"]) {
+    await page.goto(path);
+    await expectRobotsTag(page, /^noindex$/u);
+  }
+
+  await authenticateTestUser(page);
+  await page.goto("/tournaments/night-veil-open-5/profiles/u_shadow");
+  await expectRobotsTag(page, /noindex,? ?nofollow/u);
+
   await page.goto("/profile/lisalexy");
-  await expect(page.locator('meta[name="robots"]')).toHaveCount(0);
+  await expectRobotsTag(page, null);
+});
+
+test("non-admin authenticated principal is denied operations access", async ({ page }) => {
+  await page.context().addCookies([
+    {
+      name: "deadlock_platform_session",
+      value: "non-admin-smoke-session",
+      url: "http://127.0.0.1:3100"
+    },
+    {
+      name: "non-admin-principal-smoke",
+      value: "1",
+      url: "http://127.0.0.1:3100"
+    }
+  ]);
+
+  const navigation = await page.goto("/platform-ops");
+  expect(navigation?.status()).toBe(404);
+  await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
+  await expect(page.getByTestId("admin-console")).toHaveCount(0);
+  await expectRobotsTag(page, /^noindex$/u);
+  await expectRawRobots(page, "/platform-ops", 404, /^noindex$/u);
+});
+
+test("notFound routes keep a real 404 during a held slow navigation", async ({ page }) => {
+  await page.goto("/tournaments");
+  await expect(page.getByRole("heading", { name: "Deadlock-турниры", exact: true })).toBeVisible();
+
+  async function navigateWithHeldDocument(path: string) {
+    let releaseNavigation!: () => void;
+    const heldNavigation = new Promise<void>((resolve) => {
+      releaseNavigation = resolve;
+    });
+    const routeHandler = async (route: Route) => {
+      const request = route.request();
+      const requestUrl = new URL(request.url());
+      if (requestUrl.pathname === path && !isNextPrefetchRequest(route)) {
+        await heldNavigation;
+      }
+      await route.continue();
+    };
+    await page.route("**/*", routeHandler);
+    const requestPromise = page.waitForRequest((request) => {
+      const requestUrl = new URL(request.url());
+      const headers = request.headers();
+      return requestUrl.pathname === path
+        && headers["next-router-prefetch"] !== "1"
+        && headers["next-router-segment-prefetch"] !== "1"
+        && headers.purpose !== "prefetch";
+    });
+    const navigationPromise = page.goto(path);
+    try {
+      const request = await requestPromise;
+      expect(request.method()).toBe("GET");
+      // The document request is held before commit. Reading the frame URL is
+      // synchronous here, so this assertion does not auto-wait for the held
+      // navigation like a locator assertion would.
+      expect(page.url()).toMatch(/\/tournaments$/u);
+      releaseNavigation();
+      return await navigationPromise;
+    } finally {
+      releaseNavigation();
+      await navigationPromise.catch(() => undefined);
+      await page.unroute("**/*", routeHandler);
+    }
+  }
+
+  await page.context().addCookies([
+    {
+      name: "deadlock_platform_session",
+      value: "slow-navigation-session",
+      url: "http://127.0.0.1:3100"
+    },
+    {
+      name: "private-profile-missing-smoke",
+      value: "1",
+      url: "http://127.0.0.1:3100"
+    }
+  ]);
+  const missingProfile = await navigateWithHeldDocument(
+    "/tournaments/night-veil-open-5/profiles/u_shadow",
+  );
+  expect(missingProfile?.status()).toBe(404);
+  await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
+  await expectRobotsTag(page, /^noindex$/u);
+
+  await page.goto("/tournaments");
+  await expect(page.getByRole("heading", { name: "Deadlock-турниры", exact: true })).toBeVisible();
+  await page.context().addCookies([{
+    name: "non-admin-principal-smoke",
+    value: "1",
+    url: "http://127.0.0.1:3100"
+  }]);
+  const deniedOperations = await navigateWithHeldDocument("/platform-ops");
+  expect(deniedOperations?.status()).toBe(404);
+  await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
+  await expect(page.getByTestId("admin-console")).toHaveCount(0);
+  await expectRobotsTag(page, /^noindex$/u);
+});
+
+test("unknown tournament slugs return a real 404 and noindex on initial navigation", async ({ page }) => {
+  const path = "/tournaments/unknown-tournament-slug-smoke";
+  const navigation = await page.goto(path);
+  expect(navigation?.status()).toBe(404);
+  await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
+  await expectRobotsTag(page, /^noindex$/u);
+  await expectRawRobots(page, path, 404, /^noindex$/u);
+});
+
+test("unknown tournament detail and bracket stay 404 while the API is delayed", async ({ page }) => {
+  await page.context().addCookies([{
+    name: "delayed-unknown-tournament-smoke",
+    value: "1",
+    url: "http://127.0.0.1:3100"
+  }]);
+
+  for (const path of [
+    "/tournaments/delayed-unknown-tournament-smoke",
+    "/tournaments/delayed-unknown-tournament-smoke/bracket",
+  ]) {
+    const navigation = await page.goto(path);
+    expect(navigation?.status()).toBe(404);
+    await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
+    await expectRobotsTag(page, /^noindex$/u);
+    await expectRawRobots(page, path, 404, /^noindex$/u);
+  }
+});
+
+test("robots metadata stays singular across hydrated public, private, and missing navigation", async ({ page }) => {
+  await authenticateTestUser(page);
+  await page.goto("/profile/lisalexy");
+  await expectRobotsTag(page, null);
+  await expectRawRobots(page, "/profile/lisalexy", 200, null);
+
+  await page.getByRole("banner").getByRole("link", { name: "Турниры", exact: true }).click();
+  await expect(page).toHaveURL(/\/tournaments$/u);
+  await expectRobotsTag(page, null);
+  await expectRawRobots(page, "/tournaments", 200, null);
+
+  await page.getByRole("main").getByRole("link", { name: "Открыть турнир: Night Veil Open #5", exact: true }).click();
+  await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5$/u);
+  await expectRobotsTag(page, null);
+  await expectRawRobots(page, "/tournaments/night-veil-open-5", 200, null);
+
+  await page.getByRole("button", { name: "Состав" }).first().click();
+  await page.getByRole("row").filter({ hasText: "ShadowHawk" }).getByRole("link", { name: "Профиль" }).click();
+  await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5\/profiles\/u_shadow$/u);
+  await expect(page.getByRole("heading", { name: "ShadowHawk" })).toBeVisible();
+  await expectRobotsTag(page, /noindex,? ?nofollow/u);
+  await expectRawRobots(page, "/tournaments/night-veil-open-5/profiles/u_shadow", 200, /noindex,? ?nofollow/u);
+
+  await page.getByRole("link", { name: "Назад к турниру", exact: true }).click();
+  await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5$/u);
+  await expectRobotsTag(page, null);
+
+  await page.context().addCookies([{
+    name: "private-profile-missing-smoke",
+    value: "1",
+    url: "http://127.0.0.1:3100"
+  }]);
+  await page.getByRole("button", { name: "Состав" }).first().click();
+  await page.getByRole("row").filter({ hasText: "ShadowHawk" }).getByRole("link", { name: "Профиль" }).click();
+  await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5\/profiles\/u_shadow$/u);
+  await expect(page.getByRole("banner")).toHaveCount(1);
+  await expectRobotsTag(page, /^noindex$/u);
+  await expectRawRobots(page, "/tournaments/night-veil-open-5/profiles/u_shadow", 404, /^noindex$/u);
+
+  await page.getByRole("link", { name: "На главную", exact: true }).click();
+  await expect(page).toHaveURL(/\/$/u);
+  await expectRobotsTag(page, null);
+  await expectRawRobots(page, "/", 200, null);
+
+  // Keep the authenticated header mounted while removing the cookie. This
+  // exercises the same soft-navigation boundary an expired session uses.
+  await page.context().clearCookies({ name: "deadlock_platform_session" });
+  await page.getByRole("banner").getByRole("link", { name: "Operations", exact: true }).click();
+  await expect(page).toHaveURL(/\/platform-ops$/u);
+  await expect(page.getByRole("heading", { name: "404", exact: true })).toBeVisible();
+  await expect(page.getByRole("banner")).toHaveCount(1);
+  await expectRobotsTag(page, /^noindex$/u);
+  await expectRawRobots(page, "/platform-ops", 404, /^noindex$/u);
 });
 
 test("site pages keep the same space between hero and working area", async ({ page }, testInfo) => {
@@ -712,7 +968,8 @@ test("authenticated header stays resolved across client navigation without a bro
 });
 
 test("authenticated tournament keeps header SSR and defers one workspace request to the browser", async ({ page }, testInfo) => {
-  const ssrCountScope = testInfo.project.name;
+  const countScope = ssrCountScope(testInfo);
+  await resetSsrRequestCounts(page, countScope);
   let browserWorkspaceRequests = 0;
   page.on("request", (request) => {
     if (new URL(request.url()).pathname === "/api/v1/tournaments/night-veil-open-5/workspace") {
@@ -732,7 +989,7 @@ test("authenticated tournament keeps header SSR and defers one workspace request
     },
     {
       name: "ssr-count-scope",
-      value: ssrCountScope,
+      value: countScope,
       url: "http://127.0.0.1:3100",
     },
   ]);
@@ -740,15 +997,9 @@ test("authenticated tournament keeps header SSR and defers one workspace request
   await page.goto("/tournaments/night-veil-open-5");
   await expect(page.getByRole("heading", { name: "Night Veil Open #5", level: 1 })).toBeVisible();
 
-  const bootstrapCount = await page.request
-    .get(`http://127.0.0.1:3199/__test/request-count?path=%2Fapi%2Fv1%2Fauth%2Fbootstrap&scope=${ssrCountScope}`)
-    .then(async (response) => (await response.json()).count as number);
-  const usersMeCount = await page.request
-    .get(`http://127.0.0.1:3199/__test/request-count?path=%2Fapi%2Fv1%2Fusers%2Fme&scope=${ssrCountScope}`)
-    .then(async (response) => (await response.json()).count as number);
-  const workspaceCount = await page.request
-    .get(`http://127.0.0.1:3199/__test/request-count?path=%2Fapi%2Fv1%2Ftournaments%2Fnight-veil-open-5%2Fworkspace&scope=${ssrCountScope}`)
-    .then(async (response) => (await response.json()).count as number);
+  const bootstrapCount = await readSsrRequestCount(page, countScope, "/api/v1/auth/bootstrap");
+  const usersMeCount = await readSsrRequestCount(page, countScope, "/api/v1/users/me");
+  const workspaceCount = await readSsrRequestCount(page, countScope, "/api/v1/tournaments/night-veil-open-5/workspace");
 
   expect(bootstrapCount).toBeGreaterThanOrEqual(1);
   expect(usersMeCount).toBe(0);
@@ -817,7 +1068,7 @@ test("tournament filters and profile actions do not overflow a mobile viewport",
 });
 
 test("mobile empty tournament result is centered vertically", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== "mobile", "Mobile empty-state geometry is covered once.");
+  test.skip(testInfo.project.name !== "mobile-layout", "Mobile empty-state geometry is covered once.");
   await page.goto("/tournaments");
   await page.getByTestId("tournament-search-filter").fill("no-such-tournament-2026");
 
@@ -839,7 +1090,7 @@ test("mobile empty tournament result is centered vertically", async ({ page }, t
 });
 
 test("mobile profile banners show their complete descriptions", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== "mobile", "Mobile profile banner clipping is covered once.");
+  test.skip(testInfo.project.name !== "mobile-layout", "Mobile profile banner clipping is covered once.");
   await authenticateTestUser(page);
   await page.goto("/profile/me");
 
@@ -1529,7 +1780,7 @@ test("tournament cards keep compact and evenly aligned metadata", async ({ page 
 });
 
 test("mobile tournament metadata keeps limits together and the organizer last", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== "mobile", "Mobile metadata geometry is owned by the phone viewport.");
+  test.skip(testInfo.project.name !== "mobile-layout", "Mobile metadata geometry is owned by the phone viewport.");
   await page.setViewportSize({ width: 320, height: 900 });
   await page.route("**/api/v1/tournaments**", async (route) => {
     const url = new URL(route.request().url());
@@ -2418,7 +2669,7 @@ test("create tournament form uses organizer defaults and tournament limits", asy
 });
 
 test("mobile tournament creation ends with checklist, preview, and submit panel", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== "mobile", "Mobile creation order and compact schedule are covered once.");
+  test.skip(testInfo.project.name !== "mobile-layout", "Mobile creation order and compact schedule are covered once.");
   await authenticateTestUser(page);
   await page.goto("/tournaments/new");
 
@@ -3909,9 +4160,34 @@ test("active team commitment warns before formation and becomes generic afterwar
 });
 
 test("tournament detail switches opponent roster panel and returns to team list", async ({ page }, testInfo) => {
+  const countScope = ssrCountScope(testInfo);
+  await resetSsrRequestCounts(page, countScope);
+  const privateProfilePath = "/tournaments/night-veil-open-5/profiles/u_shadow";
+  let privateProfilePrefetchRequests = 0;
+  let privateProfileNavigationRequests = 0;
+  await page.route("**/tournaments/night-veil-open-5/profiles/u_shadow**", async (route) => {
+    const requestUrl = new URL(route.request().url());
+    if (requestUrl.pathname === privateProfilePath) {
+      if (isNextPrefetchRequest(route)) {
+        privateProfilePrefetchRequests += 1;
+        await route.abort();
+        return;
+      }
+      privateProfileNavigationRequests += 1;
+    }
+    await route.continue();
+  });
   await page.context().addCookies([{
     name: "deadlock_platform_session",
     value: "team-member-smoke",
+    url: "http://127.0.0.1:3100"
+  }, {
+    name: "ssr-bootstrap-profile-smoke",
+    value: "1",
+    url: "http://127.0.0.1:3100"
+  }, {
+    name: "ssr-count-scope",
+    value: countScope,
     url: "http://127.0.0.1:3100"
   }]);
   await page.goto("/tournaments/night-veil-open-5");
@@ -3986,6 +4262,13 @@ test("tournament detail switches opponent roster panel and returns to team list"
   await expect(shadowHawkRow).toBeVisible();
   const shadowProfileLink = shadowHawkRow.getByRole("link", { name: "Профиль" });
   await expect(shadowProfileLink).toHaveAttribute("href", "/tournaments/night-veil-open-5/profiles/u_shadow");
+  expect(privateProfilePrefetchRequests).toBe(0);
+  expect(privateProfileNavigationRequests).toBe(0);
+  expect(await readSsrRequestCount(
+    page,
+    countScope,
+    "/api/v1/tournaments/night-veil-open-5/profiles/u_shadow",
+  )).toBe(0);
   const opponentProfileControlBox = await shadowProfileLink.boundingBox();
   expect(opponentProfileControlBox?.width).toBeCloseTo(104, 0);
   expect(opponentProfileControlBox?.height).toBeCloseTo(32, 0);
@@ -3993,7 +4276,14 @@ test("tournament detail switches opponent roster panel and returns to team list"
   await shadowProfileLink.click();
   await expect(page).toHaveURL(/\/tournaments\/night-veil-open-5\/profiles\/u_shadow$/);
   await expect(page.getByRole("heading", { name: "ShadowHawk" })).toBeVisible();
+  expect(privateProfilePrefetchRequests).toBe(0);
+  expect(privateProfileNavigationRequests).toBe(1);
   await expect(page.getByText("shadowhawk@example.test")).toBeVisible();
+  expect(await readSsrRequestCount(
+    page,
+    countScope,
+    "/api/v1/tournaments/night-veil-open-5/profiles/u_shadow",
+  )).toBe(1);
   await expect(page.locator(".public-profile-rank img")).toHaveAttribute("src", /Oracle\.webp/);
   await expect(page.locator(".public-profile-rank")).toContainText("Oracle V");
   await expect(page.locator(".public-profile-view")).toBeVisible();

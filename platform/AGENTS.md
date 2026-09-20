@@ -17,7 +17,15 @@
 ## Invariants
 
 - Profile-level Deadlock dream slots are the source of truth.
-- Invite-only reads stay scoped to organizer, participants and admins.
+- Invite-only summary/workspace/participants/matches/bracket GETs may accept a
+  valid nonrevoked/nonexpired bearer invite code for anonymous or retained
+  inactive viewers; the code never grants profile/workflow/manage access or
+  any write. New tournament child routes require explicit bearer allowlist
+  opt-in and regression coverage. Creation, code-status and bearer query paths
+  share one strict 10–24 ASCII-alphanumeric raw-code validator (uppercase
+  canonical form, no lossy cleanup); malformed values fail with a generic
+  `422` before persistence. Conditional bracket responses authorize and
+  rate-limit before ETag comparison, so denied callers never receive `304`.
 - Terminal tournament states freeze organizer match administration.
 - Preserve the active `https://old-sparky.com` domain, secure-cookie and Cloudflare-origin contour unless a reviewed release explicitly changes it.
 - Use release scripts under `tools/`; rollback does not reverse DB migrations automatically.

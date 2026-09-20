@@ -1,5 +1,9 @@
 # Platform performance contract
 
+- Status: Active reference
+- Owner: Platform performance
+- Last reviewed: 2026-09-11
+
 The JSON files in `profiles/` are the only authored canonical load contracts
 (schema 2). `tools/platform_load.py` validates, fingerprints and dispatches
 them; `tools/platform_external_load.py` remains the external HTTP
@@ -12,32 +16,192 @@ outside the active registry and is not selectable by the production workflow.
 
 ## Canonical profiles
 
-| Profile | Category | Scenario |
+| Profile | Class/status | Scenario |
 | --- | --- | --- |
-| `ready-vote-slo-v2` | load/SLO | 500-user human-shaped Ready Vote supported-load contract |
-| `ready-vote-capacity-ramp-v2` | capacity | 20–80 logical Ready Vote actions/s, 30s steady phases |
-| `ready-vote-saturation-ramp-v1` | saturation stress | 80–120 logical Ready Vote actions/s, 30s steady phases |
-| `ready-vote-saturation-ramp-v2` | saturation stress | 120–165 logical Ready Vote actions/s, 30s steady phases |
-| `ready-vote-saturation-ramp-v3` | saturation stress | 105–120 logical Ready Vote actions/s, 30s steady phases |
-| `ready-vote-saturation-ramp-v4` | saturation stress | 120–135 logical Ready Vote actions/s, 30s steady phases |
-| `ready-vote-stress-15k-v2` | stress | 15,000-user aggressive Ready Vote behavior test |
-| `ready-vote-stress-20k-v2` | stress | Optional 20,000-user unresolved-question stress test |
-| `ready-vote-spike-v1` | spike | Normal → burst → normal with recovery phases |
-| `read-mix-human-v2` | load | 500-user human-shaped authenticated reads |
-| `read-mix-stress-v2` | stress | 20,000-user authenticated reads and conditional reloads |
-| `read-mix-concurrency-ramp-v1` | stress diagnostic | Full read mix at c16/c32/c48/c64/c80/c96/c112/c128 |
-| `tournament-lifecycle-slo-v1` | load/SLO | 20 tournaments × 500 users through completed bracket |
-| `tournament-lifecycle-scale-v1` | stress | Concurrent multi-tournament lifecycle waves |
-| `tournament-lifecycle-capacity-v1` | capacity | Lifecycle capacity contour using the QA harness |
+| `ready-vote-slo-v2` | default/active | 500-user human-shaped Ready Vote supported-load contract |
+| `ready-vote-capacity-ramp-v2` | default/active | 20–80 logical Ready Vote actions/s, 30s steady phases |
+| `ready-vote-saturation-ramp-v1` | diagnostic/deprecated | 80–120 logical Ready Vote actions/s; retained evidence only |
+| `ready-vote-saturation-ramp-v2` | diagnostic/deprecated | 120–165 logical Ready Vote actions/s; retained evidence only |
+| `ready-vote-saturation-ramp-v3` | diagnostic/deprecated | 105–120 logical Ready Vote actions/s; retained evidence only |
+| `ready-vote-saturation-ramp-v4` | diagnostic/active | 120–135 logical Ready Vote actions/s, 30s steady phases |
+| `ready-vote-stress-15k-v2` | default/active | 15,000-user aggressive Ready Vote behavior test |
+| `ready-vote-stress-20k-v2` | diagnostic/active | Optional 20,000-user unresolved-question stress test |
+| `ready-vote-spike-v1` | default/active | Normal → burst → normal with recovery phases |
+| `read-mix-human-v2` | default/active | 500-user human-shaped authenticated reads |
+| `read-mix-stress-v2` | default/active | 20,000-user authenticated reads and conditional reloads |
+| `read-mix-concurrency-ramp-v1` | diagnostic/active | Full read mix at c16/c32/c48/c64/c80/c96/c112/c128 |
+| `authenticated-page-load-v1` | default/active | Full authenticated Next.js tournament HTML control |
+| `authenticated-page-load-v2` | diagnostic/active | HTTP/1.1 keep-alive transport comparison |
+| `tournament-lifecycle-slo-v1` | diagnostic/replacement-needed | Retained lifecycle SLO shape; not dispatchable until QA profile binding exists |
+| `tournament-lifecycle-scale-v1` | diagnostic/replacement-needed | Retained lifecycle waves; not dispatchable until QA profile binding exists |
+| `tournament-lifecycle-capacity-v1` | diagnostic/replacement-needed | Lifecycle capacity contour using the QA harness |
+
+The current source portfolio contains 11 active profiles that are dispatchable
+through the production external-load workflow, three diagnostic profiles that
+are deprecated and retained for historical interpretation, and three
+diagnostic lifecycle profiles marked `replacement-needed`. The deprecated
+profiles remain listable but are not runnable; lifecycle profiles remain
+QA/preproduction-only and non-dispatchable until their profile/digest binding
+is integrated. Derive this portfolio from the executable
+[profile registry](../tools/platform_load.py)
+and the reviewed [production workflow choices](../../.github/workflows/platform-production-external-load.yml),
+not from retained report counts.
 
 Each profile owns its versioned fixture shape, setup concurrency, offered
 logical actions, HTTP concurrency, spread, timeout, retry policy, expected
 statuses, correctness requirements, latency/failure/resource budgets and exact
-cleanup contour. Its SHA-256 digest is recorded with every retained result.
+cleanup contour. The portfolio block additionally records owner, hypothesis,
+class/status, cadence, environment, request/cost budget and last accepted
+evidence. Deprecated profiles remain for interpreting old reports but are
+blocked by the runner; only active profiles are runnable. Its SHA-256 digest is
+recorded with every retained result.
 
-The tournament-lifecycle profiles are executed only by
+The external runner preserves schema-1 report fields and adds measurement
+schema 2. Compatibility `latency` remains service latency; the additive timing
+block reports schedule/enqueue/actual start/completion, executor queue wait,
+late starts, user-observed latency, actual arrival, goodput and dropped work.
+Acceptance requires explicit user-observed latency for every budgeted logical
+population; service or accepted-request latency cannot substitute for a
+missing/slow schedule-to-completion measurement, so executor saturation
+cannot hide coordinated-omission-like delay.
+
+Ready Vote reports always materialize the configured duplicate phase, including
+when its count is zero. Stress/spike duplicates are selected only from primary
+actions that reached the service; if that leaves fewer candidates than the
+configured count, the report retains the configured `expected_count`, records
+`missing_actions`, marks the phase incomplete and cannot pass acceptance.
+Primary and duplicate logical actions and HTTP attempts are included in the
+top-level acceptance aggregates, while the per-phase summaries retain their
+individual shedding, retry and completion evidence.
+
+For capacity and spike profiles, the evaluator binds phase names and order to
+the selected profile's authored plan, including each phase's configured rate,
+duration and logical action count. Missing, extra, reordered or partial phases
+fail closed. Ready Vote duplicate evidence is always materialized and must
+match configured, submitted, completed and missing action counts exactly;
+`complete=false` is never a passing duplicate result. Every non-empty authored
+phase, including the duplicate phase, is independently checked against its
+accepted-request and user-observed latency, retry-amplification, shedding and
+measured successful-goodput budgets. Aggregate percentages cannot hide a
+single phase that shed or retried its entire population.
+
+Read-mix and authenticated page-load profiles do not use an authored rate
+phase array; their strict plan is derived from the profile contract's named
+phase populations (`read_mix`, optional `manual_refresh`, or
+`authenticated_page_load`) and exact planned action counts. Their producer
+summaries must contain those phases in the same order, with complete logical
+and raw timing boundaries. The authoritative `evaluate` boundary applies the
+profile dispatchability gate first, so deprecated, replacement-needed and
+lifecycle evidence remains inspectable but can only be retained as
+non-authoritative evidence.
+
+The evaluator also recomputes every logical and raw-HTTP outcome from strict
+integer counters: successes plus failures must equal actions, successful
+responses plus errors must equal requests, and the reported failure rate must
+match that recomputation. A producer's string `contract_ok`, reported rate,
+or total-RPS value is never trusted. Read-mix and authenticated page-load
+reports bind their primary population and total logical work to the selected
+profile, including every concurrency stage and manual refresh. Ready Vote
+reports additionally require one exact raw state-read per planned tournament,
+typed authoritative `ready_count` evidence, and a duplicate outcome
+distribution with zero state-changing responses. Each phase's raw request
+count must reconcile with its logical/timing population; dispatcher-added
+runtime HTTP budget fields are allowlisted but revalidated against the
+profile during `evaluate`.
+
+The acceptance normalizer treats logical-action and raw-HTTP summaries as
+different closed-world envelopes. A logical envelope cannot satisfy a raw
+request population (or the reverse), and every canonical envelope carries a
+measured successful-goodput value that equals `successful outcomes / measured
+wall or completion window` within serialization tolerance. Zero successes can
+therefore never claim positive goodput. Raw retry attempts must satisfy
+`raw_requests = base_logical_actions + retry_attempts`, match logical
+`total_retries`, and stay within the selected retry bound. Raw overload counts,
+overload rates and unexpected-status counts are recomputed from the raw error
+population before shedding budgets are applied. Phase keys and authored
+populations are exact; unknown keys, duplicate JSON object members,
+non-finite/negative numeric budgets, and mismatched nested timing populations
+fail closed before a PASS can be emitted.
+
+The canonical `platform_load.py evaluate` step accepts only a report bound to
+the selected profile and the current external workflow. It requires report
+schema/measurement/timing versions, top-level profile ID/version/digest/mode,
+the complete profile `load_contract` (including profile schema and production
+environment), the checked-out `source_git_sha` (`SOURCE_GIT_SHA`) and the
+current `external_run_id` (`GITHUB_RUN_ID`). Runtime accounting fields added by
+the dispatcher are explicitly allowlisted; authored contract fields are not
+merged or inferred. Missing or mismatched identity is `LOAD REPORT BINDING
+FAIL`. Historical schema-1 reports remain retained evidence only and have no
+backward acceptance path.
+
+Canonical `run` and `evaluate` require both explicit `SOURCE_GIT_SHA` and
+numeric `GITHUB_RUN_ID`; the runner never substitutes the local checkout's
+Git HEAD. The standalone `platform_external_load.py` entry point is a
+diagnostic implementation detail: without the explicit canonical binding it
+is non-authoritative, non-dispatchable and cannot emit an acceptance PASS. It
+is not a route into the production workflow.
+
+### Fail-closed timing and observer evidence
+
+Every current request/action timing summary must carry the complete population
+boundary: `expected_count`, `submitted_count`, `completed_count`,
+`scheduled_count`, `started_count`, `actual_request_start_count`,
+`actual_start_count`, `response_completion_count` and `user_observed_count`.
+Those counts must agree, `partial` must be exactly `false`, `dropped_work`
+must be exactly `0`, and missing/invalid timing-context counters must be zero.
+Missing summaries, inconsistent counts, `partial=true`, dropped work or any
+missing timing context fail acceptance closed for every current SLO, stress,
+spike and capacity report; a percentile from a partial population is not a
+passing result. The executable rule is
+[`timing_summary_is_complete`](../tools/platform_load_acceptance.py).
+
+For production external profiles that require exact origin evidence, the
+observer binding's `fixture_marker` and `external_run_id` must match the
+fixture and external workflow run, and it must report `complete=true` before
+acceptance. A missing or empty observer artifact, an observer timeout, or a
+marker/run mismatch fails the run; the
+client report cannot substitute for the required observer. The observer's API
+worker selection is equally fail-closed: it chooses only direct children of
+one unambiguous Gunicorn API master, matches the `oldsparky-api` service UID,
+and binds each worker to its procfs `start_time_ticks` (and parent identity)
+before signalling. Stale/reused PIDs or an ambiguous/restarting tree are not
+profiled. See the [observer implementation](../tools/platform_external_load_observer.py)
+and the [workflow binding check](../../.github/workflows/platform-production-external-load.yml).
+
+CPU-profile files whose PID is not among the workers armed for this observer
+window are ignored for the private authoritative summary, never deleted, and
+remain caller/host retention artifacts. The private observer reports that
+preservation explicitly; unbound profile files are not evidence for this run
+and are not a cleanup error by themselves. Before upload, the
+producer-specific public projection retains only enabled/profile-count and
+numeric aggregate fields, never worker PIDs or identities. Missing required
+observer evidence remains a hard failure.
+
+### Evidence privacy boundary
+
+Load, observer and live-QA reports cross a fixed-schema boundary before they
+are persisted or uploaded. They retain population counts, throughput,
+response/status counts, route classes/templates, numeric timing distributions,
+query IDs plus allowlisted query/backend/wait categories, and bounded CPU/DB/
+Redis/process aggregates. They do not retain control/operator email values,
+tournament slugs, raw URLs/queries, request/diagnostic/correlation IDs, user
+digests, edge IP/location, Cloudflare ray values, cookies, authorization or
+SQL text. Unknown route/error/backend values collapse to `other`; control
+account state is only `control_account_preserved: bool`.
+
+Remote command output is captured in a mode-0600 temporary file, reduced to
+one bounded canonical summary, and deleted before the fixed JSON evidence is
+uploaded. Required load/QA/live artifacts use `if-no-files-found: error` and a
+14-day maximum retention. The raw attempt and logical-action populations,
+accepted latency percentiles, throughput/goodput, status/error classes, pool
+waits, DB wait-state counts, CPU/RSS, and observer completion/binding checks
+remain mandatory acceptance inputs.
+
+The tournament-lifecycle profiles are retained as diagnostic,
+replacement-needed portfolio entries and are executed only by
 `platform_production_qa.py` against the configured QA/preprod origin. They are
-not dispatchable through the external production load client and do not invoke
+explicitly non-dispatchable until that harness records the selected profile ID
+and digest; they do not invoke
 the external 15k/20k workflows. The harness reports each lifecycle phase with
 full HTTP request/success/error/percentile/throughput/goodput/response-byte
 metrics plus the existing system sampler and diagnostic `request_perf` data.
@@ -47,8 +211,9 @@ p50/p90/p95/p99 of 250/400/600/1000 ms, logical p95/p99 of 600/1000 ms,
 final logical failure below 0.5%, and effectively zero overload shedding. A
 capacity ramp reports SLO capacity and maximum stable goodput separately.
 Stress and spike profiles deliberately do not inherit the final-failure SLO;
-they evaluate bounded latency, retry amplification, shedding, origin CPU/DB
-pool/wait evidence, durable correctness and cleanup. A stress result may end
+they evaluate bounded latency, retry amplification, shedding, minimum useful
+goodput, origin CPU/DB pool/wait evidence, durable correctness and cleanup. A
+stress result may end
 with many logical failures and still conclude `STRESS BEHAVIOR PASS`; that is
 not a capacity-target pass.
 
@@ -56,6 +221,8 @@ The capacity runner allocates unique fixture users across rate phases and
 paces each phase for its declared steady duration. The spike runner preserves
 phase boundaries so pressure entry, peak latency, shedding, goodput, retry
 amplification and recovery can be compared instead of hidden in one aggregate.
+Capacity reports explicitly distinguish `experiment_complete` from
+`target_passed`; a complete run with a failed target is not green.
 
 The measured HTTP generator runs only on the GitHub-hosted runner. The
 production origin may prepare marked fixtures, collect lightweight pressure
@@ -94,21 +261,29 @@ is evaluated from the observer's `pg_stat_activity` backend count and grouped
 separate `/proc/net/tcp*` socket diagnostic. Historical reports retain their
 original TCP-based wording and decisions.
 
-## Latest production performance stage
+## Historical production performance stage (2026-09-07)
 
-The 2026-09-07 performance stage is complete with an explicit authenticated
-HTML follow-up. The exact 13-profile repeat used the unchanged contracts and
-thresholds on deployed SHA
+The 2026-09-07 performance stage is closed historical evidence with an
+explicit authenticated HTML follow-up. The exact 13-profile repeat used the
+then-current contracts and thresholds on deployed SHA
 `bba3fb278e348906a6942aee8462b758c3d616ef`; lifecycle profiles remain
 preproduction-only. The full evidence table, run links, change ledger,
 origin-safety results and cleanup proof are in the archived
 [2026-09-07 performance-stage report](../docs/archive/performance-stage-2026-09-07.md).
+Do not treat this matrix as the current portfolio or as evidence that the
+current timing, observer-binding or Redis projection cleanup contract was
+executed.
 
-All 13 profiles passed their declared acceptance and exact cleanup. Backend
+The historical run reported all 13 profiles passing their then-declared
+acceptance and exact cleanup. Backend
 peaks were 51–52 against the 52-backend budget. Normal Ready Vote/read traffic
 had no unexpected statuses, timeouts, 520s or 522s. Stress profiles returned
 only their declared controlled `503` overload responses, while read profiles
 completed their 200/304 contracts without errors or retries.
+That historical cleanup result is preserved as reported; it is not
+retroactively upgraded to proof that the current per-key Redis projection
+cleanup deleted `teams`, `workspace_detail`, `bracket_summary` and
+`bracket_full` with zero residual keys.
 
 The authenticated page returned 20,000/20,000 HTTP 200 responses, with total
 p95 `3357.939 ms` and HTML TTFB p95 `2568.859 ms`. The D9 shell projection is
@@ -228,6 +403,9 @@ read-path changes were then accepted on exact-SHA production evidence:
   and settings/account-security surfaces;
 - the external runner has `read-mix-concurrency-ramp-v1`, which records every
   c16–c128 full-population stage separately;
+  `capacity_ramp` is auxiliary evidence rather than a user-visible phase, but
+  its authored stage keys, order, populations and per-stage budgets are
+  mandatory; missing, altered or unknown auxiliary stages fail closed;
 - `uvloop`/`httptools`, Nginx upstream keepalive, pool sizes 12/16/20/24,
   `pool_pre_ping=false` and authenticated-read admission 32 were isolated
   runtime A/B profiles.
@@ -353,6 +531,10 @@ The production reference was restored from baseline `e70d1e7869e36aa401f6dc9c7fd
 
 Canonical profile fingerprints used for the retained evidence are:
 
+These are historical report digests from before the portfolio metadata block
+was added; current registry digests intentionally differ and must be recorded
+in new reports rather than rewriting retained evidence.
+
 | Profile | Version | SHA-256 |
 | --- | ---: | --- |
 | `ready-vote-slo-v2` | 2 | `c13851df4526bb4e32ddd49b93cf2810cca2da42b19c569a2c2bc7843757543a` |
@@ -372,8 +554,10 @@ p95/p99 was `264.831/639.447 ms`, and the maximum logical latency was
 connections peaked at `23`, and waiters/lock waiters were `0/0`. The SLO
 passed. The first SLO run (`33334438643`) was rejected only because the
 optional slow-request server sample was absent; client-population metrics and
-cleanup were already valid. Missing server pool spans are diagnostic gaps, not
-missing client measurements.
+cleanup were already valid under the historical contract. New exact-bound
+profiles fail closed when a required server pool sample or observer binding is
+absent; historical reports remain interpretable but are not retroactively
+reclassified.
 
 The controlled static-8 capacity ramp (`33335224474`, source `77fd8682`) used
 30-second steady phases at 20, 30, 40, 50, 60, 70 and 80 logical actions/s.

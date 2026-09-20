@@ -29,6 +29,15 @@ EXPECTED_TURNSTILE_DOMAINS = {ZONE_NAME}
 R2_BUCKET_NAME = "oldsparky"
 
 
+class AuditArgumentError(ValueError):
+    """Malformed CLI input without provider/operator text in the error."""
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> None:
+        raise AuditArgumentError("Cloudflare audit arguments are invalid.")
+
+
 @dataclass(frozen=True)
 class ApiResult:
     status: int | None
@@ -42,7 +51,7 @@ class ApiResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _SafeArgumentParser(description=__doc__)
     parser.add_argument(
         "--output",
         default=os.environ.get("CLOUDFLARE_AUDIT_REPORT", "cloudflare-audit-report.json"),
@@ -126,6 +135,245 @@ def add_summary(report: dict[str, Any]) -> None:
     for check in report["checks"]:
         counts[check["status"]] = counts.get(check["status"], 0) + 1
     report["summary"] = counts
+
+
+# The Cloudflare API contains many operator-controlled strings.  Keep the
+# public artifact deliberately boring: its shape and every public string are
+# closed sets.  ``run_audit`` may still collect a private report so that the
+# operator can validate the API responses while the runner is live; only this
+# projector may cross the public-artifact boundary.
+PUBLIC_STATUS = frozenset({"PASS", "FAIL", "REVIEW", "UNAVAILABLE"})
+PUBLIC_ERROR_CLASSES = frozenset(
+    {
+        "none",
+        "auth",
+        "not_found",
+        "api_error",
+        "transport",
+        "invalid_response",
+        "policy",
+        "missing",
+    }
+)
+PUBLIC_RESOURCE_CLASSES = (
+    "zone",
+    "dns",
+    "certificates",
+    "r2",
+    "turnstile",
+    "rulesets",
+    "response_buffering",
+    "bot_management",
+    "token_scope",
+)
+PUBLIC_CHECK_RESOURCES = {
+    "zone-access": "zone",
+    "dns-routing": "dns",
+    "www-canonical-policy": "dns",
+    "caa-decision": "dns",
+    "edge-certificates": "certificates",
+    "certificate-alerts": "certificates",
+    "r2-public-bucket": "r2",
+    "r2-dev-public-access": "r2",
+    "r2-browser-put-cors": "r2",
+    "r2-custom-domain": "r2",
+    "media-token-scope": "token_scope",
+    "turnstile-hostnames": "turnstile",
+    "cache-rules": "rulesets",
+    "managed-and-custom-waf": "rulesets",
+    "managed-waf-entrypoint": "rulesets",
+    "edge-rate-limits": "rulesets",
+    "response-buffering-zone-setting": "response_buffering",
+    "response-body-buffering-rules": "response_buffering",
+    "bot-fight-mode": "bot_management",
+}
+
+
+def _bounded_count(value: Any) -> int:
+    """Return a safe count without copying or exposing an input value."""
+
+    if isinstance(value, (list, tuple, set, frozenset, dict)):
+        return min(len(value), 100_000)
+    if type(value) is int and 0 <= value <= 100_000:
+        return value
+    return 0
+
+
+def _records_count(value: Any) -> int:
+    if not isinstance(value, dict):
+        return 0
+    return min(
+        100_000,
+        sum(_bounded_count(rows) for rows in value.values()),
+    )
+
+
+def _safe_bool(value: Any) -> bool | None:
+    return value if type(value) is bool else None
+
+
+def _safe_http_status(value: Any) -> int | None:
+    if type(value) is int and 100 <= value <= 599:
+        return value
+    return None
+
+
+def _public_error_class(status: str, evidence: Any) -> str:
+    if not isinstance(evidence, dict):
+        return "missing" if status == "UNAVAILABLE" else "none"
+    if evidence.get("_missing") is True:
+        return "missing"
+    http_status = _safe_http_status(evidence.get("http_status"))
+    if http_status in {401, 403}:
+        return "auth"
+    if http_status == 404:
+        return "not_found"
+    if evidence.get("transport_error"):
+        return "transport"
+    if evidence.get("error_codes"):
+        return "api_error"
+    if status == "UNAVAILABLE":
+        return "invalid_response"
+    if status == "FAIL":
+        return "policy"
+    return "none"
+
+
+def _public_check_values(check_id: str, source: dict[str, Any]) -> dict[str, Any]:
+    evidence = source.get("evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    raw_status = source.get("status")
+    status = raw_status if isinstance(raw_status, str) and raw_status in PUBLIC_STATUS else "REVIEW"
+    observed = 0
+    active = 0
+    unexpected = 0
+    expected: bool | None = None
+    enabled: bool | None = None
+    public: bool | None = None
+
+    if check_id == "zone-access":
+        observed = 1 if evidence else 0
+        expected = _safe_bool(evidence.get("account_match"))
+    elif check_id == "dns-routing":
+        observed = _records_count(evidence.get("records"))
+    elif check_id == "www-canonical-policy":
+        observed = _bounded_count(evidence.get("www_records"))
+        unexpected = observed
+        expected = unexpected == 0
+    elif check_id == "caa-decision":
+        observed = _bounded_count(evidence.get("records"))
+    elif check_id == "edge-certificates":
+        observed = _bounded_count(evidence.get("packs"))
+        active = _bounded_count(evidence.get("active_certificate_count"))
+        expected = active > 0
+    elif check_id == "certificate-alerts":
+        enabled = _safe_bool(evidence.get("enabled"))
+        expected = enabled
+    elif check_id == "r2-public-bucket":
+        observed = 1 if evidence.get("bucket") else 0
+        expected = observed == 1
+    elif check_id == "r2-dev-public-access":
+        enabled = _safe_bool(evidence.get("enabled"))
+        public = enabled
+        expected = enabled is False
+    elif check_id == "r2-browser-put-cors":
+        observed = _bounded_count(evidence.get("rule_count"))
+        expected = observed == 0
+    elif check_id == "r2-custom-domain":
+        observed = _bounded_count(evidence.get("domains"))
+    elif check_id == "media-token-scope":
+        expected = None
+    elif check_id == "turnstile-hostnames":
+        observed = _bounded_count(evidence.get("widgets"))
+        unexpected = _bounded_count(evidence.get("unexpected_domains"))
+        expected = unexpected == 0
+    elif check_id in {
+        "cache-rules",
+        "managed-and-custom-waf",
+        "managed-waf-entrypoint",
+        "edge-rate-limits",
+    }:
+        observed = _bounded_count(evidence.get("rules"))
+    elif check_id == "response-buffering-zone-setting":
+        value = evidence.get("value")
+        enabled = value == "off" if isinstance(value, str) else None
+        expected = enabled
+    elif check_id == "response-body-buffering-rules":
+        observed = _bounded_count(evidence.get("rules"))
+        unexpected = observed
+        expected = unexpected == 0
+    elif check_id == "bot-fight-mode":
+        configuration = evidence.get("configuration")
+        if isinstance(configuration, dict):
+            enabled = _safe_bool(configuration.get("fight_mode"))
+            expected = enabled
+
+    return {
+        "status": status,
+        "error_class": _public_error_class(status, evidence),
+        "counts": {
+            "observed": observed,
+            "active": active,
+            "unexpected": unexpected,
+        },
+        "booleans": {
+            "api_success": _safe_http_status(evidence.get("http_status")) == 200,
+            "expected": expected,
+            "enabled": enabled,
+            "public": public,
+        },
+        "numeric": {"http_status": _safe_http_status(evidence.get("http_status"))},
+    }
+
+
+def project_public_report(private_report: dict[str, Any]) -> dict[str, Any]:
+    """Project a private API report into the closed public evidence contract."""
+
+    if not isinstance(private_report, dict):
+        private_report = {}
+    raw_checks = private_report.get("checks")
+    by_id: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_checks, list):
+        for check in raw_checks:
+            if not isinstance(check, dict):
+                continue
+            check_id = check.get("id")
+            if isinstance(check_id, str) and check_id in PUBLIC_CHECK_RESOURCES:
+                by_id[check_id] = check
+    checks: list[dict[str, Any]] = []
+    summary = {status: 0 for status in ("PASS", "FAIL", "REVIEW", "UNAVAILABLE")}
+    resource_counts = {resource: 0 for resource in PUBLIC_RESOURCE_CLASSES}
+    for check_id, resource_class in PUBLIC_CHECK_RESOURCES.items():
+        source = by_id.get(
+            check_id,
+            {"status": "UNAVAILABLE", "evidence": {"_missing": True}},
+        )
+        values = _public_check_values(check_id, source)
+        status = values["status"]
+        error_class = values["error_class"]
+        if error_class not in PUBLIC_ERROR_CLASSES:  # defensive closed-set guard
+            error_class = "invalid_response"
+        checks.append(
+            {
+                "id": check_id,
+                "resource_class": resource_class,
+                "status": status,
+                "error_class": error_class,
+                "counts": values["counts"],
+                "booleans": values["booleans"],
+                "numeric": values["numeric"],
+            }
+        )
+        summary[status] += 1
+        resource_counts[resource_class] += 1
+    return {
+        "schema": "cloudflare-audit-public-v1",
+        "generated_epoch": int(datetime.now(UTC).timestamp()),
+        "read_only": True,
+        "checks": checks,
+        "summary": summary,
+        "resource_counts": resource_counts,
+    }
 
 
 def short_record(record_value: dict[str, Any]) -> dict[str, Any]:
@@ -510,15 +758,25 @@ def write_summary(report: dict[str, Any]) -> None:
     lines = [
         "## Cloudflare read-only audit",
         "",
-        "No Cloudflare settings were changed. The JSON artifact contains only redacted evidence.",
+        "No Cloudflare settings were changed. The artifact is a fixed-schema aggregate.",
         "",
-        "| Check | Status | Summary |",
-        "| --- | --- | --- |",
+        "| Check | Resource | Status | Error class | Observed | Active | Unexpected |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: |",
     ]
     for check in report["checks"]:
-        summary = str(check["summary"]).replace("|", "\\|").replace("\n", " ")
-        lines.append(f"| `{check['id']}` | **{check['status']}** | {summary} |")
-    lines.extend(["", f"Summary: `{json.dumps(report['summary'], sort_keys=True)}`"])
+        counts = check["counts"]
+        lines.append(
+            f"| `{check['id']}` | `{check['resource_class']}` | "
+            f"**{check['status']}** | `{check['error_class']}` | "
+            f"{counts['observed']} | {counts['active']} | {counts['unexpected']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "Summary counts: "
+            + json.dumps(report["summary"], sort_keys=True, separators=(",", ":")),
+        ]
+    )
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with Path(summary_path).open("a", encoding="utf-8") as handle:
@@ -529,18 +787,78 @@ def write_summary(report: dict[str, Any]) -> None:
     print(f"Summary: {json.dumps(report['summary'], sort_keys=True)}")
 
 
+def _write_json(path: Path, payload: dict[str, Any], *, mode: int = 0o600) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, mode)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def main() -> int:
-    args = parse_args()
+    try:
+        args = parse_args()
+    except AuditArgumentError:
+        print("CLOUDFLARE_AUDIT status=failed error_class=argument", file=sys.stderr)
+        return 2
     token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
     account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
     if not token or not account_id:
-        print("CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are required", file=sys.stderr)
+        print("CLOUDFLARE_AUDIT status=failed error_class=credentials", file=sys.stderr)
         return 2
-    report = run_audit(token, account_id)
     output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    write_summary(report)
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        print("CLOUDFLARE_AUDIT status=failed error_class=output", file=sys.stderr)
+        return 2
+    raw_output = output.parent / f".{output.name}.private-raw"
+    try:
+        same_output = raw_output.resolve(strict=False) == output.resolve(strict=False)
+    except OSError:
+        same_output = True
+    if same_output:
+        print("CLOUDFLARE_AUDIT status=failed error_class=output", file=sys.stderr)
+        return 2
+    try:
+        # A failed retry must not leave a stale artifact for an always-run
+        # uploader to publish.  ``lexists`` also removes a stale symlink
+        # without following it.
+        if os.path.lexists(output):
+            output.unlink()
+    except OSError:
+        print("CLOUDFLARE_AUDIT status=failed error_class=output", file=sys.stderr)
+        return 2
+    try:
+        # Keep the full provider response only in a root-readable, ephemeral
+        # file while validating the projector.  The upload path is written
+        # only after this file has been removed.
+        raw_report = run_audit(token, account_id)
+        _write_json(raw_output, raw_report)
+        public_report = project_public_report(raw_report)
+    except Exception:
+        # Do not turn a provider/parser exception into public diagnostic text.
+        print("CLOUDFLARE_AUDIT status=failed error_class=internal", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            raw_output.unlink()
+        except OSError:
+            pass
+    try:
+        _write_json(output, public_report)
+        write_summary(public_report)
+    except Exception:
+        print("CLOUDFLARE_AUDIT status=failed error_class=output", file=sys.stderr)
+        return 1
     return 0
 
 

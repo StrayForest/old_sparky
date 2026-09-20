@@ -13,6 +13,7 @@ import tempfile
 import unittest
 import zipfile
 
+from tools import platform_validate_release_artifact
 from tools import platform_validate_wheelhouse
 
 
@@ -30,6 +31,11 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
+        # Isolate the canonical production pathname in a test-only mount
+        # namespace; production code has no test lock-path override.
+        self.lock_root = self.root / "run-lock"
+        self.lock_root.mkdir(mode=0o700)
+        self.release_lock_path = self.lock_root / "oldsparky-platform-release.lock"
         self.app_dir = self.root / "platform-app"
         self.releases_dir = self.app_dir / "releases"
         self.shared_dir = self.app_dir / "shared"
@@ -37,6 +43,18 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         self.shared_dir.mkdir()
         (self.shared_dir / ".env.platform").write_text("PLATFORM_TESTING=1\n")
         (self.shared_dir / ".env.platform").chmod(0o600)
+        self.fake_systemctl = self.root / "systemctl"
+        self.fake_systemctl.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "case \"${1:-}\" in\n"
+            "  is-active) echo active; exit 0 ;;\n"
+            "  is-enabled) echo enabled; exit 0 ;;\n"
+            "  enable|disable|start|stop|restart|daemon-reload|reload) exit 0 ;;\n"
+            "  *) exit 0 ;;\n"
+            "esac\n"
+        )
+        self.fake_systemctl.chmod(0o755)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -149,6 +167,24 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             "--phase",
             "migration-pending",
         )
+
+        # A pre-upgrade receipt is not guessed into the new service-state
+        # schema. Recovery must fail closed until an operator has a compatible
+        # receipt, rather than risking a restart with an unknown pre-state.
+        legacy_payload = json.loads(state.read_text())
+        legacy_payload["version"] = 1
+        state.write_text(json.dumps(legacy_payload) + "\n")
+        result = self.run_script(
+            TRANSACTION_TOOL,
+            "status",
+            "--state",
+            str(state),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(state.exists())
+        legacy_payload["version"] = 2
+        state.write_text(json.dumps(legacy_payload) + "\n")
 
         result = self.run_script(
             TRANSACTION_TOOL,
@@ -418,7 +454,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         artifact = self.root / "lock-test.tar.gz"
         artifact.write_bytes(b"unused while the lock is held")
         Path(f"{artifact}.sha256").write_text(f"{'0' * 64}  {artifact.name}\n")
-        lock_fd = os.open(self.shared_dir, os.O_RDONLY)
+        lock_fd = os.open(self.release_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             install = self.run_script(
@@ -434,12 +470,21 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 "--no-restart",
                 check=False,
             )
+            bootstrap_app = self.root / "first-bootstrap-app"
+            bootstrap_install = self.run_script(
+                INSTALL_SCRIPT,
+                str(artifact),
+                str(bootstrap_app),
+                check=False,
+            )
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
 
         self.assertEqual(install.returncode, 3)
         self.assertEqual(rollback.returncode, 3)
+        self.assertEqual(bootstrap_install.returncode, 3)
+        self.assertFalse(bootstrap_app.exists())
         self.assertFalse((self.releases_dir / "lock-test").exists())
         self.assertFalse((self.shared_dir / "venv").exists())
         self.assertFalse((self.shared_dir / TRANSACTION_STATE_NAME).exists())
@@ -591,16 +636,26 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
 
     def test_restart_pending_recovery_finishes_without_rolling_forward(self) -> None:
         current_release, previous_release, snapshot = self.prepare_rollback_fixture()
-        systemctl = (
-            "/usr/bin/systemctl restart deadlock-api deadlock-worker deadlock-web"
-        )
         interrupted_runtime = self.root / "platform_release_restore_runtime_restart_kill.sh"
         interrupted_runtime.write_text(
             RUNTIME_RESTORE_SCRIPT.read_text().replace(
-                systemctl, '/bin/kill -KILL "$PPID" # test interrupted restart', 1
+                'if [[ "$RUN_RESTART" -eq 1 && "$RESTART_AFTER" -eq 1 ]]; then',
+                'if [[ "$RUN_RESTART" -eq 1 && "$RESTART_AFTER" -eq 1 ]]; then\n'
+                '  /bin/kill -KILL "$PPID" # test interrupted restart',
+                1,
             )
         )
         interrupted_runtime.chmod(0o755)
+        shutil.copy2(
+            REPO_ROOT / "platform" / "tools" / "platform_release_lock.sh",
+            interrupted_runtime.parent / "platform_release_lock.sh",
+        )
+        (interrupted_runtime.parent / "platform_release_lock.sh").chmod(0o755)
+        shutil.copy2(
+            REPO_ROOT / "platform" / "tools" / "platform_release_systemd_state.py",
+            interrupted_runtime.parent / "platform_release_systemd_state.py",
+        )
+        (interrupted_runtime.parent / "platform_release_systemd_state.py").chmod(0o755)
         interrupted_text = self._script_with_physical_tools(ROLLBACK_SCRIPT).replace(
             'RUNTIME_RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"',
             f'RUNTIME_RESTORE_TOOL="{interrupted_runtime}"',
@@ -711,6 +766,15 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         shutil.copy2(ROLLBACK_SCRIPT, release_tools / ROLLBACK_SCRIPT.name)
         shutil.copy2(TRANSACTION_TOOL, release_tools / TRANSACTION_TOOL.name)
         shutil.copy2(RUNTIME_RESTORE_SCRIPT, release_tools / RUNTIME_RESTORE_SCRIPT.name)
+        systemd_state_tool = (
+            REPO_ROOT / "platform" / "tools" / "platform_release_systemd_state.py"
+        )
+        shutil.copy2(systemd_state_tool, release_tools / systemd_state_tool.name)
+        (release_tools / systemd_state_tool.name).chmod(0o755)
+        shutil.copy2(
+            REPO_ROOT / "platform" / "tools" / "platform_release_lock.sh",
+            release_tools / "platform_release_lock.sh",
+        )
         shutil.copy2(RECOVERY_SHIM_SCRIPT, release_tools / RECOVERY_SHIM_SCRIPT.name)
         invoked_through_current = (
             self.app_dir / "current" / "tools" / ROLLBACK_SCRIPT.name
@@ -798,6 +862,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             "platform_install_systemd_units.sh",
             "platform_install_nginx.py",
             "platform_deploy_smoke.py",
+            "platform_live_qa_runtime_install.py",
         ):
             tool = tools / tool_name
             tool.write_text("#!/usr/bin/env sh\nexit 0\n")
@@ -829,6 +894,14 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         freeze.chmod(0o444)
         wheelhouse = release / "wheelhouse"
         wheelhouse.mkdir()
+        for relative in platform_validate_release_artifact.REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS:
+            helper = release / relative
+            helper.parent.mkdir(parents=True, exist_ok=True)
+            helper.write_text("# aggregate-only runtime helper fixture\n")
+        self.add_liveqa_runtime(release)
+        runtime_installer = release / "tools" / "platform_live_qa_runtime_install.py"
+        runtime_installer.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n")
+        runtime_installer.chmod(0o755)
         pip_wheel = self.add_fake_pip_wheel(wheelhouse, result=pip_result)
         lock.write_text(
             "pip==26.1.2 --hash=sha256:"
@@ -856,14 +929,6 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             "web_build_id": "test-build-id",
             "node_version": "26.3.1",
             "npm_version": "11.16.0",
-            "runtime_layout": {
-                "app_dir": "/opt/oldsparky/platform",
-                "current_symlink": "/opt/oldsparky/platform/current",
-                "previous_symlink": "/opt/oldsparky/platform/previous",
-                "shared_dir": "/opt/oldsparky/platform/shared",
-                "shared_env_file": "/opt/oldsparky/platform/shared/.env.platform",
-                "shared_venv_dir": "/opt/oldsparky/platform/shared/venv",
-            },
         }
         release_json = release / "RELEASE.json"
         release_json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -875,6 +940,88 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
         Path(f"{artifact}.sha256").write_text(f"{digest}  {artifact.name}\n")
         return artifact
+
+    def add_liveqa_runtime(self, release: Path) -> None:
+        """Build the smallest immutable runtime accepted by the artifact validator."""
+
+        runtime = release / platform_validate_release_artifact.LIVE_QA_RUNTIME_ROOT
+        directories = (
+            runtime,
+            runtime / "node",
+            runtime / "node" / "bin",
+            runtime / "web",
+            runtime / "web" / "tests",
+            runtime / "web" / "tests" / "smoke",
+            runtime / "web" / "tests" / "support",
+            runtime / "web" / "node_modules",
+            runtime / "web" / "node_modules" / "@playwright",
+            runtime / "web" / "node_modules" / "@playwright" / "test",
+            runtime / "web" / "node_modules" / "playwright",
+            runtime / "web" / "node_modules" / "playwright-core",
+            runtime / "browsers",
+            runtime / "browsers" / "chromium-1228",
+            runtime / "browsers" / "chromium-1228" / "chrome-linux64",
+            runtime / "browsers" / "chromium_headless_shell-1228",
+            runtime / "browsers" / "webkit-2311",
+            runtime / "browsers" / "ffmpeg-1011",
+        )
+        for directory in directories:
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o555)
+
+        files: dict[str, bytes] = {
+            "node/bin/node": b"node\n",
+            "web/package-lock.json": b"{}\n",
+            "web/playwright.live.config.ts": b"export default {};\n",
+            "web/tests/smoke/live-user-journey.spec.ts": b"test('live', () => {});\n",
+            "web/tests/support/live-qa-origin.ts": b"export {};\n",
+            "web/tests/support/live-qa-sandbox.ts": b"export {};\n",
+            "web/node_modules/@playwright/test/package.json": b'{"name":"@playwright/test"}\n',
+            "web/node_modules/playwright/package.json": b'{"name":"playwright"}\n',
+            "web/node_modules/playwright-core/package.json": b'{"name":"playwright-core"}\n',
+        }
+        for relative, content in files.items():
+            path = runtime / relative
+            path.write_bytes(content)
+            path.chmod(0o555 if relative == "node/bin/node" else 0o444)
+
+        sandbox_candidates = sorted(
+            Path("/var/lib/oldsparky-liveqa").glob(
+                "runtime-*/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+            )
+        )
+        self.assertTrue(sandbox_candidates, "canonical Chromium sandbox fixture is unavailable")
+        sandbox = runtime / "browsers" / "chromium-1228" / "chrome-linux64" / "chrome_sandbox"
+        sandbox.write_bytes(sandbox_candidates[0].read_bytes())
+        sandbox.chmod(0o4755)
+
+        digest = hashlib.sha256()
+        manifest_files: dict[str, str] = {}
+        runtime_members = sorted(
+            runtime.rglob("*"),
+            key=lambda path: path.relative_to(runtime).as_posix(),
+        )
+        for path in runtime_members:
+            relative = path.relative_to(runtime).as_posix()
+            if relative == "runtime-manifest.json":
+                continue
+            digest.update(relative.encode("utf-8") + b"\0")
+            if path.is_dir():
+                digest.update(b"d\0")
+                continue
+            file_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            manifest_files[relative] = file_digest
+            digest.update(b"f\0" + bytes.fromhex(file_digest))
+        manifest = {
+            "version": 1,
+            "node_version": platform_validate_release_artifact.PINNED_NODE_VERSION,
+            "package_lock_sha256": hashlib.sha256(b"{}\n").hexdigest(),
+            "tree_sha256": digest.hexdigest(),
+            "files": manifest_files,
+        }
+        manifest_path = runtime / "runtime-manifest.json"
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+        manifest_path.chmod(0o444)
 
     def add_fake_pip_wheel(self, wheelhouse: Path, *, result: str) -> Path:
         wheel = wheelhouse / "pip-26.1.2-py3-none-any.whl"
@@ -947,15 +1094,52 @@ raise SystemExit("unsupported fake pip invocation: " + repr(arguments))
         check: bool = True,
         cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [str(script), *args],
+        command_env = os.environ.copy()
+        command_env["PLATFORM_ENVIRONMENT"] = "test"
+        command_env["PLATFORM_TESTING"] = "1"
+        command_script = script
+        if "platform_release_rollback" in script.name:
+            command_script = self.root / f".{script.stem}.systemctl.sh"
+            script_text = script.read_text()
+            tools_needle = 'TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"'
+            if tools_needle in script_text:
+                # The wrapper lives outside the release tree. Keep the
+                # original tool directory so the lock/helper paths remain
+                # production-faithful while systemctl is test-substituted.
+                script_text = script_text.replace(
+                    tools_needle, f'TOOLS_DIR="{script.parent.resolve()}"', 1
+                )
+            command_script.write_text(
+                script_text.replace("/usr/bin/systemctl", str(self.fake_systemctl))
+            )
+            command_script.chmod(0o755)
+        result = subprocess.run(
+            [
+                "/usr/bin/unshare",
+                "-m",
+                "--propagation",
+                "private",
+                "/bin/bash",
+                "-c",
+                'mount --bind "$1" /run/lock && shift && exec "$@"',
+                "release-lock-test",
+                str(self.lock_root),
+                str(command_script),
+                *args,
+            ],
             cwd=cwd or REPO_ROOT,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**os.environ, "PATH": os.environ.get("PATH", "")},
-            check=check,
+            env=command_env,
+            check=False,
         )
+        if check and result.returncode != 0:
+            self.fail(
+                f"{command_script} failed: {result.returncode}\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}"
+            )
+        return result
 
 
 if __name__ == "__main__":

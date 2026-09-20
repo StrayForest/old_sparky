@@ -13,6 +13,21 @@ function ssrCountScope(request) {
   return match?.[1] || "default";
 }
 
+function isCountableSsrRequest(request, path) {
+  return request.method === "GET"
+    && path.startsWith("/api/v1/")
+    && (request.headers.cookie ?? "").includes("ssr-bootstrap-profile-smoke=1");
+}
+
+function resetSsrRequestCount(scope) {
+  const prefix = `${scope}:`;
+  for (const key of ssrRequestCounts.keys()) {
+    if (key.startsWith(prefix)) {
+      ssrRequestCounts.delete(key);
+    }
+  }
+}
+
 function json(response, status, payload, headers = {}) {
   response.writeHead(status, {
     "content-type": "application/json",
@@ -182,9 +197,20 @@ function proxyRequest(request, response) {
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? "/", `http://${host}:${port}`);
   const path = url.pathname.replace(/\/$/, "") || "/";
-  if ((request.headers.cookie ?? "").includes("ssr-bootstrap-profile-smoke=1")) {
+  if (isCountableSsrRequest(request, path)) {
     const key = `${ssrCountScope(request)}:${path}`;
     ssrRequestCounts.set(key, (ssrRequestCounts.get(key) ?? 0) + 1);
+  }
+
+  if (path === "/__test/request-count/reset" && request.method === "POST") {
+    const scope = url.searchParams.get("scope")?.trim() ?? "";
+    if (!scope) {
+      json(response, 400, { detail: "A request-count scope is required." });
+      return;
+    }
+    resetSsrRequestCount(scope);
+    json(response, 200, { reset: true, scope });
+    return;
   }
 
   if (path === "/__test/request-count" && request.method === "GET") {

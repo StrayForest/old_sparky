@@ -16,43 +16,117 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate-proof-inputs:
+    name: Validate AS-12 proof handoff
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      WORKFLOW_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout AS-12 validator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate and serialize AS-12 SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/dev
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py sha --value "$EXPECTED_SHA"
+          test "$EXPECTED_SHA" = "$WORKFLOW_SHA"
+          umask 077
+          /usr/bin/python3 - "$EXPECTED_SHA" "$WORKFLOW_SHA" > "$RUNNER_TEMP/as12-input.json" <<'PY'
+          import json
+          import sys
+
+          print(json.dumps(
+              {"schema": 1, "expected_sha": sys.argv[1], "workflow_sha": sys.argv[2]},
+              separators=(",", ":"),
+          ))
+          PY
+          chmod 600 "$RUNNER_TEMP/as12-input.json"
+      - name: Upload closed AS-12 handoff
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-as12-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/as12-input.json
+          if-no-files-found: error
+          retention-days: 1
+
   proof:
+    needs: validate-proof-inputs
     if: github.event_name == 'workflow_dispatch'
     name: Verify origin perimeter
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production
-    env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
-      EXPECTED_SHA: ${{ inputs.expected_sha }}
-      WORKFLOW_SHA: ${{ github.sha }}
 
     steps:
-      - name: Validate exact-SHA production proof inputs
+      - name: Download closed AS-12 handoff
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-as12-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/as12-input
+      - name: Install closed AS-12 handoff
         shell: bash
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = "refs/heads/dev" \
-            || { echo "AS-12 proof must target the reviewed dev branch" >&2; exit 1; }
-          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
-            || { echo "expected_sha must be a 40-character commit SHA" >&2; exit 1; }
-          test "$EXPECTED_SHA" = "$WORKFLOW_SHA" \
-            || { echo "proof workflow source and expected production SHA differ" >&2; exit 1; }
+          handoff_dir="$RUNNER_TEMP/as12-input"
+          handoff="$handoff_dir/as12-input.json"
+          test -d "$handoff_dir" && test ! -L "$handoff_dir"
+          test -f "$handoff" && test ! -L "$handoff"
+          test "$(find "$handoff_dir" -mindepth 1 -maxdepth 1 -type l -print -quit)" = ""
+          /usr/bin/python3 - "$handoff" "$GITHUB_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if set(payload) != {"schema", "expected_sha", "workflow_sha"}:
+              raise SystemExit("AS-12 handoff schema is invalid")
+          if payload.get("schema") != 1:
+              raise SystemExit("AS-12 handoff schema version is invalid")
+          if (
+              not isinstance(payload.get("expected_sha"), str)
+              or re.fullmatch(r"[0-9a-f]{40}", payload["expected_sha"]) is None
+              or payload.get("workflow_sha") != sys.argv[2]
+          ):
+              raise SystemExit("AS-12 handoff identity is invalid")
+          PY
+          EXPECTED_SHA="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["expected_sha"])' "$handoff")"
+          printf '%s\n' "EXPECTED_SHA=$EXPECTED_SHA" >> "$GITHUB_ENV"
+
+      - name: Validate production SSH inputs
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
 
       - name: Configure pinned production SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           install -d -m 700 ~/.ssh
           printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
           chmod 600 ~/.ssh/old_sparky_prod
           ssh_scan="$RUNNER_TEMP/as12-known-hosts"
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
           test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
             || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
@@ -70,9 +144,17 @@ jobs:
 
       - name: Run read-only VPS perimeter proof
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          umask 077
           remote_report="$RUNNER_TEMP/as12-remote-proof.txt"
+          remote_error="$RUNNER_TEMP/as12-remote-proof-error.txt"
+          : >"$remote_report"
+          : >"$remote_error"
+          chmod 600 "$remote_report" "$remote_error"
           if ! ssh \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -81,14 +163,42 @@ jobs:
             -o ConnectTimeout=10 \
             -i ~/.ssh/old_sparky_prod \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$EXPECTED_SHA" <<'REMOTE' > "$remote_report"
+            bash -s -- "$EXPECTED_SHA" <<'REMOTE' > "$remote_report" 2> "$remote_error"
           set -Eeuo pipefail
 
           expected_sha="$1"
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           guard="$current/tools/platform_release_lock_exec.sh"
-          test -x "$guard" || { echo "REMOTE_CHECK=FAIL guard_missing"; exit 1; }
+          input_guard="$current/tools/platform_workflow_input_guard.py"
+          release_json="$current/RELEASE.json"
+          edge_policy_tool="$current/tools/platform_validate_edge_policy.py"
+          test -L "$current" && test -d "$current" \
+            || { echo "REMOTE_CHECK=FAIL active_release_missing"; exit 1; }
+          test -f "$guard" && test ! -L "$guard" && test -x "$guard" \
+            || { echo "REMOTE_CHECK=FAIL guard_missing"; exit 1; }
+          test -f "$input_guard" && test ! -L "$input_guard" \
+            || { echo "REMOTE_CHECK=FAIL input_guard_missing"; exit 1; }
+          test -f "$release_json" && test ! -L "$release_json" \
+            || { echo "REMOTE_CHECK=FAIL release_metadata_missing"; exit 1; }
+          test -f "$edge_policy_tool" && test ! -L "$edge_policy_tool" \
+            || { echo "REMOTE_CHECK=FAIL edge_policy_helper_missing"; exit 1; }
+          /usr/bin/python3.12 "$input_guard" sha --value "$expected_sha" \
+            || { echo "REMOTE_CHECK=FAIL expected_sha_invalid"; exit 1; }
+          active_sha="$(/usr/bin/python3.12 - "$release_json" <<'PY'
+          import json
+          import re
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          value = payload.get("source_git_commit")
+          if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40,64}", value) is None:
+              raise SystemExit(1)
+          print(value)
+          PY
+          )"
+          test "$active_sha" = "$expected_sha" \
+            || { echo "REMOTE_CHECK=FAIL active_release_sha_mismatch"; exit 1; }
 
           /bin/bash "$guard" \
             --app-dir "$runtime" \
@@ -109,7 +219,7 @@ jobs:
           fi
 
           edge_policy="$($runtime/shared/venv/bin/python \
-            "$current/tools/platform_validate_edge_policy.py" --json)"
+            "$edge_policy_tool" --json)"
           printf 'EDGE_POLICY=%s\n' "$edge_policy"
 
           listener_file="$(mktemp)"
@@ -160,6 +270,8 @@ jobs:
               if not public:
                   continue
               protocol = line.split()[0]
+              if protocol not in {"tcp", "tcp6", "udp", "udp6"}:
+                  protocol = "unknown"
               process = "unknown"
               marker = 'users:(("'
               if marker in line:
@@ -188,13 +300,11 @@ jobs:
                   if f"unexpected_public_port_{port}" not in failures:
                       continue
                   protocol = line.split()[0]
-                  process = "unknown"
-                  marker = 'users:(("'
-                  if marker in line:
-                      process = line.split(marker, 1)[1].split('"', 1)[0]
+                  if protocol not in {"tcp", "tcp6", "udp", "udp6"}:
+                      protocol = "unknown"
                   print(
-                      "PUBLIC_LISTENER=proto={} port={} process={}".format(
-                          protocol, port, process
+                      "PUBLIC_LISTENER=proto={} port={} class=unexpected".format(
+                          protocol, port
                       )
                   )
               print("LISTENER_CHECK=FAIL reason=" + ",".join(sorted(set(failures))))
@@ -275,10 +385,6 @@ jobs:
 
           mapfile -t ipv4_targets < <(awk -F= '$1 == "ORIGIN_IPV4" {print $2}' "$remote_report")
           mapfile -t ipv6_targets < <(awk -F= '$1 == "ORIGIN_IPV6" {print $2}' "$remote_report")
-          for address in "${ipv4_targets[@]}" "${ipv6_targets[@]}"; do
-            [[ -n "$address" ]] || continue
-            printf '::add-mask::%s\n' "$address"
-          done
           ((${#ipv4_targets[@]} > 0)) \
             || { echo "No global IPv4 origin address was reported" >&2; exit 1; }
 
@@ -329,11 +435,42 @@ jobs:
             || { echo "Direct origin returned an HTTP response" >&2; exit 1; }
           cat "$summary"
 
-      - name: Publish AS-12 proof summary
+      - name: Remove production SSH material
+        id: cleanup_ssh
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- \
+            "$HOME/.ssh/old_sparky_prod" \
+            "$HOME/.ssh/known_hosts" \
+            "$HOME/.ssh/config" \
+            "$RUNNER_TEMP/as12-known-hosts"
+          handoff_dir="$RUNNER_TEMP/as12-input"
+          if [[ -e "$handoff_dir" || -L "$handoff_dir" ]]; then
+            test -d "$handoff_dir" && test ! -L "$handoff_dir"
+            rm -f -- "$handoff_dir/as12-input.json"
+            test ! -e "$handoff_dir/as12-input.json"
+            rmdir -- "$handoff_dir"
+          fi
+          rm -f -- "$RUNNER_TEMP/as12-input.json"
+          test ! -e "$RUNNER_TEMP/as12-input"
+          test ! -e "$RUNNER_TEMP/as12-input.json"
+          test ! -e "$HOME/.ssh/old_sparky_prod"
+          test ! -e "$HOME/.ssh/known_hosts"
+          test ! -e "$HOME/.ssh/config"
+          test ! -e "$RUNNER_TEMP/as12-known-hosts"
+          rm -f -- "$RUNNER_TEMP/as12-remote-proof.txt" "$RUNNER_TEMP/as12-curl-error"
+          test ! -e "$RUNNER_TEMP/as12-remote-proof.txt"
+          test ! -e "$RUNNER_TEMP/as12-curl-error"
+          rm -f -- "$RUNNER_TEMP/as12-remote-proof-error.txt"
+          test ! -e "$RUNNER_TEMP/as12-remote-proof-error.txt"
+
+      - name: Publish AS-12 proof summary
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-production-as12-proof-${{ github.run_id }}
+          name: platform-production-as12-proof-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/as12-proof-summary.txt
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14

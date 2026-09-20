@@ -41,7 +41,7 @@ RUNTIME_ENV_DIR="$APP_DIR/shared/env"
 MEDIA_STAGING_DIR="$APP_DIR/shared/media-staging"
 MEDIA_QUOTA_LOCK="$MEDIA_STAGING_DIR/.quota.lock"
 WORKER_STATE_DIR="$APP_DIR/shared/worker-state"
-WEB_CACHE_DIR="$APP_DIR/current/apps/platform_web/.next/cache"
+WEB_CACHE_DIR="$APP_DIR/current/apps/platform_web/.next/standalone/.next/cache"
 MEDIA_GROUP="oldsparky-media"
 SERVICE_USERS=(oldsparky-web oldsparky-api oldsparky-worker)
 
@@ -83,12 +83,12 @@ SYS_GID_MAX="$(login_defs_number SYS_GID_MAX 999)"
 
 validate_system_group() {
   local group_name="$1"
-  local entry name _password gid members duplicate_count
+  local entry name _password gid _members duplicate_count
   entry="$(getent group "$group_name")" || {
     echo "Required service group is missing: $group_name" >&2
     return 1
   }
-  IFS=: read -r name _password gid members <<<"$entry"
+  IFS=: read -r name _password gid _members <<<"$entry"
   if [[ "$name" != "$group_name" || ! "$gid" =~ ^[0-9]+$ \
     || "$gid" -eq 0 || "$gid" -lt "$SYS_GID_MIN" || "$gid" -gt "$SYS_GID_MAX" ]]; then
     echo "$group_name must have a non-root system GID in $SYS_GID_MIN..$SYS_GID_MAX." >&2
@@ -195,6 +195,10 @@ chmod 0600 "$CANONICAL_ENV"
 install -d -o root -g root -m 0711 "$RUNTIME_ENV_DIR"
 install -d -o root -g "$MEDIA_GROUP" -m 2770 "$MEDIA_STAGING_DIR"
 install -d -o oldsparky-worker -g oldsparky-worker -m 0700 "$WORKER_STATE_DIR"
+if [[ -L "$WEB_CACHE_DIR" ]]; then
+  echo "Refusing symlink as web cache directory: $WEB_CACHE_DIR" >&2
+  exit 1
+fi
 install -d -o oldsparky-web -g oldsparky-web -m 0750 "$WEB_CACHE_DIR"
 
 # Migrate state created by the former shared service identity. Symlinks are

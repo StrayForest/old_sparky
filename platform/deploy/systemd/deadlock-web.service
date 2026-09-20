@@ -2,6 +2,8 @@
 Description=Old Sparky Arena Web
 After=network-online.target deadlock-api.service
 Wants=network-online.target
+StartLimitIntervalSec=300s
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -16,8 +18,13 @@ Environment=PLATFORM_NODE_BIN=/opt/oldsparky/platform/shared/node-v26.3.1/bin/no
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=2000
 ExecStart=/opt/oldsparky/platform/current/tools/platform_run_web.sh
+# Keep the graceful 143 status for explicit manager stops, while Restart=always
+# also recovers an unexpected clean SIGTERM. systemd suppresses Restart for an
+# explicit stop job, so release/recovery stop semantics remain unchanged.
 SuccessExitStatus=143
-Restart=on-failure
+Restart=always
+# Five starts in five minutes bounds a persistent crash without hiding a
+# transient clean exit behind an inactive public service.
 RestartSec=5
 UMask=0077
 NoNewPrivileges=true
@@ -38,7 +45,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
-ReadWritePaths=/opt/oldsparky/platform/current/apps/platform_web/.next/cache
+ReadWritePaths=/opt/oldsparky/platform/current/apps/platform_web/.next/standalone/.next/cache
 TasksMax=128
 MemoryMax=1G
 

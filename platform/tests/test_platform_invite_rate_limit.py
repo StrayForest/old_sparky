@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from fastapi import HTTPException, Request
+from redis.exceptions import RedisError
 
 from python_packages.platform_infra.config import PlatformSettings
 from python_packages.platform_infra.invite_rate_limit import check_invite_rate_limit
@@ -119,6 +120,70 @@ class PlatformInviteRateLimitTests(PlatformIsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 429)
         self.assertEqual(fake.ip_count, 0)
+
+    async def test_bearer_read_is_bounded_by_hmac_ip_code_pair(self) -> None:
+        fake = FakeRedis()
+        settings = self.settings(platform_invite_bearer_read_limit=2)
+        with patch(
+            "python_packages.platform_infra.invite_rate_limit.redis_client",
+            return_value=fake,
+        ) as redis_factory:
+            await check_invite_rate_limit(
+                request(),
+                user_id="anonymous",
+                operation="bearer_read",
+                code="ABCDEFGHIJ",
+                settings=settings,
+                now_epoch=10,
+            )
+            await check_invite_rate_limit(
+                request(),
+                user_id="anonymous",
+                operation="bearer_read",
+                code="ABCDEFGHIJ",
+                settings=settings,
+                now_epoch=10,
+            )
+            with self.assertRaises(HTTPException) as raised:
+                await check_invite_rate_limit(
+                    request(),
+                    user_id="anonymous",
+                    operation="bearer_read",
+                    code="ABCDEFGHIJ",
+                    settings=settings,
+                    now_epoch=10,
+                )
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(fake.ip_count, 0)
+        self.assertEqual(redis_factory.call_count, 3)
+        self.assertTrue(fake.closed)
+
+    async def test_bearer_read_fails_closed_when_redis_is_unavailable(self) -> None:
+        class UnavailableRedis:
+            async def eval(self, *_args: object) -> int:
+                raise RedisError("redis unavailable")
+
+            async def aclose(self) -> None:
+                return None
+
+        settings = self.settings(platform_invite_bearer_read_limit=2)
+        with patch(
+            "python_packages.platform_infra.invite_rate_limit.redis_client",
+            return_value=UnavailableRedis(),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await check_invite_rate_limit(
+                    request(),
+                    user_id="anonymous",
+                    operation="bearer_read",
+                    code="ABCDEFGHIJ",
+                    settings=settings,
+                    now_epoch=10,
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.detail["code"], "invite_protection_unavailable")
 
 
 if __name__ == "__main__":

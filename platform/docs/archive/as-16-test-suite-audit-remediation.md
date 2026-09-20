@@ -8,7 +8,7 @@
 
 | Audit finding | Regression protection added |
 | --- | --- |
-| Production browser QA ran on the GitHub runner with the wrong privilege/sandbox contour | `platform-live-launch.yml` now connects over SSH and invokes the server-owned root supervisor with the dedicated QA UID; it requires a signed success marker. |
+| Production browser QA ran on the GitHub runner with the wrong privilege/sandbox contour | `platform-live-launch.yml` now connects over SSH and invokes the server-owned root supervisor with the dedicated QA UID; it validates the exact deployed source commit and success result. |
 | No deterministic CI proof for run-async → Celery → persisted assignment | Worker task contract, task failure/release behavior and queue route tests cover the handoff and persisted result boundary. |
 | Migration 0040 had only a source-level check | `platform_migration_scenario.py` seeds populated 0039 data, verifies fail-fast repair guidance, repairs the duplicate state, retries 0040 and checks the final state. |
 | Dream-slot replace-all had no real concurrent payloads | The profile workspace test submits two concurrent replace-all payloads and asserts exactly one complete payload remains. |

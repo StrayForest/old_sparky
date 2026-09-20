@@ -532,7 +532,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
         blocked_matches = await outsider["client"].get(f"/api/v1/tournaments/{slug}/matches")
         self.assertEqual(blocked_matches.status_code, 403, blocked_matches.text)
         self.assertIn(
-            "Tournament roster and bracket data are visible only to joined participants, the organizer, or platform admins.",
+            "Tournament roster, bracket, and match data require a valid invite code, active membership, the organizer role, or a platform admin role.",
             blocked_matches.json()["detail"],
         )
 
@@ -594,7 +594,7 @@ class PlatformAdminApiTests(PlatformIsolatedAsyncioTestCase):
         reblocked_matches = await outsider["client"].get(f"/api/v1/tournaments/{slug}/matches")
         self.assertEqual(reblocked_matches.status_code, 403, reblocked_matches.text)
         self.assertIn(
-            "Tournament roster and bracket data are visible only to joined participants, the organizer, or platform admins.",
+            "Tournament roster, bracket, and match data require a valid invite code, active membership, the organizer role, or a platform admin role.",
             reblocked_matches.json()["detail"],
         )
 

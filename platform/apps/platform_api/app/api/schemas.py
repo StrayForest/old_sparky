@@ -470,7 +470,20 @@ class TournamentCreateRequest(BaseModel):
     description: str | None = Field(default=None, max_length=200)
     cover_url: str | None = Field(default=None, max_length=512)
     visibility: str = Field(default="invite_only", pattern="^(public|invite_only)$")
-    invite_code: str | None = Field(default=None, min_length=10, max_length=24)
+    # Runtime validation is performed at the route boundary so malformed
+    # credentials can return a generic 422 without FastAPI echoing the raw
+    # value in a validation-error payload. Keep the constraints in the schema
+    # metadata for clients/OpenAPI while the shared domain validator owns the
+    # actual canonicalization.
+    invite_code: str | None = Field(
+        default=None,
+        description="Exactly 10-24 ASCII alphanumeric characters; canonicalized uppercase.",
+        json_schema_extra={
+            "minLength": 10,
+            "maxLength": 24,
+            "pattern": r"^[A-Za-z0-9]+$",
+        },
+    )
     format_slug: str = Field(default="solo", pattern="^solo$")
     allowed_ranks: list[str] = Field(default_factory=list, max_length=len(RANKS))
     max_participants: int | None = Field(default=None, ge=1, le=999_999_999)
@@ -1006,6 +1019,13 @@ class TournamentInviteClaimRequest(BaseModel):
 
 
 class TournamentInviteResponse(BaseModel):
+    """Invite metadata with non-authoritative legacy usage counters.
+
+    Read-only bearer access is unlimited and non-consuming; ``max_uses``,
+    ``use_count`` and ``remaining_uses`` are retained only for compatibility
+    with existing clients and do not grant or deny access.
+    """
+
     id: str
     tournament_id: str
     code: str

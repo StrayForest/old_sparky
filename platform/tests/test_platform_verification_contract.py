@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from tools.platform_test_catalog import (
+    BACKEND_CONTOURS,
+    CONTOUR_METADATA,
+    CONTOUR_TIMEOUT_SECONDS,
+    EXPECTED_SNAPSHOT,
+    VERIFICATION_CONTOUR,
+    cases_for_contour,
+    discover_test_cases,
+    test_id_digest,
+)
 from tools.platform_load import (
     LoadProfileError,
     get_profile,
@@ -19,13 +34,353 @@ from tools.platform_verify import (
     DETERMINISTIC_GATE_IDS,
     GATES_BY_ID,
     VerificationError,
+    _verification_contract_commands,
     dispatch,
     registry_payload,
 )
-from tools.platform_verify_contract import collect_issues, extract_gate_invocations
+from tools.platform_test_runner import (
+    TestResourceConfigurationError,
+    _integration_preflight_error,
+    _require_integration_resources_ready,
+    main as test_runner_main,
+    validate_test_resource_configuration,
+    verify_backend_components,
+)
+from tools.platform_verification_lock import VerificationLockError, verification_resource_lock
+from tools.platform_verify_contract import (
+    ALLOWED_ACTION_OWNERS,
+    SECURITY_WORKFLOW,
+    action_pin_issues,
+    collect_issues,
+    extract_gate_invocations,
+    security_status_permission_issues,
+    workflow_level_permission_issues,
+)
+
+
+def _write_backend_component_fixture(root: Path) -> None:
+    """Write complete synthetic component evidence for aggregate tamper tests."""
+
+    all_cases = discover_test_cases()
+    for contour in BACKEND_CONTOURS:
+        cases = sorted(
+            cases_for_contour(contour, all_cases),
+            key=lambda case: case.test_id,
+        )
+        expected_ids = [case.test_id for case in cases]
+        component_root = root / contour
+        component_root.mkdir(parents=True, exist_ok=True)
+        (component_root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "contour": contour,
+                    "aggregate": False,
+                    "serial": bool(CONTOUR_METADATA[contour]["serial_resources"]),
+                    "tests": [
+                        {
+                            "id": case.test_id,
+                            "module": case.module,
+                            "class": case.class_name,
+                            "method": case.method_name,
+                            "line": case.line,
+                            "async": case.is_async,
+                            "owner": case.contour,
+                        }
+                        for case in cases
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (component_root / "summary.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "contour": contour,
+                    "status": "passed",
+                    "tests_selected": len(expected_ids),
+                    "tests_run": len(expected_ids),
+                    "failures": 0,
+                    "errors": 0,
+                    "expected_failures": 0,
+                    "unexpected_successes": 0,
+                    "skipped": [],
+                    "skipped_count": 0,
+                    "skip_reasons": {},
+                    "expected_ids": expected_ids,
+                    "executed_ids": expected_ids,
+                    "missing_ids": [],
+                    "duplicate_ids": [],
+                    "unexpected_ids": [],
+                    "unexpected_skips": [],
+                    "execution_complete": True,
+                    "elapsed_ms": float(len(expected_ids)),
+                    "timeout_seconds": CONTOUR_TIMEOUT_SECONDS[contour],
+                    "test_id_digest": test_id_digest(expected_ids),
+                    "timings": [
+                        {
+                            "test_id": test_id,
+                            "duration_ms": 1.0,
+                            "outcome": "passed",
+                        }
+                        for test_id in expected_ids
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
 
 class PlatformVerificationContractTests(unittest.TestCase):
+    @staticmethod
+    def _test_settings(**overrides: object) -> SimpleNamespace:
+        values: dict[str, object] = {
+            "platform_environment": "test",
+            "platform_db_schema": "platform",
+            "platform_database_url": (
+                "postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/"
+                "platformdb_test"
+            ),
+            "platform_redis_url": "redis://127.0.0.1:6379/15",
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_test_resource_validator_rejects_ambiguous_targets(self) -> None:
+        safe = validate_test_resource_configuration(self._test_settings())
+        self.assertEqual(safe.database_host, "127.0.0.1")
+        self.assertEqual(safe.database_name, "platformdb_test")
+        self.assertEqual(safe.database_schema, "platform")
+        self.assertEqual(safe.redis_host, "127.0.0.1")
+        self.assertEqual(safe.redis_database, "15")
+
+        invalid_settings = (
+            {"platform_environment": "Test"},
+            {"platform_db_schema": "public"},
+            {"platform_database_url": "postgresql://u:p@localhost:5432/platformdb_test"},
+            {"platform_database_url": "postgresql://u:p@192.0.2.10:5432/platformdb_test"},
+            {
+                "platform_database_url": (
+                    "postgresql://u:p@127.0.0.1:5432/platformdb_test?dbname=platformdb_test"
+                )
+            },
+            {
+                "platform_database_url": (
+                    "postgresql://u:p@127.0.0.1,127.0.0.1:5432/platformdb_test"
+                )
+            },
+            {"platform_redis_url": "redis://localhost:6379/15"},
+            {"platform_redis_url": "redis://127.0.0.1:6379/0"},
+            {"platform_redis_url": "redis://127.0.0.1:6379/15?db=0"},
+            {"platform_redis_url": None},
+        )
+        for overrides in invalid_settings:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(TestResourceConfigurationError):
+                    validate_test_resource_configuration(self._test_settings(**overrides))
+
+    def test_invalid_resource_config_fails_before_client_imports(self) -> None:
+        unsafe_environment = {
+            "PLATFORM_ENVIRONMENT": "test",
+            "PLATFORM_DB_SCHEMA": "platform",
+            "PLATFORM_DATABASE_URL": "postgresql+asyncpg://u:p@remote.invalid:5432/platformdb_test",
+            "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+        }
+        imported: list[str] = []
+        real_import = __import__
+
+        def recording_import(name: str, *args: object, **kwargs: object) -> object:
+            imported.append(name)
+            return real_import(name, *args, **kwargs)
+
+        with (
+            patch.dict(os.environ, unsafe_environment, clear=True),
+            patch("builtins.__import__", side_effect=recording_import),
+        ):
+            with self.assertRaises(SystemExit):
+                _require_integration_resources_ready()
+        self.assertFalse(any(name == "sqlalchemy" or name.startswith("redis") for name in imported))
+
+    def test_db_free_contour_validates_without_resource_calls(self) -> None:
+        safe_environment = {
+            "PLATFORM_ENVIRONMENT": "test",
+            "PLATFORM_DB_SCHEMA": "platform",
+            "PLATFORM_DATABASE_URL": "postgresql+asyncpg://u:p@127.0.0.1:5432/platformdb_test",
+            "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+        }
+        with (
+            patch.dict(os.environ, safe_environment, clear=True),
+            patch("tools.platform_test_runner._require_integration_resources_ready") as preflight,
+            patch("tools.platform_test_runner._teardown_test_resources") as teardown,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(
+                test_runner_main(["--contour", "backend-unit", "--list"]),
+                0,
+            )
+        preflight.assert_not_called()
+        teardown.assert_not_called()
+
+    def test_aggregate_only_workflow_env_reaches_runner_boundary(self) -> None:
+        """The aggregate job must provide every value the pure validator requires."""
+
+        repo_root = Path(__file__).resolve().parents[2]
+        workflow = (repo_root / ".github/workflows/platform-security.yml").read_text(
+            encoding="utf-8"
+        )
+        aggregate_block = re.search(
+            r"^  backend:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(aggregate_block)
+        assert aggregate_block is not None
+        aggregate_env = {
+            name: value.strip().strip('"')
+            for name, value in re.findall(
+                r"^      (PLATFORM_(?:ENVIRONMENT|DATABASE_URL|DB_SCHEMA|REDIS_URL)):\s*(.+)$",
+                aggregate_block.group("body"),
+                re.MULTILINE,
+            )
+        }
+        self.assertEqual(
+            aggregate_env,
+            {
+                "PLATFORM_ENVIRONMENT": "test",
+                "PLATFORM_DATABASE_URL": (
+                    "postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/"
+                    "platformdb_test"
+                ),
+                "PLATFORM_DB_SCHEMA": "platform",
+                "PLATFORM_REDIS_URL": "redis://127.0.0.1:6379/15",
+            },
+        )
+
+        runner = repo_root / "platform/tools/platform_run_tests.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            missing_env_file = str(Path(directory) / "missing.env")
+            base_environment = os.environ.copy()
+            base_environment.update(
+                {
+                    **aggregate_env,
+                    "PLATFORM_ENV_FILE": missing_env_file,
+                    "PLATFORM_PYTHON_BIN": "/usr/bin/python3",
+                    "PLATFORM_TEST_AGGREGATE_ONLY": "1",
+                }
+            )
+            command = [
+                str(runner),
+                "--contour",
+                "backend",
+                "--component-dir",
+                str(Path(directory) / "missing-components"),
+            ]
+            valid = subprocess.run(
+                command,
+                cwd=repo_root / "platform",
+                env=base_environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertNotEqual(valid.returncode, 0)
+            self.assertIn("backend component result directory is unavailable", valid.stderr)
+
+            for missing_name in ("PLATFORM_DB_SCHEMA", "PLATFORM_REDIS_URL"):
+                with self.subTest(missing_name=missing_name):
+                    incomplete_environment = dict(base_environment)
+                    incomplete_environment.pop(missing_name)
+                    blocked = subprocess.run(
+                        command,
+                        cwd=repo_root / "platform",
+                        env=incomplete_environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=20,
+                    )
+                    self.assertNotEqual(blocked.returncode, 0)
+                    self.assertIn("LOCAL GATE BLOCKED", blocked.stderr)
+                    self.assertIn(missing_name, blocked.stderr)
+
+    def test_shared_resource_lock_excludes_migration_and_integration(self) -> None:
+        """A local migration cannot reset resources during integration tests."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "platformdb-test.lock"
+            holder_code = """
+from pathlib import Path
+import sys
+from tools.platform_verification_lock import verification_resource_lock
+with verification_resource_lock("backend-integration", path=Path(sys.argv[1])):
+    print("ready", flush=True)
+    sys.stdin.readline()
+"""
+            holder = subprocess.Popen(
+                [sys.executable, "-c", holder_code, str(lock_path)],
+                cwd=Path(__file__).resolve().parents[1],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(holder.stdout.readline().strip(), "ready")
+            contender_code = """
+from pathlib import Path
+import sys
+from tools.platform_verification_lock import VerificationLockError, verification_resource_lock
+try:
+    with verification_resource_lock("migration", path=Path(sys.argv[1])):
+        raise SystemExit("migration unexpectedly entered integration contour")
+except VerificationLockError as exc:
+    print(exc)
+    raise SystemExit(75)
+"""
+            contender = subprocess.run(
+                [sys.executable, "-c", contender_code, str(lock_path)],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(contender.returncode, 75, contender.stderr)
+            self.assertIn("contention", contender.stdout)
+            assert holder.stdin is not None
+            holder.stdin.write("release\n")
+            holder.stdin.close()
+            holder.wait(timeout=5)
+            stdout = holder.stdout.read()
+            stderr = holder.stderr.read()
+            holder.stdout.close()
+            holder.stderr.close()
+            self.assertEqual(holder.returncode, 0, stderr or stdout)
+            self.assertEqual(lock_path.read_text(encoding="utf-8"), "")
+
+    def test_shared_resource_lock_rejects_stale_marker_and_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = root / "platformdb-test.lock"
+            lock_path.touch(mode=0o600)
+            lock_path.write_text(
+                '{"contour":"migration","inode":%d,"pid":999999,"schema":1}\n'
+                % lock_path.stat().st_ino,
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(VerificationLockError, "stale"):
+                with verification_resource_lock("migration", path=lock_path):
+                    pass
+            link = root / "unsafe.lock"
+            link.symlink_to(lock_path)
+            with self.assertRaises(VerificationLockError):
+                with verification_resource_lock("migration", path=link):
+                    pass
+
     def test_registry_exposes_deterministic_and_workflow_only_contours(self) -> None:
         self.assertEqual(set(CI_GATE_IDS), set(DETERMINISTIC_GATE_IDS))
         self.assertIn("backend", CI_GATE_IDS)
@@ -33,6 +388,45 @@ class PlatformVerificationContractTests(unittest.TestCase):
         self.assertFalse(GATES_BY_ID["external-load"].deterministic)
         self.assertFalse(GATES_BY_ID["external-load"].local_safe)
         self.assertEqual(registry_payload()["ci_gate_ids"], list(CI_GATE_IDS))
+
+        verification_cases = cases_for_contour(
+            VERIFICATION_CONTOUR,
+            discover_test_cases(),
+        )
+        self.assertEqual(
+            sum(case.module == "test_platform_ci_classifier" for case in verification_cases),
+            int(EXPECTED_SNAPSHOT["verification_classifier_test_count"]),
+        )
+        with patch("tools.platform_verify._run", return_value=0) as run:
+            self.assertEqual(dispatch(VERIFICATION_CONTOUR), 0)
+
+        self.assertIsNone(
+            _integration_preflight_error(
+                migration_heads=["test-head"],
+                role_slugs={
+                    "authenticated_user",
+                    "player",
+                    "organizer",
+                    "moderator",
+                    "editor",
+                    "admin",
+                    "superadmin",
+                },
+                expected_head="test-head",
+            )
+        )
+        missing_seed = _integration_preflight_error(
+            migration_heads=["test-head"],
+            role_slugs={"admin"},
+            expected_head="test-head",
+        )
+        self.assertIsNotNone(missing_seed)
+        self.assertIn("missing required seed roles", str(missing_seed))
+        self.assertIn("authenticated_user", str(missing_seed))
+        self.assertEqual(
+            [call.args[1] for call in run.call_args_list],
+            list(_verification_contract_commands()),
+        )
 
     def test_production_contours_are_not_dispatchable_as_local_gates(self) -> None:
         with self.assertRaises(VerificationError):
@@ -49,7 +443,102 @@ class PlatformVerificationContractTests(unittest.TestCase):
         )
 
     def test_contract_self_test_is_clean(self) -> None:
+        self.assertEqual(ALLOWED_ACTION_OWNERS, frozenset({"actions"}))
+        self.assertEqual(action_pin_issues(), [])
+        self.assertEqual(workflow_level_permission_issues(), [])
+        self.assertEqual(
+            security_status_permission_issues(SECURITY_WORKFLOW.read_text(encoding="utf-8")),
+            [],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            action_file = Path(directory) / "action.yml"
+            action_file.write_text(
+                "\n".join(
+                    (
+                        "runs:",
+                        "  using: composite",
+                        "  steps:",
+                        "    - uses: ./local-action",
+                        "    - uses: actions/checkout@" + "a" * 40,
+                        "    - uses: actions/setup-python@v6",
+                        "    - uses: unapproved/action@" + "b" * 40,
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            action_issues = action_pin_issues([action_file])
+            self.assertEqual(len(action_issues), 2)
+            self.assertTrue(any("40-character commit SHA" in item for item in action_issues))
+            self.assertTrue(any("owner 'unapproved'" in item for item in action_issues))
         self.assertEqual(collect_issues(), [])
+        with tempfile.TemporaryDirectory() as directory:
+            component_dir = Path(directory)
+            _write_backend_component_fixture(component_dir)
+            aggregate = verify_backend_components(component_dir)
+            self.assertEqual(aggregate["status"], "passed")
+            expected_backend_count = int(EXPECTED_SNAPSHOT["backend_test_count"])
+            self.assertEqual(aggregate["tests_selected"], expected_backend_count)
+            self.assertEqual(aggregate["tests_run"], expected_backend_count)
+            expected_ids = aggregate["expected_ids"]
+            self.assertEqual(aggregate["executed_ids"], expected_ids)
+            self.assertEqual(len(aggregate["timings"]), expected_backend_count)
+
+        mutations = (
+            "duplicate executed ID",
+            "out-of-order executed IDs",
+            "unexpected executed ID",
+            "missing executed ID",
+            "empty timings",
+            "invalid timing duration",
+            "tests_run mismatch",
+            "out-of-order manifest IDs",
+            "duplicate manifest artifact",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                component_dir = Path(directory)
+                _write_backend_component_fixture(component_dir)
+                summary_path = (
+                    component_dir / "backend-unit" / "summary.json"
+                )
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                if mutation == "duplicate executed ID":
+                    summary["executed_ids"] = [
+                        summary["expected_ids"][0],
+                        *summary["expected_ids"],
+                    ]
+                elif mutation == "out-of-order executed IDs":
+                    summary["executed_ids"][0:2] = summary["executed_ids"][0:2][::-1]
+                elif mutation == "unexpected executed ID":
+                    summary["executed_ids"][0] = "tests.unexpected.TestCase.test_not_catalogued"
+                elif mutation == "missing executed ID":
+                    summary["executed_ids"] = summary["executed_ids"][:-1]
+                elif mutation == "empty timings":
+                    summary["timings"] = []
+                elif mutation == "invalid timing duration":
+                    summary["timings"][0]["duration_ms"] = -1
+                elif mutation == "tests_run mismatch":
+                    summary["tests_run"] -= 1
+                elif mutation == "out-of-order manifest IDs":
+                    manifest_path = component_dir / "backend-unit" / "manifest.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest["tests"][0:2] = manifest["tests"][0:2][::-1]
+                    manifest_path.write_text(
+                        json.dumps(manifest), encoding="utf-8"
+                    )
+                else:
+                    manifest_path = component_dir / "backend-unit" / "manifest.json"
+                    duplicate_path = component_dir / "duplicate" / "manifest.json"
+                    duplicate_path.parent.mkdir(parents=True, exist_ok=True)
+                    duplicate_path.write_text(
+                        manifest_path.read_text(encoding="utf-8"),
+                        encoding="utf-8",
+                    )
+                if mutation not in {"out-of-order manifest IDs", "duplicate manifest artifact"}:
+                    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    verify_backend_components(component_dir)
 
     def test_load_profiles_are_unique_and_have_stable_digests(self) -> None:
         profiles = load_profiles()
@@ -145,7 +634,7 @@ class PlatformVerificationContractTests(unittest.TestCase):
             self.assertEqual(profile["execution"]["generator"], "platform_production_qa.py")
             self.assertTrue(profile["execution"]["external_runner_forbidden"])
 
-        with self.assertRaisesRegex(LoadProfileError, "external runner"):
+        with self.assertRaisesRegex(LoadProfileError, "not dispatchable|external runner"):
             run_profile(
                 get_profile("tournament-lifecycle-slo-v1"),
                 Path("/tmp/unused-lifecycle-manifest.json"),
@@ -185,6 +674,10 @@ class PlatformVerificationContractTests(unittest.TestCase):
                     "tools.platform_load._source_git_sha",
                     return_value="a" * 40,
                 ),
+                patch.dict(
+                    os.environ,
+                    {"SOURCE_GIT_SHA": "a" * 40, "GITHUB_RUN_ID": "123"},
+                ),
             ):
                 self.assertEqual(
                     run_profile(profile, Path(directory) / "manifest.json", report_path),
@@ -192,6 +685,8 @@ class PlatformVerificationContractTests(unittest.TestCase):
                 )
             report = json.loads(report_path.read_text(encoding="utf-8"))
         self.assertEqual(report["source_git_sha"], "a" * 40)
+        self.assertTrue(report["authoritative"])
+        self.assertTrue(report["dispatchable"])
         self.assertEqual(report["load_contract"]["profile_id"], "ready-vote-slo-v2")
         self.assertEqual(report["load_contract"]["http_attempts"], 2)
 

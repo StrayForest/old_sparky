@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.platform_api.app.services.brackets import create_full_bracket_graph
@@ -22,6 +23,7 @@ from apps.platform_api.app.services.tournament_workflow import (
     deadlock_ready_candidate_rows_for_round,
     deadlock_ready_round_for_tournament,
     finalize_deadlock_assignment_with_commitments,
+    lock_deadlock_assignment_run_for_tournament,
     lock_tournament_for_workflow,
     prepare_deadlock_captain_candidate_rows,
     reconcile_finalized_captain_round_for_availability,
@@ -1112,6 +1114,14 @@ async def _ensure_assignment_handoff_completed(
     run_row: TournamentDeadlockAssignmentRun,
     now: datetime,
 ) -> bool:
+    run_row = await lock_deadlock_assignment_run_for_tournament(
+        db_session,
+        tournament_id=tournament.id,
+        run_id=run_row.id,
+    )
+    if run_row is None:
+        raise TournamentWorkflowError("The assignment run no longer exists.")
+
     changed = False
     if run_row.status == "generated":
         await supersede_published_deadlock_assignment_run_for_tournament(
@@ -1183,11 +1193,16 @@ async def _ensure_assignment_handoff_completed(
     if existing_match_count:
         return changed
 
-    created_matches, opening_matches = await create_full_bracket_graph(
-        db_session,
-        tournament=tournament,
-        locked_run=run_row,
-    )
+    try:
+        created_matches, opening_matches = await create_full_bracket_graph(
+            db_session,
+            tournament=tournament,
+            locked_run=run_row,
+        )
+    except IntegrityError as exc:
+        raise TournamentWorkflowError(
+            "The bracket graph could not be seeded because a match constraint failed."
+        ) from exc
     await write_audit_log(
         db_session,
         actor_user_id=AUTOMATION_ACTOR_USER_ID,

@@ -39,7 +39,7 @@ SYNTHETIC_EMAIL_PATTERN = re.compile(
     r"^(?P<marker>preprod[0-9]{12}[0-9a-f]{4})-[a-z0-9-]+@example\.com$"
 )
 RUN_ROOT_PATTERN = re.compile(
-    r"^/opt/oldsparky/platform/shared/production-retained-matrix/gha-(?P<run_id>[0-9]+)$"
+    r"^/opt/oldsparky/platform/shared/production-retained-matrix/gha-(?P<run_id>[1-9][0-9]{0,31})$"
 )
 RECOVERY_MODES = ("read-mix", "write-burst", "external-vote")
 
@@ -182,7 +182,7 @@ def build_recovered_summary(
         "mode": mode,
         "target_sha": "recovered-from-durable-run",
         "github_run_id": int(load_run_id),
-        "control_email": control_email,
+        "control_account_preserved": False,
         "planned_tournaments": planned_tournaments,
         "completed_tournaments": len(tournament_ids),
         "planned_users": planned_users,

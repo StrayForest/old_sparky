@@ -41,6 +41,12 @@ ORGANIZER_MODERATED_PARTICIPANT_STATUSES = frozenset(
 )
 PARTICIPANT_RESTORATION_STATUSES = frozenset({"registration_open", "registration_closed"})
 SOLO_TOURNAMENT_FORMAT = "solo"
+# Invite codes are bearer credentials, not user-entered display text.  Keep
+# this validator in the domain package so creation and every read path share
+# exactly the same canonical form instead of each route applying lossy
+# cleanup independently.
+INVITE_CODE_MIN_LENGTH = 10
+INVITE_CODE_MAX_LENGTH = 24
 # Ready Check timestamps are bounded to this supported workflow window. The
 # browser receives the schedule in the page payload and the server validates
 # the same window when a vote is submitted.
@@ -49,6 +55,23 @@ READY_CHECK_MAX_DURATION_SECONDS = 24 * 60 * 60
 
 class TournamentWorkflowError(ValueError):
     """Raised when a tournament or match workflow transition is invalid."""
+
+
+def normalize_strict_invite_code(value: object) -> str | None:
+    """Return the canonical invite code, or ``None`` for raw invalid input.
+
+    Do not strip, filter, transliterate, or otherwise repair a credential. A
+    code is exactly one 10–24 character ASCII alphanumeric value; lower-case
+    input is accepted only as a case-insensitive spelling of that same code.
+    """
+
+    if not isinstance(value, str):
+        return None
+    if not INVITE_CODE_MIN_LENGTH <= len(value) <= INVITE_CODE_MAX_LENGTH:
+        return None
+    if not value.isascii() or not value.isalnum():
+        return None
+    return value.upper()
 
 
 @dataclass(frozen=True, slots=True)
@@ -780,6 +803,14 @@ def resolve_match_report(
 
 
 def remaining_invite_uses(max_uses: int, use_count: int) -> int:
+    """Return the legacy display counter; it is not an access decision.
+
+    Invite-code reads are deliberately unlimited and non-consuming. The
+    durable ``max_uses``/``use_count`` columns remain compatibility metadata
+    for existing responses and must not be used to authorize a bearer read or
+    introduce a racing consumption write.
+    """
+
     return max(max_uses - use_count, 0)
 
 
@@ -797,9 +828,17 @@ def invite_is_active(
     expires_at: datetime | None,
     now: datetime,
 ) -> bool:
+    """Return whether a code is usable for read-only bearer authorization.
+
+    ``max_uses`` and ``use_count`` are retained in this signature for response
+    compatibility, but they are intentionally non-authoritative. Invite reads
+    do not consume a use, so reporting ``is_active=False`` solely because a
+    legacy counter is exhausted would contradict the authorization contract.
+    Join/registration remains responsible for its own workflow and capacity
+    checks.
+    """
+
     if revoked_at is not None:
-        return False
-    if remaining_invite_uses(max_uses, use_count) <= 0:
         return False
     if expires_at is not None and _normalize_timestamp(expires_at) <= _normalize_timestamp(now):
         return False
@@ -816,6 +855,15 @@ def ensure_invite_claimable(
     expires_at: datetime | None,
     now: datetime,
 ) -> None:
+    """Legacy compatibility validator; no active route calls this helper.
+
+    It remains importable for older callers/tests while invite access itself is
+    governed only by invite-only visibility, revocation and expiry. In
+    particular, ``max_uses``/``use_count`` are not a bearer-read authority and
+    this helper must not be introduced into a read path without a reviewed
+    consuming-claim design.
+    """
+
     if tournament_visibility != "invite_only":
         raise TournamentWorkflowError(
             "Invite claims are available only for invite-only tournaments."

@@ -328,6 +328,16 @@ class PlatformTournamentVisibilityApiTests(PlatformIsolatedAsyncioTestCase):
             params=workspace_params,
         )
         self.assertEqual(default_private_workspace.status_code, 403, default_private_workspace.text)
+        anonymous_private_workspace = await anonymous.get(
+            f"/api/v1/tournaments/{private_tournament['slug']}/workspace",
+            params=workspace_params,
+        )
+        self.assertEqual(anonymous_private_workspace.status_code, 401, anonymous_private_workspace.text)
+        unknown_workspace = await anonymous.get(
+            "/api/v1/tournaments/unknown-workspace-slug/workspace",
+            params=workspace_params,
+        )
+        self.assertEqual(unknown_workspace.status_code, 404, unknown_workspace.text)
         default_organizer_workspace = self._assert_status(
             await organizer["client"].get(
                 f"/api/v1/tournaments/{public_tournament['slug']}/workspace",
@@ -355,21 +365,48 @@ class PlatformTournamentVisibilityApiTests(PlatformIsolatedAsyncioTestCase):
             default_organizer_workspace["current_user"],
             expected_organizer_current_user,
         )
-        self.assertRegex(default_public_workspace["tournament"]["invite_code"], r"^[A-Z0-9]{10,24}$")
-        self.assertRegex(organizer_private_workspace["tournament"]["invite_code"], r"^[A-Z0-9]{10,24}$")
+        self.assertIsNone(default_public_workspace["tournament"]["invite_code"])
+        self.assertIsNone(organizer_private_workspace["tournament"]["invite_code"])
+        private_invites = self._assert_status(
+            await organizer["client"].get(
+                f"/api/v1/tournaments/{private_tournament['slug']}/invites"
+            ),
+            200,
+        )
+        private_invite_code = private_invites[0]["code"]
+        second_private_invite = self._assert_status(
+            await organizer["client"].post(
+                f"/api/v1/tournaments/{private_tournament['slug']}/invites",
+                json={"note": "Visibility A/B test", "max_uses": 1, "expires_at": None},
+            ),
+            201,
+        )
         private_with_code = self._assert_status(
             await outsider["client"].get(
                 f"/api/v1/tournaments/{private_tournament['slug']}/workspace",
-                params={**workspace_params, "invite_code": organizer_private_workspace["tournament"]["invite_code"]},
+                params={**workspace_params, "invite_code": private_invite_code},
             ),
             200,
         )
         anonymous_with_code = self._assert_status(
             await anonymous.get(
                 f"/api/v1/tournaments/{private_tournament['slug']}/workspace",
-                params={**workspace_params, "invite_code": organizer_private_workspace["tournament"]["invite_code"]},
+                params={**workspace_params, "invite_code": private_invite_code},
             ),
             200,
+        )
+        self.assertEqual(private_with_code["tournament"]["invite_code"], private_invite_code)
+        self.assertEqual(anonymous_with_code["tournament"]["invite_code"], private_invite_code)
+        anonymous_with_second_code = self._assert_status(
+            await anonymous.get(
+                f"/api/v1/tournaments/{private_tournament['slug']}/workspace",
+                params={**workspace_params, "invite_code": second_private_invite["code"]},
+            ),
+            200,
+        )
+        self.assertEqual(
+            anonymous_with_second_code["tournament"]["invite_code"],
+            second_private_invite["code"],
         )
 
         with (
@@ -462,6 +499,130 @@ class PlatformTournamentVisibilityApiTests(PlatformIsolatedAsyncioTestCase):
         self.assertIsNotNone(default_organizer_workspace["ready_check"])
         self.assertIsNotNone(default_organizer_workspace["auto_assignment"])
 
+    async def test_bracket_conditional_response_rechecks_private_access_after_revoke(self) -> None:
+        organizer = await self._register_user("etag-organizer")
+        active_member = await self._register_user("etag-member")
+        outsider = await self._register_user("etag-outsider")
+        admin = await self._register_user("etag-admin")
+        anonymous = await self._new_client()
+        await self._grant_role(admin["user_id"], "admin")
+
+        tournament = self._assert_status(
+            await organizer["client"].post(
+                "/api/v1/tournaments",
+                json={
+                    "name": f"{self.prefix}-e",
+                    "visibility": "invite_only",
+                    "format_slug": "solo",
+                },
+            ),
+            201,
+        )
+        slug = tournament["slug"]
+        invite = self._assert_status(
+            await organizer["client"].get(f"/api/v1/tournaments/{slug}/invites"),
+            200,
+        )[0]
+        code = invite["code"]
+
+        self._assert_status(
+            await organizer["client"].post(
+                f"/api/v1/tournaments/{slug}/participants/manage",
+                json={
+                    "user_email": active_member["email"],
+                    "entry_type": "solo",
+                    "team_name": None,
+                },
+            ),
+            201,
+        )
+
+        initial = await anonymous.get(
+            f"/api/v1/tournaments/{slug}/bracket",
+            params={"invite_code": code},
+        )
+        self.assertEqual(initial.status_code, 200, initial.text)
+        etag = initial.headers.get("etag")
+        self.assertIsNotNone(etag)
+        self.assertEqual(initial.headers.get("cache-control"), "private, no-cache")
+        self.assertIn('"matches"', initial.text)
+
+        self._assert_status(
+            await organizer["client"].delete(
+                f"/api/v1/tournaments/{slug}/invites/{invite['id']}"
+            ),
+            204,
+        )
+
+        # Losing the bearer grant must not turn the old validator into a
+        # successful 304. The application must not attach the private
+        # representation headers to these authorization failures.
+        for client, expected_status, label in (
+            (anonymous, 401, "anonymous"),
+            (outsider["client"], 403, "authenticated-outsider"),
+        ):
+            for code_label, params in (
+                ("no-code", {}),
+                ("same-revoked-code", {"invite_code": code}),
+                ("old-code-case", {"invite_code": code.lower()}),
+            ):
+                for validator in (etag, "*"):
+                    with self.subTest(
+                        viewer=label,
+                        code=code_label,
+                        validator=validator,
+                    ):
+                        response = await client.get(
+                            f"/api/v1/tournaments/{slug}/bracket",
+                            params=params,
+                            headers={"If-None-Match": validator},
+                        )
+                        self.assertEqual(response.status_code, expected_status, response.text)
+                        self.assertNotEqual(response.status_code, 304)
+                        self.assertNotIn("etag", response.headers)
+                        self.assertNotIn("cache-control", response.headers)
+                        self.assertNotIn(code, response.text)
+
+        # Membership and platform-admin authority remain independent of the
+        # revoked bearer. Both should receive the current representation, and
+        # conditional requests are allowed to return 304 only after that
+        # independent authorization succeeds.
+        member_bracket = await active_member["client"].get(
+            f"/api/v1/tournaments/{slug}/bracket"
+        )
+        self.assertEqual(member_bracket.status_code, 200, member_bracket.text)
+        self.assertFalse(member_bracket.json()["can_manage"])
+        self.assertEqual(member_bracket.headers.get("etag"), etag)
+
+        admin_bracket = await admin["client"].get(
+            f"/api/v1/tournaments/{slug}/bracket"
+        )
+        self.assertEqual(admin_bracket.status_code, 200, admin_bracket.text)
+        self.assertTrue(admin_bracket.json()["can_manage"])
+        self.assertEqual(admin_bracket.headers.get("etag"), etag)
+
+        for client, expected_can_manage, label in (
+            (active_member["client"], False, "active-member"),
+            (admin["client"], True, "admin"),
+        ):
+            for validator in (etag, "*"):
+                with self.subTest(viewer=label, validator=validator):
+                    response = await client.get(
+                        f"/api/v1/tournaments/{slug}/bracket",
+                        headers={"If-None-Match": validator},
+                    )
+                    self.assertIn(response.status_code, (200, 304), response.text)
+                    if response.status_code == 200:
+                        self.assertEqual(response.json()["can_manage"], expected_can_manage)
+                        self.assertIn('"matches"', response.text)
+                    else:
+                        self.assertEqual(response.content, b"")
+                        self.assertEqual(response.headers.get("etag"), etag)
+                        self.assertEqual(
+                            response.headers.get("cache-control"),
+                            "private, no-cache",
+                        )
+
     async def test_invite_only_summary_requires_auth_and_scopes_roster_reads(self) -> None:
         organizer = await self._register_user("organizer")
         outsider = await self._register_user("outsider")
@@ -498,20 +659,20 @@ class PlatformTournamentVisibilityApiTests(PlatformIsolatedAsyncioTestCase):
         blocked_participants = await outsider["client"].get(f"/api/v1/tournaments/{slug}/participants")
         self.assertEqual(blocked_participants.status_code, 403, blocked_participants.text)
         self.assertIn(
-            "Tournament roster and bracket data are visible only to joined participants, the organizer, or platform admins.",
+            "Tournament roster, bracket, and match data require a valid invite code, active membership, the organizer role, or a platform admin role.",
             blocked_participants.json()["detail"],
         )
 
         blocked_matches = await outsider["client"].get(f"/api/v1/tournaments/{slug}/matches")
         self.assertEqual(blocked_matches.status_code, 403, blocked_matches.text)
         self.assertIn(
-            "Tournament roster and bracket data are visible only to joined participants, the organizer, or platform admins.",
+            "Tournament roster, bracket, and match data require a valid invite code, active membership, the organizer role, or a platform admin role.",
             blocked_matches.json()["detail"],
         )
         blocked_bracket = await outsider["client"].get(f"/api/v1/tournaments/{slug}/bracket")
         self.assertEqual(blocked_bracket.status_code, 403, blocked_bracket.text)
         self.assertIn(
-            "Tournament roster and bracket data are visible only to joined participants, the organizer, or platform admins.",
+            "Tournament roster, bracket, and match data require a valid invite code, active membership, the organizer role, or a platform admin role.",
             blocked_bracket.json()["detail"],
         )
         scoped_workspace = await outsider["client"].get(f"/api/v1/tournaments/{slug}/workspace")

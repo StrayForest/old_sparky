@@ -67,6 +67,21 @@ from apps.platform_api.app.services.tournament_read_models import (
 from apps.platform_api.app.services.tournament_participant_capacity import (
     ensure_participant_slot_claimed,
 )
+from tools.platform_evidence_sanitizer import (
+    SAFE_ROUTE_CLASSES,
+    finite_number,
+    safe_backend,
+    safe_error_class,
+    safe_method,
+    safe_outcome,
+    safe_phase,
+    safe_route_class,
+    safe_route_key,
+    safe_route_template,
+    safe_stage,
+    safe_status,
+    safe_wait_state,
+)
 
 
 VALID_RANKS = list(RANKS[:-1])
@@ -307,25 +322,22 @@ def response_diagnostics(
     method: str,
     path: str,
 ) -> dict[str, Any]:
-    """Return bounded, secret-safe evidence for an unexpected HTTP response."""
+    """Return fixed, value-free evidence for an unexpected HTTP response."""
 
-    headers: dict[str, str] = {}
-    for name, value in response.headers.items():
-        headers[name.lower()] = (
-            "<redacted>"
-            if SENSITIVE_RESPONSE_HEADER_RE.search(name)
-            else value[:500]
-        )
+    header_names = {str(name).lower() for name in response.headers}
     return {
-        "captured_at": datetime.now(UTC).isoformat(),
-        "method": method,
-        "path": path.split("?", 1)[0],
-        "status": response.status_code,
-        "headers": headers,
-        "body": response.content[:RESPONSE_DIAGNOSTIC_BODY_LIMIT].decode(
-            "utf-8",
-            errors="replace",
-        ),
+        "schema": 1,
+        "method": safe_method(method),
+        "route_class": safe_route_class(path),
+        "status": safe_status(response.status_code),
+        "error_class": "unexpected_status",
+        "response_bytes": len(response.content or b""),
+        "header_presence": {
+            "retry_after": "retry-after" in header_names,
+            "etag": "etag" in header_names,
+            "cf_error": "cf-error-type" in header_names or "cf-error-origin" in header_names,
+            "content_type": "content-type" in header_names,
+        },
     }
 
 
@@ -408,12 +420,10 @@ def byte_stats(values: list[int]) -> dict[str, Any]:
 
 
 def normalize_path(path: str, *, tournament_slug: str | None) -> str:
-    normalized = path.split("?", 1)[0]
-    if tournament_slug:
-        normalized = normalized.replace(f"/{tournament_slug}", "/{slug}")
-    normalized = UUID_RE.sub("/{uuid}", normalized)
-    normalized = NUMERIC_PATH_RE.sub("/{id}", normalized)
-    return normalized
+    # Kept as a compatibility helper for callers that previously requested a
+    # normalized path.  It now returns only a closed template, never a caller
+    # supplied slug, query, UUID or numeric identifier.
+    return safe_route_template(path)
 
 
 def normalize_path_for_slugs(
@@ -422,14 +432,55 @@ def normalize_path_for_slugs(
     tournament_slug: str | None,
     tournament_slugs: list[str] | tuple[str, ...] = (),
 ) -> str:
-    normalized = path.split("?", 1)[0]
-    for slug in tournament_slugs:
-        normalized = normalized.replace(f"/{slug}", "/{slug}")
-    if tournament_slug:
-        normalized = normalized.replace(f"/{tournament_slug}", "/{slug}")
-    normalized = UUID_RE.sub("/{uuid}", normalized)
-    normalized = NUMERIC_PATH_RE.sub("/{id}", normalized)
-    return normalized
+    # ``tournament_slug`` and ``tournament_slugs`` are accepted for API
+    # compatibility only.  Route evidence is classified without echoing any
+    # of those values.
+    del tournament_slug, tournament_slugs
+    return safe_route_template(path)
+
+
+def _safe_qa_scenario_detail(value: Any, *, key: str = "") -> Any:
+    """Bound scenario details before they enter a durable QA report.
+
+    Scenario details are assembled from response bodies and exception text in
+    a few legacy QA branches.  Keep booleans, counts and timing values useful,
+    but never persist a body, credential, identifier, URL, query or arbitrary
+    string supplied by the system under test.
+    """
+
+    key_name = key.strip().lower().replace("-", "_")
+    if any(token in key_name for token in ("email", "token", "password", "cookie", "authorization", "secret", "csrf")):
+        return bool(value)
+    if key_name in {"path", "uri", "url", "origin", "route", "request_path"}:
+        return {"route_class": safe_route_class(value)}
+    if key_name in {"body", "response", "response_text", "raw", "query", "sql", "exception", "message", "error", "fatal_error"}:
+        return {"error_class": safe_error_class(value)}
+    if key_name.endswith("_id") or key_name in {"id", "request_id", "diagnostic_id", "correlation_id", "slug"}:
+        return bool(value)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return finite_number(value)
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            child_key = str(raw_key)
+            child_value = _safe_qa_scenario_detail(raw_value, key=child_key)
+            if child_key.lower() in {"path", "uri", "url", "origin", "route", "request_path"}:
+                output.pop(child_key, None)
+                output["route_class"] = child_value.get("route_class", "other")
+            elif child_key.lower().endswith("_id") or child_key.lower() in {"id", "slug", "request_id", "diagnostic_id", "correlation_id"}:
+                output[f"{child_key}_present"] = bool(raw_value)
+            elif child_value is not None:
+                output[child_key] = child_value
+        return output
+    if isinstance(value, (list, tuple, set)):
+        return {"count": len(value)}
+    # Only fixed, low-cardinality labels may survive as strings.
+    raw = str(value).strip().lower().replace("-", "_")
+    if re.fullmatch(r"[a-z0-9_]{1,64}", raw):
+        return raw
+    return "value_present" if raw else None
 
 
 @dataclass(slots=True)
@@ -488,13 +539,15 @@ class HttpMetricsRecorder:
     def _read_model_summary(samples: list[HttpSample]) -> dict[str, Any]:
         outcomes: Counter[str] = Counter()
         models: Counter[str] = Counter()
+        allowed_models = {"teams", "workspace_detail", "bracket_summary", "bracket_full"}
+        allowed_outcomes = {"hit", "miss", "stale", "error", "other"}
         for sample in samples:
             for event in sample.read_model_events:
                 model, separator, outcome = event.partition(":")
                 if not separator:
                     continue
-                models[model] += 1
-                outcomes[outcome] += 1
+                models[model if model in allowed_models else "other"] += 1
+                outcomes[outcome if outcome in allowed_outcomes else "other"] += 1
         return {
             "events": sum(outcomes.values()),
             "by_outcome": dict(sorted(outcomes.items())),
@@ -533,7 +586,7 @@ class HttpMetricsRecorder:
         status_counts: Counter[str] = Counter()
         for sample in samples:
             by_phase[sample.phase].append(sample.elapsed_ms)
-            route_key = f"{sample.method} {sample.path}"
+            route_key = safe_route_key(sample.method, sample.path)
             by_route[route_key].append(sample.elapsed_ms)
             by_phase_bytes[sample.phase].append(sample.response_bytes)
             by_route_bytes[route_key].append(sample.response_bytes)
@@ -622,7 +675,10 @@ def follow_up_read_counts(
             continue
         if sample.method != "GET":
             continue
-        counts[f"{sample.method} {sample.path}"] += 1
+        # The helper is consumed by the persisted QA report.  Keep the read
+        # contour useful without allowing a slug, query, UUID, or invite code
+        # to become a durable route key.
+        counts[safe_route_key(sample.method, sample.path)] += 1
     return dict(sorted(counts.items()))
 
 
@@ -1147,36 +1203,29 @@ async def sample_postgres_waits() -> dict[str, Any]:
                             ) AS backend_connections,
                             (
                                 SELECT COALESCE(
-                                    json_agg(
-                                        json_build_object(
-                                            'state', activity.state,
-                                            'application_name', coalesce(activity.application_name, ''),
-                                            'wait_event_type', activity.wait_event_type,
-                                            'wait_event', activity.wait_event,
-                                            'query_age_ms', round(
-                                                extract(epoch FROM now() - activity.query_start) * 1000,
-                                                3
-                                            ),
-                                            'query', left(
-                                                regexp_replace(activity.query, E'\\s+', ' ', 'g'),
-                                                240
-                                            )
-                                        )
-                                        ORDER BY activity.query_start
-                                    ),
-                                    '[]'::json
+                                    json_object_agg(wait_state, state_count),
+                                    '{}'::json
                                 )
                                 FROM (
-                                    SELECT state, application_name, wait_event_type, wait_event, query_start, query
+                                    SELECT
+                                        CASE lower(coalesce(wait_event_type, ''))
+                                            WHEN 'lock' THEN 'lock'
+                                            WHEN 'io' THEN 'io'
+                                            WHEN 'lwlock' THEN 'lwlock'
+                                            WHEN 'client' THEN 'client'
+                                            WHEN 'ipc' THEN 'ipc'
+                                            WHEN 'timeout' THEN 'timeout'
+                                            ELSE 'other'
+                                        END AS wait_state,
+                                        count(*)::integer AS state_count
                                     FROM pg_stat_activity
                                     WHERE datname = current_database()
                                       AND pid <> pg_backend_pid()
                                       AND state = 'active'
-                                      AND query_start IS NOT NULL
-                                    ORDER BY query_start
-                                    LIMIT 8
-                                ) AS activity
-                            ) AS active_query_samples,
+                                      AND wait_event_type IS NOT NULL
+                                    GROUP BY 1
+                                ) AS wait_states
+                            ) AS wait_state_counts,
                             (
                                 SELECT COALESCE(
                                     json_agg(
@@ -1211,11 +1260,11 @@ async def sample_postgres_waits() -> dict[str, Any]:
                 ),
                 "ungranted_locks": int(row["ungranted_locks"] or 0),
                 "backend_connections": int(row["backend_connections"] or 0),
-                "active_query_samples": row["active_query_samples"] or [],
+                "wait_state_counts": row["wait_state_counts"] or {},
                 "backend_ownership": row["backend_ownership"] or [],
             }
     except Exception as exc:
-        return {"error": type(exc).__name__}
+        return {"error_class": safe_error_class(type(exc).__name__)}
 
 
 class SystemSampler:
@@ -1249,7 +1298,7 @@ class SystemSampler:
                 for queue, length in zip(queue_names, lengths, strict=True)
             }
         except Exception as exc:
-            return {"error": type(exc).__name__}
+            return {"error_class": safe_error_class(type(exc).__name__)}
 
     async def start(self) -> None:
         if self._task is None:
@@ -1467,21 +1516,17 @@ class SystemSampler:
             )
             for row in postgres_wait_rows
         ]
-        active_query_samples: list[dict[str, Any]] = []
-        for row in postgres_wait_rows:
-            active_rows = row.get("active_query_samples")
-            if not isinstance(active_rows, list):
-                continue
-            active_query_samples.extend(
-                sample for sample in active_rows if isinstance(sample, dict)
-            )
-        active_query_samples.sort(
-            key=lambda sample: float(sample.get("query_age_ms") or 0),
-            reverse=True,
-        )
         ownership_values: dict[str, list[int]] = defaultdict(list)
+        wait_state_values: dict[str, list[int]] = defaultdict(list)
         ownership_consistency: list[bool] = []
         for row in postgres_wait_rows:
+            state_counts = row.get("wait_state_counts")
+            if isinstance(state_counts, dict):
+                for state, current in state_counts.items():
+                    try:
+                        wait_state_values[safe_wait_state(state)].append(max(0, int(current or 0)))
+                    except (TypeError, ValueError):
+                        continue
             ownership = row.get("backend_ownership")
             if not isinstance(ownership, list):
                 continue
@@ -1489,7 +1534,7 @@ class SystemSampler:
             for entry in ownership:
                 if not isinstance(entry, dict):
                     continue
-                application_name = str(entry.get("application_name") or "unknown")
+                application_name = safe_backend(entry.get("application_name"))
                 try:
                     current = max(0, int(entry.get("current") or 0))
                     ownership_total += current
@@ -1654,7 +1699,15 @@ class SystemSampler:
                     max(postgres_lock_waiting_query_ms or [0]),
                     3,
                 ),
-                "active_query_samples": active_query_samples[:16],
+                "wait_state_counts": {
+                    state: {
+                        "samples": len(values),
+                        "max": max(values or [0]),
+                        "last": values[-1] if values else 0,
+                    }
+                    for state, values in sorted(wait_state_values.items())
+                    if values
+                },
             },
             "postgres_backend_ownership": {
                 application_name: {
@@ -1859,17 +1912,16 @@ def summarize_request_perf_logs(
     by_method_route: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_qa_phase: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        route = str(row.get("route") or row.get("path") or "")
-        normalized_route = normalize_path_for_slugs(
-            route,
-            tournament_slug=tournament_slug,
-            tournament_slugs=tournament_slugs,
-        )
-        by_route[normalized_route].append(row)
-        by_method_route[f"{str(row.get('method') or '').upper()} {normalized_route}".strip()].append(row)
-        qa_phase = str(row.get("qa_phase") or "")
-        if qa_phase and qa_phase != "-":
-            by_qa_phase[qa_phase].append(row)
+        # Prefer the request path when present; older request_perf lines also
+        # carry a route template, but that template may use a leading
+        # ``/{slug}`` shorthand.  Both forms are classified, never emitted.
+        route = row.get("path") or row.get("route") or ""
+        route_class = safe_route_class(route)
+        by_route[route_class].append(row)
+        by_method_route[safe_route_key(row.get("method"), route)].append(row)
+        raw_phase = str(row.get("qa_phase") or "").strip()
+        if raw_phase and raw_phase != "-":
+            by_qa_phase[safe_phase(raw_phase)].append(row)
 
     def row_metric_stats(key: str, row_values: list[dict[str, Any]]) -> dict[str, Any]:
         values = [float(row[key]) for row in row_values if isinstance(row.get(key), (int, float))]
@@ -1892,10 +1944,23 @@ def summarize_request_perf_logs(
         )
 
     def controller_state_counts(row_values: list[dict[str, Any]]) -> dict[str, int]:
+        allowed_states = {
+            "open",
+            "closed",
+            "locked",
+            "admitting",
+            "pressure",
+            "shed",
+            "other",
+        }
         return dict(
             sorted(
                 Counter(
-                    str(row["ready_vote_controller_state"])
+                    (
+                        str(row["ready_vote_controller_state"]).lower()
+                        if str(row["ready_vote_controller_state"]).lower() in allowed_states
+                        else "other"
+                    )
                     for row in row_values
                     if isinstance(row.get("ready_vote_controller_state"), str)
                 ).items()
@@ -1905,13 +1970,14 @@ def summarize_request_perf_logs(
     def read_model_summary(row_values: list[dict[str, Any]]) -> dict[str, Any]:
         models: Counter[str] = Counter()
         outcomes: Counter[str] = Counter()
+        allowed_models = {"teams", "workspace_detail", "bracket_summary", "bracket_full", "other"}
         for row in row_values:
             for model in str(row.get("redis_read_model_models") or "").split("|"):
                 if model and model != "-":
-                    models[model] += 1
+                    models[model if model in allowed_models else "other"] += 1
             for outcome in str(row.get("redis_read_model_outcomes") or "").split("|"):
                 if outcome and outcome != "-":
-                    outcomes[outcome] += 1
+                    outcomes[safe_outcome(outcome)] += 1
         payload_values = [
             int(row["redis_read_model_payload_bytes"])
             for row in row_values
@@ -2175,7 +2241,7 @@ def summarize_bottleneck_evidence(
         if not isinstance(total, dict):
             total = {}
         server_sql_hotspots.append({
-            "route": route,
+            "route": route if route in SAFE_ROUTE_CLASSES else "other",
             "requests": metrics.get("requests"),
             "p95_ms": total.get("p95_ms"),
             "avg_sql_queries_per_request": metrics.get("avg_sql_queries_per_request"),
@@ -2259,7 +2325,7 @@ def summarize_bottleneck_evidence(
             if not isinstance(row, dict):
                 continue
             top_processes_by_cpu.append({
-                "name": label,
+                "name": safe_backend(label),
                 "avg_cpu_percent": row.get("avg_cpu_percent"),
                 "max_cpu_percent": row.get("max_cpu_percent"),
                 "avg_rss_mb": row.get("avg_rss_mb"),
@@ -2561,23 +2627,24 @@ def _nginx_html_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return selected
 
 
+def _safe_transport_value(value: Any) -> str:
+    """Keep only low-cardinality transport labels from access logs."""
+
+    raw = str(value or "").strip().lower()
+    if not raw or raw in {"-", "none"}:
+        return "none"
+    if raw in {"gzip", "br", "identity", "chunked"}:
+        return raw
+    return "other"
+
+
 def _nginx_api_route(record: dict[str, Any]) -> str | None:
     """Return a safe route class without retaining a user-controlled path."""
 
-    path = str(record.get("uri") or "").split("?", 1)[0]
-    if path == "/api/v1/auth/bootstrap":
-        return "auth_bootstrap"
-    if path == "/api/v1/users/me":
-        return "users_me"
-    if path == "/api/v1/tournaments":
-        return "tournaments_collection"
-    if re.fullmatch(r"/api/v1/tournaments/[^/]+/deadlock/ready-check/vote", path):
-        return "ready_vote"
-    if re.fullmatch(r"/api/v1/tournaments/[^/]+", path):
-        return "tournament_detail"
-    if path.startswith("/api/v1/"):
-        return "other_api"
-    return None
+    path = record.get("uri") or ""
+    if not str(path).startswith("/api/v1/"):
+        return None
+    return safe_route_class(path)
 
 
 def _nginx_api_records(records: list[dict[str, Any]]) -> list[tuple[str, str, int, dict[str, Any]]]:
@@ -2590,7 +2657,7 @@ def _nginx_api_records(records: list[dict[str, Any]]) -> list[tuple[str, str, in
             status = int(record.get("status") or 0)
         except (TypeError, ValueError):
             continue
-        method = str(record.get("method") or "").upper() or "-"
+        method = safe_method(record.get("method"))
         selected.append((route, method, status, record))
     return selected
 
@@ -2617,20 +2684,7 @@ def _nginx_request_correlation_keys(record: dict[str, Any]) -> tuple[str, ...]:
 def _safe_request_perf_route_class(row: dict[str, Any]) -> str:
     """Map a request_perf route to the same bounded class as Nginx data."""
 
-    route = str(row.get("route") or row.get("path") or "").split("?", 1)[0]
-    if route.endswith("/auth/bootstrap"):
-        return "auth_bootstrap"
-    if route.endswith("/users/me"):
-        return "users_me"
-    if route.endswith("/deadlock/ready-check/vote"):
-        return "ready_vote"
-    if route.endswith("/tournaments"):
-        return "tournaments_collection"
-    if "/tournaments/" in route and route.endswith("/workspace"):
-        return "tournament_workspace"
-    if "/tournaments/" in route:
-        return "tournament_detail"
-    return "other_api"
+    return safe_route_class(row.get("route") or row.get("path") or "")
 
 
 def summarize_ssr_observability(
@@ -2668,7 +2722,7 @@ def summarize_ssr_observability(
         duration = row.get("duration_ms")
         if not isinstance(duration, (int, float)):
             continue
-        stage = str(row["stage"])
+        stage = safe_stage(row.get("stage"))
         request_id = str(row["request_id"])
         by_stage[stage].append(float(duration))
         by_request[request_id][stage].append(float(duration))
@@ -2685,7 +2739,7 @@ def summarize_ssr_observability(
                 "start_ms": float(start_ms),
                 "end_ms": float(end_ms),
                 "duration_ms": float(duration),
-                "outcome": str(row.get("outcome") or "ok"),
+                "outcome": safe_outcome(row.get("outcome") or "ok"),
                 **(
                     {"journal_timestamp": row["journal_timestamp"]}
                     if row.get("journal_timestamp")
@@ -2697,7 +2751,7 @@ def summarize_ssr_observability(
     by_request_stream: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in stream_rows:
         request_id = str(row["request_id"])
-        stage = str(row["stage"])
+        stage = safe_stage(row.get("stage"))
         by_request_stream[request_id].append(row)
 
     api_perf_by_request: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -2709,15 +2763,10 @@ def summarize_ssr_observability(
         if start_row is not None:
             api_start_by_request[str(start_row["request_id"])].append(
                 {
-                    key: start_row[key]
-                    for key in (
-                        "request_id",
-                        "diagnostic_id",
-                        "method",
-                        "path",
-                        "journal_timestamp",
-                    )
-                    if key in start_row
+                    "method": safe_method(start_row.get("method")),
+                    "route_class": safe_route_class(
+                        start_row.get("path") or ""
+                    ),
                 }
             )
             continue
@@ -2726,16 +2775,6 @@ def summarize_ssr_observability(
             continue
         api_row = {
             "route_class": _safe_request_perf_route_class(row),
-            **(
-                {"diagnostic_id": row["diagnostic_id"]}
-                if row.get("diagnostic_id")
-                else {}
-            ),
-            **(
-                {"server_logged_at": row["journal_timestamp"]}
-                if row.get("journal_timestamp")
-                else {}
-            ),
             **{
                 key: row[key]
                 for key in (
@@ -2778,13 +2817,12 @@ def summarize_ssr_observability(
         if not stages and not stream_events:
             continue
         row: dict[str, Any] = {
-            **({"diagnostic_id": diagnostic_id} if diagnostic_id else {}),
             "request_ms": _nginx_seconds(record.get("request_time")),
             "upstream_connect_ms": _nginx_seconds(record.get("upstream_connect_time")),
             "upstream_header_ms": _nginx_seconds(record.get("upstream_header_time")),
             "upstream_ms": _nginx_seconds(record.get("upstream_time")),
             "transport": {
-                key: str(record.get(key) or "").strip() or "none"
+                key: _safe_transport_value(record.get(key))
                 for key in (
                     "upstream_content_encoding",
                     "content_encoding",
@@ -2821,16 +2859,16 @@ def summarize_ssr_observability(
                 root_relative_ms = elapsed_ms - request_to_root_ms
                 timeline_event: dict[str, Any] = {
                     "source": "stream",
-                    "stage": str(stream_event["stage"]),
+                    "stage": safe_stage(stream_event.get("stage")),
                     "start_ms": root_relative_ms,
                     "end_ms": root_relative_ms,
                     "duration_ms": 0.0,
-                    "outcome": "ok",
+                    "outcome": safe_outcome(stream_event.get("outcome") or "ok"),
                 }
-                for key in ("status", "writable_finished", "write_count", "body_bytes", "response_error"):
+                for key in ("status", "writable_finished", "write_count", "body_bytes"):
                     value = stream_event.get(key)
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
-                        timeline_event[key] = value
+                        timeline_event[key] = safe_status(value) if key == "status" else value
                 timeline.append(timeline_event)
         ordered_timeline = sorted(
             enumerate(timeline),
@@ -2843,7 +2881,7 @@ def summarize_ssr_observability(
         row["timeline"] = [event for _order, event in ordered_timeline]
         row["stream_clock_aligned"] = request_to_root_ms is not None
         api_rows: list[dict[str, Any]] | None = None
-        api_join_method = None
+        api_join_method: str | None = None
         for correlation_key in correlation_keys:
             candidate_rows = api_perf_by_request.get(correlation_key)
             if not candidate_rows:
@@ -2864,7 +2902,7 @@ def summarize_ssr_observability(
                 api_join_method = "cf_ray"
         if api_rows:
             row["api_request_perf"] = api_rows
-            row["api_request_perf_correlation"] = api_join_method
+            row["api_request_perf_correlation"] = api_join_method or "matched"
         correlated_rows.append(row)
 
     def metric_for_rows(key: str) -> dict[str, Any]:
@@ -2873,19 +2911,108 @@ def summarize_ssr_observability(
         )
 
     stage_presence = {
-        stage: sum(1 for row in correlated_rows if stage in row)
+        safe_stage(stage): sum(
+            1 for row in correlated_rows if safe_stage(stage) in row
+        )
         for stage in sorted(by_stage)
     }
     stream_stage_presence = {
-        stage: sum(
+        safe_stage(stage): sum(
             1
             for row in correlated_rows
-            if any(event["stage"] == stage for event in row.get("timeline", []))
+            if any(event["stage"] == safe_stage(stage) for event in row.get("timeline", []))
         )
         for stage in sorted({str(row["stage"]) for row in stream_rows})
     }
 
     timeout_diagnostic_rows: list[dict[str, Any]] = []
+
+    def _safe_stage_event(event: dict[str, Any]) -> dict[str, Any]:
+        output: dict[str, Any] = {
+            "stage": safe_stage(event.get("stage")),
+            "start_ms": finite_number(event.get("start_ms")),
+            "end_ms": finite_number(event.get("end_ms")),
+            "duration_ms": finite_number(event.get("duration_ms")),
+            "outcome": safe_outcome(event.get("outcome")),
+        }
+        return output
+
+    def _safe_stream_event(event: dict[str, Any]) -> dict[str, Any]:
+        output: dict[str, Any] = {
+            "stage": safe_stage(event.get("stage")),
+            "elapsed_ms": finite_number(event.get("elapsed_ms")),
+        }
+        for key in ("start_ms", "end_ms", "duration_ms"):
+            value = finite_number(event.get(key))
+            if value is not None:
+                output[key] = value
+        for key in ("active_requests", "write_count", "body_bytes"):
+            value = event.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                output[key] = value
+        if isinstance(event.get("status"), (int, float)) and not isinstance(event.get("status"), bool):
+            output["status"] = safe_status(event.get("status"))
+        writable_finished = event.get("writable_finished")
+        if isinstance(writable_finished, bool):
+            output["writable_finished"] = writable_finished
+        elif isinstance(writable_finished, int) and writable_finished in {0, 1}:
+            output["writable_finished"] = writable_finished
+        return output
+
+    def _safe_api_perf_row(row: dict[str, Any]) -> dict[str, Any]:
+        allowed_route_classes = {
+            "auth_bootstrap",
+            "auth_csrf",
+            "auth_session",
+            "users_me",
+            "profiles_me",
+            "profile_deadlock",
+            "profile_dream_slots",
+            "tournaments_collection",
+            "tournament_detail",
+            "tournament_workspace",
+            "tournament_bracket",
+            "tournament_participants",
+            "ready_check_state",
+            "ready_vote",
+            "ready_lock",
+            "auto_assignment",
+            "other",
+        }
+        output: dict[str, Any] = {
+            "route_class": (
+                row.get("route_class")
+                if row.get("route_class") in allowed_route_classes
+                else "other"
+            )
+        }
+        for key in (
+            "total_ms",
+            "request_ms",
+            "sql_ms",
+            "pool_checkout_wait_ms",
+            "pool_connection_hold_ms",
+            "compute_ms",
+        ):
+            value = finite_number(row.get(key))
+            if value is not None:
+                output[key] = value
+        for key in ("sql_count", "response_bytes"):
+            value = row.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                output[key] = value
+        return output
+
+    def _safe_request_completion(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"ok", "completed", "complete", "success"}:
+            return "completed"
+        if raw in {"timeout", "timed_out"}:
+            return "timeout"
+        if raw in {"aborted", "client_aborted", "error"}:
+            return "aborted"
+        return "other"
+
     for record in nginx_records:
         diagnostic_id = str(record.get("timeout_diagnostic_id") or "").strip()
         if not diagnostic_id or (
@@ -2911,17 +3038,14 @@ def summarize_ssr_observability(
             api_rows = api_perf_by_cf_ray.get(cf_ray, [])
         timeout_diagnostic_rows.append(
             {
-                "diagnostic_id": diagnostic_id,
-                "nginx_recorded_at": str(record.get("time") or "") or None,
-                "nginx_request_id": str(record.get("request_id") or "") or None,
-                "cf_ray": str(record.get("cf_ray") or "") or None,
-                "method": str(record.get("method") or "") or None,
-                "status": record.get("status"),
-                "request_completion": str(record.get("request_completion") or "") or None,
+                "route_class": safe_route_class(record.get("uri") or "", page=True),
+                "method": safe_method(record.get("method")),
+                "status": safe_status(record.get("status")),
+                "error_class": "timeout",
+                "request_completion": _safe_request_completion(record.get("request_completion")),
                 "next": {
                     "accepted": ":3000" in upstream_addr,
-                    "upstream_addr": upstream_addr or None,
-                    "upstream_status": upstream_status or None,
+                    "upstream_status": safe_status(upstream_status),
                     "upstream_completed": upstream_status == "200",
                     "request_time_ms": _nginx_seconds(record.get("request_time")),
                     "upstream_connect_ms": _nginx_seconds(record.get("upstream_connect_time")),
@@ -2931,45 +3055,20 @@ def summarize_ssr_observability(
                 "ssr": {
                     "started_observed": bool(stages or stream_events),
                     "stage_events": [
-                        {
-                            key: event[key]
-                            for key in (
-                                "stage",
-                                "start_ms",
-                                "end_ms",
-                                "duration_ms",
-                                "outcome",
-                                "journal_timestamp",
-                            )
-                            if key in event
-                        }
+                        _safe_stage_event(event)
                         for correlation_key in correlation_keys
                         for event in by_request_events.get(correlation_key, [])
                     ],
                     "stream_events": [
-                        {
-                            key: event[key]
-                            for key in (
-                                "stage",
-                                "elapsed_ms",
-                                "active_requests",
-                                "status",
-                                "writable_finished",
-                                "write_count",
-                                "body_bytes",
-                                "response_error",
-                                "journal_timestamp",
-                            )
-                            if key in event
-                        }
+                        _safe_stream_event(event)
                         for event in stream_events
                     ],
                 },
                 "api": {
                     "call_started_observed": bool(api_start_rows or api_rows),
-                    "request_perf_start": api_start_rows,
+                    "request_perf_start_count": len(api_start_rows),
                     "call_completed_observed": bool(api_rows),
-                    "request_perf": api_rows,
+                    "request_perf": [_safe_api_perf_row(row) for row in api_rows],
                 },
             }
         )
@@ -3059,7 +3158,9 @@ def summarize_ssr_observability(
     def api_group_summary(rows: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
         return {
             "requests": len(rows),
-            "statuses": dict(sorted(Counter(str(status) for status, _record in rows).items())),
+            "statuses": dict(
+                sorted(Counter(str(safe_status(status)) for status, _record in rows).items())
+            ),
             "request_time_ms": metric_stats(
                 [value for _status, record in rows if (value := _nginx_seconds(record.get("request_time"))) is not None]
             ),
@@ -3157,7 +3258,7 @@ def summarize_ssr_observability(
             "logged_events": len(stream_rows),
             "sampled_requests": len(by_request_stream),
             "by_stage": {
-                stage: sum(1 for row in stream_rows if row["stage"] == stage)
+                safe_stage(stage): sum(1 for row in stream_rows if row["stage"] == stage)
                 for stage in sorted({str(row["stage"]) for row in stream_rows})
             },
             "integrity": stream_integrity,
@@ -3178,7 +3279,7 @@ def summarize_ssr_observability(
             ),
             "transport": {
                 key: dict(sorted(Counter(
-                    str(record.get(key) or "").strip() or "none"
+                    _safe_transport_value(record.get(key))
                     for record in html_records
                 ).items()))
                 for key in (
@@ -3216,18 +3317,26 @@ def summarize_ssr_observability(
             },
             "timeline": [
                 {
-                    **(
-                        {"diagnostic_id": row["diagnostic_id"]}
-                        if row.get("diagnostic_id")
-                        else {}
-                    ),
+                    "route_class": "tournament_page",
                     "request_ms": row.get("request_ms"),
                     "upstream_header_ms": row.get("upstream_header_ms"),
                     "upstream_ms": row.get("upstream_ms"),
                     "transport": row.get("transport", {}),
                     "stream_clock_aligned": row.get("stream_clock_aligned", False),
-                    "timeline": row.get("timeline", []),
-                    "api_request_perf": row.get("api_request_perf", []),
+                    "timeline": [
+                        (
+                            _safe_stream_event(event)
+                            if event.get("source") == "stream"
+                            else _safe_stage_event(event)
+                        )
+                        for event in row.get("timeline", [])
+                        if isinstance(event, dict)
+                    ],
+                    "api_request_perf": [
+                        _safe_api_perf_row(event)
+                        for event in row.get("api_request_perf", [])
+                        if isinstance(event, dict)
+                    ],
                     "api_request_perf_correlation": row.get(
                         "api_request_perf_correlation"
                     ),
@@ -3415,8 +3524,10 @@ class ProductionQa:
         self.report: dict[str, Any] = {
             "marker": self.marker,
             "started_at": datetime.now(UTC).isoformat(),
-            "origin": self.origin,
-            "request_origin": self.request_origin,
+            # URLs are request inputs only.  Persist the deployment class so a
+            # caller cannot accidentally publish a host, path, or query from
+            # a QA invocation.
+            "origin_class": "production_origin",
             "mode": mode,
             "report_path": str(report_path),
             "requested_users": self.scale_users if mode in {"scale", "read-mix", "write-burst"} else (
@@ -3429,9 +3540,8 @@ class ProductionQa:
             "scenarios": self.scenarios,
             "user_ids": self.user_ids,
             "tournament_ids": [],
-            "tournament_slugs": [],
             "tournament_visibility": self.tournament_visibility,
-            "invite_code": None,
+            "invite_code_present": False,
             "teams": [],
             "strength_ranking": [],
             "initial_pairings": [],
@@ -3444,6 +3554,7 @@ class ProductionQa:
             "retained_participant": None,
             "rostered_participant": None,
             "control_participant": None,
+            "control_account_preserved": False,
             "http_failure_diagnostics": [],
             "tournament_lifecycle": {
                 "tournament_count": self.lifecycle_tournament_count,
@@ -3463,9 +3574,15 @@ class ProductionQa:
         *,
         fatal: bool = True,
     ) -> None:
-        self.scenarios.append({"name": name, "ok": ok, "detail": detail})
+        self.scenarios.append(
+            {
+                "name": name,
+                "ok": ok,
+                "detail": _safe_qa_scenario_detail(detail),
+            }
+        )
         if not ok and fatal:
-            raise QaFailure(f"{name}: {detail}")
+            raise QaFailure(f"{name}: {safe_error_class(detail)}")
 
     @contextmanager
     def phase(self, name: str):
@@ -3671,9 +3788,9 @@ class ProductionQa:
             if len(failure_samples) < RESPONSE_DIAGNOSTIC_SAMPLE_LIMIT:
                 failure_samples.append(diagnostics)
             raise QaFailure(
-                f"{method} {path}: expected {expected}, got {response.status_code}: "
-                f"{response.text[:1000]} diagnostics="
-                f"{json.dumps(diagnostics, ensure_ascii=False, separators=(',', ':'))}"
+                "HTTP request failed "
+                f"route_class={diagnostics['route_class']} "
+                f"status={diagnostics['status']} error_class={diagnostics['error_class']}"
             )
         if not response.content:
             return None
@@ -3788,7 +3905,10 @@ class ProductionQa:
                 continue
             break
         if response is None:
-            raise QaFailure(f"{method} {path}: request returned no response")
+            raise QaFailure(
+                "HTTP request returned no response "
+                f"route_class={safe_route_class(path)} error_class=transport"
+            )
         expected_statuses = (
             {expected}
             if isinstance(expected, int)
@@ -3800,9 +3920,9 @@ class ProductionQa:
             if len(failure_samples) < RESPONSE_DIAGNOSTIC_SAMPLE_LIMIT:
                 failure_samples.append(diagnostics)
             raise QaFailure(
-                f"{method} {path} as {user['label']}: expected {sorted(expected_statuses)}, got "
-                f"{response.status_code}: {response.text[:1000]} diagnostics="
-                f"{json.dumps(diagnostics, ensure_ascii=False, separators=(',', ':'))}"
+                "Authenticated HTTP request failed "
+                f"route_class={diagnostics['route_class']} "
+                f"status={diagnostics['status']} error_class={diagnostics['error_class']}"
             )
         payload = response.json() if response.content else None
         if return_response_meta:
@@ -3859,16 +3979,16 @@ class ProductionQa:
             if len(failure_samples) < RESPONSE_DIAGNOSTIC_SAMPLE_LIMIT:
                 failure_samples.append(diagnostics)
             raise QaFailure(
-                f"GET /auth/csrf as {user['label']}: expected 200, got "
-                f"{response.status_code}: {response.text[:1000]} diagnostics="
-                f"{json.dumps(diagnostics, ensure_ascii=False, separators=(',', ':'))}"
+                "CSRF request failed "
+                f"route_class={diagnostics['route_class']} "
+                f"status={diagnostics['status']} error_class={diagnostics['error_class']}"
             )
         try:
             csrf_token = str(response.json()["csrf_token"])
         except (KeyError, TypeError, ValueError):
-            raise QaFailure(f"GET /auth/csrf as {user['label']}: token missing") from None
+            raise QaFailure("CSRF request failed route_class=auth_csrf error_class=validation") from None
         if len(csrf_token) < 32:
-            raise QaFailure(f"GET /auth/csrf as {user['label']}: token invalid")
+            raise QaFailure("CSRF request failed route_class=auth_csrf error_class=validation")
         self.csrf_tokens_by_user_id[user_id] = csrf_token
         return csrf_token
 
@@ -4043,7 +4163,7 @@ class ProductionQa:
         if not progress:
             return snapshot
 
-        for key in ("user_ids", "tournament_ids", "tournament_slugs"):
+        for key in ("user_ids", "tournament_ids"):
             value = snapshot.get(key)
             if not isinstance(value, list) or len(value) <= PREPROD_PROGRESS_ID_SAMPLE_SIZE * 2:
                 continue
@@ -4095,9 +4215,7 @@ class ProductionQa:
                 select(User).where(func.lower(User.email) == self.retained_participant_email)
             )
             if user is None:
-                raise QaFailure(
-                    f"retained_participant: account {self.retained_participant_email!r} was not found"
-                )
+                raise QaFailure("retained_participant: account was not found")
             user_id = user.id
             participant = await db_session.scalar(
                 select(TournamentParticipant).where(
@@ -4200,7 +4318,6 @@ class ProductionQa:
 
         result = {
             "user_id": user_id,
-            "email": self.retained_participant_email,
             "status": "registered",
             "ready_choice": "yes" if self.retained_participant_state == "ready-unassigned" else None,
             "state": self.retained_participant_state,
@@ -4300,7 +4417,6 @@ class ProductionQa:
         }
         self.report["rostered_participant"] = {
             "user_id": user.id,
-            "email": user.email,
             "display_name": profile.display_name,
             "assigned_to_team": False,
         }
@@ -4349,6 +4465,7 @@ class ProductionQa:
 
         self.session_tokens_by_user_id[user.id] = token
         self.control_participant_session_token_digest = token_digest
+        self.report["control_account_preserved"] = True
         return {
             "id": user.id,
             "label": "control-participant",
@@ -4931,7 +5048,6 @@ class ProductionQa:
         self.tournament_ids.append(tournament_id)
         self.tournament_slugs.append(tournament_slug)
         self.report["tournament_ids"] = list(self.tournament_ids)
-        self.report["tournament_slugs"] = list(self.tournament_slugs)
         await self.request_as(
             api_client,
             organizer,
@@ -5795,7 +5911,6 @@ class ProductionQa:
             self.report["tournament_id"] = self.tournament_id
             self.report["scale_tournament_id"] = self.tournament_id
             self.report["tournament_ids"] = [self.tournament_id]
-            self.report["tournament_slug"] = self.tournament_slug
             await self.record_preprod_run(tournaments_created=1)
             with self.phase("tournament_setup"):
                 await self.request_as(
@@ -5822,7 +5937,7 @@ class ProductionQa:
                         },
                     )
                 invite_code = str(invite["code"])
-                self.report["invite_code"] = invite_code
+                self.report["invite_code_present"] = bool(invite_code)
                 self.scenario(
                     "scale_invite_only_code_created",
                     bool(invite_code),
@@ -5921,7 +6036,7 @@ class ProductionQa:
             if control_participant is not None:
                 self.report["control_participant"] = {
                     "user_id": control_participant["id"],
-                    "email": control_participant["email"],
+                    "account_preserved": True,
                     "state": self.control_participant_state,
                     "joined_via_api": True,
                     "ready_choice": self.control_participant_state in {"ready", "assigned"},
@@ -6422,7 +6537,6 @@ class ProductionQa:
                 self.tournament_id = tournament_id
                 self.tournament_slug = slug
             self.report["tournament_ids"] = list(dict.fromkeys(self.tournament_ids))
-            self.report["tournament_slugs"] = list(dict.fromkeys(self.tournament_slugs))
             return {
                 **created,
                 "slug": slug,
@@ -6771,7 +6885,6 @@ class ProductionQa:
             self.tournament_id = self.tournament_id or str(tournaments[0]["id"])
             self.tournament_slug = self.tournament_slug or str(tournaments[0]["slug"])
             self.report["tournament_ids"] = list(self.tournament_ids)
-            self.report["tournament_slugs"] = list(self.tournament_slugs)
             for index, tournament in enumerate(tournaments):
                 start_index = index * self.lifecycle_users_per_tournament
                 tournament_users[str(tournament["slug"])] = users[
@@ -8085,55 +8198,98 @@ def summarize_team_preferences(team: dict[str, Any]) -> dict[str, Any]:
 
 
 def cli_report_summary(report: dict[str, Any]) -> dict[str, Any]:
-    scenarios = list(report.get("scenarios") or [])
+    """Build the only QA summary allowed to reach a command log/CI output.
+
+    The detailed report remains a root-owned cleanup inventory.  This public
+    shape intentionally drops paths, slugs, participant identities, response
+    bodies and exception text while retaining bounded counts and timings.
+    """
+
+    def safe_count(value: Any) -> int | None:
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000_000:
+            return value
+        return None
+
+    def safe_name(value: Any) -> str:
+        raw = str(value or "").strip().lower().replace("-", "_")
+        return raw if re.fullmatch(r"[a-z0-9_]{1,64}", raw) else "other"
+
+    def safe_detail(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        output: dict[str, Any] = {}
+        route = value.get("route_class")
+        if isinstance(route, str) and route in SAFE_ROUTE_CLASSES:
+            output["route_class"] = route
+        status = safe_status(value.get("status"))
+        if status:
+            output["status"] = status
+        error = value.get("error_class")
+        if error is not None:
+            output["error_class"] = safe_error_class(error, status=status)
+        return output or None
+
+    raw_scenarios = report.get("scenarios")
+    scenarios = raw_scenarios[:128] if isinstance(raw_scenarios, list) else []
     write_burst = report.get("write_burst") if isinstance(report.get("write_burst"), dict) else {}
     performance = report.get("performance") if isinstance(report.get("performance"), dict) else {}
+    lifecycle = report.get("tournament_lifecycle") if isinstance(report.get("tournament_lifecycle"), dict) else {}
+    raw_profiles = write_burst.get("profiles")
+    profiles = raw_profiles[:128] if isinstance(raw_profiles, list) else []
+
+    def safe_profile_metric(row: dict[str, Any], key: str) -> float | None:
+        http = row.get("http")
+        overall = http.get("overall") if isinstance(http, dict) else None
+        value = overall.get(key) if isinstance(overall, dict) else None
+        return finite_number(value)
+
     return {
-        "marker": report.get("marker"),
-        "mode": report.get("mode"),
-        "passed": report.get("passed"),
-        "report_path": str(report.get("report_path") or ""),
-        "tournament_slug": report.get("tournament_slug"),
-        "created_users": report.get("created_users"),
-        "requested_users": report.get("requested_users"),
-        "tournament_visibility": report.get("tournament_visibility"),
-        "profile_journey": report.get("profile_journey"),
-        "read_mix": report.get("read_mix"),
-        "teams": len(report.get("strength_ranking") or []),
-        "matches": len(report.get("match_path") or []) or report.get("matches_count"),
-        "duration_seconds": report.get("duration_seconds"),
-        "assignment_seconds": report.get("assignment_seconds"),
-        "performance_scope": performance.get("measurement_scope"),
-        "fatal_error": report.get("fatal_error"),
+        "schema": 1,
+        "mode": safe_name(report.get("mode")),
+        "passed": report.get("passed") is True,
+        "control_account_preserved": report.get("control_account_preserved") is True,
+        "created_users": safe_count(report.get("created_users")),
+        "requested_users": safe_count(report.get("requested_users")),
+        "teams": safe_count(len(report.get("strength_ranking") or [])),
+        "matches": safe_count(len(report.get("match_path") or []) or report.get("matches_count")),
+        "duration_seconds": finite_number(report.get("duration_seconds")),
+        "assignment_seconds": finite_number(report.get("assignment_seconds")),
+        "performance_collected": isinstance(performance, dict) and bool(performance),
+        "lifecycle_phases": safe_count(len(lifecycle.get("phases") or [])),
+        "fatal_error_class": safe_error_class(
+            report.get("fatal_error_class") or report.get("fatal_error")
+        )
+        if report.get("fatal_error_class") or report.get("fatal_error")
+        else "none",
         "write_burst": (
             {
-                "profile": write_burst.get("profile"),
-                "selection": write_burst.get("selection"),
+                "profile": safe_name(write_burst.get("profile")),
                 "profiles": [
                     {
-                        "name": row.get("name"),
-                        "mutations": row.get("mutations"),
-                        "p95_ms": (row.get("http") or {}).get("overall", {}).get("p95_ms"),
-                        "p99_ms": (row.get("http") or {}).get("overall", {}).get("p99_ms"),
+                        "name": safe_name(row.get("name")),
+                        "mutations": safe_count(row.get("mutations")),
+                        "p95_ms": safe_profile_metric(row, "p95_ms"),
+                        "p99_ms": safe_profile_metric(row, "p99_ms"),
                     }
-                    for row in write_burst.get("profiles") or []
+                    for row in profiles
                     if isinstance(row, dict)
                 ],
-                "load_generator_local": write_burst.get("load_generator_local"),
+                "profile_count": safe_count(len(profiles)),
             }
             if write_burst
             else None
         ),
-        "rostered_participant": report.get("rostered_participant"),
-        "retained_participant": report.get("retained_participant"),
-        "control_participant": report.get("control_participant"),
+        "rostered_participant_present": isinstance(report.get("rostered_participant"), dict),
+        "retained_participant_present": isinstance(report.get("retained_participant"), dict),
+        "control_participant_present": isinstance(report.get("control_participant"), dict),
         "scenarios": [
             {
-                "name": scenario.get("name"),
-                "ok": scenario.get("ok"),
-                "detail": scenario.get("detail"),
+                "name": safe_name(scenario.get("name")),
+                "ok": scenario.get("ok") is True,
+                "detail": safe_detail(scenario.get("detail")),
             }
             for scenario in scenarios
+            if isinstance(scenario, dict)
         ],
     }
 
@@ -8187,7 +8343,10 @@ async def async_main() -> int:
         else:
             report = await qa.run()
     except Exception as exc:
-        qa.report["fatal_error"] = f"{type(exc).__name__}: {exc!r}"
+        # Exception text can include a response body, URL, account address or
+        # credential.  Keep only the closed error class in the durable report;
+        # the protected transient command log is sanitized separately.
+        qa.report["fatal_error_class"] = safe_error_class(type(exc).__name__)
         qa.report["finished_at"] = datetime.now(UTC).isoformat()
         qa.report["passed"] = False
         qa.report["report_path"] = str(args.report_path)

@@ -337,7 +337,7 @@ export function AuthForm({ mode, returnTo, steamAuthError = false, googleAuthErr
           </div>
           {!isRegister ? (
             <div className="auth-help-links">
-              <Link href="/reset-password">{t("auth.forgotPassword")}</Link>
+              <Link href="/reset-password" prefetch={false}>{t("auth.forgotPassword")}</Link>
             </div>
           ) : null}
         </form>

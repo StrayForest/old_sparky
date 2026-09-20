@@ -22,9 +22,6 @@ jobs:
     timeout-minutes: 20
     environment: production
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       ABORT_CONFIRMATION: ${{ inputs.confirmation }}
     steps:
       - name: Validate explicit abort confirmation
@@ -33,11 +30,17 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production release abort must run from the reviewed dev ref" >&2; exit 1; }
-          test "$ABORT_CONFIRMATION" = "ABORT-RETAINED-RELEASE-MIGRATION-NOT-REVERSED" \
-            || { echo "Refusing abort without exact migration confirmation" >&2; exit 1; }
+          case "$ABORT_CONFIRMATION" in
+            ABORT-RETAINED-RELEASE-MIGRATION-NOT-REVERSED) ;;
+            *) echo "Refusing abort without exact migration confirmation" >&2; exit 1 ;;
+          esac
 
       - name: Validate production SSH inputs
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
@@ -46,14 +49,21 @@ jobs:
 
       - name: Configure SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/platform-production-release-abort-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-release-abort-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          fi
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
           ssh_scan="$ssh_dir/known_hosts.scan"
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
           test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
             || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
@@ -67,8 +77,25 @@ jobs:
 
       - name: Abort retained release and verify restored runtime
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          umask 077
+          remote_log="$RUNNER_TEMP/platform-production-release-abort.log"
+          remote_error="$RUNNER_TEMP/platform-production-release-abort-error.log"
+          : >"$remote_log"
+          : >"$remote_error"
+          chmod 600 "$remote_log" "$remote_error"
+          cleanup_abort_capture() {
+            trap - EXIT
+            rm -f -- "$remote_log" "$remote_error"
+          }
+          trap cleanup_abort_capture EXIT
+          set +e
+          # The SSH option below is the command-line form of
+          # StrictHostKeyChecking yes.
           ssh \
             -F /dev/null \
             -o BatchMode=yes \
@@ -80,31 +107,567 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            'bash -s' <<'REMOTE'
+            'bash -s' >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
 
           runtime=/opt/oldsparky/platform
-          state="$runtime/shared/.release-operation.json"
-          deploy="$runtime/current/tools/platform_release_deploy.sh"
+          shared="$runtime/shared"
+          state="$shared/.release-operation.json"
 
           test "$(id -u)" -eq 0 || { echo "Production release abort must run as root" >&2; exit 1; }
-          test -f "$state" || { echo "No retained release transaction exists" >&2; exit 1; }
-          test -x "$deploy" || { echo "Release deploy tool is missing" >&2; exit 1; }
+          test -f "$state" && test ! -L "$state" \
+            || { echo "No safe retained release transaction exists" >&2; exit 1; }
 
-          "$deploy" \
+          # Validate the receipt before selecting an executable from either the
+          # staged candidate or current release. This is deliberately a small
+          # independent parser: an older current release must not interpret a
+          # v2 receipt with a legacy schema and then start the wrong services.
+          receipt_fields="$(
+            /usr/bin/python3 -I - "$runtime" "$state" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+
+          runtime = Path(sys.argv[1])
+          state = Path(sys.argv[2])
+          releases = runtime / "releases"
+          shared = runtime / "shared"
+          slug_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+          commit_pattern = re.compile(r"^[0-9a-f]{40,64}$")
+          full_keys = {
+              "version",
+              "operation",
+              "phase",
+              "app_dir",
+              "current_before",
+              "previous_before",
+              "candidate_release",
+              "shared_venv",
+              "peer",
+              "snapshot",
+              "transition",
+              "shared_before",
+              "peer_before",
+              "current_before_identity",
+              "previous_before_identity",
+              "candidate_identity",
+              "remove_env_on_recovery",
+              "service_state_before",
+              "quiesced_services",
+              "timer_active_before",
+          }
+          quiesce_keys = {
+              "version",
+              "operation",
+              "phase",
+              "app_dir",
+              "current_before",
+              "previous_before",
+              "candidate_release",
+              "shared_env_before",
+              "current_before_identity",
+              "previous_before_identity",
+              "service_state_before",
+              "quiesced_services",
+              "timer_active_before",
+          }
+          full_phases = {
+              "prepared",
+              "venv-transitioned",
+              "snapshot-placed",
+              "current-switched",
+              "previous-switched",
+              "pointers-switched",
+              "staged",
+              "migration-pending",
+              "migration-failed",
+              "migration-applied",
+              "activation-pending",
+              "services-restarted",
+              "nginx-pending",
+              "nginx-applied",
+              "smoke-passed",
+              "activation-committed",
+              "recovery-authorized",
+              "restart-pending",
+              "rollback-runtime-pending",
+              "rollback-runtime-applied",
+              "recovery-restored",
+          }
+          service_names = ("deadlock-api", "deadlock-worker", "deadlock-web")
+
+
+          def reject(_message: str) -> "NoReturn":
+              # Receipt validation failures are private machine state; never
+              # echo labels, paths, parser details, or exception text.
+              raise SystemExit("release receipt validation failed")
+
+
+          def strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              result: dict[str, object] = {}
+              for key, value in pairs:
+                  if key in result:
+                      reject("release receipt contains duplicate keys")
+                  result[key] = value
+              return result
+
+
+          def safe_dir(path: Path, label: str) -> os.stat_result:
+              if not path.is_absolute() or Path(os.path.abspath(path)) != path:
+                  reject(f"{label} path is not canonical")
+              try:
+                  metadata = path.lstat()
+                  resolved = path.resolve(strict=True)
+              except OSError as exc:
+                  reject(f"{label} is unavailable: {exc}")
+              if (
+                  stat.S_ISLNK(metadata.st_mode)
+                  or not stat.S_ISDIR(metadata.st_mode)
+                  or metadata.st_uid != 0
+                  or stat.S_IMODE(metadata.st_mode) & 0o022
+                  or resolved != path
+              ):
+                  reject(f"{label} metadata is unsafe")
+              return metadata
+
+
+          def safe_file(path: Path, label: str, *, maximum: int) -> os.stat_result:
+              try:
+                  metadata = path.lstat()
+              except OSError as exc:
+                  reject(f"{label} is unavailable: {exc}")
+              if (
+                  stat.S_ISLNK(metadata.st_mode)
+                  or not stat.S_ISREG(metadata.st_mode)
+                  or metadata.st_uid != 0
+                  or metadata.st_nlink != 1
+                  or stat.S_IMODE(metadata.st_mode) & 0o022
+                  or metadata.st_size > maximum
+              ):
+                  reject(f"{label} metadata is unsafe")
+              return metadata
+
+
+          def identity(value: object, label: str) -> dict[str, int]:
+              if (
+                  not isinstance(value, dict)
+                  or set(value) != {"dev", "ino"}
+                  or type(value["dev"]) is not int
+                  or type(value["ino"]) is not int
+                  or value["dev"] < 0
+                  or value["ino"] <= 0
+              ):
+                  reject(f"{label} identity is invalid")
+              return value  # type: ignore[return-value]
+
+
+          def target(value: object, label: str, *, allow_missing: bool = False) -> Path | None:
+              if value is None:
+                  return None
+              if not isinstance(value, str):
+                  reject(f"{label} path is invalid")
+              path = Path(value)
+              if (
+                  not path.is_absolute()
+                  or path.parent != releases
+                  or slug_pattern.fullmatch(path.name) is None
+              ):
+                  reject(f"{label} escapes the releases directory")
+              if not allow_missing or os.path.lexists(path):
+                  safe_dir(path, label)
+              return path
+
+
+          def matches(path: Path, expected: object, label: str) -> None:
+              recorded = identity(expected, label)
+              actual = safe_dir(path, label)
+              if {"dev": actual.st_dev, "ino": actual.st_ino} != recorded:
+                  reject(f"{label} identity changed")
+
+
+          def pointer(name: str) -> Path | None:
+              path = runtime / name
+              if not os.path.lexists(path):
+                  return None
+              try:
+                  metadata = path.lstat()
+                  resolved = path.resolve(strict=True)
+              except OSError as exc:
+                  reject(f"release pointer {name} is unavailable: {exc}")
+              if not stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0:
+                  reject(f"release pointer {name} is unsafe")
+              target_path = target(str(resolved), f"release pointer {name}")
+              if target_path is None:
+                  reject(f"release pointer {name} is empty")
+              return target_path
+
+
+          safe_dir(runtime, "application directory")
+          safe_dir(releases, "releases directory")
+          safe_dir(shared, "shared directory")
+          safe_file(state, "release receipt", maximum=64 * 1024)
+          try:
+              record = json.loads(
+                  state.read_text(encoding="ascii"), object_pairs_hook=strict_pairs
+              )
+          except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+              reject(f"release receipt is invalid: {exc}")
+          if not isinstance(record, dict):
+              reject("release receipt is not an object")
+
+          version = record.get("version")
+          if type(version) is not int:
+              reject("release receipt version is invalid")
+          if version == 2:
+              if set(record) != full_keys:
+                  reject("release receipt v2 schema is invalid")
+              phase = record.get("phase")
+              if not isinstance(phase, str) or phase not in full_phases:
+                  reject("release receipt v2 phase is invalid")
+          elif version == 1:
+              if set(record) != quiesce_keys or record.get("phase") != "quiesce-pending":
+                  reject("pre-quiesce receipt schema is invalid")
+              phase = "quiesce-pending"
+          else:
+              reject("unsupported release receipt version")
+          if record.get("operation") != "install" or record.get("app_dir") != str(runtime):
+              reject("release receipt is not for this install")
+
+          current_before = target(record.get("current_before"), "original current release")
+          previous_before = target(record.get("previous_before"), "original previous release")
+          if current_before is None:
+              if record.get("current_before_identity") is not None:
+                  reject("original current identity is unexpected")
+          else:
+              matches(current_before, record.get("current_before_identity"), "original current release")
+          if previous_before is None:
+              if record.get("previous_before_identity") is not None:
+                  reject("original previous identity is unexpected")
+          else:
+              matches(previous_before, record.get("previous_before_identity"), "original previous release")
+
+          service_state = record.get("service_state_before")
+          quiesced = record.get("quiesced_services")
+          timer_before = record.get("timer_active_before")
+          if (
+              not isinstance(service_state, dict)
+              or set(service_state) != set(service_names)
+              or any(type(value) is not str or value not in {"active", "inactive"} for value in service_state.values())
+              or quiesced != list(service_names)
+              or type(timer_before) is not bool
+          ):
+              reject("durable pre-quiesce service snapshot is incomplete or invalid")
+
+          candidate = target(
+              record.get("candidate_release"),
+              "candidate release",
+              allow_missing=version == 1 or (version == 2 and phase == "recovery-restored"),
+          )
+          candidate_exists = candidate is not None and os.path.lexists(candidate)
+          if version == 1:
+              # A pre-stage receipt is still abortable with a missing or partial
+              # candidate. It is never an executable release: the original current
+              # release must provide the v2 abort implementation below.
+              candidate = None
+          elif version == 2 and candidate_exists:
+              matches(candidate, record.get("candidate_identity"), "candidate release")
+          elif version == 2 and phase != "recovery-restored":
+              reject("candidate release is missing before recovery completion")
+
+          if version == 2:
+              # The candidate may have been removed only after a verified
+              # recovery-restored transition. Its recorded identity is still required
+              # so an incomplete/tampered receipt cannot authorize an abort.
+              identity(record.get("candidate_identity"), "candidate release")
+
+          if version == 2:
+              candidate_path = releases / Path(str(record["candidate_release"])).name
+              shared_venv = Path(str(record.get("shared_venv")))
+              peer = Path(str(record.get("peer")))
+              snapshot = Path(str(record.get("snapshot")))
+              if shared_venv != shared / "venv" or snapshot != (
+                  candidate_path / ".rollback/shared-venv-before-install"
+              ):
+                  reject("release v2 venv transaction paths are invalid")
+              candidate_name = candidate_path.name
+              if peer.parent != shared or not peer.name.startswith(f".venv-install-{candidate_name}."):
+                  reject("release v2 venv peer path is invalid")
+              transition = record.get("transition")
+              shared_before = record.get("shared_before")
+              peer_before = record.get("peer_before")
+              if transition == "exchange":
+                  identity(shared_before, "shared venv")
+                  identity(peer_before, "new venv")
+              elif transition == "create":
+                  if shared_before is not None:
+                      reject("created venv has an unexpected old identity")
+                  identity(peer_before, "new venv")
+              elif transition == "none":
+                  if peer_before is not None:
+                      reject("no-op venv has an unexpected peer identity")
+                  if shared_before is not None:
+                      identity(shared_before, "shared venv")
+              else:
+                  reject("release v2 venv transition is invalid")
+              if type(record.get("remove_env_on_recovery")) is not bool:
+                  reject("release v2 env recovery flag is invalid")
+          else:
+              shared_env_before = record.get("shared_env_before")
+              env_file = shared / ".env.platform"
+              if shared_env_before is None:
+                  if os.path.lexists(env_file):
+                      safe_file(env_file, "shared env file", maximum=64 * 1024)
+              else:
+                  matches(env_file, shared_env_before, "shared env file")
+
+          actual_pointers = (pointer("current"), pointer("previous"))
+          original_pointers = (current_before, previous_before)
+          if version == 1:
+              allowed_pointers = (original_pointers,)
+          else:
+              desired_previous = current_before if current_before is not None else previous_before
+              allowed_pointers = (
+                  original_pointers,
+                  (current_before, current_before),
+                  (Path(str(record["candidate_release"])), desired_previous),
+              )
+          if actual_pointers not in allowed_pointers:
+              reject("release pointers do not match the retained transaction")
+
+
+          def tool_is_safe(path: Path, *, executable: bool) -> str:
+              metadata = safe_file(path, f"trusted release tool {path.name}", maximum=512 * 1024)
+              if executable and not (metadata.st_mode & stat.S_IXUSR):
+                  reject(f"trusted release tool is not executable: {path}")
+              try:
+                  return path.read_text(encoding="utf-8")
+              except (OSError, UnicodeError) as exc:
+                  reject(f"trusted release tool is unreadable: {exc}")
+
+
+          trusted_release = (
+              candidate
+              if candidate is not None
+              else (current_before if current_before is not None else previous_before)
+          )
+          if trusted_release is None:
+              reject("no trusted release is available for abort")
+          release_json = trusted_release / "RELEASE.json"
+          safe_file(release_json, "trusted release metadata", maximum=64 * 1024)
+          try:
+              release_metadata = json.loads(
+                  release_json.read_text(encoding="ascii"), object_pairs_hook=strict_pairs
+              )
+          except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+              reject(f"trusted release metadata is invalid: {exc}")
+          if (
+              not isinstance(release_metadata, dict)
+              or release_metadata.get("release_slug") != trusted_release.name
+              or not isinstance(release_metadata.get("source_git_commit"), str)
+              or commit_pattern.fullmatch(release_metadata["source_git_commit"]) is None
+          ):
+              reject("trusted release identity contract is invalid")
+          transaction_tool = trusted_release / "tools/platform_release_transaction.py"
+          deploy_tool = trusted_release / "tools/platform_release_deploy.sh"
+          transaction_source = tool_is_safe(transaction_tool, executable=False)
+          deploy_source = tool_is_safe(deploy_tool, executable=True)
+          required_deploy_markers = (
+              "restore_recorded_services",
+              "restart_recorded_services",
+              'if [[ "$expected" == "active" ]]',
+              'systemctl stop "$service"',
+              "complete-recovery",
+              "--abort-retained",
+          )
+          if (
+              "STATE_VERSION = 2" not in transaction_source
+              or "service_state_before" not in transaction_source
+              or any(marker not in deploy_source for marker in required_deploy_markers)
+          ):
+              reject("trusted release does not implement the v2 abort contract")
+          if version == 1 and (
+              "QUIESCE_STATE_VERSION = 1" not in transaction_source
+              or "status-quiesce" not in transaction_source
+              or "quiesce_receipt_exists" not in deploy_source
+              or "abort_quiesce_receipt" not in deploy_source
+          ):
+              reject("trusted release does not implement the pre-quiesce abort contract")
+
+          print(phase)
+          print(version)
+          print(candidate or "")
+          print(current_before or "")
+          print(previous_before or "")
+          print(trusted_release)
+          print("active" if service_state["deadlock-api"] == "active" else "inactive")
+          print("active" if service_state["deadlock-worker"] == "active" else "inactive")
+          print("active" if service_state["deadlock-web"] == "active" else "inactive")
+          print("active" if timer_before else "inactive")
+          PY
+          )"
+          mapfile -t receipt_fields <<<"$receipt_fields"
+          test "${#receipt_fields[@]}" -eq 10 \
+            || { echo "Receipt validator returned an incomplete result" >&2; exit 1; }
+          phase="${receipt_fields[0]}"
+          receipt_version="${receipt_fields[1]}"
+          candidate_release="${receipt_fields[2]}"
+          expected_current="${receipt_fields[3]}"
+          expected_previous="${receipt_fields[4]}"
+          trusted_release="${receipt_fields[5]}"
+          expected_api="${receipt_fields[6]}"
+          expected_worker="${receipt_fields[7]}"
+          expected_web="${receipt_fields[8]}"
+          expected_timer="${receipt_fields[9]}"
+          test "$receipt_version" = "2" || test "$phase" = "quiesce-pending" \
+            || { echo "Unsupported retained receipt phase/version" >&2; exit 1; }
+          trusted_transaction="$trusted_release/tools/platform_release_transaction.py"
+          trusted_deploy="$trusted_release/tools/platform_release_deploy.sh"
+          test -x "$trusted_deploy" || { echo "Trusted v2 release deploy tool is missing" >&2; exit 1; }
+
+          # Require the selected v2 transaction parser to agree with the
+          # independently validated receipt before it is allowed to mutate it.
+          trusted_status="$(
+            /usr/bin/python3 -I "$trusted_transaction" status \
+              --state "$state" --json
+          )"
+          printf '%s' "$trusted_status" | /usr/bin/python3 -I -c '
+          import json
+          import sys
+
+          phase, runtime, candidate = sys.argv[1:]
+          payload = json.load(sys.stdin)
+          if payload.get("operation") != "install" or payload.get("phase") != phase:
+              raise SystemExit("trusted transaction parser disagrees with the receipt")
+          if payload.get("app_dir") != runtime:
+              raise SystemExit("trusted transaction parser returned the wrong application")
+          if candidate and payload.get("candidate_release") != candidate:
+              raise SystemExit("trusted transaction parser returned the wrong candidate")
+          ' "$phase" "$runtime" "$candidate_release"
+
+          "$trusted_deploy" \
             --abort-retained \
             --confirm-migration-not-reversed \
             --app-dir "$runtime"
 
           test ! -e "$state" && test ! -L "$state" \
             || { echo "Retained release transaction was not cleared" >&2; exit 1; }
+
+          assert_pointer() {
+            local name="$1"
+            local expected="$2"
+            local path="$runtime/$name"
+            if [[ -z "$expected" ]]; then
+              test ! -e "$path" && test ! -L "$path" \
+                || { echo "release pointer should be absent" >&2; return 1; }
+            else
+              test -L "$path" || { echo "release pointer is not a symlink" >&2; return 1; }
+              test "$(readlink -f "$path")" = "$expected" \
+                || { echo "release pointer does not match the receipt" >&2; return 1; }
+            fi
+          }
+
+          assert_unit_state() {
+            local unit="$1"
+            local expected="$2"
+            local actual status
+            if actual="$(systemctl is-active "$unit" 2>/dev/null)"; then
+              status=0
+            else
+              status="$?"
+            fi
+            if [[ "$expected" == "active" ]]; then
+              test "$status" -eq 0 && test "$actual" = "active" \
+                || { echo "service was not restored active" >&2; return 1; }
+            else
+              test "$actual" = "inactive" \
+                || { echo "service was not preserved inactive" >&2; return 1; }
+            fi
+          }
+
+          assert_pointer current "$expected_current"
+          assert_pointer previous "$expected_previous"
+          assert_unit_state deadlock-api "$expected_api"
+          assert_unit_state deadlock-worker "$expected_worker"
+          assert_unit_state deadlock-web "$expected_web"
+          assert_unit_state deadlock-cloudflare-ips.timer "$expected_timer"
           nginx -t >/dev/null
-          for service in deadlock-api deadlock-worker deadlock-web; do
-            systemctl is-active --quiet "$service"
-          done
-          curl --fail --silent --show-error --max-time 10 \
-            http://127.0.0.1:8010/api/v1/health/ready >/dev/null
-          curl --fail --silent --show-error --max-time 10 \
-            http://127.0.0.1:3000/ >/dev/null
-          printf 'Retained release aborted; previous runtime is active.\n'
+          if [[ "$expected_api" == "active" ]]; then
+            curl --fail --silent --show-error --max-time 10 \
+              http://127.0.0.1:8010/api/v1/health/ready >/dev/null
+          fi
+          if [[ "$expected_web" == "active" ]]; then
+            curl --fail --silent --show-error --max-time 10 \
+              http://127.0.0.1:3000/ >/dev/null
+          fi
+          abort_release_slug="$(basename "$trusted_release")"
+          [[ "$abort_release_slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] \
+            || { echo 'RELEASE_ABORT schema=1 status=failed class=identity release_slug=unavailable source_sha=unavailable receipt_version=unavailable' >&2; exit 1; }
+          abort_source_sha="$({
+            /usr/bin/python3 -I - "$trusted_release/RELEASE.json" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          try:
+              value = json.loads(Path(sys.argv[1]).read_text(encoding="ascii")).get(
+                  "source_git_commit", ""
+              )
+          except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+              value = ""
+          if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value):
+              print(value)
+          PY
+          } 2>/dev/null)"
+          [[ -n "$abort_source_sha" ]] || abort_source_sha=unavailable
+          printf 'RELEASE_ABORT schema=1 status=passed class=abort release_slug=%s source_sha=%s receipt_version=%s\n' \
+            "$abort_release_slug" "$abort_source_sha" "$receipt_version"
           REMOTE
+          remote_status="$?"
+          set -e
+          if (( remote_status != 0 )); then
+            printf '%s\n' 'RELEASE_ABORT schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable receipt_version=unavailable'
+            exit 1
+          fi
+          public_line="$(grep -E '^RELEASE_ABORT schema=1 status=passed class=abort release_slug=[A-Za-z0-9][A-Za-z0-9._-]{0,179} source_sha=(unavailable|[0-9a-f]{40,64}) receipt_version=(1|2)$' "$remote_log" | tail -n 1 || true)"
+          if [[ -z "$public_line" ]]; then
+            printf '%s\n' 'RELEASE_ABORT schema=1 status=failed class=producer release_slug=unavailable source_sha=unavailable receipt_version=unavailable'
+            exit 1
+          fi
+          printf '%s\n' "$public_line"
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-release-abort-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-release-abort-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"

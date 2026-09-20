@@ -1,0 +1,12 @@
+# Canonical direct inputs for the non-editable Python CI environment.
+#
+# Keep this file small and declarative. The fully resolved, hash-locked output
+# is requirements-ci.lock.txt; CI installs that output and never resolves
+# these inputs directly.
+-r requirements-platform.txt
+-r requirements-quality.txt
+
+# A fresh venv's bundled pip is only a bootstrap interpreter. These explicit
+# pins make the installer toolchain itself part of the reproducible CI set.
+setuptools==84.0.0
+wheel==0.48.0

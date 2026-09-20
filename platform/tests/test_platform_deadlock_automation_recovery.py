@@ -409,9 +409,13 @@ class PlatformDeadlockAutomationRecoveryTests(PlatformIsolatedAsyncioTestCase):
     async def test_persisted_matches_prevent_duplicate_bracket_on_rerun(self) -> None:
         now = datetime(2026, 6, 13, 12, 0, tzinfo=UTC)
         tournament = _tournament()
-        locked_run = SimpleNamespace(id="assignment-run", status="locked")
+        locked_run = SimpleNamespace(
+            id="assignment-run",
+            status="locked",
+            tournament_id=tournament.id,
+        )
         db_session = Mock()
-        db_session.scalar = AsyncMock(return_value=1)
+        db_session.scalar = AsyncMock(side_effect=[locked_run, 1])
 
         with patch.object(
             automation,
@@ -426,5 +430,5 @@ class PlatformDeadlockAutomationRecoveryTests(PlatformIsolatedAsyncioTestCase):
             )
 
         self.assertFalse(changed)
-        db_session.scalar.assert_awaited_once()
+        self.assertEqual(db_session.scalar.await_count, 2)
         create_bracket.assert_not_awaited()

@@ -11,8 +11,10 @@ import ipaddress
 import json
 import os
 import pathlib
+import pwd
 import re
 import secrets
+import stat
 import subprocess
 import urllib.parse
 from typing import Any
@@ -27,6 +29,10 @@ DEFAULT_EDGE_ORIGIN = "http://127.0.0.1"
 DEFAULT_API_ORIGIN = "http://127.0.0.1:8010"
 DEFAULT_WEB_ORIGIN = "http://127.0.0.1:3000"
 DEFAULT_SERVICES = ("deadlock-api", "deadlock-worker", "deadlock-web", "nginx")
+WEB_RUNTIME_CACHE_RELATIVE = pathlib.Path(
+    "apps/platform_web/.next/standalone/.next/cache"
+)
+WEB_RUNTIME_USER = "oldsparky-web"
 
 EXPECTED_CSP_POLICY_TEMPLATE = (
     "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; "
@@ -156,6 +162,98 @@ def check_service_active(service: str) -> dict[str, object]:
     return {"name": f"service:{service}", "ok": result.returncode == 0 and status == "active", "detail": status}
 
 
+def check_web_runtime_cache(
+    app_dir: pathlib.Path,
+    current_target: pathlib.Path,
+) -> dict[str, object]:
+    """Prove the standalone cache is writable through the service boundary.
+
+    The release smoke runs as the operator/root identity, so ``test -w`` is
+    performed as the locked web user and the exact systemd allowlist is
+    checked separately.  Neither check writes a probe file or changes state.
+    """
+
+    cache_path = current_target / WEB_RUNTIME_CACHE_RELATIVE
+    unit_cache_path = app_dir / "current" / WEB_RUNTIME_CACHE_RELATIVE
+    errors: list[str] = []
+    owner: str | None = None
+    mode: int | None = None
+    try:
+        metadata = cache_path.lstat()
+    except OSError:
+        metadata = None
+        errors.append("cache directory is unavailable")
+
+    if metadata is not None:
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            errors.append("cache path is not a real directory")
+        try:
+            web_account = pwd.getpwnam(WEB_RUNTIME_USER)
+        except KeyError:
+            errors.append("web service account is unavailable")
+        else:
+            owner = f"{metadata.st_uid}:{metadata.st_gid}"
+            if (
+                metadata.st_uid != web_account.pw_uid
+                or metadata.st_gid != web_account.pw_gid
+            ):
+                errors.append("cache directory is not owned by the web service")
+        if mode != 0o750:
+            errors.append("cache directory permissions must be exactly 0750")
+
+    try:
+        user_write = subprocess.run(
+            ["runuser", "-u", WEB_RUNTIME_USER, "--", "test", "-w", str(cache_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        user_write = None
+        errors.append("runuser is unavailable for the web service probe")
+    if user_write is not None and user_write.returncode != 0:
+        errors.append("web service account cannot write cache directory")
+
+    try:
+        systemd_paths = subprocess.run(
+            [
+                "systemctl",
+                "show",
+                "deadlock-web",
+                "--property=ReadWritePaths",
+                "--no-pager",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        systemd_paths = None
+        errors.append("systemctl is unavailable for the web sandbox probe")
+    allowlisted_paths: set[str] = set()
+    if systemd_paths is not None and systemd_paths.returncode == 0:
+        for line in systemd_paths.stdout.splitlines():
+            if line.startswith("ReadWritePaths="):
+                allowlisted_paths.update(line.partition("=")[2].split())
+    if str(unit_cache_path) not in allowlisted_paths and str(cache_path) not in allowlisted_paths:
+        errors.append("systemd ReadWritePaths does not allow standalone cache")
+
+    return {
+        "name": "release_standalone_cache_sandbox",
+        "ok": not errors,
+        "detail": {
+            "path": str(cache_path),
+            "owner": owner,
+            "mode": None if mode is None else oct(mode),
+            "web_user_write": user_write is not None and user_write.returncode == 0,
+            "systemd_allowlisted": str(unit_cache_path) in allowlisted_paths
+            or str(cache_path) in allowlisted_paths,
+            "errors": errors,
+        },
+    }
+
+
 def check_release_layout(app_dir: pathlib.Path) -> list[dict[str, object]]:
     current = app_dir / "current"
     previous = app_dir / "previous"
@@ -200,6 +298,7 @@ def check_release_layout(app_dir: pathlib.Path) -> list[dict[str, object]]:
                 },
             ]
         )
+        results.append(check_web_runtime_cache(app_dir, current_target))
     return results
 
 

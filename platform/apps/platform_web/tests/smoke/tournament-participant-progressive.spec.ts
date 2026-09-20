@@ -3,10 +3,16 @@ import { expect, test } from "@playwright/test";
 import type { PlatformTournament } from "../../lib/platform-types";
 
 const apiHost = "127.0.0.1";
-const apiPort = 18019;
+const apiPort = 3199;
 const webBaseUrl = "http://127.0.0.1:3101";
 const publicTournamentSlug = "lean-detail-cup";
 const readyTournamentSlug = "lean-ready-cup";
+const privateBearerSlug = "private-bearer-cup";
+const privateBearerCode = "VALIDBEARER26";
+const expiredBearerCode = "EXPIREDBEARER26";
+const revokedBearerCode = "REVOKEDBEARER26";
+const wrongBearerCode = "WRONGBEARER26";
+const privateBearerInactiveCookie = "private-bearer-inactive=1";
 const actorUserId = "user-actor";
 const apiRequests: string[] = [];
 const workspaceRequests: Array<{
@@ -17,6 +23,12 @@ const workspaceRequests: Array<{
   includeCurrentUser: boolean;
 }> = [];
 const participantRequests: string[] = [];
+const bearerWorkspaceRequests: Array<{
+  slug: string;
+  inviteCode: string | null;
+  workspaceView: string;
+}> = [];
+const bearerResponseStatuses: Array<{ code: string | null; status: number }> = [];
 let usersMeRequests = 0;
 let authBootstrapRequests = 0;
 let csrfRequests = 0;
@@ -25,6 +37,7 @@ let forcedReadyVoteOverloads = 0;
 let holdFirstReadyVoteResponse = false;
 let releaseHeldReadyVoteResponse: (() => void) | null = null;
 let bracketRequests = 0;
+let inviteClaimRequests = 0;
 
 let apiServer: Server | null = null;
 
@@ -33,7 +46,7 @@ test.setTimeout(60_000);
 test.beforeAll(async () => {
   apiServer = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", `http://${apiHost}:${apiPort}`);
-    apiRequests.push(`${request.method ?? "GET"} ${url.pathname}${url.search}`);
+    apiRequests.push(sanitizedRequestLog(request.method ?? "GET", url));
     const hasTestCookie = request.headers.cookie?.includes("lean-detail-smoke=1") ?? false;
 
     if (url.pathname === "/api/v1/auth/bootstrap") {
@@ -58,9 +71,16 @@ test.beforeAll(async () => {
       return;
     }
 
+    if (url.pathname === "/api/v1/tournaments/invites/claim") {
+      inviteClaimRequests += 1;
+      respondJson(response, 404, { detail: "Not found." });
+      return;
+    }
+
     const workspaceMatch = url.pathname.match(/^\/api\/v1\/tournaments\/([^/]+)\/workspace$/);
     if (workspaceMatch) {
       const slug = workspaceMatch[1] ?? publicTournamentSlug;
+      const inviteCode = url.searchParams.get("invite_code");
       workspaceRequests.push({
         slug,
         participantsLimit: Number(url.searchParams.get("participants_limit") ?? 25),
@@ -68,10 +88,26 @@ test.beforeAll(async () => {
         workspaceView: url.searchParams.get("workspace_view") ?? "bracket",
         includeCurrentUser: url.searchParams.get("include_current_user") !== "false"
       });
+      if (slug === privateBearerSlug) {
+        bearerWorkspaceRequests.push({
+          slug,
+          inviteCode,
+          workspaceView: url.searchParams.get("workspace_view") ?? "bracket"
+        });
+        const bearerStatus = privateBearerStatus(inviteCode);
+        if (bearerStatus !== null) {
+          bearerResponseStatuses.push({ code: inviteCode, status: bearerStatus });
+          respondJson(response, bearerStatus, { detail: "Private tournament access denied." });
+          return;
+        }
+        bearerResponseStatuses.push({ code: inviteCode, status: 200 });
+      }
       respondJson(response, 200, workspacePayload(
         slug,
         hasTestCookie,
-        url.searchParams.get("include_current_user") !== "false"
+        url.searchParams.get("include_current_user") !== "false",
+        inviteCode,
+        request.headers.cookie?.includes(privateBearerInactiveCookie) ?? false
       ));
       return;
     }
@@ -90,7 +126,7 @@ test.beforeAll(async () => {
     }
 
     if (url.pathname.match(/^\/api\/v1\/tournaments\/[^/]+\/participants$/)) {
-      participantRequests.push(`${url.pathname}${url.search}`);
+      participantRequests.push(sanitizedRequestLog(request.method ?? "GET", url));
       respondJson(response, 200, [], {
         "Access-Control-Expose-Headers": "X-Total-Count, X-Limit, X-Offset, X-Has-More",
         "X-Total-Count": "0",
@@ -137,6 +173,8 @@ test.beforeEach(() => {
   apiRequests.length = 0;
   workspaceRequests.length = 0;
   participantRequests.length = 0;
+  bearerWorkspaceRequests.length = 0;
+  bearerResponseStatuses.length = 0;
   usersMeRequests = 0;
   authBootstrapRequests = 0;
   csrfRequests = 0;
@@ -145,6 +183,7 @@ test.beforeEach(() => {
   holdFirstReadyVoteResponse = false;
   releaseHeldReadyVoteResponse = null;
   bracketRequests = 0;
+  inviteClaimRequests = 0;
 });
 
 test.afterEach(() => {
@@ -259,6 +298,7 @@ test("ready vote retries bounded overloads as one logical action", async ({ page
 });
 
 test("bracket page uses the initial workspace and has no background refresh", async ({ page }) => {
+  await page.clock.install();
   await blockNextRoutePrefetch(page);
   await page.context().addCookies([{
     name: "deadlock_platform_session",
@@ -282,17 +322,202 @@ test("bracket page uses the initial workspace and has no background refresh", as
   expect(bracketRequests).toBe(0);
   expect(participantRequests).toEqual([]);
   await expect.poll(() => csrfRequests).toBe(0);
-  await new Promise((resolve) => setTimeout(resolve, 4_000));
+  // Exercise the full no-refresh observation window through the browser clock;
+  // an accidental polling interval would fire while this virtual time runs.
+  await page.clock.runFor(4_000);
   expect(bracketRequests).toBe(0);
   await expectNoHorizontalOverflow(page);
+});
+
+test("anonymous bearer keeps the exact code across detail, bracket navigation, and reload", async ({ page }) => {
+  await blockNextRoutePrefetch(page);
+  const lowerCaseCode = privateBearerCode.toLowerCase();
+  const detailPath = `/tournaments/${privateBearerSlug}?invite_code=${lowerCaseCode}`;
+  const bracketPath = `/tournaments/${privateBearerSlug}/bracket?invite_code=${privateBearerCode}`;
+
+  const detailResponse = await page.goto(detailPath);
+  expect(detailResponse?.status()).toBe(200);
+  await expect(page.getByTestId("tournament-read-only-registration")).toBeVisible();
+  await expect(page.getByTestId("tournament-read-only-workflow")).toBeVisible();
+  await expect(page.getByTestId("registration-steps").getByRole("button")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Зарегистрироваться" })).toHaveCount(0);
+  await expect(page.locator("main a[href^='/profile']")).toHaveCount(0);
+
+  const bracketLink = page.locator("a.bracket-open-link");
+  await expect(bracketLink).toHaveAttribute("href", bracketPath);
+  expect(bearerWorkspaceRequests).toEqual([{
+    slug: privateBearerSlug,
+    inviteCode: privateBearerCode,
+    workspaceView: "detail"
+  }, {
+    slug: privateBearerSlug,
+    inviteCode: privateBearerCode,
+    workspaceView: "detail"
+  }]);
+
+  await bracketLink.click();
+  await expect(page).toHaveURL(`${webBaseUrl}${bracketPath}`);
+  await expect(page.getByTestId("bracket-match")).toHaveCount(1);
+  await expect(page.locator("[data-testid='bracket-match'] input")).toHaveCount(0);
+  await expect(page.locator("[data-testid='bracket-match'] button")).toHaveCount(0);
+  await expect(page.locator("main a[href^='/profile']")).toHaveCount(0);
+  expect(bearerWorkspaceRequests).toEqual([
+    {
+      slug: privateBearerSlug,
+      inviteCode: privateBearerCode,
+      workspaceView: "detail"
+    },
+    {
+      slug: privateBearerSlug,
+      inviteCode: privateBearerCode,
+      workspaceView: "detail"
+    },
+    {
+      slug: privateBearerSlug,
+      inviteCode: privateBearerCode,
+      workspaceView: "bracket"
+    }
+  ]);
+
+  await page.reload();
+  await expect(page).toHaveURL(`${webBaseUrl}${bracketPath}`);
+  await expect(page.getByTestId("bracket-match")).toHaveCount(1);
+  expect(bearerWorkspaceRequests).toEqual([
+    {
+      slug: privateBearerSlug,
+      inviteCode: privateBearerCode,
+      workspaceView: "detail"
+    },
+    {
+      slug: privateBearerSlug,
+      inviteCode: privateBearerCode,
+      workspaceView: "detail"
+    },
+    {
+      slug: privateBearerSlug,
+      inviteCode: privateBearerCode,
+      workspaceView: "bracket"
+    },
+    {
+      slug: privateBearerSlug,
+      inviteCode: privateBearerCode,
+      workspaceView: "bracket"
+    }
+  ]);
+  expect(inviteClaimRequests).toBe(0);
+  expect(apiRequests.join("\n")).not.toContain(privateBearerCode);
+  await expectNoHorizontalOverflow(page);
+});
+
+test("inactive retained bearer is visibly read-only without join, profile, or workflow controls", async ({ page }) => {
+  await blockNextRoutePrefetch(page);
+  await page.context().addCookies([
+    {
+      name: "deadlock_platform_session",
+      value: "private-bearer-session",
+      url: webBaseUrl
+    },
+    {
+      name: "lean-detail-smoke",
+      value: "1",
+      url: webBaseUrl
+    },
+    {
+      name: "private-bearer-inactive",
+      value: "1",
+      url: webBaseUrl
+    }
+  ]);
+
+  const detailResponse = await page.goto(
+    `/tournaments/${privateBearerSlug}?invite_code=${privateBearerCode}`
+  );
+  expect(detailResponse?.status()).toBe(200);
+  await expect(page.getByTestId("tournament-read-only-registration")).toBeVisible();
+  await expect(page.getByTestId("tournament-read-only-workflow")).toBeVisible();
+  await expect(page.getByText("Доступ только для просмотра", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("registration-steps").getByRole("button")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Зарегистрироваться" })).toHaveCount(0);
+  await expect(page.locator("main a[href^='/profile']")).toHaveCount(0);
+
+  await page.locator("a.bracket-open-link").click();
+  await expect(page).toHaveURL(`${webBaseUrl}/tournaments/${privateBearerSlug}/bracket?invite_code=${privateBearerCode}`);
+  await expect(page.getByTestId("bracket-match")).toHaveCount(1);
+  await expect(page.locator("[data-testid='bracket-match'] input")).toHaveCount(0);
+  await expect(page.locator("[data-testid='bracket-match'] button")).toHaveCount(0);
+  await expect(page.locator("main a[href^='/profile']")).toHaveCount(0);
+  expect(inviteClaimRequests).toBe(0);
+  expect(apiRequests.join("\n")).not.toContain(privateBearerCode);
+  await expectNoHorizontalOverflow(page);
+});
+
+test("expired, revoked, and wrong bearer codes fail closed without echoing secrets", async ({ page }) => {
+  await blockNextRoutePrefetch(page);
+  const cases = [
+    { code: expiredBearerCode, heading: "По приглашению", status: 401 },
+    { code: revokedBearerCode, heading: "По приглашению", status: 403 },
+    { code: wrongBearerCode, heading: "По приглашению", status: 401 }
+  ] as const;
+
+  for (const { code, heading, status } of cases) {
+    const response = await page.goto(`/tournaments/${privateBearerSlug}?invite_code=${code}`);
+    expect(response?.status()).toBe(200);
+    await expect(page.locator("main").getByRole("heading", { name: heading, exact: true })).toBeVisible();
+    await expect(page.locator("body")).not.toContainText(code);
+    expect(bearerWorkspaceRequests.at(-1)).toEqual({
+      slug: privateBearerSlug,
+      inviteCode: code,
+      workspaceView: "detail"
+    });
+    expect(bearerResponseStatuses.at(-1)).toEqual({ code, status });
+    expect(apiRequests.join("\n")).not.toContain(code);
+  }
+
+  expect(inviteClaimRequests).toBe(0);
+});
+
+test("duplicate or malformed bearer query values fail closed before the workspace read", async ({ page }) => {
+  await blockNextRoutePrefetch(page);
+  const duplicatePath = `/tournaments/${privateBearerSlug}?invite_code=${privateBearerCode}&invite_code=SECONDVALID26`;
+  const malformedPath = `/tournaments/${privateBearerSlug}?invite_code=too-short`;
+
+  await page.goto(duplicatePath);
+  await expect(page.locator("main").getByRole("heading", { name: "По приглашению", exact: true })).toBeVisible();
+  expect(bearerWorkspaceRequests.at(-1)).toEqual({
+    slug: privateBearerSlug,
+    inviteCode: null,
+    workspaceView: "detail"
+  });
+  expect(bearerResponseStatuses.at(-1)).toEqual({ code: null, status: 401 });
+
+  await page.goto(malformedPath);
+  await expect(page.locator("main").getByRole("heading", { name: "По приглашению", exact: true })).toBeVisible();
+  expect(bearerWorkspaceRequests.at(-1)).toEqual({
+    slug: privateBearerSlug,
+    inviteCode: null,
+    workspaceView: "detail"
+  });
+  expect(bearerResponseStatuses.at(-1)).toEqual({ code: null, status: 401 });
+
+  expect(apiRequests.join("\n")).not.toContain(privateBearerCode);
+  expect(apiRequests.join("\n")).not.toContain("SECONDVALID26");
+  expect(apiRequests.join("\n")).not.toContain("too-short");
+  expect(inviteClaimRequests).toBe(0);
 });
 
 async function expectWorkspaceRequest(expected: typeof workspaceRequests[number]) {
   await expect.poll(() => workspaceRequests).toEqual([expected]);
 }
 
-function workspacePayload(slug: string, authenticated: boolean, includeCurrentUser: boolean) {
+function workspacePayload(
+  slug: string,
+  authenticated: boolean,
+  includeCurrentUser: boolean,
+  inviteCode: string | null = null,
+  inactiveParticipant = false
+) {
   const isReady = slug === readyTournamentSlug;
+  const isPrivateBearer = slug === privateBearerSlug && inviteCode === privateBearerCode;
   const currentUser = authenticated && includeCurrentUser ? platformUser() : null;
   type WorkspaceTournamentFixture = Pick<
     PlatformTournament,
@@ -301,26 +526,67 @@ function workspacePayload(slug: string, authenticated: boolean, includeCurrentUs
       | "participant_count" | "max_participants" | "current_user_participant_status"
       | "starts_at" | "registration_closes_at" | "ready_check_starts_at"
       | "ready_check_ends_at" | "captain_selection_starts_at" | "allowed_ranks"
-  >;
+  > & { invite_code?: string | null };
   const tournament: WorkspaceTournamentFixture = {
     id: `t_${slug}`,
     slug,
     name: isReady ? "Lean Ready Cup" : "Lean Detail Cup",
     description: "Lean tournament detail smoke tournament.",
-    visibility: "public",
+    visibility: isPrivateBearer ? "private" : "public",
     status: isReady ? "registration_closed" : "registration_open",
     format_slug: "solo",
     organizer_user_id: "user-organizer",
     organizer_display_name: "Roster Organizer",
     participant_count: 26,
     max_participants: 64,
-    current_user_participant_status: authenticated ? "registered" : null,
+    current_user_participant_status: isPrivateBearer
+      ? (inactiveParticipant ? "withdrawn" : null)
+      : authenticated ? "registered" : null,
     starts_at: "2026-07-20T18:00:00Z",
     registration_closes_at: "2026-07-20T16:00:00Z",
     ready_check_starts_at: "2026-07-20T16:05:00Z",
     ready_check_ends_at: "2026-07-20T16:20:00Z",
     captain_selection_starts_at: "2026-07-20T16:30:00Z",
-    allowed_ranks: ["r1", "r2"]
+    allowed_ranks: ["r1", "r2"],
+    invite_code: isPrivateBearer ? privateBearerCode : null
+  };
+  const bracket = isPrivateBearer ? {
+    tournament_id: `t_${slug}`,
+    tournament_status: "in_progress",
+    status: "ready",
+    revision: 1,
+    can_manage: false,
+    capabilities: {
+      can_manage: false,
+      can_schedule_matches: false,
+      can_report_matches: false
+    },
+    teams: [],
+    matches: [{
+      id: `m_${slug}`,
+      round_number: 1,
+      match_order: 1,
+      team_a_id: null,
+      team_b_id: null,
+      home_label: "Alpha",
+      away_label: "Beta",
+      score_a: null,
+      score_b: null,
+      winner_team_id: null,
+      home_source_match_id: null,
+      away_source_match_id: null,
+      status: "scheduled",
+      match_format: "bo1",
+      ready: true,
+      scheduled_at: null
+    }]
+  } : {
+    tournament_id: `t_${slug}`,
+    status: "pending",
+    revision: 0,
+    can_manage: false,
+    teams: [],
+    matches: []
   };
   return {
     tournament,
@@ -332,20 +598,28 @@ function workspacePayload(slug: string, authenticated: boolean, includeCurrentUs
     participants_offset: 0,
     participants_has_more: true,
     participants_available: true,
-    bracket: {
-      tournament_id: `t_${slug}`,
-      status: "pending",
-      revision: 0,
-      can_manage: false,
-      teams: [],
-      matches: []
-    },
+    bracket,
     ready_check: isReady ? {
       active_round: readyRound(null),
       latest_round: readyRound(null)
     } : null,
     auto_assignment: null
   };
+}
+
+function privateBearerStatus(inviteCode: string | null): number | null {
+  if (inviteCode === privateBearerCode) {
+    return null;
+  }
+  if (inviteCode === expiredBearerCode || inviteCode === null) {
+    return 401;
+  }
+  if (inviteCode === revokedBearerCode) {
+    return 403;
+  }
+  // Any other code for an existing private tournament fails closed as an
+  // anonymous unauthorized request; only an unknown tournament is 404.
+  return 401;
 }
 
 function readyRound(choice: string | null) {
@@ -395,6 +669,15 @@ function platformAuthBootstrap() {
     avatar_url: null,
     avatar_media: null
   };
+}
+
+function sanitizedRequestLog(method: string, url: URL): string {
+  const params = new URLSearchParams(url.searchParams);
+  if (params.has("invite_code")) {
+    params.set("invite_code", "[redacted]");
+  }
+  const query = params.toString();
+  return `${method} ${url.pathname}${query ? `?${query}` : ""}`;
 }
 
 function respondJson(

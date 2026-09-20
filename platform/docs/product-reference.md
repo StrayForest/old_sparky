@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform API and web
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-13
 
 ## Public surface
 
@@ -46,15 +46,54 @@ exceptions live in the [security audit](application-security-audit.md).
 - Players create private tournaments within the monthly allowance. Public
   creation requires an explicit permission or admin role.
 - Registration is solo and uses current profile data, rank/capacity rules and
-  the invite code supplied for private tournaments. Entering a code only opens
-  the private tournament workspace; it creates no account, access record or
-  participant row.
+  the invite code supplied for private tournaments. A valid nonrevoked,
+  nonexpired code is an unlimited, non-consuming bearer read capability for
+  the private summary, workspace, participant roster, matches and bracket
+  GETs. It creates no account, access record, claim, membership or participant
+  row; joining remains an authenticated write with its own workflow checks.
+- The bearer capability is a closed API allowlist. It never authorizes profile
+  reads, invite management, Ready Check/captain/assignment workflow reads, or
+  any POST, PATCH or DELETE. The separate legacy `POST
+  /api/v1/tournaments/invites/claim` is only a read-only compatibility
+  envelope for body-code lookup; it does not create access, consume a use or
+  create membership, and it does not expand the bearer allowlist. Retained
+  inactive participants may use the five allowlisted reads with a valid code
+  but remain denied on all other private tournament surfaces. Closed and
+  completed tournaments remain readable with a valid code; writes remain
+  governed by their workflow state.
+- Workspace responses omit a default/discovered invite code. When a request
+  supplies a valid code, the response may echo only that exact validated code;
+  it never returns a different first unrevoked invite. Invite
+  `max_uses`/`use_count`/`remaining_uses` fields are compatibility metadata,
+  not bearer authorization or consumption state.
+- Custom invite codes at tournament creation and invite-code status lookup use
+  the same strict raw-code validator: exactly 10–24 ASCII alphanumeric
+  characters, canonicalized to uppercase. Punctuation, Unicode, control,
+  whitespace, duplicate bearer query values and wrong lengths are rejected
+  with a generic `422` before persistence; the API error never echoes the raw
+  credential. Auto-generated codes use this same invariant.
 - Public participant and workspace payloads use the public roster DTO and do
   not expose moderation notes, moderator identity or moderation timestamps.
   Organizer-only participant management uses a separate management DTO that
   retains those fields.
 - Ready-check, captain selection, assignment, roster lock and bracket changes
   are server-owned transitions. The UI never infers permission or state.
+- The hidden legacy captain `respond`, `close` and `finalize` routes remain
+  compatibility writers only; each takes the tournament workflow lock and
+  revalidates the round/participant state before committing. Automation and
+  the visible flow remain authoritative for new captain selection.
+- Locking a published Deadlock assignment is one atomic handoff: it
+  materializes the current teams and members, activates captain/player
+  commitments, marks the assignment run locked, seeds the complete bracket
+  graph and advances the bracket revision once. The transaction locks the
+  tournament first, then the assignment run and its workflow rows in stable
+  order. Repeating the organizer lock is an idempotent recovery for a legacy
+  locked roster with revision `0` and no matches; an existing graph is never
+  reseeded or renumbered.
+- The manager/admin `matches/seed-opening-round` endpoint remains a guarded
+  compatibility/recovery surface for already-locked legacy rosters. A normal
+  lock response is already followed by a full bracket; calling the endpoint
+  afterward is a duplicate-seed conflict.
 - Roster lock atomically creates one active
   `player_tournament_commitments` row per player. A partial unique index
   prevents two active commitments for one user.

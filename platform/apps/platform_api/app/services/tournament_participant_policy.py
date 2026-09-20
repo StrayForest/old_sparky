@@ -23,7 +23,7 @@ def _is_invite_claim_request(request: Request) -> bool:
     )
 
 
-async def _reject_disqualified_invite_claim(
+async def _reject_inactive_invite_claim(
     request: Request,
     *,
     user_id: str,
@@ -55,10 +55,10 @@ async def _reject_disqualified_invite_claim(
             TournamentParticipant.user_id == user_id,
         )
     )
-    if participant_status == "disqualified":
+    if participant_status in {"withdrawn", "disqualified"}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Disqualified participants cannot redeem invites for this tournament.",
+            detail="Inactive participants cannot redeem invites for this tournament.",
         )
 
 
@@ -67,12 +67,17 @@ async def enforce_tournament_participant_policy(
     auth_session=Depends(get_optional_authenticated_session_for_tournament_policy),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> None:
-    """Reject invite redemption for retained tournament disqualifications."""
+    """Reject invite redemption for retained inactive participants.
+
+    The compatibility POST is read-only for anonymous/new users, but it must
+    not become a mutation or a way for an inactive participant to resume the
+    same tournament workflow.
+    """
 
     if auth_session is None or not _is_invite_claim_request(request):
         return
 
-    await _reject_disqualified_invite_claim(
+    await _reject_inactive_invite_claim(
         request,
         user_id=auth_session.user.id,
         db_session=db_session,

@@ -44,13 +44,6 @@ def _is_organizer_participant_add_request(request: Request) -> bool:
     )
 
 
-def _is_self_join_request(request: Request) -> bool:
-    return (
-        request.method.upper() == "POST"
-        and _matched_route_path(request).endswith("/{slug}/join")
-    )
-
-
 def _participant_mutation_kind(request: Request) -> str | None:
     method = request.method.upper()
     route_path = _matched_route_path(request)
@@ -202,8 +195,11 @@ async def _lock_participant_mutation(
         return
 
     if mutation_kind == "self":
-        if _is_self_join_request(request):
-            return
+        # Self join and leave share the Tournament aggregate lock with status
+        # transitions and roster publish/lock.  The slot inventory is useful
+        # for bounded capacity checks, but it is not a lifecycle linearization
+        # point: without this lock a join can read registration_open and then
+        # commit after a concurrent close/roster lock.
         locked = await _lock_tournament(db_session, slug=slug)
     else:
         # Organizer moderation and removals retain the tournament-row lock so
@@ -235,13 +231,16 @@ async def serialize_tournament_write_invariants(
     auth_session=Depends(get_optional_authenticated_session_for_tournament_policy),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> None:
-    """Serialize lifecycle/invite mutations while joins claim independent slots.
+    """Serialize lifecycle/invite/participant mutations on stable rows.
 
     Locks are acquired in tournament -> invite order and remain owned by the
     request's shared database transaction until the route commits, rolls back,
-    or the dependency session closes. Organizer participant adds are rate
-    limited and may resolve only accounts that already redeemed an invite for
-    this tournament, so the endpoint cannot serve as a global account oracle.
+    or the dependency session closes. Self join/leave and organizer participant
+    mutations all acquire Tournament first, so registration lifecycle and
+    roster handoff have one server-authoritative linearization point. Organizer
+    participant adds are rate limited and may resolve only accounts that
+    already redeemed an invite for this tournament, so the endpoint cannot
+    serve as a global account oracle.
     """
 
     if auth_session is None:

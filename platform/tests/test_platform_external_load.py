@@ -14,6 +14,7 @@ from tools.platform_external_load import (
     _route_for_read,
     analyze_concurrency_ramp,
     _ready_vote_action,
+    _annotate_timing,
     _request,
     load_manifest,
     run_load,
@@ -125,6 +126,48 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertEqual(summary["errors"], 0)
         self.assertNotIn(secret, serialized)
 
+    def test_timing_summary_separates_service_queue_and_user_observed_latency(self) -> None:
+        result = RequestResult(
+            phase="diagnostic",
+            method="GET",
+            path="/health",
+            status=200,
+            elapsed_ms=10.0,
+            ok=True,
+            response_bytes=1,
+            started_at_monotonic=12.0,
+            finished_at_monotonic=12.01,
+            user_observed_elapsed_ms=30.0,
+        )
+        _annotate_timing(result, scheduled_at=10.0, enqueued_at=11.0)
+
+        summary = summarize_results([result])
+
+        self.assertEqual(summary["latency"]["p95_ms"], 10.0)
+        self.assertEqual(summary["timing"]["service_latency"]["p95_ms"], 10.0)
+        self.assertEqual(summary["timing"]["user_observed_latency"]["p95_ms"], 2010.0)
+        self.assertEqual(summary["timing"]["executor_queue_wait"]["p95_ms"], 1000.0)
+        self.assertEqual(summary["timing"]["late_start"]["p95_ms"], 2000.0)
+        self.assertEqual(summary["timing"]["late_start_count"], 1)
+        self.assertEqual(summary["timing"]["missing_schedule_context"], 0)
+
+    def test_timing_summary_marks_uninstrumented_builder_context(self) -> None:
+        result = RequestResult(
+            phase="diagnostic",
+            method="GET",
+            path="/health",
+            status=200,
+            elapsed_ms=10.0,
+            ok=True,
+            response_bytes=1,
+        )
+
+        summary = summarize_results([result])
+
+        self.assertEqual(summary["timing"]["missing_schedule_context"], 1)
+        self.assertEqual(summary["timing"]["dropped_work"], 1)
+        self.assertTrue(summary["timing"]["partial"])
+
     def test_summary_reports_explicit_client_transport_and_phase_timings(self) -> None:
         result = RequestResult(
             phase="authenticated_page_load",
@@ -179,22 +222,20 @@ class ExternalLoadTests(unittest.TestCase):
 
         summary = summarize_results([result])
 
-        self.assertEqual(summary["cf_error_type_counts"], {"522": 1})
-        self.assertEqual(summary["cf_error_origin_counts"], {"connection_failure": 1})
+        self.assertEqual(summary["cf_error_type_counts"], {"cf_522": 1})
+        self.assertEqual(summary["cf_error_origin_counts"], {"origin": 1})
         self.assertEqual(
             summary["error_samples"][0],
             {
-                "phase": "write_external_vote",
+                "phase": "write_burst",
                 "method": "POST",
-                "path": "/tournaments/qa/deadlock/ready-check/vote",
+                "route_class": "ready_vote",
                 "status": 522,
-                "error_kind": "unexpected_status",
-                "cf_ray": "ray-522",
-                "cf_error_type": "522",
-                "cf_error_origin": "connection_failure",
-                "retry_after": "60",
-                "ttfb": None,
-                "total_time": 30_000.0,
+                "error_class": "server_error",
+                "cf_error_class": "cf_522",
+                "cf_error_origin_class": "origin",
+                "ttfb_ms": None,
+                "elapsed_ms": 30_000.0,
             },
         )
 
@@ -435,9 +476,22 @@ class ExternalLoadTests(unittest.TestCase):
                 manual_refresh_count=0,
                 p95_budget_ms=600,
                 p99_budget_ms=1000,
+                authoritative_binding={
+                    "profile_id": "ready-vote-slo-v2",
+                    "profile_version": 2,
+                    "profile_digest": "a" * 64,
+                    "source_git_sha": "a" * 40,
+                    "external_run_id": "123",
+                },
             )
 
-        self.assertTrue(report["acceptance"]["passed"])
+        self.assertFalse(report["acceptance"]["passed"])
+        self.assertEqual(
+            report["acceptance"]["decision"],
+            "LEGACY DIAGNOSTIC NON-AUTHORITATIVE",
+        )
+        self.assertFalse(report["authoritative"])
+        self.assertFalse(report["dispatchable"])
         self.assertEqual(report["raw_http"]["requests"], 2)
         self.assertEqual(report["logical"]["actions"], 2)
         self.assertEqual(report["logical"]["final_failures"], 0)
@@ -538,6 +592,112 @@ class ExternalLoadTests(unittest.TestCase):
         self.assertFalse(report["acceptance"]["passed"])
         self.assertEqual(report["phases"]["duplicate"]["logical"]["final_failures"], 1)
 
+    def test_stress_marks_duplicate_phase_incomplete_when_primary_successes_are_short(self) -> None:
+        payload = manifest_payload()
+        _, users = load_manifest_from_payload(payload)
+
+        def fake_trace(origin: str, timeout: float) -> dict[str, str]:
+            return {"status": "200", "ip": "192.0.2.10", "colo": "TEST"}
+
+        def fake_action(
+            origin: str,
+            user: VirtualUser,
+            phase: str,
+            timeout: float,
+            *,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+        ) -> LogicalRequestResult:
+            duplicate = phase.endswith("duplicate")
+            primary_shed = not duplicate and user.user_id == "user-00000002"
+            result = RequestResult(
+                phase=phase,
+                method="POST",
+                path=f"/tournaments/{user.tournament_slug}/deadlock/ready-check/vote",
+                status=503 if primary_shed else 200,
+                elapsed_ms=12.0,
+                ok=not primary_shed,
+                response_bytes=120,
+                response_json=(
+                    {"code": "READY_VOTE_OVERLOADED", "retryable": True}
+                    if primary_shed
+                    else {"changed": not duplicate}
+                ),
+                error_kind="http_error" if primary_shed else None,
+            )
+            return LogicalRequestResult(
+                [result], elapsed_ms=12.0, user_id=user.user_id
+            )
+
+        def fake_state_request(
+            origin: str,
+            user: VirtualUser,
+            *,
+            method: str,
+            path: str,
+            phase: str,
+            timeout: float,
+            session_cookie_name: str,
+            csrf_cookie_name: str,
+            json_payload: dict[str, object] | None = None,
+            expected_statuses: frozenset[int] = frozenset({200}),
+            extra_headers: dict[str, str] | None = None,
+        ) -> RequestResult:
+            return RequestResult(
+                phase=phase,
+                method=method,
+                path=path,
+                status=200,
+                elapsed_ms=8.0,
+                ok=True,
+                response_bytes=150,
+                response_json={"active_round": {"ready_count": 1}},
+            )
+
+        with (
+            patch("tools.platform_external_load._trace", side_effect=fake_trace),
+            patch("tools.platform_external_load._ready_vote_action", side_effect=fake_action),
+            patch("tools.platform_external_load._request", side_effect=fake_state_request),
+        ):
+            report = run_load(
+                payload,
+                users,
+                mode="ready-vote",
+                spread_seconds=0,
+                concurrency=1,
+                timeout=1,
+                duplicate_count=2,
+                manual_refresh_count=0,
+                p95_budget_ms=600,
+                p99_budget_ms=1000,
+                scenario_kind="stress",
+                acceptance_contract={
+                    "kind": "stress",
+                    "accepted_request_latency": {
+                        "p50_ms": 1500,
+                        "p90_ms": 3000,
+                        "p95_ms": 5000,
+                        "p99_ms": 8000,
+                    },
+                    "max_shed_percent": 99.9,
+                    "max_retry_amplification_percent": 200,
+                    "minimum_useful_goodput_actions_per_second": 0.1,
+                },
+            )
+
+        duplicate = report["phases"]["duplicate"]
+        self.assertEqual(duplicate["configured_actions"], 2)
+        self.assertEqual(duplicate["candidate_actions"], 1)
+        self.assertEqual(duplicate["submitted_actions"], 1)
+        self.assertEqual(duplicate["missing_actions"], 1)
+        self.assertFalse(duplicate["complete"])
+        self.assertTrue(duplicate["logical"]["timing"]["partial"])
+        self.assertEqual(report["logical"]["configured_duplicate_actions"], 2)
+        self.assertEqual(report["logical"]["actions"], 3)
+        self.assertEqual(report["raw_http"]["requests"], 3)
+        self.assertFalse(report["acceptance"]["contract_ok"])
+        self.assertFalse(report["acceptance"]["checks"]["timing_complete"])
+
     def test_read_mix_manual_refresh_uses_conditional_workspace_request(self) -> None:
         payload = manifest_payload()
         _, users = load_manifest_from_payload(payload)
@@ -593,10 +753,30 @@ class ExternalLoadTests(unittest.TestCase):
                     manual_refresh_count=1,
                     p95_budget_ms=1000,
                     p99_budget_ms=2000,
+                    acceptance_contract={
+                        "kind": "slo",
+                        "accepted_request_latency": {
+                            "p50_ms": 100,
+                            "p90_ms": 100,
+                            "p95_ms": 100,
+                            "p99_ms": 100,
+                        },
+                        "logical_latency": {"p95_ms": 100, "p99_ms": 100},
+                        "logical_final_failure_percent": 0,
+                        "max_shed_percent": 0,
+                        "max_retry_amplification_percent": 0,
+                    },
                 )
 
-        self.assertTrue(report["acceptance"]["passed"])
+        self.assertFalse(report["acceptance"]["passed"])
+        self.assertEqual(
+            report["acceptance"]["decision"],
+            "LEGACY DIAGNOSTIC NON-AUTHORITATIVE",
+        )
+        self.assertFalse(report["authoritative"])
+        self.assertFalse(report["dispatchable"])
         self.assertEqual(report["scope"], "full_population")
+        self.assertFalse(report["acceptance"]["checks"]["authoritative_binding"])
         self.assertEqual(report["phases"]["read_mix"]["requests"], 2)
         self.assertEqual(report["phases"]["manual_refresh"]["requests"], 1)
         self.assertEqual(report["phases"]["manual_refresh"]["status_counts"], {"304": 1})
@@ -867,7 +1047,13 @@ class ExternalLoadTests(unittest.TestCase):
                 concurrency_stages=[1, 2],
             )
 
-        self.assertTrue(report["acceptance"]["passed"])
+        self.assertFalse(report["acceptance"]["passed"])
+        self.assertEqual(
+            report["acceptance"]["decision"],
+            "LEGACY DIAGNOSTIC NON-AUTHORITATIVE",
+        )
+        self.assertFalse(report["authoritative"])
+        self.assertFalse(report["dispatchable"])
         self.assertEqual(report["phases"]["read_mix"]["requests"], 4)
         self.assertEqual(
             report["phases"]["capacity_ramp"]["concurrency_stages"],

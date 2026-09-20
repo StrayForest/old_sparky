@@ -2,6 +2,17 @@
   "schema": 2,
   "profile_id": "authenticated-page-load-v1",
   "profile_version": 1,
+  "portfolio": {
+    "owner": "platform-performance",
+    "hypothesis": "The supported authenticated tournament HTML page stays within the SSR latency and error budget at the full fixture size.",
+    "class": "default",
+    "status": "active",
+    "cadence": "release",
+    "environment": "production",
+    "request_budget": {"max_logical_actions": 20000, "max_http_attempts": 20000, "max_duration_seconds": 1800},
+    "cost_budget": {"max_runner_minutes": 120, "basis": "external runner wall-clock budget"},
+    "last_accepted_evidence": {"run_id": "34096416799", "source_sha": "bba3fb278e348906a6942aee8462b758c3d616ef"}
+  },
   "category": "stress",
   "purpose": "Measure the real authenticated Next.js tournament page rather than an API-only surrogate.",
   "description": "External authenticated GET /tournaments/{slug} page loads with HTML TTFB, total latency and origin-side SSR diagnostics.",
@@ -28,6 +39,7 @@
   },
   "acceptance": {
     "kind": "stress",
+    "minimum_useful_goodput_actions_per_second": 1,
     "accepted_request_latency": {
       "p50_ms": 1000,
       "p90_ms": 2500,
@@ -59,6 +71,7 @@
   },
   "execution": {
     "generator": "GitHub-hosted external runner",
+    "require_exact_observer_binding": true,
     "measured_origin": "https://old-sparky.com",
     "origin_role": "fixture preparation, Next.js/API/DB observer and exact cleanup only",
     "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",

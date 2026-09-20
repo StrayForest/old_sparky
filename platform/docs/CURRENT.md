@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-11
+- Last reviewed: 2026-09-13
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
@@ -15,6 +15,14 @@ Read this file for the current production baseline and next engineering priority
   at source SHA `0700b7402ecdd182fe0cfba4feae14f15fb68243`; its launch QA and
   post-run storage maintenance passed. A later documentation-only publication
   must preserve this runtime profile.
+- Preventative web-runtime hardening is encoded in the source contract:
+  `deadlock-web` uses bounded automatic restart limits, the standalone cache is
+  created with exact service ownership/mode and its systemd write allowlist,
+  and the release artifact excludes stale cache state while requiring the two
+  fixed-schema diagnostics helpers. The read-only outage workflow fails closed
+  on producer/helper failure and uploads aggregate summaries only; this does
+  not itself change the recovered production runtime until the normal reviewed
+  release path runs.
 - The authenticated HTML follow-up compared the unchanged v1 control, the
   HTTP/1.1 keep-alive client, the one-worker native server transport and the
   two-worker native profile. All pressure windows observed web-process
@@ -68,14 +76,33 @@ Read this file for the current production baseline and next engineering priority
 - The full read-only Cloudflare API audit on 2026-09-05 confirmed apex-only DNS, active edge certificates, the Standard R2 bucket with `r2.dev` and browser PUT CORS disabled, the active `cdn.old-sparky.com` custom domain, and a Turnstile widget restricted to `old-sparky.com`. The reviewed catalog Cache Rule was repaired to bypass `__Host-old_sparky_session`; anonymous catalog requests are `HIT`, while session-cookie and `/mine` requests are `DYNAMIC`/uncached. AUD-02 remains open for the CAA decision, certificate alerts, media-token scope, WAF/rate-limit configuration, Bot Fight Mode runtime decision and range/UFW alerting; see [AUD-02](application-security-audit.md).
 - Cloudflare is the single visitor-facing HSTS owner. Dashboard verification on 2026-08-21 confirmed HSTS On with six-month `max-age=15552000`, `includeSubDomains` Off and preload Off; Nginx must continue to omit HSTS.
 - Cloudflare Full(strict), minimum visitor TLS 1.2, TLS 1.3/HTTP3 and DNSSEC were operator-confirmed on 2026-08-21.
-- Invite-only tournament workspace reads reject retained or otherwise inactive participant records. Bracket data is delivered through the authorized workspace response and remains governed by the ordinary request authorization boundary.
+- Invite-only summary, workspace, participant, match and bracket GETs accept a
+  valid nonrevoked/nonexpired bearer invite code for anonymous and retained
+  inactive viewers. The code grants no profile, workflow, management or write
+  capability; inactive viewers remain denied on every other tournament route.
+  The legacy invite-claim POST is a read-only body-code compatibility lookup
+  and creates no access, membership or use-count state. Direct bracket GETs
+  and the workspace's bracket projection remain governed by the ordinary
+  request authorization boundary.
 - Organizer participant removal is a retained `disqualified` record rather than a physical participant-row deletion. A disqualified participant cannot redeem another invite or self-rejoin that same tournament, and a retry does not consume another invite use. The organizer-only management roster retains inactive rows for explicit restoration; the exclusion remains scoped to that tournament and does not block participation in unrelated tournaments.
-- Tournament invite revocations and active participant-capacity mutations are transaction-serialized in PostgreSQL. Invite-code lookup is read-only and does not create personal access or consume a use; restoring a retained inactive participant rechecks capacity before making the row active again.
+- Tournament invite revocations and active participant-capacity mutations are
+  transaction-serialized in PostgreSQL. Invite-code lookup is read-only and
+  does not create personal access or consume a use; valid bearer reads are
+  bounded by a fail-closed HMAC(IP+code) Redis limiter. Workspace serialization
+  omits a default invite and may echo only the exact validated presented code.
+  Legacy `max_uses`/`use_count`/`remaining_uses` fields are compatibility
+  metadata and are not authorization authority; restoring a retained inactive
+  participant rechecks capacity before making the row active again. Custom
+  creation and code-status lookup share the same strict 10–24 ASCII
+  alphanumeric validator and reject malformed raw values with a generic `422`
+  before persistence.
 - Anonymous public profile contracts omit account/contact email and Steam authentication identity. Public tournament participant/workspace contracts omit moderation note, moderator identity and moderation timestamps; organizer management uses a separate response DTO that retains those fields.
 - Public tournament automation errors are persistence-sanitized before commit: `automation_last_error` can contain only the stable generic retry message, while restricted logs retain only tournament/failure metadata and a one-way error fingerprint. Migration `20260821_0039` rewrites historical non-null values to the same safe message.
 - Ready Check uses a deterministic timer contract: the tournament workspace carries `starts_at`, `ends_at`, eligible/current-user state and a UTC `server_time` anchor; the browser uses elapsed monotonic time to activate and expire the button locally without background requests. The vote POST revalidates server time, eligibility and workflow state under the durable concurrency rules, and a delayed automation worker cannot reject a valid in-window vote. `/tournaments` and the bracket grid remain request-driven; the initial bracket is included in the workspace response, and passive bracket changes appear after manual page reload. Redis remains available to unrelated platform services. See the [tournament timing ADR](adr/ready-check-and-bracket-boundary.md).
 - Public media delivery is one-way `R2 -> CDN -> browser`: FastAPI exposes no `/api/v1/uploads/*` serving route, performs no render-path R2 object reads and has no R2-to-local-disk read fallback. Runtime serializers return only ready media-descriptor CDN URLs; historical `avatar_url`, `banner_url` and `cover_url` values are inert.
 - Production releases are built in GitHub Actions as immutable, attested artifacts with an artifact-bound Python wheelhouse and digest; the VPS verifies the artifact/source commit and does not resolve dependencies or build from source.
+- Platform CI is always scheduled for pull requests, `dev` pushes, merge queues and explicit dispatch. Its exact-SHA classifier publishes a digest-bound, validated route manifest. Production deployment requires the exact guard `class=full`, `fallback=false`, `deployable=true`, event `push` on `dev`, a valid `target_sha` equal to the current `dev` head, and the completed successful security run/status bound to that exact SHA, run ID and run attempt. Strict `platform/docs/**` and out-of-scope routes are successful non-deployable no-ops; unknown or uncertain routes fail closed to full verification with `fallback=true`. Auto-deploy and production independently validate that manifest before release side effects. Detailed ownership is in [test-suite governance](test-suite-governance.md).
+- The current verification/classifier/load-observer/web-hermetic package in this working tree is a local source contract pending exact-SHA CI and publication. It is not a deployed-runtime fact; only the release chain above may establish deployment for its source commit. The deployed runtime baseline remains the separately verified release recorded below.
 - The production origin perimeter proof passed on 2026-09-05 for source SHA `97db79b681dd90cc8e89dd91f549610c943c16b8`: listener inventory, forwarded-header trust, Cloudflare/Nginx/UFW parity and external IPv4/IPv6 direct-origin blocking are recorded in [`archive/as-12-origin-perimeter-2026-09-05.md`](archive/as-12-origin-perimeter-2026-09-05.md).
 - Unknown public patch IDs return from the cache path without awaiting external content refresh. Per-ID negative caching and a Redis-coalesced global background-refresh gate bound miss amplification, while miss-triggered upstream requests refuse redirects and enforce a response-size limit.
 - Password-login guessing protection uses independent source-IP and account-wide Redis state. Account identifiers are represented by HMAC fingerprints, shared failures drive adaptive Turnstile and a bounded cooldown, and successful login clears account failure/cooldown state.
@@ -93,15 +120,19 @@ Read this file for the current production baseline and next engineering priority
 
 ## Current engineering priority
 
-The latest production performance stage completed on 2026-09-07 against
+The historical production performance stage completed on 2026-09-07 against
 deployed SHA `bba3fb278e348906a6942aee8462b758c3d616ef`. The measurement
 boundary and retained-load runtime contour were corrected, then the exact
 13-profile matrix was rerun with the original contracts, thresholds and
 dataset sizes; lifecycle profiles were not run on production. The complete
 table, run links, status splits, origin-safety peaks and cleanup proof are in
 the [archived performance-stage report](archive/performance-stage-2026-09-07.md).
+This matrix is historical evidence, not the current profile portfolio or a
+retroactive proof of the current fail-closed Redis projection cleanup
+contract.
 
-All 13 profiles passed their declared acceptance and exact cleanup. Normal
+The historical run reported all 13 profiles passing their then-declared
+acceptance and exact cleanup. Normal
 Ready Vote/read traffic had no unexpected statuses, timeouts, 520s or 522s.
 Stress profiles shed only with the declared `503 READY_VOTE_OVERLOADED`
 response, and read profiles completed their 200/304 contracts. PostgreSQL
@@ -486,9 +517,13 @@ and size-based rotation bounds text log files.
 ## Production invariants
 
 - Profile-level Deadlock dream slots are the source of truth.
-- Invite-only workspace reads require active participant membership or explicit organizer/admin authority; historical inactive participant rows are not authorization grants.
+- Invite-only summary, workspace, participant, match and bracket GETs accept a
+  valid nonrevoked/nonexpired bearer invite code for anonymous and retained
+  inactive viewers. The code grants no profile, workflow, management or write
+  capability; historical inactive participant rows are not authorization
+  grants without that exact bearer code.
 - Organizer exclusion must retain the tournament participant row as `disqualified`; self-rejoin and same-tournament invite redemption remain blocked until the organizer deliberately restores an active status. This is tournament-scoped and must not become a platform-wide ban.
-- Participant capacity and invite revocation are transaction-scoped PostgreSQL invariants: ordinary code lookup is read-only, while ordinary joins claim durable free slots without locking the tournament row and lifecycle/restore mutations retain the tournament-row boundary and recheck capacity. Authentication last-seen touches use an isolated database transaction and must never commit or release locks owned by a mutation request.
+- Participant capacity and invite revocation are transaction-scoped PostgreSQL invariants: revocation and self-service or organizer participant mutations lock the stable Tournament row before lifecycle/capacity checks; read-only invite lookup/bearer access performs no durable claim, use-count or membership write. Ordinary joins then claim durable free slots with `FOR UPDATE SKIP LOCKED`, while lifecycle/restore mutations retain the same tournament-row boundary and recheck capacity. Authentication last-seen touches use an isolated database transaction and must never commit or release locks owned by a mutation request.
 - Resource-creating API retries use durable actor/scope `Idempotency-Key` records. A repeated key with the same payload resolves to the originally created tournament/invite; reusing a key with a different payload is rejected.
 - Player-commitment reconciliation is a tournament workflow writer: it locks every affected Tournament row in deterministic id order before reading lifecycle state or releasing commitments. Automation failure-state persistence reacquires the same Tournament lock after any rollback.
 - Every Deadlock ready-check start/close, captain, assignment generation, roster
@@ -506,8 +541,11 @@ and size-based rotation bounds text log files.
   nine-digit API capacity cannot trigger a massive slot backfill.
 - Bracket/workspace reads expose revision-derived private ETags and accept
   `If-None-Match`; unchanged manual reloads return `304`. The browser updates
-  passive bracket state only after a manual page reload. Explicit bracket
-  mutations may refetch their authoritative response.
+  passive bracket state only after a manual page reload. Bracket conditional
+  requests recheck current authentication/authorization, exact invite validity
+  and bearer rate limits before ETag comparison; denied requests cannot return
+  `304` or private ETag/cache headers. Explicit bracket mutations may refetch
+  their authoritative response.
 - API and worker SQLAlchemy pools are explicit and bounded within the ordinary
   connection budget. Celery uses high/default/low queues, prefetch one and
   late acks; backlog/retry pressure is evidence. The reviewed Ready Vote

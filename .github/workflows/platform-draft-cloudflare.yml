@@ -28,11 +28,13 @@ jobs:
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "26.3.1"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - name: Check JavaScript syntax
@@ -77,10 +79,11 @@ jobs:
       changed: ${{ steps.paths.outputs.changed }}
       target_sha: ${{ steps.paths.outputs.target_sha }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'dev' }}
           fetch-depth: 2
+          persist-credentials: false
       - name: Detect Draft-related changes
         id: paths
         shell: bash
@@ -109,25 +112,25 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
-  release:
-    name: Publish Draft edge runtime
+  build-release:
+    name: Build digest-bound Draft bundle without Cloudflare credentials
     if: ${{ needs.detect-release.outputs.changed == 'true' }}
     needs: [detect-release]
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    environment: production
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.detect-release.outputs.target_sha }}
-      - uses: actions/setup-node@v6
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "26.3.1"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-
-      - name: Verify Draft before publication
+      - name: Build and test Draft candidate
         working-directory: platform/apps/platform_draft
         run: |
           set -euo pipefail
@@ -137,6 +140,275 @@ jobs:
           test -f dist/draft/index.html
           test -f dist/draft/app.js
           test -f dist/draft/styles.css
+      - name: Install hash-locked Wrangler without Cloudflare credentials
+        working-directory: platform/apps/platform_draft
+        env:
+          WRANGLER_LOCK_SHA256: 17d717b60ee2f9edf5bbf1c21d0e99c787e974aa347eea0dedb896d36dcff145
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$WRANGLER_LOCK_SHA256" package-lock.json | sha256sum --check --status -
+          npm ci --ignore-scripts --no-audit --no-fund --omit=dev
+      - name: Generate immutable Draft bundle
+        shell: bash
+        env:
+          TARGET_SHA: ${{ needs.detect-release.outputs.target_sha }}
+          WRANGLER_LOCK_SHA256: 17d717b60ee2f9edf5bbf1c21d0e99c787e974aa347eea0dedb896d36dcff145
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/draft-release-bundle"
+          mkdir -m 700 "$bundle"
+          cp -- platform/apps/platform_draft/wrangler.jsonc "$bundle/wrangler.jsonc"
+          cp -- platform/apps/platform_draft/worker.js "$bundle/worker.js"
+          mkdir -m 700 "$bundle/public" "$bundle/dist" "$bundle/heroes"
+          cp -- platform/apps/platform_draft/public/heroes.js "$bundle/public/heroes.js"
+          cp -a -- platform/apps/platform_draft/dist/draft "$bundle/dist/draft"
+          python -m venv platform/.venv_draft_assets
+          platform/.venv_draft_assets/bin/python -m pip install \
+            --require-hashes \
+            -r platform/apps/platform_draft/requirements-assets.lock.txt
+          cd platform
+          .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
+            --output-dir "$bundle/heroes"
+          /usr/bin/python3 - "$bundle" "$TARGET_SHA" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          target_sha = sys.argv[2]
+          files = {}
+          total_bytes = 0
+          for path in sorted(root.rglob("*")):
+              if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                  raise SystemExit("Draft bundle contains an unsafe filesystem entry")
+              if path.is_file():
+                  relative = path.relative_to(root).as_posix()
+                  size = path.stat().st_size
+                  if not relative or len(relative) > 256 or size > 16 * 1024 * 1024:
+                      raise SystemExit("Draft bundle member exceeds its bound")
+                  total_bytes += size
+                  if total_bytes > 64 * 1024 * 1024:
+                      raise SystemExit("Draft bundle exceeds its size bound")
+                  files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+          if not files or len(files) > 4096:
+              raise SystemExit("Draft bundle inventory is outside its bound")
+          payload = {"schema": 1, "target_sha": target_sha, "files": files}
+          payload["digest"] = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+          (root / "bundle-manifest.json").write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="ascii")
+          PY
+          wrangler_root="$RUNNER_TEMP/draft-wrangler-runtime"
+          install -d -m 700 "$wrangler_root/node_modules"
+          for entry in platform/apps/platform_draft/node_modules/*; do
+            [[ "$(basename "$entry")" == ".bin" ]] && continue
+            cp -a -- "$entry" "$wrangler_root/node_modules/"
+          done
+          /usr/bin/python3 - "$wrangler_root" platform/apps/platform_draft/package-lock.json "$WRANGLER_LOCK_SHA256" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path(sys.argv[1])
+          lock_path = Path(sys.argv[2])
+          expected_lock_sha = sys.argv[3]
+          if hashlib.sha256(lock_path.read_bytes()).hexdigest() != expected_lock_sha:
+              raise SystemExit("Wrangler lockfile digest is not the reviewed value")
+          files = {}
+          total_bytes = 0
+          for path in sorted(root.rglob("*")):
+              if path.is_symlink():
+                  raise SystemExit("Wrangler runtime contains a symlink")
+              if path.is_file():
+                  relative = path.relative_to(root).as_posix()
+                  if not relative or len(relative) > 256:
+                      raise SystemExit("Wrangler runtime member name is unsafe")
+                  size = path.stat().st_size
+                  total_bytes += size
+                  if size > 64 * 1024 * 1024 or total_bytes > 300 * 1024 * 1024:
+                      raise SystemExit("Wrangler runtime exceeds its size bound")
+                  files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+          if len(files) < 100 or len(files) > 4096:
+              raise SystemExit("Wrangler runtime inventory is outside its bound")
+          cli = "node_modules/wrangler/wrangler-dist/cli.js"
+          if cli not in files:
+              raise SystemExit("Wrangler CLI is missing from the runtime")
+          payload = {
+              "schema": 1,
+              "package": "wrangler",
+              "version": "4.129.0",
+              "lockfile_sha256": expected_lock_sha,
+              "files": files,
+          }
+          digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+          (root / "wrangler-tool-manifest.json").write_text(
+              json.dumps({**payload, "digest": digest}, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="ascii",
+          )
+          if digest != "c27608e7efe705b963aee2f3b2d5ef15ac7d7e51816f086836aac071ea59ad6a":
+              raise SystemExit("Wrangler runtime manifest digest is not the reviewed value")
+          PY
+      - name: Upload digest-bound Draft bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-draft-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/draft-release-bundle
+          if-no-files-found: error
+          retention-days: 2
+      - name: Upload digest-bound Wrangler runtime
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-draft-wrangler-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/draft-wrangler-runtime
+          if-no-files-found: error
+          retention-days: 2
+
+  release:
+    name: Publish Draft edge runtime
+    if: ${{ needs.detect-release.outputs.changed == 'true' }}
+    needs: [detect-release, build-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: production
+    steps:
+      - name: Download digest-bound Draft bundle
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-draft-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/draft-release-bundle
+      - name: Download digest-bound Wrangler runtime
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-draft-wrangler-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/draft-wrangler-runtime
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "26.3.1"
+      - name: Validate data-only Draft handoff
+        shell: bash
+        env:
+          TARGET_SHA: ${{ needs.detect-release.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/draft-release-bundle"
+          test -d "$bundle" && test ! -L "$bundle"
+          ! find -L "$bundle" -type l -print -quit | grep -q .
+          /usr/bin/python3 - "$bundle/bundle-manifest.json" "$bundle" "$TARGET_SHA" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          manifest_path = Path(sys.argv[1])
+          root = Path(sys.argv[2])
+          target_sha = sys.argv[3]
+          if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
+              raise SystemExit("Draft target SHA is invalid")
+          manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+          if not isinstance(manifest, dict) or manifest.get("schema") != 1 or manifest.get("target_sha") != target_sha:
+              raise SystemExit("Draft handoff schema or SHA is invalid")
+          files = manifest.get("files")
+          if not isinstance(files, dict) or not files or len(files) > 4096:
+              raise SystemExit("Draft handoff file inventory is invalid")
+          expected = set(files)
+          actual = {
+              path.relative_to(root).as_posix()
+              for path in root.rglob("*")
+              if path.is_file() and path.name != "bundle-manifest.json"
+          }
+          if actual != expected:
+              raise SystemExit("Draft handoff file inventory changed")
+          for name, expected_digest in files.items():
+              path_parts = Path(name).parts if isinstance(name, str) else ()
+              if (
+                  not isinstance(name, str)
+                  or not name.isascii()
+                  or "\\" in name
+                  or Path(name).is_absolute()
+                  or any(part in {"", ".", ".."} for part in path_parts)
+                  or len(name) > 256
+                  or not isinstance(expected_digest, str)
+                  or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+              ):
+                  raise SystemExit("Draft handoff digest is invalid")
+              path = root / name
+              metadata = path.lstat()
+              if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1:
+                  raise SystemExit("Draft handoff member is not a regular file")
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != expected_digest:
+                  raise SystemExit("Draft handoff digest mismatch")
+          canonical = json.dumps({"schema": 1, "target_sha": target_sha, "files": files}, sort_keys=True, separators=(",", ":")).encode()
+          expected_manifest_digest = hashlib.sha256(canonical).hexdigest()
+          if manifest.get("digest") != expected_manifest_digest:
+              raise SystemExit("Draft handoff manifest digest mismatch")
+          PY
+
+      - name: Validate immutable Wrangler runtime
+        shell: bash
+        env:
+          EXPECTED_WRANGLER_LOCK_SHA256: 17d717b60ee2f9edf5bbf1c21d0e99c787e974aa347eea0dedb896d36dcff145
+          EXPECTED_WRANGLER_MANIFEST_SHA256: c27608e7efe705b963aee2f3b2d5ef15ac7d7e51816f086836aac071ea59ad6a
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/draft-wrangler-runtime"
+          test -d "$root" && test ! -L "$root"
+          /usr/bin/python3 - "$root" "$EXPECTED_WRANGLER_LOCK_SHA256" "$EXPECTED_WRANGLER_MANIFEST_SHA256" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          root = Path(sys.argv[1])
+          expected_lock_sha, expected_manifest_sha = sys.argv[2:]
+          manifest_path = root / "wrangler-tool-manifest.json"
+          if not manifest_path.is_file() or manifest_path.is_symlink():
+              raise SystemExit("Wrangler runtime manifest is missing")
+          manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+          expected_keys = {"schema", "package", "version", "lockfile_sha256", "files", "digest"}
+          if set(manifest) != expected_keys or manifest.get("schema") != 1 or manifest.get("package") != "wrangler" or manifest.get("version") != "4.129.0":
+              raise SystemExit("Wrangler runtime manifest schema is not closed")
+          if manifest.get("lockfile_sha256") != expected_lock_sha:
+              raise SystemExit("Wrangler runtime lockfile digest mismatch")
+          files = manifest.get("files")
+          if not isinstance(files, dict) or not files or len(files) > 4096:
+              raise SystemExit("Wrangler runtime file inventory is invalid")
+          canonical = json.dumps({key: manifest[key] for key in ("schema", "package", "version", "lockfile_sha256", "files")}, sort_keys=True, separators=(",", ":")).encode()
+          if hashlib.sha256(canonical).hexdigest() != expected_manifest_sha or manifest.get("digest") != expected_manifest_sha:
+              raise SystemExit("Wrangler runtime manifest digest mismatch")
+          actual = set()
+          total_bytes = 0
+          for path in sorted(root.rglob("*")):
+              if path.is_symlink():
+                  raise SystemExit("Wrangler runtime contains a symlink")
+              if path.is_file() and path != manifest_path:
+                  actual.add(path.relative_to(root).as_posix())
+          if actual != set(files):
+              raise SystemExit("Wrangler runtime file inventory changed")
+          for name, expected_digest in files.items():
+              if not isinstance(name, str) or not name.isascii() or "\\" in name or Path(name).is_absolute() or any(part in {"", ".", ".."} for part in Path(name).parts) or len(name) > 256:
+                  raise SystemExit("Wrangler runtime path is unsafe")
+              if not isinstance(expected_digest, str) or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+                  raise SystemExit("Wrangler runtime member digest is malformed")
+              path = root / name
+              metadata = path.lstat()
+              if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1:
+                  raise SystemExit("Wrangler runtime member is not a regular file")
+              total_bytes += metadata.st_size
+              if metadata.st_size > 64 * 1024 * 1024 or total_bytes > 300 * 1024 * 1024:
+                  raise SystemExit("Wrangler runtime member exceeds its size bound")
+              if hashlib.sha256(path.read_bytes()).hexdigest() != expected_digest:
+                  raise SystemExit("Wrangler runtime member digest mismatch")
+          cli = root / "node_modules/wrangler/wrangler-dist/cli.js"
+          if not cli.is_file() or cli.is_symlink():
+              raise SystemExit("validated Wrangler CLI is missing")
+          print("immutable Wrangler runtime accepted")
+          PY
 
       - name: Require Cloudflare deployment credentials
         shell: bash
@@ -150,13 +422,8 @@ jobs:
 
       - name: Generate production hero thumbnails
         run: |
-          python -m venv platform/.venv_draft_assets
-          platform/.venv_draft_assets/bin/python -m pip install \
-            --require-hashes \
-            -r platform/apps/platform_draft/requirements-assets.lock.txt
-          cd platform
-          .venv_draft_assets/bin/python tools/sync_draft_hero_assets.py \
-            --output-dir /tmp/oldsparky-draft-heroes
+          set -euo pipefail
+          test -d "$RUNNER_TEMP/draft-release-bundle/heroes"
 
       - name: Upload immutable hero thumbnails to existing R2 bucket
         shell: bash
@@ -164,14 +431,16 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DRAFT_R2_BUCKET: oldsparky
+          WRANGLER_CLI: ${{ runner.temp }}/draft-wrangler-runtime/node_modules/wrangler/wrangler-dist/cli.js
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(/tmp/oldsparky-draft-heroes/*.webp)
+          files=("$RUNNER_TEMP"/draft-release-bundle/heroes/*.webp)
           test "${#files[@]}" -ge 30
+          test -f "$WRANGLER_CLI" && test ! -L "$WRANGLER_CLI"
           for file in "${files[@]}"; do
             name="$(basename "$file")"
-            npx --yes wrangler@4.129.0 r2 object put \
+            node "$WRANGLER_CLI" r2 object put \
               "${DRAFT_R2_BUCKET}/draft/heroes/v1/${name}" \
               --file "$file" \
               --content-type image/webp \
@@ -181,11 +450,15 @@ jobs:
           done
 
       - name: Deploy Worker, Static Assets and Durable Object
-        working-directory: platform/apps/platform_draft
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx --yes wrangler@4.129.0 deploy
+          WRANGLER_CLI: ${{ runner.temp }}/draft-wrangler-runtime/node_modules/wrangler/wrangler-dist/cli.js
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/draft-release-bundle"
+          test -f "$WRANGLER_CLI" && test ! -L "$WRANGLER_CLI"
+          node "$WRANGLER_CLI" deploy --config "$RUNNER_TEMP/draft-release-bundle/wrangler.jsonc"
 
       - name: Smoke-check Draft page, assets, CDN and room creation
         shell: bash
@@ -231,7 +504,7 @@ jobs:
             "Draft page" \
             "https://old-sparky.com/draft" \
             /tmp/draft.html \
-            platform/apps/platform_draft/dist/draft/index.html
+            "$RUNNER_TEMP/draft-release-bundle/dist/draft/index.html"
           grep -q 'id="app"' /tmp/draft.html
           grep -q 'ca-pub-7185165276065459' /tmp/draft.html
           grep -qi '^x-old-sparky-draft: 1' /tmp/draft.html.headers
@@ -240,7 +513,7 @@ jobs:
             "Draft app.js" \
             "https://old-sparky.com/draft/app.js" \
             /tmp/draft-app.js \
-            platform/apps/platform_draft/dist/draft/app.js
+            "$RUNNER_TEMP/draft-release-bundle/dist/draft/app.js"
           grep -q 'oldsparky:draft:solo' /tmp/draft-app.js
           grep -q 'Драфты' /tmp/draft-app.js
           grep -q 'Баны на команду' /tmp/draft-app.js
@@ -250,17 +523,17 @@ jobs:
             "Draft styles.css" \
             "https://old-sparky.com/draft/styles.css" \
             /tmp/draft-styles.css \
-            platform/apps/platform_draft/dist/draft/styles.css
+            "$RUNNER_TEMP/draft-release-bundle/dist/draft/styles.css"
           assert_live_asset \
             "Draft draft-core.js" \
             "https://old-sparky.com/draft/draft-core.js" \
             /tmp/draft-core.js \
-            platform/apps/platform_draft/dist/draft/draft-core.js
+            "$RUNNER_TEMP/draft-release-bundle/dist/draft/draft-core.js"
           assert_live_asset \
             "Draft heroes.js" \
             "https://old-sparky.com/draft/heroes.js" \
             /tmp/draft-heroes.js \
-            platform/apps/platform_draft/dist/draft/heroes.js
+            "$RUNNER_TEMP/draft-release-bundle/dist/draft/heroes.js"
 
           get_200 "Hero CDN" "https://cdn.old-sparky.com/draft/heroes/v1/abrams.webp" /tmp/abrams.webp
           test -s /tmp/abrams.webp

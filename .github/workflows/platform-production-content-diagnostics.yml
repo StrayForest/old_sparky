@@ -8,32 +8,251 @@ on:
 
 permissions:
   contents: read
-  statuses: write
 
 jobs:
-  content-diagnostics:
+  validate-content-provenance:
+    name: Validate content diagnostics handoff
+    outputs:
+      deploy_ready: ${{ steps.deployment_provenance.outputs.deploy_ready }}
+      provenance_digest: ${{ steps.deployment_provenance.outputs.provenance_digest }}
+    permissions:
+      actions: read
+      contents: read
+      statuses: read
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'dev')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
+      SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
+      PROVENANCE_TOOL: ${{ github.workspace }}/platform/tools/platform_workflow_provenance.py
+    steps:
+      # The workflow-run SHA is data to validate, never the source of this
+      # token-bearing validator. Pin the checkout to the immutable default
+      # branch commit resolved by the GitHub API.
+      - name: Resolve immutable default-branch provenance source
+        id: trusted_default
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_BRANCH: dev
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          trusted_ref="$RUNNER_TEMP/platform-trusted-content-ref.json"
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/${TRUSTED_BRANCH}" \
+            --output "$trusted_ref"
+          /usr/bin/python3 - "$trusted_ref" "$GITHUB_OUTPUT" "$TRUSTED_BRANCH" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          branch = sys.argv[3]
+          obj = payload.get("object") if isinstance(payload, dict) else None
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if payload.get("ref") != f"refs/heads/{branch}" or not isinstance(obj, dict) or obj.get("type") != "commit":
+              raise SystemExit("trusted default branch ref is not an immutable commit")
+          if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("trusted default branch commit SHA is malformed")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"sha={sha}\n")
+          PY
+          rm -f -- "$trusted_ref"
+
+      - name: Checkout trusted content diagnostics source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.trusted_default.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact completed production deployment provenance (shared validator)
+        id: deployment_provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_SOURCE_SHA: ${{ steps.trusted_default.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TRUSTED_SOURCE_SHA"
+          # The shared validator owns these exact checks; consumers must not
+          # bind an untrusted row to any other workflow: "path": ".github/workflows/platform-production-deploy.yml"
+          # and the source run must carry "event": "workflow_dispatch" with
+          # "conclusion": "success".
+          # reimplement status.get("context") == "platform-production-deploy"
+          # or status.get("target_url") == os.environ["SOURCE_RUN_URL"].
+          # Its closed output is equivalent to output.write("deploy_ready=false\n")
+          # / output.write("deploy_ready=true\n") after two equal snapshots.
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            printf '%s\n' 'deploy_ready=true' >> "$GITHUB_OUTPUT"
+            printf '%s\n' 'provenance_digest=' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          provenance_dir="$(mktemp -d "$RUNNER_TEMP/platform-production-content-provenance.XXXXXX")"
+          trap 'rm -rf -- "$provenance_dir"' EXIT
+          chmod 700 "$provenance_dir"
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          fetch_rows() {
+            local base_url="$1" output_path="$2" kind="$3" page=1 count page_path
+            local pages_dir="$provenance_dir/pages-${kind}-$(basename "$output_path")"
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+                "${base_url}?per_page=100&page=${page}" --output "$page_path"
+              count="$(/usr/bin/python3 - "$page_path" "$kind" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          rows = payload if sys.argv[2] == "statuses" else payload.get("jobs") if isinstance(payload, dict) else None
+          if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+              raise SystemExit("paginated provenance response is malformed")
+          print(len(rows))
+          PY
+              )"
+              if (( count < 100 )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 1000 )) || { echo "provenance pagination exceeded its bound" >&2; exit 1; }
+            done
+            /usr/bin/python3 - "$pages_dir" "$output_path" "$kind" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          pages_dir, output_path, kind = sys.argv[1:]
+          rows = []
+          page_paths = sorted(
+              Path(pages_dir).glob("page-*.json"),
+              key=lambda item: int(item.stem.split("-")[-1]),
+          )
+          for path in page_paths:
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              page_rows = payload if kind == "statuses" else payload.get("jobs")
+              if not isinstance(page_rows, list):
+                  raise SystemExit("paginated provenance response is malformed")
+              rows.extend(page_rows)
+          if kind == "statuses":
+              output_path = Path(output_path)
+              output_path.write_text(json.dumps(rows, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          else:
+              output_path = Path(output_path)
+              output_path.write_text(json.dumps({"total_count": len(rows), "jobs": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          }
+          fetch_snapshot() {
+            local snapshot_dir="$1"
+            install -d -m 700 "$snapshot_dir"
+            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml" \
+              --output "$snapshot_dir/workflow.json"
+            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+              --output "$snapshot_dir/run.json"
+            fetch_rows \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}/jobs" \
+              "$snapshot_dir/jobs.json" jobs
+            fetch_rows \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses" \
+              "$snapshot_dir/statuses.json" statuses
+          }
+          for snapshot in first second; do
+            fetch_snapshot "$provenance_dir/$snapshot"
+            /usr/bin/python3 "$PROVENANCE_TOOL" deployment \
+              --allow-preflight-noop \
+              --workflow "$provenance_dir/$snapshot/workflow.json" \
+              --run "$provenance_dir/$snapshot/run.json" \
+              --jobs "$provenance_dir/$snapshot/jobs.json" \
+              --status "$provenance_dir/$snapshot/statuses.json" \
+              --expected-run-id "$SOURCE_RUN_ID" \
+              --expected-attempt "$SOURCE_RUN_ATTEMPT" \
+              --expected-target-sha "$TARGET_SHA" \
+              --expected-run-url "$SOURCE_RUN_URL" \
+              > "$provenance_dir/$snapshot/validated.json"
+          done
+          /usr/bin/python3 - "$provenance_dir/first/validated.json" "$provenance_dir/second/validated.json" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          first, second = (json.loads(Path(path).read_text(encoding="utf-8")) for path in sys.argv[1:3])
+          if first != second:
+              raise SystemExit("deployment provenance changed between adjacent snapshots")
+          if first.get("deploy_ready") not in (False, True):
+              raise SystemExit("deployment provenance readiness is malformed")
+          digest = first.get("snapshot_digest")
+          if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+              raise SystemExit("deployment provenance snapshot digest is malformed")
+          with Path(sys.argv[3]).open("a", encoding="utf-8") as output:
+              output.write(f"deploy_ready={'true' if first['deploy_ready'] else 'false'}\n")
+              output.write(f"provenance_digest={digest}\n")
+          PY
+
+  content-diagnostics:
+    # The shared handoff replaces the former inline gate
+    # steps.verify_deploy_provenance.outputs.deploy_ready == 'true'.
+    permissions:
+      contents: read
+      statuses: write
+    needs: validate-content-provenance
+    if: >-
+      needs.validate-content-provenance.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' ||
+       needs.validate-content-provenance.outputs.deploy_ready == 'true')
     name: Production content diagnostics
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: production
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
+      SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
 
     steps:
+      - name: Consume validated deployment provenance
+        if: ${{ success() && needs.validate-content-provenance.outputs.deploy_ready == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ needs.validate-content-provenance.outputs.deploy_ready }}" = "true"
+          digest="${{ needs.validate-content-provenance.outputs.provenance_digest }}"
+          test -z "$digest" || [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+
       - name: Mark content diagnostics pending
+        if: ${{ success() && needs.validate-content-provenance.outputs.deploy_ready == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
@@ -43,18 +262,28 @@ jobs:
             --data "{\"state\":\"pending\",\"context\":\"platform-content-diagnostics\",\"description\":\"Production content diagnostics are running\",\"target_url\":\"${run_url}\"}"
 
       - name: Configure SSH
+        if: ${{ success() && needs.validate-content-provenance.outputs.deploy_ready == 'true' }}
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           test -n "${PROD_SSH_HOST:-}"
-          test -n "${PROD_SSH_USER:-}"
           test -n "${PROD_SSH_KEY:-}"
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
-          chmod 600 ~/.ssh/old_sparky_prod
-          ssh_scan="$(mktemp)"
-          trap 'rm -f -- "$ssh_scan"' EXIT
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          ssh_dir="$RUNNER_TEMP/platform-production-content-diagnostics-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-content-diagnostics-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          fi
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          if ! ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null; then
+            echo "Production SSH host key scan failed" >&2
+            exit 1
+          fi
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
           ssh_key_count="$(wc -l < "$ssh_scan" | tr -d ' ')"
           test "$ssh_key_count" = "1" || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
@@ -63,31 +292,45 @@ jobs:
             echo "Production SSH host fingerprint mismatch" >&2
             exit 1
           }
-          install -m 0600 "$ssh_scan" ~/.ssh/known_hosts
+          install -m 0600 "$ssh_scan" "$ssh_dir/known_hosts"
           {
             printf '%s\n' 'Host *'
             printf '%s\n' '  StrictHostKeyChecking yes'
-            printf '  UserKnownHostsFile %s/.ssh/known_hosts\n' "$HOME"
-          } > ~/.ssh/config
-          chmod 600 ~/.ssh/config
-          chmod 600 ~/.ssh/known_hosts
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          chmod 600 "$ssh_dir/known_hosts"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Probe and refresh production home content
+        if: ${{ success() && needs.validate-content-provenance.outputs.deploy_ready == 'true' }}
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          umask 077
+          remote_log="$RUNNER_TEMP/platform-production-content-diagnostics.log"
+          remote_error="$RUNNER_TEMP/platform-production-content-diagnostics-error.log"
+          : >"$remote_log"
+          : >"$remote_error"
+          chmod 600 "$remote_log" "$remote_error"
+          set +e
           ssh \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod \
+            -F "$SSH_DIR/config" \
+            -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$TARGET_SHA'" <<'REMOTE'
+            "bash -s -- '$TARGET_SHA'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
           target_sha="$1"
           runtime=/opt/oldsparky/platform
           guard="$runtime/current/tools/platform_release_lock_exec.sh"
-          test -f "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          test -f "$guard" && test ! -L "$guard" && test -x "$guard" \
+            || { echo "Production mutation guard is missing" >&2; exit 1; }
           /bin/bash "$guard" \
             --app-dir "$runtime" \
             --expected-sha "$target_sha" \
@@ -100,6 +343,13 @@ jobs:
           echo '=== YouTube endpoint probe ==='
           "$python_bin" - <<'PY'
           import httpx
+          import re
+
+          SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+          def safe_id(value):
+              candidate = str(value or "")
+              return candidate if SAFE_ID.fullmatch(candidate) else "unavailable"
 
           urls = {
               "feed": "https://www.youtube.com/feeds/videos.xml?channel_id=UCNoxEIMEAbGHLpn2IGKqlCQ",
@@ -119,28 +369,34 @@ jobs:
                           f"source={name}",
                           f"status={response.status_code}",
                           f"bytes={len(response.content)}",
-                          f"final_url={response.url}",
+                          f"redirected={response.url != url}",
                       )
-                  except Exception as error:
+                  except Exception:
                       print(
                           "YOUTUBE_PROBE",
                           f"source={name}",
-                          f"error={type(error).__name__}",
-                          f"detail={str(error)[:240]}",
+                          "error_class=request",
                       )
           PY
 
           echo '=== Forced home content refresh ==='
-          tools/platform_refresh_home_content.sh
+          tools/platform_refresh_home_content.sh >/dev/null 2>/dev/null
 
           echo '=== Local API home content and live page shape ==='
           "$python_bin" - <<'PY'
           import json
+          import re
           import urllib.request
 
           import httpx
 
           from apps.platform_api.app.services import home_content_runtime
+
+          SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+          def safe_id(value):
+              candidate = str(value or "")
+              return candidate if SAFE_ID.fullmatch(candidate) else "unavailable"
 
           with urllib.request.urlopen(
               "http://127.0.0.1:8010/api/v1/content/home",
@@ -153,12 +409,9 @@ jobs:
               "HOME_CONTENT_API",
               json.dumps(
                   {
-                      "videos_available": payload.get("videos_available"),
+                      "videos_available": payload.get("videos_available") is True,
                       "videos_count": len(videos),
-                      "latest_video_id": latest.get("id"),
-                      "latest_video_title": latest.get("title"),
-                      "latest_video_published_at": latest.get("published_at"),
-                      "generated_at": payload.get("generated_at"),
+                      "latest_video_id": safe_id(latest.get("id")),
                   },
                   ensure_ascii=False,
                   separators=(",", ":"),
@@ -194,19 +447,16 @@ jobs:
           if snippet_index < 0 and latest_id:
               snippet_index = page_text.find(f'\\"videoId\\":\\"{latest_id}\\"')
           if snippet_index >= 0:
-              snippet = page_text[max(0, snippet_index - 700):snippet_index + 2100]
-              snippet = " ".join(snippet.split())
-              print("VIDEO_PAGE_SNIPPET", snippet[:2800])
+              print("VIDEO_PAGE_SNIPPET present=true")
           else:
-              print("VIDEO_PAGE_SNIPPET not-found")
+              print("VIDEO_PAGE_SNIPPET present=false")
 
           print(
               "YOUTUBE_STRUCTURED",
               json.dumps(
                   {
                       "videos_count": len(renderer_videos),
-                      "latest_video_id": expected.get("id"),
-                      "latest_video_title": expected.get("title"),
+                      "latest_video_id": safe_id(expected.get("id")),
                   },
                   ensure_ascii=False,
                   separators=(",", ":"),
@@ -220,33 +470,98 @@ jobs:
           if not videos:
               raise SystemExit("production home content has no videos")
           if latest.get("id") != expected.get("id"):
-              raise SystemExit(
-                  "production latest video does not match YouTube /videos: "
-                  f"api={latest.get('id')} youtube={expected.get('id')}"
-              )
+              raise SystemExit("production latest video identifier mismatch")
           print(
               "CONTENT_ASSERT",
-              f"latest_video_id={latest.get('id')}",
+              f"latest_video_id={safe_id(latest.get('id'))}",
               "status=matched",
           )
           PY
 
-          echo '=== Recent worker YouTube logs ==='
+          echo '=== Recent worker YouTube log summary ==='
+          worker_raw_log_file="$(mktemp)"
+          worker_log_file="$(mktemp)"
+          cleanup_worker_logs() {
+            rm -f -- "$worker_raw_log_file" "$worker_log_file"
+          }
+          trap cleanup_worker_logs EXIT
+          worker_log_status=0
           journalctl -u deadlock-worker --since '-10 minutes' --no-pager \
-            | grep -E 'youtube|home_content' \
-            | tail -n 80 \
-            || true
+            --output cat -n 80 2>/dev/null \
+            >"$worker_raw_log_file" || worker_log_status=$?
+          if (( worker_log_status != 0 )); then
+              printf '%s\n' 'WORKER_JOURNAL_SUMMARY schema=1 status=unavailable error_class=producer'
+          else
+              grep -Ei 'youtube|home_content' "$worker_raw_log_file" \
+                >"$worker_log_file" || true
+              youtube_count="$(grep -Eic 'youtube' "$worker_log_file" || true)"
+              home_content_count="$(grep -Eic 'home_content' "$worker_log_file" || true)"
+              total_count="$(wc -l < "$worker_log_file" | tr -d ' ')"
+              printf 'WORKER_JOURNAL_SUMMARY schema=1 status=ok total_line_count=%s youtube_line_count=%s home_content_line_count=%s\n' \
+                "$total_count" "$youtube_count" "$home_content_count"
+          fi
           MUTATION
           REMOTE
+          remote_status=$?
+          set -e
+          if (( remote_status != 0 )); then
+            rm -f -- "$remote_log" "$remote_error"
+            printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=failed error_class=remote_or_transport'
+            exit 1
+          fi
+          if ! grep -Eq '^CONTENT_ASSERT latest_video_id=(unavailable|[A-Za-z0-9_-]{1,128}) status=matched$' "$remote_log"; then
+            rm -f -- "$remote_log" "$remote_error"
+            printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=failed error_class=producer'
+            exit 1
+          fi
+          printf '%s\n' 'PRODUCTION_CONTENT_DIAGNOSTICS schema=1 status=passed error_class=none'
+          rm -f -- "$remote_log" "$remote_error"
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-content-diagnostics-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-content-diagnostics-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          rm -f -- \
+            "$RUNNER_TEMP/platform-production-content-diagnostics.log" \
+            "$RUNNER_TEMP/platform-production-content-diagnostics-error.log"
+          test ! -e "$RUNNER_TEMP/platform-production-content-diagnostics.log"
+          test ! -e "$RUNNER_TEMP/platform-production-content-diagnostics-error.log"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
 
       - name: Mark content diagnostics successful
-        if: ${{ success() }}
+        if: ${{ success() && needs.validate-content-provenance.outputs.deploy_ready == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
@@ -262,7 +577,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \

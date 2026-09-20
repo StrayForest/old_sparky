@@ -14,6 +14,9 @@ from tools.platform_release_retention import (
 )
 
 
+RELEASE_LOCK_PATH = Path("/run/lock/oldsparky-platform-release.lock")
+
+
 class PlatformReleaseRetentionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -185,7 +188,7 @@ class PlatformReleaseRetentionTests(unittest.TestCase):
                 self.fail("pending transaction unexpectedly acquired retention lock")
 
     def test_release_lock_contention_fails_closed(self) -> None:
-        descriptor = os.open(self.app_dir / "shared", os.O_RDONLY | os.O_DIRECTORY)
+        descriptor = os.open(RELEASE_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaisesRegex(

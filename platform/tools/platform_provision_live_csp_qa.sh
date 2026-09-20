@@ -2,19 +2,33 @@
 set +x
 set -euo pipefail
 
-TRUSTED_REPO_ROOT="/root/old_sparky"
-PLATFORM_ROOT="$TRUSTED_REPO_ROOT/platform"
+TRUSTED_INSTALL_ROOT="${PLATFORM_LIVE_QA_INSTALL_ROOT:-}"
+TRUSTED_MODE=0
+if [[ -n "$TRUSTED_INSTALL_ROOT" ]]; then
+  TRUSTED_MODE=1
+  [[ "$TRUSTED_INSTALL_ROOT" =~ ^/root/\.oldsparky/liveqa/releases/[0-9a-f]{40}$ ]] \
+    || { echo "Trusted live-QA install root is invalid." >&2; exit 1; }
+  [[ "${PLATFORM_LIVE_QA_TARGET_SHA:-}" == "${TRUSTED_INSTALL_ROOT##*/}" ]] \
+    || { echo "Trusted live-QA target SHA does not match its install root." >&2; exit 1; }
+  PLATFORM_ROOT="$TRUSTED_INSTALL_ROOT/platform"
+else
+  TRUSTED_REPO_ROOT="/root/old_sparky"
+  PLATFORM_ROOT="$TRUSTED_REPO_ROOT/platform"
+fi
 TOOLS_DIR="$PLATFORM_ROOT/tools"
 SCRIPT_PATH="$TOOLS_DIR/platform_provision_live_csp_qa.sh"
 SYSTEM_PYTHON="/usr/bin/python3.12"
-QA_PYTHON="$PLATFORM_ROOT/.venv_platform/bin/python"
+QA_PYTHON="${PLATFORM_ROOT}/.venv_platform/bin/python"
+if (( TRUSTED_MODE == 1 )); then
+  QA_PYTHON="/opt/oldsparky/platform/shared/venv/bin/python"
+fi
 
 if [[ "$EUID" -ne 0 ]]; then
   echo "Live CSP QA provisioning must run as root." >&2
   exit 1
 fi
 if [[ "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" != "$SCRIPT_PATH" ]]; then
-  echo "Live CSP QA provisioning must run from the fixed root-controlled checkout." >&2
+  echo "Live CSP QA provisioning must run from the fixed root-controlled runtime." >&2
   exit 1
 fi
 if [[ "${PLATFORM_APP_DIR:-}" != "/opt/oldsparky/platform" ]]; then
@@ -22,7 +36,7 @@ if [[ "${PLATFORM_APP_DIR:-}" != "/opt/oldsparky/platform" ]]; then
   exit 1
 fi
 if [[ ! -x "$QA_PYTHON" ]]; then
-  echo "Root-controlled checkout Python runtime is unavailable." >&2
+  echo "Root-controlled live-QA Python runtime is unavailable." >&2
   exit 1
 fi
 
@@ -59,12 +73,16 @@ fi
 "${GUARD[@]}" assert-lock \
   --bundle-path "$BUNDLE_PATH" \
   --fd "$PLATFORM_LIVE_QA_LOCK_FD"
-"${GUARD[@]}" verify-provenance \
-  --platform-root "$PLATFORM_ROOT" \
-  --helper-path "$HELPER_PATH" >/dev/null
-"${GUARD[@]}" preflight \
-  --bundle-path "$BUNDLE_PATH" \
-  --mode provision
+if (( TRUSTED_MODE == 0 )); then
+  "${GUARD[@]}" verify-provenance \
+    --platform-root "$PLATFORM_ROOT" \
+    --helper-path "$HELPER_PATH" >/dev/null
+else
+  "${GUARD[@]}" preflight \
+    --bundle-path "$BUNDLE_PATH" \
+    --mode provision
+  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
+fi
 
 cd "$PLATFORM_ROOT"
 exec "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \

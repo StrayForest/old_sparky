@@ -108,6 +108,15 @@ async def create_full_bracket_graph(
     tournament: Tournament,
     locked_run: TournamentDeadlockAssignmentRun,
 ) -> tuple[list[TournamentMatch], list[TournamentMatch]]:
+    """Ensure the complete opening-to-final bracket graph exists.
+
+    The tournament workflow lock is the primary serialization boundary.  This
+    helper is intentionally idempotent as well because the assignment lock is
+    an explicit recovery surface for pre-graph legacy rosters and the worker
+    may observe a run whose graph was already seeded.  Existing graph rows are
+    returned without changing ``bracket_revision``; only an empty graph on a
+    zero-revision tournament is allowed to create rows and advance revision.
+    """
     locked_teams = await locked_team_snapshots(
         db_session,
         tournament_id=tournament.id,
@@ -119,6 +128,37 @@ async def create_full_bracket_graph(
         )
     ordered_team_ids = automatic_opening_team_ids(locked_teams)
     total_rounds = bracket_round_count(len(ordered_team_ids))
+
+    existing_matches = list(
+        (
+            await db_session.scalars(
+                select(TournamentMatch)
+                .where(TournamentMatch.tournament_id == tournament.id)
+                .order_by(
+                    TournamentMatch.round_number.asc(),
+                    TournamentMatch.sequence_number.asc(),
+                    TournamentMatch.created_at.asc(),
+                    TournamentMatch.id.asc(),
+                )
+                .with_for_update()
+            )
+        ).all()
+    )
+    if existing_matches:
+        expected_match_count = len(ordered_team_ids) - 1
+        if len(existing_matches) != expected_match_count:
+            raise TournamentWorkflowError(
+                "The existing bracket graph is incomplete and cannot be repaired by a repeat lock."
+            )
+        opening_matches = [
+            match for match in existing_matches if int(match.round_number) == 1
+        ]
+        return existing_matches, opening_matches
+
+    if int(tournament.bracket_revision or 0) != 0:
+        raise TournamentWorkflowError(
+            "The bracket revision is already advanced but its graph is missing."
+        )
 
     all_matches: list[TournamentMatch] = []
     previous_round: list[TournamentMatch] = []

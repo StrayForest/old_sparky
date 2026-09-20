@@ -1,0 +1,37 @@
+{
+  "freshness_policy": {
+    "default": "reuse-existing-locked-versions",
+    "update": "explicit --update required for newer resolution"
+  },
+  "index_url": "https://pypi.org/simple",
+  "input_files": [
+    {
+      "path": "requirements-ci.in",
+      "sha256": "f692b40528b6ee545c5173d089e463d118cd26a6df69a6d51bbfaddb75f8f444"
+    },
+    {
+      "path": "requirements-platform.txt",
+      "sha256": "3c68a7506e3aeddf89f8478e3fc7bb6cbb4eb5cf48788d0e384e077b475a4d74"
+    },
+    {
+      "path": "requirements-quality.txt",
+      "sha256": "04133270c753c3bc4d66c7058ecd6ed89841754dd511e5d754b7015cda9cb903"
+    }
+  ],
+  "lock_file": "requirements-ci.lock.txt",
+  "lock_sha256": "d80d165ffd8f46122f30b0e88c3057158024febfd0d0a10a2b353ff4ddd8e133",
+  "schema": 1,
+  "target": {
+    "architecture": "x86_64",
+    "platform": "linux",
+    "python": "3.12"
+  },
+  "toolchain": {
+    "pip": "26.2.1",
+    "pip-tools": "7.6.1",
+    "setuptools": "84.0.0",
+    "wheel": "0.48.0"
+  },
+  "toolchain_lock_file": "requirements-ci-locker.lock.txt",
+  "toolchain_lock_sha256": "4a229dac8f30095daf85c5e3ffe529f97b79ce44a6e04838d4dd1b2f9d5d62ac"
+}

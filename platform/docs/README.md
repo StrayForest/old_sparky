@@ -2,7 +2,7 @@
 
 - Status: Active
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-09
+- Last reviewed: 2026-09-13
 
 Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current production state and next engineering priority. Open deeper documents only when the task requires them.
 
@@ -26,14 +26,17 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |
 | Services, storage, media and performance | [Operations runbook](operations-runbook.md) |
+| Retained-load cleanup and hermetic web verification | [Retained-load and web verification](retained-load-and-web-verification.md) |
 | Authenticated HTML transport / TTFB hops | [Performance transport runbook](performance-transport-runbook.md) |
 | Load profiles and performance evidence | [`platform/performance/README.md`](../performance/README.md) |
 | Security operations / CSP policy | [Security runbook](security-runbook.md) |
 | Cloudflare dashboard work | [Cloudflare checklist](cloudflare-production-checklist.md) |
 | Incident handling | [Incident response](incident-response.md) |
 | Security findings and evidence | [Application security audit](application-security-audit.md) |
+| Secret-bearing workflow artifact boundary | [Secret-job artifact boundary ADR](adr/secret-job-artifact-boundary.md) |
 | Historical implementation context | [`archive/`](archive/) |
 | Accepted architectural decisions | [`adr/`](adr/) |
+| Private tournament bearer reads | [Private bearer read boundary](adr/private-tournament-bearer-read-boundary.md) |
 | Ready Check / bracket boundary | [Timing and bracket ADR](adr/ready-check-and-bracket-boundary.md) |
 | Public standalone Draft / Cloudflare edge boundary | [Public Draft edge ADR](adr/public-draft-edge-boundary.md) and [completion without result links](adr/public-draft-completion-without-result-links.md) |
 

@@ -73,7 +73,7 @@ class RetainedWriteBurstReportRecoveryTests(unittest.TestCase):
             marker="preprod260824120000abcd",
             report_path=report_path,
             load_run_id="32767006384",
-            control_email="aleksei.lisitsin1@gmail.com",
+            control_email="qa@example.invalid",
         )
 
         self.assertEqual(summary["mode"], "write-burst")
@@ -104,7 +104,7 @@ class RetainedWriteBurstReportRecoveryTests(unittest.TestCase):
                 "gha-32767006384/read-mix/read-mix.json"
             ),
             load_run_id="32767006384",
-            control_email="aleksei.lisitsin1@gmail.com",
+            control_email="qa@example.invalid",
         )
 
         self.assertEqual(summary["mode"], "read-mix")

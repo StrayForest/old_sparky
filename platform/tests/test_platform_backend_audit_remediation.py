@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from apps.platform_api.app.main import create_app
+from apps.platform_api.app.api.routes import tournaments as tournament_routes
 from apps.platform_api.app.services import tournament_workflow as workflow
 from python_packages.platform_domain.tournaments import TournamentWorkflowError
 from tests.platform_async_case import PlatformIsolatedAsyncioTestCase
@@ -92,6 +94,23 @@ class PlatformBackendAuditRemediationTests(PlatformIsolatedAsyncioTestCase):
             "/api/v1/tournaments/{slug}/deadlock/captain-round/finalize",
             paths,
         )
+
+    def test_hidden_captain_compatibility_writers_use_tournament_lock(self) -> None:
+        for function_name in (
+            "respond_deadlock_captain_round",
+            "close_deadlock_captain_round",
+            "finalize_deadlock_captain_round",
+        ):
+            source = inspect.getsource(getattr(tournament_routes, function_name))
+            self.assertIn(
+                "lock_tournament_for_workflow",
+                source,
+                function_name,
+            )
+
+        respond_source = inspect.getsource(tournament_routes.respond_deadlock_captain_round)
+        self.assertIn("Reacquire the", respond_source)
+        self.assertIn("deadlock_captain_entries_for_round", respond_source)
 
 
 if __name__ == "__main__":

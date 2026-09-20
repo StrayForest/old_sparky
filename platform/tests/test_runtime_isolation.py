@@ -88,6 +88,33 @@ class RuntimeIsolationTests(unittest.TestCase):
         self.assertIn("UMask=0007", api)
         self.assertIn("UMask=0007", worker)
 
+    def test_web_restarts_clean_crashes_with_bounded_start_rate(self) -> None:
+        web = (PLATFORM_ROOT / "deploy/systemd/deadlock-web.service").read_text()
+
+        self.assertIn("SuccessExitStatus=143\n", web)
+        self.assertIn("Restart=always\n", web)
+        self.assertNotIn("Restart=on-failure", web)
+        self.assertIn("RestartSec=5\n", web)
+        self.assertIn("StartLimitIntervalSec=300s\n", web)
+        self.assertIn("StartLimitBurst=5\n", web)
+        self.assertIn(
+            "ReadWritePaths=/opt/oldsparky/platform/current/"
+            "apps/platform_web/.next/standalone/.next/cache\n",
+            web,
+        )
+        self.assertNotIn(
+            "ReadWritePaths=/opt/oldsparky/platform/current/apps/platform_web/.next/cache",
+            web,
+        )
+
+    def test_explicit_stop_has_no_service_restart_override(self) -> None:
+        web = (PLATFORM_ROOT / "deploy/systemd/deadlock-web.service").read_text()
+
+        # systemd suppresses Restart=always while an explicit stop job is
+        # active; the unit must not add an ExecStop helper that changes that
+        # operator/release behavior.
+        self.assertNotIn("ExecStop=", web)
+
 
 if __name__ == "__main__":
     unittest.main()

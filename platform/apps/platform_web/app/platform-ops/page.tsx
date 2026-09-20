@@ -1,28 +1,20 @@
 import type { Metadata } from "next";
-import { cookies } from "next/headers";
 import { notFound } from "next/navigation";
 import { AdminConsole } from "@/components/admin/admin-console";
-import { getServerCurrentUser, platformSessionCookieName } from "@/lib/server-auth";
+import { resolvePlatformOperationsAccess } from "@/lib/platform-ops-access";
 
-export const metadata: Metadata = {
-  title: "Operations",
-  robots: {
-    index: false,
-    follow: false
-  }
-};
+export async function generateMetadata(): Promise<Metadata> {
+  const hasOperationsAccess = await resolvePlatformOperationsAccess();
+  return hasOperationsAccess
+    ? { title: "Operations", robots: { index: false, follow: false } }
+    : { title: "Operations" };
+}
 
 export default async function PlatformOperationsPage() {
-  const requestCookies = await cookies();
-  const cookieHeader = requestCookies.toString();
-  const authSnapshot = requestCookies.has(platformSessionCookieName())
-    ? await getServerCurrentUser(cookieHeader)
-    : null;
-  const user = authSnapshot?.user ?? null;
-  const smokeFallback = (process.env.PLATFORM_API_BASE_URL ?? "").includes("127.0.0.1:9");
-  const hasAdminRole = user?.roles.some((role) => role === "admin" || role === "superadmin");
-
-  if (!smokeFallback && !hasAdminRole) {
+  // Intentional no-segment-loading contract: non-admin requests terminate in
+  // render-time notFound. A loading.tsx here could stream a 200 shell before
+  // the access decision is complete.
+  if (!(await resolvePlatformOperationsAccess())) {
     notFound();
   }
 

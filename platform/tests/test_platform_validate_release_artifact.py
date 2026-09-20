@@ -36,7 +36,6 @@ def release_payload(**overrides: object) -> dict[str, object]:
         "web_build_id": "safe-build-id_123",
         "node_version": validator.PINNED_NODE_VERSION,
         "npm_version": validator.PINNED_NPM_VERSION,
-        "runtime_layout": dict(validator.RUNTIME_LAYOUT),
     }
     payload.update(overrides)
     return payload
@@ -90,6 +89,76 @@ class ArchiveBuilder:
             f"{RELEASE_SLUG}/apps/platform_web/.next/standalone/server.js",
             b"console.log('ok');\n",
         )
+        self.add_directory(f"{RELEASE_SLUG}/tools")
+        self.add_file(
+            f"{RELEASE_SLUG}/tools/platform_nginx_error_summary.py",
+            b"#!/usr/bin/env python3\nprint('nginx summary')\n",
+        )
+        self.add_file(
+            f"{RELEASE_SLUG}/tools/platform_web_runtime_diagnostics_summary.py",
+            b"#!/usr/bin/env python3\nprint('web summary')\n",
+        )
+        self.add_file(
+            f"{RELEASE_SLUG}/tools/platform_storage_evidence_summary.py",
+            b"#!/usr/bin/env python3\nprint('storage summary')\n",
+        )
+        self.add_file(
+            f"{RELEASE_SLUG}/tools/platform_media_migration_diagnostics_summary.py",
+            b"#!/usr/bin/env python3\nprint('media migration summary')\n",
+        )
+        self._add_liveqa_runtime()
+
+    def _add_liveqa_runtime(self) -> None:
+        """Add the minimum digest-bound runtime required by current artifacts."""
+
+        runtime = f"{RELEASE_SLUG}/liveqa-runtime"
+        directories = (
+            runtime,
+            f"{runtime}/node",
+            f"{runtime}/node/bin",
+            f"{runtime}/web",
+            f"{runtime}/web/tests",
+            f"{runtime}/web/tests/smoke",
+            f"{runtime}/web/tests/support",
+            f"{runtime}/web/node_modules",
+            f"{runtime}/web/node_modules/@playwright",
+            f"{runtime}/web/node_modules/@playwright/test",
+            f"{runtime}/web/node_modules/playwright",
+            f"{runtime}/web/node_modules/playwright-core",
+            f"{runtime}/browsers",
+            f"{runtime}/browsers/chromium-1228",
+            f"{runtime}/browsers/chromium-1228/chrome-linux64",
+            f"{runtime}/browsers/chromium_headless_shell-1228",
+            f"{runtime}/browsers/webkit-2311",
+            f"{runtime}/browsers/ffmpeg-1011",
+        )
+        for directory in directories:
+            self.add_directory(directory, mode=0o555)
+        files: dict[str, bytes] = {
+            "node/bin/node": b"node\n",
+            "web/package-lock.json": b"{}\n",
+            "web/playwright.live.config.ts": b"export default {};\n",
+            "web/tests/smoke/live-user-journey.spec.ts": b"test('live', () => {});\n",
+            "web/tests/support/live-qa-origin.ts": b"export {};\n",
+            "web/tests/support/live-qa-sandbox.ts": b"export {};\n",
+            "web/node_modules/@playwright/test/package.json": b'{"name":"@playwright/test"}\n',
+            "web/node_modules/playwright/package.json": b'{"name":"playwright"}\n',
+            "web/node_modules/playwright-core/package.json": b'{"name":"playwright-core"}\n',
+        }
+        for relative, content in files.items():
+            self.add_file(f"{runtime}/{relative}", content, mode=0o555 if relative == "node/bin/node" else 0o444)
+        sandbox_candidates = sorted(
+            Path("/var/lib/oldsparky-liveqa").glob(
+                "runtime-*/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+            )
+        )
+        if not sandbox_candidates:
+            raise RuntimeError("canonical Chromium sandbox fixture is unavailable")
+        self.add_file(
+            f"{runtime}/browsers/chromium-1228/chrome-linux64/chrome_sandbox",
+            sandbox_candidates[0].read_bytes(),
+            mode=0o4755,
+        )
 
     def add_directory(self, name: str, *, mode: int = 0o755) -> tarfile.TarInfo:
         member = tarfile.TarInfo(name)
@@ -120,6 +189,35 @@ class ArchiveBuilder:
         return member
 
     def write(self) -> Path:
+        runtime_prefix = f"{RELEASE_SLUG}/liveqa-runtime/"
+        digest = hashlib.sha256()
+        files: dict[str, str] = {}
+        for member, content in sorted(self.entries, key=lambda item: item[0].name):
+            if not member.name.startswith(runtime_prefix) or member.name.endswith(
+                "/runtime-manifest.json"
+            ):
+                continue
+            relative = member.name.removeprefix(runtime_prefix)
+            digest.update(relative.encode() + b"\0")
+            if member.isdir():
+                digest.update(b"d\0")
+            else:
+                assert content is not None
+                file_digest = hashlib.sha256(content).hexdigest()
+                files[relative] = file_digest
+                digest.update(b"f\0" + bytes.fromhex(file_digest))
+        manifest = {
+            "version": 1,
+            "node_version": validator.PINNED_NODE_VERSION,
+            "package_lock_sha256": hashlib.sha256(b"{}\n").hexdigest(),
+            "tree_sha256": digest.hexdigest(),
+            "files": files,
+        }
+        self.add_file(
+            f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json",
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n",
+            mode=0o444,
+        )
         with tarfile.open(self.artifact, "w:gz") as archive:
             for member, content in self.entries:
                 archive.addfile(
@@ -352,6 +450,33 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         builder.write()
         with self.assertRaisesRegex(validator.ArtifactError, "duplicate keys"):
             validator.validate_archive(duplicate_keys, release_slug=RELEASE_SLUG)
+
+    def test_standalone_runtime_cache_is_not_allowed_in_immutable_artifact(self) -> None:
+        artifact = self.root / "runtime-cache.tar.gz"
+        builder = ArchiveBuilder(artifact)
+        cache = f"{RELEASE_SLUG}/apps/platform_web/.next/standalone/.next/cache"
+        builder.add_directory(cache)
+        builder.add_file(f"{cache}/index", b"stale runtime state")
+        builder.write()
+
+        with self.assertRaisesRegex(validator.ArtifactError, "runtime cache"):
+            validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
+
+    def test_runtime_diagnostic_helpers_require_nonempty_tracked_content(self) -> None:
+        for index, relative in enumerate(validator.REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS):
+            artifact = self.root / f"empty-runtime-helper-{index}.tar.gz"
+            builder = ArchiveBuilder(artifact)
+            helper_name = f"{RELEASE_SLUG}/{relative}"
+            for entry_index, (member, content) in enumerate(builder.entries):
+                if member.name == helper_name:
+                    member.size = 0
+                    builder.entries[entry_index] = (member, b"")
+                    break
+            else:  # pragma: no cover - ArchiveBuilder includes every helper.
+                self.fail(f"fixture omitted {relative}")
+            builder.write()
+            with self.assertRaisesRegex(validator.ArtifactError, "helper content"):
+                validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
 
     def test_rollback_state_is_reserved_for_the_installer(self) -> None:
         artifact = self.root / "rollback-state.tar.gz"

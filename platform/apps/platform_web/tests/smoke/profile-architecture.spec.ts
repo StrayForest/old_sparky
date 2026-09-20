@@ -34,7 +34,8 @@ async function authenticateTestUser(
   ]);
 }
 
-test("profile workspace model preserves captain priority and normalizes six dream slots", () => {
+test("profile workspace model preserves captain priority and normalizes six dream slots", ({}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Pure profile model contract runs once on desktop.");
   const workspace = mapProfileWorkspacePayload({
     profile: {
       user_id: "u_profile",
@@ -87,7 +88,8 @@ test("profile workspace model preserves captain priority and normalizes six drea
 
 test("captain tab is server seeded and saves through one atomic endpoint", async ({
   page,
-}) => {
+}, testInfo) => {
+  test.skip(!["desktop", "mobile-layout"].includes(testInfo.project.name), "Profile UI contract is covered on desktop and phone layouts.");
   await authenticateTestUser(page);
   const browserReads: string[] = [];
   const writes: string[] = [];
@@ -131,7 +133,8 @@ test("captain tab is server seeded and saves through one atomic endpoint", async
 
 test("stored captain priority is visible after SSR and tab URL stays shareable", async ({
   page,
-}) => {
+}, testInfo) => {
+  test.skip(!["desktop", "mobile-layout"].includes(testInfo.project.name), "Profile UI contract is covered on desktop and phone layouts.");
   await authenticateTestUser(page, [
     { name: "captain-priority-yes-smoke", value: "1" },
   ]);
@@ -149,7 +152,8 @@ test("stored captain priority is visible after SSR and tab URL stays shareable",
 
 test("profile tabs mount lazily and share the security config request", async ({
   page,
-}) => {
+}, testInfo) => {
+  test.skip(!["desktop", "mobile-layout"].includes(testInfo.project.name), "Profile UI contract is covered on desktop and phone layouts.");
   await authenticateTestUser(page);
   let securityConfigRequests = 0;
   page.on("request", (request) => {
@@ -177,7 +181,8 @@ test("profile tabs mount lazily and share the security config request", async ({
 
 test("atomic captain editor preserves hero picker layout and save semantics", async ({
   page,
-}) => {
+}, testInfo) => {
+  test.skip(!["desktop", "mobile-layout"].includes(testInfo.project.name), "Profile UI contract is covered on desktop and phone layouts.");
   await authenticateTestUser(page);
   const requestBodies: CaptainPayload[] = [];
 

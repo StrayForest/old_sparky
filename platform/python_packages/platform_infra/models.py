@@ -915,6 +915,14 @@ class TournamentMatch(TimestampMixin, Base):
 
 
 class TournamentInvite(TimestampMixin, Base):
+    """Invite code record; usage counters are retained compatibility data.
+
+    The current invite bearer contract is read-only and non-consuming. These
+    counters are not consulted by read authorization and have no active writer;
+    keep them until a reviewed migration/consumer plan removes the legacy
+    columns and constraints.
+    """
+
     __tablename__ = "tournament_invites"
     __table_args__ = (
         CheckConstraint("max_uses > 0", name="max_uses_positive"),

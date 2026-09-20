@@ -1,6 +1,11 @@
 # Old Sparky pre-release audit report — 2026-09-05
 Status: conditional release decision; this report is an audit record, not a replacement for the protected production workflows.  The report covers the active platform source and the separately deployed Draft application.
 
+Audit addendum — 2026-09-11: current CI/release routing is owned by
+[`test-suite-governance.md`](../test-suite-governance.md) and
+[`deployment-runbook.md`](../deployment-runbook.md); this historical report's
+2026-09-05 counts and run IDs are unchanged.
+
 ## 1. Executive decision
 The application has a strong deterministic baseline: the backend suite, migration scenario, web quality gate, hermetic browser suites, Draft tests, dependency audit, repository secret scan and deployment chain all passed for the reviewed source revision.  Anonymous live HTTP smoke checks also found the canonical site available over HTTPS with the expected public/private routing boundaries.
 I am **not giving an unconditional production sign-off**.  The release remains conditional because several checks are intentionally owned by the production operator and have not been proven from this audit environment:

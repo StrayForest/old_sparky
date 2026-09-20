@@ -949,7 +949,9 @@ class LiveQaGuardTests(unittest.TestCase):
             app_dir = Path(temporary) / "platform"
             shared = app_dir / "shared"
             shared.mkdir(parents=True)
-            descriptor = os.open(shared, os.O_RDONLY | os.O_DIRECTORY)
+            descriptor = os.open(
+                guard.RELEASE_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600
+            )
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 with self.assertRaisesRegex(

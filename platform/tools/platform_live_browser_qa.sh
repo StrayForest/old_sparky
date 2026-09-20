@@ -2,8 +2,19 @@
 set +x
 set -euo pipefail
 
-TRUSTED_REPO_ROOT="/root/old_sparky"
-PLATFORM_ROOT="$TRUSTED_REPO_ROOT/platform"
+TRUSTED_INSTALL_ROOT="${PLATFORM_LIVE_QA_INSTALL_ROOT:-}"
+TRUSTED_MODE=0
+if [[ -n "$TRUSTED_INSTALL_ROOT" ]]; then
+  TRUSTED_MODE=1
+  [[ "$TRUSTED_INSTALL_ROOT" =~ ^/root/\.oldsparky/liveqa/releases/[0-9a-f]{40}$ ]] \
+    || { echo "Trusted live-QA install root is invalid." >&2; exit 1; }
+  [[ "${PLATFORM_LIVE_QA_TARGET_SHA:-}" == "${TRUSTED_INSTALL_ROOT##*/}" ]] \
+    || { echo "Trusted live-QA target SHA does not match its install root." >&2; exit 1; }
+  PLATFORM_ROOT="$TRUSTED_INSTALL_ROOT/platform"
+else
+  TRUSTED_REPO_ROOT="/root/old_sparky"
+  PLATFORM_ROOT="$TRUSTED_REPO_ROOT/platform"
+fi
 TOOLS_DIR="$PLATFORM_ROOT/tools"
 SCRIPT_PATH="$TOOLS_DIR/platform_live_browser_qa.sh"
 SYSTEM_PYTHON="/usr/bin/python3.12"
@@ -18,7 +29,7 @@ if [[ "$EUID" -ne 0 ]]; then
   exit 1
 fi
 if [[ "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" != "$SCRIPT_PATH" ]]; then
-  echo "Production browser QA must run from the fixed root-controlled checkout." >&2
+  echo "Production browser QA must run from the fixed root-controlled runtime." >&2
   exit 1
 fi
 if [[ "${PLATFORM_APP_DIR:-}" != "/opt/oldsparky/platform" ]]; then
@@ -48,11 +59,13 @@ fi
 "${GUARD[@]}" assert-lock \
   --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
   --fd "$PLATFORM_LIVE_QA_LOCK_FD"
-SOURCE_COMMIT="$(
-  "${GUARD[@]}" verify-provenance \
+if (( TRUSTED_MODE == 1 )); then
+  SOURCE_COMMIT="${PLATFORM_LIVE_QA_TARGET_SHA}"
+else
+  SOURCE_COMMIT="$("${GUARD[@]}" verify-provenance \
     --platform-root "$PLATFORM_ROOT" \
-    --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE"
-)"
+    --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE")"
+fi
 if (( $# == 2 )); then
   "${GUARD[@]}" remove-public-browser-gate --gate "$2"
   echo "Interrupted public browser gate was removed exactly."
@@ -61,6 +74,9 @@ fi
 "${GUARD[@]}" preflight \
   --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
   --mode automated
+if (( TRUSTED_MODE == 1 )); then
+  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
+fi
 EXPECTED_LIVE_ORIGIN="$(
   "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" \
     print-public-value PLATFORM_WEB_ORIGIN
@@ -76,11 +92,13 @@ if [[ "$EXPECTED_ENVIRONMENT" != "production" \
   echo "Production browser QA requires the canonical production origin." >&2
   exit 1
 fi
-RUNTIME_CACHE="$(
-  "${GUARD[@]}" prepare-runtime-cache \
+if (( TRUSTED_MODE == 1 )); then
+  RUNTIME_CACHE="$TRUSTED_INSTALL_ROOT/runtime"
+else
+  RUNTIME_CACHE="$("${GUARD[@]}" prepare-runtime-cache \
     --platform-root "$PLATFORM_ROOT" \
-    --commit "$SOURCE_COMMIT"
-)"
+    --commit "$SOURCE_COMMIT")"
+fi
 RUNTIME_NODE="$RUNTIME_CACHE/node/bin/node"
 CHROMIUM_SANDBOX="$(
   "${GUARD[@]}" sandbox-path --runtime-cache "$RUNTIME_CACHE"

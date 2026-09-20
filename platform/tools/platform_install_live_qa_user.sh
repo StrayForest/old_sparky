@@ -4,7 +4,16 @@ set -euo pipefail
 
 ACCOUNT_NAME="oldsparky-liveqa"
 APPLY=0
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TRUSTED_INSTALL_ROOT="${PLATFORM_LIVE_QA_INSTALL_ROOT:-}"
+if [[ -n "$TRUSTED_INSTALL_ROOT" ]]; then
+  [[ "$TRUSTED_INSTALL_ROOT" =~ ^/root/\.oldsparky/liveqa/releases/[0-9a-f]{40}$ ]] \
+    || { echo "Trusted live-QA install root is invalid." >&2; exit 1; }
+  [[ "${PLATFORM_LIVE_QA_TARGET_SHA:-}" == "${TRUSTED_INSTALL_ROOT##*/}" ]] \
+    || { echo "Trusted live-QA target SHA does not match its install root." >&2; exit 1; }
+  ROOT_DIR="$TRUSTED_INSTALL_ROOT/platform"
+else
+  ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+fi
 APPARMOR_PROFILE_NAME="oldsparky-liveqa-chromium"
 APPARMOR_PROFILE_SOURCE="$ROOT_DIR/deploy/apparmor/$APPARMOR_PROFILE_NAME"
 APPARMOR_PROFILE_TARGET="/etc/apparmor.d/$APPARMOR_PROFILE_NAME"

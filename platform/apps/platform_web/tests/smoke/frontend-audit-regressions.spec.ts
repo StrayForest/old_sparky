@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 
@@ -10,6 +10,7 @@ test("invite-only pages convert missing workspace proof into invite-code flow", 
   const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
   const detailClientPage = source("components/tournaments/tournament-detail-client-page.tsx");
   const bracketPage = source("app/(site)/tournaments/[slug]/bracket/page.tsx");
+  const bracketBoard = source("components/bracket/bracket-board.tsx");
 
   expect(detailPage).toContain("TournamentDetailClientPage");
   expect(detailClientPage).toContain("PlatformApiError");
@@ -18,6 +19,9 @@ test("invite-only pages convert missing workspace proof into invite-code flow", 
   expect(bracketPage).toContain("PlatformApiError");
   expect(bracketPage).toContain("error.status === 401");
   expect(bracketPage).toContain("invite_code");
+  expect(bracketPage).toContain("normalizeTournamentInviteCode");
+  expect(bracketBoard).toContain("inviteCode,");
+  expect(bracketBoard).toContain("getTournamentBracket(slug, {}, {");
 });
 
 test("private registration is gated by the invite code carried by the room URL", () => {
@@ -26,9 +30,26 @@ test("private registration is gated by the invite code carried by the room URL",
 
   expect(api).toContain("invite_code?: string | null");
   expect(api).toContain("inviteCode: item.invite_code ?? null");
+  expect(api).toContain("normalizeTournamentInviteCode(options.inviteCode)");
+  expect(api).toContain('params.set("invite_code", inviteCode)');
+  expect(api).toContain('if (typeof value !== "string")');
+  expect(api).not.toMatch(/console\.(?:debug|info|log|warn|error).*inviteCode/u);
   expect(actions).toContain("const hasRegistrationAccess = Boolean(");
   expect(actions).toContain("tournament.inviteCode");
   expect(actions).toContain("&& hasRegistrationAccess");
+  expect(actions).toContain("data-testid=\"tournament-read-only-workflow\"");
+});
+
+test("registration actions ignore stale tournament and session responses", () => {
+  const actions = source("components/tournaments/tournament-registration-actions.tsx");
+  const detailClient = source("components/tournaments/tournament-detail-client-page.tsx");
+
+  expect(actions).toContain("const actionGeneration = useRef(0)");
+  expect(actions).toContain("const activeActionController = useRef<AbortController | null>(null)");
+  expect(actions).toContain("const requestSlug = tournament.slug");
+  expect(actions).toContain("requestIsCurrent(requestGeneration, requestIdentity, controller)");
+  expect(detailClient).toContain("const requestSessionIdentity = sessionIdentity");
+  expect(detailClient).toContain("requestSlug !== slug");
 });
 
 test("auth and Steam capabilities fail closed without runtime security config", () => {
@@ -50,6 +71,57 @@ test("my profile uses the protected bootstrap request without a page auth probe"
   expect(page).toContain("getServerProfileHeroNames");
   expect(page).toContain("Promise.all");
   expect(page).not.toContain("getServerCurrentUser");
+});
+
+test("operations access fails closed and never trusts an API endpoint", () => {
+  const access = source("lib/platform-ops-access.ts");
+
+  expect(access).not.toContain("127.0.0.1:9");
+  expect(access).not.toContain("smokeFallback");
+  expect(access).toContain('role === "admin"');
+  expect(access).toContain('role === "superadmin"');
+  expect(access).toContain("return Boolean(hasAdminRole)");
+});
+
+test("notFound-capable segments keep an intentional no-segment-loading contract", () => {
+  const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
+  const bracketPage = source("app/(site)/tournaments/[slug]/bracket/page.tsx");
+  const profilePage = source("app/(site)/tournaments/[slug]/profiles/[userId]/page.tsx");
+  const operationsPage = source("app/platform-ops/page.tsx");
+  const detailLoading = resolve("app/(site)/tournaments/[slug]/loading.tsx");
+  const bracketLoading = resolve("app/(site)/tournaments/[slug]/bracket/loading.tsx");
+  const profileLoading = resolve("app/(site)/tournaments/[slug]/profiles/[userId]/loading.tsx");
+  const operationsLoading = resolve("app/platform-ops/loading.tsx");
+  const listLoading = resolve("app/(site)/tournaments/(list)/loading.tsx");
+  const detailClientPage = source("components/tournaments/tournament-detail-client-page.tsx");
+
+  expect(detailPage).toContain("Intentional no-segment-loading contract");
+  expect(bracketPage).toContain("if (!workspace)");
+  expect(bracketPage).toContain("notFound()");
+  expect(profilePage).toContain("notFound()");
+  expect(operationsPage).toContain("Intentional no-segment-loading contract");
+  expect(existsSync(detailLoading)).toBe(false);
+  expect(existsSync(bracketLoading)).toBe(false);
+  expect(existsSync(profileLoading)).toBe(false);
+  expect(existsSync(operationsLoading)).toBe(false);
+  expect(existsSync(listLoading)).toBe(true);
+  expect(detailClientPage).toContain('RouteLoadingShell variant="tournament-detail"');
+});
+
+test("tournament detail resolves missing slugs before committing the client shell", () => {
+  const detailPage = source("app/(site)/tournaments/[slug]/page.tsx");
+  const workspaceAccess = source("../platform_api/app/services/tournament_workspace_access.py");
+
+  expect(detailPage).toContain("getTournamentWorkspace");
+  expect(detailPage).toContain("const cookieHeader = (await cookies()).toString()");
+  expect(detailPage).toContain("if (!workspace)");
+  expect(detailPage).toContain("notFound()");
+  expect(detailPage).toContain("error.status === 401 || error.status === 403");
+  expect(detailPage).toContain("TournamentDetailClientPage");
+  expect(workspaceAccess).toContain('status_code=status.HTTP_404_NOT_FOUND');
+  expect(workspaceAccess).toContain('detail="Tournament not found."');
+  expect(workspaceAccess).toContain('status_code=status.HTTP_401_UNAUTHORIZED');
+  expect(workspaceAccess).toContain('status_code=status.HTTP_403_FORBIDDEN');
 });
 
 test("tournament creation serializes submit and invite-code async state", () => {

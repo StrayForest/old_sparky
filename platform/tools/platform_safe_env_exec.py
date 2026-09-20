@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -23,14 +25,21 @@ PRODUCTION_ENV_FILE = Path("/opt/oldsparky/platform/shared/.env.platform")
 PRODUCTION_SHARED_DIR = PRODUCTION_ENV_FILE.parent
 PRODUCTION_RUNTIME_ROOT = Path("/opt/oldsparky/platform")
 ACTIVE_PLATFORM_ROOT = PRODUCTION_RUNTIME_ROOT / "current"
+LIVE_QA_ROOT = Path("/root/.oldsparky/liveqa")
+LIVE_QA_RELEASE_ROOT = LIVE_QA_ROOT / "releases"
+LIVE_QA_ACTIVE_MANIFEST = LIVE_QA_ROOT / "active-manifest.json"
+LIVE_QA_ACTIVE_POINTER = LIVE_QA_ROOT / "active"
+LIVE_QA_SANDBOX_RELATIVE = "runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+LIVE_QA_SANDBOX_SIZE = 15232
+LIVE_QA_SANDBOX_SHA256 = (
+    "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
+)
 ACTIVE_PYTHON = PRODUCTION_SHARED_DIR / "venv/bin/python"
 MAX_ENV_BYTES = 256 * 1024
 KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 ALLOWED_PREFIXES = ("PLATFORM_", "NEXT_PUBLIC_PLATFORM_")
 PUBLIC_VALUE_NAMES = frozenset({"PLATFORM_ENVIRONMENT", "PLATFORM_WEB_ORIGIN"})
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-TRUSTED_PLATFORM_ROOT = Path("/root/old_sparky/platform")
-TRUSTED_PYTHON = TRUSTED_PLATFORM_ROOT / ".venv_platform/bin/python"
 TRUSTED_SYSTEM_PYTHON = Path("/usr/bin/python3.12")
 TRUSTED_DB_TOOLS = frozenset(
     {
@@ -47,6 +56,181 @@ TRUSTED_DB_TOOLS = frozenset(
 
 class SafeEnvError(RuntimeError):
     """A non-sensitive platform-env boundary failure."""
+
+
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise SafeEnvError("live-QA manifest contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _read_liveqa_manifest() -> dict[str, object]:
+    """Return the active installed payload only after pointer/SHA validation."""
+
+    try:
+        root_metadata = LIVE_QA_ROOT.lstat()
+        releases_metadata = LIVE_QA_RELEASE_ROOT.lstat()
+        manifest_metadata = LIVE_QA_ACTIVE_MANIFEST.lstat()
+        pointer_metadata = LIVE_QA_ACTIVE_POINTER.lstat()
+        pointer_target = LIVE_QA_ACTIVE_POINTER.resolve(strict=True)
+    except OSError as exc:
+        raise SafeEnvError("installed live-QA payload is unavailable") from exc
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != 0
+        or root_metadata.st_gid != 0
+        or root_metadata.st_mode & 0o7000
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        or not stat.S_ISDIR(releases_metadata.st_mode)
+        or releases_metadata.st_uid != 0
+        or releases_metadata.st_gid != 0
+        or releases_metadata.st_mode & 0o7000
+        or stat.S_IMODE(releases_metadata.st_mode) != 0o755
+    ):
+        raise SafeEnvError("installed live-QA payload root metadata is unsafe")
+    if (
+        stat.S_ISLNK(manifest_metadata.st_mode)
+        or not stat.S_ISREG(manifest_metadata.st_mode)
+        or manifest_metadata.st_uid != 0
+        or manifest_metadata.st_gid != 0
+        or manifest_metadata.st_nlink != 1
+        or manifest_metadata.st_mode & 0o7000
+        or stat.S_IMODE(manifest_metadata.st_mode) != 0o444
+        or not stat.S_ISLNK(pointer_metadata.st_mode)
+        or pointer_metadata.st_uid != 0
+        or pointer_metadata.st_gid != 0
+        or pointer_metadata.st_nlink != 1
+    ):
+        raise SafeEnvError("installed live-QA active manifest metadata is unsafe")
+    try:
+        payload = json.loads(
+            LIVE_QA_ACTIVE_MANIFEST.read_text(encoding="ascii"),
+            object_pairs_hook=_strict_object,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SafeEnvError("installed live-QA manifest is invalid") from exc
+    expected = {"version", "source_sha", "release_slug", "payload", "payload_tree_sha256", "files"}
+    source_sha = payload.get("source_sha") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected
+        or payload.get("version") != 1
+        or not isinstance(source_sha, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", source_sha)
+        or payload.get("payload") != str(LIVE_QA_RELEASE_ROOT / source_sha)
+        or pointer_target != LIVE_QA_RELEASE_ROOT / source_sha
+        or not isinstance(payload.get("files"), dict)
+        or not isinstance(payload.get("payload_tree_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", payload["payload_tree_sha256"])
+    ):
+        raise SafeEnvError("installed live-QA manifest identity is invalid")
+    try:
+        current_metadata = ACTIVE_PLATFORM_ROOT.lstat()
+        active_release = ACTIVE_PLATFORM_ROOT.resolve(strict=True)
+        releases_root = (PRODUCTION_RUNTIME_ROOT / "releases").resolve(strict=True)
+        release_metadata = active_release.lstat()
+        release_json = active_release / "RELEASE.json"
+        release_json_metadata = release_json.lstat()
+        if (
+            not stat.S_ISLNK(current_metadata.st_mode)
+            or current_metadata.st_uid != 0
+            or current_metadata.st_gid != 0
+            or current_metadata.st_nlink != 1
+            or current_metadata.st_mode & 0o7000
+            or active_release.parent != releases_root
+            or not stat.S_ISDIR(release_metadata.st_mode)
+            or release_metadata.st_uid != 0
+            or release_metadata.st_gid != 0
+            or release_metadata.st_mode & 0o7000
+            or stat.S_IMODE(release_metadata.st_mode) & 0o022
+            or stat.S_ISLNK(release_json_metadata.st_mode)
+            or not stat.S_ISREG(release_json_metadata.st_mode)
+            or release_json_metadata.st_uid != 0
+            or release_json_metadata.st_gid != 0
+            or release_json_metadata.st_nlink != 1
+            or release_json_metadata.st_mode & 0o7000
+            or stat.S_IMODE(release_json_metadata.st_mode) & 0o022
+            or release_json_metadata.st_size > MAX_ENV_BYTES
+        ):
+            raise SafeEnvError("active production release metadata is unsafe")
+        release = json.loads(release_json.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SafeEnvError("active production release metadata is unavailable") from exc
+    if (
+        not isinstance(release, dict)
+        or release.get("source_git_commit") != source_sha
+        or payload.get("release_slug") != active_release.name
+    ):
+        raise SafeEnvError("installed live-QA payload does not match active release")
+    payload_root = LIVE_QA_RELEASE_ROOT / source_sha
+    try:
+        payload_metadata = payload_root.lstat()
+    except OSError as exc:
+        raise SafeEnvError("installed live-QA payload root is unavailable") from exc
+    if (
+        stat.S_ISLNK(payload_metadata.st_mode)
+        or not stat.S_ISDIR(payload_metadata.st_mode)
+        or payload_metadata.st_uid != 0
+        or payload_metadata.st_gid != 0
+        or stat.S_IMODE(payload_metadata.st_mode) != 0o555
+        or payload_root.resolve(strict=True) != payload_root
+    ):
+        raise SafeEnvError("installed live-QA payload root metadata is unsafe")
+    _validate_liveqa_payload_tree(payload_root, payload)
+    return payload
+
+
+def _validate_liveqa_payload_tree(root: Path, manifest: dict[str, object]) -> None:
+    digest = hashlib.sha256()
+    files: dict[str, str] = {}
+    total = 0
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise SafeEnvError("installed live-QA payload contains a symlink")
+        digest.update(relative.encode("utf-8") + b"\0")
+        if stat.S_ISDIR(metadata.st_mode):
+            if (
+                metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_mode & 0o7000
+                or stat.S_IMODE(metadata.st_mode) != 0o555
+            ):
+                raise SafeEnvError("installed live-QA payload directory mode is unsafe")
+            digest.update(b"d\0")
+            continue
+        sandbox = relative == LIVE_QA_SANDBOX_RELATIVE
+        mode = stat.S_IMODE(metadata.st_mode)
+        expected_modes = {0o4755} if sandbox else {0o444, 0o555}
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 1
+            or mode not in expected_modes
+            or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+            and not sandbox
+            or path.name == "chrome_sandbox" and not sandbox
+        ):
+            raise SafeEnvError("installed live-QA payload file metadata is unsafe")
+        content = path.read_bytes()
+        total += len(content)
+        if total > 2 * 1024 * 1024 * 1024:
+            raise SafeEnvError("installed live-QA payload is too large")
+        file_digest = hashlib.sha256(content).hexdigest()
+        if sandbox and (
+            metadata.st_size != LIVE_QA_SANDBOX_SIZE
+            or file_digest != LIVE_QA_SANDBOX_SHA256
+        ):
+            raise SafeEnvError("installed Chromium sandbox checksum is invalid")
+        files[relative] = file_digest
+        digest.update(b"f\0" + bytes.fromhex(file_digest))
+    if digest.hexdigest() != manifest["payload_tree_sha256"] or files != manifest["files"]:
+        raise SafeEnvError("installed live-QA payload digest does not match manifest")
 
 
 def _open_component(
@@ -300,8 +484,9 @@ def load_env_file(path: Path) -> dict[str, str]:
 def clean_child_environment(
     values: dict[str, str], *, pythonpath: Path
 ) -> dict[str, str]:
-    if pythonpath not in {TRUSTED_PLATFORM_ROOT, ACTIVE_PLATFORM_ROOT}:
-        raise SafeEnvError("PYTHONPATH must be the fixed root-controlled checkout")
+    payload = _read_liveqa_manifest()["payload"]
+    if not isinstance(payload, str) or pythonpath != Path(payload):
+        raise SafeEnvError("PYTHONPATH must be the active digest-bound live-QA payload")
     child = dict(values)
     child.update(
         {
@@ -323,57 +508,30 @@ def validate_trusted_command(command: list[str], *, pythonpath: Path) -> None:
         )
     python = Path(command[0])
     script = Path(command[1])
-    contours = (
-        (TRUSTED_PLATFORM_ROOT, TRUSTED_PYTHON),
-        (ACTIVE_PLATFORM_ROOT, ACTIVE_PYTHON),
-    )
-    contour = next(
-        (
-            (root, trusted_python)
-            for root, trusted_python in contours
-            if pythonpath == root
-            and python == trusted_python
-            and script.is_absolute()
-            and script.parent == root / "tools"
-            and script.name in TRUSTED_DB_TOOLS
-        ),
-        None,
-    )
-    if contour is None:
+    payload_value = _read_liveqa_manifest()["payload"]
+    if not isinstance(payload_value, str):
+        raise SafeEnvError("installed live-QA payload identity is invalid")
+    payload_root = Path(payload_value)
+    if not (
+        pythonpath == payload_root
+        and python == ACTIVE_PYTHON
+        and script.is_absolute()
+        and script.parent == payload_root / "platform/tools"
+        and script.name in TRUSTED_DB_TOOLS
+    ):
         raise SafeEnvError("clean exec target is not an approved live QA DB tool")
-    root, trusted_python = contour
-    if root == ACTIVE_PLATFORM_ROOT:
-        validate_active_runtime()
-    else:
-        validate_trusted_runtime()
-    for path in (root, trusted_python, script):
+    validate_active_runtime()
+    for path in (payload_root, ACTIVE_PYTHON, script):
         try:
             resolved = path.resolve(strict=True)
             metadata = path.lstat()
         except OSError as exc:
             raise SafeEnvError("clean exec target is unavailable") from exc
-        if metadata.st_uid != 0 or (
-            path not in {TRUSTED_PYTHON, ACTIVE_PYTHON, ACTIVE_PLATFORM_ROOT}
-            and stat.S_IMODE(metadata.st_mode) & 0o022
-        ):
+        if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
             raise SafeEnvError("clean exec target ownership is unsafe")
-        if path in {TRUSTED_PYTHON, ACTIVE_PYTHON}:
+        if path == ACTIVE_PYTHON:
             if resolved != TRUSTED_SYSTEM_PYTHON or not resolved.is_file():
                 raise SafeEnvError("clean exec Python target is unsafe")
-        elif path == root and root == ACTIVE_PLATFORM_ROOT:
-            if not stat.S_ISLNK(metadata.st_mode):
-                raise SafeEnvError("active production release path is unsafe")
-            try:
-                resolved.relative_to(PRODUCTION_RUNTIME_ROOT / "releases")
-            except ValueError as exc:
-                raise SafeEnvError("active production release path is unsafe") from exc
-            release_metadata = resolved.lstat()
-            if (
-                not stat.S_ISDIR(release_metadata.st_mode)
-                or release_metadata.st_uid != 0
-                or stat.S_IMODE(release_metadata.st_mode) & 0o022
-            ):
-                raise SafeEnvError("active production release metadata is unsafe")
         elif path == script and (
             stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode)
         ):
@@ -412,11 +570,7 @@ def _validate_root_owned_tree(root: Path) -> None:
                             "root-controlled Python symlink escapes"
                         ) from exc
                 elif not (
-                    root
-                    in {
-                        TRUSTED_PLATFORM_ROOT / ".venv_platform",
-                        PRODUCTION_SHARED_DIR / "venv",
-                    }
+                    root == PRODUCTION_SHARED_DIR / "venv"
                     and target.parent == root / "bin"
                     and target.name in {"python", "python3", "python3.12"}
                 ):
@@ -442,18 +596,7 @@ def _validate_root_owned_tree(root: Path) -> None:
 
 
 def validate_trusted_runtime() -> None:
-    for directory in (
-        Path("/root"),
-        Path("/root/old_sparky"),
-        TRUSTED_PLATFORM_ROOT,
-    ):
-        metadata = directory.lstat()
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != 0
-            or stat.S_IMODE(metadata.st_mode) & 0o022
-        ):
-            raise SafeEnvError("root-controlled checkout path is unsafe")
+    _read_liveqa_manifest()
     for system_path in (Path("/usr"), Path("/usr/bin"), TRUSTED_SYSTEM_PYTHON):
         metadata = system_path.lstat()
         if (
@@ -474,24 +617,10 @@ def validate_trusted_runtime() -> None:
             )
         ):
             raise SafeEnvError("trusted system Python path is unsafe")
-    _validate_root_owned_tree(TRUSTED_PLATFORM_ROOT / ".venv_platform")
-    _validate_root_owned_tree(TRUSTED_PLATFORM_ROOT / "python_packages")
-    for name in TRUSTED_DB_TOOLS:
-        target = TRUSTED_PLATFORM_ROOT / "tools" / name
-        metadata = target.lstat()
-        if (
-            stat.S_ISLNK(metadata.st_mode)
-            or not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_uid != 0
-            or stat.S_IMODE(metadata.st_mode) & 0o022
-            or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
-        ):
-            raise SafeEnvError("approved live QA DB tool metadata is unsafe")
 
 
 def validate_active_runtime() -> None:
-    """Validate the immutable production release and shared QA runtime."""
+    """Validate production runtime plus the active digest-bound QA payload."""
 
     for directory in (
         Path("/opt"),
@@ -524,18 +653,7 @@ def validate_active_runtime() -> None:
     ):
         raise SafeEnvError("active production release metadata is unsafe")
     _validate_root_owned_tree(PRODUCTION_SHARED_DIR / "venv")
-    for name in TRUSTED_DB_TOOLS:
-        target = ACTIVE_PLATFORM_ROOT / "tools" / name
-        metadata = target.lstat()
-        if (
-            stat.S_ISLNK(metadata.st_mode)
-            or not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_uid != 0
-            or stat.S_IMODE(metadata.st_mode) & 0o022
-            or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
-        ):
-            raise SafeEnvError("approved live QA DB tool metadata is unsafe")
+    _read_liveqa_manifest()
 
 
 def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

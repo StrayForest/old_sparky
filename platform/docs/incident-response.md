@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Incident commander
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-12
 
 ## Severity
 
@@ -21,6 +21,30 @@
    containment.
 4. Protect a fresh DB backup and current/previous releases when safe.
 5. Communicate verified facts, user impact and next decision time.
+
+### Bounded web-outage evidence
+
+For repeated web 502s or an unexpected `deadlock-web` exit, collect the
+read-only, exact-SHA evidence before recovery:
+
+```bash
+gh workflow run platform-production-web-runtime-diagnostics.yml \
+  --repo StrayForest/old_sparky --ref dev \
+  -f expected_sha=<exact-deployed-source-sha> \
+  -f since_utc=<window-start-utc> \
+  -f until_utc=<window-end-utc>
+gh run watch <diagnostic-run-id> --repo StrayForest/old_sparky --exit-status
+```
+
+The two-hour-bounded artifact contains fixed-schema service state/restart/OOM
+metadata, web and kernel journal class counters with bounded timestamps, Nginx
+service state and at most 300 Nginx error-log lines reduced to
+severity/error-class counts. The summary never returns client addresses,
+hosts, request paths, upstream URLs, environment/command-line values or raw
+log lines. A producer or helper failure fails the diagnostic gate; a successful
+producer with no records is represented as a fixed `empty` summary. There is no
+unavailable/raw-log fallback. Do not disable the release preflight or dump an
+unbounded journal.
 
 ## Playbooks
 

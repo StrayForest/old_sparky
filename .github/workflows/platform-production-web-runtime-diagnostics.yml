@@ -24,54 +24,136 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  collect:
-    name: Collect read-only web restart evidence
+  validate-runtime-inputs:
+    name: Validate web-runtime diagnostic handoff
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: production
+    timeout-minutes: 10
+    permissions:
+      contents: read
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       EXPECTED_SHA: ${{ inputs.expected_sha }}
       SINCE_UTC: ${{ inputs.since_utc }}
       UNTIL_UTC: ${{ inputs.until_utc }}
       WORKFLOW_SHA: ${{ github.sha }}
     steps:
-      - name: Validate exact-SHA diagnostic inputs
+      - name: Checkout web-runtime validator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate and serialize diagnostic window
         shell: bash
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = "refs/heads/dev" \
-            || { echo "Production runtime diagnostics must run from dev." >&2; exit 1; }
-          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
-            || { echo "expected_sha must be a 40-character commit SHA." >&2; exit 1; }
-          test "$EXPECTED_SHA" = "$WORKFLOW_SHA" \
-            || { echo "diagnostic workflow source and expected production SHA differ." >&2; exit 1; }
-          [[ "$SINCE_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
-            || { echo "since_utc must be an RFC3339 UTC second timestamp." >&2; exit 1; }
-          [[ "$UNTIL_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
-            || { echo "until_utc must be an RFC3339 UTC second timestamp." >&2; exit 1; }
+          test "$GITHUB_REF" = refs/heads/dev
+          test "$EXPECTED_SHA" = "$WORKFLOW_SHA"
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py sha --value "$EXPECTED_SHA"
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py utc-timestamp --value "$SINCE_UTC"
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py utc-timestamp --value "$UNTIL_UTC"
           since_epoch="$(date -u -d "$SINCE_UTC" +%s)"
           until_epoch="$(date -u -d "$UNTIL_UTC" +%s)"
-          (( since_epoch < until_epoch )) \
-            || { echo "diagnostic window must have positive duration." >&2; exit 1; }
-          (( until_epoch - since_epoch <= 7200 )) \
-            || { echo "diagnostic window must not exceed two hours." >&2; exit 1; }
+          (( since_epoch < until_epoch && until_epoch - since_epoch <= 7200 ))
+          umask 077
+          /usr/bin/python3 - "$EXPECTED_SHA" "$SINCE_UTC" "$UNTIL_UTC" "$WORKFLOW_SHA" > "$RUNNER_TEMP/web-runtime-input.json" <<'PY'
+          import json
+          import sys
+          print(json.dumps(
+              {
+                  "schema": 1,
+                  "expected_sha": sys.argv[1],
+                  "since_utc": sys.argv[2],
+                  "until_utc": sys.argv[3],
+                  "workflow_sha": sys.argv[4],
+              },
+              separators=(",", ":"),
+          ))
+          PY
+          chmod 600 "$RUNNER_TEMP/web-runtime-input.json"
+      - name: Upload closed diagnostic handoff
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-web-runtime-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/web-runtime-input.json
+          if-no-files-found: error
+          retention-days: 1
+
+  collect:
+    needs: validate-runtime-inputs
+    name: Collect read-only web restart evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: Download closed diagnostic handoff
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-web-runtime-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/web-runtime-input
+      - name: Install and validate closed diagnostic handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          handoff_dir="$RUNNER_TEMP/web-runtime-input"
+          handoff="$handoff_dir/web-runtime-input.json"
+          test -d "$handoff_dir" && test ! -L "$handoff_dir"
+          test -f "$handoff" && test ! -L "$handoff"
+          test "$(find "$handoff_dir" -mindepth 1 -maxdepth 1 -type l -print -quit)" = ""
+          install -m 600 "$handoff" "$RUNNER_TEMP/web-runtime-input.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/web-runtime-input.json" "$GITHUB_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if set(payload) != {"schema", "expected_sha", "since_utc", "until_utc", "workflow_sha"} or payload.get("schema") != 1:
+              raise SystemExit("diagnostic handoff schema is invalid")
+          if payload.get("workflow_sha") != sys.argv[2]:
+              raise SystemExit("diagnostic handoff workflow identity is invalid")
+          if re.fullmatch(r"[0-9a-f]{40}", payload.get("expected_sha", "")) is None:
+              raise SystemExit("diagnostic handoff SHA is invalid")
+          timestamp_re = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+          for key in ("since_utc", "until_utc"):
+              if not isinstance(payload.get(key), str) or timestamp_re.fullmatch(payload[key]) is None:
+                  raise SystemExit("diagnostic handoff timestamp is invalid")
+          PY
+          {
+            printf 'EXPECTED_SHA=%s\n' "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["expected_sha"])' "$RUNNER_TEMP/web-runtime-input.json")"
+            printf 'SINCE_UTC=%s\n' "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["since_utc"])' "$RUNNER_TEMP/web-runtime-input.json")"
+            printf 'UNTIL_UTC=%s\n' "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["until_utc"])' "$RUNNER_TEMP/web-runtime-input.json")"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate production SSH inputs
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
 
       - name: Configure pinned production SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
           ssh_dir="$RUNNER_TEMP/production-web-runtime-diagnostics-ssh"
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
           ssh_scan="$ssh_dir/known_hosts.scan"
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          if ! ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null; then
+            echo "Production SSH host key scan failed." >&2
+            exit 1
+          fi
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 host key." >&2; exit 1; }
           test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
             || { echo "Expected exactly one production ED25519 host key." >&2; exit 1; }
@@ -83,9 +165,19 @@ jobs:
 
       - name: Collect exact-window read-only evidence
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          umask 077
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
           remote_report="$RUNNER_TEMP/platform-production-web-runtime-diagnostics.txt"
+          remote_error="$RUNNER_TEMP/platform-production-web-runtime-diagnostics-ssh-error.log"
+          : >"$remote_report"
+          : >"$remote_error"
+          chmod 600 "$remote_report" "$remote_error"
           # StrictHostKeyChecking yes is enforced with the explicit value
           # form below so OpenSSH receives the option as one argument.
           if ! ssh \
@@ -99,7 +191,7 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$EXPECTED_SHA" "$SINCE_UTC" "$UNTIL_UTC" > "$remote_report" <<'REMOTE'
+            bash -s -- "$EXPECTED_SHA" "$SINCE_UTC" "$UNTIL_UTC" > "$remote_report" 2> "$remote_error" <<'REMOTE'
           set -Eeuo pipefail
 
           expected_sha="$1"
@@ -108,9 +200,72 @@ jobs:
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           guard="$current/tools/platform_release_lock_exec.sh"
+          input_guard="$current/tools/platform_workflow_input_guard.py"
+          release_json="$current/RELEASE.json"
+          summary_tool="$current/tools/platform_web_runtime_diagnostics_summary.py"
+          nginx_summary_tool="$current/tools/platform_nginx_error_summary.py"
+          nginx_error_log=/var/log/nginx/error.log
 
           test "$(id -u)" -eq 0 || { echo "Production diagnostics must run as root." >&2; exit 1; }
-          test -x "$guard" || { echo "Production mutation guard is missing." >&2; exit 1; }
+          test -L "$current" && test -d "$current" \
+            || { echo "Active production release is missing or unsafe." >&2; exit 1; }
+          test -f "$release_json" && test ! -L "$release_json" \
+            || { echo "Active release metadata is missing or unsafe." >&2; exit 1; }
+          test -f "$input_guard" && test ! -L "$input_guard" \
+            || { echo "Workflow input guard is missing or unsafe." >&2; exit 1; }
+          /usr/bin/python3.12 "$input_guard" sha --value "$expected_sha" \
+            || { echo "Expected production SHA is invalid." >&2; exit 1; }
+          /usr/bin/python3.12 "$input_guard" utc-timestamp --value "$since_utc" \
+            || { echo "Diagnostic start timestamp is invalid." >&2; exit 1; }
+          /usr/bin/python3.12 "$input_guard" utc-timestamp --value "$until_utc" \
+            || { echo "Diagnostic end timestamp is invalid." >&2; exit 1; }
+          /usr/bin/python3.12 - "$since_utc" "$until_utc" <<'PY'
+          from datetime import datetime, timedelta, timezone
+          import re
+          import sys
+
+          timestamp_re = re.compile(
+              r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          )
+          now = datetime.now(timezone.utc)
+          parsed = []
+          for value in sys.argv[1:]:
+              if timestamp_re.fullmatch(value) is None:
+                  raise SystemExit("diagnostic timestamp is not strict UTC")
+              try:
+                  instant = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+                      tzinfo=timezone.utc
+                  )
+              except ValueError as exc:
+                  raise SystemExit("diagnostic timestamp is not a valid UTC instant") from exc
+              if instant > now or instant < now - timedelta(days=30):
+                  raise SystemExit("diagnostic timestamp is outside the accepted window")
+              parsed.append(instant)
+          if not parsed[0] < parsed[1] or parsed[1] - parsed[0] > timedelta(hours=2):
+              raise SystemExit("diagnostic window is invalid")
+          PY
+          test -f "$guard" && test ! -L "$guard" && test -x "$guard" \
+            || { echo "Production mutation guard is missing." >&2; exit 1; }
+          test -f "$summary_tool" && test ! -L "$summary_tool" \
+            || { echo "Runtime diagnostics summary helper is missing or unsafe." >&2; exit 1; }
+          test -f "$nginx_summary_tool" && test ! -L "$nginx_summary_tool" \
+            || { echo "Nginx diagnostics summary helper is missing or unsafe." >&2; exit 1; }
+          test -f "$nginx_error_log" && test ! -L "$nginx_error_log" \
+            || { echo "Nginx error log is missing or unsafe." >&2; exit 1; }
+          active_sha="$(/usr/bin/python3.12 - "$release_json" <<'PY'
+          import json
+          import re
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          value = payload.get("source_git_commit")
+          if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40,64}", value) is None:
+              raise SystemExit(1)
+          print(value)
+          PY
+          )"
+          test "$active_sha" = "$expected_sha" \
+            || { echo "Active production release SHA does not match the expected SHA." >&2; exit 1; }
 
           /bin/bash "$guard" \
             --app-dir "$runtime" \
@@ -122,62 +277,142 @@ jobs:
           until_utc="$2"
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
+          summary_tool="$current/tools/platform_web_runtime_diagnostics_summary.py"
+          nginx_summary_tool="$current/tools/platform_nginx_error_summary.py"
 
-          printf 'active_release=%s\n' "$(readlink -f "$current")"
-          printf 'window_since=%s\n' "$since_utc"
-          printf 'window_until=%s\n' "$until_utc"
+          systemd_properties_file="$(mktemp)"
+          nginx_properties_file="$(mktemp)"
+          web_journal_file="$(mktemp)"
+          kernel_journal_file="$(mktemp)"
+          nginx_error_file="$(mktemp)"
+          cleanup() {
+            rm -f -- \
+              "$systemd_properties_file" \
+              "$nginx_properties_file" \
+              "$web_journal_file" \
+              "$kernel_journal_file" \
+              "$nginx_error_file"
+          }
+          trap cleanup EXIT
+
+          collect_command_output() {
+            local output_file="$1"
+            local producer_name="$2"
+            shift 2
+            set +e
+            "$@" >"$output_file" 2>/dev/null
+            local producer_status="$?"
+            set -e
+            if (( producer_status != 0 )); then
+              echo "$producer_name producer failed with status $producer_status." >&2
+              return "$producer_status"
+            fi
+          }
+
+          printf '{"schema":1,"kind":"web_runtime_diagnostics","window_since":"%s","window_until":"%s"}\n' "$since_utc" "$until_utc"
           echo '=== systemd_properties ==='
-          systemctl show deadlock-web \
+          collect_command_output "$systemd_properties_file" "deadlock-web systemctl show" \
+            systemctl show deadlock-web \
             --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,ExecMainStartTimestamp,ExecMainExitTimestamp,NRestarts,Restart,RestartUSec,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec,OOMPolicy,WatchdogUSec \
             --no-pager
+          /usr/bin/python3 -I "$summary_tool" --mode properties --service web <"$systemd_properties_file"
 
-          echo '=== web_journal_sanitized ==='
-          journalctl -u deadlock-web \
+          echo '=== nginx_properties ==='
+          collect_command_output "$nginx_properties_file" "nginx systemctl show" \
+            systemctl show nginx \
+            --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts \
+            --no-pager
+          /usr/bin/python3 -I "$summary_tool" --mode properties --service nginx <"$nginx_properties_file"
+
+          echo '=== web_journal_summary ==='
+          collect_command_output "$web_journal_file" "deadlock-web journalctl" \
+            journalctl -u deadlock-web \
             --since "$since_utc" \
             --until "$until_utc" \
             --utc \
             --no-pager \
             --output short-iso-precise \
-            -n 600 \
-            | sed -E \
-                -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[EMAIL]/g' \
-                -e 's/(cookie|authorization|token|secret|password|session)[=:][^[:space:]]+/\1=[REDACTED]/Ig' \
-                -e 's/(set-cookie:|cookie:|authorization:)[^[:space:]]+/\1 [REDACTED]/Ig' \
-                -e 's/[A-Za-z0-9+\/_=-]{48,}/[LONG_VALUE_REDACTED]/g' \
-            | tail -n 600
+            -n 600
+          /usr/bin/python3 -I "$summary_tool" --mode journal <"$web_journal_file"
 
-          echo '=== kernel_oom_events ==='
-          journalctl -k \
+          echo '=== kernel_oom_summary ==='
+          collect_command_output "$kernel_journal_file" "kernel journalctl" \
+            journalctl -k \
             --since "$since_utc" \
             --until "$until_utc" \
             --utc \
             --no-pager \
             --output short-iso-precise \
-            | grep -Ei 'out of memory|oom-kill|oom_reaper|killed process|memory cgroup|invoked oom-killer' \
-            | tail -n 200 \
-            || true
+            -n 200
+          /usr/bin/python3 -I "$summary_tool" --mode kernel --max-lines 200 <"$kernel_journal_file"
 
-          echo '=== web_cgroup_status ==='
-          (systemctl status deadlock-web --no-pager --full 2>&1 || true) \
-            | sed -E \
-                -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[EMAIL]/g' \
-                -e 's/(cookie|authorization|token|secret|password|session)[=:][^[:space:]]+/\1=[REDACTED]/Ig' \
-                -e 's/[A-Za-z0-9+\/_=-]{48,}/[LONG_VALUE_REDACTED]/g' \
-            | tail -n 120
+          echo '=== nginx_error_summary ==='
+          test -f "$nginx_error_log" && test ! -L "$nginx_error_log" \
+            || { echo "Nginx error log is missing or unsafe." >&2; exit 1; }
+          collect_command_output "$nginx_error_file" "nginx error log tail" \
+            tail -n 300 -- "$nginx_error_log"
+          /usr/bin/python3 -I "$nginx_summary_tool" <"$nginx_error_file"
           LOCKED
           REMOTE
           then
+            rm -f -- "$remote_report" "$remote_error"
             echo "Remote diagnostic collection failed." >&2
-            cat "$remote_report" >&2 || true
             exit 1
           fi
-          cat "$remote_report"
           cp "$remote_report" "$RUNNER_TEMP/platform-production-web-runtime-diagnostics-artifact.txt"
+          chmod 600 "$RUNNER_TEMP/platform-production-web-runtime-diagnostics-artifact.txt"
+          rm -f -- "$remote_report"
+          test ! -e "$remote_report"
+          rm -f -- "$remote_error"
 
-      - name: Upload sanitized diagnostic evidence
+      - name: Remove production SSH material
+        id: cleanup_ssh
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-web-runtime-diagnostics-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          rm -f -- "$RUNNER_TEMP/platform-production-web-runtime-diagnostics.txt"
+          test ! -e "$RUNNER_TEMP/platform-production-web-runtime-diagnostics.txt"
+          rm -f -- "$RUNNER_TEMP/platform-production-web-runtime-diagnostics-ssh-error.log"
+          test ! -e "$RUNNER_TEMP/platform-production-web-runtime-diagnostics-ssh-error.log"
+          handoff_dir="$RUNNER_TEMP/web-runtime-input"
+          if [[ -e "$handoff_dir" || -L "$handoff_dir" ]]; then
+            test -d "$handoff_dir" && test ! -L "$handoff_dir"
+            rm -f -- "$handoff_dir/web-runtime-input.json"
+            test ! -e "$handoff_dir/web-runtime-input.json"
+            rmdir -- "$handoff_dir"
+          fi
+          rm -f -- "$RUNNER_TEMP/web-runtime-input.json"
+          test ! -e "$RUNNER_TEMP/web-runtime-input"
+          test ! -e "$RUNNER_TEMP/web-runtime-input.json"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
+
+      - name: Upload aggregate diagnostic evidence
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: platform-production-web-runtime-diagnostics-${{ github.run_id }}
+          name: platform-production-web-runtime-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/platform-production-web-runtime-diagnostics-artifact.txt
-          if-no-files-found: ignore
+          if-no-files-found: error
+          retention-days: 14

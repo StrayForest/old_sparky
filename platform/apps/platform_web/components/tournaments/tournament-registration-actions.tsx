@@ -57,6 +57,10 @@ export function TournamentRegistrationActions({
     removedRegistrationId: null
   });
   const readyActionInFlight = useRef(false);
+  const actionIdentity = `${tournament.id}:${tournament.slug}:${actorUserId ?? "anonymous"}`;
+  const actionIdentityRef = useRef(actionIdentity);
+  const actionGeneration = useRef(0);
+  const activeActionController = useRef<AbortController | null>(null);
   const [readyRetryCooldown, setReadyRetryCooldown] = useState(false);
   const readyCheckPhase = useReadyCheckPhase(
     tournament.serverTime,
@@ -68,6 +72,33 @@ export function TournamentRegistrationActions({
   useEffect(() => {
     setReadyCheckTimerMounted(true);
     return () => setReadyCheckTimerMounted(false);
+  }, []);
+
+  useEffect(() => {
+    if (actionIdentityRef.current === actionIdentity) {
+      return;
+    }
+    actionIdentityRef.current = actionIdentity;
+    actionGeneration.current += 1;
+    activeActionController.current?.abort();
+    activeActionController.current = null;
+    readyActionInFlight.current = false;
+    setReadyRetryCooldown(false);
+    setState({
+      registration: initialRegistration,
+      readyCheckChoice: initialReadyCheckChoice,
+      saving: null,
+      error: null,
+      errorStep: null,
+      removedRegistrationId: null
+    });
+  }, [actionIdentity, initialReadyCheckChoice, initialRegistration]);
+
+  useEffect(() => () => {
+    actionGeneration.current += 1;
+    activeActionController.current?.abort();
+    activeActionController.current = null;
+    readyActionInFlight.current = false;
   }, []);
 
   useEffect(() => {
@@ -125,6 +156,16 @@ export function TournamentRegistrationActions({
   );
   const checkedIn = state.readyCheckChoice === "yes";
   const teamsFormed = tournament.teams.length > 0;
+  const inactiveParticipant = Boolean(
+    actorUserId
+    && tournament.currentUserParticipantStatus
+    && !isActiveParticipantStatus(tournament.currentUserParticipantStatus)
+  );
+  const readOnlyBearer = Boolean(
+    tournament.visibility === "private"
+    && tournament.inviteCode
+    && (!actorUserId || inactiveParticipant)
+  );
   const hasRegistrationAccess = Boolean(
     tournament.visibility !== "private"
     || tournament.inviteCode
@@ -136,6 +177,7 @@ export function TournamentRegistrationActions({
     && tournament.status === "registration_open"
     && !registered
     && !teamsFormed
+    && !inactiveParticipant
   );
   const canCancelRegistration = Boolean(
     actorUserId
@@ -147,10 +189,28 @@ export function TournamentRegistrationActions({
   const canToggleReady = Boolean(actorUserId && registered && readyCheckActive && !readyCheckClosed);
   const registrationIsStatus = Boolean(
     state.saving === null
-    && ((registered && !canCancelRegistration) || (!registered && teamsFormed))
+    && (inactiveParticipant || (registered && !canCancelRegistration) || (!registered && teamsFormed))
   );
   const readyIsStatus = checkedIn && !canToggleReady && state.saving !== "ready";
-  const inviteAccessRequired = Boolean(actorUserId && !registered && !teamsFormed && !hasRegistrationAccess);
+  const inviteAccessRequired = Boolean(
+    actorUserId
+    && !inactiveParticipant
+    && !registered
+    && !teamsFormed
+    && !hasRegistrationAccess
+  );
+
+  function requestIsCurrent(
+    generation: number,
+    identity: string,
+    controller: AbortController,
+  ): boolean {
+    return (
+      !controller.signal.aborted
+      && actionGeneration.current === generation
+      && actionIdentityRef.current === identity
+    );
+  }
 
   async function handleRegister() {
     if (state.saving || !actorUserId || registered || !canRegister) {
@@ -158,6 +218,13 @@ export function TournamentRegistrationActions({
     }
 
     const previous = state.registration;
+    const requestSlug = tournament.slug;
+    const requestInviteCode = tournament.inviteCode;
+    const requestIdentity = actionIdentity;
+    const requestGeneration = actionGeneration.current;
+    const controller = new AbortController();
+    activeActionController.current?.abort();
+    activeActionController.current = controller;
     const optimistic: Registration = {
       id: "optimistic-registration",
       userId: actorUserId,
@@ -174,19 +241,36 @@ export function TournamentRegistrationActions({
       errorStep: null,
       removedRegistrationId: null
     }));
-    const result = await registerForTournament(tournament.slug, tournament.inviteCode).catch(() => null);
-    setState((current) => result
-      ? { ...current, registration: result, saving: null, error: null, errorStep: null, removedRegistrationId: null }
-      : {
-          ...current,
-          registration: previous,
-          saving: null,
-          error: t("tournament.registrationActionFailed"),
-          errorStep: "registration",
-          removedRegistrationId: null
-        });
-    if (result) {
+    let result: Registration | null = null;
+    try {
+      result = await registerForTournament(requestSlug, requestInviteCode, controller.signal);
+    } catch {
+      // An aborted request belongs to an older tournament/session and must not
+      // clear or replace state owned by the current view.
+      if (!requestIsCurrent(requestGeneration, requestIdentity, controller)) {
+        return;
+      }
+    }
+    if (!requestIsCurrent(requestGeneration, requestIdentity, controller)) {
+      return;
+    }
+    setState((current) => requestIsCurrent(requestGeneration, requestIdentity, controller)
+      ? result
+        ? { ...current, registration: result, saving: null, error: null, errorStep: null, removedRegistrationId: null }
+        : {
+            ...current,
+            registration: previous,
+            saving: null,
+            error: t("tournament.registrationActionFailed"),
+            errorStep: "registration",
+            removedRegistrationId: null
+          }
+      : current);
+    if (result && requestIsCurrent(requestGeneration, requestIdentity, controller)) {
       onRegistrationChange?.(result, previous);
+    }
+    if (activeActionController.current === controller) {
+      activeActionController.current = null;
     }
   }
 
@@ -196,6 +280,12 @@ export function TournamentRegistrationActions({
     }
 
     const previous = state.registration;
+    const requestSlug = tournament.slug;
+    const requestIdentity = actionIdentity;
+    const requestGeneration = actionGeneration.current;
+    const controller = new AbortController();
+    activeActionController.current?.abort();
+    activeActionController.current = controller;
     setState((current) => ({
       ...current,
       registration: previous,
@@ -204,27 +294,42 @@ export function TournamentRegistrationActions({
       errorStep: null,
       removedRegistrationId: null
     }));
-    const result = await leaveTournament(tournament.slug).catch(() => false);
-    setState((current) => result
-      ? {
-          ...current,
-          registration: null,
-          readyCheckChoice: null,
-          saving: null,
-          error: null,
-          errorStep: null,
-          removedRegistrationId: previous?.id ?? "removed-registration"
-        }
-      : {
-          ...current,
-          registration: previous,
-          saving: null,
-          error: t("tournament.registrationCancelFailed"),
-          errorStep: "registration",
-          removedRegistrationId: null
-        });
-    if (result) {
+    let result = false;
+    try {
+      result = await leaveTournament(requestSlug, controller.signal);
+    } catch {
+      if (!requestIsCurrent(requestGeneration, requestIdentity, controller)) {
+        return;
+      }
+    }
+    if (!requestIsCurrent(requestGeneration, requestIdentity, controller)) {
+      return;
+    }
+    setState((current) => requestIsCurrent(requestGeneration, requestIdentity, controller)
+      ? result
+        ? {
+            ...current,
+            registration: null,
+            readyCheckChoice: null,
+            saving: null,
+            error: null,
+            errorStep: null,
+            removedRegistrationId: previous?.id ?? "removed-registration"
+          }
+        : {
+            ...current,
+            registration: previous,
+            saving: null,
+            error: t("tournament.registrationCancelFailed"),
+            errorStep: "registration",
+            removedRegistrationId: null
+          }
+      : current);
+    if (result && requestIsCurrent(requestGeneration, requestIdentity, controller)) {
       onRegistrationChange?.(null, previous);
+    }
+    if (activeActionController.current === controller) {
+      activeActionController.current = null;
     }
   }
 
@@ -243,6 +348,12 @@ export function TournamentRegistrationActions({
     readyActionInFlight.current = true;
     const previousChoice = state.readyCheckChoice;
     const nextChoice = checkedIn ? "no" : "yes";
+    const requestSlug = tournament.slug;
+    const requestIdentity = actionIdentity;
+    const requestGeneration = actionGeneration.current;
+    const controller = new AbortController();
+    activeActionController.current?.abort();
+    activeActionController.current = controller;
     setState((current) => ({
       ...current,
       readyCheckChoice: nextChoice,
@@ -251,26 +362,34 @@ export function TournamentRegistrationActions({
       errorStep: null
     }));
     try {
-      const result = await setTournamentReadyCheckChoice(tournament.slug, nextChoice);
-      setState((current) => result
-        ? {
-            ...current,
-            readyCheckChoice: result.current_user_choice ?? nextChoice,
-            saving: null,
-            error: null,
-            errorStep: null
-          }
-        : {
-            ...current,
-            readyCheckChoice: previousChoice,
-            saving: null,
-            error: t("tournament.readyActionFailed"),
-            errorStep: "ready"
-          });
-      if (result) {
+      const result = await setTournamentReadyCheckChoice(requestSlug, nextChoice, controller.signal);
+      if (!requestIsCurrent(requestGeneration, requestIdentity, controller)) {
+        return;
+      }
+      setState((current) => requestIsCurrent(requestGeneration, requestIdentity, controller)
+        ? result
+          ? {
+              ...current,
+              readyCheckChoice: result.current_user_choice ?? nextChoice,
+              saving: null,
+              error: null,
+              errorStep: null
+            }
+          : {
+              ...current,
+              readyCheckChoice: previousChoice,
+              saving: null,
+              error: t("tournament.readyActionFailed"),
+              errorStep: "ready"
+            }
+        : current);
+      if (result && requestIsCurrent(requestGeneration, requestIdentity, controller)) {
         onReadyChoiceChange?.(result.current_user_choice ?? nextChoice);
       }
     } catch (error) {
+      if (!requestIsCurrent(requestGeneration, requestIdentity, controller)) {
+        return;
+      }
       const overloaded = error instanceof PlatformApiError
         && error.status === 503
         && error.code === "READY_VOTE_OVERLOADED"
@@ -286,15 +405,22 @@ export function TournamentRegistrationActions({
         errorStep: "ready"
       }));
     } finally {
-      readyActionInFlight.current = false;
+      if (activeActionController.current === controller) {
+        readyActionInFlight.current = false;
+        activeActionController.current = null;
+      }
     }
   }
 
   return (
     <section className="panel steps-panel" data-testid="registration-steps">
       <div className={`step ${registered ? "done" : canRegister ? "active" : ""}`}>
-        {!actorUserId ? (
+        {readOnlyBearer ? (
+          <div aria-disabled="true" className="disabled-action" data-testid="tournament-read-only-registration">{t("tournament.stepInactiveParticipantAction")}</div>
+        ) : !actorUserId ? (
           <div aria-disabled="true" className="disabled-action">{t("tournament.stepSignInAction")}</div>
+        ) : inactiveParticipant ? (
+          <div aria-disabled="true" className="disabled-action" data-testid="tournament-read-only-registration">{t("tournament.stepInactiveParticipantAction")}</div>
         ) : inviteAccessRequired ? (
           <div aria-disabled="true" className="disabled-action">{t("tournament.visibilityInvite")}</div>
         ) : registrationIsStatus ? (
@@ -313,7 +439,9 @@ export function TournamentRegistrationActions({
         <div className="step-note">
           {state.errorStep === "registration" && state.error
             ? state.error
-            : inviteAccessRequired
+            : readOnlyBearer
+              ? t("tournament.stepInactiveParticipantNote")
+              : inviteAccessRequired
               ? t("info.faq.private.answer")
               : t("tournament.stepRegistrationOpenUntil", { time: scheduleLabel(tournament, "registrationClosesAt") })}
         </div>
@@ -325,7 +453,9 @@ export function TournamentRegistrationActions({
         data-ready-check-phase={readyCheckPhase}
         data-ready-check-timer-mounted={readyCheckTimerMounted ? "true" : undefined}
       >
-        {readyIsStatus ? (
+        {readOnlyBearer ? (
+          <div aria-disabled="true" className="disabled-action" data-testid="tournament-read-only-workflow">{t("tournament.stepInactiveParticipantAction")}</div>
+        ) : readyIsStatus ? (
           <div className="status-action">{readyActionLabel({
             checkedIn,
             canToggleReady,

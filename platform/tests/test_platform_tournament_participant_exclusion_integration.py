@@ -215,7 +215,7 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
             },
         )
         self.assertEqual(rejected_claim.status_code, 403, rejected_claim.text)
-        self.assertIn("Disqualified", rejected_claim.json()["detail"])
+        self.assertIn("Inactive", rejected_claim.json()["detail"])
 
         invites_after_retry = self._assert_status(
             await organizer["client"].get(
@@ -229,8 +229,8 @@ class PlatformTournamentParticipantExclusionIntegrationTests(
             f"/api/v1/tournaments/{slug_a}/join",
             json={"entry_type": "solo", "invite_code": invite_a["code"]},
         )
-        self.assertEqual(rejected_rejoin.status_code, 409, rejected_rejoin.text)
-        self.assertIn("already registered", rejected_rejoin.json()["detail"])
+        self.assertEqual(rejected_rejoin.status_code, 403, rejected_rejoin.text)
+        self.assertIn("Inactive participants", rejected_rejoin.json()["detail"])
 
         denied_workspace = await player["client"].get(
             f"/api/v1/tournaments/{slug_a}/workspace"

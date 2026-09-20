@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import fcntl
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +17,7 @@ DEPLOY_SCRIPT = REPO_ROOT / "platform/tools/platform_release_deploy.sh"
 ROLLBACK_SCRIPT = REPO_ROOT / "platform/tools/platform_release_rollback.sh"
 RUNTIME_RESTORE_SCRIPT = REPO_ROOT / "platform/tools/platform_release_restore_runtime.sh"
 TRANSACTION_TOOL = REPO_ROOT / "platform/tools/platform_release_transaction.py"
+SYSTEMD_STATE_TOOL = REPO_ROOT / "platform/tools/platform_release_systemd_state.py"
 STATE_NAME = ".release-operation.json"
 
 
@@ -21,6 +25,11 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
+        # Test-only lock isolation lives in a private mount namespace.  The
+        # production helper has no environment-controlled lock pathname.
+        self.lock_root = self.root / "run-lock"
+        self.lock_root.mkdir(mode=0o700)
+        self.release_lock_path = self.lock_root / "oldsparky-platform-release.lock"
         self.app_dir = self.root / "platform-app"
         self.releases = self.app_dir / "releases"
         self.shared = self.app_dir / "shared"
@@ -51,6 +60,124 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual((self.app_dir / "current").resolve(), candidate)
         self.assertEqual((self.app_dir / "previous").resolve(), current)
         self.assertNotEqual(previous, candidate)
+
+    def test_retained_recovery_retry_preserves_mixed_state_until_final_cleanup(self) -> None:
+        """A post-pointer failure must leave both receipts retryable."""
+
+        current, previous, candidate = self.prepare_install_state(
+            service_state_required=True,
+        )
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(candidate)
+        self.advance_install_state(candidate, current, phase="staged")
+        self.run_transaction(
+            "record-services",
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "inactive",
+        )
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api.service": "inactive",
+                "deadlock-worker.service": "active",
+                "deadlock-web.service": "inactive",
+                "deadlock-maintenance.timer": "active",
+                "deadlock-logrotate.timer": "active",
+                "deadlock-offsite-backup.timer": "active",
+                "deadlock-cloudflare-ips.timer": "active",
+                "deadlock-health-monitor.timer": "active",
+            }
+        )
+        state = self.shared / STATE_NAME
+        systemd_receipt = self.shared / ".release-systemd-state.json"
+        self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "capture-transaction",
+            "--state",
+            str(systemd_receipt),
+            "--transaction",
+            str(state),
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+        )
+        enabled_path = self.root / "systemd-enabled.json"
+        interrupted_enabled = json.loads(enabled_path.read_text())
+        for unit, value in interrupted_enabled.items():
+            if value != "static":
+                interrupted_enabled[unit] = "enabled"
+        enabled_path.write_text(json.dumps(interrupted_enabled, sort_keys=True))
+
+        failed = self.root / "recover-after-pointer-failure.sh"
+        failed.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"{shlex.quote(str(TRANSACTION_TOOL))} recover --retain --state {shlex.quote(str(state))}\n"
+            "exit 42\n",
+            encoding="utf-8",
+        )
+        failed.chmod(0o755)
+        result = self.run_script(failed, check=False)
+        self.assertEqual(result.returncode, 42)
+        self.assertTrue(state.is_file())
+        self.assertTrue(systemd_receipt.is_file())
+        self.assertEqual(self.state_phase(), "recovery-restored")
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+        self.assertTrue(candidate.exists())
+
+        # A second attempt restores the recorded mixed active/enabled state,
+        # verifies it, and only then performs final receipt/transaction cleanup.
+        self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "restore",
+            "--state",
+            str(systemd_receipt),
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+        )
+        self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "verify",
+            "--state",
+            str(systemd_receipt),
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+        )
+        self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "clear",
+            "--state",
+            str(systemd_receipt),
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+        )
+        self.run_transaction("complete-recovery")
+
+        self.assertFalse(systemd_receipt.exists())
+        self.assertFalse(state.exists())
+        self.assertFalse(candidate.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+        final_state = json.loads((self.root / "systemd-state.json").read_text())
+        self.assertEqual(final_state["deadlock-api.service"], "active")
+        self.assertEqual(final_state["deadlock-worker.service"], "inactive")
+        self.assertEqual(final_state["deadlock-web.service"], "active")
+        final_enabled = json.loads(enabled_path.read_text())
+        self.assertEqual(final_enabled["deadlock-api.service"], "enabled")
+        self.assertEqual(final_enabled["deadlock-offsite-backup.timer"], "disabled")
 
     def test_abort_after_candidate_nginx_apply_restores_previous_nginx(self) -> None:
         current, _previous, candidate = self.prepare_install_state(
@@ -119,9 +246,19 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         nginx_state = self.root / "nginx.state"
         units_state.write_text("current\n")
         nginx_state.write_text("current\n")
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "active",
+                "deadlock-web": "active",
+                "deadlock-cloudflare-ips.timer": "active",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        rollback = self.copy_rollback_with_systemctl(systemctl)
 
         result = self.run_script(
-            ROLLBACK_SCRIPT,
+            rollback,
             "--app-dir",
             str(self.app_dir),
             "--no-restart",
@@ -145,7 +282,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         for label, needle in (
             (
                 "units",
-                '  run_candidate tools/platform_install_systemd_units.sh\n',
+                "  PLATFORM_ENABLE_SYSTEMD_UNITS=0 run_candidate tools/platform_install_systemd_units.sh\n",
             ),
             (
                 "restart",
@@ -377,6 +514,17 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "RECOVERY_DIR=\"$SHARED_DIR/.release-recovery\"",
             (previous / "tools/platform_release_rollback.sh").read_text(),
         )
+        # The production recovery bundle uses the fixed systemctl path.  This
+        # test substitutes the systemd boundary inside the private fixture so
+        # the old-current recovery path exercises the same receipt checks
+        # without touching the host service manager.
+        recovery_bundle = self.shared / ".release-recovery/platform_release_rollback.sh"
+        recovery_bundle.write_text(
+            recovery_bundle.read_text().replace(
+                "/usr/bin/systemctl", str(self.root / "systemctl")
+            )
+        )
+        recovery_bundle.chmod(0o755)
         recovery_runtime = self.write_test_runtime_restore()
         shutil.copy2(
             recovery_runtime,
@@ -401,6 +549,539 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual(
             (self.shared / "venv" / "deps-version").read_text(), "new\n"
         )
+
+    def test_migration_failure_restores_only_pre_active_services_and_retains_receipt(
+        self,
+    ) -> None:
+        current, _previous, candidate = self.prepare_install_state(
+            with_fake_python=True,
+            service_state_required=True,
+        )
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(candidate)
+        self.advance_install_state(candidate, current, phase="staged")
+        self.run_transaction(
+            "record-services",
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=inactive",
+            "--timer-active-before",
+            "inactive",
+        )
+        self.run_transaction("phase", "--expected", "staged", "--phase", "migration-pending")
+        migration = candidate / "tools/platform_run_alembic.sh"
+        migration.write_text("#!/usr/bin/env bash\nexit 42\n")
+        migration.chmod(0o755)
+
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        deploy = self.copy_deploy_migration_script(systemctl)
+        result = self.run_script(
+            deploy,
+            "--resume",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="previous"),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state_phase(), "migration-failed")
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        migration_state = json.loads((self.root / "systemd-state.json").read_text())
+        self.assertEqual(migration_state["deadlock-api"], "active")
+        self.assertEqual(migration_state["deadlock-worker"], "inactive")
+        self.assertEqual(migration_state["deadlock-web"], "inactive")
+        self.assertEqual(
+            migration_state["deadlock-cloudflare-ips.timer"], "inactive"
+        )
+        self.assertFalse((self.shared / ".release-quiesce.json").exists())
+
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        result = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            env={
+                "PLATFORM_TEST_UNITS_STATE": str(self.root / "units.state"),
+                "PLATFORM_TEST_UNITS_LABEL": "previous",
+                "PLATFORM_TEST_NGINX_STATE": str(self.root / "nginx.state"),
+                "PLATFORM_TEST_NGINX_LABEL": "previous",
+            },
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        final_state = json.loads((self.root / "systemd-state.json").read_text())
+        self.assertEqual(final_state["deadlock-api"], "active")
+        self.assertEqual(final_state["deadlock-worker"], "inactive")
+        self.assertEqual(final_state["deadlock-web"], "inactive")
+        log = (self.root / "systemctl.log").read_text()
+        self.assertIn("restart deadlock-api", log)
+        self.assertNotIn("restart deadlock-worker", log)
+        self.assertNotIn("restart deadlock-web", log)
+
+    def test_sigkill_after_snapshot_leaves_abortable_receipt_without_transaction(
+        self,
+    ) -> None:
+        current, _previous, _candidate = self.prepare_install_state(
+            with_fake_python=True,
+            service_state_required=True,
+        )
+        self.add_runtime_stubs(current)
+        (self.shared / STATE_NAME).unlink()
+        artifact = self.root / "release.tar.gz"
+        artifact.write_bytes(b"not reached")
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+                "deadlock-cloudflare-ips.timer": "inactive",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        interrupted = self.copy_initial_deploy_with_fault(
+            "deploy-after-snapshot-kill.sh",
+            systemctl,
+            '  "$INSTALL_TOOL" --stage-only "$ARTIFACT" "$APP_DIR"\n',
+            '  /bin/kill -KILL "$$"\n'
+            '  "$INSTALL_TOOL" --stage-only "$ARTIFACT" "$APP_DIR"\n',
+        )
+        result = self.run_script(
+            interrupted,
+            "--artifact",
+            str(artifact),
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertEqual(self.state_phase(), "quiesce-pending")
+        self.assertFalse((self.shared / ".release-quiesce.json").exists())
+        self.assertTrue(
+            all(
+                value == "inactive"
+                for value in json.loads((self.root / "systemd-state.json").read_text()).values()
+            )
+        )
+
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        result = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="previous"),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        final_state = json.loads((self.root / "systemd-state.json").read_text())
+        self.assertEqual(final_state["deadlock-api"], "active")
+        self.assertEqual(final_state["deadlock-worker"], "inactive")
+        self.assertEqual(final_state["deadlock-web"], "active")
+        self.assertEqual(final_state["deadlock-cloudflare-ips.timer"], "inactive")
+
+    def test_stage_failure_recovers_pre_active_services_without_swallowing_failure(
+        self,
+    ) -> None:
+        current, _previous, _candidate = self.prepare_install_state(
+            with_fake_python=True,
+            service_state_required=True,
+        )
+        self.add_runtime_stubs(current)
+        (self.shared / STATE_NAME).unlink()
+        artifact = self.root / "stage-failure.tar.gz"
+        artifact.write_bytes(b"not reached")
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "active",
+                "deadlock-cloudflare-ips.timer": "active",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        failed = self.copy_initial_deploy_with_fault(
+            "deploy-stage-failure.sh",
+            systemctl,
+            '  "$INSTALL_TOOL" --stage-only "$ARTIFACT" "$APP_DIR"\n',
+            '  install -d -o root -g root -m 0755 "$APP_DIR/releases/stage-failure"\n'
+            "  /bin/false\n",
+        )
+        result = self.run_script(
+            failed,
+            "--artifact",
+            str(artifact),
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="previous"),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse((self.releases / "stage-failure").exists())
+        final_state = json.loads((self.root / "systemd-state.json").read_text())
+        self.assertEqual(final_state["deadlock-api"], "active")
+        self.assertEqual(final_state["deadlock-worker"], "inactive")
+        self.assertEqual(final_state["deadlock-web"], "active")
+        self.assertEqual(final_state["deadlock-cloudflare-ips.timer"], "active")
+
+    def test_deploy_lock_contention_blocks_preflight_and_quiesce(self) -> None:
+        current, _previous, _candidate = self.prepare_install_state(
+            with_fake_python=True,
+            service_state_required=True,
+        )
+        self.add_runtime_stubs(current)
+        (self.shared / STATE_NAME).unlink()
+        artifact = self.root / "lock-contention.tar.gz"
+        artifact.write_bytes(b"not reached")
+        initial_states = {
+            "deadlock-api": "active",
+            "deadlock-worker": "inactive",
+            "deadlock-web": "active",
+            "deadlock-cloudflare-ips.timer": "active",
+            "deadlock-cloudflare-ips.service": "inactive",
+        }
+        systemctl = self.write_stateful_systemctl(initial_states)
+        failed = self.copy_initial_deploy_with_fault(
+            "deploy-lock-contention.sh",
+            systemctl,
+            '  "$INSTALL_TOOL" --stage-only "$ARTIFACT" "$APP_DIR"\n',
+            "  /bin/false\n",
+        )
+        lock_fd = os.open(self.release_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_script(
+                failed,
+                "--artifact",
+                str(artifact),
+                "--app-dir",
+                str(self.app_dir),
+                check=False,
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertEqual(
+            json.loads((self.root / "systemd-state.json").read_text()),
+            initial_states,
+        )
+        self.assertEqual((self.root / "systemctl.log").read_text(), "")
+
+    def test_killed_release_body_cannot_leave_a_background_child_holding_lock(
+        self,
+    ) -> None:
+        """The lock supervisor must close the descriptor before body children run."""
+        helper = self.root / "platform_release_lock.sh"
+        shutil.copy2(REPO_ROOT / "platform/tools/platform_release_lock.sh", helper)
+        helper.chmod(0o755)
+        child_pid_file = self.root / "child.pid"
+        script = self.root / "lock-body-kill.sh"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            f"source {shlex.quote(str(helper))}\n"
+            "ORIGINAL_ARGS=(\"$@\")\n"
+            "platform_release_lock_supervise \"${ORIGINAL_ARGS[@]}\"\n"
+            "[[ \"${PLATFORM_RELEASE_LOCK_SUPERVISED:-}\" == 1 ]] || exit 0\n"
+            "platform_release_lock_open\n"
+            f"/bin/sleep 30 >/dev/null 2>&1 </dev/null & child=$!; printf '%s\\n' \"$child\" > {shlex.quote(str(child_pid_file))}\n"
+            "/bin/kill -KILL \"$$\"\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        lock_path = self.release_lock_path
+        lock_path.touch(mode=0o600)
+        env = {
+            "PLATFORM_ENVIRONMENT": "test",
+            "PLATFORM_TESTING": "1",
+        }
+        child_pid = None
+        try:
+            result = self.run_script(script, env=env, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            child_pid = int(child_pid_file.read_text(encoding="ascii").strip())
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
+        finally:
+            if child_pid is not None:
+                try:
+                    command_line = Path(f"/proc/{child_pid}/cmdline").read_bytes()
+                except OSError:
+                    command_line = b""
+                if b"sleep" in command_line:
+                    try:
+                        os.kill(child_pid, 15)
+                    except ProcessLookupError:
+                        pass
+
+    def test_inherited_release_fd_is_rejected_without_root_path_or_body(self) -> None:
+        helper = self.root / "platform_release_lock.sh"
+        shutil.copy2(REPO_ROOT / "platform/tools/platform_release_lock.sh", helper)
+        helper.chmod(0o755)
+        child_pid_file = self.root / "inherited-child.pid"
+        script = self.root / "inherited-lock-body-kill.sh"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            f"source {shlex.quote(str(helper))}\n"
+            "ORIGINAL_ARGS=(\"$@\")\n"
+            "platform_release_lock_supervise \"${ORIGINAL_ARGS[@]}\"\n"
+            "[[ \"${PLATFORM_RELEASE_LOCK_SUPERVISED:-}\" == 1 ]] || exit 0\n"
+            "platform_release_lock_open\n"
+            f"/bin/sleep 30 >/dev/null 2>&1 </dev/null & child=$!; printf '%s\\n' \"$child\" > {shlex.quote(str(child_pid_file))}\n"
+            "/bin/kill -KILL \"$$\"\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        lock_path = self.release_lock_path
+        env = {"PLATFORM_ENVIRONMENT": "test", "PLATFORM_TESTING": "1"}
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        child_pid = None
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            env["PLATFORM_RELEASE_LOCK_FD"] = str(lock_fd)
+            result = subprocess.run(
+                [
+                    "/usr/bin/unshare",
+                    "-m",
+                    "--propagation",
+                    "private",
+                    "/bin/bash",
+                    "-c",
+                    'mount --bind "$1" /run/lock && shift && exec "$@"',
+                    "release-lock-test",
+                    str(self.lock_root),
+                    str(script),
+                ],
+                cwd=REPO_ROOT,
+                env={**os.environ, **env},
+                pass_fds=(lock_fd,),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(child_pid_file.exists(), result.stderr)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        try:
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
+        finally:
+            if child_pid is not None:
+                try:
+                    command_line = Path(f"/proc/{child_pid}/cmdline").read_bytes()
+                except OSError:
+                    command_line = b""
+                if b"sleep" in command_line:
+                    try:
+                        os.kill(child_pid, 15)
+                    except ProcessLookupError:
+                        pass
+
+    def test_abort_restart_failure_retains_receipt_and_repeated_abort_recovers(self) -> None:
+        current, _previous, candidate = self.prepare_install_state(
+            with_fake_python=True,
+            service_state_required=True,
+        )
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(candidate)
+        self.advance_install_state(candidate, current, phase="staged")
+        self.run_transaction(
+            "record-services",
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=inactive",
+            "--timer-active-before",
+            "inactive",
+        )
+        self.run_transaction("phase", "--expected", "staged", "--phase", "migration-pending")
+        self.run_transaction(
+            "phase", "--expected", "migration-pending", "--phase", "migration-failed"
+        )
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        result = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            env={
+                "PLATFORM_TEST_UNITS_STATE": str(self.root / "units.state"),
+                "PLATFORM_TEST_UNITS_LABEL": "previous",
+                "PLATFORM_TEST_NGINX_STATE": str(self.root / "nginx.state"),
+                "PLATFORM_TEST_NGINX_LABEL": "previous",
+                "PLATFORM_TEST_SYSTEMCTL_FAIL_RESTART": "1",
+            },
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state_phase(), "recovery-restored")
+        self.assertTrue((self.shared / STATE_NAME).exists())
+
+        result = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            env={
+                "PLATFORM_TEST_UNITS_STATE": str(self.root / "units.state"),
+                "PLATFORM_TEST_UNITS_LABEL": "previous",
+                "PLATFORM_TEST_NGINX_STATE": str(self.root / "nginx.state"),
+                "PLATFORM_TEST_NGINX_LABEL": "previous",
+            },
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+
+    def test_abort_refuses_release_identity_drift_before_service_restart(self) -> None:
+        current, _previous, candidate = self.prepare_install_state(
+            with_fake_python=True,
+            service_state_required=True,
+        )
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(candidate)
+        self.advance_install_state(candidate, current, phase="staged")
+        self.run_transaction(
+            "record-services",
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=active",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "active",
+        )
+        self.run_transaction("phase", "--expected", "staged", "--phase", "migration-pending")
+        self.run_transaction(
+            "phase", "--expected", "migration-pending", "--phase", "migration-failed"
+        )
+        moved = self.releases / "current-moved"
+        current.rename(moved)
+        replacement = self.releases / "current"
+        replacement.mkdir()
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        result = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertNotIn("restart", (self.root / "systemctl.log").read_text())
+
+    def test_abort_refuses_lock_contention_before_recovery_or_restart(self) -> None:
+        current, _previous, candidate = self.prepare_install_state(
+            with_fake_python=True,
+            service_state_required=True,
+        )
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(candidate)
+        self.advance_install_state(candidate, current, phase="staged")
+        self.run_transaction(
+            "record-services",
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=active",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "active",
+        )
+        self.run_transaction("phase", "--expected", "staged", "--phase", "migration-pending")
+        self.run_transaction(
+            "phase", "--expected", "migration-pending", "--phase", "migration-failed"
+        )
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        lock_fd = os.open(self.release_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_script(
+                abort,
+                "--abort-retained",
+                "--confirm-migration-not-reversed",
+                "--app-dir",
+                str(self.app_dir),
+                check=False,
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(self.state_phase(), "migration-failed")
+        self.assertEqual((self.root / "systemctl.log").read_text(), "")
 
     def prepare_deploy_state(self, phase: str) -> tuple[Path, Path, Path]:
         current, previous, candidate = self.prepare_install_state(
@@ -477,6 +1158,16 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         target = self.root / name
         target.write_text(script.replace(needle, replacement, 1))
         target.chmod(0o755)
+        shutil.copy2(
+            REPO_ROOT / "platform/tools/platform_release_lock.sh",
+            target.parent / "platform_release_lock.sh",
+        )
+        (target.parent / "platform_release_lock.sh").chmod(0o755)
+        shutil.copy2(
+            REPO_ROOT / "platform/tools/platform_release_systemd_state.py",
+            target.parent / "platform_release_systemd_state.py",
+        )
+        (target.parent / "platform_release_systemd_state.py").chmod(0o755)
         return target
 
     def copy_rollback_with_runtime(self, name: str, runtime: Path) -> Path:
@@ -484,7 +1175,25 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         needle = 'RUNTIME_RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"'
         self.assertIn(needle, script)
         script = script.replace(needle, f'RUNTIME_RESTORE_TOOL="{runtime}"', 1)
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "active",
+                "deadlock-web": "active",
+                "deadlock-cloudflare-ips.timer": "active",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        script = script.replace("/usr/bin/systemctl", str(systemctl))
         target = self.root / name
+        target.write_text(script)
+        target.chmod(0o755)
+        return target
+
+    def copy_rollback_with_systemctl(self, systemctl: Path) -> Path:
+        script = self.script_with_physical_tools(ROLLBACK_SCRIPT)
+        script = script.replace("/usr/bin/systemctl", str(systemctl))
+        target = self.root / "rollback-with-stateful-systemctl.sh"
         target.write_text(script)
         target.chmod(0o755)
         return target
@@ -509,7 +1218,10 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         return path
 
     def prepare_install_state(
-        self, *, with_fake_python: bool = False
+        self,
+        *,
+        with_fake_python: bool = False,
+        service_state_required: bool = False,
     ) -> tuple[Path, Path, Path]:
         current = self.add_release("current")
         previous = self.add_release("previous")
@@ -530,7 +1242,30 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.add_fake_venv(self.shared / "venv", marker="shared")
         if with_fake_python:
             self.write_fake_python(self.shared / "venv" / "bin" / "python")
-        self.create_transaction(candidate, current, previous)
+        self.create_transaction(
+            candidate,
+            current,
+            previous,
+            service_state_required=service_state_required,
+        )
+        if not service_state_required:
+            self.run_transaction(
+                "phase", "--expected", "prepared", "--phase", "venv-transitioned"
+            )
+            self.run_transaction(
+                "phase", "--expected", "venv-transitioned", "--phase", "staged"
+            )
+            self.run_transaction(
+                "record-services",
+                "--service-state",
+                "deadlock-api=active",
+                "--service-state",
+                "deadlock-worker=active",
+                "--service-state",
+                "deadlock-web=active",
+                "--timer-active-before",
+                "active",
+            )
         return current, previous, candidate
 
     def advance_install_state(self, candidate: Path, current: Path, *, phase: str) -> None:
@@ -545,12 +1280,22 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "smoke-passed",
             "activation-committed",
         )
+        current_phase = self.state_phase()
+        if current_phase in phases:
+            phases = phases[phases.index(current_phase) + 1 :]
         for next_phase in phases:
             self.run_transaction("phase", "--expected", self.state_phase(), "--phase", next_phase)
             if next_phase == phase:
                 break
 
-    def create_transaction(self, candidate: Path, current: Path, previous: Path) -> None:
+    def create_transaction(
+        self,
+        candidate: Path,
+        current: Path,
+        previous: Path,
+        *,
+        service_state_required: bool = False,
+    ) -> None:
         self.run_transaction(
             "create",
             "--operation",
@@ -597,6 +1342,9 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         units.chmod(0o755)
         (tools / "platform_install_nginx.py").write_text("# test stub\n")
         (tools / "platform_deploy_smoke.py").write_text("# test stub\n")
+        runtime_installer = tools / "platform_live_qa_runtime_install.py"
+        runtime_installer.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n")
+        runtime_installer.chmod(0o755)
     def add_release(self, name: str) -> Path:
         release = self.releases / name
         release.mkdir()
@@ -653,6 +1401,15 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
 
     def copy_abort_script(self, name: str) -> Path:
         script = self.script_with_physical_tools(DEPLOY_SCRIPT)
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "active",
+                "deadlock-web": "active",
+                "deadlock-cloudflare-ips.timer": "active",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
         runtime_restore = self.root / "test-runtime-restore.sh"
         runtime_restore.write_text(
             "#!/usr/bin/env bash\n"
@@ -679,12 +1436,171 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             'PLATFORM_APP_DIR="$APP_DIR" "$APP_DIR/current/tools/platform_install_systemd_units.sh"',
             "/usr/bin/true",
         )
-        script = script.replace("/usr/bin/systemctl", "/usr/bin/true")
+        script = script.replace("/usr/bin/systemctl", str(systemctl))
         script = script.replace("/usr/bin/curl", "/usr/bin/true")
         target = self.root / name
         target.write_text(script)
         target.chmod(0o755)
         return target
+
+    def copy_abort_script_with_systemctl(self, systemctl: Path) -> Path:
+        script = self.script_with_physical_tools(DEPLOY_SCRIPT)
+        runtime_restore = self.write_test_runtime_restore()
+        script = script.replace(
+            'RUNTIME_RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"',
+            f'RUNTIME_RESTORE_TOOL="{runtime_restore}"',
+            1,
+        )
+        script = script.replace("/usr/bin/systemctl", str(systemctl))
+        script = script.replace("/usr/bin/curl", "/usr/bin/true")
+        target = self.root / "abort-with-stateful-systemctl.sh"
+        target.write_text(script)
+        target.chmod(0o755)
+        return target
+
+    def copy_deploy_migration_script(self, systemctl: Path) -> Path:
+        script = self.script_with_physical_tools(DEPLOY_SCRIPT)
+        preflight = '''release_preflight() {
+  "$TOOLS_DIR/platform_release_preflight.sh" \\
+    --app-dir "$APP_DIR" \\
+    --require-previous \\
+    --require-verified-backup \\
+    --require-edge-parity \\
+    --backup-max-age-hours 24
+}
+'''
+        self.assertIn(preflight, script)
+        script = script.replace(preflight, "release_preflight() { /usr/bin/true; }\n", 1)
+        script = script.replace("/usr/bin/systemctl", str(systemctl))
+        script = script.replace("/usr/bin/curl", "/usr/bin/true")
+        target = self.root / "deploy-migration-failure.sh"
+        target.write_text(script)
+        target.chmod(0o755)
+        return target
+
+    def copy_initial_deploy_with_fault(
+        self,
+        name: str,
+        systemctl: Path,
+        needle: str,
+        replacement: str,
+    ) -> Path:
+        script = self.script_with_physical_tools(DEPLOY_SCRIPT)
+        preflight = '''release_preflight() {
+  "$TOOLS_DIR/platform_release_preflight.sh" \\
+    --app-dir "$APP_DIR" \\
+    --require-previous \\
+    --require-verified-backup \\
+    --require-edge-parity \\
+    --backup-max-age-hours 24
+}
+'''
+        self.assertIn(preflight, script)
+        script = script.replace(preflight, "release_preflight() { /usr/bin/true; }\n", 1)
+        self.assertIn(needle, script)
+        script = script.replace(needle, replacement, 1)
+        script = script.replace("/usr/bin/systemctl", str(systemctl))
+        script = script.replace("/usr/bin/curl", "/usr/bin/true")
+        target = self.root / name
+        target.write_text(script)
+        target.chmod(0o755)
+        return target
+
+    def write_stateful_systemctl(self, states: dict[str, str]) -> Path:
+        state_path = self.root / "systemd-state.json"
+        state_path.write_text(json.dumps(states, sort_keys=True))
+        enabled_path = self.root / "systemd-enabled.json"
+        owned_units = (
+            "deadlock-api.service",
+            "deadlock-worker.service",
+            "deadlock-web.service",
+            "deadlock-maintenance.service",
+            "deadlock-maintenance.timer",
+            "deadlock-logrotate.service",
+            "deadlock-logrotate.timer",
+            "deadlock-offsite-backup.service",
+            "deadlock-offsite-backup.timer",
+            "deadlock-cloudflare-ips.service",
+            "deadlock-cloudflare-ips.timer",
+            "deadlock-health-monitor.service",
+            "deadlock-health-monitor.timer",
+        )
+        static_units = {
+            "deadlock-maintenance.service",
+            "deadlock-logrotate.service",
+            "deadlock-offsite-backup.service",
+            "deadlock-cloudflare-ips.service",
+            "deadlock-health-monitor.service",
+        }
+        enabled_path.write_text(
+            json.dumps(
+                {
+                    unit: (
+                        "static"
+                        if unit in static_units
+                        else "disabled"
+                        if unit == "deadlock-offsite-backup.timer"
+                        else "enabled"
+                    )
+                    for unit in owned_units
+                },
+                sort_keys=True,
+            )
+        )
+        log_path = self.root / "systemctl.log"
+        log_path.write_text("")
+        path = self.root / "systemctl"
+        path.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            f"state_path = Path({str(state_path)!r})\n"
+            f"enabled_path = Path({str(enabled_path)!r})\n"
+            f"log_path = Path({str(log_path)!r})\n"
+            "state = json.loads(state_path.read_text())\n"
+            "enabled = json.loads(enabled_path.read_text())\n"
+            "argv = sys.argv[1:]\n"
+            "action = argv[0] if argv else \"\"\n"
+            "units = [value for value in argv[1:] if not value.startswith(\"-\")]\n"
+            "if action == \"is-active\":\n"
+            "    unit = units[0]\n"
+            "    value = state.get(unit, \"inactive\")\n"
+            "    if \"--quiet\" not in argv:\n"
+            "        print(value)\n"
+            "    raise SystemExit(0 if value == \"active\" else 3)\n"
+            "if action == \"is-enabled\":\n"
+            "    unit = units[0]\n"
+            "    value = enabled.get(unit, \"static\")\n"
+            "    if \"--quiet\" not in argv:\n"
+            "        print(value)\n"
+            "    raise SystemExit(0 if value == \"enabled\" else 1)\n"
+            "if action in {\"enable\", \"disable\"}:\n"
+            "    value = \"enabled\" if action == \"enable\" else \"disabled\"\n"
+            "    for unit in units:\n"
+            "        if enabled.get(unit) != \"static\":\n"
+            "            enabled[unit] = value\n"
+            "        with log_path.open(\"a\", encoding=\"utf-8\") as stream:\n"
+            "            stream.write(f\"{action} {unit}\\n\")\n"
+            "    enabled_path.write_text(json.dumps(enabled, sort_keys=True))\n"
+            "    raise SystemExit(0)\n"
+            "if action in {\"stop\", \"start\", \"restart\"}:\n"
+            "    for unit in units:\n"
+                "        with log_path.open(\"a\", encoding=\"utf-8\") as stream:\n"
+                "            stream.write(f\"{action} {unit}\\n\")\n"
+                "        if action == \"restart\" and unit == \"deadlock-api\" and os.getenv(\"PLATFORM_TEST_SYSTEMCTL_FAIL_RESTART\") == \"1\":\n"
+                "            raise SystemExit(1)\n"
+            "        if unit in state:\n"
+            "            state[unit] = \"inactive\" if action == \"stop\" else \"active\"\n"
+            "    state_path.write_text(json.dumps(state, sort_keys=True))\n"
+            "    raise SystemExit(0)\n"
+            "if action in {\"daemon-reload\", \"reload\"}:\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(0)\n"
+        )
+        path.chmod(0o755)
+        return path
 
     def script_with_physical_tools(self, source: Path) -> str:
         script = source.read_text()
@@ -700,9 +1616,23 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         command_env = os.environ.copy()
+        command_env["PLATFORM_ENVIRONMENT"] = "test"
+        command_env["PLATFORM_TESTING"] = "1"
         command_env.update(env or {})
         result = subprocess.run(
-            [str(script), *args],
+            [
+                "/usr/bin/unshare",
+                "-m",
+                "--propagation",
+                "private",
+                "/bin/bash",
+                "-c",
+                'mount --bind "$1" /run/lock && shift && exec "$@"',
+                "release-lock-test",
+                str(self.lock_root),
+                str(script),
+                *args,
+            ],
             cwd=REPO_ROOT,
             env=command_env,
             text=True,

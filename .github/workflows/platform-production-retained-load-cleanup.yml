@@ -14,7 +14,6 @@ on:
       control_email:
         description: "The same control account email used by the retained-load run"
         required: true
-        default: "aleksei.lisitsin1@gmail.com"
         type: string
 
 permissions:
@@ -31,9 +30,6 @@ jobs:
     timeout-minutes: 45
     environment: production
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       LOAD_RUN_ID: ${{ inputs.load_run_id }}
       CONTROL_EMAIL: ${{ inputs.control_email }}
@@ -41,6 +37,7 @@ jobs:
 
     steps:
       - name: Validate explicit cleanup confirmation
+        id: validate_cleanup_inputs
         shell: bash
         run: |
           set -euo pipefail
@@ -48,23 +45,50 @@ jobs:
             || { echo "Production cleanup must run from the reviewed dev branch." >&2; exit 1; }
           test "$QA_CONFIRMATION" = "DELETE-PRODUCTION-RETAINED-LOAD" \
             || { echo "Refusing cleanup without exact confirmation." >&2; exit 1; }
-          [[ "$LOAD_RUN_ID" =~ ^[0-9]+$ ]] \
-            || { echo "load_run_id must be numeric." >&2; exit 1; }
-          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
-          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
-          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
-          /usr/bin/python3 - "$CONTROL_EMAIL" <<'PY'
+          [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] \
+            || { echo "load_run_id must be a positive decimal identifier." >&2; exit 1; }
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "target_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
+          # Validate and serialize operator-controlled identity before any
+          # SSH key file, keyscan or remote command is reached.  This is a
+          # data-only handoff; the secret job never loads repository code.
+          /usr/bin/python3 - "$TARGET_SHA" "$CONTROL_EMAIL" "$LOAD_RUN_ID" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/platform-retained-cleanup-input.json" <<'PY'
+          import json
           import re
           import sys
 
-          if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", sys.argv[1]):
-              raise SystemExit("control_email is invalid")
+          target_sha, email, load_run_id, cleanup_run_id = sys.argv[1:]
+          if (
+              re.fullmatch(r"[0-9a-f]{40}", target_sha) is None
+              or re.fullmatch(r"[1-9][0-9]{0,31}", load_run_id) is None
+              or re.fullmatch(r"[1-9][0-9]{0,31}", cleanup_run_id) is None
+              or not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9.-]{1,253}", email)
+              or any(ord(character) < 0x21 or ord(character) > 0x7E for character in email)
+          ):
+              raise SystemExit("cleanup handoff is invalid")
+          print(json.dumps({
+              "schema": 1,
+              "confirmation": "DELETE-PRODUCTION-RETAINED-LOAD",
+              "target_sha": target_sha,
+              "control_email": email,
+              "load_run_id": load_run_id,
+              "cleanup_run_id": cleanup_run_id,
+          }, separators=(",", ":")))
           PY
+          chmod 600 "$RUNNER_TEMP/platform-retained-cleanup-input.json"
+          test "$(stat -c '%a' "$RUNNER_TEMP/platform-retained-cleanup-input.json")" = "600"
 
       - name: Configure production SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
+          test -s "$RUNNER_TEMP/platform-retained-cleanup-input.json" \
+            || { echo "Cleanup workflow handoff is missing; refusing SSH setup" >&2; exit 1; }
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
           ssh_dir="$RUNNER_TEMP/production-retained-cleanup-ssh"
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
@@ -92,12 +116,165 @@ jobs:
 
       - name: Clean the exact retained load run on production
         id: run-cleanup
-        continue-on-error: true
+        if: ${{ success() && steps.validate_cleanup_inputs.outcome == 'success' }}
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
-          set -euo pipefail
-          remote_log="$RUNNER_TEMP/production-retained-cleanup-remote.log"
+          set -u
+          umask 077
+          remote_status=1
+          cleanup_artifact_status=1
+          cleanup_export_status=1
+          input_path="$RUNNER_TEMP/platform-retained-cleanup-input.json"
           ssh_output_file="$RUNNER_TEMP/production-retained-cleanup-ssh-output"
+          canonical_raw="$RUNNER_TEMP/production-retained-cleanup-canonical.raw"
+          artifact_dir="$RUNNER_TEMP/production-retained-cleanup-artifacts"
+          cleanup_summary="$artifact_dir/cleanup-summary.json"
+          canonical_log="$artifact_dir/canonical.log"
+          export_dir="/tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID"
+          test -s "$input_path" \
+            || { echo "Cleanup workflow handoff is missing; refusing remote cleanup" >&2; exit 1; }
+          install -d -m 700 "$artifact_dir"
+          trap 'rm -f -- "$ssh_output_file" "$input_path"; test ! -e "$input_path"; ssh_dir="$RUNNER_TEMP/production-retained-cleanup-ssh"; if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then test -d "$ssh_dir" && test ! -L "$ssh_dir"; rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/config" "$ssh_dir/control.sock" "$ssh_dir/control-master" "$ssh_dir/control-master.sock"; rmdir -- "$ssh_dir"; fi; test ! -e "$ssh_dir" && test ! -L "$ssh_dir"' EXIT
+
+          project_cleanup_summary() {
+            local source="$1"
+            local destination="$2"
+            /usr/bin/python3 - "$source" "$destination" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          source_path, destination_path = (Path(value) for value in sys.argv[1:])
+          fallback = {
+              "schema": 1,
+              "ok": False,
+              "markers": 0,
+              "users_deleted": 0,
+              "tournaments_deleted": 0,
+              "control_account_preserved": False,
+              "error_class": "cleanup_summary_invalid",
+          }
+
+          def write_fallback() -> None:
+              destination_path.write_text(json.dumps(fallback, sort_keys=True) + chr(10), encoding="utf-8")
+
+          try:
+              source = json.loads(source_path.read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              write_fallback()
+              raise SystemExit(1)
+          if not isinstance(source, dict) or not isinstance(source.get("ok"), bool):
+              write_fallback()
+              raise SystemExit(1)
+
+          def bounded_count(name: str) -> int:
+              value = source.get(name)
+              if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10_000_000:
+                  raise ValueError(name)
+              return value
+
+          try:
+              projection = {
+                  "schema": 1,
+                  "ok": source["ok"],
+                  "markers": bounded_count("markers"),
+                  "users_deleted": bounded_count("users_deleted"),
+                  "tournaments_deleted": bounded_count("tournaments_deleted"),
+                  "control_account_preserved": source["control_account_preserved"] is True,
+              }
+              if "partial_run_root_removed" in source:
+                  if not isinstance(source["partial_run_root_removed"], bool):
+                      raise ValueError("partial_run_root_removed")
+                  projection["partial_run_root_removed"] = source["partial_run_root_removed"]
+          except (KeyError, ValueError, TypeError):
+              write_fallback()
+              raise SystemExit(1)
+          destination_path.write_text(json.dumps(projection, sort_keys=True) + chr(10), encoding="utf-8")
+          PY
+          }
+
+          set +e
+          # The remote command is fixed; all cleanup identity is in the
+          # validated mode-600 JSON stdin document.
+          ssh \
+            -F "$SSH_DIR/config" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            /usr/bin/python3.12 \
+            /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+            retained-cleanup < "$input_path" > "$ssh_output_file" 2>&1
+          remote_status="$?"
+          set -e
+          rm -f -- "$ssh_output_file"
+          test ! -e "$ssh_output_file"
+
+          # Project the public summary before asking the host to delete its
+          # private export inventory.  The projection has a closed schema and
+          # cannot carry the control email or arbitrary remote error text.
+          rm -f -- "$cleanup_summary"
+          set +e
+          scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/cleanup-summary.json" "$cleanup_summary" \
+            >/dev/null 2>&1
+          summary_copy_status="$?"
+          set -e
+          projection_status=1
+          if [[ "$summary_copy_status" == "0" ]]; then
+            public_summary="$cleanup_summary.public"
+            set +e
+            project_cleanup_summary "$cleanup_summary" "$public_summary"
+            projection_status="$?"
+            set -e
+            if [[ "$projection_status" == "0" && -s "$public_summary" ]]; then
+              chmod 600 "$public_summary"
+              mv -- "$public_summary" "$cleanup_summary"
+              test ! -e "$public_summary"
+            else
+              # Never leave a copied remote response in the artifact path when
+              # the closed-schema projection rejects it.  Replace it with a
+              # fixed failure record so later always-run evidence steps cannot
+              # publish provider text or the control identity.
+              rm -f -- "$cleanup_summary" "$public_summary"
+              printf '%s\n' '{"schema":1,"ok":false,"control_account_preserved":false,"error_class":"cleanup_summary_invalid"}' > "$cleanup_summary"
+              chmod 600 "$cleanup_summary"
+              projection_status=1
+            fi
+          else
+            rm -f -- "$cleanup_summary"
+            printf '%s\n' '{"schema":1,"ok":false,"control_account_preserved":false,"error_class":"cleanup_summary_unavailable"}' > "$cleanup_summary"
+            chmod 600 "$cleanup_summary"
+          fi
+
+          # Copy the canonical log while the private export still exists.  A
+          # later secret-free step reduces it to the public aggregate.
+          rm -f -- "$canonical_raw"
+          set +e
+          scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+            -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/canonical.log" "$canonical_raw" \
+            >/dev/null 2>&1
+          canonical_copy_status="$?"
+          set -e
+          canonical_status=1
+          if [[ "$canonical_copy_status" == "0" && -s "$canonical_raw" ]]; then
+            canonical_status=0
+          fi
+          if [[ "$summary_copy_status" == "0" && "$projection_status" == "0" \
+            && "$canonical_status" == "0" && -s "$cleanup_summary" ]]; then
+            cleanup_artifact_status=0
+          fi
+
+          # Exact closed-inventory removal is attempted even when the primary
+          # cleanup failed, but its status can never be hidden.
           set +e
           ssh \
             -F "$SSH_DIR/config" \
@@ -108,51 +285,148 @@ jobs:
             -o ServerAliveCountMax=3 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$LOAD_RUN_ID" "$CONTROL_EMAIL" "$GITHUB_RUN_ID" \
-            > "$ssh_output_file" 2>&1 <<'REMOTE'
-          set -Eeuo pipefail
-          confirmation="$1"
-          target_sha="$2"
-          load_run_id="$3"
-          control_email="$4"
-          cleanup_run_id="$5"
-          sudo -n -- /opt/oldsparky/platform/current/tools/platform_production_retained_load_cleanup_qa.sh \
-            "$confirmation" "$target_sha" "$load_run_id" "$control_email" "$cleanup_run_id"
-          REMOTE
-          remote_status=$?
+            /usr/bin/python3.12 \
+            /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+            retained-cleanup-exports < "$input_path" >/dev/null 2>&1
+          cleanup_export_status="$?"
           set -e
-          cp "$ssh_output_file" "$remote_log"
-          cat "$remote_log"
-          echo "remote_exit_code=$remote_status" >> "$GITHUB_OUTPUT"
-
-          export_dir="$(sed -n 's/^PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=//p' "$remote_log" | tail -n 1)"
-          if [[ -n "$export_dir" ]]; then
-            [[ "$export_dir" =~ ^/tmp/old-sparky-production-retained-cleanup-[0-9]+$ ]] || {
-              echo "Remote cleanup export path failed validation" >&2
-              exit 1
-            }
-            install -d -m 700 "$RUNNER_TEMP/production-retained-cleanup-artifacts"
-            scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -i "$SSH_DIR/id_ed25519" \
-              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/cleanup-summary.json" \
-              "$RUNNER_TEMP/production-retained-cleanup-artifacts/cleanup-summary.json"
-            scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -i "$SSH_DIR/id_ed25519" \
-              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/cleanup.log" \
-              "$RUNNER_TEMP/production-retained-cleanup-artifacts/cleanup.log"
+          if [[ "$remote_status" == "0" ]] \
+            && { [[ "$cleanup_artifact_status" != "0" ]] || [[ "$cleanup_export_status" != "0" ]]; }; then
+            remote_status=1
           fi
-          exit "$remote_status"
+          echo "remote_exit_code=$remote_status" >> "$GITHUB_OUTPUT"
+          echo "cleanup_artifact_status=$cleanup_artifact_status" >> "$GITHUB_OUTPUT"
+          echo "cleanup_export_status=$cleanup_export_status" >> "$GITHUB_OUTPUT"
+          # The final always-run gate reports the preserved primary status and
+          # rejects any incomplete artifact projection or export deletion.
+          exit 0
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          input_path="$RUNNER_TEMP/platform-retained-cleanup-input.json"
+          rm -f -- "$input_path"
+          test ! -e "$input_path"
+          ssh_dir="$RUNNER_TEMP/production-retained-cleanup-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
+
+      - name: Normalize cleanup evidence
+        id: normalize_cleanup_evidence
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/production-retained-cleanup-artifacts"
+          install -d -m 700 "$artifact_dir"
+          canonical_raw="$RUNNER_TEMP/production-retained-cleanup-canonical.raw"
+          sanitation_status=0
+          if [[ -s "$canonical_raw" ]]; then
+            # Keep this projection in the secret consumer.  It intentionally
+            # accepts only a bounded, fixed schema and never executes a
+            # sanitizer from the candidate checkout.
+            /usr/bin/python3 - "$canonical_raw" "$artifact_dir/canonical.log" <<'PY' || sanitation_status=1
+          import json
+          from pathlib import Path
+          import sys
+
+          source, destination = (Path(value) for value in sys.argv[1:])
+          try:
+              raw = source.read_bytes()
+              if len(raw) > 256 * 1024:
+                  raise ValueError
+              payload = json.loads(raw.decode("utf-8"))
+              if not isinstance(payload, dict):
+                  raise ValueError
+              status = payload.get("status")
+              if status not in {"passed", "failed", "unavailable", "unknown"}:
+                  raise ValueError
+              result = {
+                  "schema": 1,
+                  "status": status,
+                  "line_count": min(max(int(payload.get("line_count", 0)), 0), 100000),
+                  "retained_line_count": min(max(int(payload.get("retained_line_count", 0)), 0), 100000),
+                  "truncated": payload.get("truncated") is True,
+                  "class_counts": {"other": 1},
+                  "route_class_counts": {"other": 1},
+                  "status_counts": {},
+              }
+          except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+              raise SystemExit(1)
+          destination.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          else
+            sanitation_status=1
+          fi
+          rm -f -- "$canonical_raw"
+          test ! -e "$canonical_raw"
+          echo "sanitation_status=$sanitation_status" >> "$GITHUB_OUTPUT"
+          if [[ ! -s "$artifact_dir/cleanup-summary.json" ]]; then
+            printf '%s\n' '{"schema":1,"ok":false,"control_account_preserved":false,"error_class":"cleanup_unavailable"}' > "$artifact_dir/cleanup-summary.json"
+          fi
+          if [[ ! -s "$artifact_dir/canonical.log" ]]; then
+            printf '%s\n' '{"schema":1,"status":"unavailable","line_count":0,"retained_line_count":0,"truncated":false,"class_counts":{"other":1},"route_class_counts":{"other":1},"status_counts":{}}' > "$artifact_dir/canonical.log"
+          fi
+          chmod 600 "$artifact_dir/cleanup-summary.json" "$artifact_dir/canonical.log"
+          rm -f -- "$RUNNER_TEMP/production-retained-cleanup-remote.log"
+          test ! -e "$RUNNER_TEMP/production-retained-cleanup-remote.log"
+
+      - name: Reject incomplete cleanup log evidence
+        id: validate_cleanup_evidence
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - "$RUNNER_TEMP/production-retained-cleanup-artifacts/canonical.log" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          try:
+              payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit("required cleanup log evidence is not valid JSON")
+          if (
+              not isinstance(payload, dict)
+              or payload.get("truncated") is not False
+              or payload.get("status") in {"truncated", "error", "unavailable"}
+          ):
+              raise SystemExit("required cleanup log evidence is incomplete")
+          PY
 
       - name: Publish cleanup artifacts
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.validate_cleanup_evidence.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-production-retained-cleanup-${{ github.run_id }}
+          name: platform-production-retained-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/production-retained-cleanup-artifacts/cleanup-summary.json
-            ${{ runner.temp }}/production-retained-cleanup-artifacts/cleanup.log
-            ${{ runner.temp }}/production-retained-cleanup-remote.log
-          if-no-files-found: warn
+            ${{ runner.temp }}/production-retained-cleanup-artifacts/canonical.log
+          if-no-files-found: error
           retention-days: 14
 
       - name: Write cleanup summary
@@ -190,8 +464,12 @@ jobs:
           set -euo pipefail
           test "${{ steps.run-cleanup.outputs.remote_exit_code }}" = "0" \
             || { echo "Production retained-load cleanup failed; retained data was not removed by the supervisor." >&2; exit 1; }
-          grep -q '^PRODUCTION_RETAINED_LOAD_CLEANUP_OK=1$' \
-            "$RUNNER_TEMP/production-retained-cleanup-remote.log"
+          test "${{ steps.run-cleanup.outputs.cleanup_artifact_status }}" = "0" \
+            || { echo "Retained-load cleanup public projection or evidence copy failed." >&2; exit 1; }
+          test "${{ steps.run-cleanup.outputs.cleanup_export_status }}" = "0" \
+            || { echo "Retained-load private export cleanup is incomplete." >&2; exit 1; }
+          test "${{ steps.normalize_cleanup_evidence.outputs.sanitation_status }}" = "0" \
+            || { echo "Retained-load cleanup evidence sanitation failed." >&2; exit 1; }
           /usr/bin/python3 - "$RUNNER_TEMP/production-retained-cleanup-artifacts/cleanup-summary.json" <<'PY'
           import json
           from pathlib import Path

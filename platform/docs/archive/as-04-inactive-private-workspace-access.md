@@ -1,6 +1,8 @@
 # AS-04 inactive private-workspace authorization — closed
 
 - Status: Archived / resolved
+- Superseded for bearer-route scope by
+  [`adr/private-tournament-bearer-read-boundary.md`](../adr/private-tournament-bearer-read-boundary.md)
 - Closed: 2026-08-21
 - Initial implementation commit: `1405fdbaeaa7c66b974b782a26eb3cc81c5ebf6b`
 - Initial regression-test commit: `492c3cefe65fbc7b1f9995612a6f3572699dfdc8`

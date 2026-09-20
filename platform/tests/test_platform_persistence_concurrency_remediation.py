@@ -579,8 +579,12 @@ class PersistenceConcurrencyRemediationTests(PlatformIsolatedAsyncioTestCase):
         leave_block = source.split('async def leave_tournament(', 1)[1].split(
             '@router.get("/{slug}/profiles/{user_id}"', 1
         )[0]
-        self.assertIn('participant.status == "disqualified"', leave_block)
-        self.assertIn("retained until the organizer", leave_block)
+        # The route deliberately uses the shared inactive-status guard so both
+        # retained disqualified and withdrawn rows remain organizer-owned.
+        self.assertIn("participant.status in INACTIVE_PARTICIPANT_STATUSES", leave_block)
+        self.assertIn("Inactive participant records cannot be changed by the participant", leave_block)
+        self.assertIn("organizer must explicitly restore the participant first", leave_block)
+        self.assertIn('INACTIVE_PARTICIPANT_STATUSES = ("withdrawn", "disqualified")', source)
 
     def test_historical_migration_no_longer_deletes_tournaments(self) -> None:
         migration = (

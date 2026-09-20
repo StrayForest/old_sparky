@@ -2,6 +2,17 @@
   "schema": 2,
   "profile_id": "authenticated-page-load-v2",
   "profile_version": 2,
+  "portfolio": {
+    "owner": "platform-performance",
+    "hypothesis": "Explicit HTTP/1.1 keep-alive changes page transport overhead without changing authenticated HTML correctness.",
+    "class": "diagnostic",
+    "status": "active",
+    "cadence": "on-demand",
+    "environment": "production",
+    "request_budget": {"max_logical_actions": 20000, "max_http_attempts": 20000, "max_duration_seconds": 1800},
+    "cost_budget": {"max_runner_minutes": 120, "basis": "external runner wall-clock budget"},
+    "last_accepted_evidence": null
+  },
   "category": "stress",
   "purpose": "Compare authenticated Next.js page delivery with an explicit reusable HTTP/1.1 client transport.",
   "description": "External authenticated GET /tournaments/{slug} page loads with phase timing, HTTP version and per-worker connection reuse.",
@@ -29,6 +40,7 @@
   },
   "acceptance": {
     "kind": "stress",
+    "minimum_useful_goodput_actions_per_second": 1,
     "accepted_request_latency": {
       "p50_ms": 1000,
       "p90_ms": 2500,
@@ -61,6 +73,7 @@
   },
   "execution": {
     "generator": "GitHub-hosted external runner",
+    "require_exact_observer_binding": true,
     "measured_origin": "https://old-sparky.com",
     "origin_role": "fixture preparation, Next.js/API/DB observer and exact cleanup only",
     "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",

@@ -17,10 +17,13 @@ test("bracket stays request-driven until the page is manually reloaded", async (
     }
   });
 
+  await page.clock.install();
   await page.goto("/tournaments/night-veil-open-5/bracket");
   await expect(page.locator("[data-testid='bracket-shell'], [data-testid='bracket-empty']")).toHaveCount(1);
 
-  await page.waitForTimeout(4_000);
+  // Advance the intended observation window without wall-clock delay. Any
+  // production polling interval would still execute during this virtual run.
+  await page.clock.runFor(4_000);
   expect(forbiddenBackgroundRequests).toEqual([]);
 
   await page.reload();

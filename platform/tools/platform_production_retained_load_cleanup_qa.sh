@@ -10,7 +10,6 @@ QA_PYTHON="$RUNTIME_ROOT/shared/venv/bin/python"
 RUN_ROOT_BASE="$RUNTIME_ROOT/shared/production-retained-matrix"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 CONFIRMATION="DELETE-PRODUCTION-RETAINED-LOAD"
-LOCK_PATH="/run/lock/oldsparky-retained-load-matrix.lock"
 EXPECTED_ORIGIN="https://old-sparky.com"
 
 if [[ "$EUID" -ne 0 ]]; then
@@ -21,11 +20,28 @@ if [[ "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")" != "$SCRIPT_PATH" ]]; the
   echo "Production retained cleanup must run from the active immutable release." >&2
   exit 1
 fi
-exec 9>"$LOCK_PATH"
-flock -n 9 || {
+LOCK_HELPER="$TOOLS_DIR/platform_release_lock.sh"
+if [[ ! -f "$LOCK_HELPER" || -L "$LOCK_HELPER" || ! -x "$LOCK_HELPER" ]]; then
+  echo "Canonical retained-load lock helper is missing or unsafe." >&2
+  exit 1
+fi
+# The helper is selected only after the active immutable release path has been
+# validated above; ShellCheck cannot resolve that runtime-derived source path.
+# shellcheck source=/dev/null
+source "$LOCK_HELPER"
+ORIGINAL_ARGS=("$@")
+platform_retained_load_lock_supervise "${ORIGINAL_ARGS[@]}" || {
   echo "Another retained load or cleanup operation is already running on this host." >&2
   exit 1
 }
+if [[ "${PLATFORM_RETAINED_LOAD_LOCK_SUPERVISED:-}" != "1" ]]; then
+  exit 0
+fi
+platform_retained_load_lock_open || {
+  echo "Retained-load lock supervisor could not be validated." >&2
+  exit 1
+}
+trap platform_retained_load_lock_close EXIT
 if (( $# != 5 )) || [[ "$1" != "$CONFIRMATION" ]]; then
   echo "Usage: $0 $CONFIRMATION <target-sha> <load-run-id> <control-email> <cleanup-run-id>" >&2
   exit 2
@@ -42,11 +58,12 @@ cleanup_run_id="$5"
   echo "Target SHA must be a lowercase 40-character commit SHA." >&2
   exit 1
 }
-[[ "$load_run_id" =~ ^[0-9]+$ && "$cleanup_run_id" =~ ^[0-9]+$ ]] || {
+[[ "$load_run_id" =~ ^[1-9][0-9]{0,31}$ && "$cleanup_run_id" =~ ^[1-9][0-9]{0,31}$ ]] || {
   echo "GitHub run ids must be numeric." >&2
   exit 1
 }
-[[ "$control_email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] || {
+"$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_workflow_input_guard.py" email \
+  --value "$control_email" || {
   echo "Control email is invalid." >&2
   exit 1
 }
@@ -119,7 +136,8 @@ if [[ ! -e "$run_root" ]]; then
   export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
   rm -rf -- "$export_dir"
   install -d -o root -g root -m 0700 "$export_dir"
-  log_path="$export_dir/cleanup.log"
+  log_path="$export_dir/canonical.log"
+  raw_log_path="$export_dir/cleanup-raw.log"
   result_path="$export_dir/cleanup-summary.json"
   set +e
   "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
@@ -129,14 +147,13 @@ if [[ ! -e "$run_root" ]]; then
     --control-email "$control_email" \
     --confirm "$CONFIRMATION" \
     --result-path "$result_path" \
-    2>&1 | tee "$log_path"
-  pipeline_status=("${PIPESTATUS[@]}")
-  cleanup_status="${pipeline_status[0]}"
-  tee_status="${pipeline_status[1]}"
+    > "$raw_log_path" 2>&1
+  cleanup_status="$?"
   set -e
-  if [[ "$tee_status" != "0" ]]; then
-    cleanup_status=1
-  fi
+  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_evidence_sanitizer.py" \
+    --input "$raw_log_path" --output "$log_path"
+  rm -f -- "$raw_log_path"
+  test ! -e "$raw_log_path"
   if [[ "$cleanup_status" == "0" ]]; then
     test -s "$result_path" || {
       echo "Orphan cleanup returned success without a result manifest." >&2
@@ -174,10 +191,10 @@ if [[ "$run_root_uid" == "0" ]]; then
   chmod 0700 -- "$run_root"
   run_root_mode="$(stat -c '%a' -- "$run_root")"
 fi
-test "$run_root_uid" = "0" && test "$run_root_mode" = "700" || {
+if [[ "$run_root_uid" != "0" || "$run_root_mode" != "700" ]]; then
   echo "The selected retained load run root must be root-owned mode 0700." >&2
   exit 1
-}
+fi
 shopt -s nullglob
 summaries=("$run_root"/*/matrix-summary.json)
 shopt -u nullglob
@@ -219,13 +236,13 @@ if (( recovery_needed == 1 )) || {
     partial_export_dir="/tmp/old-sparky-production-retained-cleanup-$cleanup_run_id"
     rm -rf -- "$partial_export_dir"
     install -d -o root -g root -m 0700 "$partial_export_dir"
-    printf '%s\n' "No fixture inventory was published; removed exact partial run root: $run_root" \
-      > "$partial_export_dir/cleanup.log"
+    printf '%s\n' '{"schema":1,"status":"passed","event":"partial_run_root_removed"}' \
+      > "$partial_export_dir/canonical.log"
     printf '%s\n' '{"ok":true,"markers":0,"users_deleted":0,"tournaments_deleted":0,"control_account_preserved":true,"partial_run_root_removed":true}' \
       > "$partial_export_dir/cleanup-summary.json"
     chown -R "$export_uid:$export_gid" "$partial_export_dir"
     chmod 0700 "$partial_export_dir"
-    chmod 0600 "$partial_export_dir/cleanup.log" "$partial_export_dir/cleanup-summary.json"
+    chmod 0600 "$partial_export_dir/canonical.log" "$partial_export_dir/cleanup-summary.json"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=%s\n' "$partial_export_dir"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$partial_export_dir/cleanup-summary.json"
     printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXIT_CODE=0\n'
@@ -265,7 +282,8 @@ export_gid="${SUDO_GID:-0}"
 }
 rm -rf -- "$export_dir"
 install -d -o root -g root -m 0700 "$export_dir"
-log_path="$export_dir/cleanup.log"
+log_path="$export_dir/canonical.log"
+raw_log_path="$export_dir/cleanup-raw.log"
 result_path="$export_dir/cleanup-summary.json"
 
 set +e
@@ -277,14 +295,13 @@ set +e
   --control-email "$control_email" \
   --confirm "$CONFIRMATION" \
   --result-path "$result_path" \
-  2>&1 | tee "$log_path"
-pipeline_status=("${PIPESTATUS[@]}")
-cleanup_status="${pipeline_status[0]}"
-tee_status="${pipeline_status[1]}"
+  > "$raw_log_path" 2>&1
+cleanup_status="$?"
 set -e
-if [[ "$tee_status" != "0" ]]; then
-  cleanup_status=1
-fi
+"$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_evidence_sanitizer.py" \
+  --input "$raw_log_path" --output "$log_path"
+rm -f -- "$raw_log_path"
+test ! -e "$raw_log_path"
 if [[ "$cleanup_status" == "0" ]]; then
   test -s "$result_path" || {
     echo "Cleanup returned success without a result manifest." >&2
@@ -307,7 +324,7 @@ if [[ "$cleanup_status" == "0" ]]; then
 fi
 chown -R "$export_uid:$export_gid" "$export_dir"
 chmod 0700 "$export_dir"
-chmod 0600 "$export_dir/cleanup.log" "$export_dir/cleanup-summary.json" 2>/dev/null || true
+chmod 0600 "$export_dir/canonical.log" "$export_dir/cleanup-summary.json" 2>/dev/null || true
 printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXPORT=%s\n' "$export_dir"
 printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_SUMMARY=%s\n' "$export_dir/cleanup-summary.json"
 printf 'PRODUCTION_RETAINED_LOAD_CLEANUP_EXIT_CODE=%s\n' "$cleanup_status"

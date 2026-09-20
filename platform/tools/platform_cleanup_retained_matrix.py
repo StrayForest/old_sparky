@@ -31,6 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from python_packages.platform_infra.config import get_settings, validate_platform_settings
 from python_packages.platform_infra.db import dispose_engine, session_factory
 from python_packages.platform_infra.media.hard_delete import purge_deleted_media_metadata
+from python_packages.platform_infra.redis import dispose_redis_clients, redis_client
+from apps.platform_api.app.services.tournament_read_models import read_model_key
 from python_packages.platform_infra.models import (
     AuditLog,
     PlayerTournamentCommitment,
@@ -66,6 +68,7 @@ WRITE_BURST_TOURNAMENT_DESCRIPTION_PATTERN = re.compile(
     r"^Write burst profile (?P<marker>preprod[0-9]{12}[0-9a-f]{4}) "
     r"(?P<category>[a-z0-9_-]+)\.$"
 )
+READ_MODEL_KINDS = ("teams", "workspace_detail", "bracket_summary", "bracket_full")
 
 
 def _tournament_description_matches(
@@ -144,6 +147,8 @@ def _uuid_list(value: object, *, field: str, allow_empty: bool = True) -> list[s
 
 def _is_canonical_matrix_origin(report: dict[str, Any], *, mode: str) -> bool:
     """Accept only reports produced through the canonical public origin."""
+    if report.get("origin_class") == "production_origin":
+        return True
     origin = str(report.get("origin") or "").rstrip("/")
     return origin == EXPECTED_ORIGIN
 
@@ -169,9 +174,12 @@ def load_matrix_manifest(
     rows = payload.get("rows")
     if not isinstance(rows, list) or not 0 < len(rows) <= MAX_MATRIX_ROWS:
         raise ValueError("matrix summary must contain one to twenty rows")
-    control_email = str(payload.get("control_email") or "").strip().lower()
-    if control_email != expected_control_email.strip().lower():
-        raise ValueError("matrix control email does not match the cleanup input")
+    # New summaries carry only the preservation boolean.  Accept the legacy
+    # address field for one-way compatibility, but never copy it into the
+    # returned manifest/result (the cleanup input remains transient).
+    legacy_control_email = str(payload.get("control_email") or "").strip().lower()
+    if legacy_control_email and legacy_control_email != expected_control_email.strip().lower():
+        raise ValueError("matrix control account does not match the cleanup input")
     mode = str(payload.get("mode") or "scale")
     if mode not in {"scale", "read-mix", "write-burst"}:
         raise ValueError("matrix mode is not supported")
@@ -250,8 +258,11 @@ def load_matrix_manifest(
     )
     if payload.get("completed_tournaments") != expected_completed_tournaments:
         raise ValueError("matrix completed tournament count does not match its rows")
+    # The exact control address is an in-memory cleanup capability, not part
+    # of a serializable manifest/result.  Keep it under a private key so a
+    # caller cannot accidentally publish the address as evidence.
     return {
-        "control_email": control_email,
+        "_control_email": expected_control_email.strip().lower(),
         "mode": mode,
         "markers": markers,
         "user_ids": user_ids,
@@ -270,6 +281,37 @@ async def _count_ids(db_session, model: Any, ids: set[str]) -> int:
         )
         or 0
     )
+
+
+async def _delete_and_verify_read_models(tournament_ids: set[str]) -> dict[str, int]:
+    """Delete only this run's projections and fail closed if any survive.
+
+    The ordinary application helper intentionally treats Redis as an optional
+    cache and swallows outages. Retained-load cleanup has a stricter contract:
+    once the exact database fixture is removed, no stale projection for that
+    tournament may remain, and an unavailable Redis server must fail the
+    cleanup gate instead of being reported as complete.
+    """
+
+    keys = [
+        read_model_key(tournament_id, model)
+        for tournament_id in sorted(tournament_ids)
+        for model in READ_MODEL_KINDS
+    ]
+    if not keys:
+        return {"keys_expected": 0, "keys_deleted": 0, "keys_remaining": 0}
+    client = redis_client(decode_responses=False, shared=True)
+    deleted = int(await client.delete(*keys) or 0)
+    remaining = int(await client.exists(*keys) or 0)
+    if remaining:
+        raise RuntimeError(
+            "retained matrix cleanup left Redis read-model projections behind"
+        )
+    return {
+        "keys_expected": len(keys),
+        "keys_deleted": deleted,
+        "keys_remaining": remaining,
+    }
 
 
 async def _already_cleaned_manifest_result(
@@ -323,10 +365,17 @@ async def _already_cleaned_manifest_result(
             or cleanup_state.get("ok") is not True
             or cleanup_state.get("cleaned_by")
             != "platform_cleanup_retained_matrix.py"
-            or str(cleanup_state.get("control_account_preserved") or "").lower()
-            != str(manifest["control_email"]).lower()
+            or cleanup_state.get("control_account_preserved") is not True
         ):
             raise RuntimeError("database run cleanup state is not complete")
+        read_models_state = cleanup_state.get("read_models")
+        if (
+            not isinstance(read_models_state, dict)
+            or int(read_models_state.get("keys_remaining") or 0) != 0
+        ):
+            raise RuntimeError(
+                "database cleanup state has no fail-closed Redis projection proof"
+            )
 
     user_ids = set(manifest["user_ids"])
     tournament_ids = set(manifest["tournament_ids"])
@@ -336,12 +385,14 @@ async def _already_cleaned_manifest_result(
         await db_session.scalar(
             select(func.count())
             .select_from(User)
-            .where(func.lower(User.email) == str(manifest["control_email"]).lower())
+            .where(func.lower(User.email) == str(manifest["_control_email"]).lower())
         )
         or 0
     )
     if remaining_users or remaining_tournaments or control_remaining != 1:
         raise RuntimeError("database cleanup state does not match the empty fixture boundary")
+
+    read_models = await _delete_and_verify_read_models(tournament_ids)
 
     return {
         "ok": True,
@@ -349,11 +400,12 @@ async def _already_cleaned_manifest_result(
         "markers": len(markers),
         "users_deleted": 0,
         "tournaments_deleted": 0,
-        "control_account_preserved": manifest["control_email"],
+        "control_account_preserved": True,
         "remaining_users": 0,
         "remaining_tournaments": 0,
         "remaining_sessions": 0,
         "remaining_audit_logs": 0,
+        "read_models": read_models,
     }
 
 
@@ -414,7 +466,7 @@ async def cleanup_manifest(
     markers = set(manifest["markers"])
     user_ids = set(manifest["user_ids"])
     tournament_ids = set(manifest["tournament_ids"])
-    control_email = str(manifest["control_email"])
+    control_email = str(manifest["_control_email"])
     async with session_factory()() as db_session:
         already_cleaned = await _already_cleaned_manifest_result(db_session, manifest)
         if already_cleaned is not None:
@@ -612,16 +664,18 @@ async def cleanup_manifest(
         )
         await db_session.flush()
         user_result = await db_session.execute(delete(User).where(User.id.in_(user_ids)))
+        read_models = await _delete_and_verify_read_models(tournament_ids)
         deleted_at = datetime.now(UTC).isoformat()
         cleanup_state = {
             "ok": True,
             "cleaned_at": deleted_at,
             "cleaned_by": "platform_cleanup_retained_matrix.py",
-            "control_account_preserved": control_email,
+            "control_account_preserved": True,
             "users_deleted": int(user_result.rowcount or 0),
             "tournaments_deleted": int(tournament_result.rowcount or 0) if tournament_result else 0,
             "audit_logs_deleted": audit_logs_deleted,
             "media_metadata_deleted": int(media_deleted),
+            "read_models": read_models,
         }
         for run in runs:
             run.cleanup_state = cleanup_state
@@ -675,16 +729,22 @@ async def cleanup_manifest(
         if control_remaining != 1:
             raise RuntimeError("retained matrix cleanup did not preserve the control account")
 
+    # Re-check after the durable transaction as a final race-safe barrier. A
+    # stale worker/cache writer that raced the DB delete cannot leave a green
+    # cleanup result with projections behind.
+    read_models = await _delete_and_verify_read_models(tournament_ids)
+
     return {
         "ok": True,
         "markers": len(markers),
         "users_deleted": len(user_ids),
         "tournaments_deleted": len(tournament_ids),
-        "control_account_preserved": control_email,
+        "control_account_preserved": True,
         "remaining_users": 0,
         "remaining_tournaments": 0,
         "remaining_sessions": 0,
         "remaining_audit_logs": 0,
+        "read_models": read_models,
     }
 
 
@@ -719,6 +779,7 @@ async def _main() -> int:
         return await async_main()
     finally:
         await dispose_engine()
+        await dispose_redis_clients()
 
 
 def main() -> int:

@@ -14,35 +14,340 @@ on:
 
 permissions:
   contents: read
-  statuses: write
 
 concurrency:
   group: platform-patch-translation-qa
   cancel-in-progress: true
 
 jobs:
-  regression:
+  validate-translation-inputs:
+    name: Validate translation QA handoff
+    outputs:
+      deploy_ready: ${{ steps.deployment_provenance.outputs.deploy_ready }}
+      provenance_digest: ${{ steps.deployment_provenance.outputs.provenance_digest }}
+    permissions:
+      actions: read
+      contents: read
+      statuses: read
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'dev')
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: production
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
       MAX_OPENAI_CALLS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_openai_calls || '4' }}
+      SOURCE_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
+      SOURCE_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
+      PROVENANCE_TOOL: ${{ github.workspace }}/platform/tools/platform_workflow_provenance.py
     steps:
+      # TARGET_SHA is an untrusted workflow-run value. The token-bearing
+      # validator is always loaded from an immutable default-branch commit.
+      - name: Resolve immutable default-branch provenance source
+        id: trusted_default
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_BRANCH: dev
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          trusted_ref="$RUNNER_TEMP/platform-trusted-translation-ref.json"
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/${TRUSTED_BRANCH}" \
+            --output "$trusted_ref"
+          /usr/bin/python3 - "$trusted_ref" "$GITHUB_OUTPUT" "$TRUSTED_BRANCH" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          branch = sys.argv[3]
+          obj = payload.get("object") if isinstance(payload, dict) else None
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if payload.get("ref") != f"refs/heads/{branch}" or not isinstance(obj, dict) or obj.get("type") != "commit":
+              raise SystemExit("trusted default branch ref is not an immutable commit")
+          if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("trusted default branch commit SHA is malformed")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"sha={sha}\n")
+          PY
+          rm -f -- "$trusted_ref"
+
+      - name: Checkout trusted translation source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.trusted_default.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate translation warm-up input
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py bounded-int \
+            --value "$MAX_OPENAI_CALLS" \
+            --minimum 1 \
+            --maximum 4
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py sha \
+            --value "$TARGET_SHA"
+      - name: Validate workflow-run target SHA
+        if: ${{ github.event_name == 'workflow_run' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py sha \
+            --value "$TARGET_SHA"
+      - name: Verify exact completed production deployment provenance (shared validator)
+        id: deployment_provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_SOURCE_SHA: ${{ steps.trusted_default.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TRUSTED_SOURCE_SHA"
+          # The shared validator owns these exact checks; consumers must not
+          # bind an untrusted row to any other workflow: "path": ".github/workflows/platform-production-deploy.yml"
+          # and the source run must carry "event": "workflow_dispatch" with
+          # "conclusion": "success".
+          # reimplement status.get("context") == "platform-production-deploy"
+          # or status.get("target_url") == os.environ["SOURCE_RUN_URL"].
+          # Its closed output is equivalent to output.write("deploy_ready=false\n")
+          # / output.write("deploy_ready=true\n") after two equal snapshots.
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            printf '%s\n' 'deploy_ready=true' >> "$GITHUB_OUTPUT"
+            printf '%s\n' 'provenance_digest=' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          provenance_dir="$(mktemp -d "$RUNNER_TEMP/platform-patch-translation-provenance.XXXXXX")"
+          trap 'rm -rf -- "$provenance_dir"' EXIT
+          chmod 700 "$provenance_dir"
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          fetch_rows() {
+            local base_url="$1" output_path="$2" kind="$3" page=1 count page_path
+            local pages_dir="$provenance_dir/pages-${kind}-$(basename "$output_path")"
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+                "${base_url}?per_page=100&page=${page}" --output "$page_path"
+              count="$(/usr/bin/python3 - "$page_path" "$kind" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if sys.argv[2] == "statuses":
+              rows = payload
+          else:
+              rows = payload.get("jobs") if isinstance(payload, dict) else None
+          if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+              raise SystemExit("paginated provenance response is malformed")
+          print(len(rows))
+          PY
+              )"
+              if (( count < 100 )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 1000 )) || { echo "provenance pagination exceeded its bound" >&2; exit 1; }
+            done
+            /usr/bin/python3 - "$pages_dir" "$output_path" "$kind" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          pages_dir, output_path, kind = sys.argv[1:]
+          pages_dir = Path(pages_dir)
+          output_path = Path(output_path)
+          rows = []
+          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              page_rows = payload if kind == "statuses" else payload.get("jobs")
+              if not isinstance(page_rows, list):
+                  raise SystemExit("paginated provenance response is malformed")
+              rows.extend(page_rows)
+          if kind == "statuses":
+              output_path.write_text(json.dumps(rows, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          else:
+              output_path.write_text(json.dumps({"total_count": len(rows), "jobs": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          }
+          fetch_snapshot() {
+            local snapshot_dir="$1"
+            install -d -m 700 "$snapshot_dir"
+            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml" \
+              --output "$snapshot_dir/workflow.json"
+            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+              --output "$snapshot_dir/run.json"
+            fetch_rows \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}/jobs" \
+              "$snapshot_dir/jobs.json" jobs
+            fetch_rows \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses" \
+              "$snapshot_dir/statuses.json" statuses
+          }
+          for snapshot in first second; do
+            fetch_snapshot "$provenance_dir/$snapshot"
+            /usr/bin/python3 "$PROVENANCE_TOOL" deployment \
+              --allow-preflight-noop \
+              --workflow "$provenance_dir/$snapshot/workflow.json" \
+              --run "$provenance_dir/$snapshot/run.json" \
+              --jobs "$provenance_dir/$snapshot/jobs.json" \
+              --status "$provenance_dir/$snapshot/statuses.json" \
+              --expected-run-id "$SOURCE_RUN_ID" \
+              --expected-attempt "$SOURCE_RUN_ATTEMPT" \
+              --expected-target-sha "$TARGET_SHA" \
+              --expected-run-url "$SOURCE_RUN_URL" \
+              > "$provenance_dir/$snapshot/validated.json"
+          done
+          /usr/bin/python3 - "$provenance_dir/first/validated.json" "$provenance_dir/second/validated.json" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          first, second = (json.loads(Path(path).read_text(encoding="utf-8")) for path in sys.argv[1:3])
+          if first != second:
+              raise SystemExit("deployment provenance changed between adjacent snapshots")
+          if first.get("deploy_ready") not in (False, True):
+              raise SystemExit("deployment provenance readiness is malformed")
+          digest = first.get("snapshot_digest")
+          if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+              raise SystemExit("deployment provenance snapshot digest is malformed")
+          with Path(sys.argv[3]).open("a", encoding="utf-8") as output:
+              output.write(f"deploy_ready={'true' if first['deploy_ready'] else 'false'}\n")
+              output.write(f"provenance_digest={digest}\n")
+          PY
+      - name: Serialize closed translation QA handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          /usr/bin/python3 - "$TARGET_SHA" "$MAX_OPENAI_CALLS" "$GITHUB_EVENT_NAME" "$GITHUB_SHA" "${{ steps.deployment_provenance.outputs.deploy_ready }}" "${{ steps.deployment_provenance.outputs.provenance_digest }}" > "$RUNNER_TEMP/translation-qa-input.json" <<'PY'
+          import json
+          import sys
+
+          if sys.argv[5] not in {"true", "false"}:
+              raise SystemExit("deployment readiness is malformed")
+          digest = sys.argv[6]
+          if digest and (len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+              raise SystemExit("deployment snapshot digest is malformed")
+          print(json.dumps({
+              "schema": 1,
+              "event": sys.argv[3],
+              "max_openai_calls": sys.argv[2],
+              "target_sha": sys.argv[1],
+              "workflow_sha": sys.argv[4],
+              "deploy_ready": sys.argv[5] == "true",
+              "provenance_digest": digest,
+          }, separators=(",", ":")))
+          PY
+          chmod 600 "$RUNNER_TEMP/translation-qa-input.json"
+      - name: Upload closed translation QA handoff
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-translation-qa-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/translation-qa-input.json
+          if-no-files-found: error
+          retention-days: 1
+
+  regression:
+    # The shared handoff replaces the former inline gate
+    # steps.verify_deploy_provenance.outputs.deploy_ready == 'true'.
+    permissions:
+      contents: read
+      statuses: write
+    if: >-
+      needs.validate-translation-inputs.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' ||
+       needs.validate-translation-inputs.outputs.deploy_ready == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    needs: validate-translation-inputs
+    steps:
+      - name: Download closed translation QA handoff
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-translation-qa-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/translation-qa-input
+      - name: Install and validate closed translation QA handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          handoff_dir="$RUNNER_TEMP/translation-qa-input"
+          handoff="$handoff_dir/translation-qa-input.json"
+          test -d "$handoff_dir" && test ! -L "$handoff_dir"
+          test -f "$handoff" && test ! -L "$handoff"
+          test "$(find "$handoff_dir" -mindepth 1 -maxdepth 1 -type l -print -quit)" = ""
+          install -m 600 "$handoff" "$RUNNER_TEMP/translation-qa-input.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/translation-qa-input.json" "$GITHUB_SHA" "$GITHUB_EVENT_NAME" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if set(payload) != {"schema", "event", "max_openai_calls", "target_sha", "workflow_sha", "deploy_ready", "provenance_digest"}:
+              raise SystemExit("translation QA handoff schema is invalid")
+          if payload.get("schema") != 1 or payload.get("workflow_sha") != sys.argv[2]:
+              raise SystemExit("translation QA handoff identity is invalid")
+          if payload.get("event") != sys.argv[3]:
+              raise SystemExit("translation QA handoff event is invalid")
+          if re.fullmatch(r"[0-9a-f]{40}", payload.get("target_sha", "")) is None:
+              raise SystemExit("translation QA handoff SHA is invalid")
+          if re.fullmatch(r"[1-4]", payload.get("max_openai_calls", "")) is None:
+              raise SystemExit("translation QA handoff call budget is invalid")
+          if type(payload.get("deploy_ready")) is not bool:
+              raise SystemExit("translation QA handoff deployment readiness is invalid")
+          digest = payload.get("provenance_digest")
+          if not isinstance(digest, str) or len(digest) not in (0, 64) or any(c not in "0123456789abcdef" for c in digest):
+              raise SystemExit("translation QA handoff provenance digest is invalid")
+          if sys.argv[3] == "workflow_run" and payload.get("deploy_ready") is not True:
+              raise SystemExit("translation QA workflow-run handoff is not deploy-ready")
+          PY
+          {
+            printf 'TARGET_SHA=%s\n' "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["target_sha"])' "$RUNNER_TEMP/translation-qa-input.json")"
+            printf 'MAX_OPENAI_CALLS=%s\n' "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["max_openai_calls"])' "$RUNNER_TEMP/translation-qa-input.json")"
+          } >> "$GITHUB_ENV"
+
+      - name: Consume validated deployment provenance
+        if: ${{ success() && needs.validate-translation-inputs.outputs.deploy_ready == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ needs.validate-translation-inputs.outputs.deploy_ready }}" = "true"
+          digest="${{ needs.validate-translation-inputs.outputs.provenance_digest }}"
+          test -z "$digest" || [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
       - name: Mark translation QA pending
+        if: ${{ success() && needs.validate-translation-inputs.outputs.deploy_ready == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
@@ -52,18 +357,25 @@ jobs:
             --data "{\"state\":\"pending\",\"context\":\"platform-patch-translation-warmup\",\"description\":\"Controlled four-patch Russian translation warm-up is running\",\"target_url\":\"${run_url}\"}"
 
       - name: Configure SSH
+        if: ${{ success() && needs.validate-translation-inputs.outputs.deploy_ready == 'true' }}
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           test -n "${PROD_SSH_HOST:-}"
-          test -n "${PROD_SSH_USER:-}"
           test -n "${PROD_SSH_KEY:-}"
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
-          chmod 600 ~/.ssh/old_sparky_prod
-          ssh_scan="$(mktemp)"
-          trap 'rm -f -- "$ssh_scan"' EXIT
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          ssh_dir="$RUNNER_TEMP/platform-patch-translation-qa-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-patch-translation-qa-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          fi
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
           ssh_key_count="$(wc -l < "$ssh_scan" | tr -d ' ')"
           test "$ssh_key_count" = "1" || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
@@ -72,30 +384,81 @@ jobs:
             echo "Production SSH host fingerprint mismatch" >&2
             exit 1
           }
-          install -m 0600 "$ssh_scan" ~/.ssh/known_hosts
+          install -m 0600 "$ssh_scan" "$ssh_dir/known_hosts"
           {
             printf '%s\n' 'Host *'
             printf '%s\n' '  StrictHostKeyChecking yes'
-            printf '  UserKnownHostsFile %s/.ssh/known_hosts\n' "$HOME"
-          } > ~/.ssh/config
-          chmod 600 ~/.ssh/config
-          chmod 600 ~/.ssh/known_hosts
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          chmod 600 "$ssh_dir/known_hosts"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Run four-patch Russian translation QA
+        if: ${{ success() && needs.validate-translation-inputs.outputs.deploy_ready == 'true' }}
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
-          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid target SHA" >&2; exit 1; }
-          [[ "$MAX_OPENAI_CALLS" =~ ^[1-4]$ ]] || { echo "MAX_OPENAI_CALLS must be 1..4" >&2; exit 1; }
+          umask 077
+          remote_log="$(mktemp "$RUNNER_TEMP/platform-patch-translation-qa-remote.XXXXXX")"
+          remote_error="$(mktemp "$RUNNER_TEMP/platform-patch-translation-qa-remote-error.XXXXXX")"
+          chmod 600 "$remote_log" "$remote_error"
+          cleanup_translation_capture() {
+            trap - EXIT
+            rm -f -- "$remote_log" "$remote_error"
+            test ! -e "$remote_log" && test ! -e "$remote_error"
+          }
+          trap cleanup_translation_capture EXIT
+          set +e
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$TARGET_SHA' '$MAX_OPENAI_CALLS'" <<'REMOTE'
+            -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- '$TARGET_SHA' '$MAX_OPENAI_CALLS'" \
+            >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
           target_sha="$1"
           max_openai_calls="$2"
           runtime=/opt/oldsparky/platform
           guard="$runtime/current/tools/platform_release_lock_exec.sh"
-          test -x "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          input_guard="$runtime/current/tools/platform_workflow_input_guard.py"
+          release_json="$runtime/current/RELEASE.json"
+          runtime_common="$runtime/current/tools/platform_runtime_common.sh"
+          translation_summary="$runtime/current/tools/platform_translation_qa_summary.py"
+          test -L "$runtime/current" && test -d "$runtime/current" \
+            || { echo "Active production release is missing or unsafe" >&2; exit 1; }
+          test -f "$guard" && test ! -L "$guard" && test -x "$guard" \
+            || { echo "Production mutation guard is missing" >&2; exit 1; }
+          test -f "$input_guard" && test ! -L "$input_guard" \
+            || { echo "Workflow input guard is missing or unsafe" >&2; exit 1; }
+          test -f "$release_json" && test ! -L "$release_json" \
+            || { echo "Active release metadata is missing or unsafe" >&2; exit 1; }
+          test -f "$runtime_common" && test ! -L "$runtime_common" \
+            || { echo "Runtime environment helper is missing or unsafe" >&2; exit 1; }
+          test -f "$translation_summary" && test ! -L "$translation_summary" \
+            || { echo "Translation summary helper is missing or unsafe" >&2; exit 1; }
+          /usr/bin/python3.12 -I "$input_guard" bounded-int \
+            --value "$max_openai_calls" \
+            --minimum 1 \
+            --maximum 4 \
+            >/dev/null
+          /usr/bin/python3.12 -I "$input_guard" sha --value "$target_sha" >/dev/null
+          active_sha="$(/usr/bin/python3.12 - "$release_json" <<'PY'
+          import json
+          import re
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          value = payload.get("source_git_commit")
+          if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40,64}", value) is None:
+              raise SystemExit(1)
+          print(value)
+          PY
+          )"
+          test "$active_sha" = "$target_sha" \
+            || { echo "Active production release SHA does not match the expected SHA" >&2; exit 1; }
           /bin/bash "$guard" --app-dir "$runtime" --expected-sha "$target_sha" -- /bin/bash -s -- "$max_openai_calls" <<'MUTATION'
           set -Eeuo pipefail
           max_openai_calls="$1"
@@ -110,7 +473,18 @@ jobs:
           export PYTHONPATH="$runtime/current"
           export MAX_OPENAI_CALLS="$max_openai_calls"
 
-          "$runtime/shared/venv/bin/python" - <<'PY'
+          umask 077
+          private_log="$(mktemp "$runtime/shared/.translation-qa-private.XXXXXX")"
+          public_report="$(mktemp "$runtime/shared/.translation-qa-public.XXXXXX")"
+          chmod 600 "$private_log" "$public_report"
+          cleanup_translation_files() {
+            trap - EXIT
+            rm -f -- "$private_log" "$public_report"
+            test ! -e "$private_log" && test ! -e "$public_report"
+          }
+          trap cleanup_translation_files EXIT
+          set +e
+          "$runtime/shared/venv/bin/python" - >"$public_report" 2>"$private_log" <<'PY'
           import asyncio
           import json
           import os
@@ -121,12 +495,12 @@ jobs:
           from apps.platform_api.app.services.patch_detail import get_patch_detail, get_patch_detail_source
           from apps.platform_api.app.services.patch_translation import (
               CANONICAL_GLOSSARY,
-              PATCH_TRANSLATION_VERSION,
               extract_translation_segments,
               get_cached_patch_translation,
               translate_patch_to_russian,
           )
           from apps.platform_api.app.services.patch_translation_terms import fact_fingerprint
+          from tools.platform_translation_qa_summary import public_summary
 
           PATCH_IDS = (
               "1840944183775204",
@@ -136,9 +510,7 @@ jobs:
           )
           MAX_OPENAI_CALLS = int(os.environ.get("MAX_OPENAI_CALLS", "4"))
           if MAX_OPENAI_CALLS < 1 or MAX_OPENAI_CALLS > len(PATCH_IDS):
-              raise SystemExit(
-                  f"MAX_OPENAI_CALLS must be between 1 and {len(PATCH_IDS)}"
-              )
+              raise SystemExit(1)
           RIFT_SUBJECT_PATCH_ID = "1836506165584438"
           WATCH_TERMS = (
               "lifesteal", "cooldown", "spirit scaling", "spirit power",
@@ -158,66 +530,90 @@ jobs:
           def normalized_text(value):
               return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
 
-          def emit(kind, **payload):
-              print(kind, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+          metrics = {
+              "patches_checked": 0,
+              "segments_checked": 0,
+              "watched_segments": 0,
+              "translation_calls": 0,
+              "max_source_length": 0,
+              "max_translation_length": 0,
+          }
+
+          class TranslationQAFailure(RuntimeError):
+              def __init__(self, error_class):
+                  super().__init__(error_class)
+                  self.error_class = error_class
+
+          def fail(error_class):
+              raise TranslationQAFailure(error_class)
+
+          def public_report(status, error_class):
+              # Closed public schema: "kind": "translation_qa".
+              return public_summary(
+                  status=status,
+                  error_class=error_class,
+                  metrics=metrics,
+              )
 
           async def main():
-              translation_calls = 0
               catalog = await home_content.get_deadlock_asset_catalog()
               for patch_id in PATCH_IDS:
                   source = await get_patch_detail_source(patch_id)
                   if source is None:
-                      raise SystemExit(f"missing source patch {patch_id}")
+                      fail("source_missing")
 
                   cached_translation = await get_cached_patch_translation(source)
-                  if cached_translation is None and translation_calls >= MAX_OPENAI_CALLS:
-                      raise SystemExit("translation warm-up OpenAI call budget exhausted")
+                  if cached_translation is None and metrics["translation_calls"] >= MAX_OPENAI_CALLS:
+                      fail("call_budget")
                   result = await translate_patch_to_russian(source, catalog)
-                  emit("TRANSLATION_RUN", patch_id=patch_id, result=result)
+                  if not isinstance(result, dict):
+                      fail("translation_failed")
                   if cached_translation is None and result.get("status") == "translated":
-                      translation_calls += 1
-                  if not result.get("ok"):
-                      raise SystemExit(f"translation failed for {patch_id}: {result}")
+                      metrics["translation_calls"] += 1
+                  if result.get("ok") is not True:
+                      fail("translation_failed")
                   if result.get("status") == "locked":
-                      raise SystemExit(f"translation is locked for {patch_id}; fail-fast QA stops")
+                      fail("translation_locked")
 
                   translated = await get_patch_detail(patch_id)
                   if translated is None:
-                      raise SystemExit(f"missing translated patch {patch_id}")
+                      fail("translation_missing")
 
                   source_segments = extract_translation_segments(source)
                   ru_segments = extract_translation_segments(translated)
                   if [s["id"] for s in source_segments] != [s["id"] for s in ru_segments]:
-                      raise SystemExit(f"segment ids/order changed for {patch_id}")
+                      fail("segment_contract")
                   paired = list(zip(source_segments, ru_segments, strict=True))
+                  metrics["patches_checked"] += 1
+                  metrics["segments_checked"] += len(paired)
+                  for source_segment, ru_segment in paired:
+                      metrics["max_source_length"] = max(
+                          metrics["max_source_length"], len(source_segment["text"])
+                      )
+                      metrics["max_translation_length"] = max(
+                          metrics["max_translation_length"], len(ru_segment["text"])
+                      )
 
                   if patch_id == RIFT_SUBJECT_PATCH_ID:
-                      rift_subjects = [
-                          segment["text"]
+                      rift_subject_count = sum(
+                          segment["text"].startswith("Rift Troopers ")
                           for segment in source_segments
-                          if segment["text"].startswith("Rift Troopers ")
-                      ]
-                      if len(rift_subjects) < 4:
-                          raise SystemExit(
-                              "Rift Troopers subject was stripped from objective source segments: "
-                              + json.dumps(rift_subjects, ensure_ascii=False)
-                          )
+                      )
+                      if rift_subject_count < 4:
+                          fail("objective_contract")
                       if not any(
                           segment["text"].startswith("Unstable Rift ")
                           for segment in source_segments
                       ):
-                          raise SystemExit("Unstable Rift subject was stripped from objective source segments")
+                          fail("objective_contract")
 
                   for source_segment, ru_segment in paired:
                       if fact_fingerprint(source_segment["text"]) != fact_fingerprint(ru_segment["text"]):
-                          raise SystemExit(
-                              f"numeric/tier fact changed for {patch_id} {source_segment['id']}"
-                          )
+                          fail("fact_contract")
 
                   if source_segments and not any(CYRILLIC_RE.search(s["text"] or "") for s in ru_segments):
-                      raise SystemExit(f"patch {patch_id} has no Russian translation")
+                      fail("locale_contract")
 
-                  samples = []
                   for source_segment, ru_segment in paired:
                       en = source_segment["text"]
                       ru = ru_segment["text"]
@@ -226,86 +622,114 @@ jobs:
 
                       if "bullet lifesteal" in en_lower and re.search(r"[+\-]?\d", en):
                           if "bullet lifesteal" in ru_lower:
-                              raise SystemExit(
-                                  f"Bullet Lifesteal stat stayed English: {patch_id} {source_segment['id']}"
-                              )
+                              fail("terminology_contract")
                       if "spirit lifesteal" in en_lower and re.search(r"[+\-]?\d", en):
                           if "spirit lifesteal" in ru_lower:
-                              raise SystemExit(
-                                  f"Spirit Lifesteal stat stayed English: {patch_id} {source_segment['id']}"
-                              )
+                              fail("terminology_contract")
                       if "bullet, spirit and melee lifesteal" in en_lower:
                           if "lifesteal" in ru_lower or "сопротив" in ru_lower:
-                              raise SystemExit(
-                                  f"compound Lifesteal mistranslated: {patch_id} {source_segment['id']} -> {ru}"
-                              )
+                              fail("terminology_contract")
                       if "same change for melee lifesteal" in en_lower and "Melee Lifesteal" not in ru:
-                          raise SystemExit(
-                              f"Melee Lifesteal item reference was translated: {patch_id} {source_segment['id']}"
-                          )
+                          fail("terminology_contract")
                       if (
                           SPIRIT_SCALING_SOURCE_RE.search(en_lower)
                           and SPIRIT_SCALING_CANONICAL not in ru_lower
                       ):
-                          raise SystemExit(
-                              f"Spirit Scaling is not Valve-canonical: {patch_id} {source_segment['id']} -> {ru}"
-                          )
+                          fail("terminology_contract")
                       if (
                           any(term in en_lower for term in SPEED_TERMS)
                           and SOURCE_SPEED_M_RE.search(en)
                           and "м/с" not in ru_lower
                       ):
-                          raise SystemExit(
-                              f"speed value did not use м/с: {patch_id} {source_segment['id']} -> {ru}"
-                          )
+                          fail("unit_contract")
 
                       if any(term in en_lower for term in WATCH_TERMS):
-                          samples.append({"id": source_segment["id"], "en": en, "ru": ru})
+                          metrics["watched_segments"] += 1
 
-                  for sample in samples[:30]:
-                      emit("PATCH_TRANSLATION_SAMPLE", patch_id=patch_id, **sample)
+              return public_report("passed", "none")
 
-                  if paired:
-                      longest_en, longest_ru = max(paired, key=lambda pair: len(pair[0]["text"]))
-                      emit(
-                          "PATCH_TRANSLATION_LONGEST",
-                          patch_id=patch_id,
-                          id=longest_en["id"],
-                          en=longest_en["text"],
-                          ru=longest_ru["text"],
-                      )
-
-                  emit(
-                      "PATCH_TRANSLATION_PATCH_OK",
-                      patch_id=patch_id,
-                      version=PATCH_TRANSLATION_VERSION,
-                      segments=len(source_segments),
-                      watched_samples=len(samples),
-                  )
-
-          asyncio.run(main())
-          print(
-              "PATCH_TRANSLATION_WARMUP status=passed "
-              f"version={PATCH_TRANSLATION_VERSION} openai_calls<={MAX_OPENAI_CALLS}"
-          )
+          try:
+              report = asyncio.run(main())
+          except TranslationQAFailure as exc:
+              print(json.dumps(public_report("failed", exc.error_class), sort_keys=True))
+              raise SystemExit(1)
+          except Exception:
+              print(json.dumps(public_report("failed", "internal"), sort_keys=True))
+              raise SystemExit(1)
+          print(json.dumps(report, sort_keys=True))
           PY
-
-          echo '=== Recent translation usage logs ==='
-          journalctl -u deadlock-worker -u deadlock-api --since '-30 minutes' --no-pager \
-            | grep -E 'patch_translation_(openai_usage|completed|failed)' \
-            | tail -n 120 \
-            || true
+          qa_status="$?"
+          set -e
+          public_line="$(grep -E '^\{"error_class":"(none|source_missing|call_budget|translation_failed|translation_locked|translation_missing|segment_contract|objective_contract|fact_contract|locale_contract|terminology_contract|unit_contract|internal|producer|remote_or_transport)","kind":"translation_qa","max_source_length":[0-9]+,"max_translation_length":[0-9]+,"patches_checked":[0-9]+,"schema":1,"segments_checked":[0-9]+,"status":"(failed|passed)","translation_calls":[0-9]+,"watched_segments":[0-9]+\}$' "$public_report" | tail -n 1 || true)"
+          if [[ -z "$public_line" ]]; then
+            public_line='{"error_class":"producer","kind":"translation_qa","max_source_length":0,"max_translation_length":0,"patches_checked":0,"schema":1,"segments_checked":0,"status":"failed","translation_calls":0,"watched_segments":0}'
+            qa_status=1
+          fi
+          printf '%s\n' "$public_line"
+          exit "$qa_status"
           MUTATION
           REMOTE
+          remote_status="$?"
+          set -e
+          public_line="$(grep -E '^\{"error_class":"(none|source_missing|call_budget|translation_failed|translation_locked|translation_missing|segment_contract|objective_contract|fact_contract|locale_contract|terminology_contract|unit_contract|internal|producer|remote_or_transport)","kind":"translation_qa","max_source_length":[0-9]+,"max_translation_length":[0-9]+,"patches_checked":[0-9]+,"schema":1,"segments_checked":[0-9]+,"status":"(failed|passed)","translation_calls":[0-9]+,"watched_segments":[0-9]+\}$' "$remote_log" | tail -n 1 || true)"
+          if [[ -z "$public_line" ]]; then
+            public_line='{"error_class":"remote_or_transport","kind":"translation_qa","max_source_length":0,"max_translation_length":0,"patches_checked":0,"schema":1,"segments_checked":0,"status":"failed","translation_calls":0,"watched_segments":0}'
+          fi
+          printf '%s\n' "$public_line"
+          if (( remote_status != 0 )); then
+            exit 1
+          fi
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-patch-translation-qa-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-patch-translation-qa-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          handoff_dir="$RUNNER_TEMP/translation-qa-input"
+          if [[ -e "$handoff_dir" || -L "$handoff_dir" ]]; then
+            test -d "$handoff_dir" && test ! -L "$handoff_dir"
+            rm -f -- "$handoff_dir/translation-qa-input.json"
+            test ! -e "$handoff_dir/translation-qa-input.json"
+            rmdir -- "$handoff_dir"
+          fi
+          test ! -e "$handoff_dir" && test ! -L "$handoff_dir"
+          rm -f -- "$RUNNER_TEMP/translation-qa-input.json"
+          test ! -e "$RUNNER_TEMP/translation-qa-input.json"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
 
       - name: Mark translation QA successful
-        if: ${{ success() }}
+        if: ${{ success() && needs.validate-translation-inputs.outputs.deploy_ready == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
@@ -321,7 +745,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
