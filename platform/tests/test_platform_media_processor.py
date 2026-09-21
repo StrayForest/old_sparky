@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import stat
 import subprocess
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -25,6 +26,28 @@ TINY_PNG = (
     b"\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01"
     b"\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+
+_SYSTEM_EXECUTABLE_PATH = "/usr/sbin:/usr/bin:/bin"
+
+
+def _system_executable(name: str) -> str:
+    executable = shutil.which(name, path=_SYSTEM_EXECUTABLE_PATH)
+    if executable is None:
+        raise RuntimeError(
+            f"{name} is required but was not found in {_SYSTEM_EXECUTABLE_PATH}"
+        )
+    executable_path = Path(executable)
+    try:
+        executable_mode = executable_path.stat().st_mode
+    except OSError as exc:
+        raise RuntimeError(
+            f"{name} is required but {executable_path} is not accessible"
+        ) from exc
+    if not stat.S_ISREG(executable_mode) or not os.access(executable_path, os.X_OK):
+        raise RuntimeError(
+            f"{name} is required but {executable_path} is not a regular executable"
+        )
+    return str(executable_path)
 
 
 class MediaSourceStoreTests(unittest.TestCase):
@@ -222,11 +245,9 @@ class MediaSourceStoreTests(unittest.TestCase):
     def test_real_service_identities_share_files_without_web_access(self) -> None:
         if os.geteuid() != 0:
             raise unittest.SkipTest("root is needed to exercise service identities")
-        runuser = shutil.which("runuser")
-        python = shutil.which("python3")
-        test_binary = shutil.which("test")
-        if not runuser or not python or not test_binary:
-            raise unittest.SkipTest("runuser, python3 and test are required")
+        runuser = _system_executable("runuser")
+        python = _system_executable("python3")
+        test_binary = _system_executable("test")
         try:
             media_gid = grp.getgrnam("oldsparky-media").gr_gid
             service_users = {
@@ -265,7 +286,7 @@ class MediaSourceStoreTests(unittest.TestCase):
             source_path = staging_root / f"{asset_id}.source"
             environment = {
                 "LC_ALL": "C",
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "PATH": _SYSTEM_EXECUTABLE_PATH,
                 "PYTHONPATH": str(code_root),
             }
 

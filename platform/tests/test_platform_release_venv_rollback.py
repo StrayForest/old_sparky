@@ -12,6 +12,7 @@ import tempfile
 import unittest
 import zipfile
 
+from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
 from tests import platform_test_lock_support as lock_support
 from tools import platform_validate_release_artifact
 from tools import platform_validate_wheelhouse
@@ -953,8 +954,17 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         release_json.chmod(0o444)
 
         artifact = self.root / f"{slug}.tar.gz"
+
+        def archive_filter(member: tarfile.TarInfo) -> tarfile.TarInfo:
+            if member.name == (
+                f"{slug}/{platform_validate_release_artifact.LIVE_QA_SANDBOX_RELATIVE}"
+            ):
+                member.uid = member.gid = 0
+                member.mode = 0o4755
+            return member
+
         with tarfile.open(artifact, "w:gz") as archive:
-            archive.add(release, arcname=slug)
+            archive.add(release, arcname=slug, filter=archive_filter)
         digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
         Path(f"{artifact}.sha256").write_text(f"{digest}  {artifact.name}\n")
         return artifact
@@ -1003,15 +1013,18 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             path.write_bytes(content)
             path.chmod(0o555 if relative == "node/bin/node" else 0o444)
 
-        sandbox_candidates = sorted(
-            Path("/var/lib/oldsparky-liveqa").glob(
-                "runtime-*/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
-            )
-        )
-        self.assertTrue(sandbox_candidates, "canonical Chromium sandbox fixture is unavailable")
         sandbox = runtime / "browsers" / "chromium-1228" / "chrome-linux64" / "chrome_sandbox"
-        sandbox.write_bytes(sandbox_candidates[0].read_bytes())
-        sandbox.chmod(0o4755)
+        sandbox.write_bytes(chromium_sandbox_fixture.read_bytes())
+        sandbox.chmod(0o444)
+        self.assertEqual(stat.S_IMODE(sandbox.stat().st_mode), 0o444)
+        self.assertEqual(
+            platform_validate_release_artifact.LIVE_QA_SANDBOX_SIZE,
+            chromium_sandbox_fixture.EXPECTED_SIZE,
+        )
+        self.assertEqual(
+            platform_validate_release_artifact.LIVE_QA_SANDBOX_SHA256,
+            chromium_sandbox_fixture.EXPECTED_SHA256,
+        )
 
         digest = hashlib.sha256()
         manifest_files: dict[str, str] = {}

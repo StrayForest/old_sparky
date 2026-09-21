@@ -10,7 +10,12 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
 from tools import platform_validate_release_artifact as validator
+from tools import platform_live_qa_guard
+from tools import platform_live_qa_runtime_install
+from tools import platform_live_user_qa_dispatch
+from tools import platform_safe_env_exec
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -147,16 +152,9 @@ class ArchiveBuilder:
         }
         for relative, content in files.items():
             self.add_file(f"{runtime}/{relative}", content, mode=0o555 if relative == "node/bin/node" else 0o444)
-        sandbox_candidates = sorted(
-            Path("/var/lib/oldsparky-liveqa").glob(
-                "runtime-*/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
-            )
-        )
-        if not sandbox_candidates:
-            raise RuntimeError("canonical Chromium sandbox fixture is unavailable")
         self.add_file(
             f"{runtime}/browsers/chromium-1228/chrome-linux64/chrome_sandbox",
-            sandbox_candidates[0].read_bytes(),
+            chromium_sandbox_fixture.read_bytes(),
             mode=0o4755,
         )
 
@@ -243,6 +241,33 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         return checksum
 
     def test_valid_archive_checksum_and_safe_extraction(self) -> None:
+        sandbox = chromium_sandbox_fixture.read_bytes()
+        self.assertEqual(len(sandbox), chromium_sandbox_fixture.EXPECTED_SIZE)
+        self.assertEqual(
+            hashlib.sha256(sandbox).hexdigest(),
+            chromium_sandbox_fixture.EXPECTED_SHA256,
+        )
+        for size, digest in (
+            (validator.LIVE_QA_SANDBOX_SIZE, validator.LIVE_QA_SANDBOX_SHA256),
+            (
+                platform_live_qa_guard.CHROMIUM_SANDBOX_SIZE,
+                platform_live_qa_guard.CHROMIUM_SANDBOX_SHA256,
+            ),
+            (
+                platform_live_qa_runtime_install.CHROMIUM_SANDBOX_SIZE,
+                platform_live_qa_runtime_install.CHROMIUM_SANDBOX_SHA256,
+            ),
+            (
+                platform_live_user_qa_dispatch.CHROMIUM_SANDBOX_SIZE,
+                platform_live_user_qa_dispatch.CHROMIUM_SANDBOX_SHA256,
+            ),
+            (
+                platform_safe_env_exec.LIVE_QA_SANDBOX_SIZE,
+                platform_safe_env_exec.LIVE_QA_SANDBOX_SHA256,
+            ),
+        ):
+            self.assertEqual(size, chromium_sandbox_fixture.EXPECTED_SIZE)
+            self.assertEqual(digest, chromium_sandbox_fixture.EXPECTED_SHA256)
         artifact = self.root / f"{RELEASE_SLUG}.tar.gz"
         builder = ArchiveBuilder(artifact)
         builder.add_symlink(
@@ -255,6 +280,12 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         extraction_root.mkdir()
 
         validator._checksum_contract(artifact, checksum)
+        with tarfile.open(artifact, "r:gz") as archive:
+            sandbox_member = archive.getmember(
+                f"{RELEASE_SLUG}/{validator.LIVE_QA_SANDBOX_RELATIVE}"
+            )
+            self.assertEqual((sandbox_member.uid, sandbox_member.gid), (0, 0))
+            self.assertEqual(sandbox_member.mode, 0o4755)
         payload = validator.validate_archive(
             artifact,
             release_slug=RELEASE_SLUG,
