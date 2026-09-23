@@ -853,6 +853,17 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("consistency", workflow)
         self.assertIn("diagnostic_sanitizer", workflow)
         real = workflow_job(workflow, "release-runtime-real")
+        self.assertIn("builder_started=0", real)
+        self.assertIn("local builder_run_ready=0", real)
+        self.assertIn(
+            'if (( builder_started == 1 )) && [[ -n "$canonical_rc" && -n "$build_log" ]]',
+            real,
+        )
+        self.assertIn(
+            "if (( builder_run_ready == 1 && parser_rc != 0 )); then",
+            real,
+        )
+        self.assertIn("reason=builder_not_started", real)
         self.assertNotIn("tee", real)
         self.assertNotIn('cat "$build_log"', real)
         self.assertNotIn("BASH_COMMAND", real)
@@ -911,6 +922,78 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         )
         self.assertEqual(late_validation.returncode, 0, late_validation.stderr)
         self.assertIn("canonical_builder_rc=0", late_validation.stdout)
+
+        run_start = real.index("        run: |\n") + len("        run: |\n")
+        run_lines = []
+        for line in real[run_start:].splitlines():
+            if line and not line.startswith("          "):
+                break
+            run_lines.append(line[10:] if line.startswith("          ") else "")
+        run_script = "\n".join(run_lines)
+        cleanup_start = run_script.index("cleanup() {")
+        cleanup_end = run_script.index("\ntrap cleanup EXIT", cleanup_start)
+        cleanup_script = run_script[cleanup_start:cleanup_end]
+        with tempfile.TemporaryDirectory() as temporary:
+            cleanup_fixture = f"""#!/usr/bin/env bash
+set -u
+runner_temp={temporary!r}
+RUNNER_TEMP={temporary!r}
+min_free_bytes=1
+failure_reason=python_environment_failed
+release_root=""
+release_root_id=""
+artifact_sha256=""
+disk_before_bytes=""
+disk_after_bytes=""
+build_log=""
+canonical_builder_rc=""
+builder_started=0
+diagnostic_parser=/no/such/parser
+{cleanup_script}
+free_bytes() {{ printf '9999999999\\n'; }}
+set +e
+false
+cleanup
+"""
+            prebuilder = subprocess.run(
+                ["/bin/bash"],
+                input=cleanup_fixture,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        self.assertEqual(prebuilder.returncode, 1, prebuilder.stderr)
+        self.assertIn(
+            "RELEASE_RUNTIME_BUILD schema=1 status=failed reason=python_environment_failed",
+            prebuilder.stdout,
+        )
+        self.assertNotIn("diagnostic_parser", prebuilder.stdout)
+        self.assertNotIn(temporary, prebuilder.stdout)
+        with tempfile.TemporaryDirectory() as builder_temporary:
+            builder_log = Path(builder_temporary) / "canonical-builder.log"
+            builder_log.write_text("builder output is private\n")
+            builder_run = cleanup_fixture.replace(temporary, builder_temporary).replace(
+                'build_log=""\ncanonical_builder_rc=""\nbuilder_started=0',
+                f'build_log={str(builder_log)!r}\ncanonical_builder_rc=0\nbuilder_started=1',
+            )
+            builder_parser_failure = subprocess.run(
+                ["/bin/bash"],
+                input=builder_run,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(
+                builder_parser_failure.returncode,
+                1,
+                builder_parser_failure.stderr,
+            )
+            self.assertIn(
+                "RELEASE_RUNTIME_BUILD schema=1 status=failed reason=diagnostic_parser",
+                builder_parser_failure.stdout,
+            )
         builder = (REPO_ROOT / "platform/tools/platform_build_release.sh").read_text()
         self.assertIn("RELEASE_BUILD_PHASE", builder)
         for phase in (

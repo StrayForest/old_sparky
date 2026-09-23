@@ -682,6 +682,7 @@ jobs:
           disk_after_bytes=""
           build_log=""
           canonical_builder_rc=""
+          builder_started=0
           diagnostic_parser="$GITHUB_WORKSPACE/platform/tools/platform_release_build_diagnostics.py"
 
           free_bytes() {
@@ -701,13 +702,17 @@ jobs:
             local parser_rc=127
             local safe_diagnostic=""
             local sanitizer_rc=1
+            local builder_run_ready=0
             trap - EXIT
             set +e
-            if [[ -n "$build_log" ]]; then
+            if (( builder_started == 1 )) && [[ -n "$canonical_rc" && -n "$build_log" ]] \
+              && sudo -n /usr/bin/test -f "$build_log" 2>/dev/null; then
+              builder_run_ready=1
               diagnostic_line="$(sudo -n /usr/bin/python3 -I "$diagnostic_parser" --log "$build_log" 2>/dev/null)"
               parser_rc=$?
             fi
-            safe_diagnostic="$('/usr/bin/python3' -I - "$diagnostic_line" "$canonical_rc" "$parser_rc" <<'PY'
+            if (( builder_run_ready == 1 )); then
+              safe_diagnostic="$('/usr/bin/python3' -I - "$diagnostic_line" "$canonical_rc" "$parser_rc" <<'PY'
           import re
           import sys
 
@@ -816,8 +821,11 @@ jobs:
           )
           raise SystemExit(sanitizer_rc)
           PY
-          )"
-            sanitizer_rc=$?
+              )"
+              sanitizer_rc=$?
+            else
+              safe_diagnostic="RELEASE_RUNTIME_BUILD_DIAGNOSTIC schema=1 canonical_builder_rc=${canonical_rc:-unknown} parser_rc=127 phase=unknown status=failed reason=build_failed cleanup=unknown consistency=not-run"
+            fi
             printf '%s\n' "$safe_diagnostic"
             if [[ -n "$release_root" ]]; then
               if [[ -d "$release_root" && ! -L "$release_root" ]]; then
@@ -840,17 +848,21 @@ jobs:
               printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup\n'
               exit 1
             fi
-            if (( parser_rc != 0 )); then
+            if (( builder_run_ready == 1 && parser_rc != 0 )); then
               printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=diagnostic_parser\n'
               exit 1
             fi
-            if (( sanitizer_rc != 0 )); then
+            if (( builder_run_ready == 1 && sanitizer_rc != 0 )); then
               printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=diagnostic_sanitizer\n'
               exit 1
             fi
             if (( workflow_rc != 0 )); then
               printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=%s\n' "$failure_reason"
               exit "$workflow_rc"
+            fi
+            if (( builder_run_ready == 0 )); then
+              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=builder_not_started\n'
+              exit 1
             fi
             printf 'RELEASE_RUNTIME_BUILD schema=1 status=passed source_sha=%s artifact_sha256=%s disk_before_bytes=%s disk_after_bytes=%s\n' \
               "$TARGET_SHA" "$artifact_sha256" "$disk_before_bytes" "$disk_after_bytes"
@@ -929,6 +941,7 @@ jobs:
             exit 1
           }
 
+          builder_started=1
           set +e
           sudo -n /bin/bash -c \
             'build_log="$1"
