@@ -19,6 +19,8 @@ jobs:
     name: CI route classifier
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      TESTED_SHA: ${{ github.sha }}
     outputs:
       class: ${{ steps.classify.outputs.class }}
       event: ${{ steps.classify.outputs.event }}
@@ -52,21 +54,23 @@ jobs:
           event_path, repo_root, output_path = sys.argv[1:]
           payload = json.loads(Path(event_path).read_text(encoding="utf-8"))
           event = os.environ.get("GITHUB_EVENT_NAME", "")
-          base = head = None
+          base = source_head = None
           if event == "push":
               base = payload.get("before")
-              head = payload.get("after") or (payload.get("head_commit") or {}).get("id")
+              source_head = payload.get("after") or (payload.get("head_commit") or {}).get("id")
           elif event == "pull_request":
               pull = payload.get("pull_request") or {}
               base = (pull.get("base") or {}).get("sha")
-              head = (pull.get("head") or {}).get("sha")
+              # The PR source head is only the changed-file diff endpoint.
+              # TESTED_SHA remains github.sha, the synthetic merge commit.
+              source_head = (pull.get("head") or {}).get("sha")
           sha_re = re.compile(r"^[0-9a-f]{40}$")
-          if not isinstance(base, str) or not isinstance(head, str) or not sha_re.fullmatch(base) or not sha_re.fullmatch(head) or set(base) == {"0"}:
+          if not isinstance(base, str) or not isinstance(source_head, str) or not sha_re.fullmatch(base) or not sha_re.fullmatch(source_head) or set(base) == {"0"}:
               Path(output_path).write_text("\x00\n", encoding="utf-8")
               raise SystemExit(0)
           try:
               result = subprocess.run(
-                  ["git", "diff", "--name-only", "-z", base, head, "--"],
+                  ["git", "diff", "--name-only", "-z", base, source_head, "--"],
                   cwd=repo_root,
                   check=True,
                   capture_output=True,
@@ -132,7 +136,7 @@ jobs:
           set -euo pipefail
           python3 platform/tools/platform_ci_classifier.py \
             --event "$GITHUB_EVENT_NAME" \
-            --target-sha "$GITHUB_SHA" \
+            --target-sha "$TESTED_SHA" \
             --branch "${GITHUB_REF_NAME:-}" \
             --event-file "$GITHUB_EVENT_PATH" \
             --files-file "$RUNNER_TEMP/platform-ci-changed-files.txt" \
@@ -152,6 +156,8 @@ jobs:
       statuses: write
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      TESTED_SHA: ${{ github.sha }}
     steps:
       - name: Mark platform security build pending
         shell: bash
@@ -165,7 +171,7 @@ jobs:
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
             --data "{\"state\":\"pending\",\"context\":\"platform-security-build\",\"description\":\"Platform security and build is running\",\"target_url\":\"${run_url}\"}"
 
   backend-static:
@@ -611,6 +617,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TESTED_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
           CLASSIFIER_RESULT: ${{ needs.classifier.result }}
           ROUTE_CLASS: ${{ needs.classifier.outputs.class }}
@@ -633,7 +640,8 @@ jobs:
         run: |
           set -euo pipefail
           export SUMMARY_PATH="$GITHUB_WORKSPACE/platform-security-summary.json"
-          /usr/bin/python3 - <<'PY'
+          passed=$(
+            /usr/bin/python3 - <<'PY'
           import json
           import os
           import re
@@ -661,11 +669,14 @@ jobs:
               route_errors.append("classifier expected gates do not match its class")
           if route_event != event_name:
               route_errors.append("classifier event does not match the workflow event")
+          tested_sha = os.environ.get("TESTED_SHA", "")
+          if not re.fullmatch(r"[0-9a-f]{40}", tested_sha):
+              route_errors.append("tested SHA is missing")
           route_target_sha = os.environ.get("ROUTE_TARGET_SHA", "")
           if not re.fullmatch(r"[0-9a-f]{40}", route_target_sha):
               route_errors.append("classifier target SHA is missing")
-          elif route_target_sha != os.environ.get("GITHUB_SHA", ""):
-              route_errors.append("classifier target SHA does not match the workflow SHA")
+          elif route_target_sha != tested_sha:
+              route_errors.append("classifier target SHA does not match the tested SHA")
           route_digest = os.environ.get("ROUTE_DIGEST", "")
           if not re.fullmatch(r"[0-9a-f]{64}", route_digest):
               route_errors.append("classifier digest is missing")
@@ -698,7 +709,7 @@ jobs:
           )
           summary = {
               "schema": 1,
-              "target_sha": os.environ.get("ROUTE_TARGET_SHA", ""),
+              "tested_sha": os.environ.get("TESTED_SHA", ""),
               "event": os.environ.get("EVENT_NAME", ""),
               "route_event": route_event,
               "class": os.environ.get("ROUTE_CLASS", ""),
@@ -717,13 +728,13 @@ jobs:
               json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
               encoding="utf-8",
           )
-          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as env_file:
-              env_file.write(f"ROUTE_PASSED={'true' if passed else 'false'}\n")
+          print("true" if passed else "false")
           PY
+          )
 
           state=failure
           description="Platform security or build failed"
-          if [[ "${ROUTE_PASSED:-false}" == "true" ]]; then
+          if [[ "$passed" == "true" ]]; then
             state=success
             description="Platform security and build passed"
           fi
@@ -739,7 +750,7 @@ jobs:
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
               --data "$(/usr/bin/python3 - "$state" "$description" "$run_url" <<'PY'
           import json
           import sys

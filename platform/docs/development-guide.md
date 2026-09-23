@@ -198,9 +198,9 @@ canonical runner itself or isolating a CI failure. The complete local
 deterministic aggregate is available as `tools/platform_verify.py ci`; it does
 not run production smoke, live QA or load testing.
 
-For a production-bound `dev` change, final verification is the GitHub chain for the same current-head SHA:
+For a production-bound `dev` change, final verification is the GitHub chain for the same tested execution SHA:
 
-1. `Platform security and build` succeeds and publishes `platform-security-build=success` plus a classifier artifact whose `target_sha` is the current commit.
+1. `Platform security and build` succeeds and publishes `platform-security-build=success` plus a classifier artifact whose `target_sha` matches the tested execution SHA; the exact `TESTED_SHA` and pull-request source-head boundary are defined in [test-suite governance](test-suite-governance.md).
 2. `Platform production auto-deploy` accepts that SHA and a deployable `full` route rather than skipping it as stale/already deployed; docs-only and out-of-scope routes are successful no-ops.
 3. `Platform production deploy` succeeds, including immutable-artifact validation and live smoke.
 

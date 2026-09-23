@@ -101,6 +101,17 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertTrue(merge_group["fallback"])
         self.assertFalse(merge_group["deployable"])
 
+        workflow_dispatch = classify(
+            ["platform/docs/CURRENT.md"],
+            event="workflow_dispatch",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(workflow_dispatch["event"], "workflow_dispatch")
+        self.assertEqual(workflow_dispatch["class"], "docs-only")
+        self.assertFalse(workflow_dispatch["fallback"])
+        self.assertFalse(workflow_dispatch["deployable"])
+
         shallow = classify(
             ["platform/docs/CURRENT.md"],
             event="push",
@@ -308,6 +319,44 @@ class PlatformCiClassifierTests(unittest.TestCase):
 
     def test_status_final_is_fail_closed_for_published_statuses_and_routes(self) -> None:
         workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        status_final = workflow.split("  status-final:", 1)[1]
+        for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
+            self.assertRegex(workflow, rf"(?m)^  {event}:", msg=f"missing {event} trigger")
+        self.assertGreaterEqual(workflow.count("TESTED_SHA: ${{ github.sha }}"), 3)
+        self.assertIn('--target-sha "$TESTED_SHA"', workflow)
+        self.assertIn('source_head = (pull.get("head") or {}).get("sha")', workflow)
+        self.assertIn(
+            '["git", "diff", "--name-only", "-z", base, source_head, "--"]',
+            workflow,
+        )
+        self.assertIn("route_target_sha != tested_sha", status_final)
+        self.assertIn('"tested_sha": os.environ.get("TESTED_SHA", "")', status_final)
+        self.assertIn('statuses/${TESTED_SHA}', workflow)
+        self.assertNotIn('statuses/${GITHUB_SHA}', workflow)
+        self.assertIn(
+            'published_event = os.environ.get("EVENT_NAME") in {"push", "workflow_dispatch"}',
+            status_final,
+        )
+        self.assertIn(
+            'if [[ "$EVENT_NAME" == "push" || "$EVENT_NAME" == "workflow_dispatch" ]]; then',
+            status_final,
+        )
+        self.assertIn("passed=$(", status_final)
+        self.assertIn('if [[ "$passed" == "true" ]]; then', status_final)
+        self.assertNotIn("GITHUB_ENV", status_final)
+        self.assertNotIn("ROUTE_PASSED", status_final)
+
+        # A pull request's source head can differ from the synthetic merge SHA
+        # being tested; only the former belongs in the changed-file range.
+        pr_source_head = "b" * 40
+        self.assertNotEqual(pr_source_head, self.TARGET_SHA)
+        pr_manifest = classify(
+            ["platform/apps/platform_api/app/main.py"],
+            event="pull_request",
+            target_sha=self.TARGET_SHA,
+        )
+        self.assertEqual(pr_manifest["target_sha"], self.TARGET_SHA)
+        self.assertEqual(pr_manifest["event"], "pull_request")
         self.assertIn("STATUS_START_RESULT", workflow)
         self.assertIn("published_event", workflow)
         self.assertIn("expected_by_class", workflow)

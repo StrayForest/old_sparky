@@ -283,8 +283,14 @@ parallelism, caches, artifacts, permissions, environment authorization and
 commit statuses. The security workflow invokes stable gate IDs and retains
 parallel full-route jobs; reduced routes skip only gates absent from their
 manifest. Its aggregate `platform-security-build=success` status for the exact
-committed SHA remains the release authority; a local pass is neither necessary
-nor sufficient for deployment.
+tested execution SHA remains the release authority; the workflow names that
+value `TESTED_SHA=${{ github.sha }}` for pull-request synthetic merges, pushes,
+merge queues and manual dispatches. On a pull request, the source-head SHA is
+used only for the changed-file diff and never replaces `TESTED_SHA`; the
+trusted default-branch SHA used to check out the classifier is separate
+implementation provenance. Manual commit statuses are published only for
+`push` and `workflow_dispatch`, and target `TESTED_SHA`. A local pass is
+neither necessary nor sufficient for deployment.
 
 ## Production and performance boundaries
 
