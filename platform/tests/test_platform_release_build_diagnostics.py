@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 from tools import platform_release_build_diagnostics as diagnostics
@@ -159,6 +160,28 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                     b"RELEASE_BUILD_PHASE schema=1 phase=node-runtime status=passed reason=ok cleanup=not-run\n"
                     b"RELEASE_BUILD_PHASE schema=1 phase=canonical-preflight status=passed reason=ok cleanup=not-run\n",
                 ),
+                "short-success-source": (
+                    "short-success-source.log",
+                    (
+                        "RELEASE_BUILD_PHASE schema=1 phase=complete status=passed "
+                        "reason=ok cleanup=passed source_sha="
+                        + "a" * 39
+                        + " artifact_sha256="
+                        + "b" * 64
+                        + "\n"
+                    ).encode("ascii"),
+                ),
+                "short-success-artifact": (
+                    "short-success-artifact.log",
+                    (
+                        "RELEASE_BUILD_PHASE schema=1 phase=complete status=passed "
+                        "reason=ok cleanup=passed source_sha="
+                        + "a" * 40
+                        + " artifact_sha256="
+                        + "b" * 63
+                        + "\n"
+                    ).encode("ascii"),
+                ),
             }
             for name, (filename, payload) in cases.items():
                 with self.subTest(case=name):
@@ -194,6 +217,13 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
             mode = root / "wrong-mode.log"
             self._write_log(mode, valid, mode=0o644)
             parsed = self._run_parser(mode)
+            self.assertNotEqual(parsed.returncode, 0)
+            self.assertEqual(parsed.stdout.strip(), diagnostics._safe_failure())
+
+            gid = root / "wrong-gid.log"
+            self._write_log(gid, valid)
+            os.chown(gid, 0, 1)
+            parsed = self._run_parser(gid)
             self.assertNotEqual(parsed.returncode, 0)
             self.assertEqual(parsed.stdout.strip(), diagnostics._safe_failure())
 
@@ -271,6 +301,33 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                 )
             finally:
                 os.close(descriptor)
+
+            collision_ref = "identity-test"
+            current_timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            next_timestamp = time.strftime(
+                "%Y%m%dT%H%M%SZ", time.gmtime(time.time() + 1)
+            )
+            for timestamp in {current_timestamp, next_timestamp}:
+                (output / f"{collision_ref}-{timestamp}.tar.gz").write_bytes(
+                    b"fixture"
+                )
+            collided = subprocess.run(
+                [str(tools / BUILD_SCRIPT.name), collision_ref],
+                cwd=platform,
+                env={
+                    **os.environ,
+                    "PLATFORM_RELEASE_OUTPUT_DIR": str(output),
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(collided.returncode, 1, collided.stderr)
+            self.assertIn(
+                "Release output already exists for slug: identity-test-",
+                collided.stderr,
+            )
 
         self.assertEqual(completed.returncode, 3, completed.stderr)
         self.assertIn(

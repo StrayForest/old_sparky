@@ -83,6 +83,7 @@ def _read_bounded_log(path: Path) -> bytes:
     if (
         not stat.S_ISREG(before.st_mode)
         or before.st_uid != 0
+        or before.st_gid != 0
         or before.st_nlink != 1
         or stat.S_IMODE(before.st_mode) != 0o600
         or before.st_size > MAX_LOG_BYTES
@@ -99,6 +100,7 @@ def _read_bounded_log(path: Path) -> bytes:
         if (
             (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_nlink)
             != (before.st_dev, before.st_ino, before.st_uid, before.st_nlink)
+            or opened.st_gid != 0
             or stat.S_IMODE(opened.st_mode) != 0o600
             or opened.st_size > MAX_LOG_BYTES
         ):
@@ -115,6 +117,7 @@ def _read_bounded_log(path: Path) -> bytes:
         if (
             (after.st_dev, after.st_ino, after.st_uid, after.st_nlink)
             != (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_nlink)
+            or after.st_gid != 0
             or stat.S_IMODE(after.st_mode) != 0o600
             or after.st_size != len(payload)
         ):
@@ -171,7 +174,7 @@ def _parse_marker(line: str) -> Marker:
         character in "0123456789abcdef" for character in source_sha
     ):
         raise DiagnosticError
-    if source_sha is not None and len(source_sha) not in {40, 64}:
+    if source_sha is not None and len(source_sha) != 40:
         raise DiagnosticError
     if artifact_sha256 is not None or artifact_sha256 == "":
         if artifact_sha256 is None or len(artifact_sha256) != 64 or not all(

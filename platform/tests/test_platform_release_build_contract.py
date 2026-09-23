@@ -13,6 +13,7 @@ import subprocess
 import tarfile
 import tempfile
 import stat
+import textwrap
 import unittest
 import zipfile
 
@@ -847,8 +848,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("platform_build_release.sh", workflow)
         self.assertIn("platform_release_build_diagnostics.py", workflow)
         self.assertIn("RELEASE_RUNTIME_BUILD_DIAGNOSTIC", workflow)
-        self.assertIn("builder_rc", workflow)
+        self.assertIn("canonical_builder_rc", workflow)
         self.assertIn("parser_rc", workflow)
+        self.assertIn("consistency", workflow)
+        self.assertIn("diagnostic_sanitizer", workflow)
         real = workflow_job(workflow, "release-runtime-real")
         self.assertNotIn("tee", real)
         self.assertNotIn('cat "$build_log"', real)
@@ -858,6 +861,56 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             real.index("diagnostic_parser"),
             real.index('/bin/rm -rf -- "$release_root"'),
         )
+        self.assertEqual(real.count("canonical_builder_rc=$?"), 1)
+        self.assertLess(
+            real.index("canonical_builder_rc=$?"),
+            real.index("archive_candidates"),
+        )
+        sanitizer_match = re.search(
+            r"<<'PY'\n(?P<script>.*?)\n\s*PY\n",
+            real,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(sanitizer_match)
+        sanitizer = textwrap.dedent(sanitizer_match.group("script"))
+        passed_marker = (
+            "RELEASE_BUILD_DIAGNOSTIC schema=1 phase=complete status=passed "
+            "reason=ok cleanup=passed "
+            f"source_sha={'a' * 40} artifact_sha256={'b' * 64}"
+        )
+        failed_marker = (
+            "RELEASE_BUILD_DIAGNOSTIC schema=1 phase=complete status=failed "
+            "reason=build_failed cleanup=passed failed_phase=web-build"
+        )
+        for marker, canonical_rc, expected_rc in (
+            (passed_marker, "0", 0),
+            (failed_marker, "3", 0),
+            (passed_marker, "3", 1),
+            (passed_marker, "", 1),
+        ):
+            with self.subTest(canonical_rc=canonical_rc, marker=marker):
+                sanitized = subprocess.run(
+                    ["/usr/bin/python3", "-I", "-", marker, canonical_rc, "0"],
+                    input=sanitizer,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(sanitized.returncode, expected_rc, sanitized.stderr)
+                self.assertIn(
+                    f"canonical_builder_rc={canonical_rc or 'unknown'}", sanitized.stdout
+                )
+        late_validation = subprocess.run(
+            ["/usr/bin/python3", "-I", "-", passed_marker, "0", "0"],
+            input=sanitizer,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(late_validation.returncode, 0, late_validation.stderr)
+        self.assertIn("canonical_builder_rc=0", late_validation.stdout)
         builder = (REPO_ROOT / "platform/tools/platform_build_release.sh").read_text()
         self.assertIn("RELEASE_BUILD_PHASE", builder)
         for phase in (

@@ -201,6 +201,12 @@ if [[ ! -x "$ROOT_DIR/.venv_platform/bin/python" ]]; then
   echo "Missing platform/.venv_platform. Run platform/tools/platform_bootstrap.sh first." >&2
   exit 1
 fi
+RELEASE_REF="$RELEASE_REF_RAW"
+BUILD_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RELEASE_SLUG="${RELEASE_REF}-${BUILD_TIMESTAMP}"
+RELEASE_DIR="$OUTPUT_DIR/$RELEASE_SLUG"
+ARTIFACT_PATH="$OUTPUT_DIR/$RELEASE_SLUG.tar.gz"
+ARTIFACT_SHA_PATH="$ARTIFACT_PATH.sha256"
 if [[ "$(readlink -m "$OUTPUT_DIR")" != "$OUTPUT_DIR" ]]; then
   echo "Release output directory is not canonical." >&2
   exit 1
