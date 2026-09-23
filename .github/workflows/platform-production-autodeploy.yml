@@ -273,7 +273,7 @@ jobs:
           manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
           fields = (
               "schema", "version", "target_sha", "event", "class",
-              "expected_gates", "deployable", "fallback", "reason", "files",
+              "expected_gates", "runtime_sensitive", "deployable", "fallback", "reason", "files",
           )
           expected_gates = {
               "docs-only": ["docs", "verification-contract"],
@@ -306,6 +306,8 @@ jobs:
               raise SystemExit("classifier reason is missing")
           if not isinstance(manifest.get("files"), list):
               raise SystemExit("classifier files are malformed")
+          if not isinstance(manifest.get("runtime_sensitive"), bool):
+              raise SystemExit("classifier runtime-sensitive field is malformed")
           payload = {field: manifest[field] for field in fields}
           digest = hashlib.sha256(
               json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()

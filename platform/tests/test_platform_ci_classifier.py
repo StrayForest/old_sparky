@@ -13,6 +13,7 @@ from tools.platform_ci_classifier import (
     DOCS_ONLY_GATE_IDS,
     FULL_GATE_IDS,
     OUT_OF_SCOPE_GATE_IDS,
+    RUNTIME_SENSITIVE_FILES,
     ClassifierError,
     SECURITY_WORKFLOW_NAME,
     SECURITY_WORKFLOW_PATH,
@@ -68,6 +69,36 @@ class PlatformCiClassifierTests(unittest.TestCase):
             require_deployable=True,
         )
 
+    def test_runtime_sensitivity_is_exact_for_trusted_pull_request_ranges(self) -> None:
+        runtime_path = "platform/tools/platform_build_live_qa_runtime.py"
+        self.assertIn(runtime_path, RUNTIME_SENSITIVE_FILES)
+        runtime = classify(
+            [runtime_path],
+            event="pull_request",
+            target_sha=self.TARGET_SHA,
+        )
+        self.assertTrue(runtime["runtime_sensitive"])
+        validate_manifest(runtime, expected_target_sha=self.TARGET_SHA)
+
+        for files in (
+            ["platform/docs/test-suite-governance.md"],
+            ["platform/apps/platform_web/package.json"],
+        ):
+            with self.subTest(files=files):
+                manifest = classify(
+                    files,
+                    event="pull_request",
+                    target_sha=self.TARGET_SHA,
+                )
+                self.assertFalse(manifest["runtime_sensitive"])
+                validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+        tampered = dict(runtime)
+        tampered["runtime_sensitive"] = False
+        tampered["digest"] = manifest_digest(tampered)
+        with self.assertRaises(ClassifierError):
+            validate_manifest(tampered)
+
     def test_out_of_scope_change_is_contract_only_and_never_deployable(self) -> None:
         manifest = classify(
             ["oldsparky_app/services/legacy.py", "README.md"],
@@ -90,6 +121,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         )
         self.assertEqual(unknown["class"], "full")
         self.assertTrue(unknown["fallback"])
+        self.assertTrue(unknown["runtime_sensitive"])
         self.assertFalse(unknown["deployable"])
 
         merge_group = classify(
@@ -100,6 +132,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         )
         self.assertEqual(merge_group["class"], "full")
         self.assertTrue(merge_group["fallback"])
+        self.assertTrue(merge_group["runtime_sensitive"])
         self.assertFalse(merge_group["deployable"])
 
         workflow_dispatch = classify(
@@ -111,6 +144,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertEqual(workflow_dispatch["event"], "workflow_dispatch")
         self.assertEqual(workflow_dispatch["class"], "docs-only")
         self.assertFalse(workflow_dispatch["fallback"])
+        self.assertTrue(workflow_dispatch["runtime_sensitive"])
         self.assertFalse(workflow_dispatch["deployable"])
 
         shallow = classify(
@@ -122,6 +156,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         )
         self.assertEqual(shallow["class"], "full")
         self.assertTrue(shallow["fallback"])
+        self.assertTrue(shallow["runtime_sensitive"])
         self.assertFalse(shallow["deployable"])
 
     def test_malformed_input_cannot_be_promoted_by_tampering(self) -> None:
@@ -133,6 +168,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         )
         self.assertEqual(malformed["class"], "full")
         self.assertTrue(malformed["fallback"])
+        self.assertTrue(malformed["runtime_sensitive"])
         self.assertFalse(malformed["deployable"])
         validate_manifest(malformed)
         tampered = dict(malformed)
@@ -158,6 +194,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertIn("target_sha", workflow)
             self.assertIn("platform-ci-route", workflow)
             self.assertIn("digest", workflow)
+            self.assertIn("runtime_sensitive", workflow)
         self.assertIn("classifier_run_id", auto)
         self.assertIn("classifier_run_attempt", auto)
         self.assertIn("require_deployable", production)
