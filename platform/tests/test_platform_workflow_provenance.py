@@ -89,9 +89,21 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_run_id=1234,
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
+                expected_run_url=run["html_url"],
             ),
             "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/2",
         )
+        with self.assertRaises(ProvenanceError):
+            validate_deployment_marker(
+                workflow,
+                run,
+                jobs,
+                statuses,
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_target_sha=self.SHA,
+                expected_run_url=f"{run['html_url']}/wrong",
+            )
 
     def test_old_attempt_cannot_authorize_mutation(self) -> None:
         workflow, run, jobs, statuses = self._payload()
@@ -148,6 +160,27 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
             )
+        for label, creator in (
+            ("missing", "__missing__"),
+            ("null", None),
+            ("wrong", {"login": "attacker", "type": "User", "id": 1}),
+        ):
+            candidate_statuses = copy.deepcopy(self._payload()[3])
+            if creator == "__missing__":
+                candidate_statuses[0].pop("creator")
+            else:
+                candidate_statuses[0]["creator"] = creator
+            with self.subTest(creator=label):
+                with self.assertRaises(ProvenanceError):
+                    validate_deployment_marker(
+                        workflow,
+                        run,
+                        jobs,
+                        candidate_statuses,
+                        expected_run_id=1234,
+                        expected_attempt=2,
+                        expected_target_sha=self.SHA,
+                    )
 
     def test_wrong_repository_or_workflow_cannot_authorize_mutation(self) -> None:
         for field, value in (
@@ -284,9 +317,27 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 expected_attempt=2,
                 expected_target_sha=self.SHA,
             )
+        for field, value in (
+            ("context", "another-context"),
+            ("state", "failure"),
+        ):
+            candidate_statuses = copy.deepcopy(self._payload()[3])
+            candidate_statuses[0][field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(ProvenanceError):
+                    validate_deployment_marker(
+                        workflow,
+                        run,
+                        jobs,
+                        candidate_statuses,
+                        expected_run_id=1234,
+                        expected_attempt=2,
+                        expected_target_sha=self.SHA,
+                    )
 
     def test_complete_paginated_status_payload_rejects_truncation(self) -> None:
-        _workflow, _run, _jobs, statuses = self._payload()
+        workflow, run, jobs, statuses = self._payload()
+        self.assertEqual(_payload_rows(statuses, "statuses", "status"), statuses)
         payload = {"total_count": len(statuses), "statuses": statuses}
         self.assertEqual(_payload_rows(payload, "statuses", "status"), statuses)
         with self.assertRaisesRegex(ProvenanceError, "incomplete"):
@@ -295,6 +346,18 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 "statuses",
                 "status",
             )
+        for invalid_statuses in (payload, None):
+            with self.subTest(statuses=invalid_statuses):
+                with self.assertRaises(ProvenanceError):
+                    validate_deployment_marker(
+                        workflow,
+                        run,
+                        jobs,
+                        invalid_statuses,
+                        expected_run_id=1234,
+                        expected_attempt=2,
+                        expected_target_sha=self.SHA,
+                    )
         with self.assertRaises(ProvenanceError):
             _payload_rows(
                 {"total_count": True, "statuses": statuses},
@@ -385,6 +448,7 @@ class WorkflowProvenanceTests(unittest.TestCase):
 
     def test_consumers_paginate_and_require_adjacent_equal_snapshots(self) -> None:
         for workflow_name in (
+            "platform-production-autodeploy.yml",
             "platform-production-deploy.yml",
             "platform-production-content-diagnostics.yml",
             "platform-patch-translation-qa.yml",
@@ -395,6 +459,20 @@ class WorkflowProvenanceTests(unittest.TestCase):
                 self.assertIn("for snapshot in first second", source)
                 self.assertIn("if first != second:", source)
                 self.assertIn("pagination exceeded its bound", source)
+                if workflow_name == "platform-production-autodeploy.yml":
+                    self.assertIn(
+                        "/commits/${TARGET_SHA}/statuses?per_page=100&page=${page}",
+                        source,
+                    )
+                    self.assertNotIn(
+                        "/commits/${TARGET_SHA}/status?per_page=100&page=${page}",
+                        source,
+                    )
+                    self.assertNotIn(
+                        "/commits/${TARGET_SHA}/status\"",
+                        source,
+                    )
+                    self.assertIn("status rows contain duplicate or malformed IDs", source)
 
     def test_preflight_rejects_future_or_tied_deployment_markers(self) -> None:
         workflow, run, _jobs, _statuses = self._payload()

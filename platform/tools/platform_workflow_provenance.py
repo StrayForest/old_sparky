@@ -427,9 +427,8 @@ def _validate_status_rows(statuses: Sequence[Mapping[str, Any]]) -> None:
         raise _fail("status row is malformed")
     seen_ids: set[int] = set()
     for row in statuses:
-        # The combined-status fixture used by the classifier contract omits
-        # optional API metadata.  When GitHub supplies an id, never coerce it
-        # and reject duplicate rows; production snapshots retain that field.
+        # When GitHub supplies an id, never coerce it and reject duplicate
+        # rows; production snapshots retain that field.
         if "id" in row:
             status_id = _positive_int(row.get("id"), "status id")
             if status_id in seen_ids:

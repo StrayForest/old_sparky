@@ -292,6 +292,13 @@ implementation provenance. Manual commit statuses are published only for
 `push` and `workflow_dispatch`, and target `TESTED_SHA`. A local pass is
 neither necessary nor sufficient for deployment.
 
+The auto-deploy and production-deploy provenance gates read the exact
+commit's paginated raw status rows through GitHub's [list commit statuses
+endpoint](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference).
+The auto-deploy page assembler retains each row, including `creator`, and the shared validator
+requires the exact context/state, `github-actions[bot]` creator, attempt URL,
+run attempt and target SHA before a status can authorize release behavior.
+
 ## Production and performance boundaries
 
 Deployment smoke runs only after immutable deployment activation and checks

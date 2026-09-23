@@ -117,14 +117,14 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
-          release_slug="${RELEASE_SLUG:0:32}-${short_sha}"
+          candidate_release_slug="${RELEASE_SLUG:0:32}-${short_sha}"
           # The candidate parser is used only on this secret-free runner.  All
           # secret-bearing consumers independently validate the JSON schema.
           /usr/bin/python3 platform/tools/platform_workflow_input_guard.py deployment \
             --output "$RUNNER_TEMP/platform-production-deploy-input.json" \
             --mode "$DEPLOY_MODE" \
             --runtime-profile "$RUNTIME_PROFILE" \
-            --release-slug "$release_slug" \
+            --release-slug "$candidate_release_slug" \
             --target-sha "$TARGET_SHA" \
             --artifact-remote-dir "$ARTIFACT_REMOTE_DIR" \
             --classifier-run-id "$CLASSIFIER_RUN_ID" \
@@ -415,8 +415,16 @@ jobs:
           )
           fetch_statuses() {
             local output_path="$1" page=1 count page_path
-            local pages_dir="$provenance_dir/pages-$(basename "$output_path")"
+            local pages_dir="$output_path.pages"
+            case "$pages_dir" in
+              "$provenance_dir"/*) ;;
+              *) echo "status page directory escaped the ephemeral provenance root" >&2; exit 1 ;;
+            esac
+            if [[ -e "$pages_dir" || -L "$pages_dir" ]]; then
+              rm -rf -- "$pages_dir"
+            fi
             install -d -m 700 "$pages_dir"
+            test ! -L "$pages_dir"
             while :; do
               page_path="$pages_dir/page-${page}.json"
               curl --fail-with-body --silent --show-error "${api_headers[@]}" \
@@ -559,8 +567,10 @@ jobs:
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
-          test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}" \
-            || { echo "Production SSH configuration is incomplete." >&2; exit 1; }
+          if [[ -z "${PROD_SSH_HOST:-}" || -z "${PROD_SSH_USER:-}" || -z "${PROD_SSH_KEY:-}" ]]; then
+            echo "Production SSH configuration is incomplete." >&2
+            exit 1
+          fi
 
       - name: Configure preflight SSH
         shell: bash
@@ -703,11 +713,6 @@ jobs:
           # run.get("run_attempt") != int(expected_attempt), and exact
           # "event": "push", "head_branch": "dev", "head_sha": os.environ["TARGET_SHA"],
           # "status": "completed", "conclusion": "success" metadata.  The
-          # complete paginated equivalent of
-          # "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status"
-          # rejects item.get("context") == "platform-security-build" rows
-          # unless latest.get("state") != "success" is false and
-          # latest.get("target_url") != attempt_url is false.
           security_digest="${{ needs.validate-security-provenance.outputs.security_digest }}"
           [[ "$security_digest" =~ ^[0-9a-f]{64}$ ]] || { echo "security provenance handoff is malformed" >&2; exit 1; }
           test "${{ needs.validate-security-provenance.outputs.security_ready }}" = "true"
@@ -724,7 +729,8 @@ jobs:
           trap 'rm -rf -- "$route_dir"' EXIT
           fetch_classifier_artifacts() {
             local output_path="$1" page=1 count page_path
-            local pages_dir="$route_dir/artifact-pages-$(basename "$output_path")"
+            local pages_dir
+            pages_dir="$route_dir/artifact-pages-$(basename "$output_path")"
             install -d -m 700 "$pages_dir"
             while :; do
               page_path="$pages_dir/page-${page}.json"
@@ -1034,9 +1040,11 @@ jobs:
           if hashlib.sha256(Path(archive).read_bytes()).hexdigest() != provenance["artifact_sha256"]:
               raise SystemExit("release provenance digest mismatch")
           PY
-          printf 'RELEASE_ARTIFACT=%s\n' "$release_archive" >> "$GITHUB_ENV"
-          printf 'RELEASE_CHECKSUM=%s\n' "$release_checksum" >> "$GITHUB_ENV"
-          printf 'RELEASE_PROVENANCE=%s\n' "$release_provenance" >> "$GITHUB_ENV"
+          {
+            printf 'RELEASE_ARTIFACT=%s\n' "$release_archive"
+            printf 'RELEASE_CHECKSUM=%s\n' "$release_checksum"
+            printf 'RELEASE_PROVENANCE=%s\n' "$release_provenance"
+          } >> "$GITHUB_ENV"
 
       - name: Validate deployment secrets
         shell: bash
@@ -1046,8 +1054,10 @@ jobs:
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
-          test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}" \
-            || { echo "Production SSH configuration is incomplete." >&2; exit 1; }
+          if [[ -z "${PROD_SSH_HOST:-}" || -z "${PROD_SSH_USER:-}" || -z "${PROD_SSH_KEY:-}" ]]; then
+            echo "Production SSH configuration is incomplete." >&2
+            exit 1
+          fi
 
       - name: Configure SSH
         shell: bash

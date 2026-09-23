@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 import os
 from pathlib import Path
 import sys
 import tempfile
+import subprocess
+import textwrap
 import unittest
 
 
@@ -22,7 +25,10 @@ from tools.platform_workflow_input_guard import (  # noqa: E402
     validate_target_sha,
     validate_utc_timestamp,
 )
-from tools import platform_prepare_artifact_dir  # noqa: E402
+from tools import (  # noqa: E402
+    platform_media_migration_diagnostics_summary,
+    platform_prepare_artifact_dir,
+)
 
 
 WORKFLOWS = {
@@ -43,6 +49,83 @@ def _job_block(source: str, name: str) -> str:
     if match is None:
         raise AssertionError(f"workflow job is missing: {name}")
     return match.group("body")
+
+
+def _media_report_payload() -> dict[str, object]:
+    return {
+        "ok": True,
+        "mode": "check",
+        "mutated": False,
+        "inventory_before": {
+            "legacy_upload_references": 2,
+            "packaged_asset_references": 3,
+            "manual_conflicts": 0,
+        },
+        "inventory_after": {
+            "legacy_upload_references": 0,
+            "packaged_asset_references": 3,
+            "manual_conflicts": 0,
+        },
+        "source_locations": {"r2": 1},
+        "operations": {"r2_gets": 4},
+    }
+
+
+def _media_projection_script() -> str:
+    """Extract the runner-side scalar projection for deterministic tests."""
+
+    workflow = (
+        WORKFLOW_ROOT / "platform-media-migration-diagnostics.yml"
+    ).read_text(encoding="utf-8")
+    start = workflow.index("      - name: Inspect production legacy media sources")
+    end = workflow.index("      - name: Remove private media diagnostic capture", start)
+    block = workflow[start:end]
+    marker = (
+        "/usr/bin/python3 - \"$public_line\" \"$precondition_line\" "
+        '\"$remote_status\" \"$remote_stderr_bytes\" '
+        '\"$TARGET_SHA\" \"$deployed_sha\" <<\'PY\'\n'
+    )
+    script = block.split(marker, 1)[1].split("\n          PY", 1)[0]
+    return textwrap.dedent(script)
+
+
+def _run_media_projection(
+    public_line: str,
+    *,
+    remote_status: str = "0",
+    remote_stderr_bytes: str = "0",
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-",
+            public_line,
+            "",
+            remote_status,
+            remote_stderr_bytes,
+            "a" * 40,
+            "a" * 40,
+        ],
+        input=_media_projection_script(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _media_summary_script() -> str:
+    """Extract the final safe step-summary renderer for adversarial tests."""
+
+    workflow = (
+        WORKFLOW_ROOT / "platform-media-migration-diagnostics.yml"
+    ).read_text(encoding="utf-8")
+    block = workflow[workflow.index("      - name: Write media inventory summary") :]
+    marker = (
+        "/usr/bin/python3 - \"$MEDIA_SUMMARY\" \"$TARGET_SHA\" "
+        ">> \"$GITHUB_STEP_SUMMARY\" <<'PY'\n"
+    )
+    script = block.split(marker, 1)[1].split("\n          PY", 1)[0]
+    return textwrap.dedent(script)
 
 
 class RemoteWorkflowGuardContractTests(unittest.TestCase):
@@ -258,6 +341,239 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
                 link.unlink()
             if target.is_dir() and not target.is_symlink():
                 target.rmdir()
+
+    def test_media_remote_exit_and_stderr_bytes_are_actual_values(self) -> None:
+        report = platform_media_migration_diagnostics_summary.public_summary(
+            payload=_media_report_payload(),
+            producer_exit_code=1,
+            stderr_bytes=17,
+            remote_exit_code=1,
+            remote_stderr_bytes=23,
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["producer_exit_code"], 1)
+        self.assertEqual(report["stderr_bytes"], 17)
+        self.assertEqual(report["remote_exit_code"], 1)
+        self.assertEqual(report["remote_stderr_bytes"], 23)
+        self.assertFalse(report["mutated"])
+        self.assertEqual(report["inventory_before_legacy_upload_references"], 2)
+        self.assertNotIn('"remote_exit_code":255', json.dumps(report))
+
+    def test_media_transport_exit_255_is_distinct_from_precondition(self) -> None:
+        report = platform_media_migration_diagnostics_summary.public_summary(
+            payload=None,
+            producer_exit_code=None,
+            stderr_bytes=None,
+            remote_exit_code=255,
+            remote_stderr_bytes=31,
+            precondition_error_class="remote_precondition",
+            parse_ok=False,
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["error_class"], "remote_or_transport")
+        self.assertIsNone(report["producer_exit_code"])
+        self.assertIsNone(report["stderr_bytes"])
+        self.assertEqual(report["remote_exit_code"], 255)
+        self.assertEqual(report["remote_stderr_bytes"], 31)
+
+    def test_media_remote_precondition_exit_is_explicit(self) -> None:
+        report = platform_media_migration_diagnostics_summary.public_summary(
+            payload=None,
+            producer_exit_code=None,
+            stderr_bytes=None,
+            remote_exit_code=1,
+            remote_stderr_bytes=7,
+            precondition_error_class="remote_precondition",
+            parse_ok=False,
+        )
+
+        self.assertEqual(report["error_class"], "remote_precondition")
+        self.assertEqual(report["remote_exit_code"], 1)
+        self.assertEqual(report["remote_stderr_bytes"], 7)
+        self.assertIsNone(report["producer_exit_code"])
+        self.assertIsNone(report["stderr_bytes"])
+
+    def test_media_projection_rejects_malformed_old_schema_and_boundary_values(self) -> None:
+        valid_report = platform_media_migration_diagnostics_summary.public_summary(
+            payload=_media_report_payload(),
+            producer_exit_code=0,
+            stderr_bytes=0,
+            remote_exit_code=0,
+            remote_stderr_bytes=0,
+        )
+        valid_line = "MEDIA_INVENTORY " + json.dumps(
+            valid_report,
+            separators=(",", ":"),
+        )
+        accepted = _run_media_projection(valid_line)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(len(accepted.stdout.splitlines()), 1)
+
+        old_schema = dict(valid_report)
+        old_schema.pop("remote_exit_code")
+        old_schema.pop("remote_stderr_bytes")
+        cases: dict[str, str] = {
+            "old-schema": "MEDIA_INVENTORY " + json.dumps(old_schema),
+            "malformed": 'MEDIA_INVENTORY {"secret":"must-not-leak"',
+        }
+        for field, value in (
+            ("schema", True),
+            ("producer_exit_code", False),
+            ("stderr_bytes", None),
+            ("remote_exit_code", 256),
+            ("remote_stderr_bytes", -1),
+            ("processed_count", 1_000_001),
+            ("mutated", 1),
+            ("status", "unknown"),
+        ):
+            invalid = dict(valid_report)
+            invalid[field] = value
+            cases[f"invalid-{field}"] = "MEDIA_INVENTORY " + json.dumps(
+                invalid,
+                separators=(",", ":"),
+            )
+
+        for name, public_line in cases.items():
+            with self.subTest(case=name):
+                rejected = _run_media_projection(public_line)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertNotIn("must-not-leak", rejected.stdout)
+                self.assertEqual(len(rejected.stdout.splitlines()), 1)
+                safe_report = json.loads(rejected.stdout.split(" ", 1)[1])
+                self.assertEqual(safe_report["status"], "failed")
+                self.assertEqual(safe_report["remote_exit_code"], 0)
+                self.assertEqual(safe_report["remote_stderr_bytes"], 0)
+
+        for status, stderr_bytes in (
+            ("256", "0"),
+            ("-1", "0"),
+            ("0", "1000001"),
+            ("0", "-1"),
+        ):
+            with self.subTest(remote_status=status, remote_stderr=stderr_bytes):
+                rejected = _run_media_projection(
+                    valid_line,
+                    remote_status=status,
+                    remote_stderr_bytes=stderr_bytes,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+                safe_report = json.loads(rejected.stdout.split(" ", 1)[1])
+                self.assertEqual(safe_report["status"], "failed")
+                self.assertEqual(safe_report["error_class"], "internal")
+                self.assertIsNone(safe_report["remote_exit_code"])
+                self.assertIsNone(safe_report["remote_stderr_bytes"])
+
+        transport = _run_media_projection(
+            valid_line,
+            remote_status="255",
+            remote_stderr_bytes="31",
+        )
+        self.assertNotEqual(transport.returncode, 0)
+        transport_report = json.loads(transport.stdout.split(" ", 1)[1])
+        self.assertEqual(transport_report["status"], "failed")
+        self.assertEqual(transport_report["error_class"], "remote_or_transport")
+        self.assertEqual(transport_report["remote_exit_code"], 255)
+        self.assertEqual(transport_report["remote_stderr_bytes"], 31)
+
+    def test_media_workflow_is_manual_sha_locked_and_safe(self) -> None:
+        workflow = (
+            WORKFLOW_ROOT / "platform-media-migration-diagnostics.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("  workflow_dispatch:\n    inputs:\n      expected_sha:", workflow)
+        self.assertIn("        required: true", workflow)
+        self.assertNotIn("\n  push:", workflow)
+        self.assertNotIn("statuses: write", workflow)
+        self.assertNotIn("platform-media-inventory", workflow)
+        self.assertNotIn("/statuses/", workflow)
+        self.assertNotIn("Mark media inventory", workflow)
+        self.assertNotIn("GH_TOKEN", workflow)
+        self.assertNotIn("curl --fail-with-body", workflow)
+        self.assertIn("GITHUB_STEP_SUMMARY", workflow)
+        self.assertIn("Write media inventory summary", workflow)
+        self.assertIn("MEDIA_SUMMARY", workflow)
+        self.assertIn("Expected SHA:", workflow)
+        self.assertIn("Deployed SHA:", workflow)
+        self.assertIn("Aggregate counter", workflow)
+        self.assertIn("group: platform-production-deploy", workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn('test -n "${PROD_SSH_USER:-}"', workflow)
+        self.assertIn(
+            '[[ "$PROD_SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]]',
+            workflow,
+        )
+        self.assertNotIn('echo "$PROD_SSH_USER"', workflow)
+        self.assertNotIn('printf \'%s\\n\' "$PROD_SSH_USER"', workflow)
+
+        sha_read = workflow.index(
+            'active_sha="$(/usr/bin/python3.12 -I - "$release_json"'
+        )
+        sha_compare = workflow.index(
+            'test "$active_sha" = "$expected_sha" || precondition'
+        )
+        helper_check = workflow.index('test -f "$lock_guard"')
+        lock_call = workflow.index('/bin/bash "$lock_guard"')
+        producer_call = workflow.index('producer_exit="$?"')
+        self.assertLess(sha_read, sha_compare)
+        self.assertLess(sha_compare, helper_check)
+        self.assertLess(helper_check, lock_call)
+        self.assertLess(lock_call, producer_call)
+        self.assertIn('"source_git_commit"', workflow)
+        self.assertIn("remote_precondition", workflow)
+        self.assertIn(
+            'test -f "$producer_tool" && test ! -L "$producer_tool" && test -x "$producer_tool" || precondition',
+            workflow,
+        )
+        self.assertIn(
+            'test -f "$summary_tool" && test ! -L "$summary_tool" || precondition',
+            workflow,
+        )
+        self.assertIn('remote_status="$?"', workflow)
+        self.assertIn('remote_stderr_bytes="$(wc -c <"$remote_error"', workflow)
+        self.assertIn('"remote_exit_code"', workflow)
+        self.assertIn('"remote_stderr_bytes"', workflow)
+        self.assertIn(
+            'rm -f -- "$private_report" "$private_error" "$projector_error"',
+            workflow,
+        )
+        self.assertIn('rm -f -- "$public_report"', workflow)
+        self.assertIn('if: ${{ always() }}', workflow)
+        self.assertIn('"mutated"', workflow)
+        self.assertIn('"inventory_before_legacy_upload_references"', workflow)
+        self.assertNotIn('"producer_exit_code":255', workflow)
+        self.assertNotIn('"producer_exit_code":0,"stderr_bytes":0', workflow)
+
+        hostile_summary = json.dumps(
+            {
+                "expected_sha": "a" * 40,
+                "deployed_sha": "b" * 40,
+                "status": "passed",
+                "error_class": "none",
+                "producer_exit_code": None,
+                "stderr_bytes": None,
+                "remote_exit_code": None,
+                "remote_stderr_bytes": None,
+                "failed_count": 10**40,
+                "raw_stderr": "secret-stderr",
+                "ssh_user": "operator",
+                "ssh_host": "production.example.test",
+            },
+            separators=(",", ":"),
+        )
+        rendered = subprocess.run(
+            [sys.executable, "-", hostile_summary, "a" * 40],
+            input=_media_summary_script(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("Status: **failed**", rendered.stdout)
+        self.assertIn("Error class: `internal`", rendered.stdout)
+        self.assertNotIn("secret-stderr", rendered.stdout)
+        self.assertNotIn("operator", rendered.stdout)
+        self.assertNotIn("production.example.test", rendered.stdout)
 
 
 if __name__ == "__main__":

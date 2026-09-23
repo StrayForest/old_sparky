@@ -2,16 +2,19 @@ name: Platform media migration diagnostics
 
 on:
   workflow_dispatch:
-  push:
-    branches: [dev]
-    paths:
-      - ".github/workflows/platform-media-migration-diagnostics.yml"
+    inputs:
+      expected_sha:
+        description: "Exact lowercase source SHA currently deployed on the production VPS"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+# The diagnostic is read-only, but it must not race a release transaction or
+# another production operation that uses the canonical release lock.
 concurrency:
-  group: platform-media-migration-diagnostics
+  group: platform-production-deploy
   cancel-in-progress: false
 
 jobs:
@@ -19,38 +22,45 @@ jobs:
     name: Production legacy media inventory
     permissions:
       contents: read
-      statuses: write
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: production
     env:
-      TARGET_SHA: ${{ github.sha }}
+      TARGET_SHA: ${{ inputs.expected_sha }}
 
     steps:
-      - name: Mark media inventory pending
+      - name: Validate diagnostic inputs
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"pending\",\"context\":\"platform-media-inventory\",\"description\":\"Production legacy media inventory is running\",\"target_url\":\"${run_url}\"}"
+          test "$GITHUB_REF" = "refs/heads/dev" \
+            || { echo "Media diagnostics must run from dev." >&2; exit 1; }
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "expected_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
 
-      - name: Configure SSH
+      - name: Validate production SSH inputs
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
+          [[ "$PROD_SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]] \
+            || { echo "PROD_SSH_USER has an unsafe format." >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
+
+      - name: Configure pinned production SSH
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
-          test -n "${PROD_SSH_HOST:-}"
-          test -n "${PROD_SSH_KEY:-}"
+          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
+          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
           ssh_dir="$RUNNER_TEMP/platform-media-migration-diagnostics-ssh"
           test "$ssh_dir" = "$RUNNER_TEMP/platform-media-migration-diagnostics-ssh"
           if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
@@ -60,16 +70,19 @@ jobs:
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
           ssh_scan="$ssh_dir/known_hosts.scan"
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
-          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
-          ssh_key_count="$(wc -l < "$ssh_scan" | tr -d ' ')"
-          test "$ssh_key_count" = "1" || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
+          if ! ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null; then
+            echo "Production SSH host key scan failed." >&2
+            exit 1
+          fi
+          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key." >&2; exit 1; }
+          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
+            || { echo "Expected exactly one production ED25519 host key." >&2; exit 1; }
           ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
           test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" || {
-            echo "Production SSH host fingerprint mismatch" >&2
+            echo "Production SSH host fingerprint mismatch." >&2
             exit 1
           }
-          install -m 0600 "$ssh_scan" "$ssh_dir/known_hosts"
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
           {
             printf '%s\n' 'Host *'
             printf '%s\n' '  StrictHostKeyChecking yes'
@@ -80,6 +93,7 @@ jobs:
           printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Inspect production legacy media sources
+        id: inspect_media
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
@@ -106,6 +120,7 @@ jobs:
             test ! -e "$remote_log" && test ! -e "$remote_error"
           }
           trap cleanup_media_capture EXIT
+
           set +e
           ssh \
             -o BatchMode=yes \
@@ -114,90 +129,393 @@ jobs:
             -F "$SSH_DIR/config" \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            'bash -s' >"$remote_log" 2>"$remote_error" <<'REMOTE'
+            bash -s -- "$TARGET_SHA" >"$remote_log" 2>"$remote_error" <<'REMOTE'
+          set -Eeuo pipefail
+
+          expected_sha="$1"
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          shared="$runtime/shared"
+          release_json="$current/RELEASE.json"
+          lock_guard="$current/tools/platform_release_lock_exec.sh"
+          producer_tool="$current/tools/platform_migrate_legacy_r2.py"
+          summary_tool="$current/tools/platform_media_migration_diagnostics_summary.py"
+          python_bin="$shared/venv/bin/python"
+          env_file="$shared/env/api.env"
+
+          precondition() {
+            printf '%s\n' 'MEDIA_PRECONDITION error_class=remote_precondition'
+            printf '%s\n' 'media diagnostic precondition failed' >&2
+            exit 1
+          }
+
+          [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || precondition
+          test -L "$current" && test -d "$current" || precondition
+          test -f "$release_json" && test ! -L "$release_json" || precondition
+          active_sha="$(/usr/bin/python3.12 -I - "$release_json" 2>/dev/null <<'PY'
+          import json
+          import re
+          import sys
+
+          value = json.load(open(sys.argv[1], encoding="utf-8")).get("source_git_commit")
+          if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40,64}", value) is None:
+              raise SystemExit(1)
+          print(value)
+          PY
+          )" || precondition
+          test "$active_sha" = "$expected_sha" || precondition
+          printf 'MEDIA_RELEASE source_git_commit=%s\n' "$active_sha"
+
+          # Check every installed helper after the immutable release identity
+          # is proven, so a stale or partial release cannot run a producer.
+          test -d "$shared" && test ! -L "$shared" || precondition
+          test -x "$python_bin" || precondition
+          test -f "$env_file" && test ! -L "$env_file" || precondition
+          test -f "$lock_guard" && test ! -L "$lock_guard" && test -x "$lock_guard" || precondition
+          test -f "$producer_tool" && test ! -L "$producer_tool" && test -x "$producer_tool" || precondition
+          test -f "$summary_tool" && test ! -L "$summary_tool" || precondition
+
+          set +e
+          /bin/bash "$lock_guard" \
+            --app-dir "$runtime" \
+            --expected-sha "$expected_sha" \
+            -- /bin/bash -s <<'LOCKED'
           set -Eeuo pipefail
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
-          python_bin="$runtime/shared/venv/bin/python"
-          env_file="$runtime/shared/env/api.env"
+          shared="$runtime/shared"
+          python_bin="$shared/venv/bin/python"
+          env_file="$shared/env/api.env"
+          producer_tool="$current/tools/platform_migrate_legacy_r2.py"
           summary_tool="$current/tools/platform_media_migration_diagnostics_summary.py"
           umask 077
-          private_report="$(mktemp "$runtime/shared/.media-migration-private.XXXXXX")"
-          private_error="$(mktemp "$runtime/shared/.media-migration-private-error.XXXXXX")"
-          public_report="$(mktemp "$runtime/shared/.media-migration-public.XXXXXX")"
-          projector_error="$(mktemp "$runtime/shared/.media-migration-projector-error.XXXXXX")"
+          private_report="$(mktemp "$shared/.media-migration-private.XXXXXX")"
+          private_error="$(mktemp "$shared/.media-migration-private-error.XXXXXX")"
+          public_report="$(mktemp "$shared/.media-migration-public.XXXXXX")"
+          projector_error="$(mktemp "$shared/.media-migration-projector-error.XXXXXX")"
           chmod 600 "$private_report" "$private_error" "$public_report" "$projector_error"
           cleanup_media_files() {
-            rm -f -- "$private_report" "$private_error" "$public_report" "$projector_error"
+            rm -f -- "$private_report" "$private_error" "$projector_error"
+            rm -f -- "$public_report"
           }
           trap cleanup_media_files EXIT
-
-          test -x "$python_bin"
-          test -f "$env_file" && test ! -L "$env_file"
-          test -f "$current/tools/platform_migrate_legacy_r2.py" \
-            && test ! -L "$current/tools/platform_migrate_legacy_r2.py" \
-            && test -x "$current/tools/platform_migrate_legacy_r2.py"
-          test -f "$summary_tool" && test ! -L "$summary_tool"
           cd "$current"
 
           set +e
           PLATFORM_ENV_FILE="$env_file" \
-          PLATFORM_SHARED_DIR="$runtime/shared" \
+          PLATFORM_SHARED_DIR="$shared" \
             "$python_bin" \
-              tools/platform_migrate_legacy_r2.py \
+              "$producer_tool" \
               --env-file "$env_file" \
               --max-records 1000 \
               --json >"$private_report" 2>"$private_error"
           producer_exit="$?"
           set -e
 
-          stderr_bytes="$(wc -c <"$private_error" | tr -d '[:space:]')"
+          producer_stderr_bytes="$(wc -c <"$private_error" | tr -d '[:space:]')"
           set +e
           "$python_bin" "$summary_tool" \
             --input "$private_report" \
             --producer-exit-code "$producer_exit" \
-            --stderr-bytes "$stderr_bytes" \
+            --stderr-bytes "$producer_stderr_bytes" \
             >"$public_report" 2>"$projector_error"
           projector_exit="$?"
           set -e
 
-          public_cleanup_ok=true
-          rm -f -- "$private_report" "$private_error" "$projector_error" || public_cleanup_ok=false
-          for private_file in "$private_report" "$private_error" "$projector_error"; do
-            if [[ -e "$private_file" || -L "$private_file" ]]; then
-              public_cleanup_ok=false
+          # The first projection gives us the helper's actual exit and its
+          # private stderr size.  Re-project with those captured values so
+          # the public contract has no null transport fields before the
+          # runner enriches it with the actual SSH result.
+          if [[ "$(wc -l <"$public_report" | tr -d '[:space:]')" = "1" ]] \
+            && grep -Eq '^\{.*\}$' "$public_report"; then
+            projector_stderr_bytes="$(wc -c <"$projector_error" | tr -d '[:space:]')"
+            set +e
+            "$python_bin" "$summary_tool" \
+              --input "$private_report" \
+              --producer-exit-code "$producer_exit" \
+              --stderr-bytes "$producer_stderr_bytes" \
+              --remote-exit-code "$projector_exit" \
+              --remote-stderr-bytes "$projector_stderr_bytes" \
+              >"$public_report" 2>"$projector_error"
+            projector_exit="$?"
+            set -e
+            if [[ "$(wc -l <"$public_report" | tr -d '[:space:]')" = "1" ]] \
+              && grep -Eq '^\{.*\}$' "$public_report"; then
+              IFS= read -r public_line < "$public_report"
+              printf 'MEDIA_INVENTORY %s\n' "$public_line"
+            else
+              printf '%s\n' 'MEDIA_PRECONDITION error_class=remote_precondition'
+              projector_exit=1
             fi
-          done
-          if [[ "$public_cleanup_ok" != true ]]; then
-            exit 1
-          fi
-
-          public_pattern='^\{"schema":1,"kind":"media_migration_diagnostics","status":"(passed|failed)","error_class":"(none|cutover_required|source_conflict|manual_conflict|inventory_bound|legacy_references|mutation_detected|unexpected_exit|producer|internal|remote_or_transport)","source_class":"(none|r2|local|both|mixed|unknown)","producer_exit_code":[0-9]{1,3},"stderr_bytes":[0-9]{1,7},"mutated":(true|false),"read_only":(true|false),"inventory_before_present":(true|false),"inventory_after_present":(true|false),"inventory_clear":(true|false),"source_present":(true|false),"source_failures_present":(true|false),"inventory_before_legacy_upload_references":[0-9]{1,7},"inventory_before_packaged_asset_references":[0-9]{1,7},"inventory_before_manual_conflicts":[0-9]{1,7},"inventory_after_legacy_upload_references":[0-9]{1,7},"inventory_after_packaged_asset_references":[0-9]{1,7},"inventory_after_manual_conflicts":[0-9]{1,7},"source_result_count":[0-9]{1,7},"source_failure_count":[0-9]{1,7},"processed_count":[0-9]{1,7},"succeeded_count":[0-9]{1,7},"failed_count":[0-9]{1,7},"operation_r2_gets":[0-9]{1,7},"operation_local_reads":[0-9]{1,7},"operation_r2_head_objects":[0-9]{1,7},"operation_cdn_gets":[0-9]{1,7},"operation_list_objects":[0-9]{1,7},"operation_legacy_r2_deletes":[0-9]{1,7},"operation_local_deletes":[0-9]{1,7}\}$'
-          if grep -Eq "$public_pattern" "$public_report"; then
-            IFS= read -r public_line < "$public_report"
-            printf 'MEDIA_INVENTORY %s\n' "$public_line"
           else
-            printf '%s\n' '{"schema":1,"kind":"media_migration_diagnostics","status":"failed","error_class":"producer","source_class":"unknown","producer_exit_code":255,"stderr_bytes":0,"mutated":false,"read_only":false,"inventory_before_present":false,"inventory_after_present":false,"inventory_clear":false,"source_present":false,"source_failures_present":false,"inventory_before_legacy_upload_references":0,"inventory_before_packaged_asset_references":0,"inventory_before_manual_conflicts":0,"inventory_after_legacy_upload_references":0,"inventory_after_packaged_asset_references":0,"inventory_after_manual_conflicts":0,"source_result_count":0,"source_failure_count":0,"processed_count":0,"succeeded_count":0,"failed_count":0,"operation_r2_gets":0,"operation_local_reads":0,"operation_r2_head_objects":0,"operation_cdn_gets":0,"operation_list_objects":0,"operation_legacy_r2_deletes":0,"operation_local_deletes":0}'
+            printf '%s\n' 'MEDIA_PRECONDITION error_class=remote_precondition'
             projector_exit=1
           fi
           exit "$projector_exit"
+          LOCKED
           REMOTE
           remote_status="$?"
           set -e
-          public_pattern='^MEDIA_INVENTORY \{"schema":1,"kind":"media_migration_diagnostics","status":"(passed|failed)","error_class":"(none|cutover_required|source_conflict|manual_conflict|inventory_bound|legacy_references|mutation_detected|unexpected_exit|producer|internal|remote_or_transport)","source_class":"(none|r2|local|both|mixed|unknown)","producer_exit_code":[0-9]{1,3},"stderr_bytes":[0-9]{1,7},"mutated":(true|false),"read_only":(true|false),"inventory_before_present":(true|false),"inventory_after_present":(true|false),"inventory_clear":(true|false),"source_present":(true|false),"source_failures_present":(true|false),"inventory_before_legacy_upload_references":[0-9]{1,7},"inventory_before_packaged_asset_references":[0-9]{1,7},"inventory_before_manual_conflicts":[0-9]{1,7},"inventory_after_legacy_upload_references":[0-9]{1,7},"inventory_after_packaged_asset_references":[0-9]{1,7},"inventory_after_manual_conflicts":[0-9]{1,7},"source_result_count":[0-9]{1,7},"source_failure_count":[0-9]{1,7},"processed_count":[0-9]{1,7},"succeeded_count":[0-9]{1,7},"failed_count":[0-9]{1,7},"operation_r2_gets":[0-9]{1,7},"operation_local_reads":[0-9]{1,7},"operation_r2_head_objects":[0-9]{1,7},"operation_cdn_gets":[0-9]{1,7},"operation_list_objects":[0-9]{1,7},"operation_legacy_r2_deletes":[0-9]{1,7},"operation_local_deletes":[0-9]{1,7}\}$'
-          public_line="$(grep -E "$public_pattern" "$remote_log" | tail -n 1 || true)"
-          if [[ -n "$public_line" ]]; then
-            printf '%s\n' "$public_line"
-          else
-            printf '%s\n' 'MEDIA_INVENTORY {"schema":1,"kind":"media_migration_diagnostics","status":"failed","error_class":"remote_or_transport","source_class":"unknown","producer_exit_code":255,"stderr_bytes":0,"mutated":false,"read_only":false,"inventory_before_present":false,"inventory_after_present":false,"inventory_clear":false,"source_present":false,"source_failures_present":false,"inventory_before_legacy_upload_references":0,"inventory_before_packaged_asset_references":0,"inventory_before_manual_conflicts":0,"inventory_after_legacy_upload_references":0,"inventory_after_packaged_asset_references":0,"inventory_after_manual_conflicts":0,"source_result_count":0,"source_failure_count":0,"processed_count":0,"succeeded_count":0,"failed_count":0,"operation_r2_gets":0,"operation_local_reads":0,"operation_r2_head_objects":0,"operation_cdn_gets":0,"operation_list_objects":0,"operation_legacy_r2_deletes":0,"operation_local_deletes":0}'
-            remote_status=1
-          fi
-          if (( remote_status != 0 )); then
-            exit 1
-          fi
+
+          remote_stderr_bytes="$(wc -c <"$remote_error" | tr -d '[:space:]')"
+          [[ "$remote_status" =~ ^[0-9]+$ ]] || { echo "Remote status is unavailable." >&2; exit 1; }
+          [[ "$remote_stderr_bytes" =~ ^[0-9]+$ ]] || { echo "Remote stderr size is unavailable." >&2; exit 1; }
+
+          public_line="$(grep -E '^MEDIA_INVENTORY \{' "$remote_log" | tail -n 1 || true)"
+          precondition_line="$(grep -E '^MEDIA_PRECONDITION error_class=remote_precondition$' "$remote_log" | tail -n 1 || true)"
+          deployed_sha="$(grep -E '^MEDIA_RELEASE source_git_commit=[0-9a-f]{40,64}$' "$remote_log" | tail -n 1 | sed 's/^MEDIA_RELEASE source_git_commit=//' || true)"
+          /usr/bin/python3 - "$public_line" "$precondition_line" "$remote_status" "$remote_stderr_bytes" "$TARGET_SHA" "$deployed_sha" <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import re
+          import sys
+
+          (
+              public_line,
+              precondition_line,
+              status_raw,
+              stderr_raw,
+              expected_sha,
+              deployed_sha,
+          ) = sys.argv[1:]
+          try:
+              remote_status = int(status_raw, 10)
+              remote_stderr_bytes = int(stderr_raw, 10)
+          except (TypeError, ValueError, OverflowError):
+              remote_status = None
+              remote_stderr_bytes = None
+
+          max_count = 1_000_000
+          captured_metadata_valid = (
+              type(remote_status) is int
+              and 0 <= remote_status <= 255
+              and type(remote_stderr_bytes) is int
+              and 0 <= remote_stderr_bytes <= max_count
+          )
+          safe_remote_status = remote_status if captured_metadata_valid else None
+          safe_remote_stderr_bytes = (
+              remote_stderr_bytes if captured_metadata_valid else None
+          )
+
+          error_classes = {
+              "none",
+              "cutover_required",
+              "source_conflict",
+              "manual_conflict",
+              "inventory_bound",
+              "legacy_references",
+              "mutation_detected",
+              "unexpected_exit",
+              "producer",
+              "internal",
+              "remote_precondition",
+              "remote_or_transport",
+          }
+          source_classes = {"none", "r2", "local", "both", "mixed", "unknown"}
+          numeric_fields = {
+              "producer_exit_code",
+              "stderr_bytes",
+              "remote_exit_code",
+              "remote_stderr_bytes",
+              "inventory_before_legacy_upload_references",
+              "inventory_before_packaged_asset_references",
+              "inventory_before_manual_conflicts",
+              "inventory_after_legacy_upload_references",
+              "inventory_after_packaged_asset_references",
+              "inventory_after_manual_conflicts",
+              "source_result_count",
+              "source_failure_count",
+              "processed_count",
+              "succeeded_count",
+              "failed_count",
+              "operation_r2_gets",
+              "operation_local_reads",
+              "operation_r2_head_objects",
+              "operation_cdn_gets",
+              "operation_list_objects",
+              "operation_legacy_r2_deletes",
+              "operation_local_deletes",
+          }
+          boolean_fields = {
+              "mutated",
+              "read_only",
+              "inventory_before_present",
+              "inventory_after_present",
+              "inventory_clear",
+              "source_present",
+              "source_failures_present",
+          }
+          expected_fields = {
+              "schema",
+              "kind",
+              "status",
+              "error_class",
+              "source_class",
+              *numeric_fields,
+              *boolean_fields,
+          }
+          exit_fields = {"producer_exit_code", "remote_exit_code"}
+          byte_fields = {"stderr_bytes", "remote_stderr_bytes"}
+          summary_count_fields = tuple(
+              sorted(numeric_fields - exit_fields - byte_fields)
+          )
+
+          def safe_sha(value: object) -> str:
+              return (
+                  value
+                  if isinstance(value, str)
+                  and re.fullmatch(r"[0-9a-f]{40,64}", value)
+                  else "unavailable"
+              )
+
+          def safe_integer(value: object, maximum: int) -> int | None:
+              return value if type(value) is int and 0 <= value <= maximum else None
+
+          def summary_record(report: dict[str, object]) -> dict[str, object]:
+              status = report.get("status")
+              error_class = report.get("error_class")
+              record: dict[str, object] = {
+                  "expected_sha": safe_sha(expected_sha),
+                  "deployed_sha": safe_sha(deployed_sha),
+                  "status": (
+                      status
+                      if isinstance(status, str)
+                      and status in {"passed", "failed"}
+                      else "failed"
+                  ),
+                  "error_class": (
+                      error_class
+                      if isinstance(error_class, str)
+                      and error_class in error_classes
+                      else "internal"
+                  ),
+                  "producer_exit_code": safe_integer(
+                      report.get("producer_exit_code"), 255
+                  ),
+                  "stderr_bytes": safe_integer(
+                      report.get("stderr_bytes"), max_count
+                  ),
+                  "remote_exit_code": safe_integer(
+                      report.get("remote_exit_code"), 255
+                  ),
+                  "remote_stderr_bytes": safe_integer(
+                      report.get("remote_stderr_bytes"), max_count
+                  ),
+              }
+              record.update(
+                  {
+                      field: safe_integer(report.get(field), max_count)
+                      for field in summary_count_fields
+                  }
+              )
+              return record
+
+          def export_summary(report: dict[str, object]) -> None:
+              output_path = os.environ.get("GITHUB_OUTPUT")
+              if not output_path:
+                  return
+              try:
+                  with open(output_path, "a", encoding="utf-8") as stream:
+                      stream.write(
+                          "media_summary="
+                          + json.dumps(
+                              summary_record(report),
+                              separators=(",", ":"),
+                          )
+                          + "\n"
+                      )
+              except OSError:
+                  # The diagnostic result remains in the log; a summary
+                  # export failure must not expose private data or mask it.
+                  return
+
+          def fallback(error_class: str) -> dict[str, object]:
+              result: dict[str, object] = {
+                  "schema": 1,
+                  "kind": "media_migration_diagnostics",
+                  "status": "failed",
+                  "error_class": error_class,
+                  "source_class": "unknown",
+                  "producer_exit_code": None,
+                  "stderr_bytes": None,
+                  "remote_exit_code": safe_remote_status,
+                  "remote_stderr_bytes": safe_remote_stderr_bytes,
+              }
+              result.update({field: False for field in boolean_fields})
+              result.update({field: 0 for field in numeric_fields - {"producer_exit_code", "stderr_bytes", "remote_exit_code", "remote_stderr_bytes"}})
+              return result
+
+          payload: dict[str, object] | None = None
+          if public_line.startswith("MEDIA_INVENTORY ") and not precondition_line:
+              try:
+                  candidate = json.loads(public_line.removeprefix("MEDIA_INVENTORY "))
+              except (json.JSONDecodeError, TypeError):
+                  candidate = None
+              if isinstance(candidate, dict) and set(candidate) == expected_fields:
+                  def bounded_integer(value: object, maximum: int) -> bool:
+                      return type(value) is int and 0 <= value <= maximum
+
+                  valid = (
+                      type(candidate.get("schema")) is int
+                      and candidate.get("schema") == 1
+                      and candidate.get("kind") == "media_migration_diagnostics"
+                      and isinstance(candidate.get("status"), str)
+                      and candidate.get("status") in {"passed", "failed"}
+                      and isinstance(candidate.get("error_class"), str)
+                      and candidate.get("error_class") in error_classes
+                      and isinstance(candidate.get("source_class"), str)
+                      and candidate.get("source_class") in source_classes
+                      and all(
+                          bounded_integer(
+                              candidate[field],
+                              255 if field in exit_fields else max_count,
+                          )
+                          for field in numeric_fields
+                      )
+                      and all(isinstance(candidate[field], bool) for field in boolean_fields)
+                  )
+                  if valid:
+                      payload = candidate
+
+          projection_failed = not captured_metadata_valid or payload is None
+          if payload is None:
+              error_class = "remote_precondition" if precondition_line else "internal"
+              payload = fallback(error_class)
+
+          # The runner owns these two values: they include the actual SSH
+          # result, including transport exit 255, and all remote stderr bytes.
+          payload["remote_exit_code"] = safe_remote_status
+          payload["remote_stderr_bytes"] = safe_remote_stderr_bytes
+          if not captured_metadata_valid:
+              # A missing, malformed, negative, or over-bound capture cannot
+              # establish transport identity.  Never leave a passed producer
+              # report with null remote evidence; fail closed as internal.
+              payload["status"] = "failed"
+              payload["error_class"] = "internal"
+              projection_failed = True
+          elif remote_status == 255:
+              payload["status"] = "failed"
+              payload["error_class"] = "remote_or_transport"
+              projection_failed = True
+          elif (
+              captured_metadata_valid
+              and remote_status != 0
+              and payload["status"] == "passed"
+          ):
+              payload["status"] = "failed"
+              payload["error_class"] = "producer"
+              projection_failed = True
+          elif payload.get("status") != "passed":
+              projection_failed = True
+          export_summary(payload)
+          print("MEDIA_INVENTORY " + json.dumps(payload, separators=(",", ":")))
+          if projection_failed:
+              raise SystemExit(1)
+          PY
 
       - name: Remove private media diagnostic capture
-        id: cleanup_media_capture
         if: ${{ always() }}
         shell: bash
         run: |
@@ -225,7 +543,6 @@ jobs:
           test -z "${MEDIA_CAPTURE_DIR:-}" && test -z "${MEDIA_REMOTE_LOG:-}" && test -z "${MEDIA_REMOTE_ERROR:-}"
 
       - name: Remove production SSH material
-        id: cleanup_ssh
         if: ${{ always() }}
         shell: bash
         run: |
@@ -256,34 +573,139 @@ jobs:
           unset SSH_DIR
           test -z "${SSH_DIR:-}"
 
-      - name: Mark media inventory successful
-        if: ${{ success() }}
+      - name: Write media inventory summary
+        if: ${{ always() }}
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          MEDIA_SUMMARY: ${{ steps.inspect_media.outputs.media_summary }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"success\",\"context\":\"platform-media-inventory\",\"description\":\"Production legacy media inventory collected\",\"target_url\":\"${run_url}\"}"
+          /usr/bin/python3 - "$MEDIA_SUMMARY" "$TARGET_SHA" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          from __future__ import annotations
 
-      - name: Mark media inventory failed
-        if: ${{ failure() }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"failure\",\"context\":\"platform-media-inventory\",\"description\":\"Production legacy media inventory failed\",\"target_url\":\"${run_url}\"}"
+          import json
+          import re
+          import sys
+
+          raw_report, expected_arg = sys.argv[1:]
+          max_count = 1_000_000
+          error_classes = {
+              "none",
+              "cutover_required",
+              "source_conflict",
+              "manual_conflict",
+              "inventory_bound",
+              "legacy_references",
+              "mutation_detected",
+              "unexpected_exit",
+              "producer",
+              "internal",
+              "remote_precondition",
+              "remote_or_transport",
+          }
+          count_fields = (
+              "failed_count",
+              "inventory_after_legacy_upload_references",
+              "inventory_after_manual_conflicts",
+              "inventory_after_packaged_asset_references",
+              "inventory_before_legacy_upload_references",
+              "inventory_before_manual_conflicts",
+              "inventory_before_packaged_asset_references",
+              "operation_cdn_gets",
+              "operation_legacy_r2_deletes",
+              "operation_list_objects",
+              "operation_local_deletes",
+              "operation_local_reads",
+              "operation_r2_gets",
+              "operation_r2_head_objects",
+              "processed_count",
+              "source_failure_count",
+              "source_result_count",
+              "succeeded_count",
+          )
+
+          def safe_sha(value: object) -> str:
+              return (
+                  value
+                  if isinstance(value, str)
+                  and re.fullmatch(r"[0-9a-f]{40,64}", value)
+                  else "unavailable"
+              )
+
+          def bounded(value: object, maximum: int) -> int | None:
+              return value if type(value) is int and 0 <= value <= maximum else None
+
+          try:
+              report = json.loads(raw_report) if raw_report else {}
+          except (json.JSONDecodeError, TypeError):
+              report = {}
+          if not isinstance(report, dict):
+              report = {}
+
+          valid_shape = True
+          expected_sha = safe_sha(report.get("expected_sha"))
+          if expected_sha == "unavailable":
+              expected_sha = safe_sha(expected_arg)
+          deployed_sha = safe_sha(report.get("deployed_sha"))
+          status = report.get("status")
+          error_class = report.get("error_class")
+          if not isinstance(status, str) or status not in {"passed", "failed"}:
+              valid_shape = False
+              status = "failed"
+          if not isinstance(error_class, str) or error_class not in error_classes:
+              valid_shape = False
+              error_class = "internal"
+
+          producer_exit_code = bounded(report.get("producer_exit_code"), 255)
+          stderr_bytes = bounded(report.get("stderr_bytes"), max_count)
+          remote_exit_code = bounded(report.get("remote_exit_code"), 255)
+          remote_stderr_bytes = bounded(report.get("remote_stderr_bytes"), max_count)
+          for field in (
+              "producer_exit_code",
+              "stderr_bytes",
+              "remote_exit_code",
+              "remote_stderr_bytes",
+          ):
+              if field not in report:
+                  valid_shape = False
+          counts: dict[str, int | None] = {}
+          for field in count_fields:
+              counts[field] = bounded(report.get(field), max_count)
+              if field not in report or counts[field] is None:
+                  valid_shape = False
+
+          # A passed report must carry every captured process/transport value;
+          # null metadata is only meaningful on a failed precondition report.
+          if status == "passed" and any(
+              value is None
+              for value in (
+                  producer_exit_code,
+                  stderr_bytes,
+                  remote_exit_code,
+                  remote_stderr_bytes,
+              )
+          ):
+              valid_shape = False
+          if not valid_shape:
+              status = "failed"
+              error_class = "internal"
+
+          def display(value: object) -> str:
+              return "unavailable" if value is None else str(value)
+
+          print("### Platform media migration diagnostics")
+          print()
+          print(f"- Expected SHA: `{expected_sha}`")
+          print(f"- Deployed SHA: `{deployed_sha}`")
+          print(f"- Status: **{status}**")
+          print(f"- Error class: `{error_class}`")
+          print(f"- Producer exit code: `{display(producer_exit_code)}`")
+          print(f"- Producer stderr bytes: `{display(stderr_bytes)}`")
+          print(f"- Remote exit code: `{display(remote_exit_code)}`")
+          print(f"- Remote stderr bytes: `{display(remote_stderr_bytes)}`")
+          print()
+          print("| Aggregate counter | Value |")
+          print("| --- | ---: |")
+          for field in count_fields:
+              print(f"| `{field}` | {display(counts[field])} |")
+          PY

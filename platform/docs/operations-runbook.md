@@ -164,6 +164,17 @@ requests. The historical URL fields are not runtime fallbacks; any physical
 deletion requires a completed data/consumer inventory, a reviewed migration,
 and explicit approval.
 
+The retained legacy-media inventory is manual-only. Dispatch from `dev` with
+the required lowercase 40-hex `expected_sha` for the exact deployed release:
+
+```bash
+gh workflow run platform-media-migration-diagnostics.yml --repo StrayForest/old_sparky --ref dev -f expected_sha=<exact-source-sha-currently-deployed>
+```
+
+It verifies `RELEASE.json` before helpers/producer, then enters the shared
+release lock; output has bounded counters and actual remote exit/stderr-byte counts.
+Exit `255` is transport; keep the inventory active while legacy data remains.
+
 ## Request-driven tournament updates
 
 Ready Check and the bracket grid are request-driven. The tournament page

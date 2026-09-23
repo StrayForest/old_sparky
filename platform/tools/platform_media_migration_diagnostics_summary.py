@@ -34,6 +34,7 @@ ERROR_CLASSES = frozenset(
         "unexpected_exit",
         "producer",
         "internal",
+        "remote_precondition",
         "remote_or_transport",
     }
 )
@@ -48,6 +49,8 @@ KNOWN_OPERATION_FIELDS = (
     "legacy_r2_deletes",
     "local_deletes",
 )
+
+
 def _bounded_count(value: object) -> int:
     """Convert a producer count to a non-negative, bounded integer."""
 
@@ -80,12 +83,40 @@ def _is_bounded_count(value: object) -> bool:
     return False
 
 
-def _safe_process_exit(value: object) -> tuple[int, bool]:
-    """Return a bounded status byte and whether the input was a real status."""
+def _safe_process_exit(
+    value: object,
+    *,
+    invalid_value: int | None = 255,
+) -> tuple[int | None, bool]:
+    """Return a bounded status byte and whether the input was a real status.
 
+    ``None`` means that the process was not started.  It is intentionally
+    distinct from a captured process status; callers must never turn a
+    missing producer or transport result into a made-up ``0`` or ``255``.
+    Invalid non-null values retain the historical closed ``255`` value for
+    the producer field.  Remote callers use ``invalid_value=None`` so an
+    invalid transport input cannot be mistaken for real exit ``255``.
+    """
+
+    if value is None:
+        return None, False
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255:
-        return 255, False
+        return invalid_value, False
     return value, True
+
+
+def _optional_bounded_count(value: object) -> int | None:
+    """Bound a captured byte/count value while preserving an absent value."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if not _is_bounded_count(value) and not (
+        isinstance(value, int) and value >= 0
+    ):
+        return None
+    return _bounded_count(value)
 
 
 def _mapping(value: object) -> Mapping[str, object]:
@@ -197,6 +228,9 @@ def public_summary(
     payload: Mapping[str, object] | None,
     producer_exit_code: object = 0,
     stderr_bytes: object = 0,
+    remote_exit_code: object = None,
+    remote_stderr_bytes: object = None,
+    precondition_error_class: object = None,
     parse_ok: bool = True,
 ) -> dict[str, object]:
     """Return the sole public contract for media migration diagnostics.
@@ -210,7 +244,12 @@ def public_summary(
     # An exit status is useful for an operator, but it is not allowed to grow
     # beyond a normal process status byte in public evidence.
     exit_code, valid_exit_code = _safe_process_exit(producer_exit_code)
-    error_bytes = _bounded_count(stderr_bytes)
+    error_bytes = _optional_bounded_count(stderr_bytes)
+    transport_exit_code, valid_transport_exit = _safe_process_exit(
+        remote_exit_code,
+        invalid_value=None,
+    )
+    transport_error_bytes = _optional_bounded_count(remote_stderr_bytes)
 
     before = _mapping(data.get("inventory_before"))
     after = _mapping(data.get("inventory_after"))
@@ -232,15 +271,43 @@ def public_summary(
     after_present = isinstance(data.get("inventory_after"), Mapping)
     mutated = data.get("mutated") is True
     source_class = _source_class(data) if parse_ok else "unknown"
+    producer_capture_ok = stderr_bytes is not None and error_bytes is not None
+    remote_capture_ok = (
+        remote_exit_code is None
+        and remote_stderr_bytes is None
+    ) or (
+        remote_exit_code is not None
+        and remote_stderr_bytes is not None
+        and transport_error_bytes is not None
+    )
+    remote_process_ok = remote_capture_ok and (
+        remote_exit_code is None
+        or (valid_transport_exit and transport_exit_code == 0)
+    )
     valid_process = (
         parse_ok
         and isinstance(payload, Mapping)
         and valid_exit_code
+        and exit_code is not None
         and exit_code in {0, 2}
         and _report_shape_is_safe(data)
         and not mutated
+        and producer_capture_ok
+        and remote_process_ok
     )
-    if not valid_exit_code:
+    safe_precondition_class = (
+        precondition_error_class
+        if isinstance(precondition_error_class, str)
+        and precondition_error_class == "remote_precondition"
+        else None
+    )
+    if safe_precondition_class is not None:
+        valid_process = False
+    if transport_exit_code == 255:
+        error_class = "remote_or_transport"
+    elif safe_precondition_class is not None:
+        error_class = safe_precondition_class
+    elif not valid_exit_code:
         error_class = "unexpected_exit"
     elif parse_ok and isinstance(payload, Mapping):
         error_class = _error_class(data, producer_exit_code=exit_code)
@@ -248,6 +315,16 @@ def public_summary(
         error_class = "producer"
     if not valid_process and error_class == "none":
         error_class = "producer"
+    if remote_exit_code is not None and not valid_transport_exit:
+        error_class = "internal"
+    elif remote_stderr_bytes is not None and transport_error_bytes is None:
+        error_class = "internal"
+    if transport_exit_code not in (None, 0, 255) and safe_precondition_class is None:
+        # A non-zero remote status is a producer/summary failure when the
+        # closed report exists.  Missing reports are classified by the
+        # workflow as ``remote_precondition`` before this function is called.
+        if error_class == "none":
+            error_class = "producer"
 
     # A check report is only considered read-only when the producer explicitly
     # reported check mode and an exact boolean false for mutation.
@@ -268,6 +345,8 @@ def public_summary(
         "source_class": source_class,
         "producer_exit_code": exit_code,
         "stderr_bytes": error_bytes,
+        "remote_exit_code": transport_exit_code,
+        "remote_stderr_bytes": transport_error_bytes,
         "mutated": mutated,
         "read_only": read_only,
         "inventory_before_present": before_present,
@@ -320,6 +399,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--producer-exit-code", type=int, default=0)
     parser.add_argument("--stderr-bytes", type=int, default=0)
+    parser.add_argument("--remote-exit-code", type=int)
+    parser.add_argument("--remote-stderr-bytes", type=int)
+    parser.add_argument(
+        "--precondition-error-class",
+        choices=("remote_precondition",),
+    )
     return parser.parse_args(argv)
 
 
@@ -332,6 +417,9 @@ def main(argv: list[str] | None = None) -> int:
             payload=None,
             producer_exit_code=args.producer_exit_code,
             stderr_bytes=args.stderr_bytes,
+            remote_exit_code=args.remote_exit_code,
+            remote_stderr_bytes=args.remote_stderr_bytes,
+            precondition_error_class=args.precondition_error_class,
             parse_ok=False,
         )
         print(json.dumps(report, separators=(",", ":")))
@@ -341,6 +429,9 @@ def main(argv: list[str] | None = None) -> int:
         payload=payload,
         producer_exit_code=args.producer_exit_code,
         stderr_bytes=args.stderr_bytes,
+        remote_exit_code=args.remote_exit_code,
+        remote_stderr_bytes=args.remote_stderr_bytes,
+        precondition_error_class=args.precondition_error_class,
     )
     print(json.dumps(report, separators=(",", ":")))
     return 0 if report["status"] == "passed" else 1

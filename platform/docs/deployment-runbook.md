@@ -41,8 +41,10 @@ to `dev`. The chain is:
    checked by the shared dependency-free
    [`platform_workflow_provenance.py`](../tools/platform_workflow_provenance.py)
    validator, including the exact repository/workflow/run attempt, SHA, event,
-   branch, conclusion, trusted actor, description and attempt URL. It also
-   requires `platform-security-build=success` and skips a SHA that already
+   branch, conclusion, trusted actor, description and attempt URL. The gate
+   reads GitHub's paginated [list commit statuses endpoint](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference)
+   (`/commits/{sha}/statuses`), retaining each raw row and its full `creator`
+   object. It then requires `platform-security-build=success` and skips a SHA that already
    reports `platform-production-deploy=success` only when the matching
    successful deploy attempt has its exact bot-authored marker.
 4. When those checks pass, the auto-deploy workflow dispatches
