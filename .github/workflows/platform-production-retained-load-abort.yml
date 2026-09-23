@@ -30,9 +30,6 @@ jobs:
     timeout-minutes: 10
     environment: production
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       LOAD_RUN_ID: ${{ inputs.load_run_id }}
       TARGET_SHA: ${{ inputs.target_sha }}
@@ -46,16 +43,16 @@ jobs:
             || { echo "Production abort must run from the reviewed dev branch." >&2; exit 1; }
           test "$QA_CONFIRMATION" = "ABORT-PRODUCTION-RETAINED-LOAD" \
             || { echo "Refusing abort without exact confirmation." >&2; exit 1; }
-          [[ "$LOAD_RUN_ID" =~ ^[0-9]+$ ]] \
-            || { echo "load_run_id must be numeric." >&2; exit 1; }
+          [[ "$LOAD_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] \
+            || { echo "load_run_id must be a positive decimal identifier." >&2; exit 1; }
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] \
             || { echo "target_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
-          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
-          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
-          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
 
       - name: Configure production SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/production-retained-abort-ssh"
@@ -85,11 +82,18 @@ jobs:
 
       - name: Abort the exact production load process tree
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
           artifact_dir="$RUNNER_TEMP/production-retained-abort-artifacts"
           install -d -m 700 "$artifact_dir"
-          ssh_output_file="$artifact_dir/abort.log"
+          ssh_output_file="$artifact_dir/abort-raw.log"
+          canonical_log="$artifact_dir/canonical.log"
+          umask 077
+          : > "$ssh_output_file"
+          chmod 600 "$ssh_output_file"
           set +e
           ssh \
             -F "$SSH_DIR/config" \
@@ -105,8 +109,6 @@ jobs:
             > "$ssh_output_file" 2>&1
           remote_status=$?
           set -e
-          cat "$ssh_output_file"
-
           export_dir="$(sed -n 's/^ABORT_EVIDENCE_EXPORT=//p' "$ssh_output_file" | tail -n 1)"
           if [[ -n "$export_dir" ]]; then
             [[ "$export_dir" =~ ^/tmp/old-sparky-production-retained-abort-[0-9]+$ ]] || {
@@ -126,26 +128,176 @@ jobs:
               fi
             }
             copy_if_present abort-process-tree.txt
-            copy_if_present matrix.log
-            copy_if_present qa-command.log
-            copy_if_present server-observability.log
+            copy_if_present canonical.log
+            copy_if_present server-observability.json
             copy_if_present matrix-summary.json
           fi
+          echo "remote_status=$remote_status" >> "$GITHUB_OUTPUT"
           exit "$remote_status"
 
-      - name: Publish abort evidence
+      - name: Remove production SSH material
+        id: cleanup_ssh
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-retained-abort-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
+
+      - name: Normalize abort evidence
+        id: normalize_abort_evidence
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/production-retained-abort-artifacts"
+          install -d -m 700 "$artifact_dir"
+          raw_log="$artifact_dir/abort-raw.log"
+          # The secret-bearing job has no checkout.  Project the already
+          # bounded remote evidence with this closed, dependency-free schema;
+          # never execute a candidate sanitizer beside the SSH key.
+          trap 'rm -f -- "$raw_log"' EXIT
+          if [[ -s "$raw_log" ]]; then
+            /usr/bin/python3 - "$raw_log" "$artifact_dir/canonical.log" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          source, destination = (Path(value) for value in sys.argv[1:])
+          allowed_status = {"passed", "failed", "unavailable", "unknown"}
+          fallback = {
+              "schema": 1,
+              "status": "unavailable",
+              "line_count": 0,
+              "retained_line_count": 0,
+              "truncated": False,
+              "class_counts": {"other": 1},
+              "route_class_counts": {"other": 1},
+              "status_counts": {},
+          }
+          try:
+              raw = source.read_bytes()
+              payload = json.loads(raw.decode("utf-8"))
+              if not isinstance(payload, dict):
+                  raise ValueError
+              status = payload.get("status")
+              if status not in allowed_status:
+                  raise ValueError
+              result = {
+                  "schema": 1,
+                  "status": status,
+                  "line_count": min(max(int(payload.get("line_count", 0)), 0), 100000),
+                  "retained_line_count": min(max(int(payload.get("retained_line_count", 0)), 0), 100000),
+                  "truncated": payload.get("truncated") is True,
+                  "class_counts": {"other": 1},
+                  "route_class_counts": {"other": 1},
+                  "status_counts": {},
+              }
+          except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+              result = fallback
+          destination.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          fi
+          if [[ ! -s "$artifact_dir/canonical.log" ]]; then
+            printf '%s\n' '{"schema":1,"status":"unavailable","line_count":0,"retained_line_count":0,"truncated":false,"class_counts":{"other":1},"route_class_counts":{"other":1},"status_counts":{}}' > "$artifact_dir/canonical.log"
+          fi
+          if [[ ! -s "$artifact_dir/abort-process-tree.txt" ]]; then
+            printf '%s\n' '{"schema":1,"process_count":0,"snapshot_available":false}' > "$artifact_dir/abort-process-tree.txt"
+          fi
+          if [[ ! -s "$artifact_dir/matrix-summary.json" ]]; then
+            printf '%s\n' '{"schema":1,"passed":false,"control_account_preserved":false,"rows":[]}' > "$artifact_dir/matrix-summary.json"
+          fi
+          if [[ ! -s "$artifact_dir/server-observability.json" ]]; then
+            printf '%s\n' '{"schema":1,"available":false,"error_class":"observer_unavailable","binding":{"complete":false}}' > "$artifact_dir/server-observability.json"
+          fi
+          observer_source="$artifact_dir/server-observability.json"
+          observer_public="$artifact_dir/.server-observability.public.json"
+          /usr/bin/python3 - "$observer_source" "$observer_public" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          source, destination = (Path(value) for value in sys.argv[1:])
+          try:
+              payload = json.loads(source.read_text(encoding="utf-8"))
+              if not isinstance(payload, dict):
+                  raise ValueError
+              binding = payload.get("binding")
+              if not isinstance(binding, dict):
+                  binding = {}
+              result = {
+                  "schema": 1,
+                  "available": payload.get("available") is True,
+                  "error_class": "none" if payload.get("available") is True else "observer_unavailable",
+                  "binding": {"complete": binding.get("complete") is True},
+              }
+          except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+              result = {
+                  "schema": 1,
+                  "available": False,
+                  "error_class": "observer_invalid",
+                  "binding": {"complete": False},
+              }
+          destination.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          chmod 600 "$observer_public"
+          rm -f -- "$observer_source"
+          mv -- "$observer_public" "$observer_source"
+          test ! -e "$observer_public"
+          rm -f -- "$artifact_dir/abort-raw.log" "$artifact_dir/abort.log"
+          test ! -e "$artifact_dir/abort-raw.log"
+          test ! -e "$artifact_dir/abort.log"
+
+          /usr/bin/python3 - "$artifact_dir/canonical.log" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          try:
+              payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit("required abort log evidence is not valid JSON")
+          if (
+              not isinstance(payload, dict)
+              or payload.get("truncated") is not False
+              or payload.get("status") in {"truncated", "error", "unavailable"}
+          ):
+              raise SystemExit("required abort log evidence is incomplete")
+          PY
+
+      - name: Publish abort evidence
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' && steps.normalize_abort_evidence.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-production-retained-abort-${{ github.run_id }}
+          name: platform-production-retained-abort-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/production-retained-abort-artifacts/abort.log
+            ${{ runner.temp }}/production-retained-abort-artifacts/canonical.log
             ${{ runner.temp }}/production-retained-abort-artifacts/abort-process-tree.txt
-            ${{ runner.temp }}/production-retained-abort-artifacts/matrix.log
-            ${{ runner.temp }}/production-retained-abort-artifacts/qa-command.log
-            ${{ runner.temp }}/production-retained-abort-artifacts/server-observability.log
+            ${{ runner.temp }}/production-retained-abort-artifacts/server-observability.json
             ${{ runner.temp }}/production-retained-abort-artifacts/matrix-summary.json
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
       - name: Write abort summary
@@ -155,6 +307,6 @@ jobs:
           {
             echo "### Production retained-load abort"
             echo
-            echo "- Target load run: **$LOAD_RUN_ID**"
-            echo "- The abort helper matched only the exact retained-load supervisor tree for this run ID."
+            echo "- Target load run: **selected retained-load run (identifier withheld)**"
+            echo "- The abort helper matched only the exact retained-load supervisor tree for the selected run."
           } >> "$GITHUB_STEP_SUMMARY"

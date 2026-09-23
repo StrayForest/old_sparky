@@ -22,6 +22,52 @@ SPEC.loader.exec_module(cleanup)
 
 
 class RetainedMatrixManifestTests(unittest.TestCase):
+    def test_read_model_cleanup_is_exact_and_verifies_no_projection_remains(self) -> None:
+        class RedisStub:
+            def __init__(self, remaining: int = 0):
+                self.deleted_keys: tuple[str, ...] = ()
+                self.remaining = remaining
+
+            async def delete(self, *keys: str) -> int:
+                self.deleted_keys = tuple(keys)
+                return len(keys)
+
+            async def exists(self, *keys: str) -> int:
+                return self.remaining
+
+        tournament_id = "00000000-0000-0000-0000-000000000002"
+        tournament_ids = {tournament_id}
+        redis_stub = RedisStub()
+        with mock.patch.object(cleanup, "redis_client", return_value=redis_stub):
+            result = asyncio.run(cleanup._delete_and_verify_read_models(tournament_ids))
+
+        self.assertEqual(result["keys_expected"], 4)
+        self.assertEqual(result["keys_deleted"], 4)
+        self.assertEqual(result["keys_remaining"], 0)
+        self.assertEqual(
+            redis_stub.deleted_keys,
+            tuple(
+                cleanup.read_model_key(tournament_id, model)
+                for model in cleanup.READ_MODEL_KINDS
+            ),
+        )
+
+    def test_read_model_cleanup_fails_closed_when_a_projection_survives(self) -> None:
+        class RedisStub:
+            async def delete(self, *_keys: str) -> int:
+                return 4
+
+            async def exists(self, *_keys: str) -> int:
+                return 1
+
+        with mock.patch.object(cleanup, "redis_client", return_value=RedisStub()):
+            with self.assertRaisesRegex(RuntimeError, "Redis read-model"):
+                asyncio.run(
+                    cleanup._delete_and_verify_read_models(
+                        {"00000000-0000-0000-0000-000000000003"}
+                    )
+                )
+
     def test_write_burst_timeout_recovery_requires_marker_and_synthetic_owner(self) -> None:
         marker = "preprod260824120000abcd"
         user_id = str(uuid4())
@@ -64,7 +110,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
         summary_path.write_text(
             json.dumps(
                 {
-                    "control_email": "aleksei.lisitsin1@gmail.com",
+                    "control_email": "qa@example.invalid",
                     "completed_tournaments": 1,
                     "rows": [
                         {
@@ -90,7 +136,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
             summary_path.write_text(
                 json.dumps(
                     {
-                        "control_email": "aleksei.lisitsin1@gmail.com",
+                        "control_email": "qa@example.invalid",
                         "completed_tournaments": 1,
                         "rows": [
                             {
@@ -110,7 +156,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
                 cleanup.load_matrix_manifest(
                     summary_path,
                     run_root=root,
-                    expected_control_email="aleksei.lisitsin1@gmail.com",
+                    expected_control_email="qa@example.invalid",
                 )
 
     @unittest.skipUnless(os.geteuid() == 0, "permission repair requires the root test user")
@@ -126,7 +172,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
             manifest = cleanup.load_matrix_manifest(
                 summary_path,
                 run_root=root,
-                expected_control_email="aleksei.lisitsin1@gmail.com",
+                expected_control_email="qa@example.invalid",
                 repair_permissions=True,
             )
 
@@ -150,7 +196,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
                 manifest = cleanup.load_matrix_manifest(
                     summary_path,
                     run_root=root,
-                    expected_control_email="aleksei.lisitsin1@gmail.com",
+                    expected_control_email="qa@example.invalid",
                 )
             self.assertEqual(len(manifest["markers"]), 1)
             self.assertEqual(len(manifest["user_ids"]), 1)
@@ -183,7 +229,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
                 json.dumps(
                     {
                         "mode": "read-mix",
-                        "control_email": "aleksei.lisitsin1@gmail.com",
+                        "control_email": "qa@example.invalid",
                         "completed_tournaments": 0,
                         "rows": [
                             {
@@ -205,7 +251,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
             manifest = cleanup.load_matrix_manifest(
                 summary_path,
                 run_root=root,
-                expected_control_email="aleksei.lisitsin1@gmail.com",
+                expected_control_email="qa@example.invalid",
             )
 
             self.assertEqual(manifest["mode"], "read-mix")
@@ -218,7 +264,7 @@ class RetainedMatrixManifestTests(unittest.TestCase):
         user_id = "00000000-0000-0000-0000-000000000001"
         manifest = {
             "markers": {marker},
-            "control_email": "control@example.com",
+            "_control_email": "control@example.com",
             "user_ids": {user_id},
             "tournament_ids": set(),
             "rows": [{"marker": marker, "report_path": report_path}],
@@ -235,7 +281,12 @@ class RetainedMatrixManifestTests(unittest.TestCase):
                 "cleanup_state": {
                     "ok": True,
                     "cleaned_by": "platform_cleanup_retained_matrix.py",
-                    "control_account_preserved": "control@example.com",
+                    "control_account_preserved": True,
+                    "read_models": {
+                        "keys_expected": 0,
+                        "keys_deleted": 0,
+                        "keys_remaining": 0,
+                    },
                 },
             },
         )()

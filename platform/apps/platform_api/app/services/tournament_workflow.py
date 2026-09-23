@@ -28,6 +28,7 @@ from apps.platform_api.app.api.schemas import (
     TournamentDeadlockReadyCheckStateResponse,
     TournamentDeadlockReadyRoundResponse,
 )
+from apps.platform_api.app.services.brackets import create_full_bracket_graph
 from apps.platform_api.app.services.player_commitments import release_active_commitments
 from apps.platform_api.app.services.player_commitments import (
     PlayerCommitmentConflict,
@@ -77,6 +78,8 @@ from python_packages.platform_infra.models import (
     TournamentParticipant,
     User,
     TournamentMatch,
+    TournamentTeam,
+    TournamentTeamMember,
     new_uuid,
 )
 from python_packages.platform_infra.performance import measure_compute_block
@@ -1779,18 +1782,24 @@ async def deadlock_locked_auto_assignment_run_for_tournament(
         )
     )
 
-async def deadlock_assignment_run_by_id_for_tournament(
+async def lock_deadlock_assignment_run_for_tournament(
     db_session: AsyncSession,
     *,
     tournament_id: str,
     run_id: str,
 ) -> TournamentDeadlockAssignmentRun | None:
+    """Lock one assignment run after its tournament aggregate is locked."""
+
     return await db_session.scalar(
-        select(TournamentDeadlockAssignmentRun).where(
+        select(TournamentDeadlockAssignmentRun)
+        .where(
             TournamentDeadlockAssignmentRun.tournament_id == tournament_id,
             TournamentDeadlockAssignmentRun.id == run_id,
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
+
 
 def deadlock_auto_assignment_stale_reason_text(reason: str) -> str:
     if reason == "captain_round_changed":
@@ -2067,6 +2076,75 @@ async def generate_deadlock_auto_assignment_run_for_tournament(
     await db_session.refresh(run_row)
     return run_row
 
+
+async def _ensure_deadlock_bracket_graph(
+    db_session: AsyncSession,
+    *,
+    tournament: Tournament,
+    run_row: TournamentDeadlockAssignmentRun,
+    actor_user_id: str | None,
+) -> bool:
+    """Seed the complete bracket once, inside the roster-lock transaction."""
+
+    existing_match_count = int(
+        await db_session.scalar(
+            select(func.count())
+            .select_from(TournamentMatch)
+            .where(TournamentMatch.tournament_id == tournament.id)
+        )
+        or 0
+    )
+    previous_revision = int(tournament.bracket_revision or 0)
+    try:
+        created_matches, opening_matches = await create_full_bracket_graph(
+            db_session,
+            tournament=tournament,
+            locked_run=run_row,
+        )
+    except IntegrityError as exc:
+        raise TournamentWorkflowError(
+            "The bracket graph could not be seeded because a match constraint failed."
+        ) from exc
+    if existing_match_count:
+        return False
+
+    if not created_matches:
+        raise TournamentWorkflowError("The bracket graph was not created for the locked roster.")
+
+    # ``create_full_bracket_graph`` advances the revision only when it creates
+    # the graph. Keep the assertion close to the handoff so a future caller
+    # cannot accidentally turn an idempotent repair into a second revision.
+    if int(tournament.bracket_revision or 0) != previous_revision + 1:
+        raise TournamentWorkflowError(
+            "The bracket graph did not advance the tournament revision exactly once."
+        )
+    await write_audit_log(
+        db_session,
+        actor_user_id=actor_user_id,
+        action="match.seed_opening_round.deadlock_lock",
+        subject_type="tournament",
+        subject_id=tournament.id,
+        payload={
+            "tournament_slug": tournament.slug,
+            "source_run_id": run_row.id,
+            "match_count": len(created_matches),
+            "opening_match_count": len(opening_matches),
+            "revision": tournament.bracket_revision,
+            "matches": [
+                {
+                    "round_number": match.round_number,
+                    "sequence_number": match.sequence_number,
+                    "home_label": match.home_label,
+                    "away_label": match.away_label,
+                    "title": match.title,
+                }
+                for match in created_matches
+            ],
+        },
+    )
+    return True
+
+
 async def finalize_deadlock_assignment_with_commitments(
     db_session: AsyncSession,
     *,
@@ -2075,23 +2153,99 @@ async def finalize_deadlock_assignment_with_commitments(
     actor_user_id: str | None,
     now: datetime,
 ) -> tuple[bool, tuple[str, ...]]:
-    # API and automation callers already take this lock, but the service is
-    # intentionally safe for worker/direct callers as well.  It must not turn
-    # a roster into commitments after a concurrent terminal state transition.
+    # Canonical handoff lock order is Tournament -> assignment run -> source
+    # captain round -> ready users -> captain entries -> current teams ->
+    # bracket matches. API and automation callers already take the first lock,
+    # but the service is intentionally safe for worker/direct callers as well.
+    # It must not turn a roster into commitments after a concurrent terminal
+    # state transition.
     tournament = await lock_tournament_for_workflow(db_session, tournament.id)
-    locked_run = await db_session.scalar(
-        select(TournamentDeadlockAssignmentRun)
-        .where(
-            TournamentDeadlockAssignmentRun.id == run_row.id,
-            TournamentDeadlockAssignmentRun.tournament_id == tournament.id,
-        )
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    locked_run = await lock_deadlock_assignment_run_for_tournament(
+        db_session,
+        tournament_id=tournament.id,
+        run_id=run_row.id,
     )
     if locked_run is None:
         raise TournamentWorkflowError("The assignment run no longer exists.")
     run_row = locked_run
     if run_row.status == "locked":
+        # A locked run from before the atomic handoff may have materialized
+        # teams/commitments but no bracket graph yet. Repeating the organizer's
+        # lock is the explicit, narrowly-scoped recovery path for that legacy
+        # state. A graph that already exists is a strict no-op.
+        existing_team_count = int(
+            await db_session.scalar(
+                select(func.count())
+                .select_from(TournamentTeam)
+                .where(TournamentTeam.tournament_id == tournament.id)
+            )
+            or 0
+        )
+        if existing_team_count == 0:
+            await materialize_assignment_run_teams(
+                db_session,
+                tournament=tournament,
+                run_row=run_row,
+                now=now,
+            )
+        else:
+            # Recovery reads the already-normalized roster without replacing
+            # it. Keep the same team-row lock boundary as materialization so
+            # the member snapshot cannot change between commitments and graph
+            # repair, even for an older run that predates this handoff path.
+            locked_team_ids = await db_session.scalars(
+                select(TournamentTeam.id)
+                .where(TournamentTeam.tournament_id == tournament.id)
+                .order_by(TournamentTeam.id.asc())
+                .with_for_update()
+            )
+            locked_team_ids.all()
+
+        legacy_roster_user_ids = tuple(
+            str(user_id)
+            for user_id in (
+                await db_session.scalars(
+                    select(TournamentTeamMember.user_id)
+                    .where(TournamentTeamMember.tournament_id == tournament.id)
+                    .order_by(TournamentTeamMember.user_id.asc())
+                )
+            ).all()
+        )
+        locked_user_ids = await lock_commitment_users(
+            db_session,
+            legacy_roster_user_ids,
+        )
+        if len(locked_user_ids) != len(legacy_roster_user_ids):
+            raise TournamentWorkflowError("One or more locked roster players no longer exist.")
+
+        try:
+            # The commitment writer is itself idempotent: it keeps matching
+            # active rows and fills only missing members in a partially
+            # repaired legacy roster.
+            await create_assignment_commitments(
+                db_session,
+                run_row=run_row,
+                activated_at=now,
+            )
+        except PlayerCommitmentConflict as exc:
+            conflict_names = ", ".join(
+                f"{item.team_name} / {item.tournament_name}" for item in exc.commitments
+            )
+            raise TournamentWorkflowError(
+                "Player availability changed during roster locking. Retry the lock to rebalance. "
+                f"Conflicts: {conflict_names}"
+            ) from exc
+        except IntegrityError as exc:
+            raise TournamentWorkflowError(
+                "Player availability changed during roster locking. Retry the lock to rebalance."
+            ) from exc
+
+        await _ensure_deadlock_bracket_graph(
+            db_session,
+            tournament=tournament,
+            run_row=run_row,
+            actor_user_id=actor_user_id,
+        )
         return False, ()
     if run_row.status != "published":
         raise TournamentWorkflowError("Publish the roster before locking it.")
@@ -2198,6 +2352,12 @@ async def finalize_deadlock_assignment_with_commitments(
     run_row.published_by_user_id = run_row.published_by_user_id or actor_user_id
     run_row.locked_at = now
     run_row.locked_by_user_id = actor_user_id
+    await _ensure_deadlock_bracket_graph(
+        db_session,
+        tournament=tournament,
+        run_row=run_row,
+        actor_user_id=actor_user_id,
+    )
     await write_audit_log(
         db_session,
         actor_user_id=actor_user_id,

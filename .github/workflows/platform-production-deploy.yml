@@ -48,133 +48,220 @@ on:
         options:
           - enabled
           - disabled
+      classifier_run_id:
+        description: "Exact successful security workflow run supplying the classifier artifact"
+        required: false
+        default: ""
+        type: string
+      classifier_run_attempt:
+        description: "Exact attempt number for the classifier workflow run"
+        required: false
+        default: ""
+        type: string
 
 permissions:
-  actions: read
   contents: read
-  statuses: write
-  id-token: write
-  attestations: write
 
 concurrency:
   group: platform-production-deploy
   cancel-in-progress: false
 
 jobs:
-  production:
+  # This job may execute the candidate checkout.  It has no production
+  # environment and no deployment secret.  It is deliberately always
+  # scheduled: an invalid mode must fail here before either mode branch can
+  # become a successful skipped no-op.
+  validate-dispatch:
+    name: Validate deployment dispatch
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      DEPLOY_MODE: ${{ inputs.mode }}
+      RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
+      WEB_COMPRESSION: ${{ inputs.web_compression }}
+      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      RELEASE_SLUG: gha-${{ github.run_id }}-${{ github.run_attempt }}
+      ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Reject invalid dispatch values before mode branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$DEPLOY_MODE" in
+            preflight|deploy) ;;
+            *) echo "Unsupported deployment mode; refusing a green no-op." >&2; exit 1 ;;
+          esac
+          case "$RUNTIME_PROFILE" in
+            baseline|ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-cprofile|ready-vote-static-12|ready-vote-static-16|ready-vote-adaptive-v2|api-3x16|api-1x48|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|web-ssr-diagnostics|web-ssr-native-transport|web-ssr-workers-2|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24) ;;
+            *) echo "Unsupported runtime profile." >&2; exit 1 ;;
+          esac
+          case "$WEB_COMPRESSION" in enabled|disabled) ;; *) echo "Unsupported web compression mode." >&2; exit 1 ;; esac
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Deployment requires an exact target SHA." >&2; exit 1; }
+          [[ "$CLASSIFIER_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] || { echo "Classifier run ID is malformed." >&2; exit 1; }
+          [[ "$CLASSIFIER_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || { echo "Classifier run attempt is malformed." >&2; exit 1; }
+
+      - name: Checkout dispatch validator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate and create closed deployment handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${TARGET_SHA:0:12}"
+          release_slug="${RELEASE_SLUG:0:32}-${short_sha}"
+          # The candidate parser is used only on this secret-free runner.  All
+          # secret-bearing consumers independently validate the JSON schema.
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py deployment \
+            --output "$RUNNER_TEMP/platform-production-deploy-input.json" \
+            --mode "$DEPLOY_MODE" \
+            --runtime-profile "$RUNTIME_PROFILE" \
+            --release-slug "$release_slug" \
+            --target-sha "$TARGET_SHA" \
+            --artifact-remote-dir "$ARTIFACT_REMOTE_DIR" \
+            --classifier-run-id "$CLASSIFIER_RUN_ID" \
+            --classifier-run-attempt "$CLASSIFIER_RUN_ATTEMPT" \
+            --web-compression "$WEB_COMPRESSION"
+          test "$(stat -c '%a' "$RUNNER_TEMP/platform-production-deploy-input.json")" = 600
+
+      - name: Publish closed deployment handoff
+        if: ${{ success() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-deploy-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-production-deploy-input.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove validator handoff
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -f -- "$RUNNER_TEMP/platform-production-deploy-input.json"
+          test ! -e "$RUNNER_TEMP/platform-production-deploy-input.json"
+
+  # Candidate checkout and release construction are isolated from the
+  # environment-approved deployment jobs.  This job never receives SSH
+  # material and only publishes an immutable archive plus provenance.
+  build-release:
+    name: Build immutable release artifact in CI
+    needs: validate-dispatch
     if: >-
-      github.event_name == 'workflow_dispatch'
-    name: ${{ inputs.mode == 'deploy' && 'Deploy production' || 'Production preflight' }}
+      needs.validate-dispatch.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    environment: production
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       TARGET_SHA: ${{ github.sha }}
       DEPLOY_MODE: ${{ inputs.mode }}
       RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
       PLATFORM_WEB_NEXT_COMPRESSION: ${{ inputs.web_compression == 'disabled' && 'false' || 'true' }}
+      WEB_COMPRESSION: ${{ inputs.web_compression }}
+      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
       RELEASE_SLUG: gha-${{ github.run_id }}-${{ github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
-
+    outputs:
+      artifact_id: ${{ steps.publish-release-artifact.outputs.artifact-id }}
+      artifact_digest: ${{ steps.publish-release-artifact.outputs.artifact-digest }}
     steps:
-      - name: Require successful platform security build
-        if: ${{ env.DEPLOY_MODE == 'deploy' }}
+      - name: Download closed deployment handoff
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-deploy-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/deploy-input
+
+      - name: Revalidate deployment handoff before candidate build
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          status_json="$(
-            curl --fail-with-body --silent --show-error \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status"
-          )"
-          security_state="$(
-            printf '%s' "$status_json" | /usr/bin/python3 -c '
+          test -f "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" && test ! -L "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$TARGET_SHA" "$DEPLOY_MODE" "$RUNTIME_PROFILE" "$WEB_COMPRESSION" "$CLASSIFIER_RUN_ID" "$CLASSIFIER_RUN_ATTEMPT" <<'PY'
           import json
+          from pathlib import Path
+          import re
           import sys
 
-          payload = json.load(sys.stdin)
-          statuses = [
-              item for item in payload.get("statuses", [])
-              if item.get("context") == "platform-security-build"
-          ]
-          if not statuses:
-              raise SystemExit("platform-security-build status is missing")
-          latest = max(
-              statuses,
-              key=lambda item: item.get("updated_at")
-              or item.get("created_at")
-              or "",
-          )
-          print(latest.get("state") or "")
-          '
-          )"
-          test "$security_state" = success || {
-            echo "Refusing production deploy: platform-security-build=$security_state for $TARGET_SHA" >&2
-            exit 1
+          path, target_sha, mode, runtime_profile, web_compression, run_id, attempt = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          expected = {
+              "schema", "mode", "runtime_profile", "release_slug", "target_sha",
+              "artifact_remote_dir", "classifier_run_id", "classifier_run_attempt",
+              "web_compression",
           }
+          if set(payload) != expected:
+              raise SystemExit("deployment handoff schema is not closed")
+          if payload.get("schema") not in (1, "1"):
+              raise SystemExit("deployment handoff schema version is invalid")
+          if payload.get("mode") != mode or payload.get("mode") != "deploy":
+              raise SystemExit("deployment handoff mode is not deploy")
+          if payload.get("runtime_profile") != runtime_profile:
+              raise SystemExit("deployment handoff runtime profile mismatch")
+          if payload.get("web_compression") != web_compression:
+              raise SystemExit("deployment handoff compression mismatch")
+          if payload.get("target_sha") != target_sha or re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
+              raise SystemExit("deployment handoff exact target SHA mismatch")
+          if re.fullmatch(r"[1-9][0-9]{0,31}", str(payload.get("classifier_run_id"))) is None or payload.get("classifier_run_id") != run_id:
+              raise SystemExit("deployment handoff classifier run mismatch")
+          if re.fullmatch(r"[1-9][0-9]{0,31}", str(payload.get("classifier_run_attempt"))) is None or payload.get("classifier_run_attempt") != attempt:
+              raise SystemExit("deployment handoff classifier attempt mismatch")
+          if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", str(payload.get("release_slug"))) is None:
+              raise SystemExit("deployment handoff release slug is unsafe")
+          if re.fullmatch(r"/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}", str(payload.get("artifact_remote_dir"))) is None:
+              raise SystemExit("deployment handoff artifact path is unsafe")
+          print("closed deployment handoff accepted for exact target SHA")
+          PY
 
-      - name: Mark production deployment pending
-        if: ${{ env.DEPLOY_MODE == 'deploy' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"pending\",\"context\":\"platform-production-deploy\",\"description\":\"Production deployment is running\",\"target_url\":\"${run_url}\"}"
-
-      - name: Validate deployment secrets
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
-          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
-          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
-
-      - name: Require reviewed dev branch for deployment
-        if: ${{ env.DEPLOY_MODE == 'deploy' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REF" = "refs/heads/dev" \
-            || { echo "Production deploys must target the reviewed dev branch." >&2; exit 1; }
-
-      - name: Checkout the CI-verified source
-        if: ${{ env.DEPLOY_MODE == 'deploy' }}
-        uses: actions/checkout@v6
+      - name: Checkout reviewed deployment source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Build immutable release artifact in CI
-        if: ${{ env.DEPLOY_MODE == 'deploy' }}
+      - name: Require reviewed dev branch for deployment
         shell: bash
         run: |
           set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev" || { echo "Production deploys must target the reviewed dev branch." >&2; exit 1; }
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)"
+
+      - name: Build immutable release artifact in CI
+        shell: bash
+        run: |
+          set -euo pipefail
           ci_build_root=/root/old_sparky
           sudo rm -rf -- "$ci_build_root"
           sudo install -d -o root -g root -m 0755 "$ci_build_root"
           sudo cp -a "$GITHUB_WORKSPACE/." "$ci_build_root/"
           sudo chown -R root:root "$ci_build_root"
-          sudo -EH python3 -m venv "$ci_build_root/platform/.venv_platform"
+          sudo env -i \
+            HOME=/root \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/bin/python3 -m venv "$ci_build_root/platform/.venv_platform"
           sudo install -d -o root -g root -m 0755 "$ci_build_root/platform/dist/releases"
-          sudo -EH env \
+          sudo env -i \
+            HOME=/root \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             PLATFORM_RELEASE_OUTPUT_DIR="$ci_build_root/platform/dist/releases" \
             PLATFORM_WEB_NEXT_COMPRESSION="$PLATFORM_WEB_NEXT_COMPRESSION" \
             "$ci_build_root/platform/tools/platform_build_release.sh" "$RELEASE_SLUG"
@@ -187,15 +274,33 @@ jobs:
           install -d -m 0755 "$release_output"
           sudo install -m 0644 "$release_archive" "$release_output/$(basename "$release_archive")"
           sudo install -m 0644 "$release_checksum" "$release_output/$(basename "$release_checksum")"
-          sudo chown "$(id -u):$(id -g)" \
-            "$release_output/$(basename "$release_archive")" \
-            "$release_output/$(basename "$release_checksum")"
+          sudo chown "$(id -u):$(id -g)" "$release_output/$(basename "$release_archive")" "$release_output/$(basename "$release_checksum")"
           (cd "$release_output" && sha256sum -c "$(basename "$release_checksum")")
+          /usr/bin/python3 - "$release_output/$(basename "$release_archive")" "$TARGET_SHA" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          archive, target_sha = sys.argv[1:]
+          archive_path = Path(archive)
+          checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+          if len(target_sha) != 40 or any(character not in "0123456789abcdef" for character in target_sha):
+              raise SystemExit("exact target SHA is malformed")
+          Path(archive_path.parent / "RELEASE.provenance.json").write_text(
+              json.dumps({
+                  "schema": 1,
+                  "artifact_file": archive_path.name,
+                  "artifact_sha256": checksum,
+                  "source_git_commit": target_sha,
+              }, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
 
       - name: Publish immutable release artifact
-        if: ${{ env.DEPLOY_MODE == 'deploy' }}
         id: publish-release-artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-release/*
@@ -203,846 +308,891 @@ jobs:
           retention-days: 14
 
       - name: Attest immutable release artifact
-        if: ${{ env.DEPLOY_MODE == 'deploy' }}
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: ci-release/*.tar.gz
 
-      - name: Download published release artifact for deployment
-        if: ${{ env.DEPLOY_MODE == 'deploy' }}
-        uses: actions/download-artifact@v6
-        with:
-          name: platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci-release-published
+      - name: Remove candidate build tree
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -rf -- "$GITHUB_WORKSPACE/ci-release" "$RUNNER_TEMP/deploy-input"
 
-      - name: Verify published release artifact
-        if: ${{ env.DEPLOY_MODE == 'deploy' }}
+  validate-security-provenance:
+    name: Validate exact security provenance
+    needs:
+      - validate-dispatch
+      - build-release
+    outputs:
+      security_ready: ${{ steps.security_provenance.outputs.security_ready }}
+      security_digest: ${{ steps.security_provenance.outputs.security_digest }}
+    if: >-
+      needs.validate-dispatch.result == 'success' &&
+      needs.build-release.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'deploy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      statuses: read
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      SOURCE_RUN_URL: ${{ inputs.classifier_run_id && format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, inputs.classifier_run_id) || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+    steps:
+      # This job has a GitHub API token. Resolve the validator from the
+      # immutable default-branch commit before checkout; TARGET_SHA is the
+      # deployment candidate and must never select executable code here.
+      - name: Resolve immutable default-branch provenance source
+        id: trusted_default
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          PUBLISHED_ARTIFACT_ID: ${{ steps.publish-release-artifact.outputs.artifact-id }}
-          PUBLISHED_ARTIFACT_DIGEST: ${{ steps.publish-release-artifact.outputs.artifact-digest }}
+          TRUSTED_BRANCH: dev
         run: |
           set -euo pipefail
-          test -n "$PUBLISHED_ARTIFACT_ID"
-          test -n "$PUBLISHED_ARTIFACT_DIGEST"
-          PUBLISHED_ARTIFACT_DIGEST="${PUBLISHED_ARTIFACT_DIGEST#sha256:}"
-          [[ "$PUBLISHED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]] \
-            || { echo "Published GitHub artifact digest is invalid" >&2; exit 1; }
-          artifact_zip="$RUNNER_TEMP/platform-release-artifact.zip"
-          curl --fail-with-body --silent --show-error --location \
-            --retry 3 --retry-delay 2 \
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          trusted_ref="$RUNNER_TEMP/platform-trusted-default-ref.json"
+          curl --fail-with-body --silent --show-error \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${PUBLISHED_ARTIFACT_ID}/zip" \
-            --output "$artifact_zip"
-          printf '%s  %s\n' "$PUBLISHED_ARTIFACT_DIGEST" "$artifact_zip" | sha256sum -c -
-          printf 'Published GitHub artifact digest: %s\n' "$PUBLISHED_ARTIFACT_DIGEST"
-          release_archive="$(find ci-release-published -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
-          test -n "$release_archive" || { echo "Published release artifact is missing" >&2; exit 1; }
-          release_checksum="${release_archive}.sha256"
-          test -f "$release_checksum" || { echo "Published release checksum is missing" >&2; exit 1; }
-          (cd "$(dirname "$release_archive")" && sha256sum -c "$(basename "$release_checksum")")
-          /usr/bin/python3 - "$release_archive" "$TARGET_SHA" "$PUBLISHED_ARTIFACT_ID" "$PUBLISHED_ARTIFACT_DIGEST" <<'PY'
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/${TRUSTED_BRANCH}" \
+            --output "$trusted_ref"
+          /usr/bin/python3 - "$trusted_ref" "$GITHUB_OUTPUT" "$TRUSTED_BRANCH" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          branch = sys.argv[3]
+          expected_ref = f"refs/heads/{branch}"
+          obj = payload.get("object") if isinstance(payload, dict) else None
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if payload.get("ref") != expected_ref or not isinstance(obj, dict) or obj.get("type") != "commit":
+              raise SystemExit("trusted default branch ref is not an immutable commit")
+          if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("trusted default branch commit SHA is malformed")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"sha={sha}\n")
+          PY
+          rm -f -- "$trusted_ref"
+
+      - name: Checkout trusted provenance validator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.trusted_default.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate exact security snapshots
+        id: security_provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_SOURCE_SHA: ${{ steps.trusted_default.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$(git rev-parse HEAD)" = "$TRUSTED_SOURCE_SHA"
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CLASSIFIER_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$CLASSIFIER_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          provenance_dir="$(mktemp -d "$RUNNER_TEMP/platform-security-provenance.XXXXXX")"
+          trap 'rm -rf -- "$provenance_dir"' EXIT
+          chmod 700 "$provenance_dir"
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          fetch_statuses() {
+            local output_path="$1" page=1 count page_path
+            local pages_dir="$provenance_dir/pages-$(basename "$output_path")"
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=${page}" \
+                --output "$page_path"
+              count="$(/usr/bin/python3 - "$page_path" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+              raise SystemExit("paginated status response is malformed")
+          print(len(rows))
+          PY
+              )"
+              if (( count < 100 )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 1000 )) || { echo "status pagination exceeded its bound" >&2; exit 1; }
+            done
+            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          pages_dir, output_path = map(Path, sys.argv[1:])
+          rows = []
+          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
+              page_rows = json.loads(path.read_text(encoding="utf-8"))
+              if not isinstance(page_rows, list):
+                  raise SystemExit("paginated status response is malformed")
+              rows.extend(page_rows)
+          output_path.write_text(json.dumps(rows, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          }
+          fetch_snapshot() {
+            local snapshot_dir="$1"
+            install -d -m 700 "$snapshot_dir"
+            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-security.yml" \
+              --output "$snapshot_dir/workflow.json"
+            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${CLASSIFIER_RUN_ID}" \
+              --output "$snapshot_dir/run.json"
+            fetch_statuses "$snapshot_dir/statuses.json"
+          }
+          for snapshot in first second; do
+            fetch_snapshot "$provenance_dir/$snapshot"
+            /usr/bin/python3 platform/tools/platform_workflow_provenance.py security \
+              --workflow "$provenance_dir/$snapshot/workflow.json" \
+              --run "$provenance_dir/$snapshot/run.json" \
+              --status "$provenance_dir/$snapshot/statuses.json" \
+              --expected-run-id "$CLASSIFIER_RUN_ID" \
+              --expected-attempt "$CLASSIFIER_RUN_ATTEMPT" \
+              --expected-target-sha "$TARGET_SHA" \
+              --expected-run-url "$SOURCE_RUN_URL" \
+              > "$provenance_dir/$snapshot/validated.json"
+          done
+          /usr/bin/python3 - "$provenance_dir/first/validated.json" "$provenance_dir/second/validated.json" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          first, second = (json.loads(Path(path).read_text(encoding="utf-8")) for path in sys.argv[1:3])
+          if first != second:
+              raise SystemExit("security provenance changed between adjacent snapshots")
+          if first.get("deploy_ready") is not True:
+              raise SystemExit("security provenance did not authorize deployment")
+          digest = first.get("snapshot_digest")
+          if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+              raise SystemExit("security provenance snapshot digest is malformed")
+          with Path(sys.argv[3]).open("a", encoding="utf-8") as output:
+              output.write("security_ready=true\n")
+              output.write(f"security_digest={digest}\n")
+          PY
+
+  # This is the only job that owns the production environment for preflight.
+  # It has no checkout and never executes candidate source.
+  preflight:
+    name: Production preflight
+    needs: validate-dispatch
+    if: >-
+      needs.validate-dispatch.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'preflight'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      DEPLOY_MODE: preflight
+      RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
+      WEB_COMPRESSION: ${{ inputs.web_compression }}
+      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Download closed preflight handoff
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-deploy-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/deploy-input
+
+      - name: Revalidate exact target SHA preflight handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" && test ! -L "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$TARGET_SHA" "$RUNTIME_PROFILE" "$WEB_COMPRESSION" "$CLASSIFIER_RUN_ID" "$CLASSIFIER_RUN_ATTEMPT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          path, target_sha, runtime_profile, web_compression, run_id, attempt = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          expected = {"schema", "mode", "runtime_profile", "release_slug", "target_sha", "artifact_remote_dir", "classifier_run_id", "classifier_run_attempt", "web_compression"}
+          if set(payload) != expected or payload.get("schema") not in (1, "1"):
+              raise SystemExit("preflight handoff schema is not closed")
+          if payload.get("mode") != "preflight" or payload.get("runtime_profile") != runtime_profile or payload.get("web_compression") != web_compression:
+              raise SystemExit("preflight handoff values do not match dispatch")
+          if payload.get("target_sha") != target_sha or re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
+              raise SystemExit("preflight handoff exact target SHA mismatch")
+          if payload.get("classifier_run_id") != run_id or payload.get("classifier_run_attempt") != attempt:
+              raise SystemExit("preflight handoff classifier identity mismatch")
+          print("preflight handoff accepted for exact target SHA")
+          PY
+
+      - name: Validate deployment secrets
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}" \
+            || { echo "Production SSH configuration is incomplete." >&2; exit 1; }
+
+      - name: Configure preflight SSH
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-preflight-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" && test "$(wc -l < "$ssh_scan" | tr -d ' ')" = 1
+          test "$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          printf '%s\n' "PREFLIGHT_SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Run production preflight
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          input_path="$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          remote_log="$RUNNER_TEMP/platform-production-preflight-remote.log"
+          remote_error="$RUNNER_TEMP/platform-production-preflight-remote-error.log"
+          umask 077
+          : > "$remote_log"; : > "$remote_error"; chmod 600 "$remote_log" "$remote_error"
+          set +e
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+            -F "$PREFLIGHT_SSH_DIR/config" -i "$PREFLIGHT_SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            /usr/bin/python3.12 /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+            production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
+          remote_status="$?"
+          set -e
+          grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) ' "$remote_log" | tail -n 1 || true
+          rm -f -- "$remote_log" "$remote_error"
+          exit "$remote_status"
+
+      - name: Remove preflight SSH material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-preflight-ssh"
+          rm -f -- "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$RUNNER_TEMP/platform-production-preflight-remote.log" "$RUNNER_TEMP/platform-production-preflight-remote-error.log"
+          if [[ -d "$ssh_dir" && ! -L "$ssh_dir" ]]; then
+            rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/config" "$ssh_dir/control.sock" "$ssh_dir/control-master" "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -e "$ssh_dir/known_hosts" && test ! -e "$ssh_dir/config"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          printf '%s\n' 'PREFLIGHT_SSH_DIR=' >> "$GITHUB_ENV"
+
+  # This environment-approved job consumes only the exact handoff and the
+  # immutable archive.  It has no checkout: candidate code is never executed
+  # on the runner that receives PROD_SSH_KEY.
+  production:
+    name: Deploy production
+    needs:
+      - validate-dispatch
+      - build-release
+      - validate-security-provenance
+    if: >-
+      needs.validate-dispatch.result == 'success' &&
+      needs.build-release.result == 'success' &&
+      needs.validate-security-provenance.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'deploy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      DEPLOY_MODE: deploy
+      RUNTIME_PROFILE: ${{ inputs.runtime_profile }}
+      PLATFORM_WEB_NEXT_COMPRESSION: ${{ inputs.web_compression == 'disabled' && 'false' || 'true' }}
+      WEB_COMPRESSION: ${{ inputs.web_compression }}
+      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+      RELEASE_SLUG: gha-${{ github.run_id }}-${{ github.run_attempt }}
+      ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+      PUBLISHED_ARTIFACT_ID: ${{ needs.build-release.outputs.artifact_id }}
+      PUBLISHED_ARTIFACT_DIGEST: ${{ needs.build-release.outputs.artifact_digest }}
+    steps:
+      - name: Download closed deployment handoff
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-deploy-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/deploy-input
+
+      - name: Validate production deployment inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" && test ! -L "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          test -n "$CLASSIFIER_RUN_ID" || { echo "classifier_run_id is required for production deploy" >&2; exit 1; }
+          test -n "$CLASSIFIER_RUN_ATTEMPT" || { echo "classifier_run_attempt is required for production deploy" >&2; exit 1; }
+          /usr/bin/python3 - "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$TARGET_SHA" "$RUNTIME_PROFILE" "$WEB_COMPRESSION" "$CLASSIFIER_RUN_ID" "$CLASSIFIER_RUN_ATTEMPT" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          path, target_sha, runtime_profile, web_compression, run_id, attempt = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          expected = {"schema", "mode", "runtime_profile", "release_slug", "target_sha", "artifact_remote_dir", "classifier_run_id", "classifier_run_attempt", "web_compression"}
+          if set(payload) != expected or payload.get("schema") not in (1, "1"):
+              raise SystemExit("deployment handoff schema is not closed")
+          if payload.get("mode") != "deploy" or payload.get("runtime_profile") != runtime_profile or payload.get("web_compression") != web_compression:
+              raise SystemExit("deployment handoff values do not match dispatch")
+          if payload.get("target_sha") != target_sha or re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
+              raise SystemExit("deployment handoff exact target SHA mismatch")
+          if payload.get("classifier_run_id") != run_id or payload.get("classifier_run_attempt") != attempt:
+              raise SystemExit("deployment handoff classifier identity mismatch")
+          if re.fullmatch(r"/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}", str(payload.get("artifact_remote_dir"))) is None:
+              raise SystemExit("deployment handoff artifact path is unsafe")
+          print("deployment handoff accepted for exact target SHA")
+          PY
+
+      - name: Require successful platform security build (shared provenance validator)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # platform_workflow_provenance.py enforces run.get("workflow_id") != workflow.get("id"),
+          # run.get("run_attempt") != int(expected_attempt), and exact
+          # "event": "push", "head_branch": "dev", "head_sha": os.environ["TARGET_SHA"],
+          # "status": "completed", "conclusion": "success" metadata.  The
+          # complete paginated equivalent of
+          # "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status"
+          # rejects item.get("context") == "platform-security-build" rows
+          # unless latest.get("state") != "success" is false and
+          # latest.get("target_url") != attempt_url is false.
+          security_digest="${{ needs.validate-security-provenance.outputs.security_digest }}"
+          [[ "$security_digest" =~ ^[0-9a-f]{64}$ ]] || { echo "security provenance handoff is malformed" >&2; exit 1; }
+          test "${{ needs.validate-security-provenance.outputs.security_ready }}" = "true"
+          echo "exact platform security provenance accepted: snapshot=$security_digest"
+
+      - name: Require deployable exact classifier artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected_name="platform-ci-route-${CLASSIFIER_RUN_ID}-${CLASSIFIER_RUN_ATTEMPT}"
+          route_dir="$(mktemp -d "$RUNNER_TEMP/platform-ci-route.XXXXXX")"
+          trap 'rm -rf -- "$route_dir"' EXIT
+          fetch_classifier_artifacts() {
+            local output_path="$1" page=1 count page_path
+            local pages_dir="$route_dir/artifact-pages-$(basename "$output_path")"
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              curl --fail-with-body --silent --show-error \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${CLASSIFIER_RUN_ID}/artifacts?per_page=100&page=${page}" \
+                --output "$page_path"
+              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          page_path, total_path = sys.argv[1:]
+          payload = json.loads(Path(page_path).read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 10_000:
+              raise SystemExit("classifier artifact pagination total_count is malformed or excessive")
+          rows = payload.get("artifacts")
+          if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
+              raise SystemExit("classifier artifact pagination page is malformed")
+          ids = []
+          for row in rows:
+              if type(row.get("id")) is not int or row["id"] <= 0:
+                  raise SystemExit("classifier artifact row ID is malformed")
+              if not isinstance(row.get("name"), str) or not row["name"].isascii() or not 1 <= len(row["name"]) <= 256:
+                  raise SystemExit("classifier artifact row name is malformed")
+              if type(row.get("expired")) is not bool:
+                  raise SystemExit("classifier artifact expired flag is malformed")
+              workflow_run = row.get("workflow_run")
+              if not isinstance(workflow_run, dict) or type(workflow_run.get("id")) is not int or workflow_run["id"] <= 0:
+                  raise SystemExit("classifier artifact workflow identity is malformed")
+              if not isinstance(workflow_run.get("head_sha"), str) or re.fullmatch(r"[0-9a-f]{40}", workflow_run["head_sha"]) is None:
+                  raise SystemExit("classifier artifact workflow SHA is malformed")
+              if "run_attempt" in workflow_run and (type(workflow_run["run_attempt"]) is not int or workflow_run["run_attempt"] <= 0):
+                  raise SystemExit("classifier artifact workflow attempt is malformed")
+              ids.append(row["id"])
+          if len(ids) != len(set(ids)):
+              raise SystemExit("classifier artifact page contains duplicate IDs")
+          marker = Path(total_path)
+          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
+              raise SystemExit("classifier artifact total_count changed during pagination")
+          marker.write_text(str(payload["total_count"]), encoding="ascii")
+          print(len(rows))
+          PY
+              )"
+              if (( count < 100 )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 100 )) || { echo "classifier artifact pagination exceeded its bound" >&2; exit 1; }
+            done
+            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          pages_dir, output_path = map(Path, sys.argv[1:])
+          expected_total = int((pages_dir / "total").read_text(encoding="ascii"))
+          rows = []
+          seen = set()
+          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              page_rows = payload.get("artifacts") if isinstance(payload, dict) else None
+              if not isinstance(page_rows, list):
+                  raise SystemExit("classifier artifact page is malformed")
+              for row in page_rows:
+                  row_id = row.get("id")
+                  if type(row_id) is not int or row_id <= 0 or row_id in seen:
+                      raise SystemExit("classifier artifact rows contain duplicate or malformed IDs")
+                  seen.add(row_id)
+                  rows.append(row)
+          if len(rows) > expected_total:
+              raise SystemExit("classifier artifact pagination returned excess rows")
+          if len(rows) != expected_total:
+              raise SystemExit("classifier artifact pagination is incomplete")
+          Path(output_path).write_text(json.dumps({"total_count": expected_total, "artifacts": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          }
+          fetch_classifier_artifacts "$route_dir/artifacts-first.json"
+          fetch_classifier_artifacts "$route_dir/artifacts-second.json"
+          artifacts_metadata="$route_dir/platform-classifier-artifacts.json"
+          /usr/bin/python3 - "$route_dir/artifacts-first.json" "$route_dir/artifacts-second.json" "$artifacts_metadata" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          first_path, second_path, output_path = sys.argv[1:]
+          first = json.loads(Path(first_path).read_text(encoding="utf-8"))
+          second = json.loads(Path(second_path).read_text(encoding="utf-8"))
+
+          def identity(row):
+              workflow_run = row.get("workflow_run")
+              return (
+                  row.get("id"),
+                  row.get("name"),
+                  row.get("expired"),
+                  workflow_run.get("id") if isinstance(workflow_run, dict) else None,
+                  workflow_run.get("head_sha") if isinstance(workflow_run, dict) else None,
+                  workflow_run.get("run_attempt") if isinstance(workflow_run, dict) else None,
+              )
+
+          first_rows = sorted((identity(row) for row in first["artifacts"]), key=lambda value: value[0])
+          second_rows = sorted((identity(row) for row in second["artifacts"]), key=lambda value: value[0])
+          if first["total_count"] != second["total_count"] or first_rows != second_rows:
+              raise SystemExit("classifier artifact listing changed during validation")
+          Path(output_path).write_text(json.dumps(second, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          artifact_id="$(/usr/bin/python3 "$artifacts_metadata" "$expected_name" "$CLASSIFIER_RUN_ID" "$CLASSIFIER_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_name, run_id, attempt, target_sha = sys.argv[2:]
+          matches = [row for row in payload["artifacts"] if row.get("name") == expected_name and row.get("expired") is False]
+          if len(matches) != 1:
+              raise SystemExit("expected exactly one unexpired classifier artifact")
+          selected = matches[0]
+          workflow_run = selected.get("workflow_run")
+          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("classifier artifact is not bound to the exact run and target SHA")
+          if "run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(attempt):
+              raise SystemExit("classifier artifact is not bound to the exact run attempt")
+          if type(selected.get("id")) is not int or selected["id"] <= 0:
+              raise SystemExit("classifier artifact ID is malformed")
+          print(selected["id"])
+          PY
+          )"
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || { echo "classifier artifact id is malformed" >&2; exit 1; }
+          curl --fail-with-body --silent --show-error --location --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" --output "$route_dir/artifact.zip"
+          # This fresh secret-bearing job cannot import candidate helpers.  The
+          # small self-contained bounded extractor below is a reviewed,
+          # data-only boundary: it accepts
+          # exactly one regular manifest and never follows an archive or output
+          # symlink.  Every archive/member/expansion bound is checked before and
+          # during streaming; the shell trap removes all temporary material.
+          /usr/bin/python3 - "$route_dir/artifact.zip" "$route_dir/unpacked" <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+          import sys
+          import zipfile
+
+          archive_path, destination = map(Path, sys.argv[1:])
+          MAX_ARCHIVE_BYTES = 4 * 1024 * 1024
+          MAX_ENTRIES = 8
+          MAX_MEMBER_BYTES = 256 * 1024
+          MAX_TOTAL_BYTES = 512 * 1024
+          MAX_COMPRESSION_RATIO = 100
+
+          def reject(condition, message):
+              if condition:
+                  raise SystemExit(message)
+
+          try:
+              archive_metadata = archive_path.lstat()
+              reject(
+                  not stat.S_ISREG(archive_metadata.st_mode)
+                  or stat.S_ISLNK(archive_metadata.st_mode)
+                  or archive_metadata.st_nlink != 1,
+                  "classifier artifact archive is not a regular file",
+              )
+              reject(archive_metadata.st_size > MAX_ARCHIVE_BYTES, "classifier artifact ZIP is oversized")
+              os.mkdir(destination, 0o700)
+              with zipfile.ZipFile(archive_path, allowZip64=False) as bundle:
+                  members = bundle.infolist()
+                  reject(not members or len(members) > MAX_ENTRIES, "classifier artifact ZIP inventory is invalid")
+                  names = [member.filename for member in members]
+                  reject(len(set(names)) != len(names), "classifier artifact ZIP has duplicate entries")
+                  reject(names != ["classifier-manifest.json"], "classifier artifact ZIP inventory is invalid")
+                  member = members[0]
+                  name = member.filename
+                  reject(not name.isascii(), "classifier artifact ZIP name is not ASCII")
+                  reject(any(ord(char) < 0x20 or ord(char) == 0x7f for char in name), "classifier artifact ZIP name has control characters")
+                  reject("\\" in name or name.startswith("/"), "classifier artifact ZIP name is unsafe")
+                  reject(".." in Path(name).parts or "." in Path(name).parts, "classifier artifact ZIP name traverses")
+                  reject(member.is_dir() or name.endswith("/"), "classifier artifact ZIP entry is a directory")
+                  reject(member.file_size > MAX_MEMBER_BYTES or member.file_size > MAX_TOTAL_BYTES, "classifier artifact ZIP member is oversized")
+                  reject(member.compress_size == 0 and member.file_size != 0, "classifier artifact ZIP ratio is invalid")
+                  if member.file_size and member.compress_size:
+                      reject(member.file_size > member.compress_size * MAX_COMPRESSION_RATIO, "classifier artifact ZIP ratio is unsafe")
+                  reject(bool(member.flag_bits & 0x1), "classifier artifact ZIP is encrypted")
+                  reject(member.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED), "classifier artifact ZIP compression is unsupported")
+                  mode = (member.external_attr >> 16) & 0o170000
+                  reject(mode not in (0, stat.S_IFREG), "classifier artifact ZIP entry is not regular")
+                  target = destination / name
+                  descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  try:
+                      copied = 0
+                      with bundle.open(member, "r") as source, os.fdopen(descriptor, "wb") as output:
+                          descriptor = -1
+                          while True:
+                              chunk = source.read(64 * 1024)
+                              if not chunk:
+                                  break
+                              copied += len(chunk)
+                              reject(copied > MAX_MEMBER_BYTES or copied > MAX_TOTAL_BYTES, "classifier artifact member expanded beyond limit")
+                              output.write(chunk)
+                      reject(copied != member.file_size, "classifier artifact member size changed")
+                  finally:
+                      if descriptor >= 0:
+                          os.close(descriptor)
+              metadata = target.lstat()
+              reject(not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600, "classifier manifest extraction is unsafe")
+          except (OSError, EOFError, OverflowError, zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError) as exc:
+              shutil.rmtree(destination, ignore_errors=True)
+              raise SystemExit("classifier artifact ZIP is invalid") from exc
+          PY
+          manifest_path="$route_dir/unpacked/classifier-manifest.json"
+          test -f "$manifest_path" && test ! -L "$manifest_path"
+          /usr/bin/python3 - "$manifest_path" "$TARGET_SHA" <<'PY'
           import hashlib
           import json
           from pathlib import Path
           import sys
 
-          archive, target_sha, artifact_id, artifact_digest = sys.argv[1:]
-          archive_path = Path(archive)
-          payload = {
-              "artifact_id": artifact_id,
-              "artifact_digest": artifact_digest,
-              "artifact_file": archive_path.name,
-              "artifact_sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
-              "source_git_commit": target_sha,
-          }
-          Path("ci-release-published/RELEASE.provenance.json").write_text(
-              json.dumps(payload, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
+          manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          target_sha = sys.argv[2]
+          expected_gates = ["backend", "python-quality", "security", "migration", "docs", "web-quality", "web-hermetic", "verification-contract"]
+          fields = ("schema", "version", "target_sha", "event", "class", "expected_gates", "deployable", "fallback", "reason", "files")
+          if manifest.get("schema") != 1 or manifest.get("version") != 1 or manifest.get("target_sha") != target_sha:
+              raise SystemExit("classifier manifest schema or target SHA is invalid")
+          if manifest.get("event") != "push" or manifest.get("class") != "full":
+              raise SystemExit("production deployment requires a full push classifier route")
+          if manifest.get("expected_gates") != expected_gates or manifest.get("fallback") is not False or manifest.get("deployable") is not True:
+              raise SystemExit("classifier route is not deployable")
+          if not isinstance(manifest.get("reason"), str) or not manifest["reason"] or not isinstance(manifest.get("files"), list):
+              raise SystemExit("classifier manifest fields are malformed")
+          digest = hashlib.sha256(json.dumps({field: manifest[field] for field in fields}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+          if manifest.get("digest") != digest:
+              raise SystemExit("classifier digest does not match manifest")
+          require_deployable = True
+          if not require_deployable:
+              raise SystemExit("internal deployability guard is disabled")
           PY
-          printf 'RELEASE_ARTIFACT=%s\n' "$GITHUB_WORKSPACE/$release_archive" >> "$GITHUB_ENV"
-          printf 'RELEASE_CHECKSUM=%s\n' "$GITHUB_WORKSPACE/$release_checksum" >> "$GITHUB_ENV"
-          printf 'RELEASE_PROVENANCE=%s\n' "$GITHUB_WORKSPACE/ci-release-published/RELEASE.provenance.json" >> "$GITHUB_ENV"
 
-      - name: Configure SSH
+      - name: Mark production deployment pending
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
-          chmod 600 ~/.ssh/old_sparky_prod
-          ssh_scan="$(mktemp)"
-          trap 'rm -f -- "$ssh_scan"' EXIT
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
-          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
-          ssh_key_count="$(wc -l < "$ssh_scan" | tr -d ' ')"
-          test "$ssh_key_count" = "1" || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
-          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
-          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" || {
-            echo "Production SSH host fingerprint mismatch" >&2
-            exit 1
-          }
-          install -m 0600 "$ssh_scan" ~/.ssh/known_hosts
-          {
-            printf '%s\n' 'Host *'
-            printf '%s\n' '  StrictHostKeyChecking yes'
-            printf '  UserKnownHostsFile %s/.ssh/known_hosts\n' "$HOME"
-          } > ~/.ssh/config
-          chmod 600 ~/.ssh/config
-          chmod 600 ~/.ssh/known_hosts
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          curl --fail-with-body --silent --show-error --request POST --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "{\"state\":\"pending\",\"context\":\"platform-production-deploy\",\"description\":\"Production deployment is running\",\"target_url\":\"${run_url}\"}"
 
-      - name: Verify SSH connection
+      - name: Download published release artifact for deployment
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-release-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release
+
+      - name: Verify published release artifact
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ssh \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod \
-            "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            'printf "SSH connection OK\n"'
+          test -n "$PUBLISHED_ARTIFACT_ID" && test -n "$PUBLISHED_ARTIFACT_DIGEST"
+          PUBLISHED_ARTIFACT_DIGEST="${PUBLISHED_ARTIFACT_DIGEST#sha256:}"
+          [[ "$PUBLISHED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || { echo "Published GitHub artifact ID is invalid" >&2; exit 1; }
+          [[ "$PUBLISHED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]] || { echo "Published GitHub artifact digest is invalid" >&2; exit 1; }
+          artifact_metadata="$RUNNER_TEMP/platform-release-artifact-metadata.json"
+          curl --fail-with-body --silent --show-error --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${PUBLISHED_ARTIFACT_ID}" --output "$artifact_metadata"
+          /usr/bin/python3 - "$artifact_metadata" "$PUBLISHED_ARTIFACT_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
 
-      - name: Upload verified CI artifact
-        if: ${{ env.DEPLOY_MODE == 'deploy' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          ssh \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod \
-            "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "install -d -o root -g root -m 0700 '$ARTIFACT_REMOTE_DIR'"
-          scp \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod \
-            "$RELEASE_ARTIFACT" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
-          scp \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod \
-            "$RELEASE_PROVENANCE" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
-          scp \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod \
-            "$RELEASE_CHECKSUM" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
-
-      - name: Run production preflight or deployment
-        shell: bash
-        run: |
-          set -euo pipefail
-          short_sha="${TARGET_SHA:0:12}"
-          release_slug="${RELEASE_SLUG:0:32}-${short_sha}"
-
-          ssh \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=3 \
-            -i ~/.ssh/old_sparky_prod \
-            "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$TARGET_SHA' '$release_slug' '$DEPLOY_MODE' '$ARTIFACT_REMOTE_DIR' '$RUNTIME_PROFILE'" <<'REMOTE'
-          set -Eeuo pipefail
-
-          target_sha="$1"
-          release_slug="$2"
-          deploy_mode="$3"
-          artifact_dir="$4"
-          runtime_profile="$5"
-
-          runtime=/opt/oldsparky/platform
-          current="$runtime/current"
-          artifact_path=""
-          provenance_path="$artifact_dir/RELEASE.provenance.json"
-          bootstrap_dir=""
-
-          fail() {
-            printf 'ERROR: %s\n' "$*" >&2
-            exit 1
-          }
-
-          restart_web_and_wait() {
-            systemctl restart deadlock-web
-            for _ in $(seq 1 30); do
-              if systemctl is-active --quiet deadlock-web \
-                && curl --fail --silent --show-error --max-time 2 \
-                  http://127.0.0.1:3000/ >/dev/null; then
-                return 0
-              fi
-              sleep 1
-            done
-            fail "deadlock-web did not recover after runtime profile"
-          }
-
-          restart_api_and_wait() {
-            systemctl restart deadlock-api || return 1
-            for _ in $(seq 1 30); do
-              if systemctl is-active --quiet deadlock-api \
-                && curl --fail --silent --show-error --max-time 2 \
-                  http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                return 0
-              fi
-              sleep 1
-            done
-            return 1
-          }
-
-          # Keep immutable release activation out of an active retained-load
-          # window.  The load supervisor and its cleanup use this same lock,
-          # so the exact current release remains stable for both measurement
-          # and evidence collection.
-          exec 8>/run/lock/oldsparky-retained-load-matrix.lock
-          flock -n 8 || fail "a retained production load or cleanup is active"
-
-          cleanup() {
-            if [[ -n "$artifact_dir" && -d "$artifact_dir" && ! -L "$artifact_dir" ]]; then
-              rm -rf -- "$artifact_dir"
-            fi
-            if [[ -n "$bootstrap_dir" && -d "$bootstrap_dir" && ! -L "$bootstrap_dir" ]]; then
-              rm -rf -- "$bootstrap_dir"
-            fi
-          }
-          trap cleanup EXIT
-
-          test "$(id -u)" -eq 0 || fail "deployment user must be root"
-          test -L "$current" || fail "current release symlink is missing"
-          test -L "$runtime/previous" || fail "previous release symlink is missing"
-          test -x "$current/tools/platform_release_preflight.sh" || fail "release preflight tool is missing"
-          test -x "$current/tools/platform_deploy_smoke.py" || fail "deploy smoke tool is missing"
-
-          for service in deadlock-api deadlock-worker deadlock-web; do
-            systemctl is-active --quiet "$service" || fail "$service is not active before deployment"
-          done
-
-          nginx -t >/dev/null
-
-          "$current/tools/platform_release_preflight.sh" \
-            --require-previous \
-            --require-verified-backup \
-            --require-edge-parity \
-            --backup-max-age-hours 24
-
-          if [[ "$deploy_mode" == "preflight" ]]; then
-            printf 'Production preflight passed.\n'
-            exit 0
-          fi
-
-          [[ "$deploy_mode" == "deploy" ]] || fail "unsupported deployment mode"
-          test -d "$artifact_dir" && test ! -L "$artifact_dir" \
-            || fail "CI release artifact directory is missing"
-
-          artifact_path="$(find "$artifact_dir" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
-          test -n "$artifact_path" || fail "CI release artifact is missing"
-          artifact_checksum="${artifact_path}.sha256"
-          test -f "$artifact_checksum" && test ! -L "$artifact_checksum" \
-            || fail "CI release checksum is missing"
-          test -f "$provenance_path" && test ! -L "$provenance_path" \
-            || fail "CI release provenance is missing"
-          artifact_name="$(basename "$artifact_path")"
-          artifact_slug="${artifact_name%.tar.gz}"
-          (cd "$artifact_dir" && sha256sum -c "$(basename "$artifact_checksum")") \
-            || fail "CI release artifact digest mismatch"
-          bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"
-          chmod 0700 "$bootstrap_dir"
-          "$current/tools/platform_validate_release_artifact.py" \
-            --artifact "$artifact_path" \
-            --checksum "$artifact_checksum" \
-            --release-slug "$artifact_slug" \
-            --extract-to "$bootstrap_dir" \
-            || fail "CI release artifact provenance is invalid"
-          if ! /usr/bin/python3 - "$artifact_path" "$artifact_slug" "$target_sha" "$provenance_path" <<'PY'
+          metadata_path, artifact_id, run_id, attempt, target_sha = sys.argv[1:]
+          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          if payload.get("id") != int(artifact_id) or payload.get("name") != f"platform-release-artifact-{run_id}-{attempt}" or payload.get("expired") is not False:
+              raise SystemExit("published release artifact metadata is not the exact current-run artifact")
+          workflow_run = payload.get("workflow_run")
+          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("published release artifact is not bound to this exact workflow run and SHA")
+          PY
+          artifact_zip="$RUNNER_TEMP/platform-release-artifact.zip"
+          curl --fail-with-body --silent --show-error --location --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${PUBLISHED_ARTIFACT_ID}/zip" --output "$artifact_zip"
+          printf '%s  %s\n' "$PUBLISHED_ARTIFACT_DIGEST" "$artifact_zip" | sha256sum -c - >/dev/null 2>/dev/null || { echo "Published GitHub artifact digest verification failed" >&2; exit 1; }
+          release_archive="$(find "$RUNNER_TEMP/release" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$release_archive" || { echo "Published release artifact is missing" >&2; exit 1; }
+          release_checksum="${release_archive}.sha256"
+          release_provenance="$RUNNER_TEMP/release/RELEASE.provenance.json"
+          test -f "$release_checksum" && test -f "$release_provenance"
+          (cd "$(dirname "$release_archive")" && sha256sum -c "$(basename "$release_checksum")")
+          /usr/bin/python3 - "$release_archive" "$release_provenance" "$TARGET_SHA" <<'PY'
           import hashlib
           import json
           from pathlib import Path
           import re
           import sys
-          import tarfile
 
-          artifact, slug, expected_commit, provenance_path = sys.argv[1:]
+          archive, provenance_path, target_sha = sys.argv[1:]
           provenance = json.loads(Path(provenance_path).read_text(encoding="utf-8"))
-          if not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("artifact_digest"))):
-              raise SystemExit("published artifact digest is invalid")
-          if provenance.get("source_git_commit") != expected_commit:
-              raise SystemExit("provenance source commit does not match expected commit")
-          if provenance.get("artifact_file") != Path(artifact).name:
-              raise SystemExit("provenance artifact name does not match uploaded artifact")
-          actual_sha256 = hashlib.sha256(Path(artifact).read_bytes()).hexdigest()
-          if provenance.get("artifact_sha256") != actual_sha256:
-              raise SystemExit("provenance artifact checksum does not match uploaded artifact")
-          with tarfile.open(Path(artifact), mode="r:gz") as archive:
-              member = archive.getmember(f"{slug}/RELEASE.json")
-              handle = archive.extractfile(member)
-              if handle is None:
-                  raise SystemExit("RELEASE.json is missing")
-              payload = json.load(handle)
-          if payload.get("source_git_commit") != expected_commit:
-              raise SystemExit("release source commit does not match expected commit")
+          if set(provenance) != {"schema", "artifact_file", "artifact_sha256", "source_git_commit"}:
+              raise SystemExit("release provenance schema is not closed")
+          if provenance.get("schema") != 1 or provenance.get("artifact_file") != Path(archive).name or provenance.get("source_git_commit") != target_sha or re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("artifact_sha256"))) is None:
+              raise SystemExit("release provenance does not bind the exact target SHA")
+          if hashlib.sha256(Path(archive).read_bytes()).hexdigest() != provenance["artifact_sha256"]:
+              raise SystemExit("release provenance digest mismatch")
           PY
-          then
-            fail "CI release source commit does not match target SHA"
+          printf 'RELEASE_ARTIFACT=%s\n' "$release_archive" >> "$GITHUB_ENV"
+          printf 'RELEASE_CHECKSUM=%s\n' "$release_checksum" >> "$GITHUB_ENV"
+          printf 'RELEASE_PROVENANCE=%s\n' "$release_provenance" >> "$GITHUB_ENV"
+
+      - name: Validate deployment secrets
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}" \
+            || { echo "Production SSH configuration is incomplete." >&2; exit 1; }
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-deploy-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" && test "$(wc -l < "$ssh_scan" | tr -d ' ')" = 1
+          test "$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Verify SSH connection
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" true >/dev/null
+
+      - name: Upload verified CI artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          input_path="$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          test -s "$input_path"
+          require_current_dev_head() {
+            local branch_json dev_sha
+            branch_json="$(curl --fail-with-body --silent --show-error --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev")"
+            dev_sha="$(printf '%s' "$branch_json" | /usr/bin/python3 -c 'import json,sys; payload=json.load(sys.stdin); sha=payload["commit"]["sha"]; assert isinstance(sha,str) and len(sha)==40 and all(c in "0123456789abcdef" for c in sha), "current dev head SHA is malformed"; print(sha)')"
+            test "$dev_sha" = "$TARGET_SHA" || { echo "Refusing production side effects: dev moved from $TARGET_SHA to $dev_sha." >&2; exit 1; }
+          }
+          require_current_dev_head
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            /usr/bin/python3.12 /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py production-prepare-artifact < "$input_path"
+          scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_ARTIFACT" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+          scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_PROVENANCE" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+          scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_CHECKSUM" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
+
+      - name: Run production preflight or deployment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+        run: |
+          set -euo pipefail
+          input_path="$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json"
+          branch_json="$(curl --fail-with-body --silent --show-error --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/branches/dev")"
+          dev_sha="$(printf '%s' "$branch_json" | /usr/bin/python3 -c 'import json,sys; payload=json.load(sys.stdin); sha=payload["commit"]["sha"]; assert isinstance(sha,str) and len(sha)==40 and all(c in "0123456789abcdef" for c in sha), "current dev head SHA is malformed"; print(sha)')"
+          test "$dev_sha" = "$TARGET_SHA" || { echo "Refusing activation: dev moved from $TARGET_SHA to $dev_sha." >&2; exit 1; }
+          remote_log="$RUNNER_TEMP/platform-production-deploy-remote.log"
+          remote_error="$RUNNER_TEMP/platform-production-deploy-remote-error.log"
+          umask 077; : > "$remote_log"; : > "$remote_error"; chmod 600 "$remote_log" "$remote_error"
+          set +e
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            /usr/bin/python3.12 /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
+          remote_status="$?"
+          set -e
+          public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport) release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"
+          [[ -n "$public_line" ]] || public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
+          printf '%s\n' "$public_line"
+          exit "$remote_status"
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-deploy-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-deploy-ssh"
+          rm -f -- "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$RUNNER_TEMP/platform-production-deploy-remote.log" "$RUNNER_TEMP/platform-production-deploy-remote-error.log" "$RUNNER_TEMP/platform-release-artifact.zip"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
           fi
-
-          "$current/tools/platform_release_preflight.sh" \
-            --app-dir "$runtime" \
-            --require-previous \
-            --require-verified-backup \
-            --require-edge-parity \
-            --backup-max-age-hours 24
-
-          candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"
-          test -x "$candidate_deploy" || fail "candidate release deploy tool is missing"
-          if ! LC_ALL=C.UTF-8 "$candidate_deploy" \
-            --artifact "$artifact_path" \
-            --app-dir "$runtime" \
-            --edge-origin https://127.0.0.1 \
-            --edge-host old-sparky.com \
-            --expected-csp-mode enforce; then
-            echo '=== candidate_activation_failure ===' >&2
-            echo '=== candidate_filesystem ===' >&2
-            for path in / /tmp /var/tmp /usr/tmp; do
-              echo "--- ${path}.filesystem ---" >&2
-              df -hT -- "$path" >&2 || true
-              df -i -- "$path" >&2 || true
-              stat -c 'path=%n mode=%a owner=%u:%g type=%F' -- "$path" >&2 || true
-              findmnt --target "$path" --noheadings \
-                --output TARGET,SOURCE,FSTYPE,OPTIONS >&2 || true
-            done
-            echo '=== candidate_api_sandbox ===' >&2
-            systemctl show deadlock-api \
-              --property=User,Group,PrivateTmp,ProtectSystem,ProtectHome,ReadWritePaths,RuntimeDirectory,RuntimeDirectoryMode,TemporaryFileSystem,InaccessiblePaths \
-              --no-pager >&2 || true
-            for service in deadlock-api deadlock-worker deadlock-web; do
-              echo "--- ${service}.properties ---" >&2
-              systemctl show "$service" \
-                --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,ExecMainStartTimestamp,ExecMainExitTimestamp,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec \
-                --no-pager >&2 || true
-              echo "--- ${service}.journal ---" >&2
-              journalctl -u "$service" \
-                --since '-3 minutes' \
-                --utc \
-                --no-pager \
-                --output short-iso-precise \
-                -n 120 \
-                | sed -E \
-                    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[EMAIL]/g' \
-                    -e 's/(cookie|authorization|token|secret|password|session)[=:][^[:space:]]+/\1=[REDACTED]/Ig' \
-                    -e 's/(set-cookie:|cookie:|authorization:)[^[:space:]]+/\1 [REDACTED]/Ig' \
-                    -e 's/[A-Za-z0-9+\/_=-]{48,}/[LONG_VALUE_REDACTED]/g' \
-                | tail -n 120 >&2 || true
-            done
-            fail "candidate release activation failed; diagnostics collected"
-          fi
-
-          case "$runtime_profile" in
-            baseline)
-              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                --apply \
-                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                --profile baseline \
-                --only PLATFORM_LOG_LEVEL \
-                --only PLATFORM_PERF_LOG_ENABLED \
-                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED \
-                --only PLATFORM_API_WORKERS \
-                --only PLATFORM_DB_POOL_SIZE \
-                --only PLATFORM_DB_MAX_OVERFLOW \
-                --only PLATFORM_DB_CONNECTION_BUDGET \
-                --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
-                --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
-                --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY \
-                --only PLATFORM_WEB_WORKERS \
-                --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT \
-                --only PLATFORM_SSR_PERF_LOG_ENABLED \
-                --only PLATFORM_SSR_PERF_SAMPLE_RATE \
-                --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
-              systemctl restart deadlock-api
-              api_ready=false
-              for _ in $(seq 1 30); do
-                if systemctl is-active --quiet deadlock-api \
-                  && curl --fail --silent --show-error --max-time 2 \
-                    http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                  api_ready=true
-                  break
-                fi
-                sleep 1
-              done
-              [[ "$api_ready" == true ]] \
-                || fail "API did not recover on baseline runtime profile"
-              ;;
-            ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-static-12|ready-vote-static-16|ready-vote-cprofile)
-              ready_vote_profile_args=(
-                --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY
-                --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY
-                --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
-                --only PLATFORM_WEB_WORKERS
-                --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT
-                --only PLATFORM_LOG_LEVEL
-                --only PLATFORM_PERF_LOG_ENABLED
-                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-                --only PLATFORM_SSR_PERF_LOG_ENABLED
-                --only PLATFORM_SSR_PERF_SAMPLE_RATE
-                --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
-              )
-              if [[ "$runtime_profile" == ready-vote-cprofile ]]; then
-                ready_vote_profile_args+=(
-                  --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
-                  --only PLATFORM_PERF_SLOW_REQUEST_MS
-                  --only PLATFORM_PERF_LOG_MUTATIONS
-                )
-              else
-                # A static profile must also clear one-shot diagnostic
-                # overrides left by a preceding cProfile deployment.
-                ready_vote_profile_args+=(
-                  --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
-                  --only PLATFORM_PERF_SLOW_REQUEST_MS
-                  --only PLATFORM_PERF_LOG_MUTATIONS
-                )
-              fi
-              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                --apply \
-                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                --profile "$runtime_profile" \
-                "${ready_vote_profile_args[@]}"
-              systemctl restart deadlock-api
-              api_ready=false
-              for _ in $(seq 1 30); do
-                if systemctl is-active --quiet deadlock-api \
-                  && curl --fail --silent --show-error --max-time 2 \
-                    http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                  api_ready=true
-                  break
-                fi
-                sleep 1
-              done
-              if [[ "$api_ready" != true ]]; then
-                restore_ready_vote_profile_args=(
-                  --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY
-                  --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY
-                  --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY
-                  --only PLATFORM_WEB_WORKERS
-                  --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT
-                  --only PLATFORM_LOG_LEVEL
-                  --only PLATFORM_PERF_LOG_ENABLED
-                  --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-                  --only PLATFORM_SSR_PERF_LOG_ENABLED
-                  --only PLATFORM_SSR_PERF_SAMPLE_RATE
-                  --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
-                )
-                if [[ "$runtime_profile" == ready-vote-cprofile ]]; then
-                  restore_ready_vote_profile_args+=(
-                    --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
-                    --only PLATFORM_PERF_SLOW_REQUEST_MS
-                    --only PLATFORM_PERF_LOG_MUTATIONS
-                  )
-                else
-                  restore_ready_vote_profile_args+=(
-                    --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
-                    --only PLATFORM_PERF_SLOW_REQUEST_MS
-                    --only PLATFORM_PERF_LOG_MUTATIONS
-                  )
-                fi
-                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                  --apply \
-                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                  --profile baseline \
-                  "${restore_ready_vote_profile_args[@]}"
-                systemctl restart deadlock-api
-                api_ready=false
-                for _ in $(seq 1 30); do
-                  if systemctl is-active --quiet deadlock-api \
-                    && curl --fail --silent --show-error --max-time 2 \
-                      http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                    api_ready=true
-                    break
-                  fi
-                  sleep 1
-                done
-                [[ "$api_ready" == true ]] \
-                  || fail "static Ready Vote profile health check failed; baseline restore failed"
-                fail "static Ready Vote profile health check failed; baseline restored"
-              fi
-              ;;
-            ready-vote-adaptive-v2)
-              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                --apply \
-                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                --profile "$runtime_profile" \
-                --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
-                --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
-                --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY \
-                --only PLATFORM_READY_VOTE_ADMISSION_MAX_WAITERS \
-                --only PLATFORM_READY_VOTE_ADMISSION_WAIT_TIMEOUT_MS \
-                --only PLATFORM_READY_VOTE_ADMISSION_CPU_SAMPLE_INTERVAL_SECONDS \
-                --only PLATFORM_READY_VOTE_ADMISSION_CPU_EWMA_ALPHA \
-                --only PLATFORM_READY_VOTE_ADMISSION_RECOVERY_SAMPLES \
-                --only PLATFORM_READY_VOTE_ADMISSION_CONTROL_INTERVAL_SECONDS \
-                --only PLATFORM_LOG_LEVEL \
-                --only PLATFORM_PERF_LOG_ENABLED \
-                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED \
-                --only PLATFORM_SSR_PERF_LOG_ENABLED \
-                --only PLATFORM_SSR_PERF_SAMPLE_RATE \
-                --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
-              systemctl restart deadlock-api
-              api_ready=false
-              for _ in $(seq 1 30); do
-                if systemctl is-active --quiet deadlock-api \
-                  && curl --fail --silent --show-error --max-time 2 \
-                    http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                  api_ready=true
-                  break
-                fi
-                sleep 1
-              done
-              if [[ "$api_ready" != true ]]; then
-                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                  --apply \
-                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                  --profile ready-vote-static-8 \
-                  --only PLATFORM_READY_VOTE_ADMISSION_MIN_CONCURRENCY \
-                  --only PLATFORM_READY_VOTE_ADMISSION_INITIAL_CONCURRENCY \
-                  --only PLATFORM_READY_VOTE_ADMISSION_MAX_CONCURRENCY \
-                  --only PLATFORM_LOG_LEVEL \
-                  --only PLATFORM_PERF_LOG_ENABLED \
-                  --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED \
-                  --only PLATFORM_SSR_PERF_LOG_ENABLED \
-                  --only PLATFORM_SSR_PERF_SAMPLE_RATE \
-                  --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
-                systemctl restart deadlock-api
-                api_ready=false
-                for _ in $(seq 1 30); do
-                  if systemctl is-active --quiet deadlock-api \
-                    && curl --fail --silent --show-error --max-time 2 \
-                      http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                    api_ready=true
-                    break
-                  fi
-                  sleep 1
-                done
-                [[ "$api_ready" == true ]] \
-                  || fail "adaptive-v2 health check failed; static-8 restore failed"
-                fail "adaptive-v2 health check failed; static-8 restored"
-              fi
-              ;;
-            web-ssr-diagnostics)
-              web_ssr_profile_args=(
-                --only PLATFORM_WEB_WORKERS
-                --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT
-                --only PLATFORM_LOG_LEVEL
-                --only PLATFORM_PERF_LOG_ENABLED
-                --only PLATFORM_SSR_PERF_LOG_ENABLED
-                --only PLATFORM_SSR_PERF_SAMPLE_RATE
-                --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
-                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-              )
-              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                --apply \
-                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                --profile "$runtime_profile" \
-                "${web_ssr_profile_args[@]}"
-              api_env="$runtime/shared/env/api.env"
-              grep -qx 'PLATFORM_LOG_LEVEL=INFO' "$api_env" \
-                || fail "web SSR diagnostic API env did not select INFO log level"
-              grep -qx 'PLATFORM_PERF_LOG_ENABLED=true' "$api_env" \
-                || fail "web SSR diagnostic API perf logging is not enabled"
-              grep -qx 'PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=true' "$api_env" \
-                || fail "web SSR diagnostic API auth bootstrap log gate is not enabled"
-              if ! restart_api_and_wait; then
-                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                  --apply \
-                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                  --profile baseline \
-                  "${web_ssr_profile_args[@]}"
-                restart_api_and_wait \
-                  || fail "web SSR diagnostic API health check failed; baseline restore failed"
-                fail "web SSR diagnostic API health check failed; baseline restored"
-              fi
-              systemctl restart deadlock-web
-              web_ready=false
-              for _ in $(seq 1 30); do
-                if systemctl is-active --quiet deadlock-web \
-                  && curl --fail --silent --show-error --max-time 2 \
-                    http://127.0.0.1:3000/ >/dev/null; then
-                  web_ready=true
-                  break
-                fi
-                sleep 1
-              done
-              if [[ "$web_ready" != true ]]; then
-                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                  --apply \
-                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                  --profile baseline \
-                  "${web_ssr_profile_args[@]}"
-                restart_api_and_wait \
-                  || fail "web SSR diagnostic profile health check failed; API baseline restore failed"
-                systemctl restart deadlock-web
-                web_ready=false
-                for _ in $(seq 1 30); do
-                  if systemctl is-active --quiet deadlock-web \
-                    && curl --fail --silent --show-error --max-time 2 \
-                      http://127.0.0.1:3000/ >/dev/null; then
-                    web_ready=true
-                    break
-                  fi
-                  sleep 1
-                done
-                [[ "$web_ready" == true ]] \
-                  || fail "web SSR diagnostic profile health check failed; baseline restore failed"
-                fail "web SSR diagnostic profile health check failed; baseline restored"
-              fi
-              ;;
-            web-ssr-native-transport)
-              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                --apply \
-                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                --profile "$runtime_profile" \
-                --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT
-              restart_web_and_wait
-              ;;
-            web-ssr-workers-2)
-              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                --apply \
-                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                --profile "$runtime_profile" \
-                --only PLATFORM_WEB_WORKERS \
-                --only PLATFORM_WEB_SERVER_AUTH_TRANSPORT
-              restart_web_and_wait
-              ;;
-            read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24)
-              candidate_profile_args=(
-                --only PLATFORM_API_WORKERS
-                --only PLATFORM_UVICORN_LOOP
-                --only PLATFORM_UVICORN_HTTP
-                --only PLATFORM_DB_POOL_SIZE
-                --only PLATFORM_DB_MAX_OVERFLOW
-                --only PLATFORM_DB_POOL_PRE_PING
-                --only PLATFORM_DB_CONNECTION_BUDGET
-                --only PLATFORM_AUTHENTICATED_READ_ADMISSION_ENABLED
-                --only PLATFORM_AUTHENTICATED_READ_ADMISSION_CONCURRENCY
-                --only PLATFORM_AUTHENTICATED_READ_ADMISSION_MAX_WAITERS
-                --only PLATFORM_AUTHENTICATED_READ_ADMISSION_WAIT_TIMEOUT_MS
-                --only PLATFORM_READY_VOTE_CPU_PROFILE_DIR
-                --only PLATFORM_PERF_SLOW_REQUEST_MS
-                --only PLATFORM_PERF_LOG_MUTATIONS
-                --only PLATFORM_LOG_LEVEL
-                --only PLATFORM_PERF_LOG_ENABLED
-                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-                --only PLATFORM_SSR_PERF_LOG_ENABLED
-                --only PLATFORM_SSR_PERF_SAMPLE_RATE
-                --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
-              )
-              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                --apply \
-                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                --profile "$runtime_profile" \
-                "${candidate_profile_args[@]}"
-              systemctl restart deadlock-api
-              api_ready=false
-              for _ in $(seq 1 30); do
-                if systemctl is-active --quiet deadlock-api \
-                  && curl --fail --silent --show-error --max-time 2 \
-                    http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                  api_ready=true
-                  break
-                fi
-                sleep 1
-              done
-              if [[ "$api_ready" != true ]]; then
-                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                  --apply \
-                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                  --profile baseline \
-                  "${candidate_profile_args[@]}"
-                systemctl restart deadlock-api
-                api_ready=false
-                for _ in $(seq 1 30); do
-                  if systemctl is-active --quiet deadlock-api \
-                    && curl --fail --silent --show-error --max-time 2 \
-                      http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                    api_ready=true
-                    break
-                  fi
-                  sleep 1
-                done
-                [[ "$api_ready" == true ]] \
-                  || fail "runtime profile health check failed; baseline restore failed"
-                fail "runtime profile health check failed; baseline restored"
-              fi
-              ;;
-            api-3x16)
-              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                --apply \
-                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                --profile api-3x16 \
-                --only PLATFORM_API_WORKERS \
-                --only PLATFORM_DB_POOL_SIZE \
-                --only PLATFORM_DB_MAX_OVERFLOW \
-                --only PLATFORM_DB_CONNECTION_BUDGET \
-                --only PLATFORM_LOG_LEVEL \
-                --only PLATFORM_PERF_LOG_ENABLED \
-                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-              systemctl restart deadlock-api
-              api_ready=false
-              for _ in $(seq 1 30); do
-                if systemctl is-active --quiet deadlock-api \
-                  && curl --fail --silent --show-error --max-time 2 \
-                    http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                  api_ready=true
-                  break
-                fi
-                sleep 1
-              done
-              if [[ "$api_ready" != true ]]; then
-                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                  --apply \
-                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                  --profile baseline \
-                  --only PLATFORM_API_WORKERS \
-                  --only PLATFORM_DB_POOL_SIZE \
-                  --only PLATFORM_DB_MAX_OVERFLOW \
-                  --only PLATFORM_DB_CONNECTION_BUDGET \
-                  --only PLATFORM_LOG_LEVEL \
-                  --only PLATFORM_PERF_LOG_ENABLED \
-                  --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-                systemctl restart deadlock-api
-                api_ready=false
-                for _ in $(seq 1 30); do
-                  if systemctl is-active --quiet deadlock-api \
-                    && curl --fail --silent --show-error --max-time 2 \
-                      http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                    api_ready=true
-                    break
-                  fi
-                  sleep 1
-                done
-                [[ "$api_ready" == true ]] \
-                  || fail "API did not recover on baseline runtime profile"
-                fail "runtime profile health check failed; baseline restored"
-              fi
-              ;;
-            api-1x48)
-              "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                --apply \
-                --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                --profile api-1x48 \
-                --only PLATFORM_API_WORKERS \
-                --only PLATFORM_DB_POOL_SIZE \
-                --only PLATFORM_DB_MAX_OVERFLOW \
-                --only PLATFORM_DB_CONNECTION_BUDGET \
-                --only PLATFORM_LOG_LEVEL \
-                --only PLATFORM_PERF_LOG_ENABLED \
-                --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-              systemctl restart deadlock-api
-              api_ready=false
-              for _ in $(seq 1 30); do
-                if systemctl is-active --quiet deadlock-api \
-                  && curl --fail --silent --show-error --max-time 2 \
-                    http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                  api_ready=true
-                  break
-                fi
-                sleep 1
-              done
-              if [[ "$api_ready" != true ]]; then
-                "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
-                  --apply \
-                  --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
-                  --profile baseline \
-                  --only PLATFORM_API_WORKERS \
-                  --only PLATFORM_DB_POOL_SIZE \
-                  --only PLATFORM_DB_MAX_OVERFLOW \
-                  --only PLATFORM_DB_CONNECTION_BUDGET \
-                  --only PLATFORM_LOG_LEVEL \
-                  --only PLATFORM_PERF_LOG_ENABLED \
-                  --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
-                systemctl restart deadlock-api
-                api_ready=false
-                for _ in $(seq 1 30); do
-                  if systemctl is-active --quiet deadlock-api \
-                    && curl --fail --silent --show-error --max-time 2 \
-                      http://127.0.0.1:8010/api/v1/health/ready >/dev/null; then
-                    api_ready=true
-                    break
-                  fi
-                  sleep 1
-                done
-                [[ "$api_ready" == true ]] \
-                  || fail "API did not recover on baseline runtime profile"
-                fail "runtime profile health check failed; baseline restored"
-              fi
-              ;;
-            *)
-              fail "unsupported runtime profile: $runtime_profile"
-              ;;
-          esac
-
-          # SSR diagnostics are read by the Next.js process at startup. Several
-          # API-oriented runtime profiles also write those keys while updating
-          # their own limits, so a successful API restart alone can leave the
-          # web process on the previous diagnostic state.
-          case "$runtime_profile" in
-            baseline|ready-vote-static-*|ready-vote-cprofile|ready-vote-adaptive-v2|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|uvicorn-classic|uvicorn-optimized|api-pool-*)
-              restart_web_and_wait
-              ;;
-          esac
-
-          printf 'Production deployment completed for %s.\n' "$target_sha"
-          REMOTE
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
 
       - name: Deployment summary
         if: ${{ success() }}
         shell: bash
         run: |
           {
-            echo "### Platform production $DEPLOY_MODE"
+            echo "### Platform production deploy"
             echo
             echo "- Commit: \`$TARGET_SHA\`"
-            echo "- Mode: \`$DEPLOY_MODE\`"
             echo "- Web compression: \`$PLATFORM_WEB_NEXT_COMPRESSION\`"
             echo "- Status: passed"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Mark production deployment successful
-        if: ${{ success() && env.DEPLOY_MODE == 'deploy' }}
+        if: ${{ success() }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"success\",\"context\":\"platform-production-deploy\",\"description\":\"Production deployment and live smoke passed\",\"target_url\":\"${run_url}\"}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          curl --fail-with-body --silent --show-error --request POST --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" --data "{\"state\":\"success\",\"context\":\"platform-production-deploy\",\"description\":\"Production deployment and live smoke passed\",\"target_url\":\"${run_url}\"}"
 
       - name: Mark production deployment failed
-        if: ${{ failure() && env.DEPLOY_MODE == 'deploy' }}
+        if: ${{ failure() }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
-            --data "{\"state\":\"failure\",\"context\":\"platform-production-deploy\",\"description\":\"Production deployment failed\",\"target_url\":\"${run_url}\"}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          curl --fail-with-body --silent --show-error --request POST --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" --data "{\"state\":\"failure\",\"context\":\"platform-production-deploy\",\"description\":\"Production deployment failed\",\"target_url\":\"${run_url}\"}"

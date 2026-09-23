@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-02
+- Last reviewed: 2026-09-13
 
 ## Invariants
 
@@ -10,14 +10,16 @@
 - Secrets, TLS, staging, runtimes, backups and reports live under `/opt/oldsparky/platform/shared`, outside immutable releases.
 - Nginx is the only public origin listener. Application/data services bind loopback.
 - PostgreSQL is authoritative for durable state; Redis owns bounded ephemeral state, locks, cache and Celery transport; R2 is not a database.
-- Tournament invite-use and participant-capacity decisions are serialized in
-  PostgreSQL: invite claim/revoke locks the tournament row and then the invite
-  row, ordinary joins claim durable per-tournament slots with
-  `FOR UPDATE SKIP LOCKED`, and inactive restoration retains the lifecycle
-  lock before reactivation. The unique participant key and slot table remain
-  authoritative; Redis is not the capacity store. The slot table keeps a
-  bounded free-slot inventory and allocates sparse slot rows on demand above
-  the inventory window, so a large advertised capacity never materializes
+- Tournament revocation and participant-capacity decisions are serialized in
+  PostgreSQL: invite revocation and self-service join/leave or organizer
+  participant mutations lock the tournament row before lifecycle/capacity
+  checks, and slot claims use `FOR UPDATE SKIP LOCKED` only for the bounded
+  queue. Read-only invite lookup/bearer access performs no durable claim,
+  use-count or membership write. Inactive restoration retains the same
+  lifecycle lock before reactivation. The unique participant key and slot
+  table remain authoritative; Redis is not the capacity store. The slot table
+  keeps a bounded free-slot inventory and allocates sparse slot rows on demand
+  above the inventory window, so a large advertised capacity never materializes
   millions of rows.
 - Ready Check is time-based. The tournament workspace sends
   `ready_check_starts_at`, `ready_check_ends_at` and a UTC `server_time` anchor;
@@ -202,7 +204,25 @@ FastAPI exposes no `/api/v1/uploads/*` media-serving route and has no uploads `S
 - Only managed Cloudflare ranges may supply `CF-Connecting-IP`; FastAPI accepts proxy headers only from loopback.
 - Cookie mutations require application CSRF controls even behind Cloudflare.
 - Anonymous public response DTOs are explicit schema allowlists: account/contact email and Steam authentication identity do not cross the public-profile boundary, while participant moderation note, moderator identity and moderation timestamps are restricted to the organizer-management DTO.
-- Invite-only tournament workspace reads (`workspace`, roster, matches and bracket) require active participant membership or explicit organizer/admin authority; retained `withdrawn`/`disqualified` participant rows are historical and grant no workspace access.
+- Invite-only summary/workspace/roster/matches/bracket reads require a valid
+  bearer code, active participant membership or explicit organizer/admin
+  authority. Retained `withdrawn`/`disqualified` participant rows grant no
+  access without a valid code and never authorize profile/workflow/manage
+  surfaces.
+- A valid nonrevoked, nonexpired invite code is an unlimited, non-consuming
+  bearer read capability only for the exact summary, workspace, participant,
+  matches and bracket GET routes. FastAPI's matched route template is checked
+  against a closed allowlist; profile/workflow/manage reads and all writes do
+  not inherit bearer access. Direct bearer attempts use an HMAC-derived
+  IP/code Redis bucket and fail closed when Redis is unavailable. Workspace
+  serialization omits default invite discovery and echoes only the exact
+  validated presented code; legacy invite usage counters remain
+  non-authoritative compatibility fields. The shared raw-code validator also
+  gates custom tournament creation and code-status lookup (10–24 ASCII
+  alphanumeric characters, uppercase canonical form) without lossy cleanup;
+  malformed values return a generic `422` before persistence. Bracket reads
+  complete current authorization and rate-limit checks before conditional ETag
+  comparison, and the ETag covers only authorization-independent state.
 - Ready Check timing is carried by the authenticated/eligible tournament
   workspace response and is not an authorization grant. The browser timer is
   presentation-only; the vote transaction checks server time and all durable

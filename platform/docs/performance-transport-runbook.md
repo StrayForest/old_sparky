@@ -30,19 +30,19 @@ not hidden by stale startup configuration. For the same sampled requests, Next.j
 correlation headers to `GET /api/v1/auth/bootstrap`; the API uses those headers
 only for the marked diagnostic hop. The API then emits its existing bounded
 `request_perf` record even when the request is faster than the normal slow
-request threshold. In the separate timeout-path mode below, only requests
-marked by the external runner's bounded diagnostic ID are promoted from the
-sampled trace to full SSR/API lifecycle evidence when this profile is active;
-the load shape remains unchanged. Applying the profile restarts both
+request threshold. In the separate timeout-path mode below, only the bounded
+timeout observation population is promoted from the sampled trace to full
+SSR/API lifecycle evidence when this profile is active; identifiers remain
+transient and the load shape remains unchanged. Applying the profile restarts both
 `deadlock-api` and `deadlock-web` with readiness checks because the API gate is read at process
 startup; restoring `ready-vote-static-8` returns both services to baseline.
 The marker is not accepted as a standalone production switch: the API gate is
 disabled in the baseline and the route/method check is mandatory.
 
-The production observer joins these records by `request_id`; for the direct
-internal API hop it falls back to the same request's `cf_ray` when the API
-server does not preserve the incoming request ID. The report exposes the join
-method without serializing either identifier. Read
+The production observer may use request-local correlation internally while it
+is reducing the journal window, but it never persists the request ID or
+Cloudflare ray. The report exposes only aggregate join counts and the join
+method class. Read
 `correlated_html.timeline[].api_request_perf[]` together with the SSR stages:
 
 - `total_ms`/`request_ms`, `sql_ms`, pool wait and the
@@ -72,18 +72,18 @@ performance result or optimization A/B. Keep the load contract unchanged
 change workers, pools, admission, timeout values, auth/cache/security
 semantics, Nginx/Cloudflare behavior or application logic.
 
-The external runner assigns one bounded `tdiag-<workflow-run-id>-<user-index>`
-ID to each page request and records UTC start, timeout/exception and finish
-times. The opt-in header is retained in the Nginx access record. The first,
-low-overhead timeout contour keeps the pre-window runtime unchanged: it joins
-the client timeout population to Nginx's upstream status/timings and the
-nearest system/CPU/PostgreSQL samples, but intentionally leaves SSR/event-loop
-and API request logging off. Therefore an absent SSR/API row in this contour
-means “not instrumented”, not “not called”. The optional full diagnostic
-profile promotes marked requests to SSR/API lifecycle evidence and event-loop
-samples, but must be treated as a diagnostic-pressure window if it creates
-restarts or unexpected statuses. The report keeps Nginx's own request ID
-separately so the two identities cannot be confused.
+The timeout contour uses bounded observation order rather than persisting a
+request, diagnostic, correlation, Cloudflare-ray or user identifier. The
+client timeout population is joined to Nginx's allowlisted route class,
+upstream status/timings and numeric system/CPU/PostgreSQL aggregates. The
+first, low-overhead contour intentionally leaves SSR/event-loop and API
+request logging off; an absent SSR/API row therefore means “not instrumented”,
+not “not called”. The optional full diagnostic profile promotes marked
+requests to SSR/API lifecycle evidence and event-loop samples, but must be
+treated as a diagnostic-pressure window if it creates restarts or unexpected
+statuses. Reports retain only `observation_index`, route class, status, error
+class, completion booleans, bounded stage counts and timings; unknown routes
+map to `other`.
 
 Run sequencing is deliberately three-step:
 
@@ -106,18 +106,16 @@ Run sequencing is deliberately three-step:
    mode. If the minimal contour leaves an origin-localized timeout unresolved,
    run the full profile as a separately identified diagnostic window, then
    restore the pre-window profile.
-2. Read `timeout-diagnostics.json` per diagnostic ID. Missing Nginx evidence
-   means only “not observed at origin” (client vs Cloudflare is unresolved),
-   not proof that an edge layer was healthy. API start without completion
-   means the API accepted the call but completion was not observed. A later
-   Nginx completion is explicitly marked when it occurs at or after the client
-   timeout. When `request_time` is present, the report also derives the
-   approximate origin-start delta by subtracting that duration from the
-   second-precision Nginx completion timestamp; only a delta greater than one
-   second is called “origin started after client timeout”. Compare each row
-   with the nearest system sample; event-loop evidence is available only when
-   the full diagnostic profile was active. Do not infer CPU saturation from
-   aggregate CPU alone.
+2. Read the bounded `timeout-diagnostics.json` rows by observation index.
+   Missing Nginx evidence means only “not observed at origin” (client vs
+   Cloudflare is unresolved), not proof that an edge layer was healthy. API
+   start without completion means the API accepted the call but completion was
+   not observed. Because correlation identifiers and timestamps are not
+   persisted, the report deliberately does not infer cross-clock ordering or
+   claim an origin completion after the client timeout. Compare numeric rows
+   with the nearest aggregate system sample; event-loop evidence is available
+   only when the full diagnostic profile was active. Do not infer CPU
+   saturation from aggregate CPU alone.
 3. Restore the exact pre-window runtime profile through the production deploy
    workflow (substitute the recorded profile in the assignment below), for
    example:
@@ -134,10 +132,10 @@ Run sequencing is deliberately three-step:
    Verify both services are ready, confirm diagnostics are off and confirm
    `MemoryMax` is unchanged; this workflow must not be used to tune the
    memory ceiling. The supervisor always performs exact
-   fixture cleanup; its temporary manifest and diagnostic-ID handoff are
-   removed at the barrier. Do not delete the retained diagnostic artifact
-   until the evidence review is complete, then apply the normal bounded
-   storage-retention procedure.
+   fixture cleanup; its temporary manifest and handoff are removed at the
+   barrier. Do not delete the retained diagnostic artifact until the evidence
+   review is complete, then apply the normal bounded storage-retention
+   procedure.
 
 Only after the evidence identifies a reversible bottleneck may an operator
 propose a separate fix for approval. Do not rerun the full 20,000/20,000
@@ -236,16 +234,16 @@ headers, and never prints the cookie or response body:
 cd /opt/oldsparky/platform/current
 python3 tools/platform_ttfb_probe.py \
   --cookie-file /run/oldsparky/qa-cookie \
-  --request-id ttfb-hop-<run-id> \
-  --hop next=http://127.0.0.1:3000/tournaments/<slug> \
-  --hop nginx=https://127.0.0.1/tournaments/<slug> \
-  --hop cloudflare=https://old-sparky.com/tournaments/<slug>
+  --hop next=http://127.0.0.1:3000/tournaments/<fixture-slug> \
+  --hop nginx=https://127.0.0.1/tournaments/<fixture-slug> \
+  --hop cloudflare=https://old-sparky.com/tournaments/<fixture-slug>
 ```
 
 Compare `ttfb_ms`, `content-encoding`, `transfer-encoding`,
-`x-accel-buffering`, `cf-cache-status` and `cf-ray`. The public hop is the
-visitor-facing evidence. Repeat the probe enough times to see variance; do not
-add its single-request values to external-load p95s.
+`x-accel-buffering`, `cf-cache-status` and the bounded Cloudflare error class.
+The public hop is the visitor-facing evidence; raw request IDs and ray values
+are not retained. Repeat the probe enough times to see variance; do not add
+its single-request values to external-load p95s.
 
 ## Compression A/B
 
@@ -294,8 +292,16 @@ gh workflow run platform-production-web-runtime-diagnostics.yml \
   -f until_utc=2026-09-09T09:54:00Z
 ```
 
-Inspect systemd exit/result, restart count, memory peak/current, the sanitized
-service/kernel journal, and any filesystem/inode/mount facts captured by a
-candidate activation failure. Do not raise `MemoryMax`, scale workers or alter
+Inspect systemd exit/result, restart count, memory peak/current, the fixed
+aggregate service/kernel journal summaries, Nginx service state and its bounded
+error summary, plus any filesystem/inode/mount facts captured by a candidate
+activation failure.
+The diagnostics producer and both summary helpers are release-owned contracts:
+an unavailable helper, service query or Nginx error log fails the workflow and
+must be investigated as a collection failure. Only a successful producer with
+no records may produce the fixed `empty` summary; no raw-log fallback is
+permitted. Production SSH material is step-scoped and removed before the
+aggregate artifact upload.
+Do not raise `MemoryMax`, scale workers or alter
 the database pool until the restart cause is identified and a focused rollback
 plan exists. A web restart can create both 502s and secondary TTFB queueing.

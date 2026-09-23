@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: read
-  statuses: write
 
 concurrency:
   group: platform-media-migration-diagnostics
@@ -18,13 +17,13 @@ concurrency:
 jobs:
   media-inventory:
     name: Production legacy media inventory
+    permissions:
+      contents: read
+      statuses: write
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: production
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       TARGET_SHA: ${{ github.sha }}
 
     steps:
@@ -45,16 +44,22 @@ jobs:
 
       - name: Configure SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           test -n "${PROD_SSH_HOST:-}"
-          test -n "${PROD_SSH_USER:-}"
           test -n "${PROD_SSH_KEY:-}"
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
-          chmod 600 ~/.ssh/old_sparky_prod
-          ssh_scan="$(mktemp)"
-          trap 'rm -f -- "$ssh_scan"' EXIT
+          ssh_dir="$RUNNER_TEMP/platform-media-migration-diagnostics-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-media-migration-diagnostics-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          fi
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
           ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
           ssh_key_count="$(wc -l < "$ssh_scan" | tr -d ' ')"
@@ -64,41 +69,75 @@ jobs:
             echo "Production SSH host fingerprint mismatch" >&2
             exit 1
           }
-          install -m 0600 "$ssh_scan" ~/.ssh/known_hosts
+          install -m 0600 "$ssh_scan" "$ssh_dir/known_hosts"
           {
             printf '%s\n' 'Host *'
             printf '%s\n' '  StrictHostKeyChecking yes'
-            printf '  UserKnownHostsFile %s/.ssh/known_hosts\n' "$HOME"
-          } > ~/.ssh/config
-          chmod 600 ~/.ssh/config
-          chmod 600 ~/.ssh/known_hosts
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          chmod 600 "$ssh_dir/known_hosts"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Inspect production legacy media sources
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          umask 077
+          capture_dir="$RUNNER_TEMP/platform-media-migration-diagnostics-capture"
+          test "$capture_dir" = "$RUNNER_TEMP/platform-media-migration-diagnostics-capture"
+          if [[ -e "$capture_dir" || -L "$capture_dir" ]]; then
+            test -d "$capture_dir" && test ! -L "$capture_dir"
+          fi
+          install -d -m 700 "$capture_dir"
+          remote_log="$(mktemp "$capture_dir/remote-log.XXXXXX")"
+          remote_error="$(mktemp "$capture_dir/remote-error.XXXXXX")"
+          chmod 600 "$remote_log" "$remote_error"
+          printf '%s\n' \
+            "MEDIA_CAPTURE_DIR=$capture_dir" \
+            "MEDIA_REMOTE_LOG=$remote_log" \
+            "MEDIA_REMOTE_ERROR=$remote_error" >> "$GITHUB_ENV"
+          cleanup_media_capture() {
+            trap - EXIT
+            rm -f -- "$remote_log" "$remote_error"
+            test ! -e "$remote_log" && test ! -e "$remote_error"
+          }
+          trap cleanup_media_capture EXIT
+          set +e
           ssh \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod \
+            -F "$SSH_DIR/config" \
+            -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            'bash -s' <<'REMOTE'
+            'bash -s' >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           python_bin="$runtime/shared/venv/bin/python"
           env_file="$runtime/shared/env/api.env"
-          report_file="$(mktemp)"
-          error_file="$(mktemp)"
-          cleanup() {
-            rm -f -- "$report_file" "$error_file"
+          summary_tool="$current/tools/platform_media_migration_diagnostics_summary.py"
+          umask 077
+          private_report="$(mktemp "$runtime/shared/.media-migration-private.XXXXXX")"
+          private_error="$(mktemp "$runtime/shared/.media-migration-private-error.XXXXXX")"
+          public_report="$(mktemp "$runtime/shared/.media-migration-public.XXXXXX")"
+          projector_error="$(mktemp "$runtime/shared/.media-migration-projector-error.XXXXXX")"
+          chmod 600 "$private_report" "$private_error" "$public_report" "$projector_error"
+          cleanup_media_files() {
+            rm -f -- "$private_report" "$private_error" "$public_report" "$projector_error"
           }
-          trap cleanup EXIT
+          trap cleanup_media_files EXIT
 
           test -x "$python_bin"
           test -f "$env_file" && test ! -L "$env_file"
-          test -x "$current/tools/platform_migrate_legacy_r2.py"
+          test -f "$current/tools/platform_migrate_legacy_r2.py" \
+            && test ! -L "$current/tools/platform_migrate_legacy_r2.py" \
+            && test -x "$current/tools/platform_migrate_legacy_r2.py"
+          test -f "$summary_tool" && test ! -L "$summary_tool"
           cd "$current"
 
           set +e
@@ -108,63 +147,114 @@ jobs:
               tools/platform_migrate_legacy_r2.py \
               --env-file "$env_file" \
               --max-records 1000 \
-              --json >"$report_file" 2>"$error_file"
-          inventory_exit="$?"
+              --json >"$private_report" 2>"$private_error"
+          producer_exit="$?"
           set -e
 
-          "$python_bin" - "$inventory_exit" "$report_file" "$error_file" <<'PY'
-          from __future__ import annotations
+          stderr_bytes="$(wc -c <"$private_error" | tr -d '[:space:]')"
+          set +e
+          "$python_bin" "$summary_tool" \
+            --input "$private_report" \
+            --producer-exit-code "$producer_exit" \
+            --stderr-bytes "$stderr_bytes" \
+            >"$public_report" 2>"$projector_error"
+          projector_exit="$?"
+          set -e
 
-          from collections import Counter
-          import json
-          from pathlib import Path
-          import sys
+          public_cleanup_ok=true
+          rm -f -- "$private_report" "$private_error" "$projector_error" || public_cleanup_ok=false
+          for private_file in "$private_report" "$private_error" "$projector_error"; do
+            if [[ -e "$private_file" || -L "$private_file" ]]; then
+              public_cleanup_ok=false
+            fi
+          done
+          if [[ "$public_cleanup_ok" != true ]]; then
+            exit 1
+          fi
 
-          exit_code = int(sys.argv[1])
-          report_path = Path(sys.argv[2])
-          error_path = Path(sys.argv[3])
-          raw = report_path.read_text(encoding="utf-8", errors="replace").strip()
-          try:
-              payload = json.loads(raw)
-          except json.JSONDecodeError:
-              print(
-                  "MEDIA_INVENTORY",
-                  json.dumps(
-                      {
-                          "ok": False,
-                          "code": "diagnostic_output_not_json",
-                          "exit_code": exit_code,
-                          "stderr_bytes": error_path.stat().st_size,
-                      },
-                      separators=(",", ":"),
-                  ),
-              )
-              raise SystemExit(1)
-
-          source_results = payload.get("source_results") or []
-          failure_codes = Counter(
-              str(item.get("code") or "unknown")
-              for item in source_results
-              if isinstance(item, dict) and item.get("ok") is False
-          )
-          summary = {
-              "exit_code": exit_code,
-              "ok": bool(payload.get("ok")),
-              "code": payload.get("code"),
-              "mutated": bool(payload.get("mutated")),
-              "inventory_before": payload.get("inventory_before") or {},
-              "source_locations": payload.get("source_locations") or {},
-              "source_failures": dict(sorted(failure_codes.items())),
-              "operations": payload.get("operations") or {},
-          }
-          print("MEDIA_INVENTORY", json.dumps(summary, sort_keys=True, separators=(",", ":")))
-
-          if summary["mutated"]:
-              raise SystemExit("check-only media diagnostics reported an unexpected mutation")
-          if exit_code not in {0, 2}:
-              raise SystemExit(f"unexpected media diagnostics exit code: {exit_code}")
-          PY
+          public_pattern='^\{"schema":1,"kind":"media_migration_diagnostics","status":"(passed|failed)","error_class":"(none|cutover_required|source_conflict|manual_conflict|inventory_bound|legacy_references|mutation_detected|unexpected_exit|producer|internal|remote_or_transport)","source_class":"(none|r2|local|both|mixed|unknown)","producer_exit_code":[0-9]{1,3},"stderr_bytes":[0-9]{1,7},"mutated":(true|false),"read_only":(true|false),"inventory_before_present":(true|false),"inventory_after_present":(true|false),"inventory_clear":(true|false),"source_present":(true|false),"source_failures_present":(true|false),"inventory_before_legacy_upload_references":[0-9]{1,7},"inventory_before_packaged_asset_references":[0-9]{1,7},"inventory_before_manual_conflicts":[0-9]{1,7},"inventory_after_legacy_upload_references":[0-9]{1,7},"inventory_after_packaged_asset_references":[0-9]{1,7},"inventory_after_manual_conflicts":[0-9]{1,7},"source_result_count":[0-9]{1,7},"source_failure_count":[0-9]{1,7},"processed_count":[0-9]{1,7},"succeeded_count":[0-9]{1,7},"failed_count":[0-9]{1,7},"operation_r2_gets":[0-9]{1,7},"operation_local_reads":[0-9]{1,7},"operation_r2_head_objects":[0-9]{1,7},"operation_cdn_gets":[0-9]{1,7},"operation_list_objects":[0-9]{1,7},"operation_legacy_r2_deletes":[0-9]{1,7},"operation_local_deletes":[0-9]{1,7}\}$'
+          if grep -Eq "$public_pattern" "$public_report"; then
+            IFS= read -r public_line < "$public_report"
+            printf 'MEDIA_INVENTORY %s\n' "$public_line"
+          else
+            printf '%s\n' '{"schema":1,"kind":"media_migration_diagnostics","status":"failed","error_class":"producer","source_class":"unknown","producer_exit_code":255,"stderr_bytes":0,"mutated":false,"read_only":false,"inventory_before_present":false,"inventory_after_present":false,"inventory_clear":false,"source_present":false,"source_failures_present":false,"inventory_before_legacy_upload_references":0,"inventory_before_packaged_asset_references":0,"inventory_before_manual_conflicts":0,"inventory_after_legacy_upload_references":0,"inventory_after_packaged_asset_references":0,"inventory_after_manual_conflicts":0,"source_result_count":0,"source_failure_count":0,"processed_count":0,"succeeded_count":0,"failed_count":0,"operation_r2_gets":0,"operation_local_reads":0,"operation_r2_head_objects":0,"operation_cdn_gets":0,"operation_list_objects":0,"operation_legacy_r2_deletes":0,"operation_local_deletes":0}'
+            projector_exit=1
+          fi
+          exit "$projector_exit"
           REMOTE
+          remote_status="$?"
+          set -e
+          public_pattern='^MEDIA_INVENTORY \{"schema":1,"kind":"media_migration_diagnostics","status":"(passed|failed)","error_class":"(none|cutover_required|source_conflict|manual_conflict|inventory_bound|legacy_references|mutation_detected|unexpected_exit|producer|internal|remote_or_transport)","source_class":"(none|r2|local|both|mixed|unknown)","producer_exit_code":[0-9]{1,3},"stderr_bytes":[0-9]{1,7},"mutated":(true|false),"read_only":(true|false),"inventory_before_present":(true|false),"inventory_after_present":(true|false),"inventory_clear":(true|false),"source_present":(true|false),"source_failures_present":(true|false),"inventory_before_legacy_upload_references":[0-9]{1,7},"inventory_before_packaged_asset_references":[0-9]{1,7},"inventory_before_manual_conflicts":[0-9]{1,7},"inventory_after_legacy_upload_references":[0-9]{1,7},"inventory_after_packaged_asset_references":[0-9]{1,7},"inventory_after_manual_conflicts":[0-9]{1,7},"source_result_count":[0-9]{1,7},"source_failure_count":[0-9]{1,7},"processed_count":[0-9]{1,7},"succeeded_count":[0-9]{1,7},"failed_count":[0-9]{1,7},"operation_r2_gets":[0-9]{1,7},"operation_local_reads":[0-9]{1,7},"operation_r2_head_objects":[0-9]{1,7},"operation_cdn_gets":[0-9]{1,7},"operation_list_objects":[0-9]{1,7},"operation_legacy_r2_deletes":[0-9]{1,7},"operation_local_deletes":[0-9]{1,7}\}$'
+          public_line="$(grep -E "$public_pattern" "$remote_log" | tail -n 1 || true)"
+          if [[ -n "$public_line" ]]; then
+            printf '%s\n' "$public_line"
+          else
+            printf '%s\n' 'MEDIA_INVENTORY {"schema":1,"kind":"media_migration_diagnostics","status":"failed","error_class":"remote_or_transport","source_class":"unknown","producer_exit_code":255,"stderr_bytes":0,"mutated":false,"read_only":false,"inventory_before_present":false,"inventory_after_present":false,"inventory_clear":false,"source_present":false,"source_failures_present":false,"inventory_before_legacy_upload_references":0,"inventory_before_packaged_asset_references":0,"inventory_before_manual_conflicts":0,"inventory_after_legacy_upload_references":0,"inventory_after_packaged_asset_references":0,"inventory_after_manual_conflicts":0,"source_result_count":0,"source_failure_count":0,"processed_count":0,"succeeded_count":0,"failed_count":0,"operation_r2_gets":0,"operation_local_reads":0,"operation_r2_head_objects":0,"operation_cdn_gets":0,"operation_list_objects":0,"operation_legacy_r2_deletes":0,"operation_local_deletes":0}'
+            remote_status=1
+          fi
+          if (( remote_status != 0 )); then
+            exit 1
+          fi
+
+      - name: Remove private media diagnostic capture
+        id: cleanup_media_capture
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          capture_dir="${MEDIA_CAPTURE_DIR:-$RUNNER_TEMP/platform-media-migration-diagnostics-capture}"
+          test "$capture_dir" = "$RUNNER_TEMP/platform-media-migration-diagnostics-capture"
+          if [[ -n "${MEDIA_REMOTE_LOG:-}" ]]; then
+            case "$MEDIA_REMOTE_LOG" in
+              "$capture_dir"/remote-log.*) rm -f -- "$MEDIA_REMOTE_LOG" ;;
+              *) exit 1 ;;
+            esac
+          fi
+          if [[ -n "${MEDIA_REMOTE_ERROR:-}" ]]; then
+            case "$MEDIA_REMOTE_ERROR" in
+              "$capture_dir"/remote-error.*) rm -f -- "$MEDIA_REMOTE_ERROR" ;;
+              *) exit 1 ;;
+            esac
+          fi
+          if [[ -e "$capture_dir" || -L "$capture_dir" ]]; then
+            test -d "$capture_dir" && test ! -L "$capture_dir"
+            rmdir -- "$capture_dir"
+          fi
+          printf '%s\n' 'MEDIA_CAPTURE_DIR=' 'MEDIA_REMOTE_LOG=' 'MEDIA_REMOTE_ERROR=' >> "$GITHUB_ENV"
+          unset MEDIA_CAPTURE_DIR MEDIA_REMOTE_LOG MEDIA_REMOTE_ERROR
+          test -z "${MEDIA_CAPTURE_DIR:-}" && test -z "${MEDIA_REMOTE_LOG:-}" && test -z "${MEDIA_REMOTE_ERROR:-}"
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-media-migration-diagnostics-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-media-migration-diagnostics-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
 
       - name: Mark media inventory successful
         if: ${{ success() }}

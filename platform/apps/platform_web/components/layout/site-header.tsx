@@ -37,6 +37,7 @@ export function SiteHeader() {
       aria-label={t("header.createTournament")}
       className={`${isCreateTournament ? "header-create-button active" : "header-create-button"} ${MOBILE_CREATE_BUTTON}`}
       href="/tournaments/new"
+      prefetch={false}
     >
       <PlusCircle size={16} aria-hidden="true" />
       <span className="header-create-label">{t("header.createTournament")}</span>
@@ -103,7 +104,7 @@ export function SiteHeader() {
           ) : user ? (
             <>
               {canOpenAdmin ? (
-                <Link aria-label={t("header.operations")} className="login-button compact-login-button" href="/platform-ops">
+                <Link aria-label={t("header.operations")} className="login-button compact-login-button" href="/platform-ops" prefetch={false}>
                   <Shield size={17} aria-hidden="true" />
                   <span className="header-operations-label">{t("header.operations")}</span>
                 </Link>
@@ -112,6 +113,7 @@ export function SiteHeader() {
                 aria-label={t("header.profileLabel", { name: user.display_name })}
                 className={`login-button ${MOBILE_ACCOUNT_BUTTON}`}
                 href="/profile/me"
+                prefetch={false}
               >
                 <span className="header-profile-avatar" aria-hidden="true">
                   {user.avatar_media || user.avatar_url ? (

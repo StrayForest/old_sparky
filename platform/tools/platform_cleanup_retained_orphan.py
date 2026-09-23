@@ -42,6 +42,7 @@ RUN_ROOT_BASE = Path("/opt/oldsparky/platform/shared/production-retained-matrix"
 SUPPORTED_MODES = frozenset({"read-mix", "write-burst"})
 LEGACY_EXTERNAL_VOTE_MODE = "external-vote"
 MAX_COMPACT_USER_RECOVERY = 20_000
+RUN_ID_PATTERN = r"[1-9][0-9]{0,31}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,7 +55,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _canonical_report_path(*, run_id: str, mode: str) -> str:
-    if not re.fullmatch(r"[0-9]+", run_id):
+    if not re.fullmatch(RUN_ID_PATTERN, run_id):
         raise RuntimeError("load run id must be numeric")
     if mode not in SUPPORTED_MODES:
         raise RuntimeError("durable orphan cleanup supports only retained matrix modes")
@@ -62,7 +63,7 @@ def _canonical_report_path(*, run_id: str, mode: str) -> str:
 
 
 def _legacy_external_vote_report_path(*, run_id: str) -> str:
-    if not re.fullmatch(r"[0-9]+", run_id):
+    if not re.fullmatch(RUN_ID_PATTERN, run_id):
         raise RuntimeError("load run id must be numeric")
     return str(
         RUN_ROOT_BASE
@@ -136,7 +137,7 @@ def build_durable_manifest(
     if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", normalized_control_email):
         raise RuntimeError("control email is invalid")
     return {
-        "control_email": normalized_control_email,
+        "_control_email": normalized_control_email,
         "mode": mode,
         "markers": {marker},
         "user_ids": set(user_ids),
@@ -219,7 +220,7 @@ async def clean_orphan(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("retained orphan cleanup must run as root")
     if args.confirm != CONFIRMATION:
         raise RuntimeError(f"cleanup requires --confirm {CONFIRMATION}")
-    if not re.fullmatch(r"[0-9]+", args.load_run_id):
+    if not re.fullmatch(RUN_ID_PATTERN, args.load_run_id):
         raise RuntimeError("load run id must be numeric")
     run_root = RUN_ROOT_BASE / f"gha-{args.load_run_id}"
     if run_root.exists() or run_root.is_symlink():

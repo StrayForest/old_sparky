@@ -62,7 +62,13 @@ async def _claim_sparse_participant_slot(
     participant_id: str,
     claimed_at: datetime | None,
 ) -> TournamentParticipantSlot:
-    """Allocate a slot above the bounded inventory without a tournament lock."""
+    """Allocate a sparse slot while the caller owns the tournament lock.
+
+    API lifecycle writers acquire ``Tournament`` before calling this helper;
+    the row lock, rather than the sparse ``max()`` probe, is the capacity
+    linearization point. Maintenance/repair callers must provide the same
+    transaction boundary when they can overlap with participant mutations.
+    """
 
     for _ in range(32):
         next_slot = await db_session.scalar(
@@ -106,7 +112,9 @@ async def claim_participant_slot(
     """Claim one capacity slot in the caller's transaction.
 
     `SKIP LOCKED` is deliberately scoped to this queue-like slot table. It is
-    never used to read or lock the authoritative tournament row.
+    never used to read or lock the authoritative tournament row. API callers
+    must already hold the authoritative Tournament row lock before invoking
+    this helper.
     """
 
     if max_participants is None:

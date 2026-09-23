@@ -386,7 +386,7 @@ function LifecycleSuccess({
       <h3>{title}</h3>
       <p>{text}</p>
       {href ? (
-        <Link className="primary-button" href={href}>{actionLabel}</Link>
+        <Link className="primary-button" href={href} prefetch={href === "/profile/me" ? false : undefined}>{actionLabel}</Link>
       ) : (
         <button className="secondary-button" onClick={onAction} type="button">{actionLabel}</button>
       )}

@@ -101,8 +101,7 @@ platform_load_env_file() {
       echo "Failed to decode platform environment value for: $key" >&2
       exit 1
     fi
-    printf -v "$key" '%s' "$value"
-    export "$key"
+    export "$key=$value"
   done <<<"$encoded_assignments"
 }
 

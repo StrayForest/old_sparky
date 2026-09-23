@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-09-07
+- Last reviewed: 2026-09-12
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -11,9 +11,10 @@ Use this document for the normal immutable release path. CSP mode changes and pr
 1. Work from a clean, reviewed commit; release metadata records the exact
    GitHub target SHA.
 2. Push the reviewed commit to `dev` and wait for the GitHub Actions
-   `Platform security and build` gate. A successful push run for the current
-   `dev` HEAD is the normal production release signal and is consumed by the
-   automatic deployment workflow; do not substitute a manually run local test.
+   `Platform security and build` gate. A successful full-route push run for the
+   current `dev` HEAD is the normal production release signal and is consumed
+   by the automatic deployment workflow; a docs-only or out-of-scope run is a
+   successful non-deployable no-op. Do not substitute a manually run local test.
 3. Confirm migration expand/rollback compatibility.
 4. Confirm services are healthy, disk has at least 5 GiB free and is below 85%, and `current`/`previous` releases are protected.
 5. Create a fresh restore-verified backup.
@@ -29,17 +30,40 @@ Normal production deployment is automatic after the reviewed commit is pushed
 to `dev`. The chain is:
 
 1. `Platform security and build` runs for the push and publishes the
-   `platform-security-build` commit status for the exact SHA.
+   `platform-security-build` commit status plus an exact classifier artifact
+   containing its schema/version, target SHA, expected gates and digest.
 2. `Platform production auto-deploy` receives the completed workflow event only
    for a push to `dev`.
-3. The auto-deploy gate re-reads the current `dev` HEAD and refuses a stale
-   successful CI result. It also requires `platform-security-build=success` and
-   skips a SHA that already reports `platform-production-deploy=success`.
+3. The auto-deploy gate downloads the classifier artifact from that exact
+   security run, validates its schema, digest, target SHA and non-fallback
+   deployable `full` route, then re-reads the current `dev` HEAD and refuses a
+   stale successful CI result. The source run and both status snapshots are
+   checked by the shared dependency-free
+   [`platform_workflow_provenance.py`](../tools/platform_workflow_provenance.py)
+   validator, including the exact repository/workflow/run attempt, SHA, event,
+   branch, conclusion, trusted actor, description and attempt URL. It also
+   requires `platform-security-build=success` and skips a SHA that already
+   reports `platform-production-deploy=success` only when the matching
+   successful deploy attempt has its exact bot-authored marker.
 4. When those checks pass, the auto-deploy workflow dispatches
    `Platform production deploy` with `mode=deploy` on `dev`.
-5. The production workflow repeats the exact-SHA security/build check before
-   packaging, SSH or any production release side effect, then builds, attests,
-   transfers and installs the immutable artifact and runs production smoke.
+5. The production workflow independently downloads and validates the same exact
+   classifier artifact and exact-SHA security/build check before packaging, SSH
+   or any production release side effect, then builds and attests the immutable
+   artifact. Immediately before its first production-host write, it re-reads
+   the authoritative `dev` branch head. If `dev` moved from `TARGET_SHA` (the
+   A→B race), the workflow aborts closed; only then does it transfer and install
+   the artifact and run production smoke.
+
+The dispatch `mode`, runtime profile, release slug, target SHA and artifact
+directory are checked by the bounded ASCII input guard before production host
+access or secret-file setup. They cross SSH only as a mode-600 JSON handoff to
+the fixed remote dispatcher; the host revalidates them before invoking the
+deployment supervisor. Deploy handoffs also require canonical positive decimal
+`classifier_run_id`/`classifier_run_attempt` values and the exact
+`web_compression=enabled|disabled` choice. Load-cleanup evidence is projected into its closed
+public schema before the private export inventory is removed, and an unknown,
+symlinked, special or leftover export entry fails the workflow.
 
 Do not manually dispatch the deploy workflow for a normal `dev` push. Observe
 the automatic chain and wait for the exact target SHA to finish:
@@ -74,13 +98,28 @@ revalidates the artifact and invokes the guarded release state machine. Record
 the Actions run URL/ID, target SHA, release slug and final smoke result in the
 handoff.
 
+The production Alembic wrapper keeps the exact `upgrade head` allowlist and,
+after the release transaction has quiesced writers, runs the catalog recovery
+helper. The helper acts only when `alembic_version` is exactly `20260901_0050`
+and a table matching the historical 0051 schema is present. It validates the
+table and constraints, idempotently backfills the projection, and repairs only
+invalid/unfinished concurrent indexes before stamping 0051. A valid index with
+the wrong definition or table, or any incompatible table/constraint, fails
+closed. Revision `20260913_0053` provides the same validation/repair as a
+forward migration for databases that already recorded 0051/0052; no downgrade
+or automatic migration reversal is performed.
+
 ### Manual workflow fallback
 
 `Platform production deploy` keeps `workflow_dispatch` as an operator fallback,
 not as the normal release path. Use manual dispatch only when an operator has an
 explicit reason to repeat preflight/deploy for the current reviewed `dev` HEAD
 or when diagnosing the automatic contour. The same exact-SHA
-`platform-security-build=success` gate still applies to `mode=deploy`.
+`platform-security-build=success` and deployable classifier artifact gates still
+apply to `mode=deploy`; provide the originating security `run_id` and
+`run_attempt`. A missing, malformed, fallback or non-deployable manifest blocks
+deployment. `mode=preflight` remains available without that release artifact
+guard and performs no install.
 
 For a read-only production gate without an install, an operator may dispatch
 `mode=preflight` explicitly. A manual fallback must never be used to bypass a
@@ -115,8 +154,16 @@ gh workflow run platform-production-deploy.yml \
   --repo StrayForest/old_sparky \
   --ref dev \
   -f mode=deploy \
-  -f runtime_profile=ready-vote-static-8
+  -f runtime_profile=ready-vote-static-8 \
+  -f classifier_run_id=<SECURITY_RUN_ID> \
+  -f classifier_run_attempt=<SECURITY_RUN_ATTEMPT>
 ```
+
+Use the `run_id` and `run_attempt` from the exact completed successful
+`Platform security and build` push run for the same `dev` SHA. The deploy
+workflow queries that run's workflow identity, event, branch, SHA, completion
+and conclusion, then requires the `platform-security-build` status to point to
+the same run URL; a missing, stale or mixed-attempt pair is rejected.
 
 The recovery workflow does not change the active release, database, Redis,
 Nginx configuration or application data. If the restart fails, its journal
@@ -124,20 +171,50 @@ output is the diagnostic handoff; do not weaken the preflight gate.
 
 ## Release state, activation and recovery
 
-The workflow's guarded wrapper leaves a durable transaction until migration, restart/readiness,
+The workflow's guarded wrapper acquires the release-independent lock at
+`/run/lock/oldsparky-platform-release.lock` before preflight and holds it
+through staging, migration, activation, smoke and abort/recovery. This stable
+lock is created/validated before a first bootstrap creates
+`APP_DIR/releases/shared`; installer, deploy, rollback, runtime restore and
+recovery use this same identity (with an inherited FD when nested). Before the
+first stop or stage side effect it atomically writes
+`shared/.release-operation.json` in `phase=quiesce-pending` with the original
+API/worker/web/timer state, pointer identities and candidate path. After
+staging, that same receipt is promoted to the operation schema before
+migration. Never print service environments or secrets.
+
+The production deploy workflow acquires the release lock before the retained
+load lock (`/run/lock/oldsparky-retained-load-matrix.lock`) and keeps both
+through candidate activation, runtime-profile changes, service
+restart/readiness, final smoke and the commit boundary. Retained-load and
+cleanup take only the load lock; storage maintenance acquires release then
+load; rollback, release recovery and service recovery take only the release
+lock. This is the only lock ordering and has no reverse edge. Release recovery
+passes its inherited release-lock file descriptor through
+rollback and runtime restoration, so Nginx and readiness are not changed after
+the lock is released.
+
+The wrapper leaves a durable transaction until migration, restart/readiness,
 Nginx apply and both smoke paths pass. It prepares service-owned runtime paths
-before restart, refreshes scoped env files, enables the reviewed health,
-Cloudflare and maintenance timers, and installs the off-site-backup unit/timer
-without silently enabling off-site backup before its manual restore-drill gate.
-Never print service environments or secrets.
+before restart and refreshes scoped env files. A rollback or recovery runtime
+restore installs unit files with `PLATFORM_ENABLE_SYSTEMD_UNITS=0`; restoring
+unit files never implicitly enables or starts a service or timer. The normal
+activation path owns the reviewed health, Cloudflare and maintenance timer
+enablement, and installs the off-site-backup unit/timer without silently
+enabling off-site backup before its manual restore-drill gate.
 
 If candidate activation fails, the workflow records read-only filesystem,
 inode, mount and API sandbox facts, plus a sanitized systemd snapshot and the
 last three minutes of API, worker and web journals before retaining the receipt
 for the documented recovery decision.
 
-Use `release-state-machine.md` for phase-specific recovery. A retained state
-after migration is an operator decision point, not an automatic rollback.
+Use `release-state-machine.md` for phase-specific recovery. An ERR/TERM/INT
+after the snapshot may restore the old runtime and only services that were
+active before quiesce, but it retains the migration receipt and never performs
+an Alembic downgrade. Abort restores units and Nginx without an unconditional
+restart, then checks only services that were active before quiesce. Intentionally
+inactive services and timers remain stopped. A pointer, identity, restart or
+readiness mismatch retains the receipt for another guarded attempt.
 
 If an operator explicitly chooses code/runtime rollback after reviewing
 database compatibility, use the guarded abort command. It restores the
@@ -149,6 +226,31 @@ tools/platform_release_deploy.sh \
   --confirm-migration-not-reversed \
   --app-dir /opt/oldsparky/platform
 ```
+
+The command restores and verifies only services recorded active before
+quiesce; intentionally inactive units and timers remain stopped. A restart,
+readiness, pointer or identity failure retains the receipt for another guarded
+attempt.
+
+Rollback has a separate root-owned
+`shared/.release-systemd-state.json` receipt. Before switching pointers it
+records the exact active (`active|inactive`) and enablement
+(`enabled|disabled|static`) state of every unit owned by the platform unit
+installer. The receipt is validated against the original release identities
+and is retained on an installer, restart, smoke or interruption failure.
+Recovery restores only that closed owned set, first without `--now` enablement
+and then to the recorded active state; an unsupported or malformed state fails
+closed. `--no-restart` installs the files with activation disabled and verifies
+the recorded active state without starting units. The receipt is removed only
+after the rollback transaction has completed successfully.
+
+The production abort workflow applies the same receipt authority: it accepts
+only a validated v2 transaction (or the exact pre-quiesce receipt), selects a
+release whose identity contract includes the v2 recovery implementation, and
+checks every API/worker/web unit and the Cloudflare timer against the durable
+pre-quiesce snapshot. It does not require intentionally inactive units to be
+active, and it fails closed while retaining the receipt if recovery, pointer,
+identity, or readiness evidence is incomplete.
 
 ## Smoke
 

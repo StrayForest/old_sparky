@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 import httpx
 
@@ -41,9 +45,45 @@ def document_html(nonce: str = NONCE) -> str:
 
 
 class PlatformDeploySmokeTests(unittest.TestCase):
+    def test_standalone_cache_smoke_checks_service_dac_and_systemd_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app_dir = Path(temporary)
+            current_target = app_dir / "release"
+            cache = current_target / MODULE.WEB_RUNTIME_CACHE_RELATIVE
+            cache.mkdir(parents=True, mode=0o750)
+            cache.chmod(0o750)
+            metadata = cache.stat()
+            account = mock.Mock(pw_uid=metadata.st_uid, pw_gid=metadata.st_gid)
+
+            def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                if command[0] == "runuser":
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    f"ReadWritePaths={app_dir / 'current' / MODULE.WEB_RUNTIME_CACHE_RELATIVE}\n",
+                    "",
+                )
+
+            with (
+                mock.patch.object(MODULE.pwd, "getpwnam", return_value=account),
+                mock.patch.object(MODULE.subprocess, "run", side_effect=fake_run),
+            ):
+                result = MODULE.check_web_runtime_cache(app_dir, current_target)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["name"], "release_standalone_cache_sandbox")
+        self.assertEqual(result["detail"]["mode"], oct(0o750))
+        self.assertTrue(result["detail"]["web_user_write"])
+        self.assertTrue(result["detail"]["systemd_allowlisted"])
+
     def test_expected_csp_mode_is_required(self) -> None:
-        with self.assertRaises(SystemExit):
-            MODULE.parse_args([])
+        # The required option belongs to the deploy-smoke CLI, not to the
+        # catalog runner.  Keep the negative parser assertion quiet when this
+        # tool-contract test is launched through platform_test_runner.py.
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit):
+                MODULE.parse_args([])
         for mode in MODULE.CSP_HEADER_BY_MODE:
             self.assertEqual(
                 MODULE.parse_args(["--expected-csp-mode", mode]).expected_csp_mode,

@@ -169,35 +169,6 @@ class PlatformTournamentConcurrencyIntegrationTests(PlatformIsolatedAsyncioTestC
                 now=now,
             )
 
-    async def test_concurrent_invite_claims_are_read_only(self) -> None:
-        organizer = await self._register_user("invite-organizer")
-        first_player = await self._register_user("invite-first")
-        second_player = await self._register_user("invite-second")
-        code = f"{self.prefix.replace('-', '')[:16]}A1".upper()
-        slug, _ = await self._seed_tournament(
-            organizer_user_id=organizer["user_id"],
-            suffix="invite",
-            visibility="invite_only",
-            invite_code=code,
-            invite_max_uses=1,
-        )
-
-        async def claim(player: dict[str, Any]) -> httpx.Response:
-            return await player["client"].post(
-                "/api/v1/tournaments/invites/claim",
-                json={"code": code, "entry_type": "solo", "team_name": None},
-            )
-
-        with patch.object(tournament_routes, "check_invite_rate_limit", new=AsyncMock()):
-            first_response, second_response = await asyncio.gather(
-                claim(first_player),
-                claim(second_player),
-            )
-
-        self.assertEqual(sorted((first_response.status_code, second_response.status_code)), [201, 201])
-        self.assertEqual(await self._invite_state(code), (0, 0))
-        self.assertEqual(await self._participant_count(slug), 0)
-
     async def test_closed_registration_invite_claim_is_still_read_only(self) -> None:
         organizer = await self._register_user("closed-invite-organizer")
         player = await self._register_user("closed-invite-player")

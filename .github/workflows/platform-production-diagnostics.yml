@@ -16,21 +16,28 @@ jobs:
     timeout-minutes: 10
     environment: production
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       TARGET_SHA: ${{ github.sha }}
     steps:
       - name: Configure SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
-          chmod 600 ~/.ssh/old_sparky_prod
-          ssh_scan="$(mktemp)"
-          trap 'rm -f -- "$ssh_scan"' EXIT
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          ssh_dir="$RUNNER_TEMP/platform-production-diagnostics-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-diagnostics-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          fi
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          if ! ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null; then
+            echo "Production SSH host key scan failed" >&2
+            exit 1
+          fi
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
           ssh_key_count="$(wc -l < "$ssh_scan" | tr -d ' ')"
           test "$ssh_key_count" = "1" || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
@@ -39,27 +46,40 @@ jobs:
             echo "Production SSH host fingerprint mismatch" >&2
             exit 1
           }
-          install -m 0600 "$ssh_scan" ~/.ssh/known_hosts
+          install -m 0600 "$ssh_scan" "$ssh_dir/known_hosts"
           {
             printf '%s\n' 'Host *'
             printf '%s\n' '  StrictHostKeyChecking yes'
-            printf '  UserKnownHostsFile %s/.ssh/known_hosts\n' "$HOME"
-          } > ~/.ssh/config
-          chmod 600 ~/.ssh/config
-          chmod 600 ~/.ssh/known_hosts
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          chmod 600 "$ssh_dir/known_hosts"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Verify latest patch distribution
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          remote_log="$RUNNER_TEMP/platform-production-diagnostics-patch.log"
+          remote_error="$RUNNER_TEMP/platform-production-diagnostics-patch-error.log"
+          umask 077
+          : >"$remote_log"
+          : >"$remote_error"
+          chmod 600 "$remote_log" "$remote_error"
+          set +e
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$TARGET_SHA'" <<'REMOTE'
+            -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- '$TARGET_SHA'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
           target_sha="$1"
           runtime=/opt/oldsparky/platform
           guard="$runtime/current/tools/platform_release_lock_exec.sh"
-          test -f "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          test -f "$guard" && test ! -L "$guard" && test -x "$guard" \
+            || { echo "Production mutation guard is missing" >&2; exit 1; }
           /bin/bash "$guard" --app-dir "$runtime" --expected-sha "$target_sha" -- /bin/bash -s <<'MUTATION'
           set -euo pipefail
           runtime=/opt/oldsparky/platform
@@ -83,50 +103,70 @@ jobs:
               patch_id = str(latest.get("id") or "")
               detail = await get_patch_detail(patch_id)
               sections = list((detail or {}).get("sections") or [])
-              heroes = [str(s.get("title") or "") for s in sections if s.get("kind") == "hero"]
-              items = [str(s.get("title") or "") for s in sections if s.get("kind") == "item"]
-              print("latest_patch_id=" + patch_id)
-              print("latest_patch_title=" + str(latest.get("title") or ""))
-              print("section_count=" + str(len(sections)))
-              print("hero_section_count=" + str(len(heroes)))
-              print("hero_titles=" + " | ".join(heroes))
-              print("item_section_count=" + str(len(items)))
-              if patch_id == "1840944183775204" and len(heroes) < 13:
-                  raise SystemExit("latest known patch is still not distributed across its heroes")
+              if not patch_id.isdecimal() or len(patch_id) > 32:
+                  raise SystemExit(1)
+              hero_count = sum(1 for section in sections if section.get("kind") == "hero")
+              item_count = sum(1 for section in sections if section.get("kind") == "item")
+              print(
+                  "PRODUCTION_PATCH schema=1 status=passed error_class=none "
+                  "section_count=" + str(len(sections)) + " hero_section_count="
+                  + str(hero_count) + " item_section_count=" + str(item_count)
+              )
+              print("PRODUCTION_PATCH_ID=" + patch_id)
+              if patch_id == "1840944183775204" and hero_count < 13:
+                  raise SystemExit(1)
 
           asyncio.run(main())
           PY
 
-          latest_id="$($runtime/shared/venv/bin/python - <<'PY'
-          import asyncio
-          from apps.platform_api.app.services import home_content
-          async def main():
-              data = await home_content.refresh_home_content()
-              print((data.get('patches') or [{}])[0].get('id') or '')
-          asyncio.run(main())
-          PY
-          )"
+          latest_id="$(sed -n 's/^PRODUCTION_PATCH_ID=//p' "$remote_log" | tail -n 1)"
+          [[ "$latest_id" =~ ^[0-9]{1,32}$ ]] || { echo "PRODUCTION_PATCH schema=1 status=failed error_class=producer section_count=0 hero_section_count=0 item_section_count=0" >&2; exit 1; }
 
           curl -fsS --max-time 15 "http://127.0.0.1:8010/api/v1/content/patches/${latest_id}" \
-            | "$runtime/shared/venv/bin/python" -c 'import json,sys; d=json.load(sys.stdin); s=d.get("sections",[]); h=[x.get("title","") for x in s if x.get("kind")=="hero"]; print("internal_api_hero_count="+str(len(h))); print("internal_api_heroes="+" | ".join(h)); assert len(h) >= 13 if d.get("id")=="1840944183775204" else True'
+            | "$runtime/shared/venv/bin/python" -c 'import json,sys; d=json.load(sys.stdin); s=d.get("sections",[]); h=[x for x in s if x.get("kind")=="hero"]; print("PRODUCTION_PATCH_API schema=1 status=passed error_class=none api_class=internal hero_section_count="+str(len(h))); assert len(h) >= 13 if d.get("id")=="1840944183775204" else True'
 
-          curl -fsS --max-time 15 "https://old-sparky.com/api/v1/content/patches/${latest_id}?diag=$(date +%s)" \
-            | "$runtime/shared/venv/bin/python" -c 'import json,sys; d=json.load(sys.stdin); s=d.get("sections",[]); h=[x.get("title","") for x in s if x.get("kind")=="hero"]; print("public_api_hero_count="+str(len(h))); print("public_api_heroes="+" | ".join(h)); assert len(h) >= 13 if d.get("id")=="1840944183775204" else True'
+          curl -fsS --max-time 15 "https://old-sparky.com/api/v1/content/patches/${latest_id}" \
+            | "$runtime/shared/venv/bin/python" -c 'import json,sys; d=json.load(sys.stdin); s=d.get("sections",[]); h=[x for x in s if x.get("kind")=="hero"]; print("PRODUCTION_PATCH_API schema=1 status=passed error_class=none api_class=public hero_section_count="+str(len(h))); assert len(h) >= 13 if d.get("id")=="1840944183775204" else True'
           MUTATION
           REMOTE
+          remote_status=$?
+          set -e
+          if (( remote_status != 0 )); then
+            rm -f -- "$remote_log" "$remote_error"
+            printf '%s\n' 'PRODUCTION_DIAGNOSTICS status=failed error_class=remote'
+            exit 1
+          fi
+          public_line="$(grep -E '^(PRODUCTION_PATCH|PRODUCTION_PATCH_API) schema=1 status=(passed|failed) error_class=(none|producer|remote_or_transport|internal) (api_class=(internal|public) )?(section_count|hero_section_count)=[0-9]+( hero_section_count=[0-9]+)?( item_section_count=[0-9]+)?$' "$remote_log" | tail -n 20 || true)"
+          if [[ -z "$public_line" ]]; then
+            public_line='PRODUCTION_PATCH schema=1 status=failed error_class=remote_or_transport section_count=0 hero_section_count=0 item_section_count=0'
+          fi
+          printf '%s\n' "$public_line"
+          rm -f -- "$remote_log" "$remote_error"
 
       - name: Verify ru-v10 four-patch translation regression set
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          remote_log="$RUNNER_TEMP/platform-production-diagnostics-translation.log"
+          remote_error="$RUNNER_TEMP/platform-production-diagnostics-translation-error.log"
+          umask 077
+          : >"$remote_log"
+          : >"$remote_error"
+          chmod 600 "$remote_log" "$remote_error"
+          set +e
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
-            -i ~/.ssh/old_sparky_prod "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            "bash -s -- '$TARGET_SHA'" <<'REMOTE'
+            -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" \
+            "bash -s -- '$TARGET_SHA'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
           target_sha="$1"
           runtime=/opt/oldsparky/platform
           guard="$runtime/current/tools/platform_release_lock_exec.sh"
-          test -f "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          test -f "$guard" && test ! -L "$guard" && test -x "$guard" \
+            || { echo "Production mutation guard is missing" >&2; exit 1; }
           /bin/bash "$guard" --app-dir "$runtime" --expected-sha "$target_sha" -- /bin/bash -s <<'MUTATION'
           set -Eeuo pipefail
           runtime=/opt/oldsparky/platform
@@ -150,11 +190,11 @@ jobs:
               get_patch_detail_source,
           )
           from apps.platform_api.app.services.patch_translation import (
-              PATCH_TRANSLATION_VERSION,
               extract_translation_segments,
               translate_patch_to_russian,
           )
           from apps.platform_api.app.services.patch_translation_terms import fact_fingerprint
+          from tools.platform_translation_qa_summary import public_summary
 
           PATCH_IDS = (
               "1840944183775204",
@@ -177,48 +217,76 @@ jobs:
           )
           CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
-          def emit(kind, **payload):
-              print(kind, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+          metrics = {
+              "patches_checked": 0,
+              "segments_checked": 0,
+              "watched_segments": 0,
+              "translation_calls": 0,
+              "max_source_length": 0,
+              "max_translation_length": 0,
+          }
+
+          class TranslationQAFailure(RuntimeError):
+              def __init__(self, error_class):
+                  super().__init__(error_class)
+                  self.error_class = error_class
+
+          def fail(error_class):
+              raise TranslationQAFailure(error_class)
+
+          def report(status, error_class):
+              # Closed public schema: "kind": "translation_qa".
+              return public_summary(
+                  status=status,
+                  error_class=error_class,
+                  metrics=metrics,
+              )
 
           async def main():
               catalog = await home_content.get_deadlock_asset_catalog()
               for patch_id in PATCH_IDS:
                   source = await get_patch_detail_source(patch_id)
                   if source is None:
-                      raise SystemExit(f"missing source patch {patch_id}")
+                      fail("source_missing")
 
+                  metrics["translation_calls"] += 1
                   result = await translate_patch_to_russian(source, catalog)
-                  emit("TRANSLATION_RUN", patch_id=patch_id, result=result)
-                  if not result.get("ok"):
-                      raise SystemExit(f"translation failed for {patch_id}: {result}")
+                  if not isinstance(result, dict) or result.get("ok") is not True:
+                      fail("translation_failed")
                   if result.get("status") == "locked":
-                      raise SystemExit(f"translation is locked for {patch_id}; fail-fast QA stops")
+                      fail("translation_locked")
 
                   translated = await get_patch_detail(patch_id)
                   if translated is None:
-                      raise SystemExit(f"missing translated patch {patch_id}")
+                      fail("translation_missing")
 
                   source_segments = extract_translation_segments(source)
                   translated_segments = extract_translation_segments(translated)
                   if [s["id"] for s in source_segments] != [s["id"] for s in translated_segments]:
-                      raise SystemExit(f"segment ids/order changed for {patch_id}")
+                      fail("segment_contract")
                   if len(source_segments) != len(translated_segments):
-                      raise SystemExit(f"segment count changed for {patch_id}")
+                      fail("segment_contract")
 
                   paired = list(zip(source_segments, translated_segments, strict=True))
+                  metrics["patches_checked"] += 1
+                  metrics["segments_checked"] += len(paired)
+                  for source_segment, translated_segment in paired:
+                      metrics["max_source_length"] = max(
+                          metrics["max_source_length"], len(source_segment["text"])
+                      )
+                      metrics["max_translation_length"] = max(
+                          metrics["max_translation_length"], len(translated_segment["text"])
+                      )
                   for source_segment, ru_segment in paired:
                       if fact_fingerprint(source_segment["text"]) != fact_fingerprint(ru_segment["text"]):
-                          raise SystemExit(
-                              f"numeric/tier fact changed for {patch_id} {source_segment['id']}"
-                          )
+                          fail("fact_contract")
 
                   if source_segments and not any(
                       CYRILLIC_RE.search(segment["text"] or "")
                       for segment in translated_segments
                   ):
-                      raise SystemExit(f"patch {patch_id} has no Russian translation")
+                      fail("locale_contract")
 
-                  samples = []
                   for source_segment, ru_segment in paired:
                       source_text = source_segment["text"]
                       ru_text = ru_segment["text"]
@@ -227,67 +295,100 @@ jobs:
 
                       if "bullet lifesteal" in source_lower and re.search(r"[+\-]?\d", source_text):
                           if "bullet lifesteal" in ru_lower:
-                              raise SystemExit(
-                                  f"Bullet Lifesteal stat stayed English: {patch_id} {source_segment['id']}"
-                              )
+                              fail("terminology_contract")
                       if "spirit lifesteal" in source_lower and re.search(r"[+\-]?\d", source_text):
                           if "spirit lifesteal" in ru_lower:
-                              raise SystemExit(
-                                  f"Spirit Lifesteal stat stayed English: {patch_id} {source_segment['id']}"
-                              )
+                              fail("terminology_contract")
                       if "bullet, spirit and melee lifesteal" in source_lower:
                           if "lifesteal" in ru_lower or "сопротив" in ru_lower:
-                              raise SystemExit(
-                                  f"compound Lifesteal mistranslated: {patch_id} {source_segment['id']} -> {ru_text}"
-                              )
+                              fail("terminology_contract")
                       if "same change for melee lifesteal" in source_lower:
                           if "Melee Lifesteal" not in ru_text:
-                              raise SystemExit(
-                                  f"Melee Lifesteal item reference was translated: {patch_id} {source_segment['id']}"
-                              )
+                              fail("terminology_contract")
 
                       if any(term in source_lower for term in WATCH_TERMS):
-                          samples.append(
-                              {
-                                  "id": source_segment["id"],
-                                  "en": source_text,
-                                  "ru": ru_text,
-                              }
-                          )
+                          metrics["watched_segments"] += 1
 
-                  for sample in samples[:30]:
-                      emit("PATCH_TRANSLATION_SAMPLE", patch_id=patch_id, **sample)
+              return report("passed", "none")
 
-                  if paired:
-                      longest_source, longest_ru = max(
-                          paired,
-                          key=lambda pair: len(pair[0]["text"]),
-                      )
-                      emit(
-                          "PATCH_TRANSLATION_LONGEST",
-                          patch_id=patch_id,
-                          id=longest_source["id"],
-                          en=longest_source["text"],
-                          ru=longest_ru["text"],
-                      )
-
-                  emit(
-                      "PATCH_TRANSLATION_PATCH_OK",
-                      patch_id=patch_id,
-                      version=PATCH_TRANSLATION_VERSION,
-                      segments=len(source_segments),
-                      watched_samples=len(samples),
-                  )
-
-              print("PATCH_TRANSLATION_QA status=passed version=" + PATCH_TRANSLATION_VERSION)
-
-          asyncio.run(main())
+          try:
+              public = asyncio.run(main())
+          except TranslationQAFailure as exc:
+              print(json.dumps(report("failed", exc.error_class), sort_keys=True))
+              raise SystemExit(1)
+          except Exception:
+              print(json.dumps(report("failed", "internal"), sort_keys=True))
+              raise SystemExit(1)
+          print(json.dumps(public, sort_keys=True))
           PY
 
-          echo '=== Recent translation usage logs ==='
-          journalctl -u deadlock-worker -u deadlock-api --since '-20 minutes' --no-pager \
-            | grep -E 'patch_translation_(openai_usage|completed|failed)' \
-            | tail -n 120 \
-            || true
+          umask 077
+          usage_log_file="$(mktemp "$runtime/shared/.translation-usage.XXXXXX")"
+          chmod 600 "$usage_log_file"
+          cleanup_usage_log() {
+            rm -f -- "$usage_log_file"
+          }
+          trap cleanup_usage_log EXIT
+          journal_status=0
+          journalctl -u deadlock-worker -u deadlock-api --since '-20 minutes' --no-pager -n 200 \
+            --output cat >"$usage_log_file" 2>/dev/null || journal_status=$?
+          if (( journal_status != 0 )); then
+            echo 'TRANSLATION_USAGE_LOG_SUMMARY status=unavailable error_class=producer'
+            exit 1
+          fi
+          usage_count="$(awk '/patch_translation_openai_usage/ {if (count < 1000000) count++} END {print count+0}' "$usage_log_file")"
+          completed_count="$(awk '/patch_translation_completed/ {if (count < 1000000) count++} END {print count+0}' "$usage_log_file")"
+          failed_count="$(awk '/patch_translation_failed/ {if (count < 1000000) count++} END {print count+0}' "$usage_log_file")"
+          printf 'TRANSLATION_USAGE_LOG_SUMMARY schema=1 openai_usage_count=%s completed_count=%s failed_count=%s\n' \
+            "$usage_count" "$completed_count" "$failed_count"
           MUTATION
           REMOTE
+          remote_status=$?
+          set -e
+          if (( remote_status != 0 )); then
+            public_line="$(grep -E '^(\{"error_class":"(none|source_missing|call_budget|translation_failed|translation_locked|translation_missing|segment_contract|objective_contract|fact_contract|locale_contract|terminology_contract|unit_contract|internal|producer|remote_or_transport)","kind":"translation_qa","max_source_length":[0-9]+,"max_translation_length":[0-9]+,"patches_checked":[0-9]+,"schema":1,"segments_checked":[0-9]+,"status":"(failed|passed)","translation_calls":[0-9]+,"watched_segments":[0-9]+\}|TRANSLATION_USAGE_LOG_SUMMARY (schema=1 openai_usage_count=[0-9]+ completed_count=[0-9]+ failed_count=[0-9]+|status=unavailable error_class=producer))$' "$remote_log" | tail -n 20 || true)"
+            if [[ -z "$public_line" ]]; then
+              public_line='PRODUCTION_DIAGNOSTICS schema=1 status=failed error_class=remote_or_transport'
+            fi
+            printf '%s\n' "$public_line"
+            rm -f -- "$remote_log" "$remote_error"
+            exit 1
+          fi
+          public_line="$(grep -E '^(\{"error_class":"(none|source_missing|call_budget|translation_failed|translation_locked|translation_missing|segment_contract|objective_contract|fact_contract|locale_contract|terminology_contract|unit_contract|internal|producer|remote_or_transport)","kind":"translation_qa","max_source_length":[0-9]+,"max_translation_length":[0-9]+,"patches_checked":[0-9]+,"schema":1,"segments_checked":[0-9]+,"status":"(failed|passed)","translation_calls":[0-9]+,"watched_segments":[0-9]+\}|TRANSLATION_USAGE_LOG_SUMMARY schema=1 openai_usage_count=[0-9]+ completed_count=[0-9]+ failed_count=[0-9]+)$' "$remote_log" | tail -n 20 || true)"
+          if [[ -z "$public_line" ]]; then
+            public_line='PRODUCTION_DIAGNOSTICS schema=1 status=failed error_class=producer'
+          fi
+          printf '%s\n' "$public_line"
+          rm -f -- "$remote_log" "$remote_error"
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-diagnostics-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-diagnostics-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"

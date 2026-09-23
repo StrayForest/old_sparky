@@ -218,6 +218,23 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("prune-runtime-cache", service)
+        retention = (
+            REPO_ROOT / "platform/tools/platform_release_retention.py"
+        ).read_text()
+        maintenance_source = (
+            REPO_ROOT / "platform/tools/platform_storage_maintenance.py"
+        ).read_text()
+        maintenance_workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-storage-maintenance.yml"
+        ).read_text()
+        self.assertIn("exclusive_retained_load_lock", retention)
+        self.assertIn("with release_operation_lock(app_dir)", maintenance_source)
+        self.assertIn("with exclusive_retained_load_lock()", maintenance_source)
+        self.assertIn("reverse load -> release edge", maintenance_workflow)
+        self.assertNotIn(
+            'exec 9>"$retained_load_lock"', maintenance_workflow
+        )
         self.assertIn("CPUQuota=50%", service)
         self.assertIn("IOSchedulingClass=idle", service)
         self.assertIn("Persistent=true", timer)
@@ -333,6 +350,10 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
                 "retained": [],
                 "deleted": [],
                 "reclaimed_tombstones": [],
+                "protected_count": 0,
+                "retained_count": 0,
+                "deleted_count": 0,
+                "reclaimed_tombstone_count": 0,
             },
         )
 

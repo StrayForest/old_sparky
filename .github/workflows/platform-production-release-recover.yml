@@ -22,9 +22,6 @@ jobs:
     timeout-minutes: 20
     environment: production
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       RECOVERY_CONFIRMATION: ${{ inputs.confirmation }}
     steps:
       - name: Validate explicit recovery confirmation
@@ -33,11 +30,17 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production recovery must run from the reviewed dev ref" >&2; exit 1; }
-          test "$RECOVERY_CONFIRMATION" = "RECOVER-PENDING-RELEASE" \
-            || { echo "Refusing recovery without exact confirmation" >&2; exit 1; }
+          case "$RECOVERY_CONFIRMATION" in
+            RECOVER-PENDING-RELEASE) ;;
+            *) echo "Refusing recovery without exact confirmation" >&2; exit 1 ;;
+          esac
 
       - name: Validate production SSH inputs
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
@@ -46,14 +49,21 @@ jobs:
 
       - name: Configure SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/platform-production-release-recovery-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-release-recovery-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          fi
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
           ssh_scan="$ssh_dir/known_hosts.scan"
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
           test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
             || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
@@ -67,8 +77,23 @@ jobs:
 
       - name: Recover the pending release and restore runtime
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          umask 077
+          remote_log="$RUNNER_TEMP/platform-production-release-recovery.log"
+          remote_error="$RUNNER_TEMP/platform-production-release-recovery-error.log"
+          : >"$remote_log"
+          : >"$remote_error"
+          chmod 600 "$remote_log" "$remote_error"
+          cleanup_recovery_capture() {
+            trap - EXIT
+            rm -f -- "$remote_log" "$remote_error"
+          }
+          trap cleanup_recovery_capture EXIT
+          set +e
           ssh \
             -F /dev/null \
             -o BatchMode=yes \
@@ -80,39 +105,291 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            'bash -s' <<'REMOTE'
+            'bash -s' >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
 
           runtime=/opt/oldsparky/platform
-          state="$runtime/shared/.release-operation.json"
-          rollback="$runtime/current/tools/platform_release_rollback.sh"
-
           test "$(id -u)" -eq 0 || { echo "Production recovery must run as root" >&2; exit 1; }
+          lock_helper="$runtime/current/tools/platform_release_lock.sh"
+          test -f "$lock_helper" && test ! -L "$lock_helper" && test -x "$lock_helper" \
+            || { echo "Canonical release lock helper is missing or unsafe" >&2; exit 1; }
+          # Run the entire recovery body under the pathname-form common
+          # supervisor.  It uses --close, so no numeric FD is inherited by the
+          # rollback, restore or readiness commands; pending state is allowed
+          # because this is the explicit recovery entrypoint.
+          "$lock_helper" --run /bin/bash -s <<'LOCKED'
+          set -Eeuo pipefail
+          runtime=/opt/oldsparky/platform
+          state="$runtime/shared/.release-operation.json"
+          systemd_state="$runtime/shared/.release-systemd-state.json"
+          systemd_state_tool="$runtime/current/tools/platform_release_systemd_state.py"
+          transaction_tool="$runtime/current/tools/platform_release_transaction.py"
+          # shellcheck source=/dev/null
+          source "$runtime/current/tools/platform_release_lock.sh"
+          platform_release_lock_open || {
+            echo "Canonical release lock supervisor could not be validated" >&2
+            exit 75
+          }
           test -f "$state" || { echo "No pending release transaction exists" >&2; exit 1; }
-          test -x "$rollback" || { echo "Release recovery tool is missing" >&2; exit 1; }
+          test "$(stat -c '%u:%h:%a' "$state" 2>/dev/null)" = "0:1:600" \
+            || { echo "Pending release transaction metadata is unsafe" >&2; exit 1; }
+          test -f "$systemd_state_tool" && test ! -L "$systemd_state_tool" \
+            && test "$(stat -c '%u:%h:%a' "$systemd_state_tool" 2>/dev/null)" = "0:1:755" \
+            || { echo "Systemd state helper is missing or unsafe" >&2; exit 1; }
+          if [[ -e "$systemd_state" || -L "$systemd_state" ]]; then
+            test -f "$systemd_state" && test ! -L "$systemd_state" \
+              && test "$(stat -c '%u:%h:%a' "$systemd_state" 2>/dev/null)" = "0:1:600" \
+              || { echo "Retained systemd state receipt is unsafe" >&2; exit 1; }
+          fi
+          pending_operation="$({
+            /usr/bin/python3 -I - "$state" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          value = record.get("operation")
+          if value not in {"install", "rollback"}:
+              raise SystemExit(1)
+          print(value)
+          PY
+          } 2>/dev/null)"
+          # This entrypoint recovers an interrupted install transaction. A
+          # rollback transaction has its own state machine and receipt owner;
+          # refusing it here prevents a second recovery path from guessing
+          # which release/runtime snapshot is authoritative.
+          case "$pending_operation" in
+            install)
+              if [[ -e "$systemd_state" ]]; then
+                /usr/bin/python3 -I "$systemd_state_tool" validate \
+                  --state "$systemd_state" --app-dir "$runtime" \
+                  --systemctl /usr/bin/systemctl >/dev/null 2>/dev/null
+                /usr/bin/python3 -I - "$state" "$systemd_state" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
 
-          "$rollback" --recover-pending --app-dir "$runtime"
-          test ! -e "$state" && test ! -L "$state" \
-            || { echo "Pending release transaction was not cleared" >&2; exit 1; }
+          transaction = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          receipt = json.loads(Path(sys.argv[2]).read_text(encoding="ascii"))
+          if transaction.get("operation") != "install":
+              raise SystemExit(1)
+          if transaction.get("current_before") != receipt.get("current_before"):
+              raise SystemExit(1)
+          if transaction.get("previous_before") != receipt.get("previous_before"):
+              raise SystemExit(1)
+          PY
+              else
+                /usr/bin/python3 -I "$systemd_state_tool" capture-transaction \
+                  --state "$systemd_state" \
+                  --transaction "$state" \
+                  --app-dir "$runtime" \
+                  --systemctl /usr/bin/systemctl \
+                  >/dev/null 2>/dev/null
+              fi
+              ;;
+            *) echo "Unsupported pending release operation" >&2; exit 1 ;;
+          esac
+          test -f "$transaction_tool" && test ! -L "$transaction_tool" \
+            && test -x "$transaction_tool" \
+            && test "$(stat -c '%u:%h:%a' "$transaction_tool" 2>/dev/null)" = "0:1:755" \
+            || { echo "Release transaction tool is missing or unsafe" >&2; exit 1; }
+          /usr/bin/grep -Fq 'STATE_VERSION = 2' \
+            "$transaction_tool" \
+            || { echo "Release transaction tool is stale" >&2; exit 1; }
 
-          current_release="$(readlink -f "$runtime/current")"
+          # Recover only the filesystem pointers/venv and retain both durable
+          # receipts. Cleanup is committed only after runtime, systemd, Nginx
+          # and health checks have all succeeded.
+          /usr/bin/python3 -I "$transaction_tool" recover \
+            --retain --state "$state" >/dev/null 2>/dev/null
+          test -f "$state" && test ! -L "$state" \
+            || { echo "Retained release transaction disappeared during recovery" >&2; exit 1; }
+
+          current_release="$(readlink -f "$runtime/current" 2>/dev/null)"
+          test -L "$runtime/current" \
+            && test "$(stat -c '%u:%h' "$runtime/current" 2>/dev/null)" = "0:1" \
+            || { echo "Recovered current pointer is unsafe" >&2; exit 1; }
+          test -n "$current_release" \
+            && test -d "$current_release" && test ! -L "$current_release" \
+            && test "$(dirname "$current_release")" = "$runtime/releases" \
+            && test "$(stat -c '%u:%h:%a' "$current_release" 2>/dev/null)" = "0:1:755" \
+            || { echo "Recovered current release is unsafe" >&2; exit 1; }
+          expected_current="$({
+            /usr/bin/python3 -I - "$systemd_state" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          value = record.get("current_before")
+          if not isinstance(value, str) or not value.startswith("/opt/oldsparky/platform/releases/"):
+              raise SystemExit(1)
+          print(value)
+          PY
+          } 2>/dev/null)"
+          test "$current_release" = "$expected_current" \
+            || { echo "Recovered current release does not match retained receipt" >&2; exit 1; }
+          current_slug="$(basename "$current_release")"
+          [[ "$current_slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] \
+            || { echo 'RELEASE_RUNTIME schema=1 status=failed class=layout release_slug=unavailable source_sha=unavailable' >&2; exit 1; }
+          current_sha="$({
+            /usr/bin/python3 -I - "$current_release/RELEASE.json" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          try:
+              value = json.loads(Path(sys.argv[1]).read_text(encoding="ascii")).get(
+                  "source_git_commit", ""
+              )
+          except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+              value = ""
+          if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value):
+              print(value)
+          PY
+          } 2>/dev/null)"
+          [[ -n "$current_sha" ]] || current_sha=unavailable
           restore="$current_release/tools/platform_release_restore_runtime.sh"
-          test -x "$restore" || { echo "Runtime restore tool is missing" >&2; exit 1; }
-          "$restore" \
+          restore_lock_helper="$current_release/tools/platform_release_lock.sh"
+          systemd_state_tool="$current_release/tools/platform_release_systemd_state.py"
+          test -f "$restore" && test ! -L "$restore" && test -x "$restore" \
+            || { echo "Runtime restore tool is missing" >&2; exit 1; }
+          test -f "$restore_lock_helper" && test ! -L "$restore_lock_helper" \
+            && test -x "$restore_lock_helper" \
+            || { echo "Runtime restore lock helper is missing" >&2; exit 1; }
+          test "$(stat -c '%u:%h:%a' "$restore" 2>/dev/null)" = "0:1:755" \
+            || { echo "Runtime restore tool metadata is unsafe" >&2; exit 1; }
+          test "$(stat -c '%u:%h:%a' "$restore_lock_helper" 2>/dev/null)" = "0:1:755" \
+            || { echo "Runtime restore lock helper metadata is unsafe" >&2; exit 1; }
+          test -f "$systemd_state_tool" && test ! -L "$systemd_state_tool" \
+            && test "$(stat -c '%u:%h:%a' "$systemd_state_tool" 2>/dev/null)" = "0:1:755" \
+            || { echo "Runtime systemd state helper is missing or unsafe" >&2; exit 1; }
+          /usr/bin/grep -Fq 'platform_release_lock_open' "$restore" \
+            || { echo "Runtime restore tool has no v2 lock contract" >&2; exit 1; }
+          platform_release_lock_supervisor_holds \
+            || { echo "Platform release lock was lost" >&2; exit 1; }
+          PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$restore" \
             --app-dir "$runtime" \
             --release "$current_release" \
+            --systemd-state "$systemd_state" \
+            --systemctl /usr/bin/systemctl \
             --expected-csp-mode enforce \
             --edge-origin https://127.0.0.1 \
             --edge-host old-sparky.com \
             --public-edge-origin https://old-sparky.com
 
-          nginx -t >/dev/null
-          for service in deadlock-api deadlock-worker deadlock-web; do
-            systemctl is-active --quiet "$service"
+          # Restore and verify both active and enablement dimensions. Do not
+          # assume every managed service was active before the interrupted
+          # transaction; inactive services must remain inactive on recovery.
+          /usr/bin/python3 -I "$current_release/tools/platform_release_systemd_state.py" \
+            verify --state "$systemd_state" --app-dir "$runtime" \
+            --systemctl /usr/bin/systemctl >/dev/null 2>/dev/null
+          nginx -t >/dev/null 2>/dev/null
+          for service in deadlock-api.service deadlock-worker.service deadlock-web.service; do
+            expected_state="$({
+              /usr/bin/python3 -I - "$systemd_state" "$service" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          for item in record["units"]:
+              if item["name"] == sys.argv[2]:
+                  print(item["active"])
+                  break
+          else:
+              raise SystemExit(1)
+          PY
+            } 2>/dev/null)"
+            case "$expected_state" in
+              active) systemctl is-active --quiet "$service" >/dev/null 2>/dev/null ;;
+              inactive) ! systemctl is-active --quiet "$service" >/dev/null 2>/dev/null ;;
+              *) echo "Retained active state is invalid" >&2; exit 1 ;;
+            esac
           done
-          curl --fail --silent --show-error --max-time 10 \
-            http://127.0.0.1:8010/api/v1/health/ready >/dev/null
-          curl --fail --silent --show-error --max-time 10 \
-            http://127.0.0.1:3000/ >/dev/null
-          printf 'Pending release recovered; active release restored: %s\n' "$current_release"
+          api_state="$({ /usr/bin/python3 -I - "$systemd_state" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          print(next(item["active"] for item in record["units"] if item["name"] == "deadlock-api.service"))
+          PY
+          } 2>/dev/null)"
+          web_state="$({ /usr/bin/python3 -I - "$systemd_state" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          print(next(item["active"] for item in record["units"] if item["name"] == "deadlock-web.service"))
+          PY
+          } 2>/dev/null)"
+          if [[ "$api_state" == active ]]; then
+            curl --fail --silent --show-error --max-time 10 \
+              http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null
+          fi
+          if [[ "$web_state" == active ]]; then
+            curl --fail --silent --show-error --max-time 10 \
+              http://127.0.0.1:3000/ >/dev/null 2>/dev/null
+          fi
+          /usr/bin/python3 -I "$current_release/tools/platform_release_systemd_state.py" \
+            clear --state "$systemd_state" --app-dir "$runtime" \
+            --systemctl /usr/bin/systemctl >/dev/null 2>/dev/null
+          test ! -e "$systemd_state" && test ! -L "$systemd_state" \
+            || { echo "Systemd state receipt was not cleared" >&2; exit 1; }
+          # The receipt is no longer needed only after the restored state was
+          # verified and all readiness checks passed. The transaction command
+          # now performs the final identity-checked candidate cleanup and
+          # removes .release-operation.json.
+          /usr/bin/python3 -I "$transaction_tool" complete-recovery \
+            --state "$state" >/dev/null 2>/dev/null
+          test ! -e "$state" && test ! -L "$state" \
+            || { echo "Release transaction was not completed" >&2; exit 1; }
+          printf 'RELEASE_RUNTIME schema=1 status=passed class=recovery release_slug=%s source_sha=%s\n' \
+            "$current_slug" "$current_sha"
+          LOCKED
           REMOTE
+          remote_status="$?"
+          set -e
+          if (( remote_status != 0 )); then
+            printf '%s\n' 'RELEASE_RUNTIME schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
+            exit 1
+          fi
+          public_line="$(grep -E '^RELEASE_RUNTIME schema=1 status=passed class=recovery release_slug=[A-Za-z0-9][A-Za-z0-9._-]{0,179} source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"
+          if [[ -z "$public_line" ]]; then
+            public_line='RELEASE_RUNTIME schema=1 status=failed class=producer release_slug=unavailable source_sha=unavailable'
+            printf '%s\n' "$public_line"
+            exit 1
+          fi
+          printf '%s\n' "$public_line"
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-release-recovery-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-release-recovery-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"

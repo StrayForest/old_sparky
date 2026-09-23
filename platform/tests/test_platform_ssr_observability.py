@@ -319,8 +319,9 @@ class SsrObservabilityTests(unittest.TestCase):
         self.assertEqual(correlated["requests"], 1)
         self.assertEqual(correlated["api_request_perf_join"]["matched_by_diagnostic_id"], 1)
         self.assertEqual(correlated["api_request_perf_join"]["matched_by_request_id"], 0)
-        self.assertEqual(correlated["timeline"][0]["diagnostic_id"], diagnostic_id)
+        self.assertNotIn("diagnostic_id", correlated["timeline"][0])
         self.assertEqual(correlated["timeline"][0]["api_request_perf_correlation"], "diagnostic_id")
+        self.assertNotIn(diagnostic_id, json.dumps(summary))
 
     def test_ssr_summary_marks_close_without_finish_as_response_integrity_failure(self) -> None:
         summary = summarize_ssr_observability(

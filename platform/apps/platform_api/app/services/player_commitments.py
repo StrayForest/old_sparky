@@ -170,8 +170,18 @@ async def create_assignment_commitments(
         db_session,
         [member.user_id for member in roster],
     )
-    if conflicts:
-        raise PlayerCommitmentConflict(conflicts.values())
+    conflicting_commitments = {
+        member.user_id: conflicts[member.user_id]
+        for member in roster
+        if member.user_id in conflicts
+        and (
+            conflicts[member.user_id].tournament_id != run_row.tournament_id
+            or conflicts[member.user_id].assignment_run_id != run_row.id
+            or conflicts[member.user_id].team_id != member.team_id
+        )
+    }
+    if conflicting_commitments:
+        raise PlayerCommitmentConflict(conflicting_commitments.values())
 
     commitments = tuple(
         PlayerTournamentCommitment(
@@ -183,6 +193,7 @@ async def create_assignment_commitments(
             activated_at=activated_at,
         )
         for member in roster
+        if member.user_id not in conflicts
     )
     db_session.add_all(commitments)
     await db_session.flush()

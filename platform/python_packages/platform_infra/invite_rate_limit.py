@@ -35,7 +35,15 @@ end
 return user_count
 """
 
-InviteOperation = Literal["lookup", "claim", "manage"]
+INVITE_BEARER_INCREMENT_SCRIPT = """
+local pair_count = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+  redis.call('EXPIREAT', KEYS[1], ARGV[1])
+end
+return pair_count
+"""
+
+InviteOperation = Literal["lookup", "claim", "manage", "bearer_read"]
 
 
 def invite_rate_limits_enabled(settings: PlatformSettings) -> bool:
@@ -63,6 +71,8 @@ def _limits(settings: PlatformSettings, operation: InviteOperation) -> tuple[int
             settings.platform_invite_claim_user_limit,
             settings.platform_invite_claim_ip_limit,
         )
+    if operation == "bearer_read":
+        return (settings.platform_invite_bearer_read_limit, 0)
     return (
         settings.platform_invite_manage_user_limit,
         settings.platform_invite_manage_ip_limit,
@@ -74,6 +84,7 @@ async def check_invite_rate_limit(
     *,
     user_id: str,
     operation: InviteOperation,
+    code: str | None = None,
     settings: PlatformSettings | None = None,
     now_epoch: int | None = None,
 ) -> None:
@@ -91,7 +102,29 @@ async def check_invite_rate_limit(
     prefix = f"platform:invite-rate:v1:{bucket}:{operation}"
     client = redis_client()
     try:
-        if is_load_test_source(resolved, address):
+        if operation == "bearer_read":
+            # The raw code is never used as a Redis key. HMAC the canonical
+            # value together with the source address so a direct bearer read
+            # is bounded per IP/code pair without making the secret searchable
+            # in Redis or logs. Do not use the load-test IP bypass here: this
+            # is the security boundary for unauthenticated private reads.
+            if not code:
+                raise ValueError("bearer_read rate limiting requires a code")
+            code_key = _fingerprint(resolved, f"{operation}:code:{code}")
+            pair_key = _fingerprint(
+                resolved,
+                f"{operation}:ip-code:{address}:{code_key}",
+            )
+            pair_count = int(
+                await client.eval(
+                    INVITE_BEARER_INCREMENT_SCRIPT,
+                    1,
+                    f"{prefix}:ip-code:{pair_key}",
+                    expires_at,
+                )
+            )
+            user_count, ip_count = pair_count, 0
+        elif is_load_test_source(resolved, address):
             user_count = int(
                 await client.eval(
                     INVITE_USER_INCREMENT_SCRIPT,

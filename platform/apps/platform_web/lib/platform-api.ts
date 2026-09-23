@@ -634,7 +634,8 @@ export async function getAdminTournamentRoster(
 export async function mutateAdminTournamentRoster(
   slug: string,
   operation: AdminRosterMutationOperation,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  signal?: AbortSignal
 ): Promise<PlatformAdminRoster> {
   return platformApiRequest<PlatformAdminRoster>(
     `/admin/tournaments/${encodeURIComponent(slug)}/roster/${operation}`,
@@ -643,7 +644,8 @@ export async function mutateAdminTournamentRoster(
       headers: {
         "Idempotency-Key": globalThis.crypto.randomUUID()
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal
     }
   );
 }
@@ -684,6 +686,16 @@ type TournamentPageRequestOptions = {
   signal?: AbortSignal;
   revalidateSeconds?: number;
 };
+
+const tournamentInviteCodePattern = /^[A-Z0-9]{10,24}$/u;
+
+export function normalizeTournamentInviteCode(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim().toUpperCase();
+  return tournamentInviteCodePattern.test(normalized) ? normalized : undefined;
+}
 
 export async function getTournamentSummaries(
   query: TournamentListQuery = {},
@@ -795,8 +807,9 @@ export async function getTournamentWorkspace(
   if (options.includeCurrentUser !== undefined) {
     params.set("include_current_user", String(options.includeCurrentUser));
   }
-  if (options.inviteCode) {
-    params.set("invite_code", options.inviteCode);
+  const inviteCode = normalizeTournamentInviteCode(options.inviteCode);
+  if (inviteCode) {
+    params.set("invite_code", inviteCode);
   }
 
   const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/workspace?${params.toString()}`, {
@@ -1096,7 +1109,8 @@ export async function deleteTournamentBanner(slug: string): Promise<PlatformMedi
 
 export async function registerForTournament(
   slug: string,
-  inviteCode?: string | null
+  inviteCode?: string | null,
+  signal?: AbortSignal
 ): Promise<Registration | null> {
   const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/join`, {
     method: "POST",
@@ -1106,7 +1120,8 @@ export async function registerForTournament(
     },
     credentials: "include",
     body: JSON.stringify({ entry_type: "solo", team_name: null, invite_code: inviteCode ?? null }),
-    cache: "no-store"
+    cache: "no-store",
+    signal
   });
   if (!response.ok) {
     return null;
@@ -1114,19 +1129,21 @@ export async function registerForTournament(
   return mapRegistration(await response.json() as ApiRegistration);
 }
 
-export async function leaveTournament(slug: string): Promise<boolean> {
+export async function leaveTournament(slug: string, signal?: AbortSignal): Promise<boolean> {
   const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/join`, {
     method: "DELETE",
     headers: { accept: "application/json" },
     credentials: "include",
-    cache: "no-store"
+    cache: "no-store",
+    signal
   });
   return response.ok || response.status === 404;
 }
 
 export async function setTournamentReadyCheckChoice(
   slug: string,
-  choice: "yes" | "no"
+  choice: "yes" | "no",
+  signal?: AbortSignal
 ): Promise<PlatformTournamentDeadlockReadyVote | null> {
   const maxAutomaticRetries = 2;
   for (let attempt = 0; attempt <= maxAutomaticRetries; attempt += 1) {
@@ -1140,6 +1157,7 @@ export async function setTournamentReadyCheckChoice(
             "content-type": "application/json"
           },
           body: JSON.stringify({ choice }),
+          signal
         }
       );
     } catch (error) {
@@ -1151,7 +1169,7 @@ export async function setTournamentReadyCheckChoice(
         throw error;
       }
       const delayMs = readyVoteRetryDelayMs(error, attempt);
-      await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+      await abortableDelay(delayMs, signal);
     }
   }
   return null;
@@ -1212,6 +1230,7 @@ export async function getTournamentBracket(
   requestHeaders: HeadersInit = {},
   options: {
     teamsView?: "summary" | "full";
+    inviteCode?: string;
     signal?: AbortSignal;
     ifNoneMatch?: string | null;
     cachedBracket?: Bracket | null;
@@ -1227,6 +1246,10 @@ export async function getTournamentBracket(
     const params = new URLSearchParams({
       teams_view: options.teamsView ?? "summary"
     });
+    const inviteCode = normalizeTournamentInviteCode(options.inviteCode);
+    if (inviteCode) {
+      params.set("invite_code", inviteCode);
+    }
     const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/bracket?${params.toString()}`, {
       headers,
       credentials: "include",
@@ -1247,19 +1270,6 @@ export async function getTournamentBracket(
     }
     return null;
   }
-}
-
-export async function generateTournamentBracket(slug: string): Promise<Bracket | null> {
-  const response = await platformFetch(`${apiBaseUrl}/tournaments/${slug}/matches/seed-opening-round`, {
-    method: "POST",
-    headers: { accept: "application/json" },
-    credentials: "include",
-    cache: "no-store"
-  });
-  if (!response.ok) {
-    return null;
-  }
-  return getTournamentBracket(slug);
 }
 
 export async function resetTournamentBracket(slug: string): Promise<Bracket | null> {

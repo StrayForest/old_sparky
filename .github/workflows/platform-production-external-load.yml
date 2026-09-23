@@ -10,7 +10,6 @@ on:
       control_email:
         description: "Existing account preserved by exact cleanup"
         required: true
-        default: "aleksei.lisitsin1@gmail.com"
         type: string
       profile_id:
         description: "Reviewed canonical load profile ID"
@@ -20,9 +19,6 @@ on:
         options:
           - ready-vote-slo-v2
           - ready-vote-capacity-ramp-v2
-          - ready-vote-saturation-ramp-v1
-          - ready-vote-saturation-ramp-v2
-          - ready-vote-saturation-ramp-v3
           - ready-vote-saturation-ramp-v4
           - ready-vote-stress-15k-v2
           - ready-vote-stress-20k-v2
@@ -46,64 +42,226 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  external-load:
-    name: External public load with exact cleanup
+  # Candidate validation and profile code run without the production
+  # environment.  The only value crossing to an approved job is the closed
+  # mode-600 JSON handoff; the approved job validates it again inline.
+  validate-external-inputs:
+    name: Validate external-load dispatch
+    if: ${{ always() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    environment: production
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      input_artifact_id: ${{ steps.publish-input.outputs.artifact-id }}
+      input_artifact_digest: ${{ steps.publish-input.outputs.artifact-digest }}
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       QA_CONFIRMATION: ${{ inputs.confirmation }}
       CONTROL_EMAIL: ${{ inputs.control_email }}
       PROFILE_ID: ${{ inputs.profile_id }}
       TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
       TARGET_SHA: ${{ github.sha }}
-      SOURCE_GIT_SHA: ${{ github.sha }}
-
     steps:
+      - name: Reject invalid external-load dispatch before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch || { echo "External load accepts workflow_dispatch only." >&2; exit 1; }
+          test "$GITHUB_REF" = refs/heads/dev || { echo "External production load must run from dev." >&2; exit 1; }
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "External load requires an exact target SHA." >&2; exit 1; }
+          case "$TIMEOUT_DIAGNOSTICS:$PROFILE_ID:$QA_CONFIRMATION" in
+            true:authenticated-page-load-v1:RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS|false:*:RUN-PRODUCTION-EXTERNAL-LOAD) ;;
+            *) echo "External load confirmation/profile combination is invalid." >&2; exit 1 ;;
+          esac
+
       - name: Checkout reviewed load client
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Validate explicit external production load
         shell: bash
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = "refs/heads/dev" \
-            || { echo "External production load must run from dev." >&2; exit 1; }
-          if [[ "$TIMEOUT_DIAGNOSTICS" == "true" ]]; then
-            test "$PROFILE_ID" = "authenticated-page-load-v1" \
-              || { echo "Timeout diagnostics require authenticated-page-load-v1." >&2; exit 1; }
-            test "$QA_CONFIRMATION" = "RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS" \
-              || { echo "Timeout diagnostics require their dedicated confirmation." >&2; exit 1; }
-          else
-            test "$QA_CONFIRMATION" = "RUN-PRODUCTION-EXTERNAL-LOAD" \
-              || { echo "Refusing external production load without exact confirmation." >&2; exit 1; }
-          fi
-          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
-          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
-          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
-          /usr/bin/python3 platform/tools/platform_load.py validate --profile "$PROFILE_ID"
-          /usr/bin/python3 platform/tools/platform_load.py export-env --profile "$PROFILE_ID" >> "$GITHUB_ENV"
+          profile_env="$RUNNER_TEMP/profile.env"
+          run_checked_out_client() {
+            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 SOURCE_GIT_SHA="$TARGET_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" "$@"
+          }
+          run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py validate --profile "$PROFILE_ID" --dispatchable
+          run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py export-env --profile "$PROFILE_ID" > "$profile_env"
+          /usr/bin/python3 - "$profile_env" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
 
-      - name: Configure production SSH
+          lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+          required = {"SETUP_CONCURRENCY", "TOURNAMENT_COUNT", "USERS_PER_TOURNAMENT"}
+          seen = set()
+          for line in lines:
+              if not re.fullmatch(r"[A-Z0-9_]{1,80}=[A-Za-z0-9._:/+-]{1,160}", line):
+                  raise SystemExit("profile export is not a closed environment schema")
+              key, value = line.split("=", 1)
+              seen.add(key)
+              if key in required and not re.fullmatch(r"[1-9][0-9]{0,8}", value):
+                  raise SystemExit("profile export numeric value is malformed")
+          if not required <= seen:
+              raise SystemExit("profile export is missing fixture controls")
+          PY
+          while IFS='=' read -r key value; do
+            case "$key" in
+              SETUP_CONCURRENCY|TOURNAMENT_COUNT|USERS_PER_TOURNAMENT) export "$key=$value" ;;
+            esac
+          done < "$profile_env"
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py email --value "$CONTROL_EMAIL"
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py external \
+            --output "$RUNNER_TEMP/platform-production-external-load-input.json" \
+            --confirmation "$QA_CONFIRMATION" \
+            --target-sha "$TARGET_SHA" \
+            --control-email "$CONTROL_EMAIL" \
+            --setup-concurrency "$SETUP_CONCURRENCY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --profile external-vote \
+            --tournament-count "$TOURNAMENT_COUNT" \
+            --users-per-tournament "$USERS_PER_TOURNAMENT" \
+            --timeout-diagnostics "$TIMEOUT_DIAGNOSTICS"
+          test "$(stat -c '%a' "$RUNNER_TEMP/platform-production-external-load-input.json")" = 600
+
+      - name: Publish closed external-load handoff
+        id: publish-input
+        if: ${{ success() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-production-external-load-input.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove external-load validator handoff
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -f -- "$RUNNER_TEMP/platform-production-external-load-input.json" "$RUNNER_TEMP/profile.env"
+
+  # This job owns SSH only for trusted fixture setup.  It does not checkout or
+  # execute candidate code and publishes the manifest as data for a fresh
+  # external load runner.
+  fixture-setup:
+    name: Prepare external fixture with ephemeral SSH
+    needs: validate-external-inputs
+    if: needs.validate-external-inputs.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      setup_status: ${{ steps.fixture-setup.outputs.setup_status }}
+      manifest_ready: ${{ steps.fixture-setup.outputs.manifest_ready }}
+      manifest_artifact_id: ${{ steps.publish-manifest.outputs.artifact-id }}
+      manifest_artifact_digest: ${{ steps.publish-manifest.outputs.artifact-digest }}
+      ssh_cleanup_status: ${{ steps.cleanup-setup-ssh.outputs.ssh_cleanup_status }}
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      RUN_ID: ${{ github.run_id }}
+      INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
+      INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
+    steps:
+      - name: Download closed external-load handoff
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-input
+
+      - name: Verify exact external-load handoff artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$INPUT_ARTIFACT_ID" && test -n "$INPUT_ARTIFACT_DIGEST"
+          [[ "$INPUT_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          artifact_digest="${INPUT_ARTIFACT_DIGEST#sha256:}"
+          [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]]
+          metadata="$RUNNER_TEMP/external-input-artifact-metadata.json"
+          archive="$RUNNER_TEMP/external-input-artifact.zip"
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$INPUT_ARTIFACT_ID" \
+            --output "$metadata"
+          /usr/bin/python3 - "$metadata" "$INPUT_ARTIFACT_ID" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          metadata_path, artifact_id, run_id, attempt, target_sha = sys.argv[1:]
+          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          expected_name = f"platform-production-external-load-input-{run_id}-{attempt}"
+          if payload.get("id") != int(artifact_id) or payload.get("name") != expected_name or payload.get("expired") is not False:
+              raise SystemExit("external-load handoff artifact metadata is not exact")
+          workflow_run = payload.get("workflow_run")
+          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("external-load handoff artifact is not bound to this run and SHA")
+          PY
+          curl --fail-with-body --silent --show-error --location \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$INPUT_ARTIFACT_ID/zip" \
+            --output "$archive"
+          printf '%s  %s\n' "$artifact_digest" "$archive" | sha256sum -c - >/dev/null
+
+      - name: Revalidate external handoff and exact target SHA
         shell: bash
         run: |
           set -euo pipefail
-          ssh_dir="$RUNNER_TEMP/production-external-load-ssh"
-          control_path="/tmp/old-sparky-external-load-ssh-$GITHUB_RUN_ID"
+          test -f "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" && test ! -L "$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$TARGET_SHA" "$RUN_ID" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          path, target_sha, run_id = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          expected = {"schema", "confirmation", "target_sha", "control_email", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics"}
+          if set(payload) != expected:
+              raise SystemExit("external handoff schema is not closed")
+          if payload.get("schema") not in (1, "1") or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id:
+              raise SystemExit("external handoff exact target SHA or run identity mismatch")
+          if payload.get("profile") != "external-vote" or payload.get("timeout_diagnostics") not in {"true", "false"}:
+              raise SystemExit("external handoff profile is invalid")
+          if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None or re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None:
+              raise SystemExit("external handoff exact target SHA is malformed")
+          for key, maximum in (("setup_concurrency", 256), ("tournament_count", 40), ("users_per_tournament", 500)):
+              value = payload.get(key)
+              if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value) is None or int(value) > maximum:
+                  raise SystemExit(f"external handoff {key} is malformed")
+          if int(payload["users_per_tournament"]) < 14:
+              raise SystemExit("external handoff users-per-tournament is below the floor")
+          print("external handoff accepted for exact target SHA")
+          PY
+
+      - name: Configure production SSH
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-external-load-ssh-setup"
+          control_path="/tmp/old-sparky-external-load-ssh-setup-$GITHUB_RUN_ID"
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
           ssh_scan="$ssh_dir/known_hosts.scan"
           ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
-          test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key." >&2; exit 1; }
-          test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
-            || { echo "Expected exactly one production ED25519 host key." >&2; exit 1; }
-          ssh_fingerprint="$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')"
-          test "$ssh_fingerprint" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y" \
-            || { echo "Production SSH host fingerprint mismatch." >&2; exit 1; }
+          test -s "$ssh_scan" && test "$(wc -l < "$ssh_scan" | tr -d ' ')" = 1
+          test "$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
           install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
           {
             printf '%s\n' 'Host *'
@@ -114,310 +272,1126 @@ jobs:
             printf '  ControlPath %s\n' "$control_path"
           } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"
-          {
-            echo "SSH_DIR=$ssh_dir"
-            echo "SSH_CONTROL_PATH=$control_path"
-          } >> "$GITHUB_ENV"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
-      - name: Prepare fixture and run external HTTP load
-        id: external-run
-        continue-on-error: true
+      - name: Prepare external fixture with ephemeral SSH
+        id: fixture-setup
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -u
-          artifact_dir="$RUNNER_TEMP/platform-external-load-artifacts"
-          install -d -m 700 "$artifact_dir"
-          remote_log="$artifact_dir/remote-supervisor.log"
+          input_path="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          artifact_dir="$RUNNER_TEMP/external-fixture"
           export_dir="/tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID"
           manifest_path="$artifact_dir/manifest.json"
-          ready_path="$export_dir/ready"
-          client_report="$artifact_dir/external-load.json"
-          remote_status=1
-          load_status=1
-          manifest_ready=0
-          remote_pid=""
-
-          cleanup_local() {
-            rm -f -- "$manifest_path"
-          }
-          trap cleanup_local EXIT
-
+          mkdir -p "$artifact_dir"; chmod 700 "$artifact_dir"
+          manifest_ready=0; setup_status=1
           set +e
-          ssh \
-            -F "$SSH_DIR/config" \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=10 \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=3 \
-            -i "$SSH_DIR/id_ed25519" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- \
-              "$QA_CONFIRMATION" "$TARGET_SHA" "$CONTROL_EMAIL" "$SETUP_CONCURRENCY" \
-              "$GITHUB_RUN_ID" external-vote "$TOURNAMENT_COUNT" "$USERS_PER_TOURNAMENT" \
-              "$TIMEOUT_DIAGNOSTICS" \
-            > "$remote_log" 2>&1 <<'REMOTE' &
-          set -Eeuo pipefail
-          sudo -n -- /opt/oldsparky/platform/current/tools/platform_production_external_fixture_qa.sh "$@"
-          REMOTE
-          remote_pid="$!"
-          set -e
-
-          for _ in $(seq 1 900); do
-            if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -i "$SSH_DIR/id_ed25519" \
-              "$PROD_SSH_USER@$PROD_SSH_HOST:$ready_path" "$artifact_dir/ready" \
-              >/dev/null 2>&1; then
-              if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
-                -i "$SSH_DIR/id_ed25519" \
-                "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/manifest.json" "$manifest_path" \
-                >/dev/null 2>&1; then
-                manifest_ready=1
-                break
+          ssh -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -i "$SSH_DIR/id_ed25519" \
+            "$PROD_SSH_USER@$PROD_SSH_HOST" /usr/bin/python3.12 /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py external-fixture < "$input_path" >/dev/null 2>&1
+          launch_status="$?"
+          if [[ "$launch_status" == 0 ]]; then
+            for _ in $(seq 1 900); do
+              if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/ready" "$artifact_dir/ready" >/dev/null 2>&1 \
+                && scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/manifest.json" "$manifest_path" >/dev/null 2>&1; then
+                chmod 600 "$manifest_path"; manifest_ready=1; setup_status=0; break
               fi
-            fi
-            if ! kill -0 "$remote_pid" 2>/dev/null; then
-              wait "$remote_pid" 2>/dev/null || true
-              break
-            fi
-            sleep 2
-          done
+              sleep 2
+            done
+          fi
+          echo "manifest_ready=$manifest_ready" >> "$GITHUB_OUTPUT"
+          echo "setup_status=$setup_status" >> "$GITHUB_OUTPUT"
+          exit "$setup_status"
 
-          if [[ "$manifest_ready" == "1" ]]; then
-            chmod 600 "$manifest_path"
-            load_args=(
-              python3 platform/tools/platform_load.py run
-              --profile "$PROFILE_ID"
-              --manifest "$manifest_path"
-              --report-path "$client_report"
-            )
-            if [[ "$TIMEOUT_DIAGNOSTICS" == "true" ]]; then
-              load_args+=(--timeout-diagnostics-run-id "$GITHUB_RUN_ID")
-            fi
-            set +e
-            "${load_args[@]}"
-            load_status="$?"
-            set -e
-            if [[ "$TIMEOUT_DIAGNOSTICS" == "true" ]]; then
-              diagnostic_ids="$artifact_dir/timeout-diagnostic-ids.json"
-              /usr/bin/python3 - "$client_report" "$diagnostic_ids" <<'PY'
+      - name: Validate closed fixture manifest
+        if: ${{ steps.fixture-setup.outputs.manifest_ready == '1' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$RUNNER_TEMP/external-fixture/manifest.json" && test ! -L "$RUNNER_TEMP/external-fixture/manifest.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/external-fixture/manifest.json" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          keys = {"schema", "purpose", "origin", "session_cookie_name", "csrf_cookie_name", "marker", "created_at", "tournaments", "users"}
+          if set(manifest) != keys or manifest.get("schema") != 1 or manifest.get("purpose") != "external_ready_vote" or manifest.get("origin") != "https://old-sparky.com":
+              raise SystemExit("fixture manifest schema is not closed")
+          if not isinstance(manifest.get("created_at"), str) or re.fullmatch(r"preprod[0-9]{12}[0-9a-f]{4}", str(manifest.get("marker"))) is None:
+              raise SystemExit("fixture manifest marker is invalid")
+          tournaments = manifest.get("tournaments")
+          users = manifest.get("users")
+          if not isinstance(tournaments, list) or not isinstance(users, list) or not tournaments or len(tournaments) > 40 or len(users) > 20000:
+              raise SystemExit("fixture manifest population is invalid")
+          for row in tournaments:
+              if set(row) != {"id", "slug", "user_count"} or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(row["id"])) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(row["slug"])) or not isinstance(row["user_count"], int) or row["user_count"] < 14:
+                  raise SystemExit("fixture tournament row is invalid")
+          for row in users:
+              if set(row) != {"user_id", "tournament_slug", "session_token", "csrf_token"}:
+                  raise SystemExit("fixture user row schema is not closed")
+              for field in ("user_id", "tournament_slug", "session_token", "csrf_token"):
+                  if not isinstance(row[field], str) or re.fullmatch(r"[A-Za-z0-9._~+/=-]{1,1024}", row[field]) is None:
+                      raise SystemExit("fixture user field is unsafe")
+          PY
+
+      - name: Publish closed fixture manifest
+        id: publish-manifest
+        if: ${{ success() && steps.fixture-setup.outputs.setup_status == '0' && steps.fixture-setup.outputs.manifest_ready == '1' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-fixture/manifest.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove fixture-setup SSH material
+        id: cleanup-setup-ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ssh_dir="$RUNNER_TEMP/production-external-load-ssh-setup"
+          control_path="/tmp/old-sparky-external-load-ssh-setup-$GITHUB_RUN_ID"
+          handoff="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          rm -f -- "$control_path" "$handoff"
+          test ! -e "$control_path" && test ! -L "$control_path"
+          test ! -e "$handoff" && test ! -L "$handoff"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
+
+  # The measurement runner may execute the candidate load client, but it is a
+  # fresh runner with no production SSH environment or key material.
+  load-client:
+    name: Run checked-out external HTTP load client
+    needs:
+      - validate-external-inputs
+      - fixture-setup
+    if: >-
+      needs.validate-external-inputs.result == 'success' &&
+      needs.fixture-setup.result == 'success' &&
+      needs.fixture-setup.outputs.setup_status == '0' &&
+      needs.fixture-setup.outputs.manifest_ready == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      load_status: ${{ steps.external-evaluate.outputs.load_status }}
+      report_ready: ${{ steps.external-evaluate.outputs.report_ready }}
+      candidate_artifact_id: ${{ steps.publish-candidate.outputs.artifact-id }}
+      candidate_artifact_digest: ${{ steps.publish-candidate.outputs.artifact-digest }}
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      PROFILE_ID: ${{ inputs.profile_id }}
+      TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
+      SOURCE_GIT_SHA: ${{ github.sha }}
+      INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
+      INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
+      MANIFEST_ARTIFACT_ID: ${{ needs.fixture-setup.outputs.manifest_artifact_id }}
+      MANIFEST_ARTIFACT_DIGEST: ${{ needs.fixture-setup.outputs.manifest_artifact_digest }}
+    steps:
+      - name: Download external-load handoffs
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-input
+      - name: Download closed fixture manifest
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-manifest
+
+      - name: Verify exact load handoff artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          verify_artifact() {
+            local artifact_id="$1" artifact_digest="$2" artifact_name="$3" prefix="$4"
+            test -n "$artifact_id" && test -n "$artifact_digest"
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+            artifact_digest="${artifact_digest#sha256:}"
+            [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]]
+            local metadata="$RUNNER_TEMP/${prefix}-metadata.json" archive="$RUNNER_TEMP/${prefix}.zip"
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" \
+              --output "$metadata"
+            /usr/bin/python3 - "$metadata" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
           import json
           from pathlib import Path
           import sys
 
-          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          summary = report.get("overall") or report.get("raw_http") or {}
-          ids = sorted({
-              row["diagnostic_id"]
-              for row in summary.get("timeout_diagnostics") or []
-              if (
-                  isinstance(row, dict)
-                  and row.get("error_kind") == "TimeoutError"
-                  and isinstance(row.get("diagnostic_id"), str)
-              )
-          })
-          Path(sys.argv[2]).write_text(json.dumps(ids) + "\n", encoding="utf-8")
+          metadata_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]
+          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          if payload.get("id") != int(artifact_id) or payload.get("name") != artifact_name or payload.get("expired") is not False:
+              raise SystemExit("load handoff artifact metadata is not exact")
+          workflow_run = payload.get("workflow_run")
+          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("load handoff artifact is not bound to this run and SHA")
           PY
-              if ! scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
-                -i "$SSH_DIR/id_ed25519" \
-                "$diagnostic_ids" \
-                "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/timeout-diagnostic-ids.json" \
-                >/dev/null 2>&1; then
-                echo "Timeout diagnostic ID handoff to the origin failed." >&2
-                load_status=1
-              fi
-            fi
-            ssh \
-              -F "$SSH_DIR/config" \
-              -o BatchMode=yes \
-              -o IdentitiesOnly=yes \
-              -i "$SSH_DIR/id_ed25519" \
-              "$PROD_SSH_USER@$PROD_SSH_HOST" \
-              "test -d '$export_dir' && touch '$export_dir/complete'" \
-              >/dev/null 2>&1 || true
-          fi
+            curl --fail-with-body --silent --show-error --location \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" \
+              --output "$archive"
+            printf '%s  %s\n' "$artifact_digest" "$archive" | sha256sum -c - >/dev/null
+          }
+          verify_artifact "$INPUT_ARTIFACT_ID" "$INPUT_ARTIFACT_DIGEST" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-input
+          verify_artifact "$MANIFEST_ARTIFACT_ID" "$MANIFEST_ARTIFACT_DIGEST" "platform-production-external-load-manifest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-manifest
+      - name: Checkout reviewed load client
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Require the exact checked-out load-client SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+      - name: Validate load manifest before candidate execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" && test ! -L "$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          test -f "$RUNNER_TEMP/external-manifest/manifest.json" && test ! -L "$RUNNER_TEMP/external-manifest/manifest.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/external-input/platform-production-external-load-input.json" "$RUNNER_TEMP/external-manifest/manifest.json" "$TARGET_SHA" "$GITHUB_RUN_ID" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
 
-          if [[ -n "$remote_pid" ]]; then
-            set +e
-            wait "$remote_pid"
-            remote_status="$?"
-            set -e
+          input_path, manifest_path, target_sha, run_id = sys.argv[1:]
+          payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
+          expected = {"schema", "confirmation", "target_sha", "control_email", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics"}
+          if set(payload) != expected or payload.get("schema") not in (1, "1") or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id:
+              raise SystemExit("external handoff schema or exact target SHA mismatch")
+          manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+          keys = {"schema", "purpose", "origin", "session_cookie_name", "csrf_cookie_name", "marker", "created_at", "tournaments", "users"}
+          if set(manifest) != keys or manifest.get("schema") != 1 or manifest.get("origin") != "https://old-sparky.com" or re.fullmatch(r"preprod[0-9]{12}[0-9a-f]{4}", str(manifest.get("marker"))) is None:
+              raise SystemExit("fixture manifest is not a closed schema")
+          if not isinstance(manifest.get("users"), list) or not manifest["users"]:
+              raise SystemExit("fixture manifest has no users")
+          print("closed external handoff accepted for exact target SHA")
+          PY
+      - name: Run checked-out external HTTP load client
+        id: external-evaluate
+        shell: bash
+        run: |
+          set -u
+          artifact_dir="$RUNNER_TEMP/external-client"
+          mkdir -p "$artifact_dir"; chmod 700 "$artifact_dir"
+          profile_env="$artifact_dir/profile.env"
+          run_checked_out_client() {
+            env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8 SOURCE_GIT_SHA="$SOURCE_GIT_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" "$@"
+          }
+          load_status=1
+          report_ready=0
+          if run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py validate --profile "$PROFILE_ID" --dispatchable >/dev/null \
+            && run_checked_out_client /usr/bin/python3 platform/tools/platform_load.py export-env --profile "$PROFILE_ID" > "$profile_env"; then
+            profile_status=0
+          else
+            profile_status=$?
           fi
-          cp "$remote_log" "$RUNNER_TEMP/platform-external-load-remote.log" 2>/dev/null || true
-
-          for file in matrix-summary.json matrix.log server-observability.log; do
-            if scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -i "$SSH_DIR/id_ed25519" \
-              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/$file" "$artifact_dir/$file" \
-              >/dev/null 2>&1; then
-              :
-            fi
-          done
-          if [[ "$TIMEOUT_DIAGNOSTICS" == "true" \
-            && -s "$client_report" \
-            && -s "$artifact_dir/server-observability.log" ]]; then
-            python3 platform/tools/platform_timeout_diagnostics.py \
-              --client-report "$client_report" \
-              --server-observability "$artifact_dir/server-observability.log" \
-              --output "$artifact_dir/timeout-diagnostics.json"
-          fi
-          if [[ "$TIMEOUT_DIAGNOSTICS" != "true" \
-            && -s "$client_report" \
-            && -s "$artifact_dir/server-observability.log" ]]; then
+          load_report="$artifact_dir/external-load.json"
+          load_log="$artifact_dir/client-raw.log"
+          load_args=(/usr/bin/python3 platform/tools/platform_load.py run --profile "$PROFILE_ID" --manifest "$RUNNER_TEMP/external-manifest/manifest.json" --report-path "$load_report")
+          if [[ "$TIMEOUT_DIAGNOSTICS" == true ]]; then load_args+=(--timeout-diagnostics-run-id "$GITHUB_RUN_ID"); fi
+          if [[ "$profile_status" == 0 ]]; then
             set +e
-            python3 platform/tools/platform_load.py evaluate \
-              --profile "$PROFILE_ID" \
-              --report "$client_report" \
-              --server-observability "$artifact_dir/server-observability.log"
+            run_checked_out_client "${load_args[@]}" > "$load_log" 2>&1
             load_status="$?"
             set -e
+          else
+            printf '%s\n' 'load-client profile validation failed' > "$load_log"
+          fi
+          if [[ "$load_status" == 0 && -s "$load_report" ]]; then report_ready=1; fi
+          chmod 600 "$load_report" "$load_log" 2>/dev/null || true
+          printf '%s\n' "$load_status" > "$artifact_dir/load-status"
+          if [[ "$TIMEOUT_DIAGNOSTICS" == true ]]; then
+            if [[ ! -s "$load_report" ]]; then
+              load_status=1
+            else
+              set +e
+              /usr/bin/python3 - "$load_report" "$artifact_dir/timeout-diagnostic-ids.json" "$TARGET_SHA" "$GITHUB_RUN_ID" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          summary = report.get("overall") or report.get("raw_http") or {}
+          rows = summary.get("timeout_diagnostics") if isinstance(summary, dict) else []
+          ids = sorted({row.get("diagnostic_id") for row in rows or [] if isinstance(row, dict) and isinstance(row.get("diagnostic_id"), str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", row["diagnostic_id"])})
+          Path(sys.argv[2]).write_text(json.dumps({
+              "schema": 1,
+              "target_sha": sys.argv[3],
+              "run_id": sys.argv[4],
+              "ids": ids,
+          }, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+              diagnostic_ids_status="$?"
+              set -e
+              if [[ "$diagnostic_ids_status" != 0 ]]; then load_status=1; fi
+            fi
+          else
+            printf '%s\n' "{\"schema\":1,\"target_sha\":\"$TARGET_SHA\",\"run_id\":\"$GITHUB_RUN_ID\",\"ids\":[]}" > "$artifact_dir/timeout-diagnostic-ids.json"
+          fi
+          /usr/bin/python3 - "$artifact_dir/load-status.json" "$load_status" "$report_ready" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          destination, status, report_ready, target_sha, run_id, attempt = sys.argv[1:]
+          Path(destination).write_text(
+              json.dumps(
+                  {
+                      "schema": 1,
+                      "status": int(status),
+                      "report_ready": report_ready == "1",
+                      "target_sha": target_sha,
+                      "run_id": run_id,
+                      "run_attempt": attempt,
+                  },
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          chmod 600 "$artifact_dir/load-status.json"
+          echo "load_status=$load_status" >> "$GITHUB_OUTPUT"
+          echo "report_ready=$report_ready" >> "$GITHUB_OUTPUT"
+          exit "$load_status"
+      - name: Publish candidate load data
+        id: publish-candidate
+        if: ${{ always() && steps.external-evaluate.outputs.load_status == '0' && steps.external-evaluate.outputs.report_ready == '1' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-external-load-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-client/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Finalization and cleanup use a new approved runner.  They consume only the
+  # exact input and a bounded diagnostic-id list; no candidate script runs in
+  # this secret-bearing job.
+  fixture-finalize:
+    name: Signal fixture completion and collect origin evidence
+    needs:
+      - validate-external-inputs
+      - fixture-setup
+      - load-client
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      remote_status: ${{ steps.external-finalize.outputs.remote_status }}
+      observer_ready: ${{ steps.external-finalize.outputs.observer_ready }}
+      finalize_status: ${{ steps.external-finalize.outputs.finalize_status }}
+      cleanup_status: ${{ steps.cleanup.outputs.cleanup_status }}
+      cleanup_exports_status: ${{ steps.cleanup.outputs.cleanup_exports_status }}
+      cleanup_export_status: ${{ steps.cleanup.outputs.cleanup_export_status }}
+      ssh_cleanup_status: ${{ steps.cleanup_ssh.outputs.ssh_cleanup_status }}
+      cleanup_identity_status: ${{ steps.revalidate-finalizer.outputs.cleanup_identity_status }}
+      handoff_status: ${{ steps.revalidate-finalizer.outputs.handoff_status }}
+      candidate_artifact_status: ${{ steps.revalidate-finalizer.outputs.candidate_artifact_status }}
+      origin_artifact_id: ${{ steps.publish-origin.outputs.artifact-id }}
+      origin_artifact_digest: ${{ steps.publish-origin.outputs.artifact-digest }}
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      CONTROL_EMAIL: ${{ inputs.control_email }}
+      TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
+      INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
+      INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
+      CANDIDATE_ARTIFACT_ID: ${{ needs.load-client.outputs.candidate_artifact_id }}
+      CANDIDATE_ARTIFACT_DIGEST: ${{ needs.load-client.outputs.candidate_artifact_digest }}
+    steps:
+      - name: Download exact external-load handoff
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-input
+      - name: Download candidate diagnostic data
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-client
+      - name: Revalidate finalizer handoffs
+        id: revalidate-finalizer
+        if: ${{ always() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          input_path="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          cleanup_input_path="$RUNNER_TEMP/external-input/platform-production-external-load-cleanup.json"
+          candidate_dir="$RUNNER_TEMP/external-client"
+          handoff_status=0
+          candidate_artifact_status=0
+          cleanup_identity_status=1
+          install -d -m 700 "$RUNNER_TEMP/external-input"
+          # The cleanup identity is deliberately independent of the load and
+          # candidate handoffs.  Setup may already have committed a fixture
+          # when a later artifact/handoff check fails, so cleanup must still
+          # have a machine-validated run/SHA/control-account document.
+          if /usr/bin/python3 - "$cleanup_input_path" "$TARGET_SHA" "$GITHUB_RUN_ID" "$CONTROL_EMAIL" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import tempfile
+
+          destination, target_sha, run_id, control_email = sys.argv[1:]
+          email_local = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._%+\\-]{0,62}[A-Za-z0-9])?$")
+          email_label = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\\-]{0,61}[A-Za-z0-9])?$")
+          if re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
+              raise SystemExit("cleanup target SHA is malformed")
+          if re.fullmatch(r"[1-9][0-9]{0,31}", run_id) is None:
+              raise SystemExit("cleanup run id is malformed")
+          if (
+              not control_email.isascii()
+              or not 3 <= len(control_email) <= 254
+              or control_email != control_email.strip()
+              or control_email.count("@") != 1
+          ):
+              raise SystemExit("cleanup control email is malformed")
+          local, domain = control_email.split("@", 1)
+          labels = domain.split(".")
+          if (
+              not 1 <= len(local) <= 64
+              or not 1 <= len(domain) <= 253
+              or "." not in domain
+              or email_local.fullmatch(local) is None
+              or any(email_label.fullmatch(label) is None for label in labels)
+          ):
+              raise SystemExit("cleanup control email is malformed")
+          payload = {
+              "schema": "1",
+              "target_sha": target_sha,
+              "control_email": control_email.lower(),
+              "load_run_id": run_id,
+              "cleanup_run_id": run_id,
+          }
+          destination_path = Path(destination)
+          if destination_path.is_symlink() or destination_path.exists():
+              raise SystemExit("cleanup identity destination already exists")
+          destination_path.parent.mkdir(mode=0o700, exist_ok=True)
+          encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+          descriptor, temporary = tempfile.mkstemp(
+              prefix=".external-cleanup-", dir=destination_path.parent
+          )
+          try:
+              os.fchmod(descriptor, 0o600)
+              os.write(descriptor, encoded)
+              os.fsync(descriptor)
+              os.close(descriptor)
+              descriptor = -1
+              os.replace(temporary, destination_path)
+          finally:
+              if descriptor >= 0:
+                  os.close(descriptor)
+              try:
+                  os.unlink(temporary)
+              except FileNotFoundError:
+                  pass
+          if destination_path.is_symlink() or destination_path.stat().st_mode & 0o077:
+              raise SystemExit("cleanup identity permissions are unsafe")
+          PY
+          then
+            cleanup_identity_status=0
+          fi
+          verify_artifact() {
+            local artifact_id="$1" artifact_digest="$2" artifact_name="$3" prefix="$4"
+            test -n "$artifact_id" && test -n "$artifact_digest" || return 1
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || return 1
+            artifact_digest="${artifact_digest#sha256:}"
+            [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+            local metadata="$RUNNER_TEMP/${prefix}-metadata.json" archive="$RUNNER_TEMP/${prefix}.zip"
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" \
+              --output "$metadata" || return 1
+            /usr/bin/python3 - "$metadata" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          metadata_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]
+          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          if payload.get("id") != int(artifact_id) or payload.get("name") != artifact_name or payload.get("expired") is not False:
+              raise SystemExit("finalizer artifact metadata is not exact")
+          workflow_run = payload.get("workflow_run")
+          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("finalizer artifact is not bound to this run and SHA")
+          PY
+            curl --fail-with-body --silent --show-error --location \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" \
+              --output "$archive" || return 1
+            printf '%s  %s\n' "$artifact_digest" "$archive" | sha256sum -c - >/dev/null || return 1
+          }
+          if [[ ! -s "$input_path" || -L "$input_path" ]]; then
+            handoff_status=1
+          elif ! verify_artifact "$INPUT_ARTIFACT_ID" "$INPUT_ARTIFACT_DIGEST" "platform-production-external-load-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-finalizer-input; then
+            handoff_status=1
+          fi
+          install -d -m 700 "$candidate_dir"
+          if [[ -z "$CANDIDATE_ARTIFACT_ID" || -z "$CANDIDATE_ARTIFACT_DIGEST" ]] \
+            || ! verify_artifact "$CANDIDATE_ARTIFACT_ID" "$CANDIDATE_ARTIFACT_DIGEST" "platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" external-finalizer-candidate; then
+            candidate_artifact_status=1
+          fi
+          if [[ "$handoff_status" == 0 ]]; then
+            set +e
+            /usr/bin/python3 - "$input_path" "$TARGET_SHA" "$GITHUB_RUN_ID" "$RUNNER_TEMP/external-client/timeout-diagnostic-ids.json" "$RUNNER_TEMP/external-client/timeout-diagnostic-ids.remote.json" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          path, target_sha, run_id, ids_path, remote_ids_path = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          expected = {"schema", "confirmation", "target_sha", "control_email", "setup_concurrency", "run_id", "profile", "tournament_count", "users_per_tournament", "timeout_diagnostics"}
+          if set(payload) != expected or payload.get("schema") not in (1, "1") or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id:
+              raise SystemExit("external finalizer handoff schema or exact target SHA mismatch")
+          ids_file = Path(ids_path)
+          if ids_file.exists() and ids_file.is_symlink():
+              raise SystemExit("diagnostic id handoff must not be a symlink")
+          if not ids_file.exists():
+              ids_file.write_text(json.dumps({"schema": 1, "target_sha": target_sha, "run_id": run_id, "ids": []}) + "\n", encoding="utf-8")
+          ids_payload = json.loads(ids_file.read_text(encoding="utf-8"))
+          if set(ids_payload) != {"schema", "target_sha", "run_id", "ids"} or ids_payload.get("schema") != 1 or ids_payload.get("target_sha") != target_sha or ids_payload.get("run_id") != run_id:
+              raise SystemExit("diagnostic id handoff schema or exact target SHA is invalid")
+          ids = ids_payload.get("ids")
+          if not isinstance(ids, list) or len(ids) > 100000 or any(not isinstance(item, str) or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", item) is None for item in ids):
+              raise SystemExit("diagnostic id handoff is not closed")
+          Path(remote_ids_path).write_text(json.dumps(ids, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+            handoff_status="$?"
+            set -e
+          fi
+          echo "handoff_status=$handoff_status" >> "$GITHUB_OUTPUT"
+          echo "candidate_artifact_status=$candidate_artifact_status" >> "$GITHUB_OUTPUT"
+          echo "cleanup_identity_status=$cleanup_identity_status" >> "$GITHUB_OUTPUT"
+          # This status-bearing step must not prevent the always-run cleanup
+          # from executing.  The final gate consumes the explicit status and
+          # reports handoff failure only after checking cleanup first.
+          exit 0
+
+      - name: Configure finalizer SSH
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-external-load-ssh-finalize"
+          control_path="/tmp/old-sparky-external-load-ssh-finalize-$GITHUB_RUN_ID"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"; chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"; ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" && test "$(wc -l < "$ssh_scan" | tr -d ' ')" = 1
+          test "$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          { printf '%s\n' 'Host *' '  StrictHostKeyChecking yes'; printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"; printf '%s\n' '  ControlMaster auto' '  ControlPersist 15m'; printf '  ControlPath %s\n' "$control_path"; } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"; printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Signal fixture completion and collect origin evidence
+        id: external-finalize
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          HANDOFF_STATUS: ${{ steps.revalidate-finalizer.outputs.handoff_status }}
+        run: |
+          set -u
+          input_path="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          export_dir="/tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID"
+          artifact_dir="$RUNNER_TEMP/external-evidence"; mkdir -p "$artifact_dir"; chmod 700 "$artifact_dir"
+          remote_status=1; observer_ready=0; finalize_status=1
+          ssh_dir="${SSH_DIR:-$RUNNER_TEMP/production-external-load-ssh-finalize}"
+          if [[ "$HANDOFF_STATUS" == 0 && -s "$input_path" && -s "$ssh_dir/config" && -s "$ssh_dir/id_ed25519" ]]; then
+            if [[ "$TIMEOUT_DIAGNOSTICS" == true ]]; then
+              scp -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$ssh_dir/id_ed25519" "$RUNNER_TEMP/external-client/timeout-diagnostic-ids.remote.json" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/timeout-diagnostic-ids.json" >/dev/null 2>&1 || true
+            fi
+            set +e
+            ssh -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" /usr/bin/python3.12 /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py external-finalize < "$input_path" >/dev/null 2>&1
+            complete_status="$?"
+            set -e
+            if [[ "$complete_status" == 0 ]]; then
+              deadline=$(( $(date +%s) + 10800 ))
+              while (( $(date +%s) < deadline )); do
+                if scp -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/matrix-summary.json" "$artifact_dir/matrix-summary.json" >/dev/null 2>&1 \
+                  && scp -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/supervisor.exit" "$artifact_dir/supervisor.exit" >/dev/null 2>&1; then
+                  remote_status="$(tr -d '[:space:]' < "$artifact_dir/supervisor.exit")"; observer_ready=1; break
+                fi
+                sleep 2
+              done
+              for file in canonical.log server-observability.json timeout-diagnostics.json; do
+                scp -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/$file" "$artifact_dir/$file" >/dev/null 2>&1 || true
+              done
+              [[ "$observer_ready" == 1 && "$remote_status" == 0 && -s "$artifact_dir/matrix-summary.json" && -s "$artifact_dir/canonical.log" && -s "$artifact_dir/server-observability.json" ]] && finalize_status=0
+            fi
           fi
           echo "remote_status=$remote_status" >> "$GITHUB_OUTPUT"
-          echo "load_status=$load_status" >> "$GITHUB_OUTPUT"
-          echo "manifest_ready=$manifest_ready" >> "$GITHUB_OUTPUT"
-          # The final gate below owns the failure status so exact cleanup still runs.
+          echo "observer_ready=$observer_ready" >> "$GITHUB_OUTPUT"
+          echo "finalize_status=$finalize_status" >> "$GITHUB_OUTPUT"
+          # Keep the finalizer job alive so the explicit cleanup status can be
+          # observed and enforced even when completion/observer handoff fails.
           exit 0
 
       - name: Exact cleanup of external fixture
         id: cleanup
         if: ${{ always() }}
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          CLEANUP_IDENTITY_STATUS: ${{ steps.revalidate-finalizer.outputs.cleanup_identity_status }}
         run: |
           set -u
+          umask 077
+          input_path="$RUNNER_TEMP/external-input/platform-production-external-load-cleanup.json"
+          export_dir="/tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID"
+          artifact_dir="$RUNNER_TEMP/external-evidence"
+          ssh_dir="${SSH_DIR:-$RUNNER_TEMP/production-external-load-ssh-finalize}"
           cleanup_status=1
-          cleanup_log="$RUNNER_TEMP/platform-external-load-cleanup.log"
-          cleanup_summary="$RUNNER_TEMP/platform-external-load-cleanup.json"
-          set +e
-          ssh \
-            -F "$SSH_DIR/config" \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o ConnectTimeout=10 \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=3 \
-            -i "$SSH_DIR/id_ed25519" \
-            "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$TARGET_SHA" "$GITHUB_RUN_ID" "$CONTROL_EMAIL" "$GITHUB_RUN_ID" \
-            > "$cleanup_log" 2>&1 <<'REMOTE'
-          set -Eeuo pipefail
-          target_sha="$1"
-          load_run_id="$2"
-          control_email="$3"
-          cleanup_run_id="$4"
-          # Always invoke the exact supervisor.  A missing filesystem run root
-          # can still have a durable PreprodTestRun fixture inventory and must
-          # take the orphan-cleanup path instead of being treated as absent.
-          sudo -n -- /opt/oldsparky/platform/current/tools/platform_production_retained_load_cleanup_qa.sh \
-            DELETE-PRODUCTION-RETAINED-LOAD "$target_sha" "$load_run_id" "$control_email" "$cleanup_run_id"
-          REMOTE
-          cleanup_status="$?"
-          set -e
-          if [[ "$cleanup_status" == "0" ]]; then
-            export_dir="/tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID"
-            scp -F "$SSH_DIR/config" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -i "$SSH_DIR/id_ed25519" \
-              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/cleanup-summary.json" "$cleanup_summary" \
-              >/dev/null 2>&1 || true
-            ssh \
-              -F "$SSH_DIR/config" \
-              -o BatchMode=yes \
-              -o IdentitiesOnly=yes \
-              -i "$SSH_DIR/id_ed25519" \
-              "$PROD_SSH_USER@$PROD_SSH_HOST" \
-              "rm -f -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/complete /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/ready /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/manifest.json /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix-summary.json /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/matrix.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/server-observability.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/qa-command.log /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID/timeout-diagnostic-ids.json && rmdir -- /tmp/old-sparky-production-retained-load-$GITHUB_RUN_ID 2>/dev/null || true" \
-              >/dev/null 2>&1 || true
-            ssh \
-              -F "$SSH_DIR/config" \
-              -o BatchMode=yes \
-              -o IdentitiesOnly=yes \
-              -i "$SSH_DIR/id_ed25519" \
-              "$PROD_SSH_USER@$PROD_SSH_HOST" \
-              "rm -f -- /tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID/cleanup-summary.json /tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID/cleanup.log && rmdir -- /tmp/old-sparky-production-retained-cleanup-$GITHUB_RUN_ID 2>/dev/null || true" \
-              >/dev/null 2>&1 || true
-          fi
-          echo "cleanup_status=$cleanup_status" >> "$GITHUB_OUTPUT"
-          exit 0
+          cleanup_exports_status=1
+          cleanup_export_status=1
+          cleanup_artifact_status=1
+          summary_copy_status=1
+          canonical_copy_status=1
+          projection_status=1
+          install -d -m 700 "$artifact_dir"
+          cleanup_summary="$artifact_dir/cleanup-summary.json"
+          canonical_raw="$artifact_dir/cleanup-canonical.raw"
+          ssh_output_file="$artifact_dir/cleanup-ssh-output"
 
-      - name: Publish external load evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: platform-production-external-load-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/platform-external-load-artifacts/external-load.json
-            ${{ runner.temp }}/platform-external-load-artifacts/matrix-summary.json
-            ${{ runner.temp }}/platform-external-load-artifacts/matrix.log
-            ${{ runner.temp }}/platform-external-load-artifacts/server-observability.log
-            ${{ runner.temp }}/platform-external-load-artifacts/timeout-diagnostics.json
-            ${{ runner.temp }}/platform-external-load-remote.log
-            ${{ runner.temp }}/platform-external-load-cleanup.json
-            ${{ runner.temp }}/platform-external-load-cleanup.log
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Write external load summary
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          /usr/bin/python3 - "$RUNNER_TEMP/platform-external-load-artifacts/external-load.json" \
-            >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          project_cleanup_summary() {
+            local source="$1" destination="$2"
+            /usr/bin/python3 - "$source" "$destination" <<'PY'
           import json
           from pathlib import Path
           import sys
 
-          path = Path(sys.argv[1])
-          print("### Production external load")
-          print()
-          if not path.exists():
-              print("External client report was not produced.")
-          else:
-              payload = json.loads(path.read_text(encoding="utf-8"))
-              overall = payload.get("raw_http") or payload.get("overall") or {}
-              latency = overall.get("latency") or {}
-              logical = payload.get("logical") or {}
-              logical_latency = logical.get("end_to_end_latency") or {}
-              acceptance = payload.get("acceptance") or {}
-              contract = payload.get("load_contract") or {}
-              diagnostic_mode = (payload.get("timeout_path_diagnostics") or {}).get("enabled", False)
-              print(f"- Profile: **{contract.get('profile_id')}** v{contract.get('profile_version')}; digest: `{contract.get('profile_digest')}`")
-              print(f"- Source SHA: `{payload.get('source_git_sha')}`; runner: {((payload.get('runner') or {}).get('location'))}")
-              print(f"- Mode: **{payload.get('mode')}**")
-              if diagnostic_mode:
-                  print("- Mode note: **timeout-path diagnostics only**; acceptance is intentionally not evaluated.")
-              print(f"- Fixture: {payload.get('users')} users / {payload.get('tournaments')} tournaments")
-              print(f"- Raw HTTP attempts: {overall.get('requests')}; errors: {overall.get('errors')}; overloads: {overall.get('temporary_overload_responses', 0)}")
-              print(f"- Raw attempt p50/p95/p99: {latency.get('p50_ms')} / {latency.get('p95_ms')} / {latency.get('p99_ms')} ms")
-              if logical:
-                  print(f"- Logical actions: {logical.get('actions')}; final success/failure: {logical.get('final_successes')} / {logical.get('final_failures')}; retries/action: {logical.get('retries_per_action')}")
-                  print(f"- Logical E2E p50/p95/p99: {logical_latency.get('p50_ms')} / {logical_latency.get('p95_ms')} / {logical_latency.get('p99_ms')} ms")
-                  accepted = logical.get('accepted_request_latency') or {}
-                  print(f"- Accepted request p50/p90/p95/p99: {accepted.get('p50_ms')} / {accepted.get('p90_ms')} / {accepted.get('p95_ms')} / {accepted.get('p99_ms')} ms; goodput: {logical.get('successful_goodput_actions_per_second')} actions/s")
-              print(f"- Decision: **{acceptance.get('decision')}**; contract: **{'passed' if acceptance.get('contract_ok') else 'failed'}**")
-              if acceptance.get('slo_capacity_logical_actions_per_second') is not None:
-                  print(f"- SLO capacity: {acceptance.get('slo_capacity_logical_actions_per_second')} logical actions/s; max stable goodput: {acceptance.get('max_stable_goodput_actions_per_second')} actions/s")
-          PY
+          source_path, destination_path = (Path(value) for value in sys.argv[1:])
+          fallback = {
+              "schema": 1,
+              "ok": False,
+              "markers": 0,
+              "users_deleted": 0,
+              "tournaments_deleted": 0,
+              "control_account_preserved": False,
+              "error_class": "cleanup_summary_invalid",
+          }
 
-      - name: Enforce external load and cleanup gates
+          def write_fallback() -> None:
+              destination_path.write_text(json.dumps(fallback, sort_keys=True) + chr(10), encoding="utf-8")
+
+          try:
+              source = json.loads(source_path.read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              write_fallback()
+              raise SystemExit("cleanup summary projection input is invalid")
+          if not isinstance(source, dict) or source.get("ok") is not True or source.get("control_account_preserved") is not True:
+              write_fallback()
+              raise SystemExit("cleanup summary projection input is invalid")
+
+          try:
+              counts = {}
+              for name in ("markers", "users_deleted", "tournaments_deleted"):
+                  value = source.get(name)
+                  if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10_000_000:
+                      raise ValueError(name)
+                  counts[name] = value
+              projection = {
+                  "schema": 1,
+                  "ok": True,
+                  **counts,
+                  "control_account_preserved": True,
+              }
+              if "partial_run_root_removed" in source:
+                  if not isinstance(source["partial_run_root_removed"], bool):
+                      raise ValueError("partial_run_root_removed")
+                  projection["partial_run_root_removed"] = source["partial_run_root_removed"]
+          except (KeyError, ValueError, TypeError):
+              write_fallback()
+              raise SystemExit("cleanup summary projection input is invalid")
+          destination_path.write_text(json.dumps(projection, sort_keys=True) + chr(10), encoding="utf-8")
+          PY
+          }
+
+          # The reduced cleanup identity is independently validated from the
+          # workflow inputs.  Do not gate this attempt on load/candidate
+          # handoff validation: setup may have committed state already.
+          if [[ "$CLEANUP_IDENTITY_STATUS" == 0 && -s "$input_path" \
+            && -s "$ssh_dir/config" && -s "$ssh_dir/id_ed25519" ]]; then
+            set +e
+            ssh -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+              -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              /usr/bin/python3.12 /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+              external-cleanup < "$input_path" > "$ssh_output_file" 2>&1
+            cleanup_status="$?"
+            rm -f -- "$ssh_output_file"
+            test ! -e "$ssh_output_file"
+
+            # Project the remote result before deleting the private export.
+            # A missing, stale, false or malformed summary is a cleanup
+            # failure even if the helper returned zero.
+            rm -f -- "$cleanup_summary"
+            scp -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -i "$ssh_dir/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/cleanup-summary.json" \
+              "$cleanup_summary" >/dev/null 2>&1
+            summary_copy_status="$?"
+            if [[ "$summary_copy_status" == 0 ]]; then
+              public_summary="$cleanup_summary.public"
+              project_cleanup_summary "$cleanup_summary" "$public_summary"
+              projection_status="$?"
+              if [[ "$projection_status" == 0 && -s "$public_summary" && ! -L "$public_summary" ]]; then
+                chmod 600 "$public_summary"
+                mv -- "$public_summary" "$cleanup_summary"
+              else
+                rm -f -- "$cleanup_summary" "$public_summary"
+                printf '%s\n' '{"schema":1,"ok":false,"control_account_preserved":false,"error_class":"cleanup_summary_invalid"}' > "$cleanup_summary"
+                chmod 600 "$cleanup_summary"
+              fi
+            else
+              rm -f -- "$cleanup_summary"
+              printf '%s\n' '{"schema":1,"ok":false,"control_account_preserved":false,"error_class":"cleanup_summary_unavailable"}' > "$cleanup_summary"
+              chmod 600 "$cleanup_summary"
+            fi
+
+            rm -f -- "$canonical_raw"
+            scp -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -i "$ssh_dir/id_ed25519" \
+              "$PROD_SSH_USER@$PROD_SSH_HOST:$export_dir/canonical.log" \
+              "$canonical_raw" >/dev/null 2>&1
+            canonical_copy_status="$?"
+            [[ "$canonical_copy_status" == 0 && -s "$canonical_raw" ]] || canonical_copy_status=1
+            if [[ "$summary_copy_status" == 0 && "$projection_status" == 0 \
+              && "$canonical_copy_status" == 0 && -s "$cleanup_summary" ]]; then
+              cleanup_artifact_status=0
+            fi
+
+            # Always attempt private export deletion after the primary cleanup
+            # attempt.  Its status is independent and never hidden.
+            ssh -F "$ssh_dir/config" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+              -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+              /usr/bin/python3.12 /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+              external-cleanup-exports < "$input_path" >/dev/null 2>&1
+            cleanup_export_status="$?"
+            cleanup_exports_status="$cleanup_export_status"
+            if [[ "$cleanup_status" == 0 ]] \
+              && { [[ "$cleanup_artifact_status" != 0 ]] || [[ "$cleanup_exports_status" != 0 ]]; }; then
+              cleanup_status=1
+            fi
+            if [[ "$cleanup_status" != 0 || "$cleanup_exports_status" != 0 ]]; then
+              cleanup_status=1
+            fi
+            set -e
+          fi
+          echo "cleanup_status=$cleanup_status" >> "$GITHUB_OUTPUT"
+          echo "cleanup_exports_status=$cleanup_exports_status" >> "$GITHUB_OUTPUT"
+          echo "cleanup_export_status=$cleanup_export_status" >> "$GITHUB_OUTPUT"
+          # Keep status-bearing cleanup observable to the final gate.  The
+          # gate consumes these explicit values before handoff diagnostics.
+          exit 0
+
+      - name: Remove untrusted origin transport logs
         if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
-          test "${{ steps.external-run.outputs.manifest_ready }}" = "1" \
-            || { echo "External fixture never reached the barrier." >&2; exit 1; }
-          test "${{ steps.external-run.outputs.remote_status }}" = "0" \
-            || { echo "Origin external-load supervisor failed." >&2; exit 1; }
-          if [[ "$TIMEOUT_DIAGNOSTICS" == "true" ]]; then
-            test -s "$RUNNER_TEMP/platform-external-load-artifacts/timeout-diagnostics.json" \
-              || { echo "Timeout diagnostic evidence was not produced." >&2; exit 1; }
-          else
-            test "${{ steps.external-run.outputs.load_status }}" = "0" \
-              || { echo "External load acceptance failed." >&2; exit 1; }
-          fi
-          test "${{ steps.cleanup.outputs.cleanup_status }}" = "0" \
-            || { echo "Exact external-load cleanup failed." >&2; exit 1; }
+          artifact_dir="$RUNNER_TEMP/external-evidence"
+          rm -f -- "$artifact_dir/cleanup-raw.log"
+          test ! -e "$artifact_dir/cleanup-raw.log"
+          for file in matrix-summary.json canonical.log server-observability.json timeout-diagnostics.json cleanup-summary.json cleanup-canonical.log; do
+            if [[ -e "$artifact_dir/$file" ]]; then
+              test ! -L "$artifact_dir/$file"
+            fi
+          done
 
-      - name: Remove external-load SSH control socket
+      - name: Remove finalizer SSH material
+        id: cleanup_ssh
         if: ${{ always() }}
         shell: bash
-        run: rm -f -- "$SSH_CONTROL_PATH"
+        run: |
+          set -Eeuo pipefail
+          ssh_dir="$RUNNER_TEMP/production-external-load-ssh-finalize"
+          control_path="/tmp/old-sparky-external-load-ssh-finalize-$GITHUB_RUN_ID"
+          input_path="$RUNNER_TEMP/external-input/platform-production-external-load-input.json"
+          cleanup_input_path="$RUNNER_TEMP/external-input/platform-production-external-load-cleanup.json"
+
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          rm -f -- "$control_path" "$input_path" "$cleanup_input_path"
+          test ! -e "$control_path" && test ! -L "$control_path"
+          test ! -e "$input_path" && test ! -L "$input_path"
+          test ! -e "$cleanup_input_path" && test ! -L "$cleanup_input_path"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
+
+      - name: Publish origin evidence
+        id: publish-origin
+        if: ${{ success() && steps.cleanup_ssh.outcome == 'success' && steps.external-finalize.outputs.remote_status == '0' && steps.external-finalize.outputs.observer_ready == '1' && steps.external-finalize.outputs.finalize_status == '0' && steps.cleanup.outputs.cleanup_status == '0' && steps.cleanup.outputs.cleanup_exports_status == '0' && steps.cleanup_ssh.outputs.ssh_cleanup_status == '0' && steps.revalidate-finalizer.outputs.cleanup_identity_status == '0' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-external-load-origin-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/external-evidence/matrix-summary.json
+            ${{ runner.temp }}/external-evidence/canonical.log
+            ${{ runner.temp }}/external-evidence/server-observability.json
+            ${{ runner.temp }}/external-evidence/timeout-diagnostics.json
+            ${{ runner.temp }}/external-evidence/cleanup-summary.json
+            ${{ runner.temp }}/external-evidence/cleanup-canonical.log
+          if-no-files-found: error
+          retention-days: 1
+
+  # Evaluation/sanitization happens on another secret-free checkout runner.
+  evaluate-load:
+    name: Evaluate checked-out load report
+    needs:
+      - validate-external-inputs
+      - fixture-setup
+      - fixture-finalize
+      - load-client
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    env:
+      PROFILE_ID: ${{ inputs.profile_id }}
+      TIMEOUT_DIAGNOSTICS: ${{ inputs.timeout_diagnostics }}
+      SOURCE_GIT_SHA: ${{ github.sha }}
+      INPUT_ARTIFACT_ID: ${{ needs.validate-external-inputs.outputs.input_artifact_id }}
+      INPUT_ARTIFACT_DIGEST: ${{ needs.validate-external-inputs.outputs.input_artifact_digest }}
+      CANDIDATE_ARTIFACT_ID: ${{ needs.load-client.outputs.candidate_artifact_id }}
+      CANDIDATE_ARTIFACT_DIGEST: ${{ needs.load-client.outputs.candidate_artifact_digest }}
+      ORIGIN_ARTIFACT_ID: ${{ needs.fixture-finalize.outputs.origin_artifact_id }}
+      ORIGIN_ARTIFACT_DIGEST: ${{ needs.fixture-finalize.outputs.origin_artifact_digest }}
+    steps:
+      - name: Checkout reviewed load evaluator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Require the exact checked-out evaluator SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_GIT_SHA"
+      - name: Download candidate load data
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-client-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-client
+      - name: Download fixed origin evidence
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-production-external-load-origin-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/external-evidence
+      - name: Verify evaluator artifact identity and digest
+        id: verify-evaluator-artifacts
+        if: ${{ always() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          verify_artifact() {
+            local artifact_id="$1" artifact_digest="$2" artifact_name="$3" prefix="$4"
+            test -n "$artifact_id" && test -n "$artifact_digest" || return 1
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || return 1
+            artifact_digest="${artifact_digest#sha256:}"
+            [[ "$artifact_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+            local metadata="$RUNNER_TEMP/${prefix}-metadata.json" archive="$RUNNER_TEMP/${prefix}.zip"
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" \
+              --output "$metadata" || return 1
+            /usr/bin/python3 - "$metadata" "$artifact_id" "$artifact_name" "$GITHUB_RUN_ID" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          metadata_path, artifact_id, artifact_name, run_id, target_sha = sys.argv[1:]
+          payload = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+          if payload.get("id") != int(artifact_id) or payload.get("name") != artifact_name or payload.get("expired") is not False:
+              raise SystemExit("evaluator artifact metadata is not exact")
+          workflow_run = payload.get("workflow_run")
+          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("evaluator artifact is not bound to this run and SHA")
+          PY
+            curl --fail-with-body --silent --show-error --location \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" \
+              --output "$archive" || return 1
+            printf '%s  %s\n' "$artifact_digest" "$archive" | sha256sum -c - >/dev/null || return 1
+          }
+          candidate_status=0
+          origin_status=0
+          verify_artifact "$CANDIDATE_ARTIFACT_ID" "$CANDIDATE_ARTIFACT_DIGEST" "platform-production-external-load-client-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-candidate || candidate_status=1
+          verify_artifact "$ORIGIN_ARTIFACT_ID" "$ORIGIN_ARTIFACT_DIGEST" "platform-production-external-load-origin-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" evaluator-origin || origin_status=1
+          echo "candidate_artifact_status=$candidate_status" >> "$GITHUB_OUTPUT"
+          echo "origin_artifact_status=$origin_status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Evaluate checked-out load report
+        id: evaluate-load
+        shell: bash
+        run: |
+          set -u
+          report="$RUNNER_TEMP/external-client/external-load.json"
+          load_status_file="$RUNNER_TEMP/external-client/load-status.json"
+          observer="$RUNNER_TEMP/external-evidence/server-observability.json"
+          status=1
+          upstream_ready=0
+          if [[ "${{ needs.validate-external-inputs.result }}" == success \
+            && "${{ needs.fixture-setup.result }}" == success \
+            && "${{ needs.fixture-setup.outputs.setup_status }}" == 0 \
+            && "${{ needs.fixture-setup.outputs.ssh_cleanup_status }}" == 0 \
+            && "${{ needs.load-client.result }}" == success \
+            && "${{ needs.load-client.outputs.load_status }}" == 0 \
+            && "${{ needs.load-client.outputs.report_ready }}" == 1 \
+            && "${{ needs.fixture-finalize.result }}" == success \
+            && "${{ needs.fixture-finalize.outputs.remote_status }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.observer_ready }}" == 1 \
+            && "${{ needs.fixture-finalize.outputs.finalize_status }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.cleanup_status }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.cleanup_exports_status }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.ssh_cleanup_status }}" == 0 \
+            && "${{ needs.fixture-finalize.outputs.cleanup_identity_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" == 0 \
+            && "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" == 0 \
+            && -s "$report" && -s "$load_status_file" && -s "$observer" ]]; then
+            if /usr/bin/python3 - "$load_status_file" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          path, target_sha, run_id, attempt = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="utf-8"))
+          expected = {"schema", "status", "report_ready", "target_sha", "run_id", "run_attempt"}
+          if set(payload) != expected or payload.get("schema") != 1 or payload.get("status") != 0 or payload.get("report_ready") is not True or payload.get("target_sha") != target_sha or payload.get("run_id") != run_id or payload.get("run_attempt") != attempt:
+              raise SystemExit("authoritative load-status is not bound to this run")
+          PY
+            then upstream_ready=1; fi
+          fi
+          if [[ "$upstream_ready" == 1 ]]; then
+            set +e
+            if [[ "$TIMEOUT_DIAGNOSTICS" == true ]]; then
+              /usr/bin/python3 platform/tools/platform_timeout_diagnostics.py --client-report "$report" --server-observability "$observer" --output "$RUNNER_TEMP/external-evidence/timeout-diagnostics.json"
+              status="$?"
+            else
+              /usr/bin/python3 platform/tools/platform_load.py evaluate --profile "$PROFILE_ID" --report "$report" --server-observability "$observer"
+              status="$?"
+            fi
+            set -e
+          fi
+          echo "evaluation_status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Sanitize external evidence
+        id: sanitize
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          public_dir="$RUNNER_TEMP/external-public"
+          install -d -m 700 "$public_dir"
+          sanitizer_status=0
+          # Closed artifact schemas: --artifact-type external_load,
+          # --artifact-type server_observability,
+          # --artifact-type timeout_diagnostics.
+          sanitize_json() {
+            local source="$1" destination="$2" artifact_type="$3"
+            if [[ ! -s "$source" || -L "$source" ]]; then sanitizer_status=1; return; fi
+            /usr/bin/python3 platform/tools/platform_evidence_sanitizer.py \
+              --json --artifact-type "$artifact_type" --input "$source" --output "$destination"
+            local status="$?"
+            if [[ "$status" != 0 || ! -s "$destination" || -L "$destination" ]]; then sanitizer_status=1; fi
+          }
+          sanitize_log() {
+            local source="$1" destination="$2"
+            if [[ ! -s "$source" || -L "$source" ]]; then sanitizer_status=1; return; fi
+            /usr/bin/python3 platform/tools/platform_evidence_sanitizer.py \
+              --input "$source" --output "$destination"
+            local status="$?"
+            if [[ "$status" != 0 || ! -s "$destination" || -L "$destination" ]]; then sanitizer_status=1; fi
+          }
+          sanitize_json "$RUNNER_TEMP/external-client/external-load.json" "$public_dir/external-load.json" external_load
+          sanitize_json "$RUNNER_TEMP/external-evidence/server-observability.json" "$public_dir/server-observability.json" server_observability
+          if [[ "$TIMEOUT_DIAGNOSTICS" == true ]]; then
+            sanitize_json "$RUNNER_TEMP/external-evidence/timeout-diagnostics.json" "$public_dir/timeout-diagnostics.json" timeout_diagnostics
+          else
+            printf '%s\n' '{"schema":1,"enabled":false,"public_projection":true,"authoritative":false}' > "$public_dir/timeout-diagnostics.json"
+          fi
+          sanitize_log "$RUNNER_TEMP/external-client/client-raw.log" "$public_dir/client-raw.log"
+          sanitize_log "$RUNNER_TEMP/external-evidence/canonical.log" "$public_dir/canonical.log"
+          sanitize_log "$RUNNER_TEMP/external-evidence/cleanup-canonical.log" "$public_dir/cleanup-canonical.log"
+          /usr/bin/python3 - "$RUNNER_TEMP/external-evidence/matrix-summary.json" "$RUNNER_TEMP/external-evidence/cleanup-summary.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          matrix_path, cleanup_path = (Path(value) for value in sys.argv[1:])
+          matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+          cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
+          if not isinstance(matrix, dict) or matrix.get("passed") is not True:
+              raise SystemExit("matrix summary is not a passing closed record")
+          if not isinstance(cleanup, dict) or cleanup.get("ok") is not True:
+              raise SystemExit("cleanup summary is not a passing closed record")
+          PY
+          if [[ "$?" != 0 ]]; then sanitizer_status=1; fi
+          rm -f -- \
+            "$RUNNER_TEMP/external-client/external-load.json" \
+            "$RUNNER_TEMP/external-client/client-raw.log" \
+            "$RUNNER_TEMP/external-evidence/server-observability.json" \
+            "$RUNNER_TEMP/external-evidence/timeout-diagnostics.json" \
+            "$RUNNER_TEMP/external-evidence/canonical.log" \
+            "$RUNNER_TEMP/external-evidence/cleanup-canonical.log"
+          mv -- "$public_dir/external-load.json" "$RUNNER_TEMP/external-client/external-load.json"
+          mv -- "$public_dir/client-raw.log" "$RUNNER_TEMP/external-client/client-raw.log"
+          mv -- "$public_dir/server-observability.json" "$RUNNER_TEMP/external-evidence/server-observability.json"
+          mv -- "$public_dir/timeout-diagnostics.json" "$RUNNER_TEMP/external-evidence/timeout-diagnostics.json"
+          mv -- "$public_dir/canonical.log" "$RUNNER_TEMP/external-evidence/canonical.log"
+          mv -- "$public_dir/cleanup-canonical.log" "$RUNNER_TEMP/external-evidence/cleanup-canonical.log"
+          rm -rf -- "$public_dir"
+          test ! -e "$public_dir"
+          echo "sanitizer_status=$sanitizer_status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Publish external load evidence
+        if: >-
+          success() &&
+          needs.validate-external-inputs.result == 'success' &&
+          needs.fixture-setup.result == 'success' &&
+          needs.fixture-setup.outputs.setup_status == '0' &&
+          needs.fixture-setup.outputs.ssh_cleanup_status == '0' &&
+          needs.load-client.result == 'success' &&
+          needs.load-client.outputs.load_status == '0' &&
+          needs.load-client.outputs.report_ready == '1' &&
+          needs.fixture-finalize.result == 'success' &&
+          needs.fixture-finalize.outputs.remote_status == '0' &&
+          needs.fixture-finalize.outputs.observer_ready == '1' &&
+          needs.fixture-finalize.outputs.finalize_status == '0' &&
+          needs.fixture-finalize.outputs.cleanup_status == '0' &&
+          needs.fixture-finalize.outputs.cleanup_exports_status == '0' &&
+          needs.fixture-finalize.outputs.ssh_cleanup_status == '0' &&
+          needs.fixture-finalize.outputs.cleanup_identity_status == '0' &&
+          steps.verify-evaluator-artifacts.outputs.candidate_artifact_status == '0' &&
+          steps.verify-evaluator-artifacts.outputs.origin_artifact_status == '0' &&
+          steps.evaluate-load.outputs.evaluation_status == '0' &&
+          steps.sanitize.outputs.sanitizer_status == '0'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-production-external-load-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/external-client/external-load.json
+            ${{ runner.temp }}/external-evidence/matrix-summary.json
+            ${{ runner.temp }}/external-evidence/canonical.log
+            ${{ runner.temp }}/external-evidence/server-observability.json
+            ${{ runner.temp }}/external-evidence/timeout-diagnostics.json
+            ${{ runner.temp }}/external-evidence/cleanup-summary.json
+            ${{ runner.temp }}/external-evidence/cleanup-canonical.log
+            ${{ runner.temp }}/external-client/client-raw.log
+          if-no-files-found: error
+          retention-days: 14
+      - name: Enforce external load and exact cleanup gates
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ needs.validate-external-inputs.result }}" = success || { echo "External-load dispatch validation failed." >&2; exit 1; }
+          test "${{ needs.fixture-setup.result }}" = success || { echo "External fixture setup job failed." >&2; exit 1; }
+          test "${{ needs.fixture-setup.outputs.setup_status }}" = 0 || { echo "External fixture setup status failed." >&2; exit 1; }
+          test "${{ needs.fixture-setup.outputs.ssh_cleanup_status }}" = 0 || { echo "Fixture-setup SSH cleanup failed." >&2; exit 1; }
+          test "${{ needs.load-client.result }}" = success || { echo "External load-client job failed." >&2; exit 1; }
+          test "${{ needs.load-client.outputs.load_status }}" = 0 || { echo "Authoritative external load-status failed." >&2; exit 1; }
+          test "${{ needs.load-client.outputs.report_ready }}" = 1 || { echo "External load report is missing." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.result }}" = success || { echo "External fixture-finalize job failed." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.remote_status }}" = 0 || { echo "Origin external-load supervisor failed." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.observer_ready }}" = 1 || { echo "Origin observer barrier was not reached." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.finalize_status }}" = 0 || { echo "External fixture finalization failed." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.cleanup_status }}" = 0 || { echo "Exact external-load cleanup failed." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.cleanup_exports_status }}" = 0 || { echo "External-load private export cleanup failed." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.ssh_cleanup_status }}" = 0 || { echo "Finalizer SSH cleanup failed." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.cleanup_identity_status }}" = 0 || { echo "Cleanup identity validation failed." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.handoff_status }}" = 0 || { echo "Finalizer handoff validation failed." >&2; exit 1; }
+          test "${{ needs.fixture-finalize.outputs.candidate_artifact_status }}" = 0 || { echo "Candidate load artifact identity/digest failed." >&2; exit 1; }
+          test "${{ steps.verify-evaluator-artifacts.outputs.candidate_artifact_status }}" = 0 || { echo "Evaluator candidate artifact identity/digest failed." >&2; exit 1; }
+          test "${{ steps.verify-evaluator-artifacts.outputs.origin_artifact_status }}" = 0 || { echo "Evaluator origin artifact identity/digest failed." >&2; exit 1; }
+          test "${{ steps.evaluate-load.outputs.evaluation_status }}" = 0 || { echo "External load acceptance failed." >&2; exit 1; }
+          test "${{ steps.sanitize.outputs.sanitizer_status }}" = 0 || { echo "External evidence projection/sanitizer failed." >&2; exit 1; }

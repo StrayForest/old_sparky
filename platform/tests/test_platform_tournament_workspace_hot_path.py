@@ -39,48 +39,34 @@ class PlatformTournamentWorkspaceHotPathTests(PlatformIsolatedAsyncioTestCase):
         self.assertIn("SELECT count(", sql)
         self.assertNotIn("GROUP BY", sql)
 
-    def test_active_participant_workspace_does_not_load_invite_code(self) -> None:
-        tournament = SimpleNamespace(
-            organizer_user_id="organizer-1",
-            visibility="invite_only",
-        )
+    def test_active_participant_workspace_does_not_echo_invite_code(self) -> None:
         active_participant = SimpleNamespace(status="registered")
 
-        self.assertFalse(
-            tournament_routes.should_include_workspace_invite_code(
-                tournament,
-                auth_session=SimpleNamespace(
-                    user=SimpleNamespace(id="participant-1"),
-                    role_slugs=frozenset(),
-                ),
+        self.assertIsNone(
+            tournament_routes.validated_workspace_invite_code(
+                invite_code_record=SimpleNamespace(code="ABCDEFGHIJ"),
+                has_valid_invite_code=True,
+                workspace_visible=True,
                 participant_record=active_participant,
-                workspace_visible=True,
             )
         )
 
-    def test_workspace_invite_code_remains_for_public_and_manager_views(self) -> None:
-        tournament = SimpleNamespace(
-            organizer_user_id="organizer-1",
-            visibility="public",
-        )
-
-        self.assertTrue(
-            tournament_routes.should_include_workspace_invite_code(
-                tournament,
-                auth_session=None,
+    def test_workspace_echoes_only_the_presented_validated_invite(self) -> None:
+        self.assertEqual(
+            tournament_routes.validated_workspace_invite_code(
+                invite_code_record=SimpleNamespace(code="ABCDEFGHIJ"),
+                has_valid_invite_code=True,
+                workspace_visible=True,
                 participant_record=None,
-                workspace_visible=True,
-            )
+            ),
+            "ABCDEFGHIJ",
         )
-        self.assertTrue(
-            tournament_routes.should_include_workspace_invite_code(
-                tournament,
-                auth_session=SimpleNamespace(
-                    user=SimpleNamespace(id="organizer-1"),
-                    role_slugs=frozenset(),
-                ),
-                participant_record=SimpleNamespace(status="registered"),
+        self.assertIsNone(
+            tournament_routes.validated_workspace_invite_code(
+                invite_code_record=SimpleNamespace(code="ABCDEFGHIJ"),
+                has_valid_invite_code=False,
                 workspace_visible=True,
+                participant_record=None,
             )
         )
 

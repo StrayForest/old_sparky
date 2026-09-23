@@ -2,28 +2,162 @@ name: Platform security and build
 
 on:
   pull_request:
-    paths:
-      - "platform/**"
-      - ".github/workflows/**"
   push:
     branches: [dev]
-    paths:
-      - "platform/**"
-      - ".github/workflows/**"
+  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
-  statuses: write
 
 concurrency:
   group: platform-security-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  classifier:
+    name: CI route classifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TESTED_SHA: ${{ github.sha }}
+    outputs:
+      class: ${{ steps.classify.outputs.class }}
+      event: ${{ steps.classify.outputs.event }}
+      deployable: ${{ steps.classify.outputs.deployable }}
+      fallback: ${{ steps.classify.outputs.fallback }}
+      expected_gates: ${{ steps.classify.outputs.expected_gates }}
+      target_sha: ${{ steps.classify.outputs.target_sha }}
+      digest: ${{ steps.classify.outputs.digest }}
+      reason: ${{ steps.classify.outputs.reason }}
+    steps:
+      - name: Checkout candidate history as data only
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: candidate-data
+          persist-credentials: false
+
+      - name: Capture candidate changed files without executing candidate code
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - "$GITHUB_EVENT_PATH" "$GITHUB_WORKSPACE/candidate-data" "$RUNNER_TEMP/platform-ci-changed-files.txt" <<'PY'
+          import json
+          from pathlib import Path
+          import os
+          import re
+          import subprocess
+          import sys
+
+          event_path, repo_root, output_path = sys.argv[1:]
+          payload = json.loads(Path(event_path).read_text(encoding="utf-8"))
+          event = os.environ.get("GITHUB_EVENT_NAME", "")
+          base = source_head = None
+          if event == "push":
+              base = payload.get("before")
+              source_head = payload.get("after") or (payload.get("head_commit") or {}).get("id")
+          elif event == "pull_request":
+              pull = payload.get("pull_request") or {}
+              base = (pull.get("base") or {}).get("sha")
+              # The PR source head is only the changed-file diff endpoint.
+              # TESTED_SHA remains github.sha, the synthetic merge commit.
+              source_head = (pull.get("head") or {}).get("sha")
+          sha_re = re.compile(r"^[0-9a-f]{40}$")
+          if not isinstance(base, str) or not isinstance(source_head, str) or not sha_re.fullmatch(base) or not sha_re.fullmatch(source_head) or set(base) == {"0"}:
+              Path(output_path).write_text("\x00\n", encoding="utf-8")
+              raise SystemExit(0)
+          try:
+              result = subprocess.run(
+                  ["git", "diff", "--name-only", "-z", base, source_head, "--"],
+                  cwd=repo_root,
+                  check=True,
+                  capture_output=True,
+              )
+              raw = result.stdout.decode("utf-8", errors="strict")
+          except (OSError, UnicodeError, subprocess.CalledProcessError):
+              Path(output_path).write_text("\x00\n", encoding="utf-8")
+              raise SystemExit(0)
+          paths = raw.rstrip("\x00").split("\x00") if raw else []
+          if any("\n" in path or "\r" in path for path in paths):
+              Path(output_path).write_text("\x00\n", encoding="utf-8")
+          else:
+              Path(output_path).write_text("\n".join(paths) + ("\n" if paths else ""), encoding="utf-8")
+          PY
+
+      - name: Resolve immutable default-branch classifier source
+        id: trusted_default
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_BRANCH: dev
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          trusted_ref="$RUNNER_TEMP/platform-trusted-classifier-ref.json"
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/${TRUSTED_BRANCH}" \
+            --output "$trusted_ref"
+          /usr/bin/python3 - "$trusted_ref" "$GITHUB_OUTPUT" "$TRUSTED_BRANCH" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          branch = sys.argv[3]
+          obj = payload.get("object") if isinstance(payload, dict) else None
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if payload.get("ref") != f"refs/heads/{branch}" or not isinstance(obj, dict) or obj.get("type") != "commit":
+              raise SystemExit("trusted default branch ref is not an immutable commit")
+          if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("trusted default branch commit SHA is malformed")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"sha={sha}\n")
+          PY
+          rm -f -- "$trusted_ref"
+
+      - name: Checkout trusted classifier source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.trusted_default.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Classify changed files with trusted source
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 platform/tools/platform_ci_classifier.py \
+            --event "$GITHUB_EVENT_NAME" \
+            --target-sha "$TESTED_SHA" \
+            --branch "${GITHUB_REF_NAME:-}" \
+            --event-file "$GITHUB_EVENT_PATH" \
+            --files-file "$RUNNER_TEMP/platform-ci-changed-files.txt" \
+            --output classifier-manifest.json \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Publish route manifest
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-ci-route-${{ github.run_id }}-${{ github.run_attempt }}
+          path: classifier-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
   status-start:
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      statuses: write
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TESTED_SHA: ${{ github.sha }}
     steps:
       - name: Mark platform security build pending
         shell: bash
@@ -31,17 +165,71 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
             --data "{\"state\":\"pending\",\"context\":\"platform-security-build\",\"description\":\"Platform security and build is running\",\"target_url\":\"${run_url}\"}"
 
-  backend:
+  backend-static:
+    name: Backend DB-free contours
+    needs: classifier
+    if: ${{ needs.classifier.outputs.class == 'full' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      PLATFORM_ENVIRONMENT: test
+      PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+      PLATFORM_DB_SCHEMA: platform
+      PLATFORM_SECRET_KEY: ci-only-secret-key-with-at-least-32-characters
+      PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
+      PLATFORM_CELERY_BROKER_URL: redis://127.0.0.1:6379/13
+      PLATFORM_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/14
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+      - name: Install canonical hash-locked Python CI environment once for DB-free contours
+        run: platform/tools/platform_install_ci_python.sh
+      - name: Run each DB-free catalog contour exactly once
+        run: |
+          set -euo pipefail
+          mkdir -p platform/ci-backend/backend-unit \
+            platform/ci-backend/backend-tool-contract \
+            platform/ci-backend/performance-contract
+          cd platform
+          .venv_platform/bin/python tools/platform_verify.py backend-unit \
+            --manifest ci-backend/backend-unit/manifest.json \
+            --summary ci-backend/backend-unit/summary.json --quiet
+          .venv_platform/bin/python tools/platform_verify.py backend-tool-contract \
+            --manifest ci-backend/backend-tool-contract/manifest.json \
+            --summary ci-backend/backend-tool-contract/summary.json --quiet
+          .venv_platform/bin/python tools/platform_verify.py performance-contract \
+            --manifest ci-backend/performance-contract/manifest.json \
+            --summary ci-backend/performance-contract/summary.json --quiet
+      - name: Upload backend DB-free manifests
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-backend-static-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform/ci-backend
+          if-no-files-found: error
+          retention-days: 14
+
+  backend-integration:
+    name: Backend PostgreSQL and Redis integration
+    needs: classifier
+    if: ${{ needs.classifier.outputs.class == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
@@ -74,69 +262,173 @@ jobs:
       PLATFORM_CELERY_BROKER_URL: redis://127.0.0.1:6379/13
       PLATFORM_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/14
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - name: Prepare production-like root checkout and identities
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+      - name: Install canonical hash-locked Python CI environment
+        run: platform/tools/platform_install_ci_python.sh
+      - name: Provision fixed root-owned global verification lock
         run: |
           set -euo pipefail
-          for identity in oldsparky-web oldsparky-api oldsparky-worker; do
-            sudo groupadd --system "$identity"
-            sudo useradd --system --home-dir /nonexistent --no-create-home \
-              --gid "$identity" --shell /usr/sbin/nologin "$identity"
-          done
-          sudo groupadd --system oldsparky-media
-          sudo mkdir -p /opt/oldsparky
-          sudo chown root:root /opt/oldsparky
-          sudo chmod 0755 /opt/oldsparky
-          sudo rm -rf /root/old_sparky
-          sudo mkdir -p /root/old_sparky
-          sudo cp -a "$GITHUB_WORKSPACE/." /root/old_sparky/
-          sudo chown -R root:root /root/old_sparky
-          sudo mkdir -p /opt/oldsparky/platform/{releases,shared/env,shared/venv/bin}
-          sudo chmod 0755 /opt /opt/oldsparky /opt/oldsparky/platform /opt/oldsparky/platform/shared
-          sudo cp -a /root/old_sparky/platform/. /opt/oldsparky/platform/releases/ci-current
-          sudo ln -s /opt/oldsparky/platform/releases/ci-current /opt/oldsparky/platform/current
-          sudo ln -s /opt/oldsparky/platform/releases/ci-current /opt/oldsparky/platform/previous
-          sudo ln -s /usr/bin/python3 /opt/oldsparky/platform/shared/venv/bin/python
-          sudo mkdir -p /opt/oldsparky/platform/current/apps/platform_web/.next/cache
-          sudo install -o root -g root -m 0600 \
-            /root/old_sparky/platform/.env.platform.example \
-            /opt/oldsparky/platform/shared/.env.platform
-          sudo mkdir -p /tmp/oldsparky-systemd
-          sudo env \
-            PLATFORM_APP_DIR=/opt/oldsparky/platform \
-            PLATFORM_SYSTEMD_DIR=/tmp/oldsparky-systemd \
-            PLATFORM_ENABLE_SYSTEMD_UNITS=0 \
-            /root/old_sparky/platform/tools/platform_install_systemd_units.sh
-      - name: Install pinned dependencies
-        run: |
-          sudo -EH python -m venv /root/old_sparky/platform/.venv_platform
-          sudo -EH /root/old_sparky/platform/.venv_platform/bin/python -m pip install \
-            -r /root/old_sparky/platform/requirements-platform.txt \
-            -r /root/old_sparky/platform/requirements-quality.txt
+          sudo -n "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python" \
+            "$GITHUB_WORKSPACE/platform/tools/platform_verification_lock.py" --provision
       - name: Migrate isolated CI database
         run: >-
-          sudo -EH bash -lc 'cd /root/old_sparky/platform &&
-          .venv_platform/bin/python -m alembic upgrade head'
-      - name: Unit and integration tests
+          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          .venv_platform/bin/python -m alembic upgrade head"
+      - name: Run serial backend integration contour exactly once
         run: >-
-          sudo -EH bash -lc 'cd /root/old_sparky/platform &&
-          .venv_platform/bin/python tools/platform_verify.py backend'
+          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          .venv_platform/bin/python tools/platform_verify.py backend-integration
+          --manifest ci-backend/backend-integration/manifest.json
+          --summary ci-backend/backend-integration/summary.json --quiet"
+      - name: Upload backend integration manifests
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-backend-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform/ci-backend
+          if-no-files-found: error
+          retention-days: 14
+
+  backend-privileged:
+    name: Backend privileged ephemeral contour
+    needs: classifier
+    if: ${{ needs.classifier.outputs.class == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PLATFORM_ENVIRONMENT: test
+      PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+      PLATFORM_DB_SCHEMA: platform
+      PLATFORM_SECRET_KEY: ci-only-privileged-test-secret-with-no-production-credentials
+      PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
+      PLATFORM_CELERY_BROKER_URL: redis://127.0.0.1:6379/13
+      PLATFORM_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/14
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+      - name: Install canonical hash-locked Python CI environment
+        run: platform/tools/platform_install_ci_python.sh
+      - name: Provision fixed root-owned global verification lock
+        run: |
+          set -euo pipefail
+          sudo -n "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python" \
+            "$GITHUB_WORKSPACE/platform/tools/platform_verification_lock.py" --provision
+      - name: Check root Pillow runuser setpriv and media-group prerequisites
+        run: |
+          set -euo pipefail
+          test "$(sudo -n id -u)" -eq 0
+          platform/.venv_platform/bin/python -c 'import PIL; print("Pillow available")'
+          test -x /usr/bin/runuser || test -x /usr/sbin/runuser
+          test -x /usr/bin/test
+          test -x /usr/bin/setpriv
+          for identity in oldsparky-web oldsparky-api oldsparky-worker; do
+            if ! getent group "$identity" >/dev/null; then
+              sudo groupadd --system "$identity"
+            fi
+            if ! id "$identity" >/dev/null 2>&1; then
+              sudo useradd --system --home-dir /nonexistent --no-create-home \
+                --gid "$identity" --shell /usr/sbin/nologin "$identity"
+            fi
+            sudo id "$identity"
+          done
+          if ! getent group oldsparky-media >/dev/null; then
+            sudo groupadd --system oldsparky-media
+          fi
+          sudo usermod -a -G oldsparky-media oldsparky-api
+          sudo usermod -a -G oldsparky-media oldsparky-worker
+          getent group oldsparky-media
+      - name: Run serial privileged catalog contour exactly once as root
+        run: >-
+          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          .venv_platform/bin/python tools/platform_verify.py backend-privileged
+          --manifest ci-backend/backend-privileged/manifest.json
+          --summary ci-backend/backend-privileged/summary.json --quiet"
+      - name: Upload backend privileged manifests
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-backend-privileged-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform/ci-backend
+          if-no-files-found: error
+          retention-days: 14
+
+  backend:
+    name: Backend aggregate
+    needs: [classifier, backend-static, backend-integration, backend-privileged]
+    if: ${{ always() && needs.classifier.outputs.class == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PLATFORM_ENVIRONMENT: test
+      PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+      PLATFORM_DB_SCHEMA: platform
+      PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
+      PLATFORM_TEST_AGGREGATE_ONLY: "1"
+      BACKEND_STATIC_RESULT: ${{ needs.backend-static.result }}
+      BACKEND_INTEGRATION_RESULT: ${{ needs.backend-integration.result }}
+      BACKEND_PRIVILEGED_RESULT: ${{ needs.backend-privileged.result }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Download backend component manifests
+        if: ${{ always() }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: platform-backend-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: backend-components
+          merge-multiple: true
+      - name: Verify every backend component result and catalog union
+        run: |
+          set -euo pipefail
+          for result in "$BACKEND_STATIC_RESULT" "$BACKEND_INTEGRATION_RESULT" "$BACKEND_PRIVILEGED_RESULT"; do
+            test "$result" = success || {
+              echo "Backend component did not succeed: $result" >&2
+              exit 1
+            }
+          done
+          python3 platform/tools/platform_verify.py backend \
+            --component-dir "$GITHUB_WORKSPACE/backend-components" \
+            --summary "$GITHUB_WORKSPACE/backend-aggregate-summary.json"
+      - name: Upload backend aggregate summary
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-backend-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: backend-aggregate-summary.json
+          if-no-files-found: error
+          retention-days: 14
 
   python-quality:
     name: Python quality
+    needs: classifier
+    if: ${{ needs.classifier.outputs.class == 'full' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - name: Install pinned quality dependencies
-        run: |
-          python -m venv platform/.venv_platform
-          platform/.venv_platform/bin/python -m pip install -r platform/requirements-quality.txt
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+      - name: Install canonical hash-locked Python CI environment
+        run: platform/tools/platform_install_ci_python.sh
       - name: Run canonical Python quality gate
         run: >-
           cd platform &&
@@ -144,28 +436,36 @@ jobs:
 
   security:
     name: Security gates
+    needs: classifier
+    if: ${{ needs.classifier.outputs.class == 'full' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - name: Install pinned security dependencies
-        run: |
-          python -m venv platform/.venv_platform
-          platform/.venv_platform/bin/python -m pip install \
-            -r platform/requirements-platform.txt \
-            -r platform/requirements-quality.txt
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+      - name: Install canonical hash-locked Python CI environment
+        run: platform/tools/platform_install_ci_python.sh
       - name: Run canonical security gate
         run: >-
           cd platform &&
           .venv_platform/bin/python tools/platform_verify.py security
 
   web-quality:
+    needs: classifier
+    if: ${{ needs.classifier.outputs.class == 'full' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "26.3.1"
           cache: npm
@@ -178,15 +478,23 @@ jobs:
 
   docs:
     name: Documentation consistency
+    needs: classifier
+    if: ${{ needs.classifier.outputs.class == 'full' || needs.classifier.outputs.class == 'docs-only' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Check platform documentation
         run: python3 platform/tools/platform_verify.py docs
 
   migration:
     name: Migration scenarios
+    needs: classifier
+    if: ${{ needs.classifier.outputs.class == 'full' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16
@@ -208,14 +516,21 @@ jobs:
       PLATFORM_SECRET_KEY: ci-only-secret-key-with-at-least-32-characters
       PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - name: Install pinned dependencies
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+      - name: Install canonical hash-locked Python CI environment
+        run: platform/tools/platform_install_ci_python.sh
+      - name: Provision fixed root-owned global verification lock
         run: |
-          python -m venv platform/.venv_platform
-          platform/.venv_platform/bin/python -m pip install --require-hashes -r platform/requirements-platform.lock.txt
+          set -euo pipefail
+          sudo -n "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python" \
+            "$GITHUB_WORKSPACE/platform/tools/platform_verification_lock.py" --provision
       - name: Run populated legacy migration scenario
         run: >-
           cd platform &&
@@ -223,11 +538,16 @@ jobs:
 
   web-hermetic:
     name: Web hermetic
+    needs: classifier
+    if: ${{ needs.classifier.outputs.class == 'full' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "26.3.1"
           cache: npm
@@ -237,11 +557,6 @@ jobs:
         working-directory: platform/apps/platform_web
         run: npm ci
 
-      - name: Install Playwright Chromium
-        timeout-minutes: 12
-        working-directory: platform/apps/platform_web
-        run: npx playwright install chromium
-
       - name: Run canonical web hermetic gate
         run: python3 platform/tools/platform_verify.py web-hermetic
         env:
@@ -249,30 +564,71 @@ jobs:
 
       - name: Upload Playwright report
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-web-playwright-report
+          name: platform-web-playwright-report-${{ github.run_id }}-${{ github.run_attempt }}
           path: platform/apps/platform_web/playwright-report
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 14
 
   verification-contract:
     name: Verification contract
+    needs: classifier
+    if: ${{ always() && needs.classifier.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - name: Run canonical verification contract self-test
-        run: python3 platform/tools/platform_verify.py verification-contract
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+      - name: Install canonical hash-locked Python CI environment
+        run: platform/tools/platform_install_ci_python.sh
+      - name: Run canonical verification contract and external catalog contour once
+        run: |
+          set -euo pipefail
+          mkdir -p platform/ci-backend/verification-contract
+          cd platform
+          .venv_platform/bin/python tools/platform_verify.py verification-contract \
+            --manifest ci-backend/verification-contract/manifest.json \
+            --summary ci-backend/verification-contract/summary.json --quiet
+      - name: Upload verification contract evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-verification-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform/ci-backend/verification-contract
+          if-no-files-found: error
+          retention-days: 14
 
   status-final:
-    if: ${{ always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
-    needs: [status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract]
+    if: ${{ always() }}
+    permissions:
+      statuses: write
+    needs: [classifier, status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Report platform security build result
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TESTED_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          CLASSIFIER_RESULT: ${{ needs.classifier.result }}
+          ROUTE_CLASS: ${{ needs.classifier.outputs.class }}
+          ROUTE_EVENT: ${{ needs.classifier.outputs.event }}
+          ROUTE_DEPLOYABLE: ${{ needs.classifier.outputs.deployable }}
+          ROUTE_FALLBACK: ${{ needs.classifier.outputs.fallback }}
+          ROUTE_TARGET_SHA: ${{ needs.classifier.outputs.target_sha }}
+          ROUTE_DIGEST: ${{ needs.classifier.outputs.digest }}
+          ROUTE_REASON: ${{ needs.classifier.outputs.reason }}
+          EXPECTED_GATES: ${{ needs.classifier.outputs.expected_gates }}
+          STATUS_START_RESULT: ${{ needs.status-start.result }}
           BACKEND_RESULT: ${{ needs.backend.result }}
           PYTHON_QUALITY_RESULT: ${{ needs['python-quality'].result }}
           SECURITY_RESULT: ${{ needs.security.result }}
@@ -283,17 +639,137 @@ jobs:
           VERIFICATION_CONTRACT_RESULT: ${{ needs['verification-contract'].result }}
         run: |
           set -euo pipefail
+          export SUMMARY_PATH="$GITHUB_WORKSPACE/platform-security-summary.json"
+          passed=$(
+            /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          expected_by_class = {
+              "docs-only": ["docs", "verification-contract"],
+              "out-of-scope": ["verification-contract"],
+              "full": [
+                  "backend", "python-quality", "security", "migration", "docs",
+                  "web-quality", "web-hermetic", "verification-contract",
+              ],
+          }
+          route_class = os.environ.get("ROUTE_CLASS", "")
+          route_event = os.environ.get("ROUTE_EVENT", "")
+          event_name = os.environ.get("EVENT_NAME", "")
+          route_errors = []
+          try:
+              expected = json.loads(os.environ.get("EXPECTED_GATES") or "null")
+          except (TypeError, json.JSONDecodeError):
+              expected = None
+          if route_class not in expected_by_class:
+              route_errors.append("classifier route class is missing or invalid")
+          elif expected != expected_by_class[route_class]:
+              route_errors.append("classifier expected gates do not match its class")
+          if route_event != event_name:
+              route_errors.append("classifier event does not match the workflow event")
+          tested_sha = os.environ.get("TESTED_SHA", "")
+          if not re.fullmatch(r"[0-9a-f]{40}", tested_sha):
+              route_errors.append("tested SHA is missing")
+          route_target_sha = os.environ.get("ROUTE_TARGET_SHA", "")
+          if not re.fullmatch(r"[0-9a-f]{40}", route_target_sha):
+              route_errors.append("classifier target SHA is missing")
+          elif route_target_sha != tested_sha:
+              route_errors.append("classifier target SHA does not match the tested SHA")
+          route_digest = os.environ.get("ROUTE_DIGEST", "")
+          if not re.fullmatch(r"[0-9a-f]{64}", route_digest):
+              route_errors.append("classifier digest is missing")
+          if not os.environ.get("ROUTE_REASON", ""):
+              route_errors.append("classifier reason is missing")
+          if os.environ.get("ROUTE_DEPLOYABLE") not in {"true", "false"}:
+              route_errors.append("classifier deployable output is missing")
+          if os.environ.get("ROUTE_FALLBACK") not in {"true", "false"}:
+              route_errors.append("classifier fallback output is missing")
+          published_event = os.environ.get("EVENT_NAME") in {"push", "workflow_dispatch"}
+          if published_event and os.environ.get("STATUS_START_RESULT") != "success":
+              route_errors.append("status-start did not succeed before status publication")
+          results = {
+              "backend": os.environ.get("BACKEND_RESULT", "missing"),
+              "python-quality": os.environ.get("PYTHON_QUALITY_RESULT", "missing"),
+              "security": os.environ.get("SECURITY_RESULT", "missing"),
+              "web-quality": os.environ.get("WEB_QUALITY_RESULT", "missing"),
+              "web-hermetic": os.environ.get("WEB_HERMETIC_RESULT", "missing"),
+              "docs": os.environ.get("DOCS_RESULT", "missing"),
+              "migration": os.environ.get("MIGRATION_RESULT", "missing"),
+              "verification-contract": os.environ.get("VERIFICATION_CONTRACT_RESULT", "missing"),
+          }
+          missing_or_failed = [
+              gate for gate in expected if results.get(gate) != "success"
+          ] if isinstance(expected, list) else ["classifier expected gates are malformed"]
+          passed = (
+              os.environ.get("CLASSIFIER_RESULT") == "success"
+              and not route_errors
+              and not missing_or_failed
+          )
+          summary = {
+              "schema": 1,
+              "tested_sha": os.environ.get("TESTED_SHA", ""),
+              "event": os.environ.get("EVENT_NAME", ""),
+              "route_event": route_event,
+              "class": os.environ.get("ROUTE_CLASS", ""),
+              "reason": os.environ.get("ROUTE_REASON", ""),
+              "deployable": os.environ.get("ROUTE_DEPLOYABLE", "") == "true",
+              "fallback": os.environ.get("ROUTE_FALLBACK", "") == "true",
+              "manifest_digest": os.environ.get("ROUTE_DIGEST", ""),
+              "expected_gates": expected,
+              "gate_results": results,
+              "missing_or_failed": missing_or_failed,
+              "route_errors": route_errors,
+              "status_start_result": os.environ.get("STATUS_START_RESULT", "missing"),
+              "passed": passed,
+          }
+          Path(os.environ["SUMMARY_PATH"]).write_text(
+              json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print("true" if passed else "false")
+          PY
+          )
+
           state=failure
           description="Platform security or build failed"
-          if [[ "$BACKEND_RESULT" == "success" && "$PYTHON_QUALITY_RESULT" == "success" && "$SECURITY_RESULT" == "success" && "$WEB_QUALITY_RESULT" == "success" && "$WEB_HERMETIC_RESULT" == "success" && "$DOCS_RESULT" == "success" && "$MIGRATION_RESULT" == "success" && "$VERIFICATION_CONTRACT_RESULT" == "success" ]]; then
+          if [[ "$passed" == "true" ]]; then
             state=success
             description="Platform security and build passed"
           fi
-          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
-            --data "{\"state\":\"${state}\",\"context\":\"platform-security-build\",\"description\":\"${description}\",\"target_url\":\"${run_url}\"}"
+          if [[ "$state" == "success" && "$ROUTE_DEPLOYABLE" != "true" ]]; then
+            description="Platform security passed; route=$ROUTE_CLASS is non-deployable"
+          elif [[ "$state" == "success" && "$ROUTE_FALLBACK" == "true" ]]; then
+            description="Platform security passed; fail-closed fallback route is non-deployable"
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+          if [[ "$EVENT_NAME" == "push" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" \
+              --data "$(/usr/bin/python3 - "$state" "$description" "$run_url" <<'PY'
+          import json
+          import sys
+          print(json.dumps({
+              "state": sys.argv[1],
+              "context": "platform-security-build",
+              "description": sys.argv[2],
+              "target_url": sys.argv[3],
+          }))
+          PY
+              )"
+          fi
+          [[ "$state" == "success" ]] || exit 1
+
+      - name: Publish machine-readable CI summary
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-ci-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform-security-summary.json
+          if-no-files-found: error
+          retention-days: 14

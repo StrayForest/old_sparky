@@ -2,6 +2,17 @@
   "schema": 2,
   "profile_id": "ready-vote-slo-v2",
   "profile_version": 2,
+  "portfolio": {
+    "owner": "platform-performance",
+    "hypothesis": "Supported human-shaped Ready Vote actions meet latency, correctness and resource safety budgets.",
+    "class": "default",
+    "status": "active",
+    "cadence": "release",
+    "environment": "production",
+    "request_budget": {"max_logical_actions": 600, "max_http_attempts": 2000, "max_duration_seconds": 900},
+    "cost_budget": {"max_runner_minutes": 30, "basis": "external runner wall-clock budget"},
+    "last_accepted_evidence": {"run_id": "34098776746", "source_sha": "bba3fb278e348906a6942aee8462b758c3d616ef"}
+  },
   "category": "load",
   "purpose": "Measure the supported normal Ready Vote user experience.",
   "description": "Canonical supported Ready Vote SLO profile for human-shaped traffic.",
@@ -52,6 +63,7 @@
   },
   "execution": {
     "generator": "GitHub-hosted external runner",
+    "require_exact_observer_binding": true,
     "measured_origin": "https://old-sparky.com",
     "origin_role": "fixture preparation, lightweight observer and exact cleanup only",
     "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",

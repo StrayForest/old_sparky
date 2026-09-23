@@ -2,6 +2,17 @@
   "schema": 2,
   "profile_id": "tournament-lifecycle-scale-v1",
   "profile_version": 1,
+  "portfolio": {
+    "owner": "platform-performance",
+    "hypothesis": "Many independent tournaments can complete concurrent lifecycle waves without terminal-state corruption.",
+    "class": "diagnostic",
+    "status": "replacement-needed",
+    "cadence": "on-demand",
+    "environment": "qa-preprod",
+    "request_budget": {"max_logical_actions": 10000, "max_http_attempts": 100000, "max_duration_seconds": 10800},
+    "cost_budget": {"max_runner_minutes": 360, "basis": "QA harness wall-clock budget"},
+    "last_accepted_evidence": null
+  },
   "category": "stress",
   "purpose": "Exercise lifecycle write/read concurrency across many independent tournaments.",
   "description": "The full 20-tournament, 10,000-user lifecycle with immediate concurrent waves.",
@@ -55,6 +66,9 @@
   },
   "execution": {
     "generator": "platform_production_qa.py",
+    "non_dispatchable": true,
+    "profile_binding": "not-integrated-with-production-qa",
+    "require_exact_observer_binding": false,
     "measured_origin": "configured QA/preprod origin",
     "external_runner_forbidden": true,
     "run_command": "python3 platform/tools/platform_production_qa.py --mode tournament-lifecycle --concurrency 128",

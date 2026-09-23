@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,6 +13,8 @@ from tools import platform_validate_wheelhouse as validator
 
 class PlatformWheelhouseValidationTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.owner_patch = mock.patch.object(validator, "REQUIRED_OWNER_UID", os.geteuid())
+        self.owner_patch.start()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self.wheelhouse = self.root / "wheelhouse"
@@ -33,6 +36,7 @@ class PlatformWheelhouseValidationTests(unittest.TestCase):
         self.lock.chmod(0o644)
 
     def tearDown(self) -> None:
+        self.owner_patch.stop()
         self.temp_dir.cleanup()
 
     def add_wheel(
@@ -92,7 +96,9 @@ class PlatformWheelhouseValidationTests(unittest.TestCase):
     def test_tampered_wheel_is_rejected_by_manifest(self) -> None:
         self.make_manifest()
         wheel = next(self.wheelhouse.glob("demo-*.whl"))
+        wheel.chmod(0o644)
         wheel.write_bytes(wheel.read_bytes() + b"tampered")
+        wheel.chmod(0o444)
 
         with self.assertRaisesRegex(validator.WheelhouseError, "checksum mismatch"):
             validator.verify_manifest(
@@ -107,7 +113,9 @@ class PlatformWheelhouseValidationTests(unittest.TestCase):
         manifest = self.wheelhouse / validator.MANIFEST_NAME
         original = manifest.read_text()
         first = original.splitlines()[0]
+        manifest.chmod(0o644)
         manifest.write_text(f"{original}{first}\n")
+        manifest.chmod(0o444)
 
         with self.assertRaisesRegex(validator.WheelhouseError, "format is invalid"):
             validator.verify_manifest(
@@ -117,7 +125,9 @@ class PlatformWheelhouseValidationTests(unittest.TestCase):
                 self.freeze,
             )
 
+        manifest.chmod(0o644)
         manifest.write_text("\n".join(reversed(original.splitlines())) + "\n")
+        manifest.chmod(0o444)
         with self.assertRaisesRegex(
             validator.WheelhouseError, "file set is incomplete"
         ):

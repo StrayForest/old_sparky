@@ -9,9 +9,22 @@ import errno
 import fcntl
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
+import sys
 from typing import Iterator
+
+
+SAFE_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+RELEASE_LOCK_PATH = Path("/run/lock/oldsparky-platform-release.lock")
+RETAINED_LOAD_LOCK_PATH = Path("/run/lock/oldsparky-retained-load-matrix.lock")
+
+
+def _display_release_id(path: Path) -> str:
+    """Return only a validated release identifier, never its filesystem path."""
+
+    return path.name if SAFE_RELEASE_ID_RE.fullmatch(path.name) else "unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +94,8 @@ def directory_size(path: Path) -> int:
 
 
 def release_entry(path: Path) -> ReleaseEntry:
+    if SAFE_RELEASE_ID_RE.fullmatch(path.name) is None:
+        raise RuntimeError("Release identifier is invalid")
     metadata = path.lstat()
     if (
         stat.S_ISLNK(metadata.st_mode)
@@ -89,7 +104,7 @@ def release_entry(path: Path) -> ReleaseEntry:
         or metadata.st_uid != 0
         or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
-        raise RuntimeError(f"Release directory metadata is unsafe: {path}")
+        raise RuntimeError("Release directory metadata is unsafe")
     return ReleaseEntry(
         path=path,
         modified_at=datetime.fromtimestamp(metadata.st_mtime, tz=UTC),
@@ -118,7 +133,7 @@ def exclusive_directory_lock(
         or metadata.st_uid != 0
         or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
-        raise RuntimeError(f"Unsafe {label} directory: {resolved}")
+        raise RuntimeError(f"Unsafe {label} directory")
     descriptor = os.open(
         resolved,
         os.O_RDONLY
@@ -155,11 +170,145 @@ def exclusive_directory_lock(
 
 
 @contextmanager
+def exclusive_release_lock(
+    *, label: str, pending_state: Path | None = None
+) -> Iterator[Path]:
+    """Hold the canonical release lock shared with shell tooling."""
+
+    if os.geteuid() != 0:
+        raise RuntimeError(f"{label} requires root")
+    try:
+        root_metadata = Path("/run/lock").lstat()
+        root_resolved = Path("/run/lock").resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"Unsafe {label} lock root") from exc
+    root_mode = stat.S_IMODE(root_metadata.st_mode)
+    if (
+        root_resolved != Path("/run/lock")
+        or stat.S_ISLNK(root_metadata.st_mode)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != 0
+        or (root_mode & 0o022 and not root_mode & 0o1000)
+    ):
+        raise RuntimeError(f"Unsafe {label} lock root")
+    try:
+        descriptor = os.open(
+            RELEASE_LOCK_PATH,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Unable to open the {label} lock") from exc
+    try:
+        opened = os.fstat(descriptor)
+        path_metadata = RELEASE_LOCK_PATH.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != 0
+            or opened.st_gid != 0
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_uid != 0
+            or path_metadata.st_gid != 0
+            or path_metadata.st_nlink != 1
+            or stat.S_IMODE(path_metadata.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino)
+            != (path_metadata.st_dev, path_metadata.st_ino)
+        ):
+            raise RuntimeError(f"Unsafe {label} lock file")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise RuntimeError(f"Another operation holds the {label} lock") from exc
+            raise
+        if pending_state is not None and os.path.lexists(pending_state):
+            raise RuntimeError(
+                "A pending release operation must be recovered before retention"
+            )
+        yield RELEASE_LOCK_PATH
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+@contextmanager
+def exclusive_retained_load_lock() -> Iterator[Path]:
+    """Hold the retained-load lock after the canonical release lock."""
+
+    if os.geteuid() != 0:
+        raise RuntimeError("retained-load lock requires root")
+    lock_root = Path("/run/lock")
+    try:
+        root_metadata = lock_root.lstat()
+        root_resolved = lock_root.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("Unsafe retained-load lock root") from exc
+    root_mode = stat.S_IMODE(root_metadata.st_mode)
+    if (
+        root_resolved != lock_root
+        or stat.S_ISLNK(root_metadata.st_mode)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != 0
+        or (root_mode & 0o022 and not root_mode & 0o1000)
+    ):
+        raise RuntimeError("Unsafe retained-load lock root")
+    try:
+        descriptor = os.open(
+            RETAINED_LOAD_LOCK_PATH,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise RuntimeError("Unable to open the retained-load lock") from exc
+    try:
+        opened = os.fstat(descriptor)
+        path_metadata = RETAINED_LOAD_LOCK_PATH.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != 0
+            or opened.st_gid != 0
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) & 0o022
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_uid != 0
+            or path_metadata.st_gid != 0
+            or path_metadata.st_nlink != 1
+            or stat.S_IMODE(path_metadata.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino)
+            != (path_metadata.st_dev, path_metadata.st_ino)
+        ):
+            raise RuntimeError("Unsafe retained-load lock file")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise RuntimeError(
+                    "Another operation holds the retained-load lock"
+                ) from exc
+            raise
+        yield RETAINED_LOAD_LOCK_PATH
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+@contextmanager
 def release_operation_lock(app_dir: Path) -> Iterator[Path]:
     resolved_app_dir = app_dir.resolve(strict=True)
     shared_dir = resolved_app_dir / "shared"
-    with exclusive_directory_lock(
-        shared_dir,
+    with exclusive_release_lock(
         label="platform release",
         pending_state=shared_dir / ".release-operation.json",
     ):
@@ -169,14 +318,14 @@ def release_operation_lock(app_dir: Path) -> Iterator[Path]:
 def resolved_release_target(app_dir: Path, link_name: str, releases_dir: Path) -> Path:
     link_path = app_dir / link_name
     if not link_path.is_symlink():
-        raise RuntimeError(f"Required symlink is missing: {link_path}")
+        raise RuntimeError("Required release symlink is missing")
     target = link_path.resolve(strict=True)
     if target.parent != releases_dir:
         raise RuntimeError(
-            f"Refusing unexpected {link_name} target outside {releases_dir}: {target}"
+            f"Refusing unexpected {link_name} target outside release directory"
         )
     if not target.is_dir():
-        raise RuntimeError(f"{link_name} target is not a directory: {target}")
+        raise RuntimeError(f"{link_name} target is not a release directory")
     return target
 
 
@@ -190,7 +339,7 @@ def build_retention_plan(
     resolved_app_dir = app_dir.resolve(strict=True)
     releases_dir = (resolved_app_dir / "releases").resolve(strict=True)
     if not releases_dir.is_dir():
-        raise RuntimeError(f"Release directory is missing: {releases_dir}")
+        raise RuntimeError("Release directory is missing")
 
     protected_paths = {
         resolved_release_target(resolved_app_dir, "current", releases_dir),
@@ -210,8 +359,7 @@ def build_retention_plan(
     missing_protected = protected_paths.difference(entries_by_path)
     if missing_protected:
         raise RuntimeError(
-            "Protected release target is not a regular release directory: "
-            + ", ".join(str(path) for path in sorted(missing_protected))
+            "Protected release target is not a regular release directory"
         )
 
     protected = tuple(
@@ -254,7 +402,7 @@ def print_entries(title: str, entries: tuple[ReleaseEntry, ...]) -> None:
     for entry in entries:
         print(
             f"  {entry.modified_at.isoformat()}  "
-            f"{human_bytes(entry.size_bytes):>10}  {entry.path.name}"
+            f"{human_bytes(entry.size_bytes):>10}  {_display_release_id(entry.path)}"
         )
 
 
@@ -282,16 +430,12 @@ def _validate_candidate(
         resolved_release_target(app_dir, "previous", releases_dir),
     }
     if entry.path in protected_now:
-        raise RuntimeError(
-            f"Refusing to delete a release that became protected: {entry.path}"
-        )
+        raise RuntimeError("Refusing to delete a release that became protected")
     try:
         metadata = entry.path.lstat()
         resolved = entry.path.resolve(strict=True)
     except OSError as exc:
-        raise RuntimeError(
-            f"Release deletion target is unavailable: {entry.path}"
-        ) from exc
+        raise RuntimeError("Release deletion target is unavailable") from exc
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
@@ -302,9 +446,7 @@ def _validate_candidate(
         or metadata.st_dev != entry.device
         or metadata.st_ino != entry.inode
     ):
-        raise RuntimeError(
-            f"Release deletion target changed after planning: {entry.path}"
-        )
+        raise RuntimeError("Release deletion target changed after planning")
 
 
 def apply_plan(plan: RetentionPlan, *, app_dir: Path | None = None) -> None:
@@ -323,7 +465,6 @@ def print_plan(
     plan: RetentionPlan, *, app_dir: Path, keep: int, min_age_days: int, apply: bool
 ) -> None:
     print("# Platform Release Retention")
-    print(f"app_dir: {app_dir.resolve()}")
     print(f"keep_newest: {keep}")
     print(f"minimum_age_days: {min_age_days}")
     print(f"mode: {'apply' if apply else 'dry-run'}")
@@ -333,39 +474,53 @@ def print_plan(
     print(f"\nreclaimable: {human_bytes(plan.reclaimable_bytes)}")
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
-    if not args.apply:
-        plan = build_retention_plan(
-            args.app_dir,
-            keep=args.keep,
-            min_age_days=args.min_age_days,
-        )
-        print_plan(
-            plan,
-            app_dir=args.app_dir,
-            keep=args.keep,
-            min_age_days=args.min_age_days,
-            apply=False,
-        )
-        print("No files changed. Re-run with --apply to delete candidates.")
-        return
+    try:
+        if not args.apply:
+            plan = build_retention_plan(
+                args.app_dir,
+                keep=args.keep,
+                min_age_days=args.min_age_days,
+            )
+            print_plan(
+                plan,
+                app_dir=args.app_dir,
+                keep=args.keep,
+                min_age_days=args.min_age_days,
+                apply=False,
+            )
+            print("No files changed. Re-run with --apply to delete candidates.")
+            return 0
 
-    with release_operation_lock(args.app_dir) as resolved_app_dir:
-        plan = build_retention_plan(
-            resolved_app_dir,
-            keep=args.keep,
-            min_age_days=args.min_age_days,
-        )
-        print_plan(
-            plan,
-            app_dir=resolved_app_dir,
-            keep=args.keep,
-            min_age_days=args.min_age_days,
-            apply=True,
-        )
-        apply_plan(plan, app_dir=resolved_app_dir)
-        print(f"Deleted {len(plan.candidates)} release(s).")
+        with release_operation_lock(args.app_dir) as resolved_app_dir:
+            plan = build_retention_plan(
+                resolved_app_dir,
+                keep=args.keep,
+                min_age_days=args.min_age_days,
+            )
+            print_plan(
+                plan,
+                app_dir=resolved_app_dir,
+                keep=args.keep,
+                min_age_days=args.min_age_days,
+                apply=True,
+            )
+            apply_plan(plan, app_dir=resolved_app_dir)
+            print(f"Deleted {len(plan.candidates)} release(s).")
+            return 0
+    except Exception as exc:
+        message = str(exc).lower()
+        if "lock" in message or "transaction" in message:
+            error_class = "lock"
+        elif "unsafe" in message or "symlink" in message or "target" in message:
+            error_class = "integrity"
+        elif "missing" in message or "directory" in message:
+            error_class = "configuration"
+        else:
+            error_class = "storage"
+        print(f"Release retention failed ({error_class})", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

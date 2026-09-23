@@ -25,6 +25,23 @@ TIMESTAMP_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
 WEB_BUILD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 PINNED_NODE_VERSION = "26.3.1"
 PINNED_NPM_VERSION = "11.16.0"
+LIVE_QA_RUNTIME_ROOT = "liveqa-runtime"
+LIVE_QA_RUNTIME_MANIFEST = "liveqa-runtime/runtime-manifest.json"
+LIVE_QA_SANDBOX_RELATIVE = (
+    "liveqa-runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+)
+LIVE_QA_SANDBOX_SIZE = 15232
+LIVE_QA_SANDBOX_SHA256 = (
+    "4f21eddabe22d24f83b907f9404cb331135acf2d5064292aed106c7794578cb3"
+)
+LIVE_QA_BROWSER_ROOTS = frozenset(
+    {
+        "chromium-1228",
+        "chromium_headless_shell-1228",
+        "webkit-2311",
+        "ffmpeg-1011",
+    }
+)
 MAX_RELEASE_JSON_BYTES = 64 * 1024
 MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MEMBER_BYTES = 512 * 1024 * 1024
@@ -32,6 +49,12 @@ MAX_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_MEMBERS = 200_000
 MAX_PATH_BYTES = 4096
 MAX_COMPONENT_BYTES = 255
+REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS = (
+    "tools/platform_nginx_error_summary.py",
+    "tools/platform_web_runtime_diagnostics_summary.py",
+    "tools/platform_storage_evidence_summary.py",
+    "tools/platform_media_migration_diagnostics_summary.py",
+)
 
 RELEASE_KEYS = {
     "artifact_format_version",
@@ -48,15 +71,6 @@ RELEASE_KEYS = {
     "web_build_id",
     "node_version",
     "npm_version",
-    "runtime_layout",
-}
-RUNTIME_LAYOUT = {
-    "app_dir": "/opt/oldsparky/platform",
-    "current_symlink": "/opt/oldsparky/platform/current",
-    "previous_symlink": "/opt/oldsparky/platform/previous",
-    "shared_dir": "/opt/oldsparky/platform/shared",
-    "shared_env_file": "/opt/oldsparky/platform/shared/.env.platform",
-    "shared_venv_dir": "/opt/oldsparky/platform/shared/venv",
 }
 
 
@@ -281,15 +295,23 @@ def _parse_release_json(raw: bytes, *, release_slug: str) -> dict[str, object]:
         raise ArtifactError("RELEASE.json Node runtime version is invalid")
     if parsed["npm_version"] != PINNED_NPM_VERSION:
         raise ArtifactError("RELEASE.json npm runtime version is invalid")
-    if parsed["runtime_layout"] != RUNTIME_LAYOUT:
-        raise ArtifactError("RELEASE.json runtime layout is invalid")
     return parsed
 
 
-def _validate_member_mode(member: tarfile.TarInfo) -> None:
+def _validate_member_mode(
+    member: tarfile.TarInfo,
+    *,
+    sandbox_name: str,
+) -> None:
     mode = member.mode
-    if mode < 0 or mode > 0o7777 or mode & 0o7000:
+    if mode < 0 or mode > 0o7777:
         raise ArtifactError("release archive contains unsafe permissions")
+    if mode & 0o7000 and member.name != sandbox_name:
+        raise ArtifactError("release archive contains unsafe permissions")
+    if member.name == sandbox_name and mode != 0o4755:
+        raise ArtifactError("live-QA Chromium sandbox mode is invalid")
+    if member.name == f"{sandbox_name.split('/', 1)[0]}/{LIVE_QA_RUNTIME_ROOT}" and mode != 0o555:
+        raise ArtifactError("liveqa-runtime root mode is invalid")
     if not member.issym() and mode & 0o022:
         raise ArtifactError("release archive contains unsafe permissions")
     if member.isdir() and mode & 0o500 != 0o500:
@@ -318,7 +340,10 @@ def _validate_structure(
             raise ArtifactError("release archive contains unsafe ownership")
         if getattr(member, "sparse", None):
             raise ArtifactError("release archive contains a sparse member")
-        _validate_member_mode(member)
+        _validate_member_mode(
+            member,
+            sandbox_name=f"{release_slug}/{LIVE_QA_SANDBOX_RELATIVE}",
+        )
         if member.isfile():
             if member.size < 0 or member.size > MAX_MEMBER_BYTES:
                 raise ArtifactError("release archive member exceeds its size bound")
@@ -370,6 +395,188 @@ def _validate_structure(
     return by_name, symlink_targets
 
 
+def _runtime_digest(
+    archive: tarfile.TarFile,
+    by_name: dict[str, tarfile.TarInfo],
+    *,
+    release_slug: str,
+) -> tuple[str, dict[str, str]]:
+    """Digest runtime members without extracting untrusted archive data."""
+
+    prefix = f"{release_slug}/{LIVE_QA_RUNTIME_ROOT}/"
+    digest = hashlib.sha256()
+    files: dict[str, str] = {}
+    for name in sorted(by_name):
+        if not name.startswith(prefix):
+            continue
+        relative = name[len(prefix) :]
+        if relative == "runtime-manifest.json":
+            continue
+        member = by_name[name]
+        digest.update(relative.encode("utf-8") + b"\0")
+        if member.isdir():
+            digest.update(b"d\0")
+            continue
+        if not member.isfile():
+            raise ArtifactError("live-QA runtime must not contain symlinks")
+        source = archive.extractfile(member)
+        if source is None:
+            raise ArtifactError("live-QA runtime member is unavailable")
+        content = source.read(member.size + 1)
+        source.close()
+        if len(content) != member.size:
+            raise ArtifactError("live-QA runtime member is truncated")
+        file_digest = hashlib.sha256(content).hexdigest()
+        files[relative] = file_digest
+        digest.update(b"f\0" + bytes.fromhex(file_digest))
+        if relative == LIVE_QA_SANDBOX_RELATIVE.removeprefix(f"{LIVE_QA_RUNTIME_ROOT}/"):
+            if member.size != LIVE_QA_SANDBOX_SIZE or file_digest != LIVE_QA_SANDBOX_SHA256:
+                raise ArtifactError("live-QA Chromium sandbox checksum is invalid")
+    return digest.hexdigest(), files
+
+
+def _validate_liveqa_runtime(
+    archive: tarfile.TarFile,
+    by_name: dict[str, tarfile.TarInfo],
+    *,
+    release_slug: str,
+) -> None:
+    prefix = f"{release_slug}/{LIVE_QA_RUNTIME_ROOT}"
+    root = by_name.get(prefix)
+    if root is None or not root.isdir():
+        raise ArtifactError("release archive is missing liveqa-runtime")
+    required = (
+        "node/bin/node",
+        "runtime-manifest.json",
+        "web/package-lock.json",
+        "web/playwright.live.config.ts",
+        "web/tests/smoke/live-user-journey.spec.ts",
+        "web/tests/support/live-qa-origin.ts",
+        "web/tests/support/live-qa-sandbox.ts",
+        "web/node_modules/@playwright/test/package.json",
+        "web/node_modules/playwright/package.json",
+        "web/node_modules/playwright-core/package.json",
+        "browsers/chromium-1228/chrome-linux64/chrome_sandbox",
+    )
+    for relative in required:
+        member = by_name.get(f"{prefix}/{relative}")
+        if member is None or not member.isfile():
+            raise ArtifactError(f"liveqa-runtime is missing required file: {relative}")
+    for browser_root in LIVE_QA_BROWSER_ROOTS:
+        member = by_name.get(f"{prefix}/browsers/{browser_root}")
+        if member is None or not member.isdir():
+            raise ArtifactError(
+                f"liveqa-runtime is missing required browser: {browser_root}"
+            )
+    runtime_prefix = f"{prefix}/"
+    allowed_top = {"node", "web", "browsers", "runtime-manifest.json"}
+    allowed_web_files = {
+        "web/package-lock.json",
+        "web/playwright.live.config.ts",
+        "web/tests/smoke/live-user-journey.spec.ts",
+        "web/tests/support/live-qa-origin.ts",
+        "web/tests/support/live-qa-sandbox.ts",
+    }
+    allowed_package_roots = {
+        "web/node_modules/@playwright/test",
+        "web/node_modules/playwright",
+        "web/node_modules/playwright-core",
+    }
+    for name in by_name:
+        if not name.startswith(runtime_prefix):
+            continue
+        relative = name[len(runtime_prefix) :]
+        if not relative:
+            continue
+        if relative.split("/", 1)[0] not in allowed_top:
+            raise ArtifactError("liveqa-runtime contains an unreviewed top-level member")
+        if relative.startswith("node/") and relative not in {
+            "node/bin",
+            "node/bin/node",
+        }:
+            raise ArtifactError("liveqa-runtime contains an unreviewed Node member")
+        if relative == "node" or relative == "browsers" or relative.startswith("browsers/"):
+            browser_parts = relative.split("/")
+            if relative not in {"node", "browsers"} and browser_parts[0] == "browsers":
+                if len(browser_parts) < 2 or browser_parts[1] not in LIVE_QA_BROWSER_ROOTS:
+                    raise ArtifactError("liveqa-runtime contains an unreviewed browser")
+        if relative.startswith("web/"):
+            package_relative = relative.removeprefix("web/node_modules/")
+            if relative in allowed_web_files or relative in {
+                "web/tests",
+                "web/tests/smoke",
+                "web/tests/support",
+            }:
+                pass
+            elif relative in {"web/node_modules", "web/node_modules/@playwright"}:
+                pass
+            elif any(
+                package_relative == package_root.removeprefix("web/node_modules/")
+                or package_relative.startswith(
+                    package_root.removeprefix("web/node_modules/") + "/"
+                )
+                for package_root in allowed_package_roots
+            ):
+                if "/node_modules/" in package_relative:
+                    raise ArtifactError("liveqa-runtime contains nested node_modules")
+            else:
+                raise ArtifactError("liveqa-runtime contains an unreviewed web member")
+        if name.endswith("chrome_sandbox") and name != f"{release_slug}/{LIVE_QA_SANDBOX_RELATIVE}":
+            raise ArtifactError("liveqa-runtime contains an unexpected sandbox helper")
+    package_root = f"{prefix}/web/node_modules/"
+    for name, member in by_name.items():
+        if not name.startswith(package_root):
+            continue
+        relative = name[len(package_root) :]
+        if not relative:
+            continue
+        first = relative.split("/", 1)[0]
+        if first not in {"@playwright", "playwright", "playwright-core"}:
+            raise ArtifactError("liveqa-runtime contains an unreviewed node package")
+        if first == "@playwright" and relative not in {
+            "@playwright",
+            "@playwright/test",
+        } and not relative.startswith("@playwright/test/"):
+            raise ArtifactError("liveqa-runtime contains an unreviewed scoped package")
+        if member.issym() or member.islnk():
+            raise ArtifactError("liveqa-runtime package contains a symlink")
+
+    manifest_member = by_name[f"{prefix}/runtime-manifest.json"]
+    manifest_file = archive.extractfile(manifest_member)
+    if manifest_file is None:
+        raise ArtifactError("liveqa-runtime manifest is unavailable")
+    raw = manifest_file.read(64 * 1024 + 1)
+    manifest_file.close()
+    if len(raw) > 64 * 1024:
+        raise ArtifactError("liveqa-runtime manifest is too large")
+    try:
+        manifest = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError("liveqa-runtime manifest is invalid") from exc
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"version", "node_version", "package_lock_sha256", "tree_sha256", "files"}
+        or manifest.get("version") != 1
+        or manifest.get("node_version") != PINNED_NODE_VERSION
+        or not isinstance(manifest.get("package_lock_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest["package_lock_sha256"]) is None
+        or not isinstance(manifest.get("tree_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest["tree_sha256"]) is None
+        or not isinstance(manifest.get("files"), dict)
+    ):
+        raise ArtifactError("liveqa-runtime manifest schema is invalid")
+    lock_member = archive.extractfile(by_name[f"{prefix}/web/package-lock.json"])
+    if lock_member is None:
+        raise ArtifactError("liveqa-runtime package lock is unavailable")
+    lock_digest = hashlib.sha256(lock_member.read()).hexdigest()
+    lock_member.close()
+    if manifest["package_lock_sha256"] != lock_digest:
+        raise ArtifactError("liveqa-runtime package lock digest is invalid")
+    tree_digest, files = _runtime_digest(archive, by_name, release_slug=release_slug)
+    if manifest["tree_sha256"] != tree_digest or manifest["files"] != files:
+        raise ArtifactError("liveqa-runtime content digest does not match its manifest")
+
+
 def _required_members(
     by_name: dict[str, tarfile.TarInfo], *, release_slug: str
 ) -> None:
@@ -382,21 +589,35 @@ def _required_members(
         "wheelhouse/WHEELHOUSE.sha256",
         "apps/platform_web/package-lock.json",
         "apps/platform_web/.next/standalone/server.js",
+        *REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS,
     )
     required_directories = (
         "wheelhouse",
         "apps/platform_web/.next/standalone/.next/static",
+        LIVE_QA_RUNTIME_ROOT,
     )
     for relative in required_files:
         member = by_name.get(f"{release_slug}/{relative}")
         if member is None or not member.isfile():
             raise ArtifactError(f"release archive is missing required file: {relative}")
+        if relative in REQUIRED_RUNTIME_DIAGNOSTIC_HELPERS and member.size <= 0:
+            raise ArtifactError(
+                f"release archive is missing required helper content: {relative}"
+            )
     for relative in required_directories:
         member = by_name.get(f"{release_slug}/{relative}")
         if member is None or not member.isdir():
             raise ArtifactError(
                 f"release archive is missing required directory: {relative}"
             )
+    runtime_cache = (
+        f"{release_slug}/apps/platform_web/.next/standalone/.next/cache"
+    )
+    if any(
+        name == runtime_cache or name.startswith(f"{runtime_cache}/")
+        for name in by_name
+    ):
+        raise ArtifactError("release archive contains a standalone runtime cache")
     wheel_prefix = f"{release_slug}/wheelhouse/"
     if not any(
         name.startswith(wheel_prefix) and name.endswith(".whl") for name in by_name
@@ -518,6 +739,11 @@ def validate_archive(
                     )
             by_name, _ = _validate_structure(members, release_slug=release_slug)
             _required_members(by_name, release_slug=release_slug)
+            _validate_liveqa_runtime(
+                archive,
+                by_name,
+                release_slug=release_slug,
+            )
 
             release_member = by_name[f"{release_slug}/RELEASE.json"]
             if release_member.size > MAX_RELEASE_JSON_BYTES:

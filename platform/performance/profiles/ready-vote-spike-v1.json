@@ -2,6 +2,17 @@
   "schema": 2,
   "profile_id": "ready-vote-spike-v1",
   "profile_version": 1,
+  "portfolio": {
+    "owner": "platform-performance",
+    "hypothesis": "Ready Vote overload admission recovers after a bounded burst without losing useful post-burst goodput.",
+    "class": "default",
+    "status": "active",
+    "cadence": "release",
+    "environment": "production",
+    "request_budget": {"max_logical_actions": 1800, "max_http_attempts": 6000, "max_duration_seconds": 1800},
+    "cost_budget": {"max_runner_minutes": 60, "basis": "external runner wall-clock budget"},
+    "last_accepted_evidence": {"run_id": "34115313086", "source_sha": "bba3fb278e348906a6942aee8462b758c3d616ef"}
+  },
   "category": "spike",
   "purpose": "Measure controller pressure entry and recovery after a sudden Ready Vote burst.",
   "description": "Ready Vote normal-to-burst-to-normal spike with explicit pressure and recovery phases.",
@@ -33,6 +44,7 @@
   },
   "acceptance": {
     "kind": "spike",
+    "minimum_useful_goodput_actions_per_second": 1,
     "accepted_request_latency": {"p50_ms": 1500, "p90_ms": 3000, "p95_ms": 5000, "p99_ms": 8000},
     "logical_latency": {"p95_ms": 8000, "p99_ms": 12000},
     "max_shed_percent": 99.9,
@@ -53,6 +65,7 @@
   },
   "execution": {
     "generator": "GitHub-hosted external runner",
+    "require_exact_observer_binding": true,
     "measured_origin": "https://old-sparky.com",
     "origin_role": "fixture preparation, lightweight observer and exact cleanup only",
     "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",

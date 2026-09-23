@@ -57,7 +57,7 @@ export function SiteFooter() {
             <ul>
               {platformLinks.map((item) => (
                 <li key={item.href}>
-                  <Link href={item.href}>{t(item.labelKey)}</Link>
+                  <Link href={item.href} prefetch={item.href === "/tournaments/new" ? false : undefined}>{t(item.labelKey)}</Link>
                 </li>
               ))}
             </ul>
@@ -70,7 +70,7 @@ export function SiteFooter() {
                 <li key={item.href}>
                   <Link
                     href={authHref(item.href, pathname)}
-                    prefetch={!item.href.startsWith("/auth/")}
+                    prefetch={false}
                   >
                     {t(item.labelKey)}
                   </Link>

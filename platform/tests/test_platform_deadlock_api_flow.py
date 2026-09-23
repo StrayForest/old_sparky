@@ -1257,6 +1257,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
         )
         self.assertEqual(locked_run_payload["status"], "locked")
         self.assertIsNotNone(locked_run_payload["locked_at"])
+        self.assertEqual(len(locked_run_payload["teams"]), 2)
 
         locked_tournament_payload = self._assert_status(
             await organizer["client"].get(f"/api/v1/tournaments/{slug}"),
@@ -1318,22 +1319,12 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             locked_tournament_payload["id"],
         )
 
-        seeded_matches_payload = self._assert_status(
-            await organizer["client"].post(
-                f"/api/v1/tournaments/{slug}/matches/seed-opening-round"
-            ),
-            201,
-        )
-        self.assertEqual(len(seeded_matches_payload), 1)
-        self.assertEqual(seeded_matches_payload[0]["title"], "Grand Final")
-        self.assertEqual(seeded_matches_payload[0]["home_label"], "Team 1")
-        self.assertEqual(seeded_matches_payload[0]["away_label"], "Team 2")
-        match_id = seeded_matches_payload[0]["id"]
         bracket_payload = self._assert_status(
             await organizer["client"].get(f"/api/v1/tournaments/{slug}/bracket"),
             200,
         )
         self.assertEqual(bracket_payload["status"], "ready")
+        self.assertEqual(bracket_payload["revision"], 1)
         self.assertEqual(len(bracket_payload["teams"]), 2)
         self.assertGreater(len(bracket_payload["teams"][0]["members"]), 0)
         roster_members = [
@@ -1365,6 +1356,7 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             bracket_payload["teams"][0]["starter_strength"],
         )
         self.assertEqual(len(summary_bracket_payload["matches"]), 1)
+        match_id = bracket_payload["matches"][0]["id"]
 
         duplicate_seed_attempt = await organizer["client"].post(
             f"/api/v1/tournaments/{slug}/matches/seed-opening-round"
@@ -2219,8 +2211,20 @@ class PlatformDeadlockApiFlowTests(PlatformIsolatedAsyncioTestCase):
             200,
         )
         self.assertEqual(bracket_payload["status"], "ready")
+        self.assertEqual(bracket_payload["revision"], 1)
         self.assertEqual(len(bracket_payload["teams"]), 2)
         self.assertEqual(len(bracket_payload["matches"]), 1)
+        repeat_assignment_result = await self._advance_deadlock_automation_for_slug(
+            slug,
+            now=captain_start + timedelta(minutes=2),
+        )
+        self.assertEqual(repeat_assignment_result["assignment_generated"], 0)
+        repeat_bracket_payload = self._assert_status(
+            await organizer["client"].get(f"/api/v1/tournaments/{slug}/bracket"),
+            200,
+        )
+        self.assertEqual(repeat_bracket_payload["revision"], 1)
+        self.assertEqual(len(repeat_bracket_payload["matches"]), 1)
         refreshed_tournament = self._assert_status(
             await organizer["client"].get(f"/api/v1/tournaments/{slug}"),
             200,

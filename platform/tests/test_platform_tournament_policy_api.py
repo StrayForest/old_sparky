@@ -423,6 +423,19 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
         )
         self.assertEqual(len(invites), 1)
         self.assertTrue(invites[0]["is_active"])
+        async with session_factory()() as db_session:
+            exhausted_invite = await db_session.scalar(
+                select(TournamentInvite).where(TournamentInvite.id == invites[0]["id"])
+            )
+            self.assertIsNotNone(exhausted_invite)
+            exhausted_invite.use_count = exhausted_invite.max_uses
+            await db_session.commit()
+        exhausted_payload = self._assert_status(
+            await organizer["client"].get(f"/api/v1/tournaments/{created['slug']}/invites"),
+            200,
+        )[0]
+        self.assertEqual(exhausted_payload["remaining_uses"], 0)
+        self.assertTrue(exhausted_payload["is_active"])
 
         second_private = await organizer["client"].post(
             "/api/v1/tournaments",
@@ -748,6 +761,75 @@ class PlatformTournamentPolicyApiTests(PlatformIsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(duplicate.status_code, 409, duplicate.text)
+
+    async def test_create_rejects_raw_invite_codes_before_persistence(self) -> None:
+        organizer = await self._register_user("strict-code-organizer")
+        invalid_codes = (
+            "ABCDEFGHI-",
+            "ABCDEFGHI J",
+            "ABCDEFGHI\nJ",
+            "АБВГДЕЖЗИЙ",
+        )
+
+        for index, raw_code in enumerate(invalid_codes):
+            name = f"{self.prefix}-s{index}"
+            with self.subTest(raw_code=raw_code):
+                status_response = await organizer["client"].get(
+                    "/api/v1/tournaments/invites/code-status",
+                    params={"code": raw_code},
+                )
+                self.assertEqual(status_response.status_code, 422, status_response.text)
+                self.assertNotIn(raw_code, status_response.text)
+
+                response = await organizer["client"].post(
+                    "/api/v1/tournaments",
+                    json={
+                        "name": name,
+                        "visibility": "invite_only",
+                        "format_slug": "solo",
+                        "invite_code": raw_code,
+                    },
+                )
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertNotIn(raw_code, response.text)
+                self.assertIn(
+                    "Invite code must contain 10-24 ASCII letters or digits.",
+                    response.text,
+                )
+
+                async with session_factory()() as db_session:
+                    self.assertIsNone(
+                        await db_session.scalar(
+                            select(Tournament.id).where(Tournament.name == name)
+                        )
+                    )
+                    self.assertIsNone(
+                        await db_session.scalar(
+                            select(TournamentInvite.id)
+                            .join(Tournament, Tournament.id == TournamentInvite.tournament_id)
+                            .where(Tournament.name == name)
+                        )
+                    )
+
+        canonical = self._assert_status(
+            await organizer["client"].post(
+                "/api/v1/tournaments",
+                json={
+                    "name": f"{self.prefix}-v",
+                    "visibility": "invite_only",
+                    "format_slug": "solo",
+                    "invite_code": f"{self.prefix[-8:]}ab".lower(),
+                },
+            ),
+            201,
+        )
+        stored_invites = self._assert_status(
+            await organizer["client"].get(
+                f"/api/v1/tournaments/{canonical['slug']}/invites"
+            ),
+            200,
+        )
+        self.assertEqual(stored_invites[0]["code"], f"{self.prefix[-8:]}AB".upper())
 
     async def test_legacy_standard_bracket_tournaments_are_hidden_from_player_lists(self) -> None:
         organizer = await self._register_user("organizer")

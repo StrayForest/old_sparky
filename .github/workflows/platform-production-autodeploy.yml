@@ -10,7 +10,6 @@ on:
       - dev
 
 permissions:
-  actions: write
   contents: read
 
 concurrency:
@@ -19,19 +18,306 @@ concurrency:
 
 jobs:
   dispatch:
+    permissions:
+      actions: write
+      contents: read
+      statuses: read
     if: >-
       github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.status == 'completed' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'dev'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+      SECURITY_WORKFLOW_NAME: Platform security and build
+      SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
+      SECURITY_WORKFLOW_FILE: platform-security.yml
+      PROVENANCE_TOOL: ${{ github.workspace }}/platform/tools/platform_workflow_provenance.py
     steps:
+      - name: Checkout exact source for shared provenance validation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact completed security workflow run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          metadata_dir="$(mktemp -d "$RUNNER_TEMP/platform-security-metadata.XXXXXX")"
+          trap 'rm -rf -- "$metadata_dir"' EXIT
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${SECURITY_WORKFLOW_FILE}" \
+            --output "$metadata_dir/workflow.json"
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+            --output "$metadata_dir/run.json"
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status" \
+            --output "$metadata_dir/status.json"
+          # The validator is loaded from the exact source SHA that produced
+          # this completed security run.  It is dependency-free and receives
+          # no GitHub token, so this privileged workflow never executes a
+          # checkout with credentials or a second provenance implementation.
+          # It binds "event": "push", "head_branch": "dev",
+          # "status": "completed", "conclusion": "success", run_attempt,
+          # platform-security-build, trusted creator and target_url.
+          test -f "$PROVENANCE_TOOL"
+          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 "$PROVENANCE_TOOL" security \
+            --workflow "$metadata_dir/workflow.json" \
+            --run "$metadata_dir/run.json" \
+            --status "$metadata_dir/status.json" \
+            --expected-run-id "$SOURCE_RUN_ID" \
+            --expected-attempt "$SOURCE_RUN_ATTEMPT" \
+            --expected-target-sha "$TARGET_SHA" \
+            --expected-run-url "$SOURCE_RUN_URL"
+
+      - name: Download and validate exact classifier artifact
+        id: route
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$SOURCE_RUN_ID"
+          test -n "$SOURCE_RUN_ATTEMPT"
+          expected_name="platform-ci-route-${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
+          route_dir="$(mktemp -d "$RUNNER_TEMP/platform-ci-route.XXXXXX")"
+          trap 'rm -rf -- "$route_dir" "$RUNNER_TEMP/platform-ci-artifact-pages"' EXIT
+          fetch_classifier_artifacts() {
+            local output_path="$1" page=1 count page_path
+            local pages_dir="$RUNNER_TEMP/platform-ci-artifact-pages/$(basename "$output_path")"
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              curl --fail-with-body --silent --show-error \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100&page=${page}" \
+                --output "$page_path"
+              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          page_path, total_path = sys.argv[1:]
+          payload = json.loads(Path(page_path).read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 10_000:
+              raise SystemExit("classifier artifact pagination total_count is malformed or excessive")
+          rows = payload.get("artifacts")
+          if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
+              raise SystemExit("classifier artifact pagination page is malformed")
+          ids = []
+          for row in rows:
+              if type(row.get("id")) is not int or row["id"] <= 0:
+                  raise SystemExit("classifier artifact row ID is malformed")
+              if not isinstance(row.get("name"), str) or not row["name"].isascii() or not 1 <= len(row["name"]) <= 256:
+                  raise SystemExit("classifier artifact row name is malformed")
+              if type(row.get("expired")) is not bool:
+                  raise SystemExit("classifier artifact expired flag is malformed")
+              workflow_run = row.get("workflow_run")
+              if not isinstance(workflow_run, dict) or type(workflow_run.get("id")) is not int or workflow_run["id"] <= 0:
+                  raise SystemExit("classifier artifact workflow identity is malformed")
+              if not isinstance(workflow_run.get("head_sha"), str) or re.fullmatch(r"[0-9a-f]{40}", workflow_run["head_sha"]) is None:
+                  raise SystemExit("classifier artifact workflow SHA is malformed")
+              if "run_attempt" in workflow_run and (type(workflow_run["run_attempt"]) is not int or workflow_run["run_attempt"] <= 0):
+                  raise SystemExit("classifier artifact workflow attempt is malformed")
+              ids.append(row["id"])
+          if len(ids) != len(set(ids)):
+              raise SystemExit("classifier artifact page contains duplicate IDs")
+          marker = Path(total_path)
+          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
+              raise SystemExit("classifier artifact total_count changed during pagination")
+          marker.write_text(str(payload["total_count"]), encoding="ascii")
+          print(len(rows))
+          PY
+              )"
+              if (( count < 100 )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 100 )) || { echo "classifier artifact pagination exceeded its bound" >&2; exit 1; }
+            done
+            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          pages_dir, output_path = map(Path, sys.argv[1:])
+          total_path = pages_dir / "total"
+          expected_total = int(total_path.read_text(encoding="ascii"))
+          rows = []
+          seen = set()
+          paths = sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1]))
+          for path in paths:
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              page_rows = payload.get("artifacts") if isinstance(payload, dict) else None
+              if not isinstance(page_rows, list):
+                  raise SystemExit("classifier artifact page is malformed")
+              for row in page_rows:
+                  row_id = row.get("id")
+                  if type(row_id) is not int or row_id <= 0 or row_id in seen:
+                      raise SystemExit("classifier artifact rows contain duplicate or malformed IDs")
+                  seen.add(row_id)
+                  rows.append(row)
+          if len(rows) > expected_total:
+              raise SystemExit("classifier artifact pagination returned excess rows")
+          if len(rows) != expected_total:
+              raise SystemExit("classifier artifact pagination is incomplete")
+          output_path = Path(output_path)
+          output_path.write_text(json.dumps({"total_count": expected_total, "artifacts": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          }
+          fetch_classifier_artifacts "$route_dir/artifacts-first.json"
+          fetch_classifier_artifacts "$route_dir/artifacts-second.json"
+          artifact_id="$(/usr/bin/python3 - "$route_dir/artifacts-first.json" "$route_dir/artifacts-second.json" "$expected_name" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          first_path, second_path, expected_name, run_id, attempt, target_sha = sys.argv[1:]
+          first = json.loads(Path(first_path).read_text(encoding="utf-8"))
+          second = json.loads(Path(second_path).read_text(encoding="utf-8"))
+
+          def identity(row):
+              workflow_run = row.get("workflow_run")
+              return (
+                  row.get("id"),
+                  row.get("name"),
+                  row.get("expired"),
+                  workflow_run.get("id") if isinstance(workflow_run, dict) else None,
+                  workflow_run.get("head_sha") if isinstance(workflow_run, dict) else None,
+                  workflow_run.get("run_attempt") if isinstance(workflow_run, dict) else None,
+              )
+
+          first_rows = sorted((identity(row) for row in first["artifacts"]), key=lambda value: value[0])
+          second_rows = sorted((identity(row) for row in second["artifacts"]), key=lambda value: value[0])
+          if first["total_count"] != second["total_count"] or first_rows != second_rows:
+              raise SystemExit("classifier artifact listing changed during validation")
+          matches = [row for row in second["artifacts"] if row.get("name") == expected_name and row.get("expired") is False]
+          if len(matches) != 1:
+              raise SystemExit(f"expected exactly one unexpired classifier artifact {expected_name!r}; found {len(matches)}")
+          selected = matches[0]
+          workflow_run = selected.get("workflow_run")
+          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
+              raise SystemExit("classifier artifact is not bound to the exact run and target SHA")
+          if "run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(attempt):
+              raise SystemExit("classifier artifact is not bound to the exact run attempt")
+          if type(selected.get("id")) is not int or selected["id"] <= 0:
+              raise SystemExit("classifier artifact ID is malformed")
+          print(selected["id"])
+          PY
+          )"
+          curl --fail-with-body --silent --show-error --location \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
+            --output "$route_dir/artifact.zip"
+          # The artifact is data-only, but it is still an untrusted ZIP.  The
+          # dependency-free checked-out helper rejects absolute/traversal,
+          # symlink, duplicate and compression-bomb entries before a manifest
+          # reaches the output protocol.  This job has only the GitHub API
+          # token; it never receives production credentials.
+          env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 - "$route_dir/artifact.zip" "$route_dir/unpacked" <<'PY'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "platform/tools")
+          from platform_safe_zip import extract_single_manifest
+
+          extract_single_manifest(Path(sys.argv[1]), Path(sys.argv[2]))
+          PY
+          manifest_path="$route_dir/unpacked/classifier-manifest.json"
+          /usr/bin/python3 - "$manifest_path" "$TARGET_SHA" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          manifest_path, target_sha, output_path = sys.argv[1:]
+          manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+          fields = (
+              "schema", "version", "target_sha", "event", "class",
+              "expected_gates", "deployable", "fallback", "reason", "files",
+          )
+          expected_gates = {
+              "docs-only": ["docs", "verification-contract"],
+              "out-of-scope": ["verification-contract"],
+              "full": [
+                  "backend", "python-quality", "security", "migration", "docs",
+                  "web-quality", "web-hermetic", "verification-contract",
+              ],
+          }
+          if manifest.get("schema") != 1 or manifest.get("version") != 1:
+              raise SystemExit("classifier manifest schema/version is invalid")
+          route_class = manifest.get("class")
+          if route_class not in expected_gates:
+              raise SystemExit("classifier manifest class is invalid")
+          if manifest.get("expected_gates") != expected_gates[route_class]:
+              raise SystemExit("classifier expected gates are invalid")
+          if manifest.get("target_sha") != target_sha:
+              raise SystemExit("classifier target SHA does not match workflow_run head SHA")
+          if manifest.get("event") != "push":
+              raise SystemExit("auto-deploy classifier event is not push")
+          if manifest.get("fallback") is not False:
+              raise SystemExit("fallback classifier routes cannot auto-deploy")
+          reason = manifest.get("reason")
+          if (
+              not isinstance(reason, str)
+              or not reason
+              or len(reason) > 512
+              or any(not 0x20 <= ord(character) <= 0x7E for character in reason)
+          ):
+              raise SystemExit("classifier reason is missing")
+          if not isinstance(manifest.get("files"), list):
+              raise SystemExit("classifier files are malformed")
+          payload = {field: manifest[field] for field in fields}
+          digest = hashlib.sha256(
+              json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+          ).hexdigest()
+          if manifest.get("digest") != digest:
+              raise SystemExit("classifier digest does not match manifest")
+          if route_class == "full" and manifest.get("deployable") is not True:
+              raise SystemExit("full dev push classifier route is not deployable")
+          if route_class != "full" and manifest.get("deployable") is not False:
+              raise SystemExit("reduced classifier route must be non-deployable")
+          with Path(output_path).open("a", encoding="utf-8") as output:
+              output.write(f"route_class={route_class}\n")
+              output.write(f"route_deployable={'true' if manifest['deployable'] else 'false'}\n")
+              output.write(f"route_fallback={'true' if manifest['fallback'] else 'false'}\n")
+              output.write(f"route_digest={manifest['digest']}\n")
+              output.write(f"route_reason={reason}\n")
+          PY
+
       - name: Verify tested SHA is current dev head
         id: gate
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
+          ROUTE_DEPLOYABLE: ${{ steps.route.outputs.route_deployable }}
         run: |
           set -euo pipefail
 
@@ -56,50 +342,345 @@ jobs:
             exit 0
           fi
 
-          status_json="$(
+          if [[ "$ROUTE_DEPLOYABLE" != "true" ]]; then
+            echo "Classifier route is non-deployable ($ROUTE_CLASS); no production deployment required."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          status_dir="$(mktemp -d "$RUNNER_TEMP/platform-autodeploy-status.XXXXXX")"
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          # Combined-status and workflow-run APIs are paginated even when the
+          # first response happens to contain fewer than 100 rows.  Require a
+          # stable total_count, bounded pages, regular row shapes and unique
+          # numeric IDs while assembling a complete snapshot. A changed total
+          # or repeated ID is a mutation/ambiguity and fails closed.
+          fetch_combined_status() {
+            local output_path="$1" page=1 count page_path
+            local pages_dir="$output_path.pages"
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status?per_page=100&page=${page}" \
+                --output "$page_path"
+              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 99999:
+              raise SystemExit("combined-status pagination response is malformed")
+          rows = payload.get("statuses")
+          if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
+              raise SystemExit("combined-status page rows are malformed")
+          ids = []
+          for row in rows:
+              if type(row.get("id")) is not int or row["id"] <= 0:
+                  raise SystemExit("combined-status row ID is malformed")
+              ids.append(row["id"])
+          if len(ids) != len(set(ids)):
+              raise SystemExit("combined-status page contains duplicate IDs")
+          marker = Path(sys.argv[2])
+          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
+              raise SystemExit("combined-status total_count changed during pagination")
+          marker.write_text(str(payload["total_count"]), encoding="ascii")
+          print(len(rows))
+          PY
+              )"
+              if (( count < 100 )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 1000 )) || { echo "combined-status pagination exceeded its bound" >&2; exit 1; }
+            done
+            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          pages_dir, output_path = map(Path, sys.argv[1:])
+          rows = []
+          expected_total = int((pages_dir / "total").read_text(encoding="ascii"))
+          seen = set()
+          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              page_rows = payload.get("statuses") if isinstance(payload, dict) else None
+              if not isinstance(page_rows, list):
+                  raise SystemExit("combined-status page rows are malformed")
+              for row in page_rows:
+                  row_id = row.get("id")
+                  if type(row_id) is not int or row_id <= 0 or row_id in seen:
+                      raise SystemExit("combined-status rows contain duplicate or malformed IDs")
+                  seen.add(row_id)
+                  rows.append(row)
+          if len(rows) != expected_total:
+              raise SystemExit("combined-status pagination is incomplete")
+          output_path.write_text(json.dumps({"total_count": expected_total, "statuses": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          }
+          fetch_security_snapshot() {
+            local snapshot_dir="$1"
+            install -d -m 700 "$snapshot_dir"
+            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${SECURITY_WORKFLOW_FILE}" \
+              --output "$snapshot_dir/workflow.json"
+            curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+              --output "$snapshot_dir/run.json"
+            fetch_combined_status "$snapshot_dir/status.json"
+          }
+          # Read the complete combined status twice immediately before the
+          # deployment candidate check. Equality is over the shared validator
+          # output, not merely state/URL fields, so mutations cannot suppress a
+          # required dispatch.
+          for snapshot in first second; do
+            fetch_security_snapshot "$status_dir/$snapshot"
+          done
+          security_marker_first="$(
+            env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 "$PROVENANCE_TOOL" security \
+              --workflow "$status_dir/first/workflow.json" \
+              --run "$status_dir/first/run.json" \
+              --status "$status_dir/first/status.json" \
+              --expected-run-id "$SOURCE_RUN_ID" \
+              --expected-attempt "$SOURCE_RUN_ATTEMPT" \
+              --expected-target-sha "$TARGET_SHA" \
+              --expected-run-url "$SOURCE_RUN_URL"
+          )"
+          security_marker_second="$(
+            env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 "$PROVENANCE_TOOL" security \
+              --workflow "$status_dir/second/workflow.json" \
+              --run "$status_dir/second/run.json" \
+              --status "$status_dir/second/status.json" \
+              --expected-run-id "$SOURCE_RUN_ID" \
+              --expected-attempt "$SOURCE_RUN_ATTEMPT" \
+              --expected-target-sha "$TARGET_SHA" \
+              --expected-run-url "$SOURCE_RUN_URL"
+          )"
+          /usr/bin/python3 - "$security_marker_first" "$security_marker_second" <<'PY'
+          import json
+          import sys
+
+          first, second = (json.loads(value) for value in sys.argv[1:])
+          if first != second:
+              raise SystemExit("platform-security-build status changed during validation")
+          PY
+          rm -rf -- "$status_dir"
+          test ! -e "$status_dir"
+
+          # A status context alone is not an authentication signal: any actor
+          # with statuses:write can post the same name.  Only an exact,
+          # completed Deploy production job with its bot-produced attempt
+          # marker may suppress a new dispatch.  Every API request is fail-
+          # closed, while a missing exact deploy run means dispatch is needed.
+          deployment_dir="$(mktemp -d "$RUNNER_TEMP/platform-deploy-provenance.XXXXXX")"
+          trap 'rm -rf -- "$deployment_dir" "$status_dir"' EXIT
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml" \
+            --output "$deployment_dir/workflow.json"
+          fetch_deployment_runs() {
+            local output_path="$1" page=1 count page_path
+            local pages_dir="$deployment_dir/run-pages"
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/runs?event=workflow_dispatch&branch=dev&head_sha=${TARGET_SHA}&per_page=100&page=${page}" \
+                --output "$page_path"
+              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 99999:
+              raise SystemExit("deployment run pagination response is malformed")
+          rows = payload.get("workflow_runs")
+          if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
+              raise SystemExit("deployment run page rows are malformed")
+          ids = []
+          for row in rows:
+              if type(row.get("id")) is not int or row["id"] <= 0 or type(row.get("run_attempt")) is not int or row["run_attempt"] <= 0:
+                  raise SystemExit("deployment run identity is malformed")
+              ids.append(row["id"])
+          if len(ids) != len(set(ids)):
+              raise SystemExit("deployment run page contains duplicate IDs")
+          marker = Path(sys.argv[2])
+          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
+              raise SystemExit("deployment run total_count changed during pagination")
+          marker.write_text(str(payload["total_count"]), encoding="ascii")
+          print(len(rows))
+          PY
+              )"
+              if (( count < 100 )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 1000 )) || { echo "deployment run pagination exceeded its bound" >&2; exit 1; }
+            done
+            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          pages_dir, output_path = map(Path, sys.argv[1:])
+          expected_total = int((pages_dir / "total").read_text(encoding="ascii"))
+          rows = []
+          seen = set()
+          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              page_rows = payload.get("workflow_runs") if isinstance(payload, dict) else None
+              if not isinstance(page_rows, list):
+                  raise SystemExit("deployment run page rows are malformed")
+              for row in page_rows:
+                  run_id = row.get("id")
+                  if type(run_id) is not int or run_id <= 0 or run_id in seen:
+                      raise SystemExit("deployment run rows contain duplicate or malformed IDs")
+                  seen.add(run_id)
+                  rows.append(row)
+          if len(rows) != expected_total:
+              raise SystemExit("deployment run pagination is incomplete")
+          output_path.write_text(json.dumps({"total_count": expected_total, "workflow_runs": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          }
+          fetch_deployment_runs "$deployment_dir/runs.json"
+          fetch_deployment_jobs() {
+            local run_id="$1" attempt="$2" output_path="$3" page=1 count page_path
+            local pages_dir="$deployment_dir/job-pages-$run_id-$attempt"
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              curl --fail-with-body --silent --show-error "${api_headers[@]}" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/$run_id/attempts/$attempt/jobs?per_page=100&page=${page}" \
+                --output "$page_path"
+              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 99999:
+              raise SystemExit("deployment job pagination response is malformed")
+          rows = payload.get("jobs")
+          if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
+              raise SystemExit("deployment job page rows are malformed")
+          ids = []
+          for row in rows:
+              if type(row.get("id")) is not int or row["id"] <= 0:
+                  raise SystemExit("deployment job ID is malformed")
+              ids.append(row["id"])
+          if len(ids) != len(set(ids)):
+              raise SystemExit("deployment job page contains duplicate IDs")
+          marker = Path(sys.argv[2])
+          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
+              raise SystemExit("deployment job total_count changed during pagination")
+          marker.write_text(str(payload["total_count"]), encoding="ascii")
+          print(len(rows))
+          PY
+              )"
+              if (( count < 100 )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 1000 )) || { echo "deployment job pagination exceeded its bound" >&2; exit 1; }
+            done
+            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          pages_dir, output_path = map(Path, sys.argv[1:])
+          expected_total = int((pages_dir / "total").read_text(encoding="ascii"))
+          rows = []
+          seen = set()
+          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              page_rows = payload.get("jobs") if isinstance(payload, dict) else None
+              if not isinstance(page_rows, list):
+                  raise SystemExit("deployment job page rows are malformed")
+              for row in page_rows:
+                  job_id = row.get("id")
+                  if type(job_id) is not int or job_id <= 0 or job_id in seen:
+                      raise SystemExit("deployment job rows contain duplicate or malformed IDs")
+                  seen.add(job_id)
+                  rows.append(row)
+          if len(rows) != expected_total:
+              raise SystemExit("deployment job pagination is incomplete")
+          output_path.write_text(json.dumps({"total_count": expected_total, "jobs": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          }
+          readarray -t deployment_candidates < <(
+            /usr/bin/python3 - "$deployment_dir/workflow.json" "$deployment_dir/runs.json" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          workflow, payload = (
+              json.loads(Path(path).read_text(encoding="utf-8"))
+              for path in sys.argv[1:]
+          )
+          if not isinstance(workflow, dict) or not isinstance(payload, dict):
+              raise SystemExit("production deploy workflow response is malformed")
+          runs = payload.get("workflow_runs")
+          if not isinstance(runs, list):
+              raise SystemExit("production deploy run response is malformed")
+          # Preserve API order. Authorization is performed by the shared
+          # validator for every candidate; no lexicographic or guessed
+          # "latest" run is allowed to suppress a dispatch.
+          seen_runs = set()
+          for run in runs:
+              if not isinstance(run, dict):
+                  raise SystemExit("production deploy run row is malformed")
+              run_id = run.get("id")
+              attempt = run.get("run_attempt")
+              if (
+                  type(run_id) is int
+                  and type(attempt) is int
+                  and re.fullmatch(r"[1-9][0-9]{0,31}", str(run_id))
+                  and re.fullmatch(r"[1-9][0-9]{0,31}", str(attempt))
+              ):
+                  if run_id in seen_runs:
+                      raise SystemExit("production deploy run rows contain duplicate IDs")
+                  seen_runs.add(run_id)
+                  print(f"{run_id}\t{attempt}")
+              else:
+                  raise SystemExit("production deploy run identity is malformed")
+          PY
+          )
+          for candidate in "${deployment_candidates[@]}"; do
+            IFS=$'\t' read -r deployment_run_id deployment_attempt <<< "$candidate"
             curl --fail-with-body --silent --show-error \
               --header "Authorization: Bearer $GH_TOKEN" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status"
-          )"
-          readarray -t states < <(
-            printf '%s' "$status_json" | /usr/bin/python3 -c '
-          import json
-          import sys
-
-          payload = json.load(sys.stdin)
-          statuses = payload.get("statuses", [])
-
-          def latest_state(context):
-              rows = [item for item in statuses if item.get("context") == context]
-              if not rows:
-                  return "missing"
-              latest = max(
-                  rows,
-                  key=lambda item: item.get("updated_at")
-                  or item.get("created_at")
-                  or "",
-              )
-              return latest.get("state") or "missing"
-
-          print(latest_state("platform-security-build"))
-          print(latest_state("platform-production-deploy"))
-          '
-          )
-          security_state="${states[0]}"
-          deployment_state="${states[1]}"
-
-          test "$security_state" = success || {
-            echo "Refusing auto-deploy: platform-security-build=$security_state for $TARGET_SHA" >&2
-            exit 1
-          }
-
-          if [[ "$deployment_state" == success ]]; then
-            echo "Production already reports success for $TARGET_SHA; nothing to dispatch."
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${deployment_run_id}" \
+              --output "$deployment_dir/run.json"
+            fetch_deployment_jobs "$deployment_run_id" "$deployment_attempt" "$deployment_dir/jobs.json"
+            fetch_combined_status "$deployment_dir/status-$deployment_run_id-$deployment_attempt.json"
+            if env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 "$PROVENANCE_TOOL" deployment \
+              --workflow "$deployment_dir/workflow.json" \
+              --run "$deployment_dir/run.json" \
+              --jobs "$deployment_dir/jobs.json" \
+              --status "$deployment_dir/status-$deployment_run_id-$deployment_attempt.json" \
+              --expected-run-id "$deployment_run_id" \
+              --expected-attempt "$deployment_attempt" \
+              --expected-target-sha "$TARGET_SHA" \
+              > "$deployment_dir/validated-marker.json"
+            then
+              echo "Production already has an authenticated successful deploy for this exact SHA/run attempt; nothing to dispatch."
+              echo "deploy=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
 
           echo "deploy=true" >> "$GITHUB_OUTPUT"
 
@@ -136,7 +717,23 @@ jobs:
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/platform-production-deploy.yml/dispatches" \
-            --data '{"ref":"dev","inputs":{"mode":"deploy","runtime_profile":"ready-vote-static-8","web_compression":"enabled"}}'
+            --data "$(/usr/bin/python3 - "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" <<'PY'
+          import json
+          import sys
+          # Keep the reviewed default profile and compression contract explicit:
+          # "runtime_profile":"ready-vote-static-8" and "web_compression":"enabled".
+          print(json.dumps({
+              "ref": "dev",
+              "inputs": {
+                  "mode": "deploy",
+                  "runtime_profile": "ready-vote-static-8",
+                  "web_compression": "enabled",
+                  "classifier_run_id": sys.argv[1],
+                  "classifier_run_attempt": sys.argv[2],
+              },
+          }))
+          PY
+            )"
 
       - name: Auto-deploy summary
         if: ${{ always() }}
@@ -144,12 +741,15 @@ jobs:
         env:
           SHOULD_DEPLOY: ${{ steps.gate.outputs.deploy }}
           SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          ROUTE_CLASS: ${{ steps.route.outputs.route_class }}
+          ROUTE_REASON: ${{ steps.route.outputs.route_reason }}
         run: |
           {
             echo "### Platform production auto-deploy"
             echo
             echo "- Tested commit: \`$TARGET_SHA\`"
             echo "- Security/build run: $SOURCE_RUN_URL"
+            echo "- Classifier route: \`$ROUTE_CLASS\` ($ROUTE_REASON)"
             if [[ "$SHOULD_DEPLOY" == "true" ]]; then
               echo "- Result: production deployment dispatched"
             else

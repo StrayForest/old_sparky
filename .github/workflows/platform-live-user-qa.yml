@@ -16,38 +16,120 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate-live-user-inputs:
+    name: Validate live-user QA handoff
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      QA_CONFIRMATION: ${{ inputs.confirmation }}
+      TARGET_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout reviewed live-user QA source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate and serialize live-user QA handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/dev \
+            || { echo "Live-user QA must run from the reviewed dev branch." >&2; exit 1; }
+          test "$TARGET_SHA" = "$GITHUB_SHA"
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py confirmation \
+            --value "$QA_CONFIRMATION" \
+            --expected "RUN-LIVE-USER-QA"
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py sha \
+            --value "$TARGET_SHA"
+          umask 077
+          /usr/bin/python3 - "$TARGET_SHA" > "$RUNNER_TEMP/live-user-qa-input.json" <<'PY'
+          import json
+          import sys
+
+          print(json.dumps(
+              {
+                  "schema": 1,
+                  "base_url": "https://old-sparky.com",
+                  "provision": "false",
+                  "marker": "",
+                  "target_sha": sys.argv[1],
+              },
+              separators=(",", ":"),
+          ))
+          PY
+          chmod 600 "$RUNNER_TEMP/live-user-qa-input.json"
+      - name: Upload closed live-user QA handoff
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-live-user-qa-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/live-user-qa-input.json
+          if-no-files-found: error
+          retention-days: 1
+
   live-user-qa:
+    needs: validate-live-user-inputs
     name: Automated live-user QA on production server
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: production
-    env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
-      QA_CONFIRMATION: ${{ inputs.confirmation }}
-      TARGET_SHA: ${{ github.sha }}
-
     steps:
-      - name: Validate explicit production QA confirmation
+      - name: Download closed live-user QA handoff
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-live-user-qa-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/live-user-qa-input
+      - name: Install and validate closed live-user QA handoff
         shell: bash
         run: |
           set -euo pipefail
-          test "$QA_CONFIRMATION" = "RUN-LIVE-USER-QA" \
-            || { echo "Refusing destructive live-user QA without exact confirmation." >&2; exit 1; }
-          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
-          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
-          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
+          handoff_dir="$RUNNER_TEMP/live-user-qa-input"
+          handoff="$handoff_dir/live-user-qa-input.json"
+          test -d "$handoff_dir" && test ! -L "$handoff_dir"
+          test -f "$handoff" && test ! -L "$handoff"
+          test "$(find "$handoff_dir" -mindepth 1 -maxdepth 1 -type l -print -quit)" = ""
+          install -m 600 "$handoff" "$RUNNER_TEMP/live-user-qa-input.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/live-user-qa-input.json" "$GITHUB_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if set(payload) != {"schema", "base_url", "provision", "marker", "target_sha"}:
+              raise SystemExit("live-user QA handoff schema is invalid")
+          if payload.get("schema") != 1:
+              raise SystemExit("live-user QA handoff identity is invalid")
+          if payload.get("base_url") != "https://old-sparky.com" or payload.get("provision") != "false" or payload.get("marker") != "":
+              raise SystemExit("live-user QA handoff mode is invalid")
+          if re.fullmatch(r"[0-9a-f]{40}", payload.get("target_sha", "")) is None:
+              raise SystemExit("live-user QA handoff SHA is invalid")
+          if payload["target_sha"] != sys.argv[2]:
+              raise SystemExit("live-user QA handoff SHA does not match this run")
+          PY
+          {
+            printf 'TARGET_SHA=%s\n' "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["target_sha"])' "$RUNNER_TEMP/live-user-qa-input.json")"
+          } >> "$GITHUB_ENV"
 
       - name: Configure SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/old_sparky_prod
-          chmod 600 ~/.ssh/old_sparky_prod
-          ssh_scan="$(mktemp)"
-          trap 'rm -f -- "$ssh_scan"' EXIT
+          ssh_dir="$RUNNER_TEMP/platform-live-user-qa-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-live-user-qa-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          fi
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
           ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
           ssh_key_count="$(wc -l < "$ssh_scan" | tr -d ' ')"
@@ -57,77 +139,206 @@ jobs:
             echo "Production SSH host fingerprint mismatch" >&2
             exit 1
           }
-          install -m 0600 "$ssh_scan" ~/.ssh/known_hosts
+          install -m 0600 "$ssh_scan" "$ssh_dir/known_hosts"
           {
             printf '%s\n' 'Host *'
             printf '%s\n' '  StrictHostKeyChecking yes'
-            printf '  UserKnownHostsFile %s/.ssh/known_hosts\n' "$HOME"
-          } > ~/.ssh/config
-          chmod 600 ~/.ssh/config
-          chmod 600 ~/.ssh/known_hosts
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          chmod 600 "$ssh_dir/known_hosts"
+          printf '%s\n' "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Run live-user QA on the production server
+        id: run_live_user_qa
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          raw_report="$RUNNER_TEMP/live-user-qa-raw.log"
+          umask 077
+          : > "$raw_report"
+          chmod 600 "$raw_report"
+          set +e
+          # The fixed trusted wrapper enters through the active
+          # tools/platform_release_lock_exec.sh --expected-sha guard for the complete QA contour.
           ssh \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o ConnectTimeout=10 \
             -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=3 \
-            -i ~/.ssh/old_sparky_prod \
+            -F "$SSH_DIR/config" \
+            -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" <<'REMOTE'
-          set -Eeuo pipefail
-          confirmation="$1"
-          target_sha="$2"
-          test "$confirmation" = "RUN-LIVE-USER-QA"
+            /usr/bin/env \
+            PLATFORM_LIVE_QA_TARGET_SHA="$TARGET_SHA" \
+            PLATFORM_APP_DIR=/opt/oldsparky/platform \
+            PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
+            /root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh \
+            < /dev/null > "$raw_report" 2>&1
+          ssh_status="$?"
+          set -e
+          echo "ssh_status=$ssh_status" >> "$GITHUB_OUTPUT"
+          exit "$ssh_status"
 
-          repo=/root/old_sparky
-          runtime=/opt/oldsparky/platform
-          test -d "$repo/.git" || { echo "Trusted production QA checkout is missing" >&2; exit 1; }
-          test -L "$runtime/current" || { echo "Active production release is missing" >&2; exit 1; }
-          test "$(git -C "$repo" rev-parse --verify HEAD)" = "$target_sha" \
-            || { echo "Trusted QA checkout does not match the dispatched target SHA" >&2; exit 1; }
-
-          guard="$runtime/current/tools/platform_release_lock_exec.sh"
-          test -x "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
-          /bin/bash "$guard" \
-            --app-dir "$runtime" \
-            --expected-sha "$target_sha" \
-            -- /bin/bash -s -- "$repo" "$runtime" "$target_sha" <<'LOCKED'
-          set -Eeuo pipefail
-          repo="$1"
-          runtime="$2"
-          target_sha="$3"
-          test -d "$repo/.git" || { echo "Trusted production QA checkout is missing" >&2; exit 1; }
-          test -L "$runtime/current" || { echo "Active production release is missing" >&2; exit 1; }
-          test "$(git -C "$repo" rev-parse --verify HEAD)" = "$target_sha" \
-            || { echo "Trusted QA checkout does not match the dispatched target SHA" >&2; exit 1; }
-          reviewed_helper="$repo/platform/tools/platform_live_qa_mailbox_helper.py"
-          installed_helper="/root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py"
-          test -f "$reviewed_helper" \
-            || { echo "Reviewed mailbox helper is missing" >&2; exit 1; }
-          test -d /root/.oldsparky/liveqa \
-            || { echo "Live QA secret directory is missing" >&2; exit 1; }
-          install -o root -g root -m 0500 "$reviewed_helper" "$installed_helper"
-          exec /usr/bin/env \
-              PLATFORM_APP_DIR="$runtime" \
-              PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
-              PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com \
-              /root/old_sparky/platform/tools/platform_live_user_qa.sh
-          LOCKED
-          echo "LIVE_USER_QA_SUCCESS source_commit=$target_sha"
-          REMOTE
-
-      - name: QA summary
-        if: ${{ success() }}
+      - name: Sanitize live-user QA report
+        id: sanitize_live_user_report
+        if: ${{ always() }}
         shell: bash
         run: |
+          set -euo pipefail
+          raw_report="$RUNNER_TEMP/live-user-qa-raw.log"
+          report="$RUNNER_TEMP/live-user-qa-report.json"
+          test -e "$raw_report" || : > "$raw_report"
+          chmod 600 "$raw_report"
+          ssh_status="${{ steps.run_live_user_qa.outputs.ssh_status || '1' }}"
+          set +e
+          /usr/bin/python3 - "$raw_report" "$report" "$ssh_status" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          source = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          try:
+              exit_code = int(sys.argv[3], 10)
+          except ValueError:
+              exit_code = 1
+          try:
+              raw = source.read_bytes()
+          except OSError:
+              raw = b""
+          bounded = raw[:262144]
+          lines = bounded.splitlines()[:1000]
+          text = b"\n".join(lines).decode("utf-8", errors="replace").casefold()
+          passed = exit_code == 0 and (
+              "live_user_qa_success" in text
+              or '"status": "passed"' in text
+              or '"success": true' in text
+              or '"passed": true' in text
+          )
+          report = {
+              "schema": 1,
+              "status": "passed" if passed else ("failed" if exit_code else "unavailable"),
+              "success": passed,
+              "process_exit_code": exit_code if 0 <= exit_code <= 255 else 1,
+              "line_count": len(lines),
+              "retained_line_count": len(lines),
+              "truncated": len(raw) > len(bounded) or len(bounded.splitlines()) > len(lines),
+              "test_count": 1 if lines else 0,
+              "failed_test_count": 0 if passed else (1 if lines or exit_code else 0),
+              "error_class_counts": {} if passed else {"transport" if exit_code else "other": 1},
+          }
+          destination.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+          raise SystemExit(0)
+          PY
+          report_status="$?"
+          set -e
+          rm -f -- "$raw_report"
+          test ! -e "$raw_report"
+          test -s "$report" || {
+            echo "Live-user fixed report was not produced." >&2
+            exit "$report_status"
+          }
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-live-user-qa-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-live-user-qa-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          handoff_dir="$RUNNER_TEMP/live-user-qa-input"
+          if [[ -e "$handoff_dir" || -L "$handoff_dir" ]]; then
+            test -d "$handoff_dir" && test ! -L "$handoff_dir"
+            rm -f -- "$handoff_dir/live-user-qa-input.json"
+            test ! -e "$handoff_dir/live-user-qa-input.json"
+            rmdir -- "$handoff_dir"
+          fi
+          test ! -e "$handoff_dir" && test ! -L "$handoff_dir"
+          rm -f -- "$RUNNER_TEMP/live-user-qa-input.json"
+          test ! -e "$RUNNER_TEMP/live-user-qa-input.json"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
+
+      - name: Reject incomplete live-user QA report
+        id: validate_live_user_report
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - "$RUNNER_TEMP/live-user-qa-report.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          try:
+              report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit("required live-user QA report is not valid JSON")
+          if (
+              not isinstance(report, dict)
+              or report.get("truncated") is not False
+              or report.get("status") in {"truncated", "error", "unavailable"}
+          ):
+              raise SystemExit("required live-user QA report is incomplete")
+          PY
+
+      - name: QA summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          report="$RUNNER_TEMP/live-user-qa-report.json"
           {
             echo "### Platform live-user QA"
             echo
             echo "- Target SHA: \`$TARGET_SHA\`"
-            echo "- Status: passed on production server"
+            if [[ -s "$report" ]]; then
+              /usr/bin/python3 - "$report" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print(f"- Status: **{payload.get('status')}**")
+          print(f"- Tests observed: {payload.get('test_count', 0)}; failed: {payload.get('failed_test_count', 0)}")
+          print(f"- Error classes: `{payload.get('error_class_counts', {})}`")
+          PY
+            else
+              echo "- Status: **unavailable**"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload live-user QA report
+        if: ${{ !cancelled() && steps.cleanup_ssh.outcome == 'success' && steps.sanitize_live_user_report.outcome == 'success' && steps.validate_live_user_report.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-live-user-qa-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/live-user-qa-report.json
+          if-no-files-found: error
+          retention-days: 14

@@ -67,9 +67,11 @@ type PanState = {
 
 export function BracketBoard({
   initialBracket,
+  inviteCode,
   slug,
 }: {
   initialBracket?: Bracket | null;
+  inviteCode?: string;
   slug: string;
 }) {
   const { t } = useI18n();
@@ -100,6 +102,7 @@ export function BracketBoard({
     const requestGeneration = ++refreshGeneration.current;
     const request = getTournamentBracket(slug, {}, {
       teamsView: "summary",
+      inviteCode,
       signal: controller.signal,
       ifNoneMatch: bracketEtag.current,
       cachedBracket: bracketRef.current,
@@ -144,7 +147,7 @@ export function BracketBoard({
       });
     refreshInFlight.current = request;
     return request;
-  }, [slug, t]);
+  }, [inviteCode, slug, t]);
 
   useEffect(() => {
     bracketEtag.current = null;

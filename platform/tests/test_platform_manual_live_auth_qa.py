@@ -336,10 +336,20 @@ class ManualLiveAuthQaUnitTests(unittest.TestCase):
             with self.subTest(wrapper=name):
                 source = (TOOLS_DIR / name).read_text(encoding="utf-8")
                 self.assertEqual(source.splitlines()[1], "set +x")
-                self.assertNotIn("source ", source)
+                # Match shell source commands rather than the safe diagnostic
+                # strings that describe a source checkout or source SHA.
+                self.assertNotRegex(source, r"(?m)^\s*(?:source|\.)\s+")
                 self.assertNotIn("platform_runtime_common.sh", source)
                 self.assertNotIn("platform_load_env_file", source)
                 self.assertNotIn("${PYTHONPATH:+:$PYTHONPATH}", source)
+                self.assertRegex(
+                    source,
+                    r'(?m)^\s*(?:TRUSTED_REPO_ROOT="/root/old_sparky"|PLATFORM_ROOT="\$TRUSTED_INSTALL_ROOT/platform")\s*$',
+                )
+                self.assertRegex(
+                    source,
+                    r'(?m)^\s*TOOLS_DIR="\$PLATFORM_ROOT/tools"\s*$',
+                )
                 self.assertIn('SYSTEM_PYTHON="/usr/bin/python3.12"', source)
                 self.assertIn("platform_safe_env_exec.py", source)
 

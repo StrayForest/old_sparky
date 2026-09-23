@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
 import grp
 import hashlib
 import importlib.util
@@ -20,6 +19,8 @@ from unittest import mock
 from uuid import uuid4
 import zipfile
 
+from tests import platform_test_lock_support as lock_support
+
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "tools" / "platform_live_qa_guard.py"
@@ -30,6 +31,82 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC is not None and SPEC.loader is not None
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
+
+
+@contextmanager
+def synthetic_trusted_tools():
+    """Materialize a root-owned minimal trusted-wrapper fixture under /root."""
+
+    parent = Path("/root")
+    parent_metadata = parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent.resolve(strict=True) != parent
+        or parent_metadata.st_uid != 0
+        or parent_metadata.st_gid != 0
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+    ):
+        raise AssertionError("unsafe synthetic tools parent")
+    tools_root = Path(tempfile.mkdtemp(prefix="oldsparky-liveqa-tools-", dir=parent))
+    initial: tuple[int, int] | None = None
+    wrapper = tools_root / "platform_live_user_qa.sh"
+    wrapper_initial: tuple[int, int] | None = None
+    try:
+        tools_metadata = tools_root.lstat()
+        initial = (tools_metadata.st_dev, tools_metadata.st_ino)
+        if (
+            tools_root.parent != parent
+            or not tools_root.name.startswith("oldsparky-liveqa-tools-")
+            or not stat.S_ISDIR(tools_metadata.st_mode)
+            or tools_metadata.st_uid != 0
+            or tools_metadata.st_gid != 0
+            or stat.S_IMODE(tools_metadata.st_mode) != 0o700
+        ):
+            raise AssertionError("unsafe synthetic tools directory")
+        wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        wrapper.chmod(0o700)
+        wrapper_metadata = wrapper.lstat()
+        wrapper_initial = (wrapper_metadata.st_dev, wrapper_metadata.st_ino)
+        if (
+            not stat.S_ISREG(wrapper_metadata.st_mode)
+            or wrapper_metadata.st_uid != 0
+            or wrapper_metadata.st_gid != 0
+            or wrapper_metadata.st_nlink != 1
+            or stat.S_IMODE(wrapper_metadata.st_mode) != 0o700
+        ):
+            raise AssertionError("unsafe synthetic trusted wrapper")
+        yield tools_root
+    finally:
+        try:
+            current = tools_root.lstat()
+        except FileNotFoundError:
+            current = None
+        if current is not None:
+            common_metadata_ok = (
+                tools_root.parent == parent
+                and tools_root.name.startswith("oldsparky-liveqa-tools-")
+                and stat.S_ISDIR(current.st_mode)
+                and current.st_uid == 0
+                and current.st_gid == 0
+                and (initial is None or (current.st_dev, current.st_ino) == initial)
+            )
+            current_wrapper = None
+            if wrapper_initial is not None:
+                try:
+                    current_wrapper = wrapper.lstat()
+                except FileNotFoundError:
+                    current_wrapper = None
+            wrapper_metadata_ok = wrapper_initial is None or (
+                current_wrapper is not None
+                and (current_wrapper.st_dev, current_wrapper.st_ino) == wrapper_initial
+                and stat.S_ISREG(current_wrapper.st_mode)
+                and current_wrapper.st_uid == 0
+                and current_wrapper.st_gid == 0
+                and current_wrapper.st_nlink == 1
+            )
+            if not common_metadata_ok or not wrapper_metadata_ok:
+                raise AssertionError("refusing to clean replaced synthetic tools")
+            shutil.rmtree(tools_root)
 
 
 def passwd_entry(
@@ -182,9 +259,13 @@ class LiveQaGuardTests(unittest.TestCase):
             )
 
     def test_recovery_exec_requires_an_exact_recovery_command(self) -> None:
-        wrapper = guard.TRUSTED_TOOLS_ROOT / "platform_live_user_qa.sh"
-        with self.assertRaisesRegex(guard.GuardError, "arguments are invalid"):
-            guard._validate_trusted_wrapper([str(wrapper)], recovery=True)
+        with synthetic_trusted_tools() as tools_root:
+            wrapper = tools_root / "platform_live_user_qa.sh"
+            with mock.patch.object(guard, "TRUSTED_TOOLS_ROOT", tools_root):
+                with self.assertRaisesRegex(
+                    guard.GuardError, "arguments are invalid"
+                ):
+                    guard._validate_trusted_wrapper([str(wrapper)], recovery=True)
 
     def test_checkout_provenance_rejects_any_other_checkout(self) -> None:
         with tempfile.TemporaryDirectory(dir="/root") as temporary:
@@ -830,20 +911,27 @@ class LiveQaGuardTests(unittest.TestCase):
                 app_dir, current=current, previous=previous
             )
             lock_path = base / "liveqa.lock"
+            release_lock = lock_support.create_test_lock(
+                "liveqa-retention-release", root=base
+            )
             with (
                 mock.patch.object(guard, "MACHINE_LOCK_PATH", lock_path),
+                mock.patch.object(guard, "RELEASE_LOCK_PATH", release_lock.path),
                 mock.patch.object(guard, "_liveqa_cgroup_process_ids", return_value=()),
                 mock.patch.object(guard, "_liveqa_process_ids", return_value=()),
                 mock.patch.object(
                     guard, "_open_machine_lock", wraps=guard._open_machine_lock
                 ) as opened_lock,
             ):
-                plan = guard.prune_runtime_cache(
-                    apply=False,
-                    keep=1,
-                    root=root,
-                    app_dir=app_dir,
-                )
+                try:
+                    plan = guard.prune_runtime_cache(
+                        apply=False,
+                        keep=1,
+                        root=root,
+                        app_dir=app_dir,
+                    )
+                finally:
+                    release_lock.cleanup()
             opened_lock.assert_called_once_with()
             self.assertEqual([entry.path for entry in plan.retained], [newest])
             self.assertEqual([entry.path for entry in plan.candidates], [old])
@@ -872,26 +960,32 @@ class LiveQaGuardTests(unittest.TestCase):
             base = Path(temporary)
             root = base / "cache"
             root.mkdir(mode=0o755)
-            descriptor = os.open(base / "lock", os.O_RDWR | os.O_CREAT, 0o600)
-            with (
-                mock.patch.object(
-                    guard, "_open_machine_lock", return_value=descriptor
-                ),
-                mock.patch.object(
-                    guard,
-                    "assert_liveqa_idle",
-                    side_effect=guard.GuardError(
-                        "dedicated oldsparky-liveqa system account is unavailable"
+            machine_lock = lock_support.create_test_lock(
+                "liveqa-machine", root=base
+            )
+            try:
+                descriptor = os.dup(machine_lock.fd)
+                with (
+                    mock.patch.object(
+                        guard, "_open_machine_lock", return_value=descriptor
                     ),
-                ),
-                self.assertRaisesRegex(guard.GuardError, "account is unavailable"),
-            ):
-                guard.prune_runtime_cache_release_lock_held(
-                    apply=False,
-                    keep=1,
-                    root=root,
-                    app_dir=Path("/opt/oldsparky/platform"),
-                )
+                    mock.patch.object(
+                        guard,
+                        "assert_liveqa_idle",
+                        side_effect=guard.GuardError(
+                            "dedicated oldsparky-liveqa system account is unavailable"
+                        ),
+                    ),
+                    self.assertRaisesRegex(guard.GuardError, "account is unavailable"),
+                ):
+                    guard.prune_runtime_cache_release_lock_held(
+                        apply=False,
+                        keep=1,
+                        root=root,
+                        app_dir=Path("/opt/oldsparky/platform"),
+                    )
+            finally:
+                machine_lock.cleanup()
 
     def test_runtime_retention_cli_is_dry_run_by_default(self) -> None:
         args = guard._parser().parse_args(["prune-runtime-cache"])
@@ -936,7 +1030,7 @@ class LiveQaGuardTests(unittest.TestCase):
                 guard.prune_runtime_cache(
                     apply=False,
                     keep=1,
-                    root=Path("/var/lib/oldsparky-liveqa"),
+                    root=guard.RUNNER_CACHE_ROOT,
                     app_dir=Path("/opt/oldsparky/platform"),
                 ),
                 empty,
@@ -949,21 +1043,21 @@ class LiveQaGuardTests(unittest.TestCase):
             app_dir = Path(temporary) / "platform"
             shared = app_dir / "shared"
             shared.mkdir(parents=True)
-            descriptor = os.open(shared, os.O_RDONLY | os.O_DIRECTORY)
+            release_lock = lock_support.create_test_lock("liveqa-contention")
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                with self.assertRaisesRegex(
-                    guard.GuardError, "another platform release operation"
-                ):
-                    guard.prune_runtime_cache(
-                        apply=False,
-                        keep=1,
-                        root=Path(temporary) / "missing-cache",
-                        app_dir=app_dir,
-                    )
+                release_lock.acquire(nonblocking=True)
+                with mock.patch.object(guard, "RELEASE_LOCK_PATH", release_lock.path):
+                    with self.assertRaisesRegex(
+                        guard.GuardError, "another platform release operation"
+                    ):
+                        guard.prune_runtime_cache(
+                            apply=False,
+                            keep=1,
+                            root=Path(temporary) / "missing-cache",
+                            app_dir=app_dir,
+                        )
             finally:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
+                release_lock.cleanup()
 
     @unittest.skipUnless(os.geteuid() == 0, "root-owned cache contract")
     def test_interrupted_deletion_is_reclaimed_from_a_validated_tombstone(

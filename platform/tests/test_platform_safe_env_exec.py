@@ -22,6 +22,11 @@ SPEC.loader.exec_module(safe_env)
 
 
 class SafeEnvExecTests(unittest.TestCase):
+    LIVE_QA_PAYLOAD = Path(
+        "/root/.oldsparky/liveqa/releases/"
+        "0123456789abcdef0123456789abcdef01234567"
+    )
+
     def test_production_path_requires_root_owned_fixed_components(self) -> None:
         self.assertEqual(safe_env._production_component_owners(), (0, 0, 0, 0, 0))
 
@@ -64,25 +69,37 @@ class SafeEnvExecTests(unittest.TestCase):
             "PLATFORM_ENVIRONMENT": "production",
             "PLATFORM_DATABASE_URL": "postgresql://required-secret",
         }
-        with mock.patch.dict(
-            os.environ,
-            {"LD_PRELOAD": "/tmp/attack.so", "PYTHONPATH": "/tmp/attack"},
-            clear=True,
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"LD_PRELOAD": "/tmp/attack.so", "PYTHONPATH": "/tmp/attack"},
+                clear=True,
+            ),
+            mock.patch.object(
+                safe_env,
+                "_read_liveqa_manifest",
+                return_value={"payload": str(self.LIVE_QA_PAYLOAD)},
+            ),
         ):
             child = safe_env.clean_child_environment(
                 values,
-                pythonpath=safe_env.TRUSTED_PLATFORM_ROOT,
+                pythonpath=self.LIVE_QA_PAYLOAD,
             )
         self.assertNotIn("LD_PRELOAD", child)
-        self.assertEqual(child["PYTHONPATH"], str(safe_env.TRUSTED_PLATFORM_ROOT))
+        self.assertEqual(child["PYTHONPATH"], str(self.LIVE_QA_PAYLOAD))
         self.assertEqual(child["HOME"], "/nonexistent")
         self.assertEqual(
             child["PLATFORM_DATABASE_URL"], values["PLATFORM_DATABASE_URL"]
         )
 
     def test_command_validation_requires_matching_runtime_contour(self) -> None:
-        with self.assertRaisesRegex(
-            safe_env.SafeEnvError, "approved live QA DB tool"
+        with (
+            mock.patch.object(
+                safe_env,
+                "_read_liveqa_manifest",
+                return_value={"payload": str(self.LIVE_QA_PAYLOAD)},
+            ),
+            self.assertRaisesRegex(safe_env.SafeEnvError, "approved live QA DB tool"),
         ):
             safe_env.validate_trusted_command(
                 [
@@ -92,7 +109,7 @@ class SafeEnvExecTests(unittest.TestCase):
                         / "tools/platform_cleanup_live_user_qa.py"
                     ),
                 ],
-                pythonpath=safe_env.TRUSTED_PLATFORM_ROOT,
+                pythonpath=self.LIVE_QA_PAYLOAD,
             )
 
     def test_retained_report_recovery_is_an_approved_db_tool(self) -> None:

@@ -1,11 +1,9 @@
 import Link from "next/link";
-import { SiteHeader } from "@/components/layout/site-header";
 
 export default function NotFound() {
   return (
     <>
       <div aria-hidden="true" className="page-noise" />
-      <SiteHeader />
       <main className="not-found-main">
         <section aria-labelledby="not-found-title" className="panel not-found-panel">
           <h1 className="not-found-code" id="not-found-title">404</h1>

@@ -2,6 +2,17 @@
   "schema": 2,
   "profile_id": "read-mix-concurrency-ramp-v1",
   "profile_version": 1,
+  "portfolio": {
+    "owner": "platform-performance",
+    "hypothesis": "The authenticated read mix has a measurable concurrency knee that should guide admission limits.",
+    "class": "diagnostic",
+    "status": "active",
+    "cadence": "on-demand",
+    "environment": "production",
+    "request_budget": {"max_logical_actions": 170000, "max_http_attempts": 170000, "max_duration_seconds": 3600},
+    "cost_budget": {"max_runner_minutes": 240, "basis": "external runner wall-clock budget"},
+    "last_accepted_evidence": {"run_id": "34108903886", "source_sha": "bba3fb278e348906a6942aee8462b758c3d616ef"}
+  },
   "category": "stress",
   "purpose": "Find the authenticated read-mix concurrency knee before choosing admission and pool settings.",
   "description": "Full-population authenticated read mix repeated at concurrency 16, 32, 48, 64, 80, 96, 112 and 128.",
@@ -29,6 +40,7 @@
   },
   "acceptance": {
     "kind": "stress",
+    "minimum_useful_goodput_actions_per_second": 1,
     "accepted_request_latency": {"p50_ms": 1500, "p90_ms": 3000, "p95_ms": 8000, "p99_ms": 12000},
     "logical_latency": {"p95_ms": 12000, "p99_ms": 20000},
     "max_shed_percent": 100,
@@ -53,6 +65,7 @@
   },
   "execution": {
     "generator": "GitHub-hosted external runner",
+    "require_exact_observer_binding": true,
     "measured_origin": "https://old-sparky.com",
     "origin_role": "fixture preparation, lightweight observer and exact cleanup only",
     "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",

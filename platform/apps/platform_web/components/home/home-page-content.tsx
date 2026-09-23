@@ -95,7 +95,7 @@ export function HomePageContent() {
             <Link className="hero-action hero-action-primary" href="/tournaments">
               {t("home.findTournament")}
             </Link>
-            <Link className="hero-action hero-action-secondary" href="/tournaments/new">
+            <Link className="hero-action hero-action-secondary" href="/tournaments/new" prefetch={false}>
               {t("home.createTournament")}
             </Link>
           </>

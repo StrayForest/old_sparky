@@ -16,31 +16,153 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - uses: actions/checkout@v6
-
       - name: Require Cloudflare audit credentials
         shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+          rm -f -- \
+            "$RUNNER_TEMP/cloudflare-audit-report.json" \
+            "$RUNNER_TEMP/.cloudflare-audit-report.json.private-raw" \
+            2>/dev/null \
+            || { echo "Cloudflare audit output cleanup failed" >&2; exit 1; }
+          test ! -e "$RUNNER_TEMP/cloudflare-audit-report.json"
+          test ! -e "$RUNNER_TEMP/.cloudflare-audit-report.json.private-raw"
           test -n "${CLOUDFLARE_API_TOKEN:-}" || { echo "CLOUDFLARE_API_TOKEN is not configured" >&2; exit 1; }
           test -n "${CLOUDFLARE_ACCOUNT_ID:-}" || { echo "CLOUDFLARE_ACCOUNT_ID is not configured" >&2; exit 1; }
 
       - name: Run read-only Cloudflare audit
         shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          python3 platform/tools/cloudflare_readonly_audit.py \
-            --output "$RUNNER_TEMP/cloudflare-audit-report.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/cloudflare-audit-report.json" <<'PY'
+          """Fixed, value-free Cloudflare API read-only projection.
+
+          This consumer intentionally contains no repository import or
+          downloaded executable.  It records only fixed check IDs, HTTP
+          classes and bounded counts; provider response text never crosses
+          into the public artifact.
+          """
+          from __future__ import annotations
+
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+          output = Path(sys.argv[1])
+          token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+          account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+          api_root = "https://api.cloudflare.com/client/v4"
+          checks = []
+
+          def query(check_id: str, path: str, params: dict[str, str] | None = None) -> dict[str, object]:
+              url = api_root + path
+              if params:
+                  url += "?" + urlencode(params)
+              request = Request(
+                  url,
+                  headers={
+                      "Accept": "application/json",
+                      "Authorization": "Bearer " + token,
+                      "User-Agent": "old-sparky-cloudflare-readonly-audit/2",
+                  },
+                  method="GET",
+              )
+              status = None
+              success = False
+              count = 0
+              error_class = "none"
+              try:
+                  with urlopen(request, timeout=20) as response:
+                      status = response.status
+                      raw = response.read(1024 * 1024 + 1)
+                  if len(raw) > 1024 * 1024:
+                      error_class = "oversized"
+                  else:
+                      payload = json.loads(raw.decode("utf-8"))
+                      if isinstance(payload, dict):
+                          success = payload.get("success") is True and status == 200
+                          result = payload.get("result")
+                          if isinstance(result, list):
+                              count = min(len(result), 100000)
+                          elif isinstance(result, dict):
+                              count = min(len(result), 100000)
+                          else:
+                              count = int(success)
+                      else:
+                          error_class = "invalid_response"
+              except HTTPError as error:
+                  status = error.code
+                  error_class = "auth" if status in (401, 403) else ("not_found" if status == 404 else "api_error")
+              except (URLError, TimeoutError, OSError):
+                  error_class = "transport"
+              except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+                  error_class = "invalid_response"
+              checks.append({
+                  "id": check_id,
+                  "status": "PASS" if success else ("UNAVAILABLE" if status is None else "REVIEW"),
+                  "summary": "fixed read-only API observation",
+                  "evidence": {
+                      "http_status": status if isinstance(status, int) and 100 <= status <= 599 else None,
+                      "result_count": count,
+                      "error_class": error_class,
+                  },
+              })
+              return {"success": success, "result_count": count}
+
+          zone = query("zone-access", "/zones", {"name": "old-sparky.com", "per_page": "1"})
+          # The zone ID is data from the provider, never a workflow input.  A
+          # closed hexadecimal grammar prevents it becoming a URL fragment.
+          zone_id = ""
+          if zone.get("success"):
+              # Re-query through a bounded parser so the public projection
+              # still emits no provider-controlled values.
+              try:
+                  request = Request(
+                      api_root + "/zones?" + urlencode({"name": "old-sparky.com", "per_page": "1"}),
+                      headers={"Accept": "application/json", "Authorization": "Bearer " + token},
+                  )
+                  with urlopen(request, timeout=20) as response:
+                      payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+                  candidate = payload.get("result", [{}])[0].get("id", "") if isinstance(payload, dict) else ""
+                  if isinstance(candidate, str) and re.fullmatch(r"[0-9a-f]{32}", candidate):
+                      zone_id = candidate
+              except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError, IndexError, KeyError):
+                  zone_id = ""
+          if zone_id:
+              query("dns-routing", f"/zones/{zone_id}/dns_records", {"per_page": "1"})
+              query("edge-certificates", f"/zones/{zone_id}/ssl/certificate_packs")
+              query("cache-rules", f"/zones/{zone_id}/rulesets", {"per_page": "1"})
+          else:
+              for check_id in ("dns-routing", "edge-certificates", "cache-rules"):
+                  checks.append({"id": check_id, "status": "UNAVAILABLE", "summary": "zone identity unavailable", "evidence": {"error_class": "missing"}})
+          if re.fullmatch(r"[0-9a-f]{32}", account):
+              query("r2-public-bucket", f"/accounts/{account}/r2/buckets")
+          else:
+              checks.append({"id": "r2-public-bucket", "status": "UNAVAILABLE", "summary": "account identity unavailable", "evidence": {"error_class": "missing"}})
+          summary = {}
+          for check in checks:
+              summary[check["status"]] = summary.get(check["status"], 0) + 1
+          output.write_text(json.dumps({"schema": 1, "checks": checks, "summary": summary}, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          test ! -e "$RUNNER_TEMP/.cloudflare-audit-report.json.private-raw"
 
       - name: Upload redacted Cloudflare audit evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cloudflare-readonly-audit-${{ github.run_id }}
+          name: cloudflare-readonly-audit-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cloudflare-audit-report.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14

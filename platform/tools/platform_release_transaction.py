@@ -19,10 +19,13 @@ from uuid import uuid4
 
 
 STATE_NAME = ".release-operation.json"
-STATE_VERSION = 1
+QUIESCE_STATE_NAME = ".release-quiesce.json"
+STATE_VERSION = 2
+QUIESCE_STATE_VERSION = 1
 RENAME_EXCHANGE = 2
 AT_FDCWD = -100
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+SERVICE_UNITS = ("deadlock-api", "deadlock-worker", "deadlock-web")
 PHASES = {
     "prepared",
     "venv-transitioned",
@@ -118,11 +121,67 @@ RECORD_KEYS = {
     "previous_before_identity",
     "candidate_identity",
     "remove_env_on_recovery",
+    "service_state_before",
+    "quiesced_services",
+    "timer_active_before",
+}
+QUIESCE_RECORD_KEYS = {
+    "version",
+    "operation",
+    "phase",
+    "app_dir",
+    "current_before",
+    "previous_before",
+    "candidate_release",
+    "shared_env_before",
+    "current_before_identity",
+    "previous_before_identity",
+    "service_state_before",
+    "quiesced_services",
+    "timer_active_before",
 }
 
 
 class TransactionError(RuntimeError):
     """A release transaction cannot be proven safe."""
+
+
+def _validate_service_snapshot(record: dict[str, object]) -> None:
+    service_state = record.get("service_state_before")
+    quiesced_services = record.get("quiesced_services")
+    timer_active_before = record.get("timer_active_before")
+
+    # Rollback transactions do not quiesce the application services. The
+    # low-level installer may create an install receipt before the deploy
+    # wrapper has captured its pre-migration state; the production migration
+    # and abort callers reject that receipt rather than guessing a state.
+    if (
+        service_state is None
+        and quiesced_services is None
+        and timer_active_before is None
+    ):
+        return
+    if record.get("operation") != "install":
+        raise TransactionError(
+            "service state is unexpected for a rollback transaction"
+        )
+    if not isinstance(service_state, dict) or set(service_state) != set(SERVICE_UNITS):
+        raise TransactionError("pre-migration service state is invalid")
+    if any(
+        type(value) is not str or value not in {"active", "inactive"}
+        for value in service_state.values()
+    ):
+        raise TransactionError("pre-migration service state is invalid")
+    if (
+        not isinstance(quiesced_services, list)
+        or len(quiesced_services) != len(SERVICE_UNITS)
+        or any(type(value) is not str for value in quiesced_services)
+        or any(value not in SERVICE_UNITS for value in quiesced_services)
+        or set(quiesced_services) != set(SERVICE_UNITS)
+    ):
+        raise TransactionError("quiesced service set is invalid")
+    if type(timer_active_before) is not bool:
+        raise TransactionError("pre-migration timer state is invalid")
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -177,6 +236,24 @@ def _safe_state_file(path: Path) -> os.stat_result:
         or metadata.st_size > 64 * 1024
     ):
         raise TransactionError("release operation record metadata is unsafe")
+    return metadata
+
+
+def _optional_safe_private_file(path: Path, *, label: str) -> os.stat_result | None:
+    if not _lexists(path):
+        return None
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise TransactionError(f"{label} is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise TransactionError(f"{label} metadata is unsafe")
     return metadata
 
 
@@ -385,6 +462,7 @@ def _validate_record(
         raise TransactionError("release venv transition is invalid")
     if type(record.get("remove_env_on_recovery")) is not bool:
         raise TransactionError("release env recovery flag is invalid")
+    _validate_service_snapshot(record)
 
     app = Path(str(record.get("app_dir")))
     _safe_directory(app, label="application directory")
@@ -482,6 +560,105 @@ def _validate_record(
     }
 
 
+def _validate_quiesce_record(
+    state: Path,
+    record: dict[str, object],
+) -> dict[str, object]:
+    if (
+        set(record) != QUIESCE_RECORD_KEYS
+        or record.get("version") != QUIESCE_STATE_VERSION
+    ):
+        raise TransactionError("pre-quiesce receipt schema is invalid")
+    if record.get("operation") != "install":
+        raise TransactionError("pre-quiesce receipt operation is invalid")
+    if record.get("phase") != "quiesce-pending":
+        raise TransactionError("pre-quiesce receipt phase is invalid")
+    app_value = record.get("app_dir")
+    if not isinstance(app_value, str):
+        raise TransactionError("pre-quiesce receipt application path is invalid")
+    app = Path(app_value)
+    _safe_directory(app, label="application directory")
+    releases = app / "releases"
+    shared = app / "shared"
+    _safe_directory(releases, label="releases directory")
+    _safe_directory(shared, label="shared directory")
+    if state not in {shared / QUIESCE_STATE_NAME, shared / STATE_NAME}:
+        raise TransactionError("pre-quiesce receipt path is invalid")
+
+    current_before = _release_target(
+        record.get("current_before"),
+        releases,
+        label="original current release",
+    )
+    previous_before = _release_target(
+        record.get("previous_before"),
+        releases,
+        label="original previous release",
+    )
+    candidate = _release_target(
+        record.get("candidate_release"),
+        releases,
+        label="candidate release",
+        must_exist=False,
+    )
+    if candidate is None:
+        raise TransactionError("pre-quiesce candidate release is missing")
+    if candidate in {current_before, previous_before}:
+        raise TransactionError("pre-quiesce candidate is already active")
+    shared_env = shared / ".env.platform"
+    shared_env_before = record.get("shared_env_before")
+    if shared_env_before is not None:
+        if not _valid_identity(shared_env_before):
+            raise TransactionError("pre-quiesce shared env identity is invalid")
+        env_metadata = _optional_safe_private_file(
+            shared_env, label="shared env file"
+        )
+        if env_metadata is None or _identity(env_metadata) != shared_env_before:
+            raise TransactionError("pre-quiesce shared env identity changed")
+    else:
+        _optional_safe_private_file(shared_env, label="shared env file")
+    for path, identity, label in (
+        (
+            current_before,
+            record.get("current_before_identity"),
+            "original current release",
+        ),
+        (
+            previous_before,
+            record.get("previous_before_identity"),
+            "original previous release",
+        ),
+    ):
+        if path is None:
+            if identity is not None:
+                raise TransactionError(f"{label} identity is unexpected")
+        elif not _valid_identity(identity) or not _matches(path, identity):
+            raise TransactionError(f"{label} identity changed")
+
+    # Reuse the exact install snapshot contract, but do not allow a receipt
+    # that has no service state: this file is the recovery authority before
+    # the low-level installer has created its transaction record.
+    snapshot_record = {
+        "operation": "install",
+        "service_state_before": record.get("service_state_before"),
+        "quiesced_services": record.get("quiesced_services"),
+        "timer_active_before": record.get("timer_active_before"),
+    }
+    _validate_service_snapshot(snapshot_record)
+    if any(value is None for value in snapshot_record.values()):
+        raise TransactionError("pre-quiesce receipt service state is incomplete")
+
+    return {
+        **record,
+        "app": app,
+        "releases": releases,
+        "shared": shared,
+        "candidate_path": candidate,
+        "current_before_path": current_before,
+        "previous_before_path": previous_before,
+    }
+
+
 def _load_record(state: Path) -> dict[str, object]:
     _safe_state_file(state)
     try:
@@ -496,8 +673,26 @@ def _load_record(state: Path) -> dict[str, object]:
     return _validate_record(state, parsed)
 
 
+def _load_quiesce_record(state: Path) -> dict[str, object]:
+    _safe_state_file(state)
+    try:
+        raw = state.read_text(encoding="ascii")
+        parsed = json.loads(raw, object_pairs_hook=_strict_object)
+    except TransactionError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise TransactionError("pre-quiesce receipt is invalid") from exc
+    if not isinstance(parsed, dict):
+        raise TransactionError("pre-quiesce receipt schema is invalid")
+    return _validate_quiesce_record(state, parsed)
+
+
 def _record_for_write(record: dict[str, object]) -> dict[str, object]:
     return {key: record[key] for key in RECORD_KEYS}
+
+
+def _quiesce_record_for_write(record: dict[str, object]) -> dict[str, object]:
+    return {key: record[key] for key in QUIESCE_RECORD_KEYS}
 
 
 def create_record(
@@ -570,6 +765,9 @@ def create_record(
             _safe_directory(candidate_release, label="candidate release")
         ),
         "remove_env_on_recovery": remove_env_on_recovery,
+        "service_state_before": None,
+        "quiesced_services": None,
+        "timer_active_before": None,
     }
     validated = _validate_record(state, record)
     _write_record(state, _record_for_write(validated), creating=True)
@@ -589,6 +787,250 @@ def set_phase(state: Path, *, expected: str, phase: str) -> None:
         )
     record["phase"] = phase
     _write_record(state, _record_for_write(record), creating=False)
+
+
+def _parse_service_snapshot(
+    service_states: list[str], timer_active_before: str
+) -> tuple[dict[str, str], bool]:
+    parsed_states: dict[str, str] = {}
+    for value in service_states:
+        if "=" not in value:
+            raise TransactionError("pre-migration service state entry is invalid")
+        service, service_state = value.split("=", 1)
+        if service in parsed_states or service not in SERVICE_UNITS:
+            raise TransactionError("pre-migration service state entry is invalid")
+        if service_state not in {"active", "inactive"}:
+            raise TransactionError("pre-migration service state entry is invalid")
+        parsed_states[service] = service_state
+    if set(parsed_states) != set(SERVICE_UNITS):
+        raise TransactionError("pre-migration service state is incomplete")
+    if timer_active_before not in {"active", "inactive"}:
+        raise TransactionError("pre-migration timer state is invalid")
+    return parsed_states, timer_active_before == "active"
+
+
+def record_services(
+    state: Path,
+    *,
+    service_states: list[str],
+    timer_active_before: str,
+) -> None:
+    record = _load_record(state)
+    if record["operation"] != "install" or record["phase"] != "staged":
+        raise TransactionError(
+            "pre-migration service state can only be recorded for a staged install"
+        )
+    parsed_states, timer_value = _parse_service_snapshot(
+        service_states, timer_active_before
+    )
+
+    existing_states = record["service_state_before"]
+    existing_services = record["quiesced_services"]
+    existing_timer = record["timer_active_before"]
+    if existing_states is not None or existing_services is not None or existing_timer is not None:
+        if (
+            existing_states != parsed_states
+            or existing_services != list(SERVICE_UNITS)
+            or existing_timer != timer_value
+        ):
+            raise TransactionError("pre-migration service state was already recorded")
+        return
+
+    record["service_state_before"] = parsed_states
+    record["quiesced_services"] = list(SERVICE_UNITS)
+    record["timer_active_before"] = timer_value
+    _write_record(state, _record_for_write(record), creating=False)
+
+
+def prepare_quiesce(
+    state: Path,
+    *,
+    app_dir: Path,
+    candidate_release: Path,
+    service_states: list[str],
+    timer_active_before: str,
+    candidate_may_exist: bool,
+) -> None:
+    """Persist the pre-stop runtime snapshot before staging can mutate files."""
+
+    if os.geteuid() != 0:
+        raise TransactionError("release transactions require root")
+    _safe_directory(app_dir, label="application directory")
+    app_path = app_dir
+    releases = app_path / "releases"
+    shared = app_path / "shared"
+    _safe_directory(releases, label="releases directory")
+    _safe_directory(shared, label="shared directory")
+    if state not in {shared / QUIESCE_STATE_NAME, shared / STATE_NAME}:
+        raise TransactionError("pre-quiesce receipt path is invalid")
+    parsed_states, timer_value = _parse_service_snapshot(
+        service_states, timer_active_before
+    )
+    shared_env = app_path / "shared" / ".env.platform"
+    shared_env_metadata = _optional_safe_private_file(
+        shared_env, label="shared env file"
+    )
+    candidate = _release_target(
+        str(candidate_release),
+        releases,
+        label="candidate release",
+        must_exist=False,
+    )
+    if candidate is None or (not candidate_may_exist and _lexists(candidate)):
+        raise TransactionError("pre-quiesce candidate release already exists")
+    current = _read_pointer(app_path, "current")
+    previous = _read_pointer(app_path, "previous")
+    record: dict[str, object] = {
+        "version": QUIESCE_STATE_VERSION,
+        "operation": "install",
+        "phase": "quiesce-pending",
+        "app_dir": str(app_path),
+        "current_before": str(current) if current is not None else None,
+        "previous_before": str(previous) if previous is not None else None,
+        "candidate_release": str(candidate),
+        "shared_env_before": (
+            _identity(shared_env_metadata) if shared_env_metadata is not None else None
+        ),
+        "current_before_identity": (
+            _identity(_safe_directory(current, label="original current release"))
+            if current is not None
+            else None
+        ),
+        "previous_before_identity": (
+            _identity(_safe_directory(previous, label="original previous release"))
+            if previous is not None
+            else None
+        ),
+        "service_state_before": parsed_states,
+        "quiesced_services": list(SERVICE_UNITS),
+        "timer_active_before": timer_value,
+    }
+    validated = _validate_quiesce_record(state, record)
+    _write_record(state, _quiesce_record_for_write(validated), creating=True)
+
+
+def promote_quiesce(
+    state: Path,
+    *,
+    candidate_release: Path,
+    shared_venv: Path,
+    peer: Path,
+    snapshot: Path,
+    transition: str,
+    remove_env_on_recovery: bool,
+) -> None:
+    """Promote the pre-stop receipt into the full installer transaction."""
+
+    pre = _load_quiesce_record(state)
+    # Promotion is the boundary at which the installer is allowed to mutate
+    # the candidate/venv metadata. Recheck both release pointers while the
+    # caller still owns the canonical release lock; a stale pre-quiesce receipt
+    # must never be converted into an apparently valid staged transaction.
+    verify_quiesce(state)
+    app = cast(Path, pre["app"])
+    shared = cast(Path, pre["shared"])
+    if state != shared / STATE_NAME:
+        raise TransactionError("pre-quiesce promotion requires the operation path")
+    candidate_path = cast(Path, pre["candidate_path"])
+    if candidate_release != candidate_path:
+        raise TransactionError("staged candidate does not match pre-quiesce receipt")
+    candidate_metadata = _safe_directory(candidate_release, label="candidate release")
+    shared_metadata = _optional_safe_directory(shared_venv, label="shared venv")
+    peer_metadata = _optional_safe_directory(peer, label="venv transaction peer")
+    if transition == "exchange" and (shared_metadata is None or peer_metadata is None):
+        raise TransactionError("venv exchange inputs are missing")
+    if transition == "create" and (
+        shared_metadata is not None or peer_metadata is None
+    ):
+        raise TransactionError("created venv inputs are ambiguous")
+    current_before = cast(Path | None, pre["current_before_path"])
+    if current_before is not None and transition in {"exchange", "none"}:
+        _fsync_install_rollback_metadata(
+            candidate_release,
+            str(current_before),
+            transition=transition,
+        )
+    record: dict[str, object] = {
+        "version": STATE_VERSION,
+        "operation": "install",
+        "phase": "prepared",
+        "app_dir": str(app),
+        "current_before": str(current_before) if current_before is not None else None,
+        "previous_before": (
+            str(pre["previous_before_path"])
+            if pre["previous_before_path"] is not None
+            else None
+        ),
+        "candidate_release": str(candidate_release),
+        "shared_venv": str(shared_venv),
+        "peer": str(peer),
+        "snapshot": str(snapshot),
+        "transition": transition,
+        "shared_before": (
+            _identity(shared_metadata) if shared_metadata is not None else None
+        ),
+        "peer_before": (
+            _identity(peer_metadata)
+            if peer_metadata is not None and transition in {"exchange", "create"}
+            else None
+        ),
+        "current_before_identity": pre["current_before_identity"],
+        "previous_before_identity": pre["previous_before_identity"],
+        "candidate_identity": _identity(candidate_metadata),
+        "remove_env_on_recovery": remove_env_on_recovery,
+        "service_state_before": pre["service_state_before"],
+        "quiesced_services": pre["quiesced_services"],
+        "timer_active_before": pre["timer_active_before"],
+    }
+    validated = _validate_record(state, record)
+    _write_record(state, _record_for_write(validated), creating=False)
+
+
+def verify_quiesce(state: Path) -> None:
+    record = _load_quiesce_record(state)
+    app = cast(Path, record["app"])
+    if (
+        _read_pointer(app, "current") != record["current_before_path"]
+        or _read_pointer(app, "previous") != record["previous_before_path"]
+    ):
+        raise TransactionError("pre-quiesce release pointers changed")
+
+
+def clear_quiesce(state: Path) -> None:
+    _load_quiesce_record(state)
+    state.unlink()
+    _fsync_directory(state.parent)
+
+
+def abort_quiesce(state: Path) -> None:
+    record = _load_quiesce_record(state)
+    verify_quiesce(state)
+    candidate = cast(Path, record["candidate_path"])
+    if _lexists(candidate):
+        _remove_tree(candidate)
+    shared = cast(Path, record["shared"])
+    if record["shared_env_before"] is None:
+        shared_env = shared / ".env.platform"
+        if _lexists(shared_env):
+            _optional_safe_private_file(shared_env, label="shared env file")
+            shared_env.unlink()
+            _fsync_directory(shared)
+    candidate_name = candidate.name
+    for pattern in (
+        f".venv-install-{candidate_name}.*",
+        f".freeze-check-{candidate_name}.*",
+    ):
+        for path in sorted(shared.glob(pattern)):
+            if path.is_symlink():
+                raise TransactionError("pre-quiesce temporary path is a symlink")
+            if path.is_dir():
+                _remove_tree(path)
+            else:
+                _optional_safe_private_file(path, label="pre-quiesce temporary file")
+                path.unlink()
+                _fsync_directory(shared)
+    state.unlink()
+    _fsync_directory(state.parent)
 
 
 def authorize_recovery(state: Path, *, confirmation: str) -> None:
@@ -793,6 +1235,32 @@ def _verify_original_pointers(record: dict[str, object]) -> None:
         raise TransactionError("previous release pointer was not restored")
 
 
+def _verify_recovery_pointers(record: dict[str, object]) -> None:
+    """Reject an unrelated pointer pair before restoring a receipt."""
+
+    app = cast(Path, record["app"])
+    actual = (_read_pointer(app, "current"), _read_pointer(app, "previous"))
+    original = (record["current_before_path"], record["previous_before_path"])
+    if record["operation"] == "install":
+        current_before = cast(Path | None, record["current_before_path"])
+        previous_before = cast(Path | None, record["previous_before_path"])
+        candidate = cast(Path, record["candidate_path"])
+        desired_previous = current_before if current_before is not None else previous_before
+        allowed = (
+            original,
+            (current_before, current_before),
+            (candidate, desired_previous),
+        )
+    else:
+        allowed = (
+            original,
+            (record["previous_before_path"], record["previous_before_path"]),
+            (record["previous_before_path"], record["current_before_path"]),
+        )
+    if actual not in allowed:
+        raise TransactionError("release pointers do not match this transaction")
+
+
 def _restore_venv(record: dict[str, object]) -> None:
     transition = record["transition"]
     shared = cast(Path, record["shared_venv_path"])
@@ -901,6 +1369,17 @@ def _cleanup_recovered_install(state: Path, record: dict[str, object]) -> None:
                 raise TransactionError("created shared env file is unsafe to remove")
             env_file.unlink()
             _fsync_directory(shared)
+    # The installer creates this private check file before the venv
+    # transaction is published. A SIGKILL after promotion bypasses the
+    # installer's EXIT cleanup, so consume only the exact candidate-scoped
+    # regular files here; an unexpected symlink or directory keeps the receipt
+    # retained for operator recovery.
+    for path in sorted(shared.glob(f".freeze-check-{candidate.name}.*")):
+        if path.is_symlink() or path.is_dir():
+            raise TransactionError("install freeze-check temporary path is unsafe")
+        _optional_safe_private_file(path, label="install freeze-check temporary file")
+        path.unlink()
+        _fsync_directory(shared)
     if _lexists(state):
         state.unlink()
         _fsync_directory(state.parent)
@@ -923,6 +1402,7 @@ def recover(state: Path, *, retain: bool = False) -> None:
         raise TransactionError(
             "rollback filesystem state is complete but its service restart is pending"
         )
+    _verify_recovery_pointers(record)
     if record["phase"] != "recovery-restored":
         _restore_pointers(record)
         _restore_venv(record)
@@ -1053,6 +1533,54 @@ def _build_parser() -> argparse.ArgumentParser:
     phase.add_argument("--expected", required=True, choices=tuple(sorted(PHASES)))
     phase.add_argument("--phase", required=True, choices=tuple(sorted(PHASES)))
 
+    record_services_parser = commands.add_parser("record-services")
+    record_services_parser.add_argument("--state", required=True, type=Path)
+    record_services_parser.add_argument(
+        "--service-state", required=True, action="append"
+    )
+    record_services_parser.add_argument(
+        "--timer-active-before", required=True, choices=("active", "inactive")
+    )
+
+    prepare_quiesce_parser = commands.add_parser("prepare-quiesce")
+    prepare_quiesce_parser.add_argument("--state", required=True, type=Path)
+    prepare_quiesce_parser.add_argument("--app-dir", required=True, type=Path)
+    prepare_quiesce_parser.add_argument(
+        "--candidate-release", required=True, type=Path
+    )
+    prepare_quiesce_parser.add_argument(
+        "--candidate-may-exist", action="store_true"
+    )
+    prepare_quiesce_parser.add_argument(
+        "--service-state", required=True, action="append"
+    )
+    prepare_quiesce_parser.add_argument(
+        "--timer-active-before", required=True, choices=("active", "inactive")
+    )
+    promote_quiesce_parser = commands.add_parser("promote-quiesce")
+    promote_quiesce_parser.add_argument("--state", required=True, type=Path)
+    promote_quiesce_parser.add_argument(
+        "--candidate-release", required=True, type=Path
+    )
+    promote_quiesce_parser.add_argument("--shared-venv", required=True, type=Path)
+    promote_quiesce_parser.add_argument("--peer", required=True, type=Path)
+    promote_quiesce_parser.add_argument("--snapshot", required=True, type=Path)
+    promote_quiesce_parser.add_argument(
+        "--transition", required=True, choices=("exchange", "create", "none")
+    )
+    promote_quiesce_parser.add_argument(
+        "--remove-env-on-recovery", action="store_true"
+    )
+    verify_quiesce_parser = commands.add_parser("verify-quiesce")
+    verify_quiesce_parser.add_argument("--state", required=True, type=Path)
+    clear_quiesce_parser = commands.add_parser("clear-quiesce")
+    clear_quiesce_parser.add_argument("--state", required=True, type=Path)
+    abort_quiesce_parser = commands.add_parser("abort-quiesce")
+    abort_quiesce_parser.add_argument("--state", required=True, type=Path)
+    status_quiesce_parser = commands.add_parser("status-quiesce")
+    status_quiesce_parser.add_argument("--state", required=True, type=Path)
+    status_quiesce_parser.add_argument("--json", action="store_true", dest="as_json")
+
     exchange = commands.add_parser("exchange")
     exchange.add_argument("--state", required=True, type=Path)
     rename = commands.add_parser("rename")
@@ -1070,6 +1598,8 @@ def _build_parser() -> argparse.ArgumentParser:
     authorize_parser = commands.add_parser("authorize-recovery")
     authorize_parser.add_argument("--state", required=True, type=Path)
     authorize_parser.add_argument("--confirm", required=True)
+    verify_original_parser = commands.add_parser("verify-original")
+    verify_original_parser.add_argument("--state", required=True, type=Path)
     complete_parser = commands.add_parser("complete")
     complete_parser.add_argument("--state", required=True, type=Path)
     complete_recovery_parser = commands.add_parser("complete-recovery")
@@ -1101,6 +1631,58 @@ def main() -> int:
             )
         elif args.command == "phase":
             set_phase(args.state, expected=args.expected, phase=args.phase)
+        elif args.command == "record-services":
+            record_services(
+                args.state,
+                service_states=args.service_state,
+                timer_active_before=args.timer_active_before,
+            )
+        elif args.command == "prepare-quiesce":
+            prepare_quiesce(
+                args.state,
+                app_dir=args.app_dir,
+                candidate_release=args.candidate_release,
+                service_states=args.service_state,
+                timer_active_before=args.timer_active_before,
+                candidate_may_exist=args.candidate_may_exist,
+            )
+        elif args.command == "promote-quiesce":
+            promote_quiesce(
+                args.state,
+                candidate_release=args.candidate_release,
+                shared_venv=args.shared_venv,
+                peer=args.peer,
+                snapshot=args.snapshot,
+                transition=args.transition,
+                remove_env_on_recovery=args.remove_env_on_recovery,
+            )
+        elif args.command == "verify-quiesce":
+            verify_quiesce(args.state)
+        elif args.command == "clear-quiesce":
+            clear_quiesce(args.state)
+        elif args.command == "abort-quiesce":
+            abort_quiesce(args.state)
+        elif args.command == "status-quiesce":
+            record = _load_quiesce_record(args.state)
+            if args.as_json:
+                print(
+                    json.dumps(
+                        {
+                            "operation": record["operation"],
+                            "phase": record["phase"],
+                            "app_dir": record["app_dir"],
+                            "current_before": record["current_before"],
+                            "previous_before": record["previous_before"],
+                            "candidate_release": record["candidate_release"],
+                            "service_state_before": record["service_state_before"],
+                            "quiesced_services": record["quiesced_services"],
+                            "timer_active_before": record["timer_active_before"],
+                        },
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"{record['operation']} {record['phase']}")
         elif args.command == "exchange":
             exchange_recorded_venvs(args.state)
         elif args.command == "rename":
@@ -1111,12 +1693,49 @@ def main() -> int:
             recover(args.state, retain=args.retain)
         elif args.command == "authorize-recovery":
             authorize_recovery(args.state, confirmation=args.confirm)
+        elif args.command == "verify-original":
+            record = _load_record(args.state)
+            _verify_original_pointers(record)
         elif args.command == "complete":
             complete(args.state)
         elif args.command == "complete-recovery":
             complete_recovery(args.state)
-        else:
-            record = _load_record(args.state)
+        elif args.command == "status":
+            try:
+                record = _load_record(args.state)
+            except TransactionError as operation_error:
+                try:
+                    quiesce_record = _load_quiesce_record(args.state)
+                except TransactionError:
+                    raise operation_error
+                if args.as_json:
+                    print(
+                        json.dumps(
+                            {
+                                "operation": quiesce_record["operation"],
+                                "phase": quiesce_record["phase"],
+                                "app_dir": quiesce_record["app_dir"],
+                                "current_before": quiesce_record["current_before"],
+                                "previous_before": quiesce_record["previous_before"],
+                                "candidate_release": quiesce_record[
+                                    "candidate_release"
+                                ],
+                                "service_state_before": quiesce_record[
+                                    "service_state_before"
+                                ],
+                                "quiesced_services": quiesce_record[
+                                    "quiesced_services"
+                                ],
+                                "timer_active_before": quiesce_record[
+                                    "timer_active_before"
+                                ],
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                else:
+                    print(f"{quiesce_record['operation']} {quiesce_record['phase']}")
+                return 0
             if record["phase"] == "restart-pending":
                 _validate_success(record)
             if args.as_json:
@@ -1129,15 +1748,38 @@ def main() -> int:
                             "current_before": record["current_before"],
                             "previous_before": record["previous_before"],
                             "candidate_release": record["candidate_release"],
+                            "service_state_before": record["service_state_before"],
+                            "quiesced_services": record["quiesced_services"],
+                            "timer_active_before": record["timer_active_before"],
                         },
                         sort_keys=True,
                     )
                 )
             else:
                 print(f"{record['operation']} {record['phase']}")
+        else:
+            raise TransactionError("unknown release transaction command")
         return 0
     except TransactionError as exc:
-        print(f"Release transaction refused: {exc}", file=sys.stderr)
+        # Error details can contain private release/shared paths from the
+        # durable receipt. Callers project only this fixed class; the full
+        # exception remains available to root-only diagnostics, never to a
+        # public workflow log.
+        migration_uncertain = str(exc).startswith(
+            "migration outcome is not safely reversible"
+        )
+        if migration_uncertain:
+            print(
+                "RELEASE_TRANSACTION schema=1 status=failed class=transaction "
+                "error_class=migration_uncertain "
+                "detail=migration outcome is not safely reversible",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "RELEASE_TRANSACTION schema=1 status=failed class=transaction",
+                file=sys.stderr,
+            )
         return 2
 
 

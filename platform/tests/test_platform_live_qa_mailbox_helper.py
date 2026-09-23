@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
+import stat
 from types import SimpleNamespace
 import sys
 import tempfile
@@ -32,6 +34,58 @@ BASE_EMAIL = "Live.QA@auth.old-sparky.com"
 RECIPIENT = "live.qa+liveqa-20260809-csp@auth.old-sparky.com"
 API_KEY = "re_1234567890abcdef"
 MESSAGE_ID = "a39999a6-88e3-48b1-888b-beaabcde1b33"
+
+
+@contextmanager
+def root_owned_private_directory(prefix: str):
+    """Create and clean a root-owned private fixture directory fail-closed."""
+
+    parent = Path("/root")
+    parent_metadata = parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent.resolve(strict=True) != parent
+        or parent_metadata.st_uid != 0
+        or parent_metadata.st_gid != 0
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+    ):
+        raise AssertionError("unsafe root fixture parent")
+    path = Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
+    initial: tuple[int, int] | None = None
+    try:
+        metadata = path.lstat()
+        initial = (metadata.st_dev, metadata.st_ino)
+        if (
+            path.parent != parent
+            or not path.name.startswith(prefix)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise AssertionError("unsafe root fixture directory")
+        yield path
+    finally:
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            current = None
+        if current is not None:
+            common_metadata_ok = (
+                path.parent == parent
+                and path.name.startswith(prefix)
+                and stat.S_ISDIR(current.st_mode)
+                and current.st_uid == 0
+                and current.st_gid == 0
+            )
+            if not common_metadata_ok or (
+                initial is not None
+                and (current.st_dev, current.st_ino) != initial
+            ):
+                raise AssertionError(
+                    "refusing to clean replaced root fixture directory"
+                )
+            shutil.rmtree(path)
 
 
 def bundle_payload(**updates: object) -> dict[str, object]:
@@ -216,9 +270,7 @@ class MailboxHelperTests(unittest.TestCase):
     def test_private_file_requires_absolute_root_only_file_and_controlled_parent(
         self,
     ) -> None:
-        tests_dir = Path(__file__).resolve().parent
-        with tempfile.TemporaryDirectory(dir=tests_dir) as temporary:
-            directory = Path(temporary)
+        with root_owned_private_directory("oldsparky-mailbox-test-") as directory:
             path = directory / "private.json"
             path.write_text("{}", encoding="utf-8")
             path.chmod(0o600)
@@ -314,9 +366,7 @@ class MailboxHelperTests(unittest.TestCase):
             )
 
     def test_private_file_rejects_a_symlinked_parent_component(self) -> None:
-        tests_dir = Path(__file__).resolve().parent
-        with tempfile.TemporaryDirectory(dir=tests_dir) as temporary:
-            directory = Path(temporary)
+        with root_owned_private_directory("oldsparky-mailbox-test-") as directory:
             real_parent = directory / "real"
             real_parent.mkdir(mode=0o700)
             target = real_parent / "private.json"

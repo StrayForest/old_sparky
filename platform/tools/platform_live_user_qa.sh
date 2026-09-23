@@ -8,6 +8,19 @@ TOOLS_DIR="$PLATFORM_ROOT/tools"
 SCRIPT_PATH="$TOOLS_DIR/platform_live_user_qa.sh"
 SYSTEM_PYTHON="/usr/bin/python3.12"
 QA_PYTHON="$PLATFORM_ROOT/.venv_platform/bin/python"
+TRUSTED_INSTALL_ROOT="${PLATFORM_LIVE_QA_INSTALL_ROOT:-}"
+TRUSTED_MODE=0
+if [[ -n "$TRUSTED_INSTALL_ROOT" ]]; then
+  TRUSTED_MODE=1
+  if [[ ! "$TRUSTED_INSTALL_ROOT" =~ ^/root/\.oldsparky/liveqa/releases/[0-9a-f]{40}$ ]]; then
+    echo "Trusted live-user QA install root is invalid." >&2
+    exit 1
+  fi
+  PLATFORM_ROOT="$TRUSTED_INSTALL_ROOT/platform"
+  TOOLS_DIR="$PLATFORM_ROOT/tools"
+  SCRIPT_PATH="$TOOLS_DIR/platform_live_user_qa.sh"
+  QA_PYTHON="/opt/oldsparky/platform/shared/venv/bin/python"
+fi
 
 usage() {
   echo "Usage: $0 | $0 recover /absolute/path/to/live-user-qa.XXXXXX | $0 recover-setup /absolute/path/to/.live-user-qa.setup-<id>" >&2
@@ -26,7 +39,7 @@ if [[ "${PLATFORM_APP_DIR:-}" != "/opt/oldsparky/platform" ]]; then
   exit 1
 fi
 if [[ ! -x "$QA_PYTHON" ]]; then
-  echo "Root-controlled checkout Python runtime is unavailable." >&2
+  echo "Root-controlled live-QA Python runtime is unavailable." >&2
   exit 1
 fi
 : "${PLATFORM_LIVE_CSP_QA_BUNDLE:?PLATFORM_LIVE_CSP_QA_BUNDLE must point to the root-only CSP QA bundle}"
@@ -58,11 +71,20 @@ fi
 "${GUARD[@]}" assert-lock \
   --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
   --fd "$PLATFORM_LIVE_QA_LOCK_FD"
-SOURCE_COMMIT="$(
-  "${GUARD[@]}" verify-provenance \
-    --platform-root "$PLATFORM_ROOT" \
-    --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE"
-)"
+if (( TRUSTED_MODE == 1 )); then
+  SOURCE_COMMIT="${PLATFORM_LIVE_QA_TARGET_SHA:-}"
+  if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "Trusted live-user QA requires an exact installed source SHA." >&2
+    exit 1
+  fi
+  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
+else
+  SOURCE_COMMIT="$(
+    "${GUARD[@]}" verify-provenance \
+      --platform-root "$PLATFORM_ROOT" \
+      --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE"
+  )"
+fi
 
 EXPECTED_LIVE_ORIGIN="$(
   "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" \
@@ -132,11 +154,15 @@ fi
 "${GUARD[@]}" preflight \
   --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
   --mode automated
-RUNTIME_CACHE="$(
-  "${GUARD[@]}" prepare-runtime-cache \
-    --platform-root "$PLATFORM_ROOT" \
-    --commit "$SOURCE_COMMIT"
-)"
+if (( TRUSTED_MODE == 1 )); then
+  RUNTIME_CACHE="$TRUSTED_INSTALL_ROOT/runtime"
+else
+  RUNTIME_CACHE="$(
+    "${GUARD[@]}" prepare-runtime-cache \
+      --platform-root "$PLATFORM_ROOT" \
+      --commit "$SOURCE_COMMIT"
+  )"
+fi
 RUNTIME_NODE="$RUNTIME_CACHE/node/bin/node"
 CHROMIUM_SANDBOX="$(
   "${GUARD[@]}" sandbox-path --runtime-cache "$RUNTIME_CACHE"

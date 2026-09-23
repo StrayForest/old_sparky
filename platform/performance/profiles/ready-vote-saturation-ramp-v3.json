@@ -2,6 +2,17 @@
   "schema": 2,
   "profile_id": "ready-vote-saturation-ramp-v3",
   "profile_version": 3,
+  "portfolio": {
+    "owner": "platform-performance",
+    "hypothesis": "A narrow Ready Vote sweep below 120 actions/s distinguishes the capacity knee from saturation behavior.",
+    "class": "diagnostic",
+    "status": "deprecated",
+    "cadence": "never",
+    "environment": "production",
+    "request_budget": {"max_logical_actions": 30000, "max_http_attempts": 50000, "max_duration_seconds": 2400},
+    "cost_budget": {"max_runner_minutes": 180, "basis": "external runner wall-clock budget"},
+    "last_accepted_evidence": {"run_id": "34103704225", "source_sha": "bba3fb278e348906a6942aee8462b758c3d616ef"}
+  },
   "category": "stress",
   "purpose": "Confirm the Ready Vote saturation ceiling in the 105–120 logical actions/s transition band.",
   "description": "Narrow steady 105–120 logical actions/s rate sweep; saturation evidence, not the supported-traffic SLO.",
@@ -34,6 +45,7 @@
   },
   "acceptance": {
     "kind": "stress",
+    "minimum_useful_goodput_actions_per_second": 1,
     "accepted_request_latency": {"p50_ms": 1500, "p90_ms": 3000, "p95_ms": 5000, "p99_ms": 8000},
     "logical_latency": {"p95_ms": 8000, "p99_ms": 12000},
     "max_shed_percent": 99.9,
@@ -54,6 +66,7 @@
   },
   "execution": {
     "generator": "GitHub-hosted external runner",
+    "require_exact_observer_binding": true,
     "measured_origin": "https://old-sparky.com",
     "origin_role": "fixture preparation, lightweight observer and exact cleanup only",
     "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",

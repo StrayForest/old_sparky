@@ -33,13 +33,16 @@ export function TournamentDetailClientPage({
   const [retryGeneration, setRetryGeneration] = useState(0);
   const requestGeneration = useRef(0);
   const actorUserId = authStatus === "authenticated" ? user?.id ?? null : null;
+  const sessionIdentity = `${authStatus}:${actorUserId ?? "anonymous"}`;
 
   useEffect(() => {
     const controller = new AbortController();
     const generation = ++requestGeneration.current;
+    const requestSlug = slug;
+    const requestSessionIdentity = sessionIdentity;
     setState({ status: "loading" });
 
-    void getTournamentWorkspace(slug, {}, {
+    void getTournamentWorkspace(requestSlug, {}, {
       participantsLimit: 0,
       workspaceView: "detail",
       includeCurrentUser: false,
@@ -47,7 +50,12 @@ export function TournamentDetailClientPage({
       signal: controller.signal
     })
       .then((workspace) => {
-        if (controller.signal.aborted || requestGeneration.current !== generation) {
+        if (
+          controller.signal.aborted
+          || requestGeneration.current !== generation
+          || requestSlug !== slug
+          || requestSessionIdentity !== sessionIdentity
+        ) {
           return;
         }
         setState(workspace
@@ -55,7 +63,12 @@ export function TournamentDetailClientPage({
           : { status: "not-found" });
       })
       .catch((error: unknown) => {
-        if (controller.signal.aborted || requestGeneration.current !== generation) {
+        if (
+          controller.signal.aborted
+          || requestGeneration.current !== generation
+          || requestSlug !== slug
+          || requestSessionIdentity !== sessionIdentity
+        ) {
           return;
         }
         if (error instanceof PlatformApiError && (error.status === 401 || error.status === 403)) {
@@ -66,7 +79,7 @@ export function TournamentDetailClientPage({
       });
 
     return () => controller.abort();
-  }, [inviteCode, retryGeneration, slug]);
+  }, [actorUserId, authStatus, inviteCode, retryGeneration, sessionIdentity, slug]);
 
   if (state.status === "loading") {
     return <RouteLoadingShell variant="tournament-detail" />;

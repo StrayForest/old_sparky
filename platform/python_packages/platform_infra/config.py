@@ -100,6 +100,10 @@ class PlatformSettings(BaseSettings):
     platform_invite_claim_ip_limit: int = Field(default=60, ge=1, le=10_000)
     platform_invite_manage_user_limit: int = Field(default=30, ge=1, le=1_000)
     platform_invite_manage_ip_limit: int = Field(default=120, ge=1, le=10_000)
+    # Direct private-read bearer attempts are bounded per source IP and HMAC'd
+    # invite-code pair. This is intentionally separate from mutation/lookup
+    # budgets because bearer reads may be anonymous and never consume a use.
+    platform_invite_bearer_read_limit: int = Field(default=60, ge=1, le=10_000)
     platform_turnstile_site_key: str | None = None
     platform_turnstile_secret_key: str | None = None
     platform_turnstile_mode: str = "off"

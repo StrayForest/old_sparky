@@ -1,13 +1,17 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const apiPort = 18019;
+const apiPort = 3199;
 const webPort = 3101;
+const preparedBuildDir = process.env.PLATFORM_WEB_HERMETIC_BUILD_DIR;
 const standaloneWebServerCommand = [
-  "../../tools/platform_web_npm.sh run build",
+  preparedBuildDir
+    ? `rm -rf .next/standalone && cp -a "${preparedBuildDir}/standalone" .next/standalone`
+    : "../../tools/platform_web_npm.sh run build",
   "rm -rf .next/standalone/.next/static .next/standalone/public",
   "mkdir -p .next/standalone/.next",
-  "cp -R .next/static .next/standalone/.next/static",
-  "cp -R public .next/standalone/public",
+  preparedBuildDir
+    ? `cp -a "${preparedBuildDir}/static" .next/standalone/.next/static && cp -a "${preparedBuildDir}/public" .next/standalone/public`
+    : "cp -R .next/static .next/standalone/.next/static && cp -R public .next/standalone/public",
   "../../tools/platform_node.sh .next/standalone/server.js"
 ].join(" && ");
 
@@ -24,7 +28,7 @@ export default defineConfig({
   reporter: [["list"]],
   use: {
     baseURL: `http://127.0.0.1:${webPort}`,
-    trace: "on-first-retry"
+    trace: "retain-on-failure"
   },
   webServer: {
     command: standaloneWebServerCommand,

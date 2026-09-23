@@ -16,10 +16,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: production
-    env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
     steps:
       - name: Require the reviewed dev ref
         shell: bash
@@ -30,6 +26,10 @@ jobs:
 
       - name: Validate production SSH inputs
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
@@ -38,14 +38,24 @@ jobs:
 
       - name: Configure SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/platform-production-backup-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-backup-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          fi
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
           ssh_scan="$ssh_dir/known_hosts.scan"
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          if ! ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null; then
+            echo "Production SSH host key scan failed" >&2
+            exit 1
+          fi
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
           test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
             || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
@@ -61,9 +71,18 @@ jobs:
 
       - name: Create and verify the production backup
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
-          ssh \
+          umask 077
+          remote_report="$RUNNER_TEMP/platform-production-backup-report.log"
+          remote_error="$RUNNER_TEMP/platform-production-backup-ssh-error.log"
+          : >"$remote_report"
+          : >"$remote_error"
+          chmod 600 "$remote_report" "$remote_error"
+          if ! ssh \
             -F /dev/null \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -74,7 +93,7 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            'bash -s' <<'REMOTE'
+            'bash -s' >"$remote_report" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
 
           runtime=/opt/oldsparky/platform
@@ -82,23 +101,141 @@ jobs:
           backup_dir="$runtime/shared/backups"
           python_bin="$runtime/shared/venv/bin/python"
           backup_tool="$current/tools/platform_backup_restore_drill.py"
+          summary_tool="$current/tools/platform_storage_evidence_summary.py"
+          umask 077
+          backup_create_file="$(mktemp)"
+          backup_check_file="$(mktemp)"
+          chmod 600 "$backup_create_file" "$backup_check_file"
+          cleanup() {
+            rm -f -- "$backup_create_file" "$backup_check_file"
+          }
+          trap cleanup EXIT
 
           test "$(id -u)" -eq 0 || { echo "Production backup must run as root" >&2; exit 1; }
           test -L "$current" || { echo "Current release symlink is missing" >&2; exit 1; }
           test -x "$python_bin" || { echo "Shared Python runtime is missing" >&2; exit 1; }
           test -f "$runtime/shared/.env.platform" || { echo "Platform env file is missing" >&2; exit 1; }
-          test -f "$backup_tool" || { echo "Backup tool is missing" >&2; exit 1; }
+          test -f "$backup_tool" && test ! -L "$backup_tool" \
+            || { echo "Backup tool is missing" >&2; exit 1; }
+          test -f "$summary_tool" && test ! -L "$summary_tool" \
+            || { echo "Storage evidence summary helper is missing or unsafe" >&2; exit 1; }
 
-          "$python_bin" "$backup_tool" \
+          if ! "$python_bin" "$backup_tool" \
             --env-file "$runtime/shared/.env.platform" \
             --output-dir "$backup_dir" \
             --keep 14 \
-            --json
+            --json >"$backup_create_file" 2>/dev/null; then
+            echo "Production backup creation failed" >&2
+            exit 1
+          fi
+          /usr/bin/python3 -I "$summary_tool" --mode backup --phase create \
+            <"$backup_create_file" \
+            || { echo "Production backup creation summary failed" >&2; exit 1; }
 
-          "$python_bin" "$backup_tool" \
+          if ! "$python_bin" "$backup_tool" \
             --env-file "$runtime/shared/.env.platform" \
             --output-dir "$backup_dir" \
             --check-latest \
             --max-age-hours 24 \
-            --json
+            --json >"$backup_check_file" 2>/dev/null; then
+            echo "Production backup verification failed" >&2
+            exit 1
+          fi
+          /usr/bin/python3 -I "$summary_tool" --mode backup --phase check \
+            <"$backup_check_file" \
+            || { echo "Production backup verification summary failed" >&2; exit 1; }
           REMOTE
+          then
+            rm -f -- "$remote_report" "$remote_error"
+            echo "Production backup failed" >&2
+            exit 1
+          fi
+          public_report="$({
+            /usr/bin/python3 -I - "$remote_report" <<'PY'
+          import json
+          import sys
+
+          phases = {"create", "check"}
+          statuses = {"ok", "failed"}
+          error_classes = {"none", "backup"}
+          for line in open(sys.argv[1], encoding="utf-8"):
+              try:
+                  value = json.loads(line)
+              except (TypeError, UnicodeError, json.JSONDecodeError):
+                  continue
+              if not isinstance(value, dict):
+                  continue
+              phase = value.get("phase")
+              status = value.get("status")
+              error_class = value.get("error_class")
+              if (
+                  not isinstance(phase, str)
+                  or phase not in phases
+                  or not isinstance(status, str)
+                  or status not in statuses
+                  or not isinstance(error_class, str)
+                  or error_class not in error_classes
+              ):
+                  continue
+              public = {
+                  "age_hours": value.get("age_hours") if type(value.get("age_hours")) in {int, float} and not isinstance(value.get("age_hours"), bool) and 0 <= value.get("age_hours") <= 1000000 else None,
+                  "alembic_revision_verified": value.get("alembic_revision_verified") if type(value.get("alembic_revision_verified")) is bool else None,
+                  "checksum_present": value.get("checksum_present") is True,
+                  "duration_seconds": value.get("duration_seconds") if type(value.get("duration_seconds")) in {int, float} and not isinstance(value.get("duration_seconds"), bool) and 0 <= value.get("duration_seconds") <= 1000000000 else None,
+                  "error_class": error_class,
+                  "kind": "backup_evidence",
+                  "phase": phase,
+                  "removed_count": value.get("removed_count") if type(value.get("removed_count")) is int and 0 <= value.get("removed_count") <= 1000000 else 0,
+                  "restore_verified": value.get("restore_verified") if type(value.get("restore_verified")) is bool else None,
+                  "restored_table_count": value.get("restored_table_count") if type(value.get("restored_table_count")) is int and 0 <= value.get("restored_table_count") <= 1000000000000000000 else None,
+                  "schema": 1,
+                  "size_bytes": value.get("size_bytes") if type(value.get("size_bytes")) is int and 0 <= value.get("size_bytes") <= 1000000000000000000 else None,
+                  "status": status,
+              }
+              print(json.dumps(public, sort_keys=True, separators=(",", ":")))
+          PY
+          } 2>/dev/null)"
+          test -n "$public_report" || {
+            rm -f -- "$remote_report" "$remote_error"
+            echo "Production backup summary was unavailable" >&2
+            exit 1
+          }
+          printf '%s\n' "$public_report"
+          rm -f -- "$remote_report" "$remote_error"
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-backup-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-backup-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          rm -f -- \
+            "$RUNNER_TEMP/platform-production-backup-report.log" \
+            "$RUNNER_TEMP/platform-production-backup-ssh-error.log"
+          test ! -e "$RUNNER_TEMP/platform-production-backup-report.log"
+          test ! -e "$RUNNER_TEMP/platform-production-backup-ssh-error.log"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"

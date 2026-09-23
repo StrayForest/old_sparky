@@ -10,7 +10,6 @@ on:
       operator_email:
         description: "Existing account to place into Team 1 as a regular player"
         required: true
-        default: "aleksei.lisitsin1@gmail.com"
         type: string
 
 permissions:
@@ -21,42 +20,115 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate-fixture-inputs:
+    name: Validate profile-review fixture handoff
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      QA_CONFIRMATION: ${{ inputs.confirmation }}
+      OPERATOR_EMAIL: ${{ inputs.operator_email }}
+      TARGET_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout reviewed profile-review source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate and serialize profile-review handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/dev \
+            || { echo "Production fixture must run from the reviewed dev branch." >&2; exit 1; }
+          test "$TARGET_SHA" = "$GITHUB_SHA"
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py confirmation \
+            --value "$QA_CONFIRMATION" \
+            --expected "RUN-PRODUCTION-PROFILE-REVIEW"
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py sha \
+            --value "$TARGET_SHA"
+          /usr/bin/python3 platform/tools/platform_workflow_input_guard.py email \
+            --value "$OPERATOR_EMAIL"
+          umask 077
+          /usr/bin/python3 - "$QA_CONFIRMATION" "$OPERATOR_EMAIL" "$TARGET_SHA" "$GITHUB_SHA" > "$RUNNER_TEMP/profile-review-input.json" <<'PY'
+          import json
+          import sys
+
+          print(json.dumps(
+              {
+                  "schema": 1,
+                  "confirmation": sys.argv[1],
+                  "operator_email": sys.argv[2],
+                  "target_sha": sys.argv[3],
+                  "workflow_sha": sys.argv[4],
+              },
+              separators=(",", ":"),
+          ))
+          PY
+          chmod 600 "$RUNNER_TEMP/profile-review-input.json"
+      - name: Upload closed profile-review handoff
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-profile-review-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/profile-review-input.json
+          if-no-files-found: error
+          retention-days: 1
+
   create-fixture:
+    needs: validate-fixture-inputs
     name: Create retained eight-team profile review fixture
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: production
-    env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
-      QA_CONFIRMATION: ${{ inputs.confirmation }}
-      OPERATOR_EMAIL: ${{ inputs.operator_email }}
-      TARGET_SHA: ${{ github.sha }}
 
     steps:
-      - name: Validate explicit production fixture confirmation
+      - name: Download closed profile-review handoff
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: platform-profile-review-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/profile-review-input
+      - name: Install and validate closed profile-review handoff
         shell: bash
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = "refs/heads/dev" \
-            || { echo "Production fixture must run from the reviewed dev branch." >&2; exit 1; }
-          test "$QA_CONFIRMATION" = "RUN-PRODUCTION-PROFILE-REVIEW" \
-            || { echo "Refusing production fixture without exact confirmation." >&2; exit 1; }
-          test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
-          test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured" >&2; exit 1; }
-          test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured" >&2; exit 1; }
-          /usr/bin/python3 - "$OPERATOR_EMAIL" <<'PY'
+          handoff_dir="$RUNNER_TEMP/profile-review-input"
+          handoff="$handoff_dir/profile-review-input.json"
+          test -d "$handoff_dir" && test ! -L "$handoff_dir"
+          test -f "$handoff" && test ! -L "$handoff"
+          test "$(find "$handoff_dir" -mindepth 1 -maxdepth 1 -type l -print -quit)" = ""
+          install -m 600 "$handoff" "$RUNNER_TEMP/profile-review-input.json"
+          /usr/bin/python3 - "$RUNNER_TEMP/profile-review-input.json" "$GITHUB_SHA" <<'PY'
+          import json
+          from pathlib import Path
           import re
           import sys
 
-          email = sys.argv[1]
-          if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email):
-              raise SystemExit("operator_email is invalid")
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if set(payload) != {"schema", "confirmation", "operator_email", "target_sha", "workflow_sha"}:
+              raise SystemExit("profile-review handoff schema is invalid")
+          if payload.get("schema") != 1 or payload.get("workflow_sha") != sys.argv[2]:
+              raise SystemExit("profile-review handoff identity is invalid")
+          if re.fullmatch(r"[0-9a-f]{40}", payload.get("target_sha", "")) is None:
+              raise SystemExit("profile-review handoff SHA is invalid")
+          if payload.get("confirmation") != "RUN-PRODUCTION-PROFILE-REVIEW":
+              raise SystemExit("profile-review handoff confirmation is invalid")
+          if not isinstance(payload.get("operator_email"), str) or "\n" in payload["operator_email"]:
+              raise SystemExit("profile-review handoff email is invalid")
           PY
+          {
+            printf 'QA_CONFIRMATION=%s\n' "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["confirmation"])' "$RUNNER_TEMP/profile-review-input.json")"
+            printf 'OPERATOR_EMAIL=%s\n' "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["operator_email"])' "$RUNNER_TEMP/profile-review-input.json")"
+            printf 'TARGET_SHA=%s\n' "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["target_sha"])' "$RUNNER_TEMP/profile-review-input.json")"
+          } >> "$GITHUB_ENV"
 
       - name: Configure production SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/production-profile-review-ssh"
@@ -83,10 +155,18 @@ jobs:
           echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
       - name: Create and verify the retained fixture on production
+        id: create_fixture
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
-          remote_log="$RUNNER_TEMP/production-profile-review-fixture.log"
+          raw_log="$RUNNER_TEMP/production-profile-review-fixture-raw.log"
+          umask 077
+          : > "$raw_log"
+          chmod 600 "$raw_log"
+          set +e
           ssh \
             -F "$SSH_DIR/config" \
             -o BatchMode=yes \
@@ -96,15 +176,49 @@ jobs:
             -o ServerAliveCountMax=3 \
             -i "$SSH_DIR/id_ed25519" \
           "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$OPERATOR_EMAIL" <<'REMOTE' | tee "$remote_log"
+            bash -s -- "$QA_CONFIRMATION" "$TARGET_SHA" "$OPERATOR_EMAIL" > "$raw_log" 2>&1 <<'REMOTE'
           set -Eeuo pipefail
           confirmation="$1"
           target_sha="$2"
           operator_email="$3"
-          test "$confirmation" = "RUN-PRODUCTION-PROFILE-REVIEW"
           runtime=/opt/oldsparky/platform
           guard="$runtime/current/tools/platform_release_lock_exec.sh"
-          test -f "$guard" || { echo "Production mutation guard is missing" >&2; exit 1; }
+          input_guard="$runtime/current/tools/platform_workflow_input_guard.py"
+          release_json="$runtime/current/RELEASE.json"
+          runtime_common="$runtime/current/tools/platform_runtime_common.sh"
+          seed_tool="$runtime/current/tools/platform_seed_profile_review_tournament.py"
+          test -L "$runtime/current" && test -d "$runtime/current" \
+            || { echo "Active production release is missing or unsafe" >&2; exit 1; }
+          test -f "$guard" && test ! -L "$guard" && test -x "$guard" \
+            || { echo "Production mutation guard is missing" >&2; exit 1; }
+          test -f "$input_guard" && test ! -L "$input_guard" \
+            || { echo "Workflow input guard is missing or unsafe" >&2; exit 1; }
+          test -f "$release_json" && test ! -L "$release_json" \
+            || { echo "Active release metadata is missing or unsafe" >&2; exit 1; }
+          test -f "$runtime_common" && test ! -L "$runtime_common" \
+            || { echo "Runtime environment helper is missing or unsafe" >&2; exit 1; }
+          test -f "$seed_tool" && test ! -L "$seed_tool" \
+            || { echo "Profile-review seed helper is missing or unsafe" >&2; exit 1; }
+          /usr/bin/python3.12 -I "$input_guard" confirmation \
+            --value "$confirmation" \
+            --expected "RUN-PRODUCTION-PROFILE-REVIEW" \
+            >/dev/null
+          /usr/bin/python3.12 -I "$input_guard" sha --value "$target_sha" >/dev/null
+          /usr/bin/python3.12 -I "$input_guard" email --value "$operator_email" >/dev/null
+          active_sha="$(/usr/bin/python3.12 - "$release_json" <<'PY'
+          import json
+          import re
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          value = payload.get("source_git_commit")
+          if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40,64}", value) is None:
+              raise SystemExit(1)
+          print(value)
+          PY
+          )"
+          test "$active_sha" = "$target_sha" \
+            || { echo "Active production release SHA does not match the expected SHA" >&2; exit 1; }
           sudo -n -- /bin/bash "$guard" \
             --app-dir "$runtime" \
             --expected-sha "$target_sha" \
@@ -114,6 +228,7 @@ jobs:
           operator_email="$2"
           runtime=/opt/oldsparky/platform
           repo=/root/old_sparky
+          runtime_common="$runtime/current/tools/platform_runtime_common.sh"
           test "$(git -C "$repo" rev-parse --verify HEAD)" = "$target_sha" \
             || { echo "Trusted production checkout does not match target SHA" >&2; exit 1; }
           cd "$runtime/current"
@@ -121,7 +236,7 @@ jobs:
           export PLATFORM_SHARED_DIR="$runtime/shared"
           export PLATFORM_ENV_FILE="$runtime/shared/.env.platform"
           export PLATFORM_PYTHON_BIN="$runtime/shared/venv/bin/python"
-          source "$runtime/current/tools/platform_runtime_common.sh"
+          source "$runtime_common"
           platform_load_env_file
           export PYTHONPATH="$runtime/current"
           "$runtime/shared/venv/bin/python" \
@@ -133,34 +248,168 @@ jobs:
             --verify-only
           MUTATION
           REMOTE
+          ssh_status="$?"
+          set -e
+          echo "ssh_status=$ssh_status" >> "$GITHUB_OUTPUT"
+          exit "$ssh_status"
+
+      - name: Sanitize profile-review report
+        id: sanitize_profile_report
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw_log="$RUNNER_TEMP/production-profile-review-fixture-raw.log"
+          report="$RUNNER_TEMP/production-profile-review-fixture.json"
+          test -e "$raw_log" || : > "$raw_log"
+          chmod 600 "$raw_log"
+          ssh_status="${{ steps.create_fixture.outputs.ssh_status || '1' }}"
+          set +e
+          /usr/bin/python3 - "$raw_log" "$report" "$ssh_status" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          source = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          try:
+              exit_code = int(sys.argv[3], 10)
+          except ValueError:
+              exit_code = 1
+          try:
+              raw = source.read_bytes()
+          except OSError:
+              raw = b""
+          bounded = raw[:262144]
+          lines = bounded.splitlines()[:1000]
+          text = b"\n".join(lines).decode("utf-8", errors="replace").casefold()
+          passed = exit_code == 0 and (
+              "live_user_qa_success" in text
+              or '"status": "passed"' in text
+              or '"success": true' in text
+              or '"passed": true' in text
+          )
+          report = {
+              "schema": 1,
+              "status": "passed" if passed else ("failed" if exit_code else "unavailable"),
+              "success": passed,
+              "process_exit_code": exit_code if 0 <= exit_code <= 255 else 1,
+              "line_count": len(lines),
+              "retained_line_count": len(lines),
+              "truncated": len(raw) > len(bounded) or len(bounded.splitlines()) > len(lines),
+              "test_count": 1 if lines else 0,
+              "failed_test_count": 0 if passed else (1 if lines or exit_code else 0),
+              "error_class_counts": {} if passed else {"transport" if exit_code else "other": 1},
+          }
+          destination.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+          raise SystemExit(0)
+          PY
+          report_status="$?"
+          set -e
+          rm -f -- "$raw_log"
+          test ! -e "$raw_log"
+          test -s "$report" || {
+            echo "Profile-review fixed report was not produced." >&2
+            exit "$report_status"
+          }
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/production-profile-review-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          handoff_dir="$RUNNER_TEMP/profile-review-input"
+          if [[ -e "$handoff_dir" || -L "$handoff_dir" ]]; then
+            test -d "$handoff_dir" && test ! -L "$handoff_dir"
+            rm -f -- "$handoff_dir/profile-review-input.json"
+            test ! -e "$handoff_dir/profile-review-input.json"
+            rmdir -- "$handoff_dir"
+          fi
+          test ! -e "$handoff_dir" && test ! -L "$handoff_dir"
+          rm -f -- "$RUNNER_TEMP/profile-review-input.json"
+          test ! -e "$RUNNER_TEMP/profile-review-input.json"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
+
+      - name: Reject incomplete profile-review report
+        id: validate_profile_report
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - "$RUNNER_TEMP/production-profile-review-fixture.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          try:
+              report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              raise SystemExit("required profile-review report is not valid JSON")
+          if (
+              not isinstance(report, dict)
+              or report.get("truncated") is not False
+              or report.get("status") != "passed"
+              or report.get("success") is not True
+              or report.get("process_exit_code") != 0
+          ):
+              raise SystemExit("required profile-review report did not pass")
+          PY
 
       - name: Publish fixture result
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        if: ${{ always() && steps.create_fixture.outcome == 'success' && steps.cleanup_ssh.outcome == 'success' && steps.sanitize_profile_report.outcome == 'success' && steps.validate_profile_report.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-production-profile-review-${{ github.run_id }}
-          path: ${{ runner.temp }}/production-profile-review-fixture.log
-          if-no-files-found: warn
+          name: platform-production-profile-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-profile-review-fixture.json
+          if-no-files-found: error
           retention-days: 14
 
       - name: Write fixture summary
         if: ${{ always() }}
         shell: bash
         run: |
-          log="$RUNNER_TEMP/production-profile-review-fixture.log"
+          report="$RUNNER_TEMP/production-profile-review-fixture.json"
           {
             echo "### Production profile review fixture"
             echo
             echo "- Target SHA: \`$TARGET_SHA\`"
-            echo "- Operator: \`$OPERATOR_EMAIL\`"
-            echo "- Tournament: [open tournament](https://old-sparky.com/tournaments/old-sparky-profile-cup-8)"
-            echo "- Team: \`Night Wardens\` (regular player slot)"
             echo
-            if [[ -s "$log" ]]; then
-              echo "#### Server result"
-              echo
-              sed -n '/^{/p' "$log"
+            if [[ -s "$report" ]]; then
+              /usr/bin/python3 - "$report" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print(f"- Status: **{payload.get('status')}**")
+          print(f"- Tests observed: {payload.get('test_count', 0)}; failed: {payload.get('failed_test_count', 0)}")
+          print(f"- Error classes: `{payload.get('error_class_counts', {})}`")
+          PY
             else
-              echo "The production server returned no fixture result."
+              echo "The production server returned no fixed fixture result."
             fi
           } >> "$GITHUB_STEP_SUMMARY"

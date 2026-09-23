@@ -1,109 +1,66 @@
 #!/usr/bin/env python3
-"""Join bounded client timeout evidence with the matching origin observations.
+"""Join bounded client timeout evidence with bounded origin observations.
 
 This tool is diagnostic-only.  It never makes requests, changes runtime state,
 or treats a missing layer record as proof that the layer was healthy.  The
 client report is the complete timeout population; the origin report contains
-only the bounded rows selected by the timeout diagnostic IDs.
+only the bounded rows selected for the same diagnostic window.  Correlation
+identifiers are intentionally not required or emitted.  Rows are paired by
+their bounded observation order and all public fields pass through the same
+closed route/status/error schema used by the load producers.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import UTC, datetime
 import json
 from pathlib import Path
 import re
 from typing import Any
 
+try:
+    from tools.platform_evidence_sanitizer import (
+        SAFE_ROUTE_CLASSES,
+        finite_number,
+        safe_cf_error_class,
+        safe_error_class,
+        safe_method,
+        safe_phase,
+        safe_route_class,
+        safe_status,
+    )
+except ModuleNotFoundError:  # Direct execution from platform/tools.
+    from platform_evidence_sanitizer import (
+        SAFE_ROUTE_CLASSES,
+        finite_number,
+        safe_cf_error_class,
+        safe_error_class,
+        safe_method,
+        safe_phase,
+        safe_route_class,
+        safe_status,
+    )
 
-DIAGNOSTIC_ID_RE = re.compile(r"^tdiag-[0-9]{1,32}-[0-9]{5}$")
+
 NGINX_TIMEOUT_POLICY = {
     "proxy_connect_timeout_seconds": 5,
     "proxy_read_timeout_seconds": 30,
     "proxy_send_timeout_seconds": 30,
     "send_timeout_seconds": 30,
-    "source": "platform/deploy/nginx/deadlock-platform.conf",
+    "source": "canonical_nginx_timeout_policy",
 }
-# ``$time_iso8601`` in the access log has second-level precision.  Keep a
-# one-second safety margin before claiming that the origin request started
-# after the client timeout.
-NGINX_TIMESTAMP_PRECISION_MS = 1_000.0
-
-
-def parse_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
+PROFILE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-v[0-9]{1,4}$")
 
 
 def load_object(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{path} is not valid JSON") from exc
+        raise ValueError("timeout evidence input is not valid JSON") from exc
     if not isinstance(payload, dict):
-        raise ValueError(f"{path} must contain a JSON object")
+        raise ValueError("timeout evidence input must contain a JSON object")
     return payload
-
-
-def nearest_sample(samples: object, target: datetime | None) -> dict[str, Any] | None:
-    if target is None or not isinstance(samples, list):
-        return None
-    candidates: list[tuple[float, dict[str, Any]]] = []
-    for sample in samples:
-        if not isinstance(sample, dict):
-            continue
-        timestamp = parse_timestamp(sample.get("timestamp"))
-        if timestamp is None:
-            continue
-        candidates.append((abs((timestamp - target).total_seconds()), sample))
-    if not candidates:
-        return None
-    return min(candidates, key=lambda item: item[0])[1]
-
-
-def nearest_event_loop(samples: object, target: datetime | None) -> dict[str, Any] | None:
-    if target is None or not isinstance(samples, list):
-        return None
-    candidates: list[tuple[float, dict[str, Any]]] = []
-    for sample in samples:
-        if not isinstance(sample, dict):
-            continue
-        timestamp = parse_timestamp(sample.get("journal_timestamp"))
-        if timestamp is None:
-            continue
-        candidates.append((abs((timestamp - target).total_seconds()), sample))
-    if not candidates:
-        return None
-    return min(candidates, key=lambda item: item[0])[1]
-
-
-def safe_system_sample(sample: dict[str, Any] | None) -> dict[str, Any] | None:
-    if sample is None:
-        return None
-    return {
-        key: sample[key]
-        for key in (
-            "timestamp",
-            "cpu_per_core_percent",
-            "postgres_cpu_percent",
-            "tcp_socket_states",
-            "tcp_listen_counters",
-            "postgres_backend_connections",
-            "postgres_backend_ownership",
-            "postgres_waits",
-            "api_process",
-            "web_process",
-            "process_lifecycle",
-        )
-        if key in sample
-    }
 
 
 def classify_timeout(
@@ -116,7 +73,7 @@ def classify_timeout(
     if server_row is None:
         return (
             "before_origin_observed",
-            "No matching Nginx access record was observed for this diagnostic ID.",
+            "no_origin_observation",
         )
     next_row = server_row.get("next") if isinstance(server_row.get("next"), dict) else {}
     ssr_row = server_row.get("ssr") if isinstance(server_row.get("ssr"), dict) else {}
@@ -124,70 +81,150 @@ def classify_timeout(
     if origin_request_started_after_client_timeout and next_row.get("upstream_completed"):
         return (
             "client_or_edge_before_origin",
-            "The client timed out before the origin request could have started; "
-            "Nginx later completed the correlated upstream request.",
+            "origin_started_after_timeout",
         )
     if origin_completed_after_client_timeout and next_row.get("upstream_completed"):
         return (
             "origin_completion_after_client_timeout",
-            "Nginx recorded a completed upstream request after the client timeout, "
-            "but access-log precision leaves the origin start ordering ambiguous.",
+            "origin_completed_after_timeout",
         )
     if origin_completed_before_client_timeout and next_row.get("upstream_completed"):
         return (
             "client_or_edge_after_origin",
-            "Nginx recorded a completed upstream request before the client timeout, "
-            "but the client did not receive an HTTP response.",
+            "origin_completed_before_timeout",
         )
     if not next_row.get("accepted"):
         return (
             "nginx_or_edge_before_next",
-            "Nginx recorded the request without an observed Next.js upstream connection.",
+            "next_not_accepted",
         )
     if api_row.get("call_completed_observed"):
         return (
             "api_or_next_after_api",
-            "The request reached Next.js and a correlated API request_perf row completed.",
+            "api_completed",
         )
     if api_row.get("call_started_observed"):
         return (
             "api_or_next_incomplete",
-            "The request reached Next.js and the API accepted a correlated request, but no completion row was logged.",
+            "api_incomplete",
         )
     if ssr_row.get("started_observed"):
         return (
             "next_ssr_or_node_queue",
-            "The request reached Next.js and emitted SSR/stream evidence, but no correlated API completion was logged.",
+            "ssr_observed",
         )
     return (
         "next_accept_or_node_queue",
-        "Nginx connected to Next.js, but no SSR/stream journal event was observed.",
+        "next_accepted_without_ssr",
     )
 
 
+def _safe_client_timeout_row(row: Any) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    raw_error = row.get("error_class") or row.get("error_kind")
+    error_class = safe_error_class(raw_error, status=row.get("status"))
+    if error_class != "timeout":
+        return None
+    raw_route_class = row.get("route_class")
+    route_class = (
+        raw_route_class
+        if isinstance(raw_route_class, str) and raw_route_class in SAFE_ROUTE_CLASSES
+        else safe_route_class(row.get("path"))
+    )
+    output: dict[str, Any] = {
+        "phase": safe_phase(row.get("phase")),
+        "method": safe_method(row.get("method")),
+        "route_class": route_class,
+        "status": safe_status(row.get("status")),
+        "error_class": "timeout",
+    }
+    for key in ("cf_error_class", "cf_error_origin_class"):
+        value = row.get(key)
+        if value is not None:
+            output[key] = safe_cf_error_class(value)
+    for key in ("ttfb_ms", "elapsed_ms"):
+        value = finite_number(row.get(key))
+        if value is not None:
+            output[key] = value
+    return output
+
+
+def _safe_origin_timeout_row(row: Any) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    next_row = row.get("next") if isinstance(row.get("next"), dict) else {}
+    ssr_row = row.get("ssr") if isinstance(row.get("ssr"), dict) else {}
+    api_row = row.get("api") if isinstance(row.get("api"), dict) else {}
+    raw_route_class = row.get("route_class")
+    route_class = (
+        raw_route_class
+        if isinstance(raw_route_class, str) and raw_route_class in SAFE_ROUTE_CLASSES
+        else safe_route_class(row.get("uri"), page=True)
+    )
+    output: dict[str, Any] = {
+        "route_class": route_class,
+        "method": safe_method(row.get("method")),
+        "status": safe_status(row.get("status")),
+        "error_class": "timeout",
+        "request_completion": str(row.get("request_completion") or "other")
+        if str(row.get("request_completion") or "other")
+        in {"completed", "timeout", "aborted", "other"}
+        else "other",
+        "next": {
+            "accepted": next_row.get("accepted") is True,
+            "upstream_status": safe_status(next_row.get("upstream_status")),
+            "upstream_completed": next_row.get("upstream_completed") is True,
+        },
+        "ssr": {
+            "started_observed": ssr_row.get("started_observed") is True,
+            "stage_event_count": len(ssr_row.get("stage_events") or []) if isinstance(ssr_row.get("stage_events"), list) else 0,
+            "stream_event_count": len(ssr_row.get("stream_events") or []) if isinstance(ssr_row.get("stream_events"), list) else 0,
+        },
+        "api": {
+            "call_started_observed": api_row.get("call_started_observed") is True,
+            "request_perf_start_count": max(0, int(api_row.get("request_perf_start_count") or 0)),
+            "call_completed_observed": api_row.get("call_completed_observed") is True,
+        },
+    }
+    for source_key, output_key in (
+        ("request_time_ms", "request_time_ms"),
+        ("upstream_connect_ms", "upstream_connect_ms"),
+        ("upstream_header_ms", "upstream_header_ms"),
+        ("upstream_ms", "upstream_ms"),
+    ):
+        value = finite_number(next_row.get(source_key))
+        if value is not None:
+            output["next"][output_key] = value
+    return output
+
+
 def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(client, dict):
+        client = {}
+    if not isinstance(server, dict):
+        server = {}
     client_summary = client.get("overall") or client.get("raw_http") or {}
+    if not isinstance(client_summary, dict):
+        client_summary = {}
     client_rows = [
-        row
+        sanitized
         for row in client_summary.get("timeout_diagnostics") or []
-        if isinstance(row, dict)
-        and isinstance(row.get("diagnostic_id"), str)
-        and DIAGNOSTIC_ID_RE.fullmatch(row["diagnostic_id"])
-        and row.get("error_kind") == "TimeoutError"
+        if (sanitized := _safe_client_timeout_row(row)) is not None
     ]
     server_section = server.get("server_ssr_observability") or {}
-    server_rows = server_section.get("timeout_diagnostics") or {}
-    origin_rows = {
-        row["diagnostic_id"]: row
-        for row in server_rows.get("rows") or []
-        if isinstance(row, dict)
-        and isinstance(row.get("diagnostic_id"), str)
-        and DIAGNOSTIC_ID_RE.fullmatch(row["diagnostic_id"])
-    }
+    if not isinstance(server_section, dict):
+        server_section = {}
+    server_timeout_section = server_section.get("timeout_diagnostics") or {}
+    if not isinstance(server_timeout_section, dict):
+        server_timeout_section = {}
+    origin_rows = [
+        sanitized
+        for row in server_timeout_section.get("rows") or []
+        if (sanitized := _safe_origin_timeout_row(row)) is not None
+    ]
     system = server.get("system") or {}
-    system_timeline = system.get("timeline") if isinstance(system, dict) else []
     event_loop = server_section.get("event_loop") or {}
-    event_loop_samples = event_loop.get("samples_detail") if isinstance(event_loop, dict) else []
 
     joined_rows: list[dict[str, Any]] = []
     classifications: Counter[str] = Counter()
@@ -199,100 +236,63 @@ def join_reports(client: dict[str, Any], server: dict[str, Any]) -> dict[str, An
     origin_started_after_timeout = 0
     origin_start_timing_ambiguous = 0
     origin_completed_before_timeout = 0
-    for client_row in client_rows:
-        diagnostic_id = str(client_row["diagnostic_id"])
-        origin_row = origin_rows.get(diagnostic_id)
-        timeout_at = parse_timestamp(client_row.get("exception_at") or client_row.get("finished_at"))
-        server_timestamp = parse_timestamp(origin_row.get("nginx_recorded_at")) if origin_row else None
-        server_after_timeout = bool(
-            timeout_at is not None
-            and server_timestamp is not None
-            and server_timestamp >= timeout_at
-        )
-        next_row = origin_row.get("next") if origin_row and isinstance(origin_row.get("next"), dict) else {}
-        request_time_ms = next_row.get("request_time_ms")
-        origin_start_delta_ms: float | None = None
-        if timeout_at is not None and server_timestamp is not None and isinstance(request_time_ms, (int, float)):
-            origin_start_delta_ms = (
-                (server_timestamp - timeout_at).total_seconds() * 1000
-                - float(request_time_ms)
-            )
-        origin_request_started_after_client_timeout = bool(
-            origin_start_delta_ms is not None
-            and origin_start_delta_ms >= NGINX_TIMESTAMP_PRECISION_MS
-        )
-        origin_start_is_ambiguous = bool(
-            origin_start_delta_ms is not None
-            and -NGINX_TIMESTAMP_PRECISION_MS < origin_start_delta_ms < NGINX_TIMESTAMP_PRECISION_MS
-        )
-        origin_timestamp_before_timeout = bool(
-            server_timestamp is not None
-            and timeout_at is not None
-            and server_timestamp < timeout_at
-        )
-        if origin_request_started_after_client_timeout:
-            origin_started_after_timeout += 1
-        elif origin_start_is_ambiguous:
-            origin_start_timing_ambiguous += 1
-        elif origin_timestamp_before_timeout:
-            origin_completed_before_timeout += 1
-        classification, reason = classify_timeout(
+    # No request/diagnostic/correlation identifier is persisted.  Pair only
+    # bounded rows by observation order; an absent origin row remains explicit
+    # and cannot be interpreted as a successful origin response.
+    for index, client_row in enumerate(client_rows):
+        origin_row = origin_rows[index] if index < len(origin_rows) else None
+        next_row = origin_row.get("next") if origin_row else {}
+        api_row = origin_row.get("api") if origin_row else {}
+        classification, reason_class = classify_timeout(
             origin_row,
-            origin_request_started_after_client_timeout=origin_request_started_after_client_timeout,
-            origin_completed_after_client_timeout=server_after_timeout,
-            origin_completed_before_client_timeout=origin_timestamp_before_timeout,
+            origin_request_started_after_client_timeout=False,
+            origin_completed_after_client_timeout=False,
+            origin_completed_before_client_timeout=False,
         )
         classifications[classification] += 1
         if origin_row is not None:
             nginx_matches += 1
-        if next_row.get("accepted"):
+        if next_row.get("accepted") is True:
             next_matches += 1
-        api_row = origin_row.get("api") if origin_row and isinstance(origin_row.get("api"), dict) else {}
-        if api_row.get("call_completed_observed"):
+        if api_row.get("call_completed_observed") is True:
             api_matches += 1
-        if server_after_timeout:
-            post_timeout_completions += 1
-        upstream_completed_after_timeout = bool(
-            server_after_timeout
-            and isinstance(next_row, dict)
-            and next_row.get("upstream_completed")
-        )
-        if upstream_completed_after_timeout:
-            upstream_post_timeout_completions += 1
-        system_sample = nearest_sample(system_timeline, timeout_at)
-        event_loop_sample = nearest_event_loop(event_loop_samples, timeout_at)
+        # Absolute ordering cannot be established after timestamps and IDs are
+        # removed.  Keep these counters present and conservatively zero.
         joined_rows.append(
             {
-                "diagnostic_id": diagnostic_id,
+                "observation_index": index,
                 "client": client_row,
                 "classification": classification,
-                "classification_reason": reason,
+                "classification_reason_class": reason_class,
                 "origin": origin_row,
-                "server_completed_at_or_after_client_timeout": server_after_timeout,
-                "upstream_completed_at_or_after_client_timeout": upstream_completed_after_timeout,
-                "estimated_origin_request_start_delta_ms": (
-                    round(origin_start_delta_ms, 3)
-                    if origin_start_delta_ms is not None
-                    else None
-                ),
-                "origin_request_started_after_client_timeout": origin_request_started_after_client_timeout,
-                "origin_request_start_timing_ambiguous": origin_start_is_ambiguous,
-                "nearest_system_sample": safe_system_sample(system_sample),
-                "nearest_event_loop_sample": event_loop_sample,
+                "server_completed_at_or_after_client_timeout": False,
+                "upstream_completed_at_or_after_client_timeout": False,
+                "estimated_origin_request_start_delta_ms": None,
+                "origin_request_started_after_client_timeout": False,
+                "origin_request_start_timing_ambiguous": False,
+                "nearest_system_sample_available": bool(system.get("timeline")) if isinstance(system, dict) else False,
+                "nearest_event_loop_sample_available": bool(event_loop.get("samples")) if isinstance(event_loop, dict) else False,
             }
         )
 
+    load_contract = client.get("load_contract")
+    load_contract = load_contract if isinstance(load_contract, dict) else {}
+    raw_profile_id = load_contract.get("profile_id")
+    profile_id = (
+        raw_profile_id
+        if isinstance(raw_profile_id, str) and PROFILE_ID_RE.fullmatch(raw_profile_id)
+        else None
+    )
     return {
         "schema": 1,
         "kind": "timeout_path_diagnostics",
-        "source_git_sha": client.get("source_git_sha"),
-        "profile_id": (client.get("load_contract") or {}).get("profile_id"),
+        "profile_id": profile_id,
         "load_window": {
             "client_started_at": client.get("started_at"),
             "client_finished_at": client.get("finished_at"),
             "origin_started_at": server.get("started_at"),
             "origin_finished_at": server.get("finished_at"),
-            "timestamps": "UTC; runner/origin clock alignment is assumed from host time sync",
+            "timestamps": "UTC; runner/origin clock alignment is not used for row correlation",
         },
         "summary": {
             "client_timeout_errors": len(client_rows),

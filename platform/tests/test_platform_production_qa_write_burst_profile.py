@@ -46,7 +46,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
                     "ungranted_locks": 0,
                     "max_waiting_query_ms": 10,
                     "max_lock_waiting_query_ms": 0,
-                    "active_query_samples": [{"query_age_ms": 10}],
+                    "wait_state_counts": {"Lock": 1, "IO": 2},
                     "backend_connections": 4,
                     "backend_ownership": [
                         {"application_name": "oldsparky-api", "current": 2},
@@ -66,16 +66,14 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
 
         self.assertEqual(result["samples"], 1)
         self.assertEqual(result["gunicorn_workers"]["last"], 2)
+        self.assertEqual(result["postgres_waits"]["wait_state_counts"]["lock"]["max"], 1)
+        self.assertEqual(result["postgres_waits"]["wait_state_counts"]["io"]["max"], 2)
         self.assertEqual(
-            result["postgres_waits"]["active_query_samples"][0]["query_age_ms"],
-            10,
-        )
-        self.assertEqual(
-            result["postgres_backend_ownership"]["oldsparky-api"]["max"],
+            result["postgres_backend_ownership"]["api"]["max"],
             2,
         )
         self.assertEqual(
-            result["postgres_backend_ownership"]["oldsparky-worker"]["last"],
+            result["postgres_backend_ownership"]["worker"]["last"],
             1,
         )
         self.assertEqual(result["postgres_backend_connections"]["max"], 4)
@@ -86,7 +84,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             ),
             result["postgres_backend_connections"]["max"],
         )
-        self.assertEqual(result["postgres_backend_ownership"]["unknown"]["max"], 1)
+        self.assertEqual(result["postgres_backend_ownership"]["other"]["max"], 1)
         self.assertTrue(result["postgres_backend_ownership_consistency"]["all_match"])
 
     def test_burst_offsets_are_even_and_do_not_exceed_window(self) -> None:
@@ -176,7 +174,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
 
         self.assertEqual(
             counts,
-            {"GET /tournaments/{slug}/deadlock/ready-check": 1},
+            {"GET ready_check_state": 1},
         )
 
     def test_request_perf_summary_includes_method_and_response_bytes(self) -> None:
@@ -191,11 +189,11 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             tournament_slug="demo",
         )
 
-        route = summary["by_method_route"]["POST /api/v1/tournaments/{slug}/join"]
+        route = summary["by_method_route"]["POST tournament_participants"]
         self.assertEqual(route["avg_sql_queries_per_request"], 3.0)
         self.assertEqual(route["response_bytes"]["max_bytes"], 320)
         self.assertEqual(
-            summary["by_qa_phase"]["write_join_burst_10s"]["requests"],
+            summary["by_qa_phase"]["write_burst"]["requests"],
             1,
         )
 
@@ -219,7 +217,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             tournament_slug="demo",
         )
 
-        ready_vote = summary["by_route"]["/{slug}/deadlock/ready-check/vote"]["ready_vote"]
+        ready_vote = summary["by_route"]["ready_vote"]["ready_vote"]
         self.assertEqual(summary["scope"]["kind"], "diagnostic_sample")
         self.assertEqual(ready_vote["ready_vote_auth_ms"]["avg_ms"], 4.0)
         self.assertEqual(ready_vote["ready_vote_checkout_count"]["avg_ms"], 1.0)
@@ -228,7 +226,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
         self.assertEqual(ready_vote["ready_vote_cpu_pressure"]["avg_ms"], 81.5)
         self.assertEqual(ready_vote["ready_vote_cpu_monitor_samples"]["avg_ms"], 20.0)
         self.assertEqual(
-            summary["by_route"]["/{slug}/deadlock/ready-check/vote"]
+            summary["by_route"]["ready_vote"]
             ["ready_vote_controller_state_counts"],
             {"pressure": 1},
         )
@@ -277,7 +275,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             tournament_slug=None,
         )
 
-        workspace = summary["by_method_route"]["GET /tournaments/{slug}/workspace"]
+        workspace = summary["by_method_route"]["GET tournament_workspace"]
         self.assertEqual(workspace["requests"], 2)
         self.assertEqual(workspace["total"]["p95_ms"], 243.75)
         self.assertEqual(workspace["avg_sql_queries_per_request"], 6.0)
@@ -299,7 +297,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             tournament_slug=None,
         )
 
-        route = summary["by_route"]["/users/me"]
+        route = summary["by_route"]["users_me"]
         self.assertEqual(summary["pool_connection_hold_ms"]["avg_ms"], 900.0)
         self.assertEqual(route["pool_connection_hold_ms"]["avg_ms"], 900.0)
         self.assertEqual(summary["authenticated_read_admission_wait_ms"]["avg_ms"], 2.0)
@@ -319,7 +317,7 @@ class ProductionQaWriteBurstProfileTests(unittest.TestCase):
             tournament_slug=None,
         )
 
-        route = summary["by_route"]["/auth/bootstrap"]
+        route = summary["by_route"]["auth_bootstrap"]
         self.assertEqual(
             route["auth_bootstrap"]["auth_bootstrap_auth_query_ms"]["avg_ms"],
             120.0,

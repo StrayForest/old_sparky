@@ -2,6 +2,17 @@
   "schema": 2,
   "profile_id": "ready-vote-stress-20k-v2",
   "profile_version": 2,
+  "portfolio": {
+    "owner": "platform-performance",
+    "hypothesis": "A specific unresolved 20,000-user Ready Vote overload question remains worth answering on demand.",
+    "class": "diagnostic",
+    "status": "active",
+    "cadence": "on-demand",
+    "environment": "production",
+    "request_budget": {"max_logical_actions": 50000, "max_http_attempts": 100000, "max_duration_seconds": 3600},
+    "cost_budget": {"max_runner_minutes": 240, "basis": "external runner wall-clock budget"},
+    "last_accepted_evidence": {"run_id": "34113845670", "source_sha": "bba3fb278e348906a6942aee8462b758c3d616ef"}
+  },
   "category": "stress",
   "purpose": "Answer a specific unresolved overload hypothesis at 20,000 users.",
   "description": "Optional aggressive 20,000-user Ready Vote stress profile for a specific unresolved question.",
@@ -28,6 +39,7 @@
   },
   "acceptance": {
     "kind": "stress",
+    "minimum_useful_goodput_actions_per_second": 1,
     "accepted_request_latency": {"p50_ms": 1500, "p90_ms": 3000, "p95_ms": 5000, "p99_ms": 8000},
     "logical_latency": {"p95_ms": 8000, "p99_ms": 12000},
     "max_shed_percent": 99.9,
@@ -48,6 +60,7 @@
   },
   "execution": {
     "generator": "GitHub-hosted external runner",
+    "require_exact_observer_binding": true,
     "measured_origin": "https://old-sparky.com",
     "origin_role": "fixture preparation, lightweight observer and exact cleanup only",
     "operator_confirmation": "RUN-PRODUCTION-EXTERNAL-LOAD",

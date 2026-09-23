@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform web
-- Last reviewed: 2026-09-01
+- Last reviewed: 2026-09-11
 
 ## Ownership
 
@@ -26,8 +26,14 @@ compatibility layer while structural CSS still consumes it.
   action.
 - Focus remains keyboard-visible; headings are semantic and decorative icons,
   arrows/numbers are hidden from assistive technology.
-- Layouts are fluid and bounded by the shared main width. No route may create
-  horizontal overflow at desktop, 1300 px, tablet or phone viewports.
+- Layouts are fluid and bounded by the shared main width. Responsive rules
+  apply at every owned viewport: desktop (1440 px), wide (1300 px), tablet
+  (820 px) and mobile (Pixel 5). No responsive route may create horizontal
+  overflow at any of those viewports.
+- Desktop-only regressions are a separate ownership case: the explicit
+  desktop-only spec list runs in the `desktop` project only. It is not evidence
+  that those cases are responsive coverage; responsive specs remain owned by
+  the full viewport matrix.
 
 ## Home page geometry
 
@@ -61,9 +67,16 @@ tools/platform_run_quiet.sh "web lint" -- \
   tools/platform_web_npm.sh --prefix apps/platform_web run lint
 tools/platform_run_quiet.sh "web build" -- \
   tools/platform_web_npm.sh --prefix apps/platform_web run build
+tools/platform_run_quiet.sh "web hermetic" -- \
+  tools/platform_verify.py web-hermetic
 ```
 
-Run affected Playwright scenarios at every configured viewport. Inspect desktop
+The [responsive and desktop-only project ownership](../apps/platform_web/playwright.config.ts)
+is executable: run responsive scenarios at every configured viewport, while
+desktop-only scenarios run only in `desktop`. The hermetic runner's
+[single-build sequential process boundary](../tools/platform_web_hermetic.sh)
+also runs the source-only contract without a `webServer`, then starts fresh
+smoke and participant processes without ambient-server reuse. Inspect desktop
 and mobile screenshots after fonts, lazy images and CSS backgrounds load. Check
 overflow, clipping, text contrast, focus, loading/error/empty/disabled states
 and control sizing separately from decoration.

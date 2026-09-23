@@ -67,6 +67,15 @@ if [[ "$EUID" -ne 0 ]]; then
   echo "Platform release builds require root." >&2
   exit 1
 fi
+BOOTSTRAP_TOOL="$ROOT_DIR/tools/platform_bootstrap.sh"
+if [[ ! -f "$BOOTSTRAP_TOOL" || -L "$BOOTSTRAP_TOOL" || ! -x "$BOOTSTRAP_TOOL" ]]; then
+  echo "Release build prerequisite is missing: platform/tools/platform_bootstrap.sh" >&2
+  exit 1
+fi
+if [[ ! -x "$ROOT_DIR/.venv_platform/bin/python" ]]; then
+  echo "Missing platform/.venv_platform. Run platform/tools/platform_bootstrap.sh first." >&2
+  exit 1
+fi
 RELEASE_REF="$RELEASE_REF_RAW"
 BUILD_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RELEASE_SLUG="${RELEASE_REF}-${BUILD_TIMESTAMP}"
@@ -116,13 +125,13 @@ cleanup_staging() {
 trap cleanup_staging EXIT
 
 if [[ "$(readlink -m "$OUTPUT_DIR")" != "$OUTPUT_DIR" ]]; then
-  echo "Release output directory path is not canonical: $OUTPUT_DIR" >&2
+  echo "Release output directory is not canonical." >&2
   exit 1
 fi
 OUTPUT_PARENT="$(dirname "$OUTPUT_DIR")"
 if [[ ! -d "$OUTPUT_PARENT" || -L "$OUTPUT_PARENT" \
   || "$(readlink -f "$OUTPUT_PARENT")" != "$OUTPUT_PARENT" ]]; then
-  echo "Release output parent directory is unsafe: $OUTPUT_PARENT" >&2
+  echo "Release output parent directory is unsafe." >&2
   exit 1
 fi
 OUTPUT_PARENT_UID="$(stat -c %u "$OUTPUT_PARENT")"
@@ -136,7 +145,7 @@ if [[ ! -e "$OUTPUT_DIR" ]]; then
 fi
 if [[ ! -d "$OUTPUT_DIR" || -L "$OUTPUT_DIR" \
   || "$(readlink -f "$OUTPUT_DIR")" != "$OUTPUT_DIR" ]]; then
-  echo "Release output directory is unsafe: $OUTPUT_DIR" >&2
+  echo "Release output directory is unsafe." >&2
   exit 1
 fi
 OUTPUT_UID="$(stat -c %u "$OUTPUT_DIR")"
@@ -269,10 +278,6 @@ if [[ "$NODE_VERSION" != "$EXPECTED_NODE_VERSION" ]]; then
   exit 1
 fi
 
-if [[ ! -x "$ROOT_DIR/.venv_platform/bin/python" ]]; then
-  echo "Missing platform/.venv_platform. Run platform/tools/platform_bootstrap.sh first." >&2
-  exit 1
-fi
 STAGING_DIR="$(mktemp -d "$OUTPUT_DIR/.build-$RELEASE_SLUG.XXXXXX")"
 chmod 0755 "$STAGING_DIR"
 
@@ -286,13 +291,26 @@ if [[ -n "$(find "$STAGING_DIR" -type l -print -quit)" ]]; then
   echo "Release build refused: tracked source contains a symlink." >&2
   exit 1
 fi
+# The read-only outage diagnostics workflow executes these tools from the
+# immutable current release.  Keep the dependency explicit so a future
+# archive/pruning change cannot publish a release that silently loses its
+# aggregate-only evidence path.
+for runtime_helper in \
+  "tools/platform_nginx_error_summary.py" \
+  "tools/platform_web_runtime_diagnostics_summary.py" \
+  "tools/platform_storage_evidence_summary.py" \
+  "tools/platform_media_migration_diagnostics_summary.py"; do
+  if [[ ! -s "$STAGING_DIR/$runtime_helper" || -L "$STAGING_DIR/$runtime_helper" ]]; then
+    echo "Release build refused: tracked runtime diagnostic helper is missing: $runtime_helper" >&2
+    exit 1
+  fi
+done
 rm -rf \
   "$STAGING_DIR/.github" \
   "$STAGING_DIR/AGENTS.md" \
   "$STAGING_DIR/docs" \
   "$STAGING_DIR/tests" \
-  "$STAGING_DIR/apps/platform_web/AGENTS.md" \
-  "$STAGING_DIR/apps/platform_web/tests"
+  "$STAGING_DIR/apps/platform_web/AGENTS.md"
 
 NPM_CLI="$PINNED_NODE_HOME/lib/node_modules/npm/bin/npm-cli.js"
 PACKAGE_MANAGER="$({ /usr/bin/python3 -I - "$STAGING_DIR/apps/platform_web/package.json" <<'PY'
@@ -336,10 +354,26 @@ mkdir -m 0700 "$NPM_CACHE"
     --prefix "$STAGING_DIR/apps/platform_web"
 rm -rf "$NPM_CACHE"
 
+# Build the credential-bearing browser runtime from the exact lock-installed
+# Playwright packages before the full application dependency tree is removed.
+# The builder copies only the pinned Node executable, Playwright packages,
+# reviewed live-journey sources and checksum-pinned browser archives; it never
+# publishes the application's arbitrary node_modules tree.
+"$ROOT_DIR/.venv_platform/bin/python" -I \
+  "$STAGING_DIR/tools/platform_build_live_qa_runtime.py" \
+  --platform-root "$STAGING_DIR" \
+  --node-home "$PINNED_NODE_HOME" \
+  --output "$STAGING_DIR/liveqa-runtime"
+if [[ ! -d "$STAGING_DIR/liveqa-runtime" || -L "$STAGING_DIR/liveqa-runtime" \
+  || ! -f "$STAGING_DIR/liveqa-runtime/runtime-manifest.json" \
+  || -L "$STAGING_DIR/liveqa-runtime/runtime-manifest.json" ]]; then
+  echo "Release build refused: live-QA runtime artifact is incomplete." >&2
+  exit 1
+fi
+rm -rf "$STAGING_DIR/apps/platform_web/tests"
+
 WHEELHOUSE_DIR="$STAGING_DIR/wheelhouse"
 mkdir -m 0700 "$WHEELHOUSE_DIR"
-"$ROOT_DIR/.venv_platform/bin/python" -I \
-  "$ROOT_DIR/tools/platform_safe_env_exec.py" validate-runtime
 /usr/bin/env -i \
   HOME=/nonexistent \
   LANG=C.UTF-8 \
@@ -512,6 +546,10 @@ fi
     rm -rf .next/standalone/public
     cp -R public .next/standalone/public
   fi
+  # Next.js standalone serves from this tree and may create its incremental
+  # runtime cache there. Never carry a cache from the build into an immutable
+  # release; the service preparer creates the empty service-owned directory.
+  rm -rf .next/standalone/.next/cache
   rm -rf node_modules .next/cache
 )
 
@@ -566,14 +604,6 @@ payload = {
     "web_build_id": web_build_id,
     "node_version": node_version,
     "npm_version": npm_version,
-    "runtime_layout": {
-        "app_dir": "/opt/oldsparky/platform",
-        "current_symlink": "/opt/oldsparky/platform/current",
-        "previous_symlink": "/opt/oldsparky/platform/previous",
-        "shared_dir": "/opt/oldsparky/platform/shared",
-        "shared_env_file": "/opt/oldsparky/platform/shared/.env.platform",
-        "shared_venv_dir": "/opt/oldsparky/platform/shared/venv",
-    },
 }
 Path(output).write_text(
     json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
@@ -654,16 +684,8 @@ if [[ -n "$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all -- p
 fi
 BUILD_COMPLETE=1
 
-cat <<EOF
-Platform release built successfully.
-
-Release directory:
-  $RELEASE_DIR
-Artifact:
-  $ARTIFACT_PATH
-SHA256:
-  $ARTIFACT_SHA_PATH
-
-Next step:
-  platform/tools/platform_release_deploy.sh --artifact "$ARTIFACT_PATH" --app-dir /opt/oldsparky/platform
-EOF
+# Build output is a public CI channel.  Keep the machine layout and command
+# line private while retaining the validated release identity and source
+# provenance needed by the caller.
+printf 'RELEASE_BUILD schema=1 status=passed class=build release_slug=%s source_sha=%s artifact=validated\n' \
+  "$RELEASE_SLUG" "$SOURCE_GIT_COMMIT"

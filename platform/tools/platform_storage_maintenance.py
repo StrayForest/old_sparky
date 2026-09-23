@@ -9,6 +9,7 @@ from fnmatch import fnmatch
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -22,6 +23,7 @@ try:
         apply_plan as apply_release_plan,
         build_retention_plan,
         exclusive_directory_lock,
+        exclusive_retained_load_lock,
         human_bytes,
         release_operation_lock,
         resolved_release_target,
@@ -33,6 +35,7 @@ except ImportError:  # Direct execution from the tools directory.
         apply_plan as apply_release_plan,
         build_retention_plan,
         exclusive_directory_lock,
+        exclusive_retained_load_lock,
         human_bytes,
         release_operation_lock,
         resolved_release_target,
@@ -42,6 +45,18 @@ except ImportError:  # Direct execution from the tools directory.
 DEFAULT_APP_DIR = Path("/opt/oldsparky/platform")
 DEFAULT_SOURCE_RELEASE_DIR = Path("/root/old_sparky/platform/dist/releases")
 DEFAULT_WEB_ARTIFACT_DIR = Path("/root/old_sparky/platform/apps/platform_web")
+SAFE_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+SAFE_RUNTIME_ID_RE = re.compile(r"^runtime-[0-9a-f]{40}$")
+
+
+def _safe_release_id(value: Any) -> str | None:
+    candidate = str(value)
+    return candidate if SAFE_RELEASE_ID_RE.fullmatch(candidate) else None
+
+
+def _safe_runtime_id(value: Any) -> str | None:
+    candidate = str(value)
+    return candidate if SAFE_RUNTIME_ID_RE.fullmatch(candidate) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,13 +141,18 @@ def path_size(path: Path) -> int:
 
 def artifact_slug(path: Path) -> str | None:
     if path.is_dir() and not path.is_symlink():
-        return path.name if (path / "RELEASE.json").is_file() else None
+        return (
+            path.name
+            if (path / "RELEASE.json").is_file()
+            and SAFE_RELEASE_ID_RE.fullmatch(path.name)
+            else None
+        )
     if not path.is_file() or path.is_symlink():
         return None
     for suffix in (".tar.gz.sha256", ".tar.gz"):
         if path.name.endswith(suffix):
             slug = path.name[: -len(suffix)]
-            return slug or None
+            return slug if slug and SAFE_RELEASE_ID_RE.fullmatch(slug) else None
     return None
 
 
@@ -148,7 +168,7 @@ def build_artifact_retention_plan(
         return ArtifactRetentionPlan((), (), ())
     resolved_dir = release_dir.resolve(strict=True)
     if not resolved_dir.is_dir():
-        raise RuntimeError(f"Source release path is not a directory: {resolved_dir}")
+        raise RuntimeError("Source release path is not a directory")
 
     grouped: dict[str, list[Path]] = {}
     for path in resolved_dir.iterdir():
@@ -162,9 +182,7 @@ def build_artifact_retention_plan(
             sorted((path.resolve(strict=True) for path in paths), key=str)
         )
         if any(path.parent != resolved_dir for path in resolved_paths):
-            raise RuntimeError(
-                f"Refusing source artifact outside {resolved_dir}: {slug}"
-            )
+            raise RuntimeError("Refusing source artifact outside release directory")
         metadata = tuple(path.lstat() for path in resolved_paths)
         if any(
             stat_result.st_uid != 0
@@ -174,7 +192,7 @@ def build_artifact_retention_plan(
             )
             for stat_result in metadata
         ):
-            raise RuntimeError(f"Refusing non-root-owned source artifact: {slug}")
+            raise RuntimeError("Refusing non-root-owned source artifact")
         groups.append(
             ArtifactGroup(
                 slug=slug,
@@ -211,17 +229,13 @@ def apply_artifact_retention_plan(
     resolved_dir = release_dir.resolve(strict=True)
     for group in plan.candidates:
         if len(group.paths) != len(group.identities):
-            raise RuntimeError(
-                f"Artifact deletion plan identity mismatch: {group.slug}"
-            )
+            raise RuntimeError("Artifact deletion plan identity mismatch")
         for path, identity in zip(group.paths, group.identities, strict=True):
             try:
                 metadata = path.lstat()
                 resolved = path.resolve(strict=True)
             except OSError as exc:
-                raise RuntimeError(
-                    f"Artifact deletion target is unavailable: {path}"
-                ) from exc
+                raise RuntimeError("Artifact deletion target is unavailable") from exc
             if (
                 path.is_symlink()
                 or path.parent != resolved_dir
@@ -233,7 +247,7 @@ def apply_artifact_retention_plan(
                 )
                 or (metadata.st_dev, metadata.st_ino) != identity
             ):
-                raise RuntimeError(f"Refusing unsafe artifact deletion target: {path}")
+                raise RuntimeError("Refusing unsafe artifact deletion target")
             if path.is_dir():
                 shutil.rmtree(path)
             else:
@@ -272,7 +286,7 @@ def delete_known_children(directory: Path, candidates: tuple[Path, ...]) -> int:
     reclaimed = 0
     for path in candidates:
         if path.is_symlink() or path.parent != resolved_dir:
-            raise RuntimeError(f"Refusing unsafe transient deletion target: {path}")
+            raise RuntimeError("Refusing unsafe transient deletion target")
         reclaimed += path_size(path)
         if path.is_dir():
             shutil.rmtree(path)
@@ -283,18 +297,48 @@ def delete_known_children(directory: Path, candidates: tuple[Path, ...]) -> int:
 
 def release_plan_summary(plan: RetentionPlan) -> dict[str, Any]:
     return {
-        "protected": [entry.path.name for entry in plan.protected],
-        "retained": [entry.path.name for entry in plan.retained],
-        "deleted": [entry.path.name for entry in plan.candidates],
+        "protected": [
+            safe_id
+            for entry in plan.protected
+            if (safe_id := _safe_release_id(entry.path.name)) is not None
+        ],
+        "retained": [
+            safe_id
+            for entry in plan.retained
+            if (safe_id := _safe_release_id(entry.path.name)) is not None
+        ],
+        "deleted": [
+            safe_id
+            for entry in plan.candidates
+            if (safe_id := _safe_release_id(entry.path.name)) is not None
+        ],
+        "protected_count": len(plan.protected),
+        "retained_count": len(plan.retained),
+        "deleted_count": len(plan.candidates),
         "reclaimable_bytes": plan.reclaimable_bytes,
     }
 
 
 def artifact_plan_summary(plan: ArtifactRetentionPlan) -> dict[str, Any]:
     return {
-        "protected": [group.slug for group in plan.protected],
-        "retained": [group.slug for group in plan.retained],
-        "deleted": [group.slug for group in plan.candidates],
+        "protected": [
+            safe_id
+            for group in plan.protected
+            if (safe_id := _safe_release_id(group.slug)) is not None
+        ],
+        "retained": [
+            safe_id
+            for group in plan.retained
+            if (safe_id := _safe_release_id(group.slug)) is not None
+        ],
+        "deleted": [
+            safe_id
+            for group in plan.candidates
+            if (safe_id := _safe_release_id(group.slug)) is not None
+        ],
+        "protected_count": len(plan.protected),
+        "retained_count": len(plan.retained),
+        "deleted_count": len(plan.candidates),
         "reclaimable_bytes": plan.reclaimable_bytes,
     }
 
@@ -303,10 +347,26 @@ def live_qa_runtime_plan_summary(
     plan: live_qa_guard.RuntimeCacheRetentionPlan,
 ) -> dict[str, Any]:
     return {
-        "protected": [entry.path.name for entry in plan.protected],
-        "retained": [entry.path.name for entry in plan.retained],
-        "deleted": [entry.path.name for entry in plan.candidates],
-        "reclaimed_tombstones": [entry.path.name for entry in plan.tombstones],
+        "protected": [
+            safe_id
+            for entry in plan.protected
+            if (safe_id := _safe_runtime_id(entry.path.name)) is not None
+        ],
+        "retained": [
+            safe_id
+            for entry in plan.retained
+            if (safe_id := _safe_runtime_id(entry.path.name)) is not None
+        ],
+        "deleted": [
+            safe_id
+            for entry in plan.candidates
+            if (safe_id := _safe_runtime_id(entry.path.name)) is not None
+        ],
+        "reclaimed_tombstones": [],
+        "protected_count": len(plan.protected),
+        "retained_count": len(plan.retained),
+        "deleted_count": len(plan.candidates),
+        "reclaimed_tombstone_count": len(plan.tombstones),
     }
 
 
@@ -340,14 +400,24 @@ def run_backup(app_dir: Path, *, keep: int) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise RuntimeError("Platform backup returned invalid JSON output.") from exc
     if completed.returncode != 0 or not result.get("ok"):
-        raise RuntimeError(str(result.get("error") or "Platform backup failed."))
+        raise RuntimeError("Platform backup failed.")
     return {
-        "dump_file": result.get("dump_file"),
-        "metadata_file": result.get("metadata_file"),
-        "size_bytes": result.get("size_bytes"),
-        "duration_seconds": result.get("duration_seconds"),
-        "restore_verified": result.get("restore_verified"),
-        "restored_table_count": result.get("restored_table_count"),
+        "size_bytes": result.get("size_bytes")
+        if isinstance(result.get("size_bytes"), int)
+        and not isinstance(result.get("size_bytes"), bool)
+        and result.get("size_bytes") >= 0
+        else None,
+        "duration_seconds": result.get("duration_seconds")
+        if isinstance(result.get("duration_seconds"), (int, float))
+        and not isinstance(result.get("duration_seconds"), bool)
+        and result.get("duration_seconds") >= 0
+        else None,
+        "restore_verified": result.get("restore_verified") is True,
+        "restored_table_count": result.get("restored_table_count")
+        if isinstance(result.get("restored_table_count"), int)
+        and not isinstance(result.get("restored_table_count"), bool)
+        and result.get("restored_table_count") >= 0
+        else None,
         "removed_count": len(result.get("removed") or []),
     }
 
@@ -485,26 +555,32 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
     disk_before = disk_snapshot(Path("/"))
 
     if args.apply:
-        # Fixed global order: release transaction lock, build-output lock, then
-        # live-QA machine lock. Install/rollback take only the first; builds take
-        # only the second; standalone live-QA retention takes first then third.
+        # Fixed global order: release transaction lock, retained-load lock,
+        # build-output lock, then live-QA machine lock. Install/rollback take
+        # only the first; deploy takes the first two; builds take only the
+        # third; standalone live-QA retention takes first then the fourth.
         with release_operation_lock(app_dir):
-            with source_release_lock(args.source_release_dir) as source_release_dir:
-                maintenance_result = _plan_and_maybe_apply(
-                    args,
-                    app_dir=app_dir,
-                    source_release_dir=source_release_dir,
-                )
-                live_qa_plan = live_qa_guard.prune_runtime_cache_release_lock_held(
-                    apply=True,
-                    keep=args.live_qa_runtime_keep,
-                    root=getattr(
+            with exclusive_retained_load_lock():
+                with source_release_lock(
+                    args.source_release_dir
+                ) as source_release_dir:
+                    maintenance_result = _plan_and_maybe_apply(
                         args,
-                        "live_qa_runtime_root",
-                        live_qa_guard.RUNNER_CACHE_ROOT,
-                    ),
-                    app_dir=app_dir,
-                )
+                        app_dir=app_dir,
+                        source_release_dir=source_release_dir,
+                    )
+                    live_qa_plan = (
+                        live_qa_guard.prune_runtime_cache_release_lock_held(
+                            apply=True,
+                            keep=args.live_qa_runtime_keep,
+                            root=getattr(
+                                args,
+                                "live_qa_runtime_root",
+                                live_qa_guard.RUNNER_CACHE_ROOT,
+                            ),
+                            app_dir=app_dir,
+                        )
+                    )
     else:
         source_release_dir = (
             args.source_release_dir if args.source_release_dir.exists() else None
@@ -553,9 +629,18 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
         "source_release_artifacts": artifact_plan_summary(source_plan),
         "live_qa_runtime_caches": live_qa_runtime_plan_summary(live_qa_plan),
         "transient": {
-            "failed_builds": [path.name for path in failed_builds],
-            "browser_test_artifacts": [path.name for path in test_artifacts],
-            "preprod_screenshots": [path.name for path in screenshots],
+            "failed_builds": {
+                "count": len(failed_builds),
+                "reclaimable_bytes": transient_reclaimed["failed_builds"],
+            },
+            "browser_test_artifacts": {
+                "count": len(test_artifacts),
+                "reclaimable_bytes": transient_reclaimed["browser_test_artifacts"],
+            },
+            "preprod_screenshots": {
+                "count": len(screenshots),
+                "reclaimable_bytes": transient_reclaimed["preprod_screenshots"],
+            },
             "reclaimable_bytes": transient_reclaimed,
         },
         "disk_before": disk_before,
@@ -577,14 +662,14 @@ def print_summary(report: dict[str, Any]) -> None:
     for key in ("production_releases", "source_release_artifacts"):
         section = report[key]
         print(
-            f"{key}: delete={len(section['deleted'])}, "
+            f"{key}: delete={section['deleted_count']}, "
             f"reclaimable={human_bytes(section['reclaimable_bytes'])}"
         )
     live_qa = report["live_qa_runtime_caches"]
     print(
         "live_qa_runtime_caches: "
-        f"delete={len(live_qa['deleted'])}, "
-        f"reclaim_tombstones={len(live_qa['reclaimed_tombstones'])}"
+        f"delete={live_qa['deleted_count']}, "
+        f"reclaim_tombstones={live_qa['reclaimed_tombstone_count']}"
     )
     disk_after = report["disk_after"]
     print(
@@ -598,26 +683,38 @@ def main() -> int:
     try:
         report = run_maintenance(args)
         if args.apply:
-            report_path = write_report(
+            write_report(
                 args.app_dir / "shared" / "maintenance",
                 report,
                 keep=args.report_keep,
             )
-            report["report_file"] = str(report_path)
         if args.as_json:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
             print_summary(report)
         return 0 if report["ok"] else 1
     except Exception as exc:
+        message = str(exc).lower()
+        if "backup" in message or "restore" in message:
+            error_class = "backup"
+        elif "lock" in message or "transaction" in message:
+            error_class = "lock"
+        elif "unsafe" in message or "symlink" in message or "target" in message:
+            error_class = "integrity"
+        elif "missing" in message or "directory" in message:
+            error_class = "configuration"
+        else:
+            error_class = "storage"
         if args.as_json:
             print(
                 json.dumps(
-                    {"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2
+                    {"ok": False, "status": "failed", "error_class": error_class},
+                    ensure_ascii=False,
+                    indent=2,
                 )
             )
         else:
-            print(f"[FAIL] {exc}", file=sys.stderr)
+            print(f"[FAIL] Platform storage maintenance ({error_class})", file=sys.stderr)
         return 1
 
 

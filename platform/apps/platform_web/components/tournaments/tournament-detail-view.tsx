@@ -88,6 +88,16 @@ export function TournamentDetailView({ tournament, actorUserId }: TournamentDeta
     )
   );
   const teamsFormed = detail.teams.length > 0;
+  const inactiveParticipant = Boolean(
+    actorUserId
+    && detail.currentUserParticipantStatus
+    && !isActiveParticipantStatus(detail.currentUserParticipantStatus)
+  );
+  const readOnlyBearer = Boolean(
+    detail.visibility === "private"
+    && detail.inviteCode
+    && (!actorUserId || inactiveParticipant)
+  );
   const blockedByOtherTournament = Boolean(
     detail.activeCommitment
     && detail.activeCommitment.tournamentId !== detail.id
@@ -152,6 +162,7 @@ export function TournamentDetailView({ tournament, actorUserId }: TournamentDeta
             href={detail.inviteCode
               ? `/tournaments/${detail.slug}/bracket?invite_code=${encodeURIComponent(detail.inviteCode)}`
               : `/tournaments/${detail.slug}/bracket`}
+            prefetch={false}
             onClick={(event) => {
               if (!bracketReady) {
                 event.preventDefault();
@@ -166,9 +177,15 @@ export function TournamentDetailView({ tournament, actorUserId }: TournamentDeta
           <div>
             <div className="small-title">{t("tournament.nextStepsTitle")}</div>
             <div className="check-list">
-              <CheckItem label={registered ? t("tournament.nextStepRegistered") : t("tournament.nextStepRegister")} done={registered} />
-              <CheckItem label={checkedIn ? t("tournament.nextStepReadyDone") : t("tournament.nextStepReady")} done={checkedIn} />
-              <CheckItem label={teamsFormed ? t("tournament.nextStepTeamsDone") : t("tournament.nextStepTeams")} done={teamsFormed} />
+              {readOnlyBearer ? (
+                <CheckItem label={t("tournament.nextStepReadOnly")} done={false} />
+              ) : (
+                <>
+                  <CheckItem label={registered ? t("tournament.nextStepRegistered") : t("tournament.nextStepRegister")} done={registered} />
+                  <CheckItem label={checkedIn ? t("tournament.nextStepReadyDone") : t("tournament.nextStepReady")} done={checkedIn} />
+                  <CheckItem label={teamsFormed ? t("tournament.nextStepTeamsDone") : t("tournament.nextStepTeams")} done={teamsFormed} />
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -350,11 +367,12 @@ function TeamTable({
               </td>
               <td className="team-action-cell">
                 {member.userId === actorUserId ? (
-                  <Link className="team-control" href="/profile/me">{t("tournament.viewProfile")}</Link>
+                  <Link className="team-control" href="/profile/me" prefetch={false}>{t("tournament.viewProfile")}</Link>
                 ) : (
                   <Link
                     className="team-control"
                     href={`/tournaments/${encodeURIComponent(tournamentSlug)}/profiles/${encodeURIComponent(member.userId)}`}
+                    prefetch={false}
                   >
                     {t("tournament.viewProfile")}
                   </Link>

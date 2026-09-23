@@ -22,9 +22,6 @@ jobs:
     timeout-minutes: 15
     environment: production
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       RECOVERY_CONFIRMATION: ${{ inputs.confirmation }}
     steps:
       - name: Validate explicit recovery confirmation
@@ -34,10 +31,14 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production service recovery must run from the reviewed dev ref" >&2; exit 1; }
           test "$RECOVERY_CONFIRMATION" = "RECOVER-DEADLOCK-WEB" \
-            || { echo "Refusing service recovery without exact confirmation" >&2; exit 1; }
+            || { echo "Refusing recovery without exact confirmation" >&2; exit 1; }
 
       - name: Validate production SSH inputs
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured" >&2; exit 1; }
@@ -46,14 +47,24 @@ jobs:
 
       - name: Configure SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/platform-production-service-recovery-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-service-recovery-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          fi
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
           ssh_scan="$ssh_dir/known_hosts.scan"
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          if ! ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null; then
+            echo "Production SSH host key scan failed" >&2
+            exit 1
+          fi
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 key" >&2; exit 1; }
           test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
             || { echo "Expected exactly one production ED25519 host key" >&2; exit 1; }
@@ -67,8 +78,18 @@ jobs:
 
       - name: Restart and verify deadlock-web
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          umask 077
+          remote_log="$RUNNER_TEMP/platform-production-service-recovery.log"
+          remote_error="$RUNNER_TEMP/platform-production-service-recovery-error.log"
+          : >"$remote_log"
+          : >"$remote_error"
+          chmod 600 "$remote_log" "$remote_error"
+          set +e
           ssh \
             -F /dev/null \
             -o BatchMode=yes \
@@ -80,12 +101,14 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            'bash -s' <<'REMOTE'
+            'bash -s' >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
 
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           shared="$runtime/shared"
+          summary_tool="$current/tools/platform_storage_evidence_summary.py"
+          journal_summary_tool="$current/tools/platform_web_runtime_diagnostics_summary.py"
 
           test "$(id -u)" -eq 0 || { echo "Production service recovery must run as root" >&2; exit 1; }
           test -d "$runtime" && test ! -L "$runtime" || { echo "Production runtime directory is missing or unsafe" >&2; exit 1; }
@@ -96,10 +119,27 @@ jobs:
           shared_mode="$(stat -c %a "$shared")"
           test "$shared_owner" = "0" && test $((8#$shared_mode & 8#022)) -eq 0 \
             || { echo "Production shared directory permissions are unsafe" >&2; exit 1; }
-          exec {release_lock_fd}<"$shared"
-          /usr/bin/flock -n "$release_lock_fd" \
-            || { echo "Another platform install or rollback operation holds the release lock" >&2; exit 75; }
-
+          lock_helper="$current/tools/platform_release_lock.sh"
+          test -f "$lock_helper" && test ! -L "$lock_helper" && test -x "$lock_helper" \
+            || { echo "Canonical release lock helper is missing or unsafe" >&2; exit 1; }
+          # Keep service recovery under the same pathname-form supervisor as
+          # deploy/rollback.  --close prevents a release FD from reaching
+          # systemctl, curl or any diagnostic child.
+          "$lock_helper" --run /bin/bash -s <<'LOCKED'
+          set -Eeuo pipefail
+          runtime=/opt/oldsparky/platform
+          current="$runtime/current"
+          shared="$runtime/shared"
+          summary_tool="$current/tools/platform_storage_evidence_summary.py"
+          journal_summary_tool="$current/tools/platform_web_runtime_diagnostics_summary.py"
+          # shellcheck source=/dev/null
+          source "$current/tools/platform_release_lock.sh"
+          platform_release_lock_open || {
+            echo "Canonical release lock supervisor could not be validated" >&2
+            exit 75
+          }
+          platform_release_lock_supervisor_holds \
+            || { echo "Platform release lock was lost" >&2; exit 75; }
           test ! -e "$runtime/shared/.release-operation.json" \
             || { echo "A release transaction is already pending" >&2; exit 75; }
           systemctl is-active --quiet deadlock-api \
@@ -108,23 +148,36 @@ jobs:
             || { echo "deadlock-worker is not active; refusing web-only recovery" >&2; exit 1; }
           systemctl is-active --quiet nginx \
             || { echo "nginx is not active; refusing web-only recovery" >&2; exit 1; }
-          test -x "$current/tools/platform_run_web.sh" \
+          test -f "$current/tools/platform_run_web.sh" \
+            && test ! -L "$current/tools/platform_run_web.sh" \
+            && test -x "$current/tools/platform_run_web.sh" \
             || { echo "Current web runtime entrypoint is missing" >&2; exit 1; }
+          test -f "$summary_tool" && test ! -L "$summary_tool" \
+            || { echo "Storage evidence summary helper is missing or unsafe" >&2; exit 1; }
+          test -f "$journal_summary_tool" && test ! -L "$journal_summary_tool" \
+            || { echo "Web runtime summary helper is missing or unsafe" >&2; exit 1; }
 
-          printf 'active_release=%s\n' "$(readlink -f "$current")"
+          current_id="$(basename "$(readlink -f "$current")")"
+          [[ "$current_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] \
+            || { echo "Current release identifier is invalid" >&2; exit 1; }
+          printf 'active_release_id=%s\n' "$current_id"
           printf 'web_state_before=%s\n' "$(systemctl is-active deadlock-web || true)"
-          systemctl show deadlock-web \
+          service_output="$(systemctl show deadlock-web \
             --property=ActiveState,SubState,Result,ExecMainStatus,NRestarts \
-            --no-pager
+            --no-pager 2>/dev/null)" \
+            || { echo "Web service state producer failed" >&2; exit 1; }
+          printf '%s\n' "$service_output" \
+            | /usr/bin/python3 -I "$summary_tool" --mode service --service deadlock-web \
+            || { echo "Web service state summary failed" >&2; exit 1; }
 
-          systemctl reset-failed deadlock-web || true
-          systemctl restart deadlock-web
+          systemctl reset-failed deadlock-web >/dev/null 2>&1 || true
+          systemctl restart deadlock-web >/dev/null 2>&1
 
           web_ready=false
           for _ in $(seq 1 30); do
             if systemctl is-active --quiet deadlock-web \
               && curl --fail --silent --show-error --max-time 2 \
-                http://127.0.0.1:3000/ >/dev/null; then
+                http://127.0.0.1:3000/ >/dev/null 2>&1; then
               web_ready=true
               break
             fi
@@ -133,13 +186,83 @@ jobs:
 
           if [[ "$web_ready" != true ]]; then
             echo "deadlock-web did not recover" >&2
-            systemctl show deadlock-web \
+            service_output="$(systemctl show deadlock-web \
               --property=ActiveState,SubState,Result,ExecMainStatus,NRestarts \
-              --no-pager >&2 || true
-            journalctl -u deadlock-web --since '-10 minutes' --no-pager -n 80 >&2 || true
+              --no-pager 2>/dev/null)" || service_output=""
+            if [[ -n "$service_output" ]]; then
+              printf '%s\n' "$service_output" \
+                | /usr/bin/python3 -I "$summary_tool" --mode service --service deadlock-web \
+                || printf '%s\n' 'WEB_SERVICE_SUMMARY status=unavailable error_class=summary'
+            else
+              printf '%s\n' 'WEB_SERVICE_SUMMARY status=unavailable error_class=producer'
+            fi
+            journal_file="$(mktemp)"
+            trap 'rm -f -- "$journal_file"' EXIT
+            journal_status=0
+            journalctl -u deadlock-web --since '-10 minutes' --no-pager -n 80 \
+              --output short-iso-precise >"$journal_file" 2>/dev/null || journal_status=$?
+            if (( journal_status == 0 )); then
+              /usr/bin/python3 -I "$journal_summary_tool" --mode journal --max-lines 80 \
+                <"$journal_file" \
+                || printf '%s\n' 'WEB_JOURNAL_SUMMARY status=unavailable error_class=summary'
+            else
+              printf '%s\n' 'WEB_JOURNAL_SUMMARY status=unavailable error_class=producer'
+            fi
             exit 1
           fi
 
           printf 'web_state_after=%s\n' "$(systemctl is-active deadlock-web)"
           printf 'web_health=passed\n'
+          LOCKED
           REMOTE
+          remote_status=$?
+          set -e
+          if (( remote_status != 0 )); then
+            rm -f -- "$remote_log" "$remote_error"
+            printf '%s\n' 'PRODUCTION_SERVICE_RECOVERY schema=1 status=failed error_class=remote_or_transport'
+            exit 1
+          fi
+          if ! grep -Fxq 'web_health=passed' "$remote_log"; then
+            rm -f -- "$remote_log" "$remote_error"
+            printf '%s\n' 'PRODUCTION_SERVICE_RECOVERY schema=1 status=failed error_class=producer'
+            exit 1
+          fi
+          printf '%s\n' 'PRODUCTION_SERVICE_RECOVERY schema=1 status=passed error_class=none'
+          rm -f -- "$remote_log" "$remote_error"
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-service-recovery-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-production-service-recovery-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519" && test ! -L "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts" && test ! -L "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan" && test ! -L "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config" && test ! -L "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock" && test ! -L "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master" && test ! -L "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock" && test ! -L "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          rm -f -- \
+            "$RUNNER_TEMP/platform-production-service-recovery.log" \
+            "$RUNNER_TEMP/platform-production-service-recovery-error.log"
+          test ! -e "$RUNNER_TEMP/platform-production-service-recovery.log"
+          test ! -e "$RUNNER_TEMP/platform-production-service-recovery-error.log"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"

@@ -36,6 +36,9 @@ TRUSTED_REPO_ROOT = Path("/root/old_sparky")
 TRUSTED_PLATFORM_ROOT = TRUSTED_REPO_ROOT / "platform"
 TRUSTED_TOOLS_ROOT = TRUSTED_PLATFORM_ROOT / "tools"
 TRUSTED_SECRET_ROOT = Path("/root/.oldsparky/liveqa")
+TRUSTED_PAYLOAD_ROOT = TRUSTED_SECRET_ROOT / "releases"
+TRUSTED_ACTIVE_MANIFEST = TRUSTED_SECRET_ROOT / "active-manifest.json"
+TRUSTED_ACTIVE_POINTER = TRUSTED_SECRET_ROOT / "active"
 LIVE_QA_USER = "oldsparky-liveqa"
 RUNNER_CACHE_ROOT = Path("/var/lib/oldsparky-liveqa")
 BUILD_NODE_ROOT = Path("/var/lib/oldsparky-build")
@@ -110,6 +113,7 @@ MAX_TAR_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
 MAX_NPM_FILE_BYTES = 256 * 1024 * 1024
 LOCK_ENV_NAME = "PLATFORM_LIVE_QA_LOCK_FD"
 MACHINE_LOCK_PATH = Path("/run/lock/oldsparky-liveqa.lock")
+RELEASE_LOCK_PATH = Path("/run/lock/oldsparky-platform-release.lock")
 STATE_PHASE_FILE = "phase.json"
 STATE_PHASE_SETUP = "setup"
 STATE_PHASE_ROOT = "root-prepared"
@@ -162,9 +166,18 @@ class GuardError(RuntimeError):
     """A deliberately non-sensitive live-QA guard failure."""
 
 
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise GuardError("live-QA JSON contains duplicate keys")
+        result[key] = value
+    return result
+
+
 @contextmanager
 def _release_operation_lock(app_dir: Path) -> Iterator[Path]:
-    """Join the install/rollback flock without importing under Python -I."""
+    """Join the canonical install/rollback flock without Python -I imports."""
 
     try:
         resolved_app = app_dir.resolve(strict=True)
@@ -189,27 +202,54 @@ def _release_operation_lock(app_dir: Path) -> Iterator[Path]:
         or stat.S_IMODE(shared_metadata.st_mode) & 0o022
     ):
         raise GuardError("platform release lock boundary metadata is unsafe")
+    lock_root = Path("/run/lock")
+    try:
+        root_metadata = lock_root.lstat()
+        root_resolved = lock_root.resolve(strict=True)
+    except OSError as exc:
+        raise GuardError("platform release lock root is unavailable") from exc
+    root_mode = stat.S_IMODE(root_metadata.st_mode)
+    if (
+        root_resolved != lock_root
+        or stat.S_ISLNK(root_metadata.st_mode)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != 0
+        # A group- or world-writable non-sticky lock root permits another
+        # account to replace the canonical pathname between validation and
+        # open.  Keep this boundary identical to the shell and retention
+        # lock implementations; sticky roots are safe for the fixed name.
+        or (root_mode & 0o022 and not root_mode & 0o1000)
+    ):
+        raise GuardError("platform release lock root metadata is unsafe")
     try:
         descriptor = os.open(
-            shared,
-            os.O_RDONLY
+            RELEASE_LOCK_PATH,
+            os.O_RDWR
+            | os.O_CREAT
             | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_DIRECTORY", 0)
             | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
         )
     except OSError as exc:
         raise GuardError("platform release lock could not be opened") from exc
     try:
         opened = os.fstat(descriptor)
+        path_metadata = RELEASE_LOCK_PATH.lstat()
         if (
-            not stat.S_ISDIR(opened.st_mode)
-            or (opened.st_dev, opened.st_ino)
-            != (shared_metadata.st_dev, shared_metadata.st_ino)
+            not stat.S_ISREG(opened.st_mode)
             or opened.st_uid != 0
             or opened.st_gid != 0
-            or stat.S_IMODE(opened.st_mode) & 0o022
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_uid != 0
+            or path_metadata.st_gid != 0
+            or path_metadata.st_nlink != 1
+            or stat.S_IMODE(path_metadata.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino)
+            != (path_metadata.st_dev, path_metadata.st_ino)
         ):
-            raise GuardError("platform release lock changed during validation")
+            raise GuardError("platform release lock file metadata is unsafe")
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
@@ -480,7 +520,11 @@ def _bundle_marker_and_helper(bundle_path: Path) -> tuple[str, Path]:
 
 
 def _sha256_regular(
-    path: Path, *, expected_uid: int, expected_mode: int | None = None
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_mode: int | None = None,
+    maximum: int = 1024 * 1024,
 ) -> str:
     try:
         metadata = path.lstat()
@@ -495,7 +539,7 @@ def _sha256_regular(
             expected_mode is not None
             and stat.S_IMODE(metadata.st_mode) != expected_mode
         )
-        or metadata.st_size > 1024 * 1024
+        or metadata.st_size > maximum
     ):
         raise GuardError("helper file metadata is unsafe")
     descriptor = os.open(
@@ -666,6 +710,151 @@ def _active_release_commit(app_dir: Path = APP_DIR) -> str:
     return _release_pointer_commit("current", app_dir)
 
 
+def _validate_installed_payload_root(
+    payload_root: Path,
+    *,
+    target_sha: str | None = None,
+) -> str:
+    """Validate the only payload root accepted by trusted live-QA commands."""
+
+    try:
+        root_metadata = TRUSTED_SECRET_ROOT.lstat()
+        releases_metadata = TRUSTED_PAYLOAD_ROOT.lstat()
+        manifest_metadata = TRUSTED_ACTIVE_MANIFEST.lstat()
+        pointer_metadata = TRUSTED_ACTIVE_POINTER.lstat()
+        pointer_target = TRUSTED_ACTIVE_POINTER.resolve(strict=True)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != 0
+            or root_metadata.st_gid != 0
+            or root_metadata.st_mode & 0o7000
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+            or not stat.S_ISDIR(releases_metadata.st_mode)
+            or releases_metadata.st_uid != 0
+            or releases_metadata.st_gid != 0
+            or releases_metadata.st_mode & 0o7000
+            or stat.S_IMODE(releases_metadata.st_mode) != 0o755
+            or manifest_metadata.st_size > MAX_JSON_BYTES
+        ):
+            raise GuardError("installed live-QA payload root metadata is unsafe")
+        raw = TRUSTED_ACTIVE_MANIFEST.read_text(encoding="ascii")
+        manifest = json.loads(raw, object_pairs_hook=_strict_object)
+    except (OSError, UnicodeError, json.JSONDecodeError, GuardError) as exc:
+        raise GuardError("installed live-QA payload manifest is unavailable") from exc
+    if (
+        stat.S_ISLNK(manifest_metadata.st_mode)
+        or not stat.S_ISREG(manifest_metadata.st_mode)
+        or manifest_metadata.st_uid != 0
+        or manifest_metadata.st_gid != 0
+        or manifest_metadata.st_nlink != 1
+        or manifest_metadata.st_mode & 0o7000
+        or stat.S_IMODE(manifest_metadata.st_mode) != 0o444
+        or not stat.S_ISLNK(pointer_metadata.st_mode)
+        or pointer_metadata.st_uid != 0
+        or pointer_metadata.st_gid != 0
+        or pointer_metadata.st_nlink != 1
+    ):
+        raise GuardError("installed live-QA payload manifest metadata is unsafe")
+    expected = {"version", "source_sha", "release_slug", "payload", "payload_tree_sha256", "files"}
+    source_sha = manifest.get("source_sha") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != expected
+        or manifest.get("version") != 1
+        or not isinstance(source_sha, str)
+        or COMMIT_PATTERN.fullmatch(source_sha) is None
+        or target_sha is not None and source_sha != target_sha
+        or manifest.get("payload") != str(TRUSTED_PAYLOAD_ROOT / source_sha)
+        or pointer_target != TRUSTED_PAYLOAD_ROOT / source_sha
+        or payload_root != TRUSTED_PAYLOAD_ROOT / source_sha
+        or not isinstance(manifest.get("release_slug"), str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", manifest["release_slug"]) is None
+        or not isinstance(manifest.get("files"), dict)
+        or not isinstance(manifest.get("payload_tree_sha256"), str)
+        or DIGEST_PATTERN.fullmatch(manifest["payload_tree_sha256"]) is None
+    ):
+        raise GuardError("installed live-QA payload identity is invalid")
+    manifest_files = manifest["files"]
+    if any(
+        not isinstance(relative, str)
+        or not relative
+        or relative.startswith("/")
+        or "\\" in relative
+        or any(component in {"", ".", ".."} for component in relative.split("/"))
+        or not isinstance(file_digest, str)
+        or DIGEST_PATTERN.fullmatch(file_digest) is None
+        for relative, file_digest in manifest_files.items()
+    ):
+        raise GuardError("installed live-QA payload file map is invalid")
+    if _active_release_commit() != source_sha:
+        raise GuardError("installed live-QA payload does not match active release")
+    try:
+        metadata = payload_root.lstat()
+    except OSError as exc:
+        raise GuardError("installed live-QA payload root is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_mode & 0o7000
+        or stat.S_IMODE(metadata.st_mode) != 0o555
+        or payload_root.resolve(strict=True) != payload_root
+    ):
+        raise GuardError("installed live-QA payload root metadata is unsafe")
+    digest = hashlib.sha256()
+    files: dict[str, str] = {}
+    total = 0
+    for path in sorted(payload_root.rglob("*")):
+        relative = path.relative_to(payload_root).as_posix()
+        item = path.lstat()
+        if stat.S_ISLNK(item.st_mode):
+            raise GuardError("installed live-QA payload contains a symlink")
+        digest.update(relative.encode("utf-8") + b"\0")
+        if stat.S_ISDIR(item.st_mode):
+            if (
+                item.st_uid != 0
+                or item.st_gid != 0
+                or item.st_mode & 0o7000
+                or stat.S_IMODE(item.st_mode) != 0o555
+            ):
+                raise GuardError("installed live-QA payload directory mode is unsafe")
+            digest.update(b"d\0")
+            continue
+        sandbox = relative == "runtime/browsers/chromium-1228/chrome-linux64/chrome_sandbox"
+        expected_modes = {0o4755} if sandbox else {0o444, 0o555}
+        if (
+            not stat.S_ISREG(item.st_mode)
+            or item.st_uid != 0
+            or item.st_gid != 0
+            or item.st_nlink != 1
+            or stat.S_IMODE(item.st_mode) not in expected_modes
+            or item.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+            and not sandbox
+            or path.name == "chrome_sandbox" and not sandbox
+        ):
+            raise GuardError("installed live-QA payload file metadata is unsafe")
+        total += item.st_size
+        if total > 2 * 1024 * 1024 * 1024:
+            raise GuardError("installed live-QA payload is too large")
+        file_digest = _sha256_regular(
+            path,
+            expected_uid=0,
+            expected_mode=0o4755 if sandbox else stat.S_IMODE(item.st_mode),
+            maximum=768 * 1024 * 1024,
+        )
+        if sandbox and (
+            item.st_size != CHROMIUM_SANDBOX_SIZE
+            or file_digest != CHROMIUM_SANDBOX_SHA256
+        ):
+            raise GuardError("installed Chromium sandbox checksum is invalid")
+        files[relative] = file_digest
+        digest.update(b"f\0" + bytes.fromhex(file_digest))
+    if digest.hexdigest() != manifest["payload_tree_sha256"] or files != manifest["files"]:
+        raise GuardError("installed live-QA payload digest does not match manifest")
+    return source_sha
+
+
 def _protected_release_commits(app_dir: Path = APP_DIR) -> frozenset[str]:
     commits = frozenset(
         {
@@ -811,7 +1000,23 @@ def _validate_trusted_wrapper(argv: list[str], *, recovery: bool) -> None:
         raise GuardError("locked exec requires a reviewed wrapper")
     executable = Path(argv[0])
     allowed = TRUSTED_RECOVERY_WRAPPERS if recovery else TRUSTED_WRAPPERS
-    expected = TRUSTED_TOOLS_ROOT / executable.name
+    installed_root = os.environ.get("PLATFORM_LIVE_QA_INSTALL_ROOT")
+    if installed_root is not None:
+        if (
+            not re.fullmatch(
+                r"/root/\.oldsparky/liveqa/releases/[0-9a-f]{40}",
+                installed_root,
+            )
+            or os.environ.get("PLATFORM_LIVE_QA_TARGET_SHA")
+            != Path(installed_root).name
+        ):
+            raise GuardError("installed live-QA wrapper root is invalid")
+        target_sha = os.environ["PLATFORM_LIVE_QA_TARGET_SHA"]
+        installed_payload = Path(installed_root)
+        _validate_installed_payload_root(installed_payload, target_sha=target_sha)
+        expected = installed_payload / "platform/tools" / executable.name
+    else:
+        expected = TRUSTED_TOOLS_ROOT / executable.name
     if executable != expected or executable.name not in allowed:
         raise GuardError("locked exec target is not a reviewed live QA wrapper")
     _assert_root_controlled_path(executable, directory=False)
@@ -1721,6 +1926,7 @@ def _validate_cache_tree_permissions(
         not stat.S_ISDIR(root_metadata.st_mode)
         or root_metadata.st_uid != 0
         or root_metadata.st_gid != 0
+        or root_metadata.st_mode & 0o7000
         or stat.S_IMODE(root_metadata.st_mode) != 0o555
     ):
         raise GuardError("runtime cache root permissions are unsafe")
@@ -1743,7 +1949,10 @@ def _validate_cache_tree_permissions(
             except (OSError, ValueError) as exc:
                 raise GuardError("runtime cache symlink escapes its tree") from exc
         elif stat.S_ISDIR(metadata.st_mode):
-            if stat.S_IMODE(metadata.st_mode) != 0o555:
+            if (
+                metadata.st_mode & 0o7000
+                or stat.S_IMODE(metadata.st_mode) != 0o555
+            ):
                 raise GuardError("runtime cache directory permissions are unsafe")
         elif stat.S_ISREG(metadata.st_mode):
             expected_modes = {0o444, 0o555}
@@ -2198,10 +2407,22 @@ def _install_locked_dependencies(target: Path) -> Path:
 
 
 def _sandbox_path(runtime_cache: Path) -> Path:
-    if runtime_cache.parent != RUNNER_CACHE_ROOT or not RUNTIME_NAME_PATTERN.fullmatch(
+    trusted_payload = False
+    if runtime_cache.parent == RUNNER_CACHE_ROOT and RUNTIME_NAME_PATTERN.fullmatch(
         runtime_cache.name
     ):
-        raise GuardError("runtime cache path is unsafe")
+        pass
+    else:
+        payload = runtime_cache.parent
+        if (
+            payload.parent != TRUSTED_PAYLOAD_ROOT
+            or COMMIT_PATTERN.fullmatch(payload.name) is None
+        ):
+            raise GuardError("runtime cache path is unsafe")
+        _validate_installed_payload_root(payload)
+        trusted_payload = True
+    if trusted_payload and runtime_cache.name != "runtime":
+        raise GuardError("installed live-QA runtime path is unsafe")
     sandbox = runtime_cache / CHROMIUM_SANDBOX_RELATIVE
     try:
         sandboxes = list(runtime_cache.rglob("chrome_sandbox"))
@@ -2814,6 +3035,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "preflight":
             if args.mode == "automated":
                 validate_chromium_apparmor_contract()
+                installed_root = os.environ.get("PLATFORM_LIVE_QA_INSTALL_ROOT")
+                target_sha = os.environ.get("PLATFORM_LIVE_QA_TARGET_SHA")
+                if installed_root is not None:
+                    if target_sha is None or COMMIT_PATTERN.fullmatch(target_sha) is None:
+                        raise GuardError("installed live-QA target SHA is invalid")
+                    _validate_installed_payload_root(Path(installed_root), target_sha=target_sha)
             assert_no_recovery_state(
                 args.bundle_path,
                 include_manual=args.mode in {"automated", "provision"},

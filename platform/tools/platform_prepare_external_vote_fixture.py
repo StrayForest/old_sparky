@@ -182,7 +182,6 @@ async def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 )
 
         qa.report["tournament_ids"] = list(qa.tournament_ids)
-        qa.report["tournament_slugs"] = list(qa.tournament_slugs)
         qa.report["external_vote"]["manifest_user_count"] = len(manifest_users)
         qa.scenario(
             "external_vote_fixture_ready_rounds_created",

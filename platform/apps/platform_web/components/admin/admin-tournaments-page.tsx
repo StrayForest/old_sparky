@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, ArrowUpRight, CalendarClock, CheckCircle2, ChevronRight, Eye, GitBranch, LockKeyhole, Search, Settings2, Trash2, Trophy, UsersRound } from "lucide-react";
 import { useI18n } from "@/components/i18n-provider";
 import { AdminTournamentRoster } from "@/components/admin/admin-tournament-roster";
@@ -74,14 +74,14 @@ function TournamentDetail({ tournament, enumLabel, formatDate, onUpdate, onDelet
   const [tab, setTab] = useState<DetailTab>("summary");
   if (!tournament) return <aside className="ops-detail ops-detail-empty"><Trophy size={22} /><strong>{t("admin.new.selectTournamentTitle")}</strong><span>{t("admin.new.selectTournamentCopy")}</span></aside>;
   return <aside className="ops-detail ops-tournament-detail" data-testid="admin-tournament-inspector">
-    <div className="ops-detail-header"><div><span className="ops-kicker">{t("admin.new.tournamentDetail")}</span><h2>{tournament.name}</h2><p>{tournament.organizer_display_name ?? t("common.unknown")} · {tournament.slug}</p></div><Link className="ops-icon-button" href={`/tournaments/${tournament.slug}`} aria-label={t("admin.new.openTournament")}><Eye size={17} /></Link></div>
+    <div className="ops-detail-header"><div><span className="ops-kicker">{t("admin.new.tournamentDetail")}</span><h2>{tournament.name}</h2><p>{tournament.organizer_display_name ?? t("common.unknown")} · {tournament.slug}</p></div><Link className="ops-icon-button" href={`/tournaments/${tournament.slug}`} prefetch={false} aria-label={t("admin.new.openTournament")}><Eye size={17} /></Link></div>
     <div className="ops-detail-badges"><span className="ops-status ops-status-info">{enumLabel(tournament.status)}</span><span className="ops-status ops-status-muted">{enumLabel(tournament.visibility)}</span><span className={tournament.has_locked_deadlock_roster ? "ops-status ops-status-warning" : "ops-status ops-status-muted"}><LockKeyhole size={13} />{tournament.has_locked_deadlock_roster ? t("admin.new.rosterLocked") : t("admin.new.rosterOpen")}</span></div>
     <nav className="ops-detail-tabs" aria-label={t("admin.new.tournamentSections")}>{(["summary", "roster", "bracket", "recovery"] as DetailTab[]).map((value) => <button className={tab === value ? "is-active" : ""} key={value} type="button" onClick={() => setTab(value)}>{detailTabLabel(value, t)}</button>)}</nav>
     {tournament.admin_override_warning ? <div className="ops-warning"><AlertTriangle size={16} /><span>{tournament.admin_override_warning}</span></div> : null}
     {tab === "summary" ? <TournamentSummary tournament={tournament} formatDate={formatDate} onOpenRoster={() => setTab("roster")} /> : null}
-    {tab === "roster" ? <AdminTournamentRoster slug={tournament.slug} formatDate={formatDate} /> : null}
+    {tab === "roster" ? <AdminTournamentRoster key={tournament.id} slug={tournament.slug} formatDate={formatDate} /> : null}
     {tab === "bracket" ? <BracketImpact tournament={tournament} /> : null}
-    {tab === "recovery" ? <TournamentRecovery tournament={tournament} enumLabel={enumLabel} onUpdate={onUpdate} onDelete={onDelete} /> : null}
+    {tab === "recovery" ? <TournamentRecovery key={tournament.id} tournament={tournament} enumLabel={enumLabel} onUpdate={onUpdate} onDelete={onDelete} /> : null}
   </aside>;
 }
 
@@ -93,11 +93,16 @@ function TournamentSummary({ tournament, formatDate, onOpenRoster }: { tournamen
 
 function BracketImpact({ tournament }: { tournament: PlatformAdminTournament }) {
   const { t } = useI18n();
-  return <div className="ops-detail-content"><section className="ops-detail-section"><SectionTitle title={t("admin.new.bracketTitle")} copy={t("admin.new.bracketCopy")} /><div className="ops-bracket-facts"><Fact label={t("admin.new.matches")} value={String(tournament.match_count)} /><Fact label={t("admin.new.latestRound")} value={String(tournament.latest_round_number ?? "—")} /><Fact label={t("admin.new.completed")} value={String(tournament.completed_match_count)} /></div><div className="ops-info"><GitBranch size={16} /><span>{t("admin.new.bracketIdentityCopy")}</span></div><Link className="ops-button ops-button-secondary ops-full-button" href={`/tournaments/${tournament.slug}/bracket`}><ArrowUpRight size={16} />{t("admin.new.openBracket")}</Link></section></div>;
+  return <div className="ops-detail-content"><section className="ops-detail-section"><SectionTitle title={t("admin.new.bracketTitle")} copy={t("admin.new.bracketCopy")} /><div className="ops-bracket-facts"><Fact label={t("admin.new.matches")} value={String(tournament.match_count)} /><Fact label={t("admin.new.latestRound")} value={String(tournament.latest_round_number ?? "—")} /><Fact label={t("admin.new.completed")} value={String(tournament.completed_match_count)} /></div><div className="ops-info"><GitBranch size={16} /><span>{t("admin.new.bracketIdentityCopy")}</span></div><Link className="ops-button ops-button-secondary ops-full-button" href={`/tournaments/${tournament.slug}/bracket`} prefetch={false}><ArrowUpRight size={16} />{t("admin.new.openBracket")}</Link></section></div>;
 }
 
 function TournamentRecovery({ tournament, enumLabel, onUpdate, onDelete }: { tournament: PlatformAdminTournament; enumLabel: (value: string | null | undefined) => string; onUpdate: (tournament: PlatformAdminTournament) => void; onDelete: (slug: string) => void }) {
   const { t } = useI18n();
+  const tournamentIdentity = `${tournament.id}:${tournament.slug}`;
+  const tournamentIdentityRef = useRef(tournamentIdentity);
+  tournamentIdentityRef.current = tournamentIdentity;
+  const requestGenerationRef = useRef(0);
+  const requestControllerRef = useRef<AbortController | null>(null);
   const [status, setStatus] = useState(tournament.status);
   const [visibility, setVisibility] = useState(tournament.visibility);
   const [schedule, setSchedule] = useState(() => scheduleFromTournament(tournament));
@@ -108,9 +113,39 @@ function TournamentRecovery({ tournament, enumLabel, onUpdate, onDelete }: { tou
   const [deleteName, setDeleteName] = useState("");
   const [deleteNote, setDeleteNote] = useState("");
   const [isDeleting, setIsDeleting] = useState(false);
+
+  useEffect(() => {
+    requestGenerationRef.current += 1;
+    requestControllerRef.current?.abort();
+    requestControllerRef.current = null;
+    setStatus(tournament.status);
+    setVisibility(tournament.visibility);
+    setSchedule(scheduleFromTournament(tournament));
+    setNote("");
+    setIsSaving(false);
+    setError("");
+    setMessage("");
+    setDeleteName("");
+    setDeleteNote("");
+    setIsDeleting(false);
+
+    return () => {
+      requestGenerationRef.current += 1;
+      requestControllerRef.current?.abort();
+      requestControllerRef.current = null;
+    };
+  }, [tournament.id, tournament.slug]);
+
+  function ownsRequest(generation: number, identity: string, controller: AbortController): boolean {
+    return requestGenerationRef.current === generation
+      && tournamentIdentityRef.current === identity
+      && requestControllerRef.current === controller;
+  }
+
   const scheduleChanged = Object.entries(schedule).some(([key, value]) => value !== dateTimeLocal(tournament[key as keyof PlatformAdminTournament] as string | null | undefined));
   const changed = status !== tournament.status || visibility !== tournament.visibility || (status === "registration_open" && scheduleChanged);
   const scheduleComplete = status !== "registration_open" || Object.values(schedule).every(Boolean);
+  const mutationBusy = isSaving || isDeleting;
 
   function changeStatus(value: string) {
     setStatus(value);
@@ -118,15 +153,23 @@ function TournamentRecovery({ tournament, enumLabel, onUpdate, onDelete }: { tou
   }
 
   async function save() {
-    if (!changed || !scheduleComplete || note.trim().length < 3 || isSaving) return;
+    if (!changed || !scheduleComplete || note.trim().length < 3 || mutationBusy) return;
+    const targetTournament = tournament;
+    const targetIdentity = tournamentIdentity;
+    const targetSlug = tournament.slug;
+    const generation = requestGenerationRef.current;
+    const controller = new AbortController();
+    requestControllerRef.current?.abort();
+    requestControllerRef.current = controller;
     setIsSaving(true); setError(""); setMessage("");
     try {
       const includeSchedule = status === "registration_open";
-      const updated = await platformApiRequest<PlatformAdminTournament>(`/admin/tournaments/${tournament.slug}`, {
+      const updated = await platformApiRequest<PlatformAdminTournament>(`/admin/tournaments/${targetSlug}`, {
         method: "PATCH",
+        signal: controller.signal,
         body: JSON.stringify({
-          status: status !== tournament.status || scheduleChanged ? status : null,
-          visibility: visibility === tournament.visibility ? null : visibility,
+          status: status !== targetTournament.status || scheduleChanged ? status : null,
+          visibility: visibility === targetTournament.visibility ? null : visibility,
           registration_closes_at: includeSchedule ? toIso(schedule.registration_closes_at) : null,
           ready_check_starts_at: includeSchedule ? toIso(schedule.ready_check_starts_at) : null,
           ready_check_ends_at: includeSchedule ? toIso(schedule.ready_check_ends_at) : null,
@@ -135,6 +178,7 @@ function TournamentRecovery({ tournament, enumLabel, onUpdate, onDelete }: { tou
           note: note.trim()
         })
       });
+      if (!ownsRequest(generation, targetIdentity, controller) || controller.signal.aborted || updated.id !== targetTournament.id || updated.slug !== targetSlug) return;
       onUpdate(updated);
       setSchedule(scheduleFromTournament(updated));
       setStatus(updated.status);
@@ -142,44 +186,63 @@ function TournamentRecovery({ tournament, enumLabel, onUpdate, onDelete }: { tou
       setNote("");
       setMessage(t("admin.new.overrideSaved"));
     } catch (requestError) {
-      setError(platformApiMessage(requestError, t("admin.new.overrideFailed")));
+      if (ownsRequest(generation, targetIdentity, controller) && !controller.signal.aborted) setError(platformApiMessage(requestError, t("admin.new.overrideFailed")));
     } finally {
-      setIsSaving(false);
+      if (ownsRequest(generation, targetIdentity, controller)) {
+        requestControllerRef.current = null;
+        setIsSaving(false);
+      }
     }
   }
 
   async function remove() {
-    if (deleteName.trim() !== tournament.name || deleteNote.trim().length < 3 || isDeleting) return;
+    if (deleteName.trim() !== tournament.name || deleteNote.trim().length < 3 || mutationBusy) return;
+    const targetIdentity = tournamentIdentity;
+    const targetSlug = tournament.slug;
+    const generation = requestGenerationRef.current;
+    const controller = new AbortController();
+    requestControllerRef.current?.abort();
+    requestControllerRef.current = controller;
     setIsDeleting(true); setError("");
     try {
-      await platformApiRequest<void>(`/admin/tournaments/${tournament.slug}`, {
+      await platformApiRequest<void>(`/admin/tournaments/${targetSlug}`, {
         method: "DELETE",
+        signal: controller.signal,
         body: JSON.stringify({ confirmation_name: deleteName.trim(), note: deleteNote.trim() })
       });
-      onDelete(tournament.slug);
+      if (!ownsRequest(generation, targetIdentity, controller) || controller.signal.aborted) return;
+      requestControllerRef.current = null;
+      onDelete(targetSlug);
     } catch (requestError) {
-      setError(platformApiMessage(requestError, t("admin.new.deleteTournamentFailed")));
-      setIsDeleting(false);
+      if (ownsRequest(generation, targetIdentity, controller) && !controller.signal.aborted) {
+        setError(platformApiMessage(requestError, t("admin.new.deleteTournamentFailed")));
+        setIsDeleting(false);
+      }
+    } finally {
+      if (ownsRequest(generation, targetIdentity, controller)) {
+        requestControllerRef.current = null;
+        setIsDeleting(false);
+      }
     }
   }
 
-  return <div className="ops-detail-content">
+  return <div className="ops-detail-content" aria-busy={mutationBusy}>
     <section className="ops-detail-section">
       <SectionTitle title={t("admin.new.recoveryTitle")} copy={t("admin.new.recoveryCopy")} />
       <div className="ops-form-grid-two">
-        <label className="ops-field"><span>{t("admin.new.lifecycle")}</span><select data-testid="admin-status-override" value={status} onChange={(event) => changeStatus(event.target.value)}>{["registration_open", "registration_closed", "in_progress", "completed", "cancelled"].map((value) => <option key={value} value={value}>{enumLabel(value)}</option>)}</select></label>
-        <label className="ops-field"><span>{t("admin.new.visibility")}</span><select data-testid="admin-visibility-override" value={visibility} onChange={(event) => setVisibility(event.target.value)}><option value="public">{enumLabel("public")}</option><option value="invite_only">{enumLabel("invite_only")}</option></select></label>
+        <label className="ops-field"><span>{t("admin.new.lifecycle")}</span><select data-testid="admin-status-override" disabled={mutationBusy} value={status} onChange={(event) => changeStatus(event.target.value)}>{["registration_open", "registration_closed", "in_progress", "completed", "cancelled"].map((value) => <option key={value} value={value}>{enumLabel(value)}</option>)}</select></label>
+        <label className="ops-field"><span>{t("admin.new.visibility")}</span><select data-testid="admin-visibility-override" disabled={mutationBusy} value={visibility} onChange={(event) => setVisibility(event.target.value)}><option value="public">{enumLabel("public")}</option><option value="invite_only">{enumLabel("invite_only")}</option></select></label>
       </div>
       {status === "registration_open" ? <div className="ops-schedule" data-testid="admin-schedule-editor">
         <div className="ops-info"><CalendarClock size={15} /><span>{t("admin.new.reopenScheduleNotice")}</span></div>
-        <ScheduleField label={t("admin.new.registrationClosesAt")} testId="admin-registration-closes-at" value={schedule.registration_closes_at} onChange={(value) => setSchedule((current) => ({ ...current, registration_closes_at: value }))} />
-        <ScheduleField label={t("admin.new.readyCheckStartsAt")} value={schedule.ready_check_starts_at} onChange={(value) => setSchedule((current) => ({ ...current, ready_check_starts_at: value }))} />
-        <ScheduleField label={t("admin.new.readyCheckEndsAt")} value={schedule.ready_check_ends_at} onChange={(value) => setSchedule((current) => ({ ...current, ready_check_ends_at: value }))} />
-        <ScheduleField label={t("admin.new.captainSelectionStartsAt")} value={schedule.captain_selection_starts_at} onChange={(value) => setSchedule((current) => ({ ...current, captain_selection_starts_at: value }))} />
-        <ScheduleField label={t("admin.new.tournamentStartsAt")} value={schedule.starts_at} onChange={(value) => setSchedule((current) => ({ ...current, starts_at: value }))} />
+        <ScheduleField label={t("admin.new.registrationClosesAt")} testId="admin-registration-closes-at" value={schedule.registration_closes_at} disabled={mutationBusy} onChange={(value) => setSchedule((current) => ({ ...current, registration_closes_at: value }))} />
+        <ScheduleField label={t("admin.new.readyCheckStartsAt")} value={schedule.ready_check_starts_at} disabled={mutationBusy} onChange={(value) => setSchedule((current) => ({ ...current, ready_check_starts_at: value }))} />
+        <ScheduleField label={t("admin.new.readyCheckEndsAt")} value={schedule.ready_check_ends_at} disabled={mutationBusy} onChange={(value) => setSchedule((current) => ({ ...current, ready_check_ends_at: value }))} />
+        <ScheduleField label={t("admin.new.captainSelectionStartsAt")} value={schedule.captain_selection_starts_at} disabled={mutationBusy} onChange={(value) => setSchedule((current) => ({ ...current, captain_selection_starts_at: value }))} />
+        <ScheduleField label={t("admin.new.tournamentStartsAt")} value={schedule.starts_at} disabled={mutationBusy} onChange={(value) => setSchedule((current) => ({ ...current, starts_at: value }))} />
       </div> : null}
-      <ReasonField value={note} onChange={setNote} testId="admin-override-note" />
-      <button className="ops-button ops-button-primary ops-full-button" data-testid="admin-apply-override" type="button" disabled={!changed || !scheduleComplete || note.trim().length < 3 || isSaving} onClick={() => void save()}><Settings2 size={16} />{isSaving ? t("common.saving") : t("admin.new.applyOverride")}</button>
+      <ReasonField value={note} disabled={mutationBusy} onChange={setNote} testId="admin-override-note" />
+      <button className="ops-button ops-button-primary ops-full-button" data-testid="admin-apply-override" type="button" disabled={!changed || !scheduleComplete || note.trim().length < 3 || mutationBusy} onClick={() => void save()}><Settings2 size={16} />{isSaving ? t("common.saving") : t("admin.new.applyOverride")}</button>
       {message ? <div className="ops-feedback ops-feedback-success">{message}</div> : null}
       {error ? <div className="ops-feedback ops-feedback-error">{error}</div> : null}
     </section>
@@ -187,9 +250,9 @@ function TournamentRecovery({ tournament, enumLabel, onUpdate, onDelete }: { tou
       <summary><Trash2 size={15} />{t("admin.new.deleteTournamentTitle")}</summary>
       <div className="ops-danger-content">
         <div className="ops-warning"><AlertTriangle size={16} /><span>{t("admin.new.deleteTournamentCopy")}</span></div>
-        <label className="ops-field"><span>{t("admin.new.confirmTournamentName")}</span><input data-testid="admin-delete-tournament-confirmation" value={deleteName} maxLength={140} onChange={(event) => setDeleteName(event.target.value)} /><small>{tournament.name}</small></label>
-        <ReasonField value={deleteNote} onChange={setDeleteNote} testId="admin-delete-tournament-note" />
-        <button className="ops-button ops-button-danger" data-testid="admin-delete-tournament" type="button" disabled={deleteName.trim() !== tournament.name || deleteNote.trim().length < 3 || isDeleting} onClick={() => void remove()}><Trash2 size={16} />{isDeleting ? t("admin.new.deleting") : t("admin.new.deleteTournamentButton")}</button>
+        <label className="ops-field"><span>{t("admin.new.confirmTournamentName")}</span><input data-testid="admin-delete-tournament-confirmation" disabled={mutationBusy} value={deleteName} maxLength={140} onChange={(event) => setDeleteName(event.target.value)} /><small>{tournament.name}</small></label>
+        <ReasonField value={deleteNote} disabled={mutationBusy} onChange={setDeleteNote} testId="admin-delete-tournament-note" />
+        <button className="ops-button ops-button-danger" data-testid="admin-delete-tournament" type="button" disabled={deleteName.trim() !== tournament.name || deleteNote.trim().length < 3 || mutationBusy} onClick={() => void remove()}><Trash2 size={16} />{isDeleting ? t("admin.new.deleting") : t("admin.new.deleteTournamentButton")}</button>
       </div>
     </details>
   </div>;
@@ -198,9 +261,9 @@ function TournamentRecovery({ tournament, enumLabel, onUpdate, onDelete }: { tou
 function Timeline({ items, formatDate }: { items: [string, string | null | undefined][]; formatDate: (value: string) => string }) { return <div className="ops-timeline">{items.map(([label, value]) => <div key={label}><span className={value ? "ops-timeline-dot is-set" : "ops-timeline-dot"} /><div><strong>{label}</strong><small>{value ? formatDate(value) : "—"}</small></div></div>)}</div>; }
 function Fact({ label, value }: { label: string; value: string }) { return <div className="ops-fact"><span>{label}</span><strong>{value}</strong></div>; }
 function SectionTitle({ title, copy }: { title: string; copy: string }) { return <div className="ops-section-title"><h3>{title}</h3><p>{copy}</p></div>; }
-function ReasonField({ value, onChange, testId }: { value: string; onChange: (value: string) => void; testId?: string }) { const { t } = useI18n(); return <label className="ops-field"><span>{t("admin.new.reason")}</span><textarea data-testid={testId} maxLength={1000} value={value} placeholder={t("admin.new.reasonPlaceholder")} onChange={(event) => onChange(event.target.value)} /></label>; }
+function ReasonField({ value, onChange, testId, disabled }: { value: string; onChange: (value: string) => void; testId?: string; disabled?: boolean }) { const { t } = useI18n(); return <label className="ops-field"><span>{t("admin.new.reason")}</span><textarea data-testid={testId} disabled={disabled} maxLength={1000} value={value} placeholder={t("admin.new.reasonPlaceholder")} onChange={(event) => onChange(event.target.value)} /></label>; }
 type ScheduleDraft = { registration_closes_at: string; ready_check_starts_at: string; ready_check_ends_at: string; captain_selection_starts_at: string; starts_at: string };
-function ScheduleField({ label, value, onChange, testId }: { label: string; value: string; onChange: (value: string) => void; testId?: string }) { return <label className="ops-field"><span>{label}</span><input data-testid={testId} type="datetime-local" value={value} onChange={(event) => onChange(event.target.value)} /></label>; }
+function ScheduleField({ label, value, onChange, testId, disabled }: { label: string; value: string; onChange: (value: string) => void; testId?: string; disabled?: boolean }) { return <label className="ops-field"><span>{label}</span><input data-testid={testId} disabled={disabled} type="datetime-local" value={value} onChange={(event) => onChange(event.target.value)} /></label>; }
 function scheduleFromTournament(tournament: PlatformAdminTournament): ScheduleDraft { return { registration_closes_at: dateTimeLocal(tournament.registration_closes_at), ready_check_starts_at: dateTimeLocal(tournament.ready_check_starts_at), ready_check_ends_at: dateTimeLocal(tournament.ready_check_ends_at), captain_selection_starts_at: dateTimeLocal(tournament.captain_selection_starts_at), starts_at: dateTimeLocal(tournament.starts_at) }; }
 function fillFutureSchedule(schedule: ScheduleDraft): ScheduleDraft { const base = Date.now() + 3600000; return { registration_closes_at: schedule.registration_closes_at || dateTimeLocal(new Date(base).toISOString()), ready_check_starts_at: schedule.ready_check_starts_at || dateTimeLocal(new Date(base + 3600000).toISOString()), ready_check_ends_at: schedule.ready_check_ends_at || dateTimeLocal(new Date(base + 7200000).toISOString()), captain_selection_starts_at: schedule.captain_selection_starts_at || dateTimeLocal(new Date(base + 10800000).toISOString()), starts_at: schedule.starts_at || dateTimeLocal(new Date(base + 14400000).toISOString()) }; }
 function dateTimeLocal(value: string | null | undefined): string { if (!value) return ""; const date = new Date(value); const offset = date.getTimezoneOffset(); return new Date(date.getTime() - offset * 60000).toISOString().slice(0, 16); }

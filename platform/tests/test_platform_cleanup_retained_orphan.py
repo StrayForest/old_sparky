@@ -40,7 +40,8 @@ class RetainedOrphanCleanupTests(unittest.TestCase):
             load_run_id="12345",
             control_email="Control@example.com",
         )
-        self.assertEqual(manifest["control_email"], "control@example.com")
+        self.assertEqual(manifest["_control_email"], "control@example.com")
+        self.assertNotIn("control_email", manifest)
         self.assertEqual(manifest["markers"], {"preprod260829000001abcd"})
         self.assertEqual(len(manifest["user_ids"]), 1)
         self.assertEqual(manifest["rows"][0]["report_path"], self._run().report_path)

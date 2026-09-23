@@ -185,11 +185,27 @@ test("live player completes the accelerated tournament journey through visible c
     await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/ready-check/close`, "POST", undefined, 200);
     await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/captain-round/start`, "POST", { teams_count: 2 }, 201);
 
+    // Assignment, publish, and lock are intentionally exercised through the
+    // API control-plane in this MVP. This journey covers the player bracket
+    // and report surfaces; it makes no promise of an organizer console for
+    // those lifecycle controls.
     await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/auto-assignment/run-async`, "POST", undefined, 202);
     const run = await pollAssignment(organizerContext, tournamentSlug);
     await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/auto-assignment/${run.id}/publish`, "POST", undefined, 200);
     await apiJson(organizerContext, `/tournaments/${tournamentSlug}/deadlock/auto-assignment/${run.id}/lock`, "POST", undefined, 200);
-    await apiJson(organizerContext, `/tournaments/${tournamentSlug}/matches/seed-opening-round`, "POST", undefined, 201);
+    const bracketAfterLock = await apiJson<{
+      revision: number;
+      matches: Array<{ id: string; round_number: number }>;
+    }>(
+      organizerContext,
+      `/tournaments/${tournamentSlug}/bracket?teams_view=summary`,
+      "GET",
+      undefined,
+      200,
+    );
+    expect(bracketAfterLock.revision).toBe(1);
+    expect(bracketAfterLock.matches.length).toBeGreaterThan(0);
+    expect(bracketAfterLock.matches.some((match) => match.round_number === 1)).toBe(true);
 
     await playerPage.reload();
     await expect(playerPage.getByText("Моя команда", { exact: true })).toBeVisible();
@@ -199,6 +215,9 @@ test("live player completes the accelerated tournament journey through visible c
     ]);
     const organizerPage = await organizerContext.newPage();
     const bracketRoute = `${origin}/tournaments/${tournamentSlug}/bracket`;
+    // Install before bracket navigation so every timer on this page belongs to
+    // the deterministic clock used by the no-background-refresh assertion.
+    await playerPage.clock.install();
     await Promise.all([
       organizerPage.goto(bracketRoute),
       playerPage.goto(bracketRoute),
@@ -748,7 +767,9 @@ async function assertManualBracketRefresh(
       },
       200,
     );
-    await playerPage.waitForTimeout(2_000);
+    // Keep the live contract's two-second no-refresh window while advancing
+    // browser timers deterministically; any interval-based refresh still runs.
+    await playerPage.clock.runFor(2_000);
     expect(backgroundBracketRequests).toBe(0);
 
     await playerPage.reload();

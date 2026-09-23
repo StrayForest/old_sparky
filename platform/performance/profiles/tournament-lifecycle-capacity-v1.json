@@ -2,6 +2,17 @@
   "schema": 2,
   "profile_id": "tournament-lifecycle-capacity-v1",
   "profile_version": 1,
+  "portfolio": {
+    "owner": "platform-performance",
+    "hypothesis": "The lifecycle harness can expose a capacity contour while preserving complete workflow correctness at every stage.",
+    "class": "diagnostic",
+    "status": "replacement-needed",
+    "cadence": "on-demand",
+    "environment": "qa-preprod",
+    "request_budget": {"max_logical_actions": 10000, "max_http_attempts": 100000, "max_duration_seconds": 10800},
+    "cost_budget": {"max_runner_minutes": 360, "basis": "QA harness wall-clock budget"},
+    "last_accepted_evidence": null
+  },
   "category": "capacity",
   "purpose": "Find the lifecycle read/write capacity ceiling while retaining complete workflow correctness.",
   "description": "Canonical lifecycle capacity contour for the existing QA/performance harness.",
@@ -67,6 +78,9 @@
   },
   "execution": {
     "generator": "platform_production_qa.py",
+    "non_dispatchable": true,
+    "profile_binding": "not-integrated-with-production-qa",
+    "require_exact_observer_binding": false,
     "measured_origin": "configured QA/preprod origin",
     "external_runner_forbidden": true,
     "run_command": "python3 platform/tools/platform_production_qa.py --mode tournament-lifecycle",

@@ -97,7 +97,9 @@ from apps.platform_api.app.services.tournament_participant_policy import (
     enforce_tournament_participant_policy,
 )
 from apps.platform_api.app.services.tournament_workspace_access import (
+    enforce_tournament_bearer_read_rate_limit,
     ensure_private_tournament_read_membership_is_active,
+    strict_invite_code_query,
 )
 from apps.platform_api.app.services.tournament_write_serialization import (
     serialize_tournament_write_invariants,
@@ -141,7 +143,6 @@ from apps.platform_api.app.services.tournament_workflow import (
     TournamentStatusTransitionError,
     build_deadlock_ready_round_state_snapshot,
     complete_locked_tournament_after_final_match,
-    deadlock_assignment_run_by_id_for_tournament,
     deadlock_auto_assignment_run_freshness,
     deadlock_auto_assignment_state_runs_for_tournament,
     deadlock_auto_assignment_stale_detail,
@@ -158,6 +159,7 @@ from apps.platform_api.app.services.tournament_workflow import (
     deadlock_ready_state_response_for_tournament,
     deadlock_ready_state_round_for_tournament,
     finalize_deadlock_assignment_with_commitments,
+    lock_deadlock_assignment_run_for_tournament,
     lock_tournament_for_workflow,
     mark_ready_check_closed,
     mark_ready_check_started,
@@ -255,6 +257,7 @@ from python_packages.platform_domain.tournaments import (
     invite_is_active,
     is_solo_tournament_format,
     normalize_tournament_allowed_ranks,
+    normalize_strict_invite_code,
     remaining_invite_uses,
     resolve_match_report,
     strength_seed_teams,
@@ -1838,7 +1841,10 @@ def ensure_tournament_workspace_visible(
         return
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="Tournament roster and bracket data are visible only to joined participants, the organizer, or platform admins.",
+        detail=(
+            "Tournament roster, bracket, and match data require a valid invite "
+            "code, active membership, the organizer role, or a platform admin role."
+        ),
     )
 
 
@@ -2279,6 +2285,14 @@ def winner_label_for_match(match: TournamentMatch) -> str | None:
 
 
 def normalize_invite_code(code: object) -> str:
+    """Keep legacy body-code compatibility normalization out of bearer reads.
+
+    The claim/join body contracts predate the private bearer boundary and
+    retain their historical cleanup behavior. New invite creation, code-status
+    lookup and every bearer query use ``normalize_strict_invite_code`` instead;
+    they must reject raw invalid credentials rather than repair them.
+    """
+
     return "".join(char for char in str(code or "").upper() if char.isalnum())
 
 
@@ -2288,9 +2302,15 @@ async def valid_invite_code_for_tournament(
     tournament: Tournament,
     invite_code: str | None,
 ) -> bool:
+    """Validate a non-consuming bearer code for one exact tournament.
+
+    Revocation and expiry are the only durable code validity controls. Legacy
+    usage counters are intentionally absent from this read-only lookup.
+    """
+
     if tournament.visibility != "invite_only":
         return False
-    normalized = normalize_invite_code(invite_code or "")
+    normalized = normalize_strict_invite_code(invite_code)
     if not normalized:
         return False
     invite_id = await db_session.scalar(
@@ -2439,31 +2459,31 @@ def can_view_tournament_workspace_data(
         return False
 
 
-def should_include_workspace_invite_code(
-    tournament: Tournament,
+def validated_workspace_invite_code(
     *,
-    auth_session,
-    participant_record: TournamentParticipant | None,
+    invite_code_record: TournamentInvite | None,
+    has_valid_invite_code: bool,
     workspace_visible: bool,
-) -> bool:
-    """Keep invite-code reads off active participant workspace requests.
+    participant_record: TournamentParticipant | None,
+) -> str | None:
+    """Return only the exact invite code validated for this request.
 
-    The code remains part of the public workspace contract for anonymous and
-    non-member visitors, and managers still need it for sharing/management.
-    An active participant already has access and does not need the code to
-    register, so that read is the safe optimization boundary.
+    Workspace responses intentionally omit manager/default invite discovery.
+    If a bearer read is authorized, echoing the matching stored code is safe
+    for the existing share flow; selecting another unrevoked invite would leak
+    an A/B code and could expose a revoked/expired value.
     """
 
-    if not workspace_visible:
-        return False
-    if auth_session is not None and (
-        tournament.organizer_user_id == auth_session.user.id
-        or auth_session_has_admin_role(auth_session)
+    if not workspace_visible or not has_valid_invite_code:
+        return None
+    # Active participants already have membership and should not receive a
+    # code merely because they supplied one. Anonymous and inactive viewers
+    # may receive only the exact validated presented code.
+    if participant_record is not None and not participant_status_is_inactive(
+        participant_record.status
     ):
-        return True
-    if participant_record is None:
-        return True
-    return participant_status_is_inactive(participant_record.status)
+        return None
+    return invite_code_record.code if invite_code_record is not None else None
 
 
 async def tournament_participant_page(
@@ -3165,6 +3185,11 @@ async def create_participant(
 async def generate_unique_invite_code(db_session: AsyncSession) -> str:
     for _ in range(8):
         code = "".join(secrets.choice(INVITE_CODE_ALPHABET) for _ in range(10))
+        # Keep generated credentials on the same strict contract as supplied
+        # codes. This should be tautological for the fixed alphabet, but makes
+        # the invariant explicit at the only other invite-creation boundary.
+        if normalize_strict_invite_code(code) != code:
+            continue
         existing = await db_session.scalar(
             select(TournamentInvite.id).where(TournamentInvite.code == code)
         )
@@ -3177,8 +3202,8 @@ async def generate_unique_invite_code(db_session: AsyncSession) -> str:
 
 
 async def invite_code_is_available(db_session: AsyncSession, code: str) -> bool:
-    normalized_code = normalize_invite_code(code)
-    if len(normalized_code) < 10 or len(normalized_code) > 24:
+    normalized_code = normalize_strict_invite_code(code)
+    if normalized_code is None:
         return False
     existing = await db_session.scalar(
         select(TournamentInvite.id).where(TournamentInvite.code == normalized_code)
@@ -3737,6 +3762,23 @@ async def create_tournament(
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentResponse:
+    """Create a tournament and its initial invite under strict code rules.
+
+    A supplied code is validated before idempotency, allowance, tournament or
+    invite persistence. Invalid raw credentials receive the generic API error
+    below; the value is never included in the response.
+    """
+
+    requested_invite_code = None
+    if payload.invite_code is not None:
+        requested_invite_code = normalize_strict_invite_code(payload.invite_code)
+        if requested_invite_code is None:
+            # Validate before idempotency, quota, resource or invite writes.
+            # Do not include the credential in the error response.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Invite code must contain 10-24 ASCII letters or digits.",
+            )
     try:
         ensure_supported_tournament_format(payload.format_slug)
     except TournamentWorkflowError as exc:
@@ -3836,14 +3878,7 @@ async def create_tournament(
             detail="Турнир с таким публичным названием уже существует.",
         ) from exc
     bind_mutation_idempotency_resource(idempotency, tournament.id)
-    invite_code = normalize_invite_code(payload.invite_code or "")
-    if payload.invite_code is not None and len(invite_code) < 10:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Invite code must contain at least 10 letters or digits.",
-        )
-    if not invite_code:
-        invite_code = await generate_unique_invite_code(db_session)
+    invite_code = requested_invite_code or await generate_unique_invite_code(db_session)
     if not await invite_code_is_available(db_session, invite_code):
         await db_session.rollback()
         raise HTTPException(
@@ -3936,16 +3971,30 @@ async def suggest_tournament_invite_code(
 @router.get("/invites/code-status", response_model=TournamentInviteCodeAvailabilityResponse)
 async def get_tournament_invite_code_status(
     request: Request,
-    code: str = Query(min_length=1, max_length=64),
+    code: str = Query(
+        description="Exactly 10-24 ASCII alphanumeric characters; canonicalized uppercase.",
+        json_schema_extra={
+            "minLength": 10,
+            "maxLength": 24,
+            "pattern": r"^[A-Za-z0-9]+$",
+        },
+    ),
     auth_session=Depends(get_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentInviteCodeAvailabilityResponse:
+    """Return availability for one canonical, strictly formatted code."""
+
     await check_invite_rate_limit(
         request,
         user_id=auth_session.user.id,
         operation="lookup",
     )
-    normalized_code = normalize_invite_code(code)
+    normalized_code = strict_invite_code_query(request, parameter_name="code")
+    if normalized_code is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="code must contain 10-24 ASCII letters or digits.",
+        )
     return TournamentInviteCodeAvailabilityResponse(
         code=normalized_code,
         available=await invite_code_is_available(db_session, normalized_code),
@@ -4068,6 +4117,13 @@ async def redeem_tournament_invite(
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentInviteRedeemResponse:
+    """Return invite metadata without claiming access or consuming a use.
+
+    The POST shape is retained for compatibility with existing clients. It is
+    a read-only body-code lookup; bearer authorization remains limited to the
+    explicit tournament GET surfaces.
+    """
+
     await check_invite_rate_limit(request, user_id=auth_session.user.id if auth_session else "anonymous", operation="claim")
     code = normalize_invite_code(payload.code)
     row = (
@@ -4209,7 +4265,12 @@ async def list_tournament_participants(
         le=PARTICIPANT_LIST_MAX_LIMIT,
     ),
     offset: int = Query(default=0, ge=0),
-    invite_code: str | None = Query(default=None, min_length=6, max_length=64),
+    invite_code: str | None = Query(
+        default=None,
+        min_length=10,
+        max_length=24,
+        pattern=r"^[A-Za-z0-9]+$",
+    ),
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> list[TournamentParticipantResponse]:
@@ -4709,7 +4770,12 @@ async def revoke_tournament_invite(
 )
 async def list_tournament_matches(
     slug: str,
-    invite_code: str | None = Query(default=None, min_length=6, max_length=64),
+    invite_code: str | None = Query(
+        default=None,
+        min_length=10,
+        max_length=24,
+        pattern=r"^[A-Za-z0-9]+$",
+    ),
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> list[TournamentMatchResponse]:
@@ -4757,21 +4823,26 @@ async def get_tournament_bracket(
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
     teams_view: Literal["full", "summary"] = Query(default="full"),
-    invite_code: str | None = Query(default=None, min_length=6, max_length=64),
+    invite_code: str | None = Query(
+        default=None,
+        min_length=10,
+        max_length=24,
+        pattern=r"^[A-Za-z0-9]+$",
+    ),
 ) -> TournamentBracketResponse | Response:
+    """Return a bracket only after current access and bearer checks complete.
+
+    The conditional ETag is deliberately evaluated after visibility and exact
+    invite validation so revocation cannot be bypassed by a cached validator.
+    """
+
     tournament = await get_tournament_or_404(db_session, slug)
-    etag = _representation_etag(
-        "bracket",
-        tournament.id,
-        tournament.updated_at,
-        tournament.bracket_revision,
-        teams_view,
-        auth_session.user.id if auth_session is not None else "anonymous",
-        tuple(sorted(auth_session.role_slugs)) if auth_session is not None else (),
-    )
-    not_modified = _conditional_response(request, response, etag=etag)
-    if not_modified is not None:
-        return not_modified
+    # The dependency rejects inactive retained members and validates bearer
+    # syntax/rate limits, but it deliberately lets an authenticated outsider
+    # reach the handler. Complete the current request's exact permission check
+    # before constructing or comparing any conditional response. Otherwise an
+    # outsider with a cached ETag (including ``If-None-Match: *``) could retain
+    # a private bracket body after invite revocation.
     has_participant_record = False
     if auth_session is not None and tournament.visibility == "invite_only":
         participant_record = await participant_for_user(
@@ -4780,14 +4851,37 @@ async def get_tournament_bracket(
             user_id=auth_session.user.id,
         )
         has_participant_record = participant_record is not None
+    has_valid_invite_code = await valid_invite_code_for_tournament(
+        db_session,
+        tournament=tournament,
+        invite_code=invite_code,
+    )
+    ensure_tournament_workspace_visible(
+        tournament,
+        auth_session=auth_session,
+        has_participant_record=has_participant_record,
+        has_valid_invite_code=has_valid_invite_code,
+    )
+
+    # The validator represents the bracket's authorization-independent
+    # structural payload. Authorization is checked above on every request;
+    # identity/role values must not become an access-control input to ETag.
+    etag = _representation_etag(
+        "bracket",
+        tournament.id,
+        tournament.updated_at,
+        tournament.bracket_revision,
+        teams_view,
+    )
+    not_modified = _conditional_response(request, response, etag=etag)
+    if not_modified is not None:
+        return not_modified
     bracket = await build_tournament_bracket_response(
         db_session,
         tournament=tournament,
         auth_session=auth_session,
         has_participant_record=has_participant_record,
-        has_valid_invite_code=await valid_invite_code_for_tournament(
-            db_session, tournament=tournament, invite_code=invite_code
-        ),
+        has_valid_invite_code=has_valid_invite_code,
         include_team_members=teams_view == "full",
     )
     return bracket
@@ -6333,6 +6427,8 @@ async def respond_deadlock_captain_round(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockCaptainRoundResponse:
     tournament = await get_tournament_or_404(db_session, slug)
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
+    await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
     current_user_id = auth_session.user.id
     if payload.decision == "decline":
@@ -6370,6 +6466,35 @@ async def respond_deadlock_captain_round(
         now=auth_session.now,
         allow_assignment_generation=False,
     )
+
+    # Automation may have committed a due lifecycle transition. Reacquire the
+    # aggregate lock and re-read before changing a captain entry so this
+    # legacy-compatible writer cannot commit against stale workflow state.
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
+    await db_session.refresh(tournament)
+    try:
+        ensure_deadlock_roster_staging_allowed(
+            format_slug=tournament.format_slug,
+            tournament_status=tournament.status,
+            has_locked_deadlock_roster=await tournament_has_locked_deadlock_roster(
+                db_session,
+                tournament=tournament,
+            ),
+            action_name="Deadlock captain offers",
+        )
+    except TournamentWorkflowError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    participant = await joined_participant_for_user(
+        db_session,
+        tournament_id=tournament.id,
+        user_id=current_user_id,
+    )
+    if participant is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only joined participants can respond to captain offers.",
+        )
 
     active_round = await deadlock_captain_round_for_tournament(
         db_session,
@@ -6478,6 +6603,8 @@ async def close_deadlock_captain_round(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockCaptainRoundResponse:
     tournament = await get_tournament_or_404(db_session, slug)
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
+    await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
     ensure_tournament_organizer(auth_session, tournament)
     try:
@@ -6562,6 +6689,8 @@ async def finalize_deadlock_captain_round(
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentDeadlockCaptainRoundResponse:
     tournament = await get_tournament_or_404(db_session, slug)
+    tournament = await lock_tournament_for_workflow(db_session, tournament.id)
+    await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
     ensure_tournament_organizer(auth_session, tournament)
     try:
@@ -6758,7 +6887,7 @@ async def publish_deadlock_auto_assignment_run(
     except TournamentWorkflowError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
-    run_row = await deadlock_assignment_run_by_id_for_tournament(
+    run_row = await lock_deadlock_assignment_run_for_tournament(
         db_session,
         tournament_id=tournament.id,
         run_id=run_id,
@@ -6861,20 +6990,7 @@ async def lock_deadlock_auto_assignment_run(
     await db_session.refresh(tournament)
     ensure_deadlock_tournament_format(tournament)
     ensure_tournament_organizer(auth_session, tournament)
-    try:
-        ensure_deadlock_roster_staging_allowed(
-            format_slug=tournament.format_slug,
-            tournament_status=tournament.status,
-            has_locked_deadlock_roster=await tournament_has_locked_deadlock_roster(
-                db_session,
-                tournament=tournament,
-            ),
-            action_name="Deadlock roster locking",
-        )
-    except TournamentWorkflowError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-
-    run_row = await deadlock_assignment_run_by_id_for_tournament(
+    run_row = await lock_deadlock_assignment_run_for_tournament(
         db_session,
         tournament_id=tournament.id,
         run_id=run_id,
@@ -6885,8 +7001,22 @@ async def lock_deadlock_auto_assignment_run(
             detail="Deadlock auto-assignment run not found.",
         )
 
-    if run_row.status == "locked":
-        return serialize_deadlock_auto_assignment_run(run_row)
+    # A published run is subject to the normal staging guard. A locked run is
+    # accepted only for the service's explicit legacy graph-repair/no-op path;
+    # the service still owns the assignment-run lock and revalidates state.
+    if run_row.status != "locked":
+        try:
+            ensure_deadlock_roster_staging_allowed(
+                format_slug=tournament.format_slug,
+                tournament_status=tournament.status,
+                has_locked_deadlock_roster=await tournament_has_locked_deadlock_roster(
+                    db_session,
+                    tournament=tournament,
+                ),
+                action_name="Deadlock roster locking",
+            )
+        except TournamentWorkflowError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     try:
         rebalanced, unavailable_user_ids = await finalize_deadlock_assignment_with_commitments(
@@ -6897,6 +7027,7 @@ async def lock_deadlock_auto_assignment_run(
             now=auth_session.now,
         )
     except (AutoAssignmentError, AutoAssignmentRunWorkflowError, TournamentWorkflowError) as exc:
+        await db_session.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
@@ -6948,6 +7079,22 @@ async def join_tournament(
     )
     if preflight is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found.")
+    if preflight.has_existing_participant:
+        existing_participant = await participant_for_user(
+            db_session,
+            tournament_id=preflight.tournament.id,
+            user_id=auth_session.user.id,
+        )
+        if existing_participant is not None and participant_status_is_inactive(
+            existing_participant.status
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Inactive participants cannot change tournament membership; "
+                    "the organizer must explicitly restore the participant first."
+                ),
+            )
     idempotency = await reserve_mutation_idempotency(
         db_session,
         actor_user_id=auth_session.user.id,
@@ -7120,12 +7267,12 @@ async def leave_tournament(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="You are not registered in this tournament.",
         )
-    if participant.status == "disqualified":
+    if participant.status in INACTIVE_PARTICIPANT_STATUSES:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail=(
-                "Disqualified participant records are retained until the organizer "
-                "explicitly restores the participant."
+                "Inactive participant records cannot be changed by the participant; "
+                "the organizer must explicitly restore the participant first."
             ),
         )
     if participant.status in {"confirmed", "checked_in"}:
@@ -7288,7 +7435,12 @@ async def get_tournament_workspace(
     participants_offset: int = Query(default=0, ge=0),
     workspace_view: Literal["detail", "bracket", "bracket_summary"] = Query(default="bracket"),
     include_current_user: bool = Query(default=True),
-    invite_code: str | None = Query(default=None, min_length=6, max_length=64),
+    invite_code: str | None = Query(
+        default=None,
+        min_length=10,
+        max_length=24,
+        pattern=r"^[A-Za-z0-9]+$",
+    ),
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentWorkspaceResponse | Response:
@@ -7467,7 +7619,7 @@ async def get_tournament_workspace(
             participant_count,
             locked_roster_count,
         ) = row
-    normalized_invite_code = normalize_invite_code(invite_code or "")
+    normalized_invite_code = normalize_strict_invite_code(invite_code)
     invite_code_record = None
     has_valid_invite_code = False
     with measure_workspace_stage("workspace_invite"):
@@ -7534,23 +7686,12 @@ async def get_tournament_workspace(
             has_participant_record=has_participant_record,
             has_valid_invite_code=has_valid_invite_code,
         )
-    invite_code = None
-    if should_include_workspace_invite_code(
-        tournament,
-        auth_session=auth_session,
-        participant_record=participant_record,
+    invite_code = validated_workspace_invite_code(
+        invite_code_record=invite_code_record,
+        has_valid_invite_code=has_valid_invite_code,
         workspace_visible=workspace_visible,
-    ):
-        with measure_workspace_stage("workspace_invite"):
-            invite_code = await db_session.scalar(
-                select(TournamentInvite.code)
-                .where(
-                    TournamentInvite.tournament_id == tournament.id,
-                    TournamentInvite.revoked_at.is_(None),
-                )
-                .order_by(TournamentInvite.created_at.asc())
-                .limit(1)
-            )
+        participant_record=participant_record,
+    )
     with measure_workspace_stage("workspace_serialization"):
         tournament_response = serialize_tournament(
             tournament,
@@ -7753,10 +7894,19 @@ async def get_tournament_workspace(
     return serialized_response
 
 
-@router.get("/{slug}", response_model=TournamentResponse)
+@router.get(
+    "/{slug}",
+    response_model=TournamentResponse,
+    dependencies=[Depends(enforce_tournament_bearer_read_rate_limit)],
+)
 async def get_tournament(
     slug: str,
-    invite_code: str | None = Query(default=None, min_length=6, max_length=64),
+    invite_code: str | None = Query(
+        default=None,
+        min_length=10,
+        max_length=24,
+        pattern=r"^[A-Za-z0-9]+$",
+    ),
     auth_session=Depends(get_optional_authenticated_session),
     db_session: AsyncSession = Depends(get_db_session),
 ) -> TournamentResponse:

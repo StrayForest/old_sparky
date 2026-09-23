@@ -163,6 +163,14 @@ function headerAvatarUrl(request) {
 
 function actorForRequest(request) {
   const cookie = request.headers.cookie ?? "";
+  if (cookie.includes("non-admin-principal-smoke=1")) {
+    return {
+      id: "u_non_admin",
+      email: "player-only@example.test",
+      display_name: "Player Only",
+      roles: ["authenticated_user", "player"]
+    };
+  }
   if (cookie.includes("steam-only-smoke=1")) {
     return {
       id: "u_steam_only",
@@ -591,6 +599,15 @@ const server = createServer((request, response) => {
     const tournament = workspaceMatch[1] === bracketManagerTournament.slug
       ? bracketManagerTournament
       : tournaments.find((item) => item.slug === workspaceMatch[1]);
+    if (
+      !tournament
+      && (request.headers.cookie ?? "").includes("delayed-unknown-tournament-smoke=1")
+    ) {
+      setTimeout(() => {
+        json(response, 404, { detail: "Tournament not found." });
+      }, 250);
+      return;
+    }
     const actor = actorForRequest(request);
     json(
       response,
@@ -867,6 +884,10 @@ const server = createServer((request, response) => {
   }
   const tournamentProfileMatch = path.match(/^\/api\/v1\/tournaments\/night-veil-open-5\/profiles\/(u_shadow|u_echo)$/);
   if (tournamentProfileMatch) {
+    if ((request.headers.cookie ?? "").includes("private-profile-missing-smoke=1")) {
+      json(response, 404, { detail: "Tournament participant profile not found." });
+      return;
+    }
     const userId = tournamentProfileMatch[1];
     const isShadow = userId === "u_shadow";
     json(response, 200, {

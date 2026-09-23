@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-umask 022
+umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
+ORIGINAL_ARGS=("$@")
 SKIP_PYTHON_DEPS=0
 SEED_ENV_FROM=""
 STAGE_ONLY=0
@@ -45,6 +46,11 @@ orchestrator. Without it, this low-level installer retains the legacy pointer
 activation behavior for recovery/test compatibility; production deploys must
 never call that mode directly.
 
+The deploy orchestrator and direct invocations enter through the shared
+pathname-form release-lock supervisor. Numeric lock descriptors are never
+passed through the environment: util-linux `flock --close` treats a numeric
+argument as a pathname and release bodies must not inherit lock FDs.
+
 By default, app_dir is /opt/oldsparky/platform.
 EOF
       exit 0
@@ -56,11 +62,11 @@ EOF
 done
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "Usage: platform_release_install.sh [--stage-only] [--skip-python-deps] [--seed-env-from <env_file>] <artifact.tar.gz> [app_dir]" >&2
+  echo "RELEASE_INSTALL status=failed class=argument release_slug=unavailable" >&2
   exit 1
 fi
 if [[ "$EUID" -ne 0 ]]; then
-  echo "Platform release installation requires root." >&2
+  echo "RELEASE_INSTALL status=failed class=privilege release_slug=unavailable" >&2
   exit 1
 fi
 
@@ -70,29 +76,29 @@ TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TRANSACTION_TOOL="$TOOLS_DIR/platform_release_transaction.py"
 
 if [[ ! -f "$ARTIFACT_PATH" || -L "$ARTIFACT_PATH" ]]; then
-  echo "Artifact is missing or unsafe: $ARTIFACT_PATH" >&2
+  echo "RELEASE_INSTALL status=failed class=artifact release_slug=unavailable" >&2
   exit 1
 fi
 ARTIFACT_PATH="$(readlink -f "$ARTIFACT_PATH")"
 CHECKSUM_PATH="$ARTIFACT_PATH.sha256"
 if [[ ! -f "$CHECKSUM_PATH" || -L "$CHECKSUM_PATH" ]]; then
-  echo "Adjacent release checksum is missing or unsafe: $CHECKSUM_PATH" >&2
+  echo "RELEASE_INSTALL status=failed class=checksum release_slug=unavailable" >&2
   exit 1
 fi
 if [[ "$APP_DIR" != /* ]]; then
-  echo "Application directory must be an absolute path." >&2
+  echo "RELEASE_INSTALL status=failed class=argument release_slug=unavailable" >&2
   exit 1
 fi
 if [[ -n "$SEED_ENV_FROM" ]]; then
   if [[ ! -f "$SEED_ENV_FROM" || -L "$SEED_ENV_FROM" ]]; then
-    echo "Seed env file is missing or unsafe: $SEED_ENV_FROM" >&2
+    echo "RELEASE_INSTALL status=failed class=environment release_slug=unavailable" >&2
     exit 1
   fi
   SEED_ENV_FROM="$(readlink -f "$SEED_ENV_FROM")"
-  SEED_UID="$(stat -c %u "$SEED_ENV_FROM")"
-  SEED_MODE="$(stat -c %a "$SEED_ENV_FROM")"
+  SEED_UID="$(stat -c %u "$SEED_ENV_FROM" 2>/dev/null)"
+  SEED_MODE="$(stat -c %a "$SEED_ENV_FROM" 2>/dev/null)"
   if [[ "$SEED_UID" != "0" || $((8#$SEED_MODE & 8#022)) -ne 0 ]]; then
-    echo "Seed env file ownership or permissions are unsafe." >&2
+    echo "RELEASE_INSTALL status=failed class=environment release_slug=unavailable" >&2
     exit 1
   fi
 fi
@@ -102,18 +108,53 @@ case "$(basename "$ARTIFACT_PATH")" in
     RELEASE_SLUG="$(basename "$ARTIFACT_PATH" .tar.gz)"
     ;;
   *)
-    echo "Artifact must end with .tar.gz: $ARTIFACT_PATH" >&2
+    echo "RELEASE_INSTALL status=failed class=artifact release_slug=unavailable" >&2
     exit 1
     ;;
 esac
 if [[ ! "$RELEASE_SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]]; then
-  echo "Artifact release slug is unsafe." >&2
+  echo "RELEASE_INSTALL status=failed class=artifact release_slug=unavailable" >&2
   exit 1
 fi
 
+PUBLIC_RELEASE_SLUG="$RELEASE_SLUG"
+public_status() {
+  local status="$1"
+  local class="$2"
+  printf 'RELEASE_INSTALL schema=1 status=%s class=%s release_slug=%s\n' \
+    "$status" "$class" "$PUBLIC_RELEASE_SLUG"
+}
+
+LOCK_HELPER="$TOOLS_DIR/platform_release_lock.sh"
+if [[ ! -f "$LOCK_HELPER" || -L "$LOCK_HELPER" ]]; then
+  echo "RELEASE_INSTALL status=failed class=lock release_slug=$PUBLIC_RELEASE_SLUG" >&2
+  exit 3
+fi
+# The pathname-form supervisor owns the release lock before the first
+# APP_DIR/releases/shared mutation.  A nested installer re-validates its live
+# /usr/bin/flock parent; no numeric descriptor is inherited or accepted.
+# shellcheck source=/dev/null
+source "$LOCK_HELPER"
+platform_release_lock_supervise "${ORIGINAL_ARGS[@]}" || {
+  lock_status=$?
+  if [[ "$lock_status" -eq "$PLATFORM_RELEASE_LOCK_CONFLICT_EXIT_CODE" ]]; then
+    echo "RELEASE_INSTALL status=failed class=lock release_slug=$PUBLIC_RELEASE_SLUG" >&2
+    exit 3
+  fi
+  exit "$lock_status"
+}
+if [[ "${PLATFORM_RELEASE_LOCK_SUPERVISED:-}" != "1" ]]; then
+  exit 0
+fi
+if ! platform_release_lock_open; then
+  echo "RELEASE_INSTALL status=failed class=lock release_slug=$PUBLIC_RELEASE_SLUG" >&2
+  exit 3
+fi
+trap platform_release_lock_close EXIT
+
 if [[ -e "$APP_DIR" || -L "$APP_DIR" ]]; then
   if [[ ! -d "$APP_DIR" || -L "$APP_DIR" ]]; then
-    echo "Application directory is unsafe: $APP_DIR" >&2
+    echo "RELEASE_INSTALL status=failed class=layout release_slug=$PUBLIC_RELEASE_SLUG" >&2
     exit 1
   fi
 else
@@ -121,7 +162,7 @@ else
 fi
 APP_DIR="$(readlink -f "$APP_DIR")"
 if [[ "$STAGE_ONLY" -eq 0 && "$APP_DIR" == "/opt/oldsparky/platform" ]]; then
-  echo "Direct production pointer activation is disabled; use platform_release_deploy.sh." >&2
+  echo "RELEASE_INSTALL status=failed class=production_guard release_slug=$PUBLIC_RELEASE_SLUG" >&2
   exit 1
 fi
 RELEASES_DIR="$APP_DIR/releases"
@@ -138,7 +179,7 @@ VENV_ROLLBACK_FREEZE_FILE="$VENV_ROLLBACK_DIR/shared-freeze.sha256"
 for REQUIRED_DIR in "$RELEASES_DIR" "$SHARED_DIR"; do
   if [[ -e "$REQUIRED_DIR" || -L "$REQUIRED_DIR" ]]; then
     if [[ ! -d "$REQUIRED_DIR" || -L "$REQUIRED_DIR" ]]; then
-      echo "Release install directory is unsafe: $REQUIRED_DIR" >&2
+      echo "RELEASE_INSTALL status=failed class=layout release_slug=$PUBLIC_RELEASE_SLUG" >&2
       exit 1
     fi
   else
@@ -149,46 +190,46 @@ for SAFE_DIR in "$APP_DIR" "$RELEASES_DIR" "$SHARED_DIR"; do
   SAFE_UID="$(stat -c %u "$SAFE_DIR")"
   SAFE_MODE="$(stat -c %a "$SAFE_DIR")"
   if [[ "$SAFE_UID" != "0" || $((8#$SAFE_MODE & 8#022)) -ne 0 ]]; then
-    echo "Release install directory ownership or permissions are unsafe: $SAFE_DIR" >&2
+    echo "RELEASE_INSTALL status=failed class=layout release_slug=$PUBLIC_RELEASE_SLUG" >&2
     exit 1
   fi
 done
 
-exec {RELEASE_LOCK_FD}<"$SHARED_DIR"
-if ! /usr/bin/flock -n "$RELEASE_LOCK_FD"; then
-  echo "Another platform install or rollback operation holds the release lock." >&2
-  exit 3
-fi
 TRANSACTION_STATE="$SHARED_DIR/.release-operation.json"
+PREPARE_RECEIPT=0
 if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
-  cat >&2 <<EOF
-A pending platform release operation must be recovered before installation.
-Run:
-  platform/tools/platform_release_rollback.sh --recover-pending --app-dir "$APP_DIR"
-Then retry the install command.
-EOF
-  exit 3
+  pending_phase=""
+  if pending_status="$(
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" status --state "$TRANSACTION_STATE" 2>/dev/null
+  )"; then
+    pending_phase="${pending_status#* }"
+  fi
+  if [[ "$pending_phase" == "quiesce-pending" ]]; then
+    PREPARE_RECEIPT=1
+  else
+    echo "RELEASE_INSTALL status=failed class=pending_operation release_slug=$PUBLIC_RELEASE_SLUG" >&2
+    exit 3
+  fi
 fi
 
 if [[ -e "$RELEASE_DIR" || -L "$RELEASE_DIR" ]]; then
-  echo "Release already exists: $RELEASE_DIR" >&2
+  echo "RELEASE_INSTALL status=failed class=duplicate release_slug=$PUBLIC_RELEASE_SLUG" >&2
   exit 1
 fi
 
 validate_installed_release_target() {
   local target="$1"
-  local label="$2"
   if [[ -z "$target" || ! -d "$target" || -L "$target" \
     || "$(dirname "$target")" != "$RELEASES_DIR" \
     || ! "$(basename "$target")" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]]; then
-    echo "$label does not name a contained installed release." >&2
+    echo "RELEASE_INSTALL status=failed class=layout release_slug=$PUBLIC_RELEASE_SLUG" >&2
     return 1
   fi
   local target_uid target_mode
-  target_uid="$(stat -c %u "$target")"
-  target_mode="$(stat -c %a "$target")"
+  target_uid="$(stat -c %u "$target" 2>/dev/null)"
+  target_mode="$(stat -c %a "$target" 2>/dev/null)"
   if [[ "$target_uid" != "0" || $((8#$target_mode & 8#022)) -ne 0 ]]; then
-    echo "$label target ownership or permissions are unsafe." >&2
+    echo "RELEASE_INSTALL status=failed class=layout release_slug=$PUBLIC_RELEASE_SLUG" >&2
     return 1
   fi
 }
@@ -196,20 +237,26 @@ validate_installed_release_target() {
 PREVIOUS_TARGET=""
 if [[ -e "$APP_DIR/current" || -L "$APP_DIR/current" ]]; then
   if [[ ! -L "$APP_DIR/current" || "$(stat -c %u "$APP_DIR/current")" != "0" ]]; then
-    echo "Current release pointer is not a symlink." >&2
+    echo "RELEASE_INSTALL status=failed class=pointer release_slug=$PUBLIC_RELEASE_SLUG" >&2
     exit 1
   fi
-  PREVIOUS_TARGET="$(readlink -f "$APP_DIR/current" 2>/dev/null || true)"
-  validate_installed_release_target "$PREVIOUS_TARGET" "Current release pointer"
+  if ! PREVIOUS_TARGET="$(readlink -f "$APP_DIR/current" 2>/dev/null)"; then
+    echo "RELEASE_INSTALL status=failed class=pointer release_slug=$PUBLIC_RELEASE_SLUG" >&2
+    exit 1
+  fi
+  validate_installed_release_target "$PREVIOUS_TARGET"
 fi
 ORIGINAL_PREVIOUS_TARGET=""
 if [[ -e "$APP_DIR/previous" || -L "$APP_DIR/previous" ]]; then
   if [[ ! -L "$APP_DIR/previous" || "$(stat -c %u "$APP_DIR/previous")" != "0" ]]; then
-    echo "Previous release pointer is not a symlink." >&2
+    echo "RELEASE_INSTALL status=failed class=pointer release_slug=$PUBLIC_RELEASE_SLUG" >&2
     exit 1
   fi
-  ORIGINAL_PREVIOUS_TARGET="$(readlink -f "$APP_DIR/previous" 2>/dev/null || true)"
-  validate_installed_release_target "$ORIGINAL_PREVIOUS_TARGET" "Previous release pointer"
+  if ! ORIGINAL_PREVIOUS_TARGET="$(readlink -f "$APP_DIR/previous" 2>/dev/null)"; then
+    echo "RELEASE_INSTALL status=failed class=pointer release_slug=$PUBLIC_RELEASE_SLUG" >&2
+    exit 1
+  fi
+  validate_installed_release_target "$ORIGINAL_PREVIOUS_TARGET"
 fi
 
 INSTALL_COMPLETE=0
@@ -221,14 +268,31 @@ FREEZE_CHECK_FILE=""
 remove_tree() {
   local target="$1"
   if [[ -n "$target" && -d "$target" && ! -L "$target" ]]; then
-    chmod -R u+rwX "$target" 2>/dev/null || true
-    rm -rf -- "$target"
+    if ! chmod -R u+rwX "$target" 2>/dev/null; then
+      echo "RELEASE_INSTALL status=failed class=cleanup release_slug=$PUBLIC_RELEASE_SLUG" >&2
+      return 1
+    fi
+    if ! rm -rf -- "$target"; then
+      echo "RELEASE_INSTALL status=failed class=cleanup release_slug=$PUBLIC_RELEASE_SLUG" >&2
+      return 1
+    fi
   fi
 }
 
 cleanup_failed_install() {
   local cleanup_failed=0
   if [[ "$INSTALL_COMPLETE" -eq 1 ]]; then
+    platform_release_lock_close
+    return
+  fi
+  if [[ "$PREPARE_RECEIPT" -eq 1 \
+    && ( -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ) ]]; then
+    # The deploy wrapper owns the pre-quiesce receipt and must perform the
+    # recovery under its still-held release lock. Removing this state here
+    # would leave stopped writers untracked if the stage process is killed or
+    # fails after promoting the receipt.
+    echo "RELEASE_INSTALL status=failed class=pending_operation release_slug=$PUBLIC_RELEASE_SLUG" >&2
+    platform_release_lock_close
     return
   fi
   if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
@@ -236,8 +300,29 @@ cleanup_failed_install() {
       RELEASE_EXTRACTED=0
       CREATED_ENV=0
       NEW_VENV_DIR=""
+      # Transaction recovery restores the production pointer, but the
+      # digest-bound live-QA generation has its own durable pointer. Reconcile
+      # the restored release before removing the candidate so a failed
+      # activation cannot leave QA bound to a non-active release.
+      restored_current=""
+      if [[ -L "$APP_DIR/current" ]]; then
+        restored_current="$(readlink -f "$APP_DIR/current" 2>/dev/null || true)"
+      fi
+      if [[ -n "$restored_current" && "$(dirname "$restored_current")" == "$RELEASES_DIR" \
+        && -f "$restored_current/tools/platform_live_qa_runtime_install.py" \
+        && ! -L "$restored_current/tools/platform_live_qa_runtime_install.py" ]]; then
+        if ! "$SHARED_VENV_DIR/bin/python" -I \
+          "$restored_current/tools/platform_live_qa_runtime_install.py" \
+          reconcile --app-dir "$APP_DIR" >/dev/null 2>/dev/null; then
+          echo "RELEASE_INSTALL status=failed class=liveqa_runtime_recovery release_slug=$PUBLIC_RELEASE_SLUG" >&2
+          cleanup_failed=1
+        fi
+      elif [[ -n "$restored_current" ]]; then
+        echo "RELEASE_INSTALL status=failed class=liveqa_runtime_recovery release_slug=$PUBLIC_RELEASE_SLUG" >&2
+        cleanup_failed=1
+      fi
     else
-      echo "CRITICAL: durable release transaction recovery failed; state was retained." >&2
+      echo "RELEASE_INSTALL status=failed class=recovery release_slug=$PUBLIC_RELEASE_SLUG" >&2
       cleanup_failed=1
     fi
   fi
@@ -254,6 +339,7 @@ cleanup_failed_install() {
   if [[ -n "$FREEZE_CHECK_FILE" && -f "$FREEZE_CHECK_FILE" ]]; then
     rm -f -- "$FREEZE_CHECK_FILE"
   fi
+  platform_release_lock_close
 }
 trap cleanup_failed_install EXIT
 
@@ -261,21 +347,21 @@ trap cleanup_failed_install EXIT
   --artifact "$ARTIFACT_PATH" \
   --checksum "$CHECKSUM_PATH" \
   --release-slug "$RELEASE_SLUG" \
-  --extract-to "$RELEASES_DIR"
+  --extract-to "$RELEASES_DIR" >/dev/null 2>/dev/null
 RELEASE_EXTRACTED=1
 
 /usr/bin/python3 -I "$TOOLS_DIR/platform_validate_wheelhouse.py" verify \
   --wheelhouse "$RELEASE_DIR/wheelhouse" \
   --requirements "$RELEASE_DIR/requirements-platform.txt" \
   --lock "$RELEASE_DIR/requirements-platform.lock.txt" \
-  --freeze "$RELEASE_DIR/requirements-platform.freeze.txt"
+  --freeze "$RELEASE_DIR/requirements-platform.freeze.txt" >/dev/null 2>/dev/null
 
 if [[ ! -f "$RELEASE_DIR/apps/platform_web/.next/standalone/server.js" ]]; then
-  echo "Installed release is missing the Next.js standalone server artifact." >&2
+    echo "RELEASE_INSTALL status=failed class=artifact release_slug=$PUBLIC_RELEASE_SLUG" >&2
   exit 1
 fi
 if [[ ! -d "$RELEASE_DIR/apps/platform_web/.next/standalone/.next/static" ]]; then
-  echo "Installed release is missing the Next.js standalone static assets." >&2
+    echo "RELEASE_INSTALL status=failed class=artifact release_slug=$PUBLIC_RELEASE_SLUG" >&2
   exit 1
 fi
 
@@ -289,7 +375,7 @@ if [[ ! -f "$SHARED_ENV_FILE" ]]; then
   CREATED_ENV=1
 fi
 if [[ -L "$SHARED_ENV_FILE" || ! -f "$SHARED_ENV_FILE" ]]; then
-  echo "Shared env file is unsafe." >&2
+  echo "RELEASE_INSTALL status=failed class=environment release_slug=$PUBLIC_RELEASE_SLUG" >&2
   exit 1
 fi
 ENV_UID="$(stat -c %u "$SHARED_ENV_FILE")"
@@ -297,7 +383,7 @@ ENV_LINKS="$(stat -c %h "$SHARED_ENV_FILE")"
 ENV_MODE="$(stat -c %a "$SHARED_ENV_FILE")"
 if [[ "$ENV_UID" != "0" || "$ENV_LINKS" != "1" \
   || $((8#$ENV_MODE & 8#022)) -ne 0 ]]; then
-  echo "Shared env file ownership or permissions are unsafe." >&2
+  echo "RELEASE_INSTALL status=failed class=environment release_slug=$PUBLIC_RELEASE_SLUG" >&2
   exit 1
 fi
 # The canonical env contains database/session/R2 credentials. Keep it root-only
@@ -323,12 +409,12 @@ run_isolated_python() {
 verify_venv() {
   local venv_dir="$1"
   local freeze_output="$2"
-  run_isolated_python "$venv_dir/bin/python" -I -m pip check
+  run_isolated_python "$venv_dir/bin/python" -I -m pip check >/dev/null 2>/dev/null
   run_isolated_python "$venv_dir/bin/python" -I -m pip freeze --all \
-    | /usr/bin/sort >"$freeze_output"
+    2>/dev/null | /usr/bin/sort >"$freeze_output"
   if ! /usr/bin/cmp -s \
     "$RELEASE_DIR/requirements-platform.freeze.txt" "$freeze_output"; then
-    echo "Installed Python environment does not exactly match the artifact freeze." >&2
+    echo "RELEASE_INSTALL status=failed class=venv release_slug=$PUBLIC_RELEASE_SLUG" >&2
     return 1
   fi
 }
@@ -347,30 +433,30 @@ new_prefix = os.fsencode(destination)
 paths = [source / "pyvenv.cfg"]
 try:
     paths.extend(sorted(source.joinpath("bin").iterdir()))
-except OSError as exc:
-    raise SystemExit("fresh venv bin directory is unavailable") from exc
+except OSError:
+    raise SystemExit(1) from None
 for path in paths:
     try:
         metadata = path.lstat()
-    except OSError as exc:
-        raise SystemExit(f"fresh venv path is unavailable: {path.name}") from exc
+    except OSError:
+        raise SystemExit(1) from None
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         continue
     if metadata.st_uid != 0 or metadata.st_nlink != 1 or metadata.st_size > 4 * 1024 * 1024:
-        raise SystemExit(f"fresh venv path metadata is unsafe: {path.name}")
+        raise SystemExit(1)
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
         current = os.fstat(descriptor)
         if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
-            raise SystemExit(f"fresh venv path changed during relocation: {path.name}")
+            raise SystemExit(1)
         raw = b""
         while chunk := os.read(descriptor, 1024 * 1024):
             raw += chunk
         if old_prefix not in raw:
             continue
         if b"\x00" in raw:
-            raise SystemExit(f"fresh venv binary embeds its temporary path: {path.name}")
+            raise SystemExit(1)
         relocated = raw.replace(old_prefix, new_prefix)
         os.lseek(descriptor, 0, os.SEEK_SET)
         os.ftruncate(descriptor, 0)
@@ -378,7 +464,7 @@ for path in paths:
         while view:
             written = os.write(descriptor, view)
             if written <= 0:
-                raise SystemExit(f"fresh venv path relocation failed: {path.name}")
+                raise SystemExit(1)
             view = view[written:]
         os.fsync(descriptor)
     finally:
@@ -390,37 +476,37 @@ FREEZE_CHECK_FILE="$(mktemp "$SHARED_DIR/.freeze-check-$RELEASE_SLUG.XXXXXX")"
 if [[ -e "$SHARED_VENV_DIR" || -L "$SHARED_VENV_DIR" ]]; then
   if [[ ! -d "$SHARED_VENV_DIR" || -L "$SHARED_VENV_DIR" \
     || ! -x "$SHARED_VENV_DIR/bin/python" ]]; then
-    echo "Existing shared Python venv is unsafe." >&2
+    echo "RELEASE_INSTALL status=failed class=venv release_slug=$PUBLIC_RELEASE_SLUG" >&2
     exit 1
   fi
   VENV_UID="$(stat -c %u "$SHARED_VENV_DIR")"
   VENV_MODE="$(stat -c %a "$SHARED_VENV_DIR")"
   if [[ "$VENV_UID" != "0" || $((8#$VENV_MODE & 8#022)) -ne 0 ]]; then
-    echo "Existing shared Python venv ownership or permissions are unsafe." >&2
+    echo "RELEASE_INSTALL status=failed class=venv release_slug=$PUBLIC_RELEASE_SLUG" >&2
     exit 1
   fi
 fi
 if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
   if [[ ! -x "$SHARED_VENV_DIR/bin/python" ]]; then
-    echo "--skip-python-deps requires an existing shared Python venv." >&2
+    echo "RELEASE_INSTALL status=failed class=venv release_slug=$PUBLIC_RELEASE_SLUG" >&2
     exit 1
   fi
   verify_venv "$SHARED_VENV_DIR" "$FREEZE_CHECK_FILE"
 else
   NEW_VENV_DIR="$(mktemp -d "$SHARED_DIR/.venv-install-$RELEASE_SLUG.XXXXXX")"
-  /usr/bin/python3 -I -m venv "$NEW_VENV_DIR"
+  /usr/bin/python3 -I -m venv "$NEW_VENV_DIR" >/dev/null 2>/dev/null
   shopt -s nullglob
   PIP_WHEELS=("$RELEASE_DIR"/wheelhouse/pip-*.whl)
   shopt -u nullglob
   if (( ${#PIP_WHEELS[@]} != 1 )); then
-    echo "Release wheelhouse must contain exactly one pinned pip wheel." >&2
+    echo "RELEASE_INSTALL status=failed class=wheelhouse release_slug=$PUBLIC_RELEASE_SLUG" >&2
     exit 1
   fi
   run_isolated_python "$NEW_VENV_DIR/bin/python" -I -m pip install \
     --no-index \
     --no-deps \
     --force-reinstall \
-    "${PIP_WHEELS[0]}"
+    "${PIP_WHEELS[0]}" >/dev/null 2>/dev/null
   run_isolated_python "$NEW_VENV_DIR/bin/python" -I -m pip install \
     --no-index \
     --find-links "$RELEASE_DIR/wheelhouse" \
@@ -428,8 +514,8 @@ else
     --upgrade \
     --force-reinstall \
     --require-hashes \
-    --requirement "$RELEASE_DIR/requirements-platform.lock.txt"
-  relocate_venv_paths "$NEW_VENV_DIR" "$SHARED_VENV_DIR"
+    --requirement "$RELEASE_DIR/requirements-platform.lock.txt" >/dev/null 2>/dev/null
+  relocate_venv_paths "$NEW_VENV_DIR" "$SHARED_VENV_DIR" >/dev/null 2>/dev/null
   verify_venv "$NEW_VENV_DIR" "$FREEZE_CHECK_FILE"
   chmod 0755 "$NEW_VENV_DIR"
   rm -f -- "$FREEZE_CHECK_FILE"
@@ -440,7 +526,7 @@ else
     TRANSACTION_TRANSITION="exchange"
     install -d -o root -g root -m 0700 "$VENV_ROLLBACK_DIR"
     if [[ -e "$VENV_ROLLBACK_SNAPSHOT_DIR" || -L "$VENV_ROLLBACK_SNAPSHOT_DIR" ]]; then
-      echo "Release venv rollback snapshot already exists." >&2
+      echo "RELEASE_INSTALL status=failed class=rollback_metadata release_slug=$PUBLIC_RELEASE_SLUG" >&2
       exit 1
     fi
     if [[ -n "$PREVIOUS_TARGET" ]]; then
@@ -450,19 +536,31 @@ else
     printf 'snapshot\n' >"$VENV_ROLLBACK_TRANSITION_FILE"
     chmod 0600 "$VENV_ROLLBACK_TRANSITION_FILE"
   fi
-  TRANSACTION_CREATE_ARGS=(
-    create
-    --state "$TRANSACTION_STATE"
-    --operation install
-    --app-dir "$APP_DIR"
-    --current-before "$PREVIOUS_TARGET"
-    --previous-before "$ORIGINAL_PREVIOUS_TARGET"
-    --candidate-release "$RELEASE_DIR"
-    --shared-venv "$SHARED_VENV_DIR"
-    --peer "$NEW_VENV_DIR"
-    --snapshot "$VENV_ROLLBACK_SNAPSHOT_DIR"
-    --transition "$TRANSACTION_TRANSITION"
-  )
+  if [[ "$PREPARE_RECEIPT" -eq 1 ]]; then
+    TRANSACTION_CREATE_ARGS=(
+      promote-quiesce
+      --state "$TRANSACTION_STATE"
+      --candidate-release "$RELEASE_DIR"
+      --shared-venv "$SHARED_VENV_DIR"
+      --peer "$NEW_VENV_DIR"
+      --snapshot "$VENV_ROLLBACK_SNAPSHOT_DIR"
+      --transition "$TRANSACTION_TRANSITION"
+    )
+  else
+    TRANSACTION_CREATE_ARGS=(
+      create
+      --state "$TRANSACTION_STATE"
+      --operation install
+      --app-dir "$APP_DIR"
+      --current-before "$PREVIOUS_TARGET"
+      --previous-before "$ORIGINAL_PREVIOUS_TARGET"
+      --candidate-release "$RELEASE_DIR"
+      --shared-venv "$SHARED_VENV_DIR"
+      --peer "$NEW_VENV_DIR"
+      --snapshot "$VENV_ROLLBACK_SNAPSHOT_DIR"
+      --transition "$TRANSACTION_TRANSITION"
+    )
+  fi
   if [[ "$CREATED_ENV" -eq 1 ]]; then
     TRANSACTION_CREATE_ARGS+=(--remove-env-on-recovery)
   fi
@@ -507,7 +605,7 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
       || -L "$VENV_ROLLBACK_TRANSITION_FILE" \
       || -e "$VENV_ROLLBACK_FREEZE_FILE" \
       || -L "$VENV_ROLLBACK_FREEZE_FILE" ]]; then
-      echo "Skip-dependency rollback metadata already exists." >&2
+      echo "RELEASE_INSTALL status=failed class=rollback_metadata release_slug=$PUBLIC_RELEASE_SLUG" >&2
       exit 1
     fi
     printf '%s\n' "$PREVIOUS_TARGET" >"$VENV_ROLLBACK_PREVIOUS_FILE"
@@ -517,7 +615,7 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
     )"
     FREEZE_DIGEST="${FREEZE_DIGEST%% *}"
     if [[ ! "$FREEZE_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
-      echo "Artifact freeze digest is invalid." >&2
+      echo "RELEASE_INSTALL status=failed class=artifact release_slug=$PUBLIC_RELEASE_SLUG" >&2
       exit 1
     fi
     printf '%s\n' "$FREEZE_DIGEST" >"$VENV_ROLLBACK_FREEZE_FILE"
@@ -527,19 +625,31 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
       "$VENV_ROLLBACK_FREEZE_FILE"
   fi
   SKIP_TRANSACTION_PEER="$SHARED_DIR/.venv-install-$RELEASE_SLUG.none"
-  TRANSACTION_CREATE_ARGS=(
-    create
-    --state "$TRANSACTION_STATE"
-    --operation install
-    --app-dir "$APP_DIR"
-    --current-before "$PREVIOUS_TARGET"
-    --previous-before "$ORIGINAL_PREVIOUS_TARGET"
-    --candidate-release "$RELEASE_DIR"
-    --shared-venv "$SHARED_VENV_DIR"
-    --peer "$SKIP_TRANSACTION_PEER"
-    --snapshot "$VENV_ROLLBACK_SNAPSHOT_DIR"
-    --transition none
-  )
+  if [[ "$PREPARE_RECEIPT" -eq 1 ]]; then
+    TRANSACTION_CREATE_ARGS=(
+      promote-quiesce
+      --state "$TRANSACTION_STATE"
+      --candidate-release "$RELEASE_DIR"
+      --shared-venv "$SHARED_VENV_DIR"
+      --peer "$SKIP_TRANSACTION_PEER"
+      --snapshot "$VENV_ROLLBACK_SNAPSHOT_DIR"
+      --transition none
+    )
+  else
+    TRANSACTION_CREATE_ARGS=(
+      create
+      --state "$TRANSACTION_STATE"
+      --operation install
+      --app-dir "$APP_DIR"
+      --current-before "$PREVIOUS_TARGET"
+      --previous-before "$ORIGINAL_PREVIOUS_TARGET"
+      --candidate-release "$RELEASE_DIR"
+      --shared-venv "$SHARED_VENV_DIR"
+      --peer "$SKIP_TRANSACTION_PEER"
+      --snapshot "$VENV_ROLLBACK_SNAPSHOT_DIR"
+      --transition none
+    )
+  fi
   if [[ "$CREATED_ENV" -eq 1 ]]; then
     TRANSACTION_CREATE_ARGS+=(--remove-env-on-recovery)
   fi
@@ -551,6 +661,7 @@ if [[ "$SKIP_PYTHON_DEPS" -eq 1 ]]; then
 fi
 
 if [[ "$STAGE_ONLY" -eq 1 ]]; then
+  # Install units and prepare release-specific writable paths before activation.
   trap '' HUP INT TERM
   /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
     --state "$TRANSACTION_STATE" \
@@ -558,19 +669,9 @@ if [[ "$STAGE_ONLY" -eq 1 ]]; then
     --phase staged
   trap - HUP INT TERM
   INSTALL_COMPLETE=1
+  platform_release_lock_close
   trap - EXIT
-  cat <<EOF
-Platform release staged.
-
-Candidate release:
-  $RELEASE_DIR
-Transaction state:
-  $TRANSACTION_STATE
-
-The end-to-end deploy orchestrator must now make the migration decision,
-activate the pointers, restart/readiness-check services, run smoke and commit
-the transaction. Do not remove the transaction state manually.
-EOF
+  public_status passed staged
   exit 0
 fi
 
@@ -600,30 +701,20 @@ trap '' HUP INT TERM
   --state "$TRANSACTION_STATE" \
   --expected "$POINTER_PHASE" \
   --phase pointers-switched
+# The active release and the trusted live-QA generation are one release
+# identity.  Reconcile while the canonical release lock is still held; a
+# failure leaves the transaction retained for guarded pointer/runtime recovery.
+LIVE_QA_RUNTIME_INSTALLER="$RELEASE_DIR/tools/platform_live_qa_runtime_install.py"
+if [[ ! -f "$LIVE_QA_RUNTIME_INSTALLER" || -L "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
+  echo "RELEASE_INSTALL status=failed class=liveqa_runtime release_slug=$PUBLIC_RELEASE_SLUG" >&2
+  exit 1
+fi
+"$SHARED_VENV_DIR/bin/python" -I "$LIVE_QA_RUNTIME_INSTALLER" \
+  reconcile --app-dir "$APP_DIR" >/dev/null
 /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
 INSTALL_COMPLETE=1
+platform_release_lock_close
 trap - HUP INT TERM
 trap - EXIT
 
-cat <<EOF
-Platform release installed.
-
-Current release:
-  $RELEASE_DIR
-Shared env file:
-  $SHARED_ENV_FILE
-Shared venv:
-  $SHARED_VENV_DIR
-
-Next steps:
-1. Review the shared env file and set production values if this is the first deploy.
-2. Run migrations:
-   cd "$APP_DIR/current" && PLATFORM_ENV_FILE="$SHARED_ENV_FILE" PLATFORM_PYTHON_BIN="$SHARED_VENV_DIR/bin/python" tools/platform_run_alembic.sh upgrade head
-3. Install units and prepare release-specific writable paths:
-   cd "$APP_DIR/current" && tools/platform_install_systemd_units.sh
-4. Restart services:
-   systemctl restart deadlock-api deadlock-worker deadlock-web
-5. Verify readiness:
-   curl -sS http://127.0.0.1:8010/api/v1/health/ready
-   curl -sS http://127.0.0.1:3000/
-EOF
+public_status installed installed

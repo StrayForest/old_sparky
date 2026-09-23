@@ -30,6 +30,7 @@ from python_packages.platform_domain.tournaments import (
     ensure_match_team_ids_are_locked,
     ensure_participant_restoration_allowed,
     ensure_invite_claimable,
+    invite_is_active,
     next_match_statuses,
     next_participant_statuses,
     next_tournament_statuses,
@@ -626,4 +627,25 @@ class PlatformTournamentWorkflowTests(unittest.TestCase):
             revoked_at=None,
             expires_at=datetime.now(UTC) + timedelta(hours=1),
             now=datetime.now(UTC),
+        )
+
+    def test_invite_read_activity_ignores_legacy_usage_counters(self):
+        now = datetime.now(UTC)
+        self.assertTrue(
+            invite_is_active(
+                max_uses=1,
+                use_count=1,
+                revoked_at=None,
+                expires_at=now + timedelta(minutes=1),
+                now=now,
+            )
+        )
+        self.assertFalse(
+            invite_is_active(
+                max_uses=500,
+                use_count=0,
+                revoked_at=now,
+                expires_at=None,
+                now=now,
+            )
         )

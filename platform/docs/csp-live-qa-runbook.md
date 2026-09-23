@@ -153,19 +153,24 @@ each release. Do not run the contours concurrently or start the manual contour
 until the automated inventory, users, sessions, tournament and media have all
 been confirmed absent.
 
-The automated journey runs from the source checkout because release artifacts
-intentionally exclude tests and `node_modules`. The checkout must be the
-reviewed source for the release being exercised; the supervisor installs exact
-dependencies from the tracked lockfile into its immutable cache. Run as root
-and first create the root-only bundle through the public shell wrapper:
+The credential-bearing automated journey never runs a candidate checkout or an
+unverified mailbox helper. Every release artifact must contain the reviewed,
+minimal `liveqa-runtime` member: pinned Node, the three Playwright packages,
+the reviewed journey/configuration, checksum-pinned browser archives and a
+content manifest. Release activation reconciles that member under the
+canonical release lock into the digest-bound generation at
+`/root/.oldsparky/liveqa/releases/<source-sha>` and atomically switches the
+active pointer. The fixed root-owned supervisor at
+`/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh` (mode `0755`) then
+dispatches only that active generation; a missing, stale, symlinked or
+interrupted installation fails closed. The host still needs the dedicated
+account/AppArmor profile. Run as root and first create the root-only bundle
+through the public shell wrapper:
 
 ```bash
 cd /root/old_sparky
 install -d -o root -g root -m 0700 /root/.oldsparky/liveqa
 platform/tools/platform_install_live_qa_user.sh --apply
-install -o root -g root -m 0500 \
-  platform/tools/platform_live_qa_mailbox_helper.py \
-  /root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py
 PLATFORM_APP_DIR=/opt/oldsparky/platform \
 platform/tools/platform_provision_live_csp_qa.sh \
   --marker liveqa-csp-candidate-<unique> \
@@ -174,11 +179,12 @@ platform/tools/platform_provision_live_csp_qa.sh \
   --mailbox-helper /root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py
 ```
 
-For an existing bundle, both automated live workflows refresh the installed
-mailbox helper from the exact-SHA trusted checkout while holding the machine
-release lock, before starting the browser supervisor. The provenance guard then
-checks the helper digest and `0500` root-only mode. This repairs a stale helper
-without replacing the bundle or credentials; never bypass the guard or copy a
+For an existing bundle, release reconciliation owns the fixed mailbox helper
+alongside the supervisor and dispatcher. Automated secret-bearing workflows
+never refresh it from a checkout. The dispatcher checks the fixed
+`/root/.oldsparky/liveqa/platform_live_qa_mailbox_helper.py` path, root-only
+`0500` mode, its active-manifest digest and the bundle's exact helper binding
+before invoking the trusted supervisor. Never bypass that check or copy a
 helper from an unrelated checkout.
 
 The canonical automated journey dispatch is:
@@ -190,8 +196,19 @@ gh workflow run platform-live-user-qa.yml \
 ```
 
 Dispatch only after the exact deployed `dev` SHA is confirmed. The workflow
-creates no fixture until the release lock, checkout, helper, bundle and browser
-preflight checks pass.
+creates no fixture until the release lock, active-SHA check, host-installed
+supervisor/helper, bundle and browser preflight checks pass.
+
+The launch workflow validates `base_url`, `provision` and the optional marker
+with the canonical bounded-ASCII workflow-input parser before it creates any
+SSH key file or performs keyscan. It hands the accepted values to the remote
+host as private mode-0600 JSON on stdin; the SSH command contains only the
+literal `live-launch` dispatcher mode. The remote dispatcher and
+`platform_live_launch_supervisor.sh` validate the values again and pass them to
+the supervisor as fixed-argv data. Shell punctuation, quotes, newlines,
+command substitutions, option-like prefixes, Unicode/control/NUL-equivalent
+and overlong markers are rejected without reaching SSH, and rejected values
+are never printed in the browser report.
 
 To rotate a stale existing bundle, dispatch the same launch workflow with
 `provision=true` and a fresh marker. The provisioner does not unlink the old
@@ -211,14 +228,14 @@ gh workflow run platform-live-launch.yml \
 The dedicated `oldsparky-liveqa` system account has `/nonexistent` as its home,
 `/usr/sbin/nologin` as its shell, its same-named non-root primary group and no
 supplementary groups. Never substitute `oldsparky` or `oldsparky-platform`:
-those identities own deployment or production-runtime paths. The wrappers
-also require a clean `platform/` checkout whose `HEAD` exactly matches the
-active `current/RELEASE.json` source commit, and require the installed helper's
-SHA-256 to match the reviewed helper in that checkout.
+those identities own deployment or production-runtime paths. The trusted
+supervisor consumes only the active release-bound generation; it checks the
+active `current/RELEASE.json` source commit before starting and refuses any
+candidate-provided path that is not digest-bound by the installed manifest.
 
 The same installer loads two named AppArmor profiles granting `userns` only to
 the checksum-pinned Chromium and headless-shell revision paths below the
-root-owned immutable runtime cache. It validates the profile before loading it
+root-owned immutable installed runtime. It validates the profile before loading it
 and requires the installed root-owned `0644` copy to match the reviewed source.
 Keep `kernel.apparmor_restrict_unprivileged_userns=1` and
 `kernel.unprivileged_userns_clone=1`; automated preflight refuses a disabled
@@ -270,39 +287,35 @@ PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com \
 platform/tools/platform_live_browser_qa.sh public
 ```
 
-On the first run for a reviewed commit, the supervisor builds a root-owned,
-read-only cache under `/var/lib/oldsparky-liveqa/runtime-<source-commit>`. It
-uses the pinned official Node 26 archive checksum, `npm ci` from the tracked
-package lock, the exact Playwright browser revision, and a content manifest;
-drift is refused. Chromium runs as `oldsparky-liveqa` with its matching
-root-owned mode `4755` SUID sandbox helper. Do not disable the sandbox, change
-the global AppArmor/sysctl contour, or add
+The supervisor consumes the already-installed, root-owned immutable runtime
+under `/root/.oldsparky/liveqa/releases/<source-commit>/runtime`. The release
+builder obtains the pinned official Node 26 executable, lock-installed
+Playwright packages, exact browser revisions and checksum-pinned browser
+archives; the runtime and payload manifests are verified again on the host.
+Chromium runs as `oldsparky-liveqa` with its matching root-owned mode `4755`
+SUID sandbox helper at the exact reviewed path and digest. Do not disable the
+sandbox, change the global AppArmor/sysctl contour, or add
 `--no-sandbox`/`--disable-setuid-sandbox`. The only AppArmor exception is the
 reviewed profile installed above for the two pinned executable paths.
 
-Daily platform maintenance prunes only strict
-`/var/lib/oldsparky-liveqa/runtime-<40 lowercase hex>` cache directories,
-protecting the live `current` and `previous` source commits and keeping exactly
-the newest additional fallback. Storage maintenance holds the release and
-source-build locks before taking the same machine-wide lock as live QA. The
-guard refuses a non-idle QA identity/cgroup and validates root ownership plus
-the read-only cache/manifest/type/device/symlink contract. It intentionally
-does not recompute the multi-gigabyte content digest during retention; the
-runtime reuse path still verifies that digest before execution. Deletion uses
-a validated hidden tombstone so the next maintenance run can reclaim an
-interrupted deletion. The standalone command also takes the release lock and is
-dry-run unless `--apply` is supplied. Preview and apply commands are owned by the
+Release reconciliation retains only inactive generation directories after
+exact active/current/previous SHA identity checks; it never removes the active
+generation or a secret bundle. The guard and dispatcher recompute payload/file
+digests before execution, reject symlinks and every special bit except the
+exact checksum-pinned sandbox, and fail closed on an interrupted
+pointer/manifest switch. Storage maintenance still owns the legacy
+`/var/lib/oldsparky-liveqa/runtime-<40 lowercase hex>` fallback caches used by
+the non-trusted browser contour. Preview and apply commands are owned by the
 [operations runbook](operations-runbook.md#retention-and-disk-safety).
 
-Bind the source checkout to the production app directory and run the journey
-on the server:
+The normal workflow dispatch runs the host-installed trusted supervisor on the
+server. For a manually controlled host run, invoke that same fixed path:
 
 ```bash
-cd /root/old_sparky
 PLATFORM_APP_DIR=/opt/oldsparky/platform \
 PLATFORM_LIVE_CSP_QA_BUNDLE=/root/.oldsparky/liveqa/csp-live-qa.json \
 PLAYWRIGHT_LIVE_BASE_URL=https://old-sparky.com \
-platform/tools/platform_live_user_qa.sh
+/root/.oldsparky/liveqa/platform_live_user_qa_trusted.sh
 ```
 
 Before Playwright starts, the wrapper derives the marker from the bundle and

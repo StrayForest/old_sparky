@@ -603,6 +603,7 @@ export function AccountProfileTab({
                 <Link
                   className="secondary-button"
                   href="/reset-password?returnTo=%2Fprofile%2Fme%3Ftab%3Daccount"
+                  prefetch={false}
                 >
                   {t("profile.setPassword")}
                 </Link>

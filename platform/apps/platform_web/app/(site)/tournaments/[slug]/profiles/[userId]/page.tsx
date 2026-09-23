@@ -1,28 +1,30 @@
 import type { Metadata } from "next";
-import { cookies } from "next/headers";
 import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 import { HistoryBackLink } from "@/components/layout/history-back-link";
 import { Hero } from "@/components/layout/hero";
 import { PublicProfileView } from "@/components/profile/public-profile-view";
-import { getTournamentPlayerProfile } from "@/lib/platform-api";
+import { resolveTournamentPlayerProfile } from "@/lib/tournament-player-profile-page";
 
-export const metadata: Metadata = {
-  title: "Профиль участника",
-  robots: { index: false, follow: false }
+type TournamentPlayerProfilePageProps = {
+  params: Promise<{ slug: string; userId: string }>;
 };
+
+export async function generateMetadata({
+  params
+}: TournamentPlayerProfilePageProps): Promise<Metadata> {
+  const { slug, userId } = await params;
+  const profile = await resolveTournamentPlayerProfile(slug, userId);
+  return profile
+    ? { title: "Профиль участника", robots: { index: false, follow: false } }
+    : { title: "Профиль участника" };
+}
 
 export default async function TournamentPlayerProfilePage({
   params
-}: {
-  params: Promise<{ slug: string; userId: string }>;
-}) {
+}: TournamentPlayerProfilePageProps) {
   const { slug, userId } = await params;
-  const cookieHeader = (await cookies()).toString();
-  if (!cookieHeader) {
-    notFound();
-  }
-  const profile = await getTournamentPlayerProfile(slug, userId, { cookie: cookieHeader });
+  const profile = await resolveTournamentPlayerProfile(slug, userId);
   if (!profile) {
     notFound();
   }

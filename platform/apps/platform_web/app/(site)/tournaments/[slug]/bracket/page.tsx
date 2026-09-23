@@ -5,7 +5,7 @@ import { ArrowLeft } from "lucide-react";
 import { BracketBoard } from "@/components/bracket/bracket-board";
 import { Hero } from "@/components/layout/hero";
 import { HistoryBackLink } from "@/components/layout/history-back-link";
-import { getTournamentWorkspace, PlatformApiError } from "@/lib/platform-api";
+import { getTournamentWorkspace, normalizeTournamentInviteCode, PlatformApiError } from "@/lib/platform-api";
 
 export const metadata: Metadata = {
   title: "Сетка турнира"
@@ -16,11 +16,11 @@ export default async function TournamentBracketPage({
   searchParams
 }: {
   params: Promise<{ slug: string }>;
-  searchParams?: Promise<{ invite_code?: string }>;
+  searchParams?: Promise<{ invite_code?: string | string[] }>;
 }) {
   const { slug } = await params;
   const resolvedSearchParams = await searchParams;
-  const inviteCode = resolvedSearchParams?.invite_code?.trim().toUpperCase() || undefined;
+  const inviteCode = normalizeTournamentInviteCode(resolvedSearchParams?.invite_code);
   const cookieHeader = (await cookies()).toString();
   const requestHeaders: HeadersInit = cookieHeader ? { cookie: cookieHeader } : {};
 
@@ -53,7 +53,7 @@ export default async function TournamentBracketPage({
           <ArrowLeft aria-hidden="true" size={18} />
           Назад к турниру
         </HistoryBackLink>
-        <BracketBoard initialBracket={tournament.bracket} slug={slug} />
+        <BracketBoard initialBracket={tournament.bracket} inviteCode={inviteCode} slug={slug} />
       </main>
     </>
   );

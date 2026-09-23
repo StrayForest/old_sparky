@@ -22,9 +22,6 @@ jobs:
     timeout-minutes: 15
     environment: production
     env:
-      PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
-      PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
-      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
       EXPECTED_SHA: ${{ inputs.expected_sha }}
     steps:
       - name: Validate diagnostic inputs
@@ -33,14 +30,27 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production storage diagnostics must run from dev." >&2; exit 1; }
+
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] \
-            || { echo "expected_sha must be a 40-character commit SHA." >&2; exit 1; }
+            || { echo "expected_sha must be a lowercase 40-character commit SHA." >&2; exit 1; }
+
+      - name: Validate production SSH inputs
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
           test -n "${PROD_SSH_HOST:-}" || { echo "PROD_SSH_HOST is not configured." >&2; exit 1; }
           test -n "${PROD_SSH_USER:-}" || { echo "PROD_SSH_USER is not configured." >&2; exit 1; }
           test -n "${PROD_SSH_KEY:-}" || { echo "PROD_SSH_KEY is not configured." >&2; exit 1; }
 
       - name: Configure pinned production SSH
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
           ssh_dir="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh"
@@ -48,7 +58,10 @@ jobs:
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
           ssh_scan="$ssh_dir/known_hosts.scan"
-          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          if ! ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan" 2>/dev/null; then
+            echo "Production SSH host key scan failed." >&2
+            exit 1
+          fi
           test -s "$ssh_scan" || { echo "Production SSH host exposed no ED25519 host key." >&2; exit 1; }
           test "$(wc -l < "$ssh_scan" | tr -d ' ')" = "1" \
             || { echo "Expected exactly one production ED25519 host key." >&2; exit 1; }
@@ -66,10 +79,18 @@ jobs:
 
       - name: Collect read-only storage evidence
         shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
         run: |
           set -euo pipefail
+          umask 077
           remote_report="$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
-          ssh \
+          ssh_error="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
+          : >"$remote_report"
+          : >"$ssh_error"
+          chmod 600 "$remote_report" "$ssh_error"
+          if ! ssh \
             -F "$SSH_DIR/config" \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -78,17 +99,25 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            bash -s -- "$EXPECTED_SHA" > "$remote_report" <<'REMOTE'
+            bash -s -- "$EXPECTED_SHA" > "$remote_report" 2> "$ssh_error" <<'REMOTE'
           set -Eeuo pipefail
 
           expected_sha="$1"
           runtime=/opt/oldsparky/platform
           current="$runtime/current"
           python_bin="$runtime/shared/venv/bin/python"
+          summary_tool="$current/tools/platform_storage_evidence_summary.py"
+          input_guard="$current/tools/platform_workflow_input_guard.py"
 
           test "$(id -u)" -eq 0 || { echo "Production diagnostics must run as root." >&2; exit 1; }
+          test -f "$input_guard" && test ! -L "$input_guard" \
+            || { echo "Workflow input guard is missing or unsafe." >&2; exit 1; }
+          /usr/bin/python3 -I "$input_guard" sha --value "$expected_sha" >/dev/null \
+            || { echo "expected_sha is invalid." >&2; exit 1; }
           test -L "$current" || { echo "Current release symlink is missing." >&2; exit 1; }
           test -x "$python_bin" || { echo "Shared Python runtime is missing." >&2; exit 1; }
+          test -f "$summary_tool" && test ! -L "$summary_tool" \
+            || { echo "Storage evidence summary helper is missing or unsafe." >&2; exit 1; }
 
           active_sha="$(/usr/bin/python3 -I - "$current/RELEASE.json" <<'PY'
           import json
@@ -102,89 +131,139 @@ jobs:
           test "$active_sha" = "$expected_sha" \
             || { echo "active release SHA differs from expected_sha." >&2; exit 1; }
 
-          printf 'active_release=%s\n' "$(readlink -f "$current")"
-          printf 'active_source_sha=%s\n' "$active_sha"
+          current_id="$(basename "$(readlink -f "$current")")"
+          [[ "$current_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] \
+            || { echo "active release identifier is invalid." >&2; exit 1; }
+          printf '{"schema":1,"kind":"platform_storage_diagnostics","active_release_id":"%s","active_source_sha":"%s"}\n' \
+            "$current_id" "$active_sha"
 
           echo '=== retained_load_lock ==='
           retained_load_lock=/run/lock/oldsparky-retained-load-matrix.lock
           exec 9>"$retained_load_lock"
           if flock -n 9; then
-            echo 'state=unlocked'
+            lock_state=unlocked
             flock -u 9
           else
-            echo 'state=held'
-            /usr/bin/lslocks --noheadings --output PID,COMMAND,PATH \
-              | awk -v lock="$retained_load_lock" '$3 == lock {print}' \
-              || true
-            /usr/bin/fuser --verbose "$retained_load_lock" 2>/dev/null \
-              | awk 'NR > 1 {print}' \
-              || true
+            lock_state=held
           fi
           exec 9>&-
+          printf 'state=%s\n' "$lock_state" \
+            | /usr/bin/python3 -I "$summary_tool" --mode lock
 
           echo '=== filesystem_usage ==='
-          for path in / /tmp /var/tmp /opt/oldsparky/platform /var/log; do
-            echo "--- ${path} ---"
-            df -hT -- "$path" || true
-            df -i -- "$path" || true
-            stat -c 'path=%n mode=%a owner=%u:%g type=%F' -- "$path" || true
-            findmnt --target "$path" --noheadings \
-              --output TARGET,SOURCE,FSTYPE,OPTIONS || true
-          done
+          emit_disk_usage() {
+            local category="$1"
+            local path="$2"
+            local bytes_output inode_output
+            bytes_output="$(df -B1 --output=size,used,avail,pcent -- "$path" 2>/dev/null)" \
+              || { echo "disk usage producer failed." >&2; exit 1; }
+            printf '%s\n' "$bytes_output" \
+              | /usr/bin/python3 -I "$summary_tool" --mode df --category "$category"
+            inode_output="$(df --output=iused,iavail,ipcent -- "$path" 2>/dev/null)" \
+              || { echo "inode usage producer failed." >&2; exit 1; }
+            printf '%s\n' "$inode_output" \
+              | /usr/bin/python3 -I "$summary_tool" --mode inode --category "$category"
+          }
+          emit_disk_usage root /
+          emit_disk_usage tmp /tmp
+          emit_disk_usage var_tmp /var/tmp
+          emit_disk_usage platform_runtime /opt/oldsparky/platform
+          emit_disk_usage logs /var/log
 
           echo '=== journal_usage ==='
-          journalctl --disk-usage || true
+          journal_usage="$(journalctl --disk-usage --no-pager 2>/dev/null)" \
+            || { echo "journal usage producer failed." >&2; exit 1; }
+          printf '%s\n' "$journal_usage" \
+            | /usr/bin/python3 -I "$summary_tool" --mode journal
 
           echo '=== service_sandbox ==='
           for service in deadlock-api deadlock-worker deadlock-web; do
-            echo "--- ${service} ---"
-            systemctl show "$service" \
-              --property=User,Group,PrivateTmp,ProtectSystem,ProtectHome,ReadWritePaths,RuntimeDirectory,RuntimeDirectoryMode,MemoryCurrent,MemoryMax,TasksCurrent,TasksMax \
-              --no-pager || true
+            service_output="$(systemctl show "$service" \
+              --property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,TasksCurrent,TasksMax,CPUUsageNSec \
+              --no-pager 2>/dev/null)" \
+              || { echo "service state producer failed." >&2; exit 1; }
+            printf '%s\n' "$service_output" \
+              | /usr/bin/python3 -I "$summary_tool" --mode service --service "$service"
           done
 
-          echo '=== top_level_usage ==='
-          timeout 90s du -x -h -d 1 -- \
-            /opt/oldsparky/platform /var/log /tmp /var/tmp /home /root 2>/dev/null \
-            | sort -h | tail -n 80 || true
+          echo '=== known_category_usage ==='
+          emit_category_size() {
+            local category="$1"
+            local path="$2"
+            local size_output
+            if [[ -e "$path" && ! -L "$path" ]]; then
+              size_output="$(timeout 90s du -x -s -B1 -- "$path" 2>/dev/null)" \
+                || { echo "category size producer failed." >&2; exit 1; }
+            else
+              size_output='0'
+            fi
+            printf '%s\n' "$size_output" \
+              | /usr/bin/python3 -I "$summary_tool" --mode du --category "$category"
+          }
+          emit_category_size source_release_artifacts "$runtime/dist/releases"
+          emit_category_size browser_test_artifacts "$runtime/apps/platform_web"
+          emit_category_size preprod_screenshots "$runtime/shared/preprod-screenshots"
+          emit_category_size live_qa_runtime /var/lib/oldsparky-liveqa
+          emit_category_size backups "$runtime/shared/backups"
 
           echo '=== storage_retention_dry_run ==='
-          retention_report="$(
-            "$python_bin" "$current/tools/platform_storage_maintenance.py" --json \
-              2>/dev/null || true
-          )"
-          /usr/bin/python3 - "$retention_report" <<'PY'
-          import json
-          import sys
-
-          raw = sys.argv[1]
-          try:
-              report = json.loads(raw)
-          except json.JSONDecodeError:
-              print("retention_report=invalid")
-              raise SystemExit(0)
-
-          print("retention_ok=" + str(bool(report.get("ok"))).lower())
-          for key in ("production_releases", "source_release_artifacts", "live_qa_runtime_caches"):
-              section = report.get(key) or {}
-              print(
-                  f"{key}_deleted={len(section.get('deleted') or [])}"
-                  f" reclaimable_bytes={section.get('reclaimable_bytes', 0)}"
-              )
-          transient = report.get("transient") or {}
-          print("transient_reclaimable_bytes=" + str(transient.get("reclaimable_bytes") or {}))
-          disk_after = report.get("disk_after") or {}
-          print("retention_disk_free_bytes=" + str(disk_after.get("free_bytes", "")))
-          print("retention_disk_used_percent=" + str(disk_after.get("used_percent", "")))
-          PY
+          retention_file="$(mktemp)"
+          trap 'rm -f -- "$retention_file"' EXIT
+          "$python_bin" "$current/tools/platform_storage_maintenance.py" --json \
+            >"$retention_file" 2>/dev/null \
+            || { echo "storage retention producer failed." >&2; exit 1; }
+          /usr/bin/python3 -I "$summary_tool" --mode retention <"$retention_file" \
+            || { echo "storage retention summary failed." >&2; exit 1; }
           REMOTE
-          cat "$remote_report"
+          then
+            echo "Production storage diagnostics collection failed." >&2
+            exit 1
+          fi
           cp "$remote_report" "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+          chmod 600 "$RUNNER_TEMP/platform-production-storage-diagnostics-artifact.txt"
+          rm -f -- "$remote_report"
+          test ! -e "$remote_report"
+
+      - name: Remove production SSH material
+        id: cleanup_ssh
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/platform-production-storage-diagnostics-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+            rm -f -- \
+              "$ssh_dir/id_ed25519" \
+              "$ssh_dir/known_hosts" \
+              "$ssh_dir/known_hosts.scan" \
+              "$ssh_dir/config" \
+              "$ssh_dir/control.sock" \
+              "$ssh_dir/control-master" \
+              "$ssh_dir/control-master.sock"
+            test ! -e "$ssh_dir/id_ed25519"
+            test ! -e "$ssh_dir/known_hosts"
+            test ! -e "$ssh_dir/known_hosts.scan"
+            test ! -e "$ssh_dir/config"
+            test ! -e "$ssh_dir/control.sock"
+            test ! -e "$ssh_dir/control-master"
+            test ! -e "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          rm -f -- "$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
+          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics.txt"
+          rm -f -- "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
+          test ! -e "$RUNNER_TEMP/platform-production-storage-diagnostics-ssh-error"
+          printf '%s\n' 'SSH_DIR=' >> "$GITHUB_ENV"
+          unset SSH_DIR
+          test -z "${SSH_DIR:-}"
 
       - name: Upload storage diagnostic evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.cleanup_ssh.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: platform-production-storage-diagnostics-${{ github.run_id }}
+          name: platform-production-storage-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/platform-production-storage-diagnostics-artifact.txt
-          if-no-files-found: ignore
+          if-no-files-found: error
+          retention-days: 14
