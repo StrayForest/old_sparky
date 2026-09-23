@@ -523,16 +523,23 @@ class EvidencePrivacyTests(unittest.TestCase):
                 },
                 "signal_delivery": {
                     "arm": {
-                        "requested_count": 3,
+                        "requested_count": 4,
                         "delivered_count": 1,
-                        "rejected_count": 2,
+                        "rejected_count": 3,
                         "pidfd_api_available": False,
-                        "availability_reason": "uid_unavailable",
                         "rejection_reasons": {
                             "pidfd_unavailable": 1,
+                            "uid_unavailable": 1,
                             "worker_missing": 1,
                             "operator@example.test": 99,
                         },
+                    },
+                    "flush": {
+                        "requested_count": 0,
+                        "delivered_count": 0,
+                        "rejected_count": 0,
+                        "pidfd_api_available": False,
+                        "availability_reason": "uid_unavailable",
                     },
                 },
             },
@@ -567,10 +574,14 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertEqual(public_observer["cpu_profile"]["ignored_stale_profiles"], 2)
         self.assertEqual(
             public_observer["cpu_profile"]["signal_delivery"]["arm"]["rejection_reasons"],
-            {"pidfd_unavailable": 1, "worker_missing": 1},
+            {
+                "pidfd_unavailable": 1,
+                "uid_unavailable": 1,
+                "worker_missing": 1,
+            },
         )
         self.assertEqual(
-            public_observer["cpu_profile"]["signal_delivery"]["arm"]["availability_reason"],
+            public_observer["cpu_profile"]["signal_delivery"]["flush"]["availability_reason"],
             "uid_unavailable",
         )
         self.assertEqual(public_observer["postgres_stat_statements"]["before"]["rows"][0]["queryid"], "42")

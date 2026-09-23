@@ -388,9 +388,13 @@ def _signal_api_workers_detailed(
     armed = armed_identities if armed_identities is not None else armed_workers
     uid = expected_api_uid() if expected_uid is None else expected_uid
     if uid is None:
-        # There is no safe identity basis for a request in this case.  Keep
-        # the availability condition separate from worker rejection counts so
-        # requested=delivered+rejected remains true (with zero requested).
+        # There is no safe identity basis for a request in this case.  A
+        # previously armed mapping still represents concrete requested
+        # workers, so account for each one as a bounded rejection.  With no
+        # mapping there were no candidates to reject; retain availability as
+        # a diagnostic rather than inventing a worker rejection.
+        if armed:
+            return [], Counter({"uid_unavailable": len(armed)}), None
         return [], Counter(), "uid_unavailable"
     current = api_worker_identities(processes, expected_uid=uid)
     reasons: Counter[str] = Counter()
@@ -559,7 +563,11 @@ def cpu_profile_summary(
     for path in profile_paths:
         try:
             stats = Stats(str(path))
-        except (EOFError, OSError, TypeError, ValueError):
+        # pstats/marshal reports truncated streams as EOFError, invalid marshal
+        # bytes as ValueError, and a valid marshal payload with the wrong
+        # shape can surface as AttributeError or TypeError.  These are the
+        # bounded parser failures that must not invalidate other evidence.
+        except (AttributeError, EOFError, OSError, TypeError, ValueError):
             invalid_profile_count += 1
             continue
         functions: list[dict[str, object]] = []
@@ -620,13 +628,33 @@ def _signal_delivery_summary(
 
     bounded_requested = max(0, int(requested))
     bounded_delivered = min(len(delivered), bounded_requested)
+    reasons = Counter(reasons)
     bounded_rejected = sum(reasons.values())
+    rejection_capacity = max(0, bounded_requested - bounded_delivered)
+    if bounded_rejected > rejection_capacity:
+        # Keep the public accounting invariant even if a caller supplies
+        # duplicate or otherwise over-counted rejection reasons.
+        bounded_rejected = rejection_capacity
+        limited_reasons: Counter[str] = Counter()
+        remaining = rejection_capacity
+        for reason, count in sorted(reasons.items()):
+            kept = min(max(0, int(count)), remaining)
+            if kept:
+                limited_reasons[reason] = kept
+                remaining -= kept
+            if remaining == 0:
+                break
+        reasons = limited_reasons
     # Every worker selected for a signal must be accounted for, even if a
     # future caller introduces a new pre-delivery rejection path.
     unaccounted = max(0, bounded_requested - bounded_delivered - bounded_rejected)
     if unaccounted:
-        reasons = Counter(reasons)
-        reasons["worker_missing"] += unaccounted
+        rejection_reason = (
+            availability_reason
+            if availability_reason == "uid_unavailable"
+            else "worker_missing"
+        )
+        reasons[rejection_reason] += unaccounted
         bounded_rejected += unaccounted
 
     summary: dict[str, object] = {
@@ -637,7 +665,7 @@ def _signal_delivery_summary(
         "pidfd_api_available": callable(getattr(os, "pidfd_open", None))
         and callable(getattr(signal, "pidfd_send_signal", None)),
     }
-    if availability_reason is not None:
+    if availability_reason is not None and not unaccounted:
         summary["availability_reason"] = availability_reason
     return summary
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import cProfile
 import json
+import marshal
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,7 @@ from tools.platform_external_load import (
 )
 from tools.platform_external_load_observer import (
     _signal_api_workers_detailed,
+    _signal_delivery_summary,
     api_worker_identities,
     cpu_profile_summary,
     profile_artifact_snapshot,
@@ -692,6 +694,9 @@ class PerformanceProfileContractTests(unittest.TestCase):
             profile = output_dir / "ready-vote-cprofile-123-456.pstats"
             wrong_generation = output_dir / "ready-vote-cprofile-123-999.pstats"
             partial = output_dir / "ready-vote-cprofile-124-457.pstats"
+            corrupt = output_dir / "ready-vote-cprofile-125-458.pstats"
+            invalid_marshal = output_dir / "ready-vote-cprofile-126-459.pstats"
+            wrong_shape = output_dir / "ready-vote-cprofile-127-460.pstats"
             producer = cProfile.Profile()
             producer.enable()
             sum(range(1000))
@@ -700,7 +705,16 @@ class PerformanceProfileContractTests(unittest.TestCase):
             producer.dump_stats(str(valid_profile))
             profile.write_bytes(valid_profile.read_bytes())
             wrong_generation.write_bytes(b"wrong")
-            partial.write_bytes(profile.read_bytes()[: max(1, profile.stat().st_size // 2)])
+            invalid_fixtures = {
+                partial: profile.read_bytes()[: max(1, profile.stat().st_size // 2)],
+                # A real marshal payload with the wrong top-level shape makes
+                # pstats access `.items` on ellipsis and raise AttributeError.
+                corrupt: marshal.dumps(Ellipsis),
+                invalid_marshal: b"not-marshal",
+                wrong_shape: marshal.dumps([]),
+            }
+            for path, contents in invalid_fixtures.items():
+                path.write_bytes(contents)
             baseline = profile_artifact_snapshot(output_dir)
 
             identities = {123: {"pid": 123, "start_time_ticks": 456}}
@@ -716,17 +730,25 @@ class PerformanceProfileContractTests(unittest.TestCase):
             partial_mtime = int(baseline[partial.name][3]) + 1
             os.utime(profile, ns=(profile_mtime, profile_mtime))
             os.utime(partial, ns=(partial_mtime, partial_mtime))
+            corrupt_mtime = int(baseline[corrupt.name][3]) + 1
+            os.utime(corrupt, ns=(corrupt_mtime, corrupt_mtime))
+            for path in (invalid_marshal, wrong_shape):
+                mtime = int(baseline[path.name][3]) + 1
+                os.utime(path, ns=(mtime, mtime))
             fresh = cpu_profile_summary(
                 output_dir,
                 armed_identities={
                     123: {"pid": 123, "start_time_ticks": 456},
                     124: {"pid": 124, "start_time_ticks": 457},
+                    125: {"pid": 125, "start_time_ticks": 458},
+                    126: {"pid": 126, "start_time_ticks": 459},
+                    127: {"pid": 127, "start_time_ticks": 460},
                 },
                 baseline_artifacts=baseline,
             )
 
             self.assertEqual(len(fresh["profiles"]), 1)
-            self.assertEqual(fresh["retention"]["invalid_profiles"], 1)
+            self.assertEqual(fresh["retention"]["invalid_profiles"], 4)
             self.assertTrue(profile.exists())
             self.assertTrue(wrong_generation.exists())
 
@@ -850,6 +872,65 @@ class PerformanceProfileContractTests(unittest.TestCase):
         self.assertEqual(signalled, [])
         self.assertEqual(reasons, {})
         self.assertEqual(availability_reason, "uid_unavailable")
+
+        with patch(
+            "tools.platform_external_load_observer.expected_api_uid",
+            return_value=None,
+        ):
+            signalled, reasons, availability_reason = _signal_api_workers_detailed(
+                signal.SIGUSR2,
+                processes=processes,
+                expected_uid=None,
+                armed_identities={
+                    101: {"pid": 101, "uid": 994, "ppid": 100, "start_time_ticks": 11},
+                    102: {"pid": 102, "uid": 994, "ppid": 100, "start_time_ticks": 12},
+                },
+                process_reader=lambda pid: records.get(pid),  # type: ignore[arg-type]
+            )
+        self.assertEqual(signalled, [])
+        self.assertEqual(reasons, {"uid_unavailable": 2})
+        self.assertIsNone(availability_reason)
+
+        initial_arm = _signal_delivery_summary(
+            [],
+            {},
+            requested=2,
+            availability_reason="uid_unavailable",
+        )
+        self.assertEqual(initial_arm["requested_count"], 2)
+        self.assertEqual(initial_arm["delivered_count"], 0)
+        self.assertEqual(initial_arm["rejected_count"], 2)
+        self.assertEqual(initial_arm["rejection_reasons"], {"uid_unavailable": 2})
+        self.assertNotIn("availability_reason", initial_arm)
+
+        flush_after_prior_arm = _signal_delivery_summary(
+            [],
+            {},
+            requested=2,
+            availability_reason="uid_unavailable",
+        )
+        self.assertEqual(flush_after_prior_arm["requested_count"], 2)
+        self.assertEqual(flush_after_prior_arm["rejected_count"], 2)
+        self.assertEqual(flush_after_prior_arm["rejection_reasons"], {"uid_unavailable": 2})
+        self.assertNotIn("availability_reason", flush_after_prior_arm)
+
+        flush_after_no_candidates = _signal_delivery_summary(
+            [],
+            {},
+            requested=0,
+            availability_reason="uid_unavailable",
+        )
+        self.assertEqual(flush_after_no_candidates["requested_count"], 0)
+        self.assertEqual(flush_after_no_candidates["rejected_count"], 0)
+        self.assertEqual(flush_after_no_candidates["availability_reason"], "uid_unavailable")
+
+        overcounted = _signal_delivery_summary(
+            [101],
+            {"worker_missing": 3},
+            requested=2,
+        )
+        self.assertEqual(overcounted["delivered_count"] + overcounted["rejected_count"], 2)
+        self.assertEqual(overcounted["rejection_reasons"], {"worker_missing": 1})
 
     def test_observer_flush_rejects_stale_or_reused_worker_identity(self) -> None:
         command = (
