@@ -680,6 +680,8 @@ jobs:
           artifact_sha256=""
           disk_before_bytes=""
           disk_after_bytes=""
+          build_log=""
+          diagnostic_parser="$GITHUB_WORKSPACE/platform/tools/platform_release_build_diagnostics.py"
 
           free_bytes() {
             local disk_path="${runner_temp:-${RUNNER_TEMP}}"
@@ -691,10 +693,79 @@ jobs:
 
           cleanup() {
             local rc=$?
+            local builder_rc=$rc
             local cleanup_rc=0
             local current_id=""
+            local diagnostic_line=""
+            local parser_rc=127
+            local safe_diagnostic=""
             trap - EXIT
             set +e
+            if [[ -n "$build_log" ]]; then
+              diagnostic_line="$(sudo -n /usr/bin/python3 -I "$diagnostic_parser" --log "$build_log" 2>/dev/null)"
+              parser_rc=$?
+            fi
+            safe_diagnostic="$('/usr/bin/python3' -I - "$diagnostic_line" "$builder_rc" "$parser_rc" <<'PY'
+          import re
+          import sys
+
+
+          line, builder_rc, parser_rc = sys.argv[1:]
+          safe = {
+              "phase": "unknown",
+              "status": "failed",
+              "reason": "build_failed",
+              "cleanup": "unknown",
+          }
+          if re.fullmatch(r"[0-9]+", builder_rc) is None:
+              builder_rc = "1"
+          if re.fullmatch(r"[0-9]+", parser_rc) is None:
+              parser_rc = "1"
+          parts = line.split()
+          if parts and parts[0] == "RELEASE_BUILD_DIAGNOSTIC":
+              fields = {}
+              valid = True
+              for token in parts[1:]:
+                  if "=" not in token:
+                      valid = False
+                      break
+                  key, value = token.split("=", 1)
+                  if key in fields or re.fullmatch(r"[a-z_]+", key) is None:
+                      valid = False
+                      break
+                  fields[key] = value
+              if (
+                  valid
+                  and set(fields) <= {"schema", "phase", "status", "reason", "cleanup", "failed_phase"}
+                  and set(fields) >= {"schema", "phase", "status", "reason", "cleanup"}
+                  and fields.get("schema") == "1"
+                  and fields.get("status") in {"passed", "failed"}
+                  and fields.get("reason") in {"ok", "build_failed", "cleanup_failed", "interrupted"}
+                  and fields.get("cleanup") in {"not-run", "passed", "failed", "unknown"}
+              ):
+                  safe.update({key: fields[key] for key in safe if fields.get(key)})
+                  if "failed_phase" in fields and re.fullmatch(r"[a-z-]+", fields["failed_phase"]):
+                      safe["failed_phase"] = fields["failed_phase"]
+                  if any(
+                      re.fullmatch(r"[a-z0-9_-]+", safe[key] or "") is None
+                      for key in ("phase", "status", "reason", "cleanup")
+                  ):
+                      safe = {
+                          "phase": "unknown",
+                          "status": "failed",
+                          "reason": "build_failed",
+                          "cleanup": "unknown",
+                      }
+          print(
+              "RELEASE_RUNTIME_BUILD_DIAGNOSTIC schema=1 "
+              f"builder_rc={builder_rc} parser_rc={parser_rc} "
+              f"phase={safe['phase']} status={safe['status']} "
+              f"reason={safe['reason']} cleanup={safe['cleanup']}"
+              + (f" failed_phase={safe['failed_phase']}" if "failed_phase" in safe else "")
+          )
+          PY
+          )"
+            printf '%s\n' "$safe_diagnostic"
             if [[ -n "$release_root" ]]; then
               if [[ -d "$release_root" && ! -L "$release_root" ]]; then
                 current_id="$(sudo -n /usr/bin/stat -c '%d:%i' -- "$release_root" 2>/dev/null)"
@@ -714,6 +785,10 @@ jobs:
             fi
             if (( cleanup_rc != 0 )); then
               printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup\n'
+              exit 1
+            fi
+            if (( parser_rc != 0 && builder_rc == 0 )); then
+              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=diagnostic_parser\n'
               exit 1
             fi
             if (( rc != 0 )); then
@@ -798,19 +873,25 @@ jobs:
           }
 
           set +e
-          sudo -n /usr/bin/env -i \
-            HOME=/root \
-            LANG=C.UTF-8 \
-            LC_ALL=C.UTF-8 \
-            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            PLATFORM_RELEASE_OUTPUT_DIR="$release_output" \
-            PLATFORM_WEB_NEXT_COMPRESSION=true \
-            "$build_root/platform/tools/platform_build_release.sh" "$release_ref" \
-            2>&1 | sudo -n /usr/bin/tee "$build_log" >/dev/null
-          builder_status=("${PIPESTATUS[@]}")
+          sudo -n /bin/bash -c \
+            'build_log="$1"
+             release_output="$2"
+             builder="$3"
+             release_ref="$4"
+             exec >"$build_log" 2>&1
+             exec /usr/bin/env -i \
+               HOME=/root \
+               LANG=C.UTF-8 \
+               LC_ALL=C.UTF-8 \
+               PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+               PLATFORM_RELEASE_OUTPUT_DIR="$release_output" \
+               PLATFORM_WEB_NEXT_COMPRESSION=true \
+               "$builder" "$release_ref"' \
+            _ "$build_log" "$release_output" \
+            "$build_root/platform/tools/platform_build_release.sh" "$release_ref"
+          builder_status=$?
           set -e
-          [[ "${builder_status[1]:-1}" -eq 0 ]] || { failure_reason=build_log_failed; exit 1; }
-          [[ "${builder_status[0]:-1}" -eq 0 ]] || { failure_reason=canonical_builder_failed; exit 1; }
+          [[ "$builder_status" -eq 0 ]] || { failure_reason=canonical_builder_failed; exit "$builder_status"; }
 
           archive_candidates="$(sudo -n /usr/bin/find "$release_output" -maxdepth 1 -type f \
             -name "${release_ref}-*.tar.gz" -print 2>/dev/null)" || {

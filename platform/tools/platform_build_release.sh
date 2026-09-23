@@ -1,11 +1,138 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 OUTPUT_DIR="${PLATFORM_RELEASE_OUTPUT_DIR:-$ROOT_DIR/dist/releases}"
 WEB_NEXT_COMPRESSION="${PLATFORM_WEB_NEXT_COMPRESSION:-true}"
+DEPENDENCY_BASELINE=""
+RELEASE_REF_RAW="workspace"
+RELEASE_REF_SET=0
+CURRENT_PHASE="canonical-preflight"
+FAILURE_REASON="build_failed"
+ORIGINAL_RC=0
+TELEMETRY_ENABLED=1
+RELEASE_REF=""
+BUILD_TIMESTAMP=""
+RELEASE_SLUG=""
+RELEASE_DIR=""
+ARTIFACT_PATH=""
+ARTIFACT_SHA_PATH=""
+STAGING_DIR=""
+ARTIFACT_TEMP=""
+CHECKSUM_TEMP=""
+RELEASE_ID=""
+ARTIFACT_ID=""
+CHECKSUM_ID=""
+BUILD_COMPLETE=0
+SOURCE_GIT_COMMIT=""
+ARTIFACT_SHA256=""
+
+emit_phase_marker() {
+  local phase="$1"
+  local status="$2"
+  local reason="$3"
+  local cleanup="$4"
+  local failed_phase="${5:-}"
+  case "$reason" in
+    ok|build_failed|cleanup_failed|interrupted) ;;
+    *) reason="build_failed" ;;
+  esac
+  case "$cleanup" in
+    not-run|passed|failed) ;;
+    *) cleanup="not-run" ;;
+  esac
+  if [[ "$phase" == "complete" && "$status" == "passed" ]]; then
+    printf 'RELEASE_BUILD_PHASE schema=1 phase=complete status=passed reason=ok cleanup=passed source_sha=%s artifact_sha256=%s\n' \
+      "$SOURCE_GIT_COMMIT" "$ARTIFACT_SHA256" || true
+  elif [[ "$status" == "failed" ]]; then
+    printf 'RELEASE_BUILD_PHASE schema=1 phase=%s status=failed reason=%s cleanup=%s failed_phase=%s\n' \
+      "$phase" "$reason" "$cleanup" "${failed_phase:-$CURRENT_PHASE}" || true
+  else
+    printf 'RELEASE_BUILD_PHASE schema=1 phase=%s status=passed reason=ok cleanup=%s\n' \
+      "$phase" "$cleanup" || true
+  fi
+}
+
+mark_phase_passed() {
+  emit_phase_marker "$CURRENT_PHASE" passed ok not-run
+}
+
+capture_error() {
+  local rc="$1"
+  if [[ "$ORIGINAL_RC" -eq 0 ]]; then
+    ORIGINAL_RC="$rc"
+  fi
+  return 0
+}
+
+interrupt_build() {
+  FAILURE_REASON="interrupted"
+  exit "$1"
+}
+
+path_identity() {
+  /usr/bin/stat -c '%d:%i' -- "$1"
+}
+
+cleanup_staging() {
+  local rc=$?
+  local cleanup_rc=0
+  trap - ERR EXIT INT TERM HUP
+  if [[ "$ORIGINAL_RC" -ne 0 ]]; then
+    rc="$ORIGINAL_RC"
+  fi
+  set +e
+  if [[ "$TELEMETRY_ENABLED" -eq 0 ]]; then
+    exit "$rc"
+  fi
+  if [[ -n "$STAGING_DIR" && -d "$STAGING_DIR" && ! -L "$STAGING_DIR" ]]; then
+    chmod -R u+rwX "$STAGING_DIR" 2>/dev/null || cleanup_rc=1
+    rm -rf -- "$STAGING_DIR" || cleanup_rc=1
+  fi
+  for TEMP_FILE in "$ARTIFACT_TEMP" "$CHECKSUM_TEMP"; do
+    if [[ -n "$TEMP_FILE" && -f "$TEMP_FILE" && ! -L "$TEMP_FILE" \
+      && "$(dirname "$TEMP_FILE")" == "$OUTPUT_DIR" ]]; then
+      rm -f -- "$TEMP_FILE" || cleanup_rc=1
+    fi
+  done
+  if [[ "$BUILD_COMPLETE" -eq 0 ]]; then
+    if [[ -n "$RELEASE_ID" && -d "$RELEASE_DIR" && ! -L "$RELEASE_DIR" \
+      && "$(path_identity "$RELEASE_DIR")" == "$RELEASE_ID" ]]; then
+      chmod -R u+rwX "$RELEASE_DIR" 2>/dev/null || cleanup_rc=1
+      rm -rf -- "$RELEASE_DIR" || cleanup_rc=1
+    fi
+    if [[ -n "$ARTIFACT_ID" && -f "$ARTIFACT_PATH" && ! -L "$ARTIFACT_PATH" \
+      && "$(path_identity "$ARTIFACT_PATH")" == "$ARTIFACT_ID" ]]; then
+      rm -f -- "$ARTIFACT_PATH" || cleanup_rc=1
+    fi
+    if [[ -n "$CHECKSUM_ID" && -f "$ARTIFACT_SHA_PATH" \
+      && ! -L "$ARTIFACT_SHA_PATH" \
+      && "$(path_identity "$ARTIFACT_SHA_PATH")" == "$CHECKSUM_ID" ]]; then
+      rm -f -- "$ARTIFACT_SHA_PATH" || cleanup_rc=1
+    fi
+  fi
+  if [[ "$cleanup_rc" -ne 0 ]]; then
+    emit_phase_marker cleanup failed cleanup_failed failed "$CURRENT_PHASE"
+    emit_phase_marker complete failed cleanup_failed failed "$CURRENT_PHASE"
+    [[ "$rc" -ne 0 ]] || rc=1
+  else
+    emit_phase_marker cleanup passed ok passed
+    if [[ "$rc" -eq 0 && "$BUILD_COMPLETE" -eq 1 ]]; then
+      emit_phase_marker complete passed ok passed
+    else
+      emit_phase_marker complete failed "${FAILURE_REASON:-build_failed}" passed "$CURRENT_PHASE"
+    fi
+  fi
+  exit "$rc"
+}
+
+trap 'capture_error "$?"' ERR
+trap cleanup_staging EXIT
+trap 'interrupt_build 130' INT
+trap 'interrupt_build 143' TERM
+
 case "$WEB_NEXT_COMPRESSION" in
   true|false) ;;
   *)
@@ -13,9 +140,6 @@ case "$WEB_NEXT_COMPRESSION" in
     exit 1
     ;;
 esac
-DEPENDENCY_BASELINE=""
-RELEASE_REF_RAW="workspace"
-RELEASE_REF_SET=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dependency-baseline)
@@ -27,6 +151,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --help|-h)
+      TELEMETRY_ENABLED=0
       cat <<'EOF'
 Usage: platform_build_release.sh [--dependency-baseline <absolute candidate-release-dir>] [release-ref]
 
@@ -76,54 +201,6 @@ if [[ ! -x "$ROOT_DIR/.venv_platform/bin/python" ]]; then
   echo "Missing platform/.venv_platform. Run platform/tools/platform_bootstrap.sh first." >&2
   exit 1
 fi
-RELEASE_REF="$RELEASE_REF_RAW"
-BUILD_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-RELEASE_SLUG="${RELEASE_REF}-${BUILD_TIMESTAMP}"
-RELEASE_DIR="$OUTPUT_DIR/$RELEASE_SLUG"
-ARTIFACT_PATH="$OUTPUT_DIR/$RELEASE_SLUG.tar.gz"
-ARTIFACT_SHA_PATH="$ARTIFACT_PATH.sha256"
-STAGING_DIR=""
-ARTIFACT_TEMP=""
-CHECKSUM_TEMP=""
-RELEASE_ID=""
-ARTIFACT_ID=""
-CHECKSUM_ID=""
-BUILD_COMPLETE=0
-
-path_identity() {
-  /usr/bin/stat -c '%d:%i' -- "$1"
-}
-
-cleanup_staging() {
-  if [[ -n "$STAGING_DIR" && -d "$STAGING_DIR" && ! -L "$STAGING_DIR" ]]; then
-    chmod -R u+rwX "$STAGING_DIR" 2>/dev/null || true
-    rm -rf -- "$STAGING_DIR"
-  fi
-  for TEMP_FILE in "$ARTIFACT_TEMP" "$CHECKSUM_TEMP"; do
-    if [[ -n "$TEMP_FILE" && -f "$TEMP_FILE" && ! -L "$TEMP_FILE" \
-      && "$(dirname "$TEMP_FILE")" == "$OUTPUT_DIR" ]]; then
-      rm -f -- "$TEMP_FILE"
-    fi
-  done
-  if [[ "$BUILD_COMPLETE" -eq 0 ]]; then
-    if [[ -n "$RELEASE_ID" && -d "$RELEASE_DIR" && ! -L "$RELEASE_DIR" \
-      && "$(path_identity "$RELEASE_DIR")" == "$RELEASE_ID" ]]; then
-      chmod -R u+rwX "$RELEASE_DIR" 2>/dev/null || true
-      rm -rf -- "$RELEASE_DIR"
-    fi
-    if [[ -n "$ARTIFACT_ID" && -f "$ARTIFACT_PATH" && ! -L "$ARTIFACT_PATH" \
-      && "$(path_identity "$ARTIFACT_PATH")" == "$ARTIFACT_ID" ]]; then
-      rm -f -- "$ARTIFACT_PATH"
-    fi
-    if [[ -n "$CHECKSUM_ID" && -f "$ARTIFACT_SHA_PATH" \
-      && ! -L "$ARTIFACT_SHA_PATH" \
-      && "$(path_identity "$ARTIFACT_SHA_PATH")" == "$CHECKSUM_ID" ]]; then
-      rm -f -- "$ARTIFACT_SHA_PATH"
-    fi
-  fi
-}
-trap cleanup_staging EXIT
-
 if [[ "$(readlink -m "$OUTPUT_DIR")" != "$OUTPUT_DIR" ]]; then
   echo "Release output directory is not canonical." >&2
   exit 1
@@ -254,6 +331,8 @@ if [[ ! "$SOURCE_GIT_COMMIT" =~ ^[0-9a-f]{40,64}$ ]]; then
   echo "Release build refused: source HEAD is invalid." >&2
   exit 1
 fi
+mark_phase_passed
+CURRENT_PHASE="node-runtime"
 
 EXPECTED_NODE_VERSION="26.3.1"
 EXPECTED_NPM_VERSION="11.16.0"
@@ -277,6 +356,8 @@ if [[ "$NODE_VERSION" != "$EXPECTED_NODE_VERSION" ]]; then
   echo "Release builds require Node $EXPECTED_NODE_VERSION; got $NODE_VERSION." >&2
   exit 1
 fi
+mark_phase_passed
+CURRENT_PHASE="source-stage"
 
 STAGING_DIR="$(mktemp -d "$OUTPUT_DIR/.build-$RELEASE_SLUG.XXXXXX")"
 chmod 0755 "$STAGING_DIR"
@@ -311,6 +392,8 @@ rm -rf \
   "$STAGING_DIR/docs" \
   "$STAGING_DIR/tests" \
   "$STAGING_DIR/apps/platform_web/AGENTS.md"
+mark_phase_passed
+CURRENT_PHASE="web-dependencies"
 
 NPM_CLI="$PINNED_NODE_HOME/lib/node_modules/npm/bin/npm-cli.js"
 PACKAGE_MANAGER="$({ /usr/bin/python3 -I - "$STAGING_DIR/apps/platform_web/package.json" <<'PY'
@@ -353,6 +436,8 @@ mkdir -m 0700 "$NPM_CACHE"
     --ignore-scripts --no-audit --no-fund \
     --prefix "$STAGING_DIR/apps/platform_web"
 rm -rf "$NPM_CACHE"
+mark_phase_passed
+CURRENT_PHASE="live-qa-runtime"
 
 # Build the credential-bearing browser runtime from the exact lock-installed
 # Playwright packages before the full application dependency tree is removed.
@@ -371,6 +456,8 @@ if [[ ! -d "$STAGING_DIR/liveqa-runtime" || -L "$STAGING_DIR/liveqa-runtime" \
   exit 1
 fi
 rm -rf "$STAGING_DIR/apps/platform_web/tests"
+mark_phase_passed
+CURRENT_PHASE="python-wheelhouse"
 
 WHEELHOUSE_DIR="$STAGING_DIR/wheelhouse"
 mkdir -m 0700 "$WHEELHOUSE_DIR"
@@ -494,6 +581,8 @@ fi
   --requirements "$STAGING_DIR/requirements-platform.txt" \
   --lock "$STAGING_DIR/requirements-platform.lock.txt" \
   --freeze "$STAGING_DIR/requirements-platform.freeze.txt"
+mark_phase_passed
+CURRENT_PHASE="dependency-baseline"
 
 if [[ -n "$DEPENDENCY_BASELINE" ]]; then
   REVALIDATED_BASELINE="$(validate_dependency_baseline "$DEPENDENCY_BASELINE")"
@@ -518,6 +607,8 @@ if [[ -n "$DEPENDENCY_BASELINE" ]]; then
     fi
   done
 fi
+mark_phase_passed
+CURRENT_PHASE="web-build"
 
 (
   cd "$STAGING_DIR/apps/platform_web"
@@ -569,6 +660,8 @@ if [[ -n "$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all -- p
   exit 1
 fi
 WEB_BUILD_ID="$(cat "$STAGING_DIR/apps/platform_web/.next/BUILD_ID")"
+mark_phase_passed
+CURRENT_PHASE="release-metadata"
 
 /usr/bin/python3 -I - \
   "$STAGING_DIR/RELEASE.json" \
@@ -611,6 +704,8 @@ Path(output).write_text(
 )
 PY
 chmod 0444 "$STAGING_DIR/RELEASE.json"
+mark_phase_passed
+CURRENT_PHASE="artifact-promote"
 
 # npm/Next may preserve group-writable modes from package archives even under
 # the build umask. Preserve every executable/read-only bit while removing only
@@ -631,6 +726,8 @@ if [[ ! -d "$RELEASE_DIR" || -L "$RELEASE_DIR" \
 fi
 STAGING_DIR=""
 trap - HUP INT TERM
+trap 'interrupt_build 130' INT
+trap 'interrupt_build 143' TERM
 SOURCE_DATE_EPOCH="$(git -C "$REPO_ROOT" show -s --format=%ct "$SOURCE_GIT_COMMIT")"
 ARTIFACT_TEMP="$(mktemp "$OUTPUT_DIR/.artifact-$RELEASE_SLUG.XXXXXX")"
 (
@@ -656,6 +753,8 @@ if [[ ! -f "$ARTIFACT_PATH" || -L "$ARTIFACT_PATH" \
 fi
 ARTIFACT_TEMP=""
 trap - HUP INT TERM
+trap 'interrupt_build 130' INT
+trap 'interrupt_build 143' TERM
 CHECKSUM_TEMP="$(mktemp "$OUTPUT_DIR/.checksum-$RELEASE_SLUG.XXXXXX")"
 (
   cd "$OUTPUT_DIR"
@@ -672,6 +771,10 @@ if [[ ! -f "$ARTIFACT_SHA_PATH" || -L "$ARTIFACT_SHA_PATH" \
 fi
 CHECKSUM_TEMP=""
 trap - HUP INT TERM
+trap 'interrupt_build 130' INT
+trap 'interrupt_build 143' TERM
+mark_phase_passed
+CURRENT_PHASE="artifact-validate"
 /usr/bin/python3 -I "$ROOT_DIR/tools/platform_validate_release_artifact.py" \
   --artifact "$ARTIFACT_PATH" \
   --checksum "$ARTIFACT_SHA_PATH" \
@@ -682,6 +785,12 @@ if [[ -n "$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all -- p
   echo "Release build refused: platform source changed before artifact completion." >&2
   exit 1
 fi
+ARTIFACT_SHA256="$(/usr/bin/sha256sum "$ARTIFACT_PATH" | awk '{print $1}')"
+if [[ ! "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Release build refused: artifact digest is invalid." >&2
+  exit 1
+fi
+mark_phase_passed
 BUILD_COMPLETE=1
 
 # Build output is a public CI channel.  Keep the machine layout and command

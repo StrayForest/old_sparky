@@ -1132,6 +1132,11 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         ("platform_validate_release_artifact.py", "read-only artifact validation"),
         ("sha256sum -c", "checksum validation"),
         ("RELEASE.json", "release provenance validation"),
+        ("platform_release_build_diagnostics.py", "bounded builder diagnostics parser"),
+        ("RELEASE_RUNTIME_BUILD_DIAGNOSTIC", "bounded workflow diagnostic"),
+        ("builder_rc", "builder result capture"),
+        ("parser_rc", "diagnostic parser result capture"),
+        ('/usr/bin/install -o root -g root -m 0600 /dev/null "$build_log"', "root-only diagnostic log"),
         ("min_free_bytes", "disk preflight"),
         ("disk_after_bytes", "post-cleanup disk check"),
         ("trap cleanup EXIT", "guaranteed cleanup"),
@@ -1147,6 +1152,15 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         issues.append("release-runtime-real must use its own clean production-style venv setup")
     if "platform_verify.py release-runtime" in real:
         issues.append("release-runtime-real must not run the fixture gate")
+    if "tee" in real or 'cat "$build_log"' in real or "BASH_COMMAND" in real:
+        issues.append("release-runtime-real must not expose raw builder diagnostics")
+    builder_path = PLATFORM_ROOT / "tools" / "platform_build_release.sh"
+    try:
+        builder_source = builder_path.read_text(encoding="utf-8")
+    except OSError:
+        builder_source = ""
+    if "RELEASE_BUILD_PHASE" not in builder_source:
+        issues.append("canonical release builder must emit machine-readable phases")
     if "secrets." in real or "PROD_SSH_" in real or "SSH_PRIVATE_KEY" in real:
         issues.append("release-runtime-real must not receive production credentials")
     if "actions/upload-artifact@" in real or "actions/attest-build-provenance@" in real:

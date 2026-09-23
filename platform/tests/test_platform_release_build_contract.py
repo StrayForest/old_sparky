@@ -845,6 +845,38 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("name: Conditional release runtime fixture", workflow)
         self.assertIn("name: Trusted dev immutable release runtime", workflow)
         self.assertIn("platform_build_release.sh", workflow)
+        self.assertIn("platform_release_build_diagnostics.py", workflow)
+        self.assertIn("RELEASE_RUNTIME_BUILD_DIAGNOSTIC", workflow)
+        self.assertIn("builder_rc", workflow)
+        self.assertIn("parser_rc", workflow)
+        real = workflow_job(workflow, "release-runtime-real")
+        self.assertNotIn("tee", real)
+        self.assertNotIn('cat "$build_log"', real)
+        self.assertNotIn("BASH_COMMAND", real)
+        self.assertNotIn("actions/upload-artifact@", real)
+        self.assertLess(
+            real.index("diagnostic_parser"),
+            real.index('/bin/rm -rf -- "$release_root"'),
+        )
+        builder = (REPO_ROOT / "platform/tools/platform_build_release.sh").read_text()
+        self.assertIn("RELEASE_BUILD_PHASE", builder)
+        for phase in (
+            "canonical-preflight",
+            "node-runtime",
+            "source-stage",
+            "web-dependencies",
+            "live-qa-runtime",
+            "python-wheelhouse",
+            "dependency-baseline",
+            "web-build",
+            "release-metadata",
+            "artifact-promote",
+            "artifact-validate",
+            "cleanup",
+            "complete",
+        ):
+            self.assertIn(phase, builder)
+        self.assertNotIn("BASH_COMMAND", builder)
         self.assertIn("needs['release-runtime-real'].result", workflow)
 
     def test_server_diagnostics_have_github_dispatch_contours(self) -> None:
