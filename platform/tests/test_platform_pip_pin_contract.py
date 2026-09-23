@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from tools import platform_validate_wheelhouse as validator
+from tools.platform_verify_contract import _workflow_step_blocks
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -241,13 +242,70 @@ class PlatformPipPinContractTests(unittest.TestCase):
 
     def test_security_workflow_uses_only_the_canonical_ci_installer(self) -> None:
         workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("platform/tools/platform_install_ci_python.sh"), 7)
-        self.assertEqual(workflow.count('python-version: "3.12"'), 7)
-        self.assertEqual(workflow.count("cache: pip"), 7)
-        self.assertEqual(
-            workflow.count("cache-dependency-path: platform/requirements-ci.lock.txt"),
-            7,
-        )
+        job_blocks = {
+            match.group("job_id"): match.group("body")
+            for match in re.finditer(
+                r"^  (?P<job_id>[A-Za-z0-9_-]+):\n"
+                r"(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                workflow,
+                re.MULTILINE | re.DOTALL,
+            )
+        }
+        setup_jobs = {
+            job_id: block
+            for job_id, block in job_blocks.items()
+            if re.search(
+                r"^\s*(?:-\s+)?uses:\s*actions/setup-python@",
+                block,
+                re.MULTILINE,
+            )
+        }
+        self.assertIn("release-runtime", setup_jobs)
+        self.assertGreater(len(setup_jobs), 1)
+        for job_id, block in sorted(setup_jobs.items()):
+            steps = _workflow_step_blocks(block)
+            setup_steps = tuple(
+                step
+                for step in steps
+                if re.search(
+                    r"^\s*(?:-\s+)?uses:\s*actions/setup-python@",
+                    step,
+                    re.MULTILINE,
+                )
+            )
+            installer_steps = tuple(
+                step
+                for step in steps
+                if re.search(
+                    r"^\s*run:\s*platform/tools/platform_install_ci_python\.sh\s*$",
+                    step,
+                    re.MULTILINE,
+                )
+            )
+            self.assertEqual(len(setup_steps), 1, job_id)
+            self.assertEqual(len(installer_steps), 1, job_id)
+            setup_step = setup_steps[0]
+            self.assertEqual(
+                len(re.findall(r'^\s+python-version:\s*"3\.12"\s*$', setup_step, re.MULTILINE)),
+                1,
+                job_id,
+            )
+            self.assertEqual(
+                len(re.findall(r"^\s+cache:\s*pip\s*$", setup_step, re.MULTILINE)),
+                1,
+                job_id,
+            )
+            self.assertEqual(
+                len(
+                    re.findall(
+                        r"^\s+cache-dependency-path:\s*platform/requirements-ci\.lock\.txt\s*$",
+                        setup_step,
+                        re.MULTILINE,
+                    )
+                ),
+                1,
+                job_id,
+            )
         self.assertNotIn("requirements-platform.txt", workflow)
         self.assertNotIn("requirements-quality.txt", workflow)
         self.assertNotIn("requirements-platform.lock.txt", workflow)

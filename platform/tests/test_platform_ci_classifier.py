@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import tempfile
+import textwrap
 import unittest
 import warnings
 import zipfile
@@ -69,7 +72,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             require_deployable=True,
         )
 
-    def test_runtime_sensitivity_is_exact_for_trusted_pull_request_ranges(self) -> None:
+    def test_release_runtime_sensitivity_is_exact_and_digest_bound(self) -> None:
         runtime_path = "platform/tools/platform_build_live_qa_runtime.py"
         self.assertIn(runtime_path, RUNTIME_SENSITIVE_FILES)
         runtime = classify(
@@ -185,6 +188,13 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("if: ${{ always() }}", workflow)
         self.assertIn("platform-security-build", workflow)
         self.assertIn("expected_gates", workflow)
+        self.assertIn("runtime_sensitive: ${{ steps.classify.outputs.runtime_sensitive }}", workflow)
+        self.assertIn("release-runtime", workflow)
+        self.assertIn(
+            "needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true'",
+            workflow,
+        )
+        self.assertNotIn("schedule:", workflow)
 
     def test_deploy_consumers_validate_the_exact_classifier_artifact(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
@@ -470,6 +480,187 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("classifier expected gates do not match its class", workflow)
         self.assertIn("classifier digest is missing", workflow)
         self.assertIn("status-start did not succeed before status publication", workflow)
+        self.assertIn(
+            'raw_runtime_sensitive = os.environ.get("ROUTE_RUNTIME_SENSITIVE", "")',
+            status_final,
+        )
+        self.assertIn(
+            'raw_runtime_sensitive not in {"true", "false"}',
+            status_final,
+        )
+        self.assertIn(
+            "classifier runtime-sensitive output is missing or malformed",
+            status_final,
+        )
+        self.assertIn(
+            'requires_release_runtime = runtime_sensitive or raw_fallback == "true"',
+            status_final,
+        )
+        self.assertIn('release_runtime_result != "success"', status_final)
+        self.assertIn('release_runtime_result != "skipped"', status_final)
+
+        script_match = re.search(
+            r"(?ms)^\s+/usr/bin/python3 - <<'PY'\n(?P<script>.*?)^\s+PY$",
+            status_final,
+        )
+        self.assertIsNotNone(script_match)
+        assert script_match is not None
+        status_script = textwrap.dedent(script_match.group("script"))
+        base_environment = {
+            "CLASSIFIER_RESULT": "success",
+            "EVENT_NAME": "pull_request",
+            "ROUTE_EVENT": "pull_request",
+            "ROUTE_CLASS": "docs-only",
+            "ROUTE_DEPLOYABLE": "false",
+            "ROUTE_FALLBACK": "false",
+            "ROUTE_REASON": "trusted docs route",
+            "ROUTE_DIGEST": "a" * 64,
+            "ROUTE_TARGET_SHA": self.TARGET_SHA,
+            "TESTED_SHA": self.TARGET_SHA,
+            "EXPECTED_GATES": '["docs", "verification-contract"]',
+            "DOCS_RESULT": "success",
+            "VERIFICATION_CONTRACT_RESULT": "success",
+            "STATUS_START_RESULT": "skipped",
+            "WORKFLOW_REF": "refs/heads/feature",
+            "RELEASE_RUNTIME_REAL_RESULT": "skipped",
+        }
+        status_cases = (
+            ("missing", None, "false", "skipped", False),
+            ("empty", "", "false", "skipped", False),
+            ("uppercase", "TRUE", "false", "skipped", False),
+            ("sensitive success", "true", "false", "success", True),
+            ("sensitive skipped", "true", "false", "skipped", False),
+            ("fallback success", "false", "true", "success", True),
+            ("fallback skipped", "false", "true", "skipped", False),
+            ("ordinary skipped", "false", "false", "skipped", True),
+            ("ordinary success", "false", "false", "success", False),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for label, raw_runtime, raw_fallback, release_result, expected_passed in status_cases:
+                with self.subTest(status_case=label):
+                    environment = os.environ.copy()
+                    environment.update(
+                        {
+                            **base_environment,
+                            "ROUTE_FALLBACK": raw_fallback,
+                            "RELEASE_RUNTIME_RESULT": release_result,
+                            "SUMMARY_PATH": str(Path(directory) / f"{label}.json"),
+                        }
+                    )
+                    if raw_runtime is not None:
+                        environment["ROUTE_RUNTIME_SENSITIVE"] = raw_runtime
+                    else:
+                        environment.pop("ROUTE_RUNTIME_SENSITIVE", None)
+                    completed = subprocess.run(
+                        ["/usr/bin/python3"],
+                        input=status_script,
+                        text=True,
+                        capture_output=True,
+                        env=environment,
+                        check=False,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(completed.stdout.strip(), str(expected_passed).lower())
+                    summary = json.loads(
+                        Path(environment["SUMMARY_PATH"]).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        summary["requires_release_runtime"],
+                        raw_runtime == "true" or raw_fallback == "true",
+                    )
+
+            trusted_base = {
+                **base_environment,
+                "EVENT_NAME": "push",
+                "ROUTE_EVENT": "push",
+                "ROUTE_CLASS": "full",
+                "ROUTE_FALLBACK": "false",
+                "ROUTE_RUNTIME_SENSITIVE": "true",
+                "EXPECTED_GATES": json.dumps(
+                    [
+                        "backend",
+                        "python-quality",
+                        "security",
+                        "migration",
+                        "docs",
+                        "web-quality",
+                        "web-hermetic",
+                        "verification-contract",
+                    ]
+                ),
+                "BACKEND_RESULT": "success",
+                "PYTHON_QUALITY_RESULT": "success",
+                "SECURITY_RESULT": "success",
+                "MIGRATION_RESULT": "success",
+                "WEB_QUALITY_RESULT": "success",
+                "WEB_HERMETIC_RESULT": "success",
+                "STATUS_START_RESULT": "success",
+                "RELEASE_RUNTIME_RESULT": "success",
+            }
+            trusted_cases = (
+                ("dev push real", "push", "refs/heads/dev", "success", True, True),
+                ("dev push fixture only", "push", "refs/heads/dev", "skipped", False, True),
+                (
+                    "dev manual real",
+                    "workflow_dispatch",
+                    "refs/heads/dev",
+                    "success",
+                    True,
+                    True,
+                ),
+                (
+                    "non-dev manual fixture only",
+                    "workflow_dispatch",
+                    "refs/heads/feature",
+                    "skipped",
+                    True,
+                    False,
+                ),
+                (
+                    "merge group fixture only",
+                    "merge_group",
+                    "refs/heads/gh-readonly-queue/main/pr-1-abc",
+                    "skipped",
+                    True,
+                    False,
+                ),
+            )
+            for (
+                label,
+                event_name,
+                workflow_ref,
+                real_result,
+                expected_passed,
+                expected_requires_real,
+            ) in trusted_cases:
+                with self.subTest(trusted_status_case=label):
+                    environment = os.environ.copy()
+                    environment.update(
+                        {
+                            **trusted_base,
+                            "EVENT_NAME": event_name,
+                            "ROUTE_EVENT": event_name,
+                            "WORKFLOW_REF": workflow_ref,
+                            "RELEASE_RUNTIME_REAL_RESULT": real_result,
+                            "SUMMARY_PATH": str(Path(directory) / f"trusted-{label}.json"),
+                        }
+                    )
+                    completed = subprocess.run(
+                        ["/usr/bin/python3"],
+                        input=status_script,
+                        text=True,
+                        capture_output=True,
+                        env=environment,
+                        check=False,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(completed.stdout.strip(), str(expected_passed).lower())
+                    summary = json.loads(
+                        Path(environment["SUMMARY_PATH"]).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        summary["requires_real_release_runtime"], expected_requires_real
+                    )
 
     def test_manifest_is_json_serializable_for_artifact_transport(self) -> None:
         manifest = classify(

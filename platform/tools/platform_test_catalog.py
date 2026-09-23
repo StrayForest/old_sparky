@@ -444,14 +444,14 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 154,
     "module_digest": "dca5e370c29b823a833a6678c5c64043721ce7cee3ecf3afa2c0e39083c1a81e",
-    "test_count": 1285,
-    "test_id_digest": "cc3efe529cd02ac745aad77a1dd62e863cf67c65d1a9f780be93b559bd5fd9ed",
-    "backend_test_count": 1246,
-    "backend_test_id_digest": "34f1bd8b0e13b560b8e603a3adbf71094475af31f73a34728fd9ef81bc2bab7c",
+    "test_count": 1288,
+    "test_id_digest": "8702fcb6c3d30abbb09a78333b2a4d0246238a80fcf8dcfabc2f6565103cc9de",
+    "backend_test_count": 1249,
+    "backend_test_id_digest": "ba548aae83fde906abc850923c780d9d8448d00fcf5a4f73fde6e66846d8a7e1",
     "verification_test_count": 39,
-    "verification_test_id_digest": "8bdde46a3749cae04c81c0c92f15ea0218f77f1e9440dbfa6fc15c78d1a87bf0",
+    "verification_test_id_digest": "a22c826f040efcd9b5518d87070ef1c1152843e5c6595145e0f3268fe7cc9306",
     "verification_classifier_test_count": 18,
-    "verification_classifier_test_id_digest": "e3c213c93565fbcbb5d40e33652f2effd791808bbbf7bd8ddef23f9a64110bc5",
+    "verification_classifier_test_id_digest": "2c65657404b34cae9567a636e4c5c887c1052115ac52614ac221f534cbe94a62",
 }
 # Keep each executable contour's boundary independently snapshotted.  The
 # aggregate snapshot proves total ownership, while these entries make a
@@ -488,8 +488,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-privileged": {
         "module_count": 21,
         "module_digest": "a671daef37f23599d9231140a05b21c8c9b236dc42cbcd82ff742d011aa1d1b2",
-        "test_count": 292,
-        "test_id_digest": "ac9f119c92d01b79c20a10023352e53f1d6b9fe20972590dce130c1929e100a7",
+        "test_count": 295,
+        "test_id_digest": "95402a4339488773661d3a2822ac2d33942e408c747115ac4f19380d6942b1b5",
     },
     "performance-contract": {
         "module_count": 10,
@@ -501,7 +501,7 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "module_count": 2,
         "module_digest": "b2a31b179b655a3aafcfd5c2ebc5dd0f09645024663d5985815355c2a2b984ee",
         "test_count": 39,
-        "test_id_digest": "8bdde46a3749cae04c81c0c92f15ea0218f77f1e9440dbfa6fc15c78d1a87bf0",
+        "test_id_digest": "a22c826f040efcd9b5518d87070ef1c1152843e5c6595145e0f3268fe7cc9306",
     },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])

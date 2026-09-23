@@ -56,10 +56,11 @@ DOCS_ONLY_GATE_IDS: tuple[str, ...] = ("docs", "verification-contract")
 OUT_OF_SCOPE_GATE_IDS: tuple[str, ...] = ("verification-contract",)
 KNOWN_EVENTS = frozenset({"pull_request", "push", "merge_group", "workflow_dispatch"})
 
-# Runtime-sensitive changes keep the normal full route, but phase-two workflow
-# consumption may add the privileged release-runtime fixture gate.  The set is
-# deliberately exact so docs and ordinary application changes do not pay that
-# cost when the changed-file range is trustworthy.
+# Runtime-sensitive changes retain the normal full route, but also enable the
+# root-owned release-runtime fixture gate in the verification job.  Keeping
+# this list exact prevents a docs or ordinary application change from paying
+# for the privileged builder regression while ensuring the builder, guard,
+# install/validator contracts and their hermetic test cannot bypass it.
 RUNTIME_SENSITIVE_FILES = frozenset(
     {
         "platform/tools/platform_build_live_qa_runtime.py",
@@ -304,6 +305,7 @@ def classify(
 
     raw_files = list(files)
     normalised, malformed_reason = _normalise_files(raw_files)
+    runtime_sensitive = any(path in RUNTIME_SENSITIVE_FILES for path in normalised)
     target_sha = target_sha.lower() if isinstance(target_sha, str) else ""
     event = event if isinstance(event, str) else ""
     branch = branch if isinstance(branch, str) else ""

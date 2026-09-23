@@ -60,7 +60,9 @@ from tools.platform_verify_contract import (
     SECURITY_WORKFLOW,
     action_pin_issues,
     collect_issues,
+    _ci_dependency_issues,
     extract_gate_invocations,
+    release_runtime_workflow_issues,
     security_status_permission_issues,
     workflow_level_permission_issues,
 )
@@ -708,12 +710,12 @@ except lock.VerificationLockError as exc:
         workflow = (
             Path(__file__).resolve().parents[2] / ".github/workflows/platform-security.yml"
         ).read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("name: Provision fixed root-owned global verification lock"), 3)
-        self.assertEqual(workflow.count("platform/tools/platform_verification_lock.py\" --provision"), 3)
+        self.assertEqual(workflow.count("name: Provision fixed root-owned global verification lock"), 4)
+        self.assertEqual(workflow.count("platform/tools/platform_verification_lock.py\" --provision"), 4)
         self.assertNotIn("RUNNER_TEMP/platform-verification-runtime", workflow)
         self.assertNotIn("PLATFORM_VERIFICATION_RUNTIME_DIR", workflow)
         self.assertNotIn("sudo install -d", workflow)
-        self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 3)
+        self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 4)
         verification_block = re.search(
             r"^  verification-contract:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
             workflow,
@@ -724,9 +726,16 @@ except lock.VerificationLockError as exc:
         self.assertNotIn("Provision fixed root-owned global verification lock", verification_block.group("body"))
 
     def test_registry_exposes_deterministic_and_workflow_only_contours(self) -> None:
-        self.assertEqual(set(CI_GATE_IDS), set(DETERMINISTIC_GATE_IDS))
+        conditional = {
+            gate_id
+            for gate_id in DETERMINISTIC_GATE_IDS
+            if GATES_BY_ID[gate_id].conditional
+        }
+        self.assertEqual(set(CI_GATE_IDS), set(DETERMINISTIC_GATE_IDS) - conditional)
         self.assertIn("backend", CI_GATE_IDS)
         self.assertIn("verification-contract", CI_GATE_IDS)
+        self.assertTrue(GATES_BY_ID["release-runtime"].conditional)
+        self.assertFalse(GATES_BY_ID["release-runtime"].ci_required)
         self.assertFalse(GATES_BY_ID["external-load"].deterministic)
         self.assertFalse(GATES_BY_ID["external-load"].local_safe)
         self.assertEqual(registry_payload()["ci_gate_ids"], list(CI_GATE_IDS))
@@ -788,9 +797,56 @@ except lock.VerificationLockError as exc:
         self.assertEqual(ALLOWED_ACTION_OWNERS, frozenset({"actions"}))
         self.assertEqual(action_pin_issues(), [])
         self.assertEqual(workflow_level_permission_issues(), [])
+        workflow_text = SECURITY_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(
-            security_status_permission_issues(SECURITY_WORKFLOW.read_text(encoding="utf-8")),
+            security_status_permission_issues(workflow_text),
             [],
+        )
+        self.assertEqual(release_runtime_workflow_issues(workflow_text), [])
+        missing_manual_route = workflow_text.replace(
+            "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&",
+            "(github.event_name == 'push') &&",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "manual route condition" in issue
+                for issue in release_runtime_workflow_issues(missing_manual_route)
+            )
+        )
+        missing_dev_route = workflow_text.replace(
+            "github.ref == 'refs/heads/dev'",
+            "github.ref == 'refs/heads/main'",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "canonical dev ref condition" in issue
+                for issue in release_runtime_workflow_issues(missing_dev_route)
+            )
+        )
+        missing_full_builder = workflow_text.replace(
+            "$build_root/platform/tools/platform_build_release.sh",
+            "$build_root/platform/tools/platform_build_live_qa_runtime.py",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "canonical release builder" in issue
+                for issue in release_runtime_workflow_issues(missing_full_builder)
+            )
+        )
+        release_publishing = workflow_text.replace(
+            "        run: |\n          set -Eeuo pipefail\n          umask 077",
+            "        uses: actions/upload-artifact@" + "a" * 40 + "\n"
+            "        run: |\n          set -Eeuo pipefail\n          umask 077",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "must not publish" in issue
+                for issue in release_runtime_workflow_issues(release_publishing)
+            )
         )
         with tempfile.TemporaryDirectory() as directory:
             action_file = Path(directory) / "action.yml"
@@ -814,6 +870,24 @@ except lock.VerificationLockError as exc:
             self.assertTrue(any("40-character commit SHA" in item for item in action_issues))
             self.assertTrue(any("owner 'unapproved'" in item for item in action_issues))
         self.assertEqual(collect_issues(), [])
+        synthetic_setup_job = SECURITY_WORKFLOW.read_text(encoding="utf-8") + """
+  synthetic-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+"""
+        dependency_issues = _ci_dependency_issues(synthetic_setup_job)
+        self.assertTrue(
+            any(
+                "Python CI job synthetic-python must invoke the canonical installer exactly once"
+                in issue
+                for issue in dependency_issues
+            )
+        )
         with tempfile.TemporaryDirectory() as directory:
             component_dir = Path(directory)
             _write_backend_component_fixture(component_dir)

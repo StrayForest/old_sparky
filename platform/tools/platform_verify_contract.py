@@ -129,6 +129,10 @@ _REMOTE_ACTION_RE = re.compile(
     r"(?:/(?P<path>[^@\s]+))?@(?P<ref>[^@\s]+)$",
 )
 _FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_SETUP_PYTHON_USE_RE = re.compile(
+    r"^\s*(?:-\s+)?uses:\s*actions/setup-python@",
+    re.MULTILINE,
+)
 
 
 def _action_definition_paths() -> tuple[Path, ...]:
@@ -860,27 +864,56 @@ def _ci_dependency_issues(security_text: str) -> list[str]:
             if marker not in pip_env_text:
                 issues.append(f"CI pip environment wrapper is missing marker: {marker}")
 
-    python_jobs = (
-        "backend-static",
-        "backend-integration",
-        "backend-privileged",
-        "python-quality",
-        "security",
-        "migration",
-        "verification-contract",
-    )
-    for job_id in python_jobs:
-        block = _workflow_job_block(security_text, job_id)
-        if not block:
-            issues.append(f"platform-security.yml is missing Python CI job: {job_id}")
-            continue
-        if block.count("platform/tools/platform_install_ci_python.sh") != 1:
+    job_blocks = {
+        match.group("job_id"): match.group("body")
+        for match in re.finditer(
+            r"^  (?P<job_id>[A-Za-z0-9_-]+):\n"
+            r"(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            security_text,
+            re.MULTILINE | re.DOTALL,
+        )
+    }
+    setup_python_jobs = {
+        job_id: block
+        for job_id, block in job_blocks.items()
+        if _SETUP_PYTHON_USE_RE.search(block)
+    }
+    if not setup_python_jobs:
+        issues.append("platform-security.yml must contain a Python setup job")
+    for job_id, block in sorted(setup_python_jobs.items()):
+        steps = _workflow_step_blocks(block)
+        setup_steps = tuple(
+            step
+            for step in steps
+            if _SETUP_PYTHON_USE_RE.search(step)
+        )
+        if len(setup_steps) != 1:
+            issues.append(f"Python CI job {job_id} must have exactly one setup-python step")
+            setup_step = ""
+        else:
+            setup_step = setup_steps[0]
+        installer_steps = tuple(
+            step
+            for step in steps
+            if re.search(
+                r"^\s*run:\s*platform/tools/platform_install_ci_python\.sh\s*$",
+                step,
+                re.MULTILINE,
+            )
+        )
+        if len(installer_steps) != 1:
             issues.append(f"Python CI job {job_id} must invoke the canonical installer exactly once")
-        if block.count('python-version: "3.12"') != 1:
+        if len(re.findall(r'^\s+python-version:\s*"3\.12"\s*$', setup_step, re.MULTILINE)) != 1:
             issues.append(f"Python CI job {job_id} must use the Python 3.12 lock target")
-        if block.count("cache: pip") != 1:
+        if len(re.findall(r"^\s+cache:\s*pip\s*$", setup_step, re.MULTILINE)) != 1:
             issues.append(f"Python CI job {job_id} must enable the pip cache")
-        if block.count("cache-dependency-path: platform/requirements-ci.lock.txt") != 1:
+        if len(
+            re.findall(
+                r"^\s+cache-dependency-path:\s*platform/requirements-ci\.lock\.txt\s*$",
+                setup_step,
+                re.MULTILINE,
+            )
+        ) != 1:
             issues.append(f"Python CI job {job_id} cache must use the CI lock digest")
         for marker in (
             "requirements-platform.txt",
@@ -1013,6 +1046,87 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
     return issues
 
 
+def release_runtime_workflow_issues(security_text: str) -> list[str]:
+    """Keep the conditional release gate fixture-only except trusted dev runs."""
+
+    issues: list[str] = []
+    block = _workflow_job_block(security_text, "release-runtime")
+    if not block:
+        return ["platform-security.yml is missing release-runtime"]
+    if "needs: classifier" not in block:
+        issues.append("release-runtime must depend on classifier")
+    if "name: Conditional release runtime gate" not in block:
+        issues.append("release-runtime must be named as a gate")
+    if "timeout-minutes: 45" not in block:
+        issues.append("release-runtime must retain a 45-minute job timeout")
+    if "permissions:\n      contents: read" not in block:
+        issues.append("release-runtime must have contents: read permissions")
+    checkout = next(
+        (
+            step
+            for step in _workflow_step_blocks(block)
+            if "actions/checkout@" in step
+        ),
+        "",
+    )
+    for marker, message in (
+        ("ref: ${{ github.sha }}", "exact checkout SHA"),
+        ("fetch-depth: 0", "full checkout history"),
+        ("persist-credentials: false", "checkout credential isolation"),
+    ):
+        if marker not in checkout:
+            issues.append(f"release-runtime checkout must set {message}")
+    if block.count("platform_verify.py release-runtime") != 1:
+        issues.append("release-runtime fixture must invoke the canonical gate exactly once")
+
+    real_step = next(
+        (step for step in _workflow_step_blocks(block) if "id: real-runtime" in step),
+        "",
+    )
+    if not real_step:
+        issues.append("release-runtime must define the real-runtime step")
+        return issues
+    for marker, message in (
+        ("github.event_name == 'push'", "push route condition"),
+        ("github.event_name == 'workflow_dispatch'", "manual route condition"),
+        ("github.ref == 'refs/heads/dev'", "canonical dev ref condition"),
+        ("needs.classifier.outputs.runtime_sensitive == 'true'", "runtime-sensitive condition"),
+        ("needs.classifier.outputs.fallback == 'true'", "fallback condition"),
+    ):
+        if marker not in real_step:
+            issues.append(f"release-runtime real step is missing {message}")
+    if "timeout-minutes: 40" not in real_step:
+        issues.append("release-runtime real step must have a fixed timeout")
+    for marker, message in (
+        ("platform_build_release.sh", "canonical release builder"),
+        ("PLATFORM_RELEASE_OUTPUT_DIR=\"$release_output\"", "task-owned release output"),
+        ("PLATFORM_WEB_NEXT_COMPRESSION=true", "canonical web compression mode"),
+        ("/usr/bin/python3 -m venv", "root-isolated Python environment"),
+        ("platform_validate_release_artifact.py", "read-only artifact validation"),
+        ("sha256sum -c", "checksum validation"),
+        ("RELEASE.json", "release provenance validation"),
+        ("min_free_bytes", "disk preflight"),
+        ("disk_after_bytes", "post-cleanup disk check"),
+        ("trap cleanup EXIT", "guaranteed cleanup"),
+        ("mktemp -d", "task-owned temporary root"),
+        ('/bin/rm -rf -- "$release_root"', "identity-checked cleanup"),
+        ("RELEASE_RUNTIME_BUILD schema=1", "bounded build diagnostic"),
+    ):
+        if marker not in real_step:
+            issues.append(f"release-runtime real step is missing {message}")
+    if "sudo -n /usr/bin/env -i" not in real_step:
+        issues.append("release-runtime real step must use root env isolation")
+    if "secrets." in block or "PROD_SSH_" in block or "SSH_PRIVATE_KEY" in block:
+        issues.append("release-runtime must not receive production credentials")
+    if "actions/upload-artifact@" in block or "actions/attest-build-provenance@" in block:
+        issues.append("release-runtime must not publish or attest an artifact")
+    if "GITHUB_WORKSPACE/platform/dist/releases" in real_step or "/root/old_sparky" in real_step:
+        issues.append("release-runtime must use task-owned output, not production paths")
+    if "platform_build_live_qa_runtime.py" in real_step:
+        issues.append("release-runtime must call the full canonical builder, not a partial imitation")
+    return issues
+
+
 def collect_issues() -> list[str]:
     issues: list[str] = []
 
@@ -1059,6 +1173,7 @@ def collect_issues() -> list[str]:
                 f"found {invocations.count(gate_id)}"
             )
     issues.extend(_backend_workflow_issues(security_text))
+    issues.extend(release_runtime_workflow_issues(security_text))
     issues.extend(
         _backend_timeout_budget_issues(
             {
@@ -1360,8 +1475,13 @@ def collect_issues() -> list[str]:
 
     if any(not GATES_BY_ID[gate_id].deterministic for gate_id in DETERMINISTIC_GATE_IDS):
         issues.append("deterministic registry contains a production-only gate")
-    if set(CI_GATE_IDS) != set(DETERMINISTIC_GATE_IDS):
-        issues.append("CI gate list must equal the deterministic registry gates")
+    conditional = {
+        gate_id for gate_id in DETERMINISTIC_GATE_IDS if GATES_BY_ID[gate_id].conditional
+    }
+    if set(CI_GATE_IDS) != set(DETERMINISTIC_GATE_IDS) - conditional:
+        issues.append(
+            "CI gate list must equal deterministic registry gates minus conditional gates"
+        )
 
     try:
         profiles = load_profiles()

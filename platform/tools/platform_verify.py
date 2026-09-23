@@ -46,6 +46,7 @@ class Gate:
     canonical_runner: str
     timeout_class: str
     owner: str
+    conditional: bool = False
 
     def as_json(self) -> dict[str, object]:
         payload = asdict(self)
@@ -153,6 +154,27 @@ GATES: tuple[Gate, ...] = (
         owner="platform-tooling",
     ),
     Gate(
+        id="release-runtime",
+        description=(
+            "Privileged hermetic live-QA runtime build and browser-link materialization fixture."
+        ),
+        deterministic=True,
+        local_safe=True,
+        ci_required=False,
+        environment_requirements=(
+            "root test user",
+            "disposable staged checkout and local pinned ZIP fixtures",
+            "no production network or credentials",
+        ),
+        canonical_runner=(
+            "tools/platform_test_runner.py --contour backend-privileged --focused "
+            "release build contract IDs"
+        ),
+        timeout_class="medium",
+        owner="release",
+        conditional=True,
+    ),
+    Gate(
         id="server-smoke",
         description="Small critical-interface smoke after an immutable deployment.",
         deterministic=False,
@@ -205,6 +227,12 @@ GATES: tuple[Gate, ...] = (
 GATES_BY_ID = {gate.id: gate for gate in GATES}
 DETERMINISTIC_GATE_IDS = tuple(gate.id for gate in GATES if gate.deterministic)
 CI_GATE_IDS = tuple(gate.id for gate in GATES if gate.ci_required)
+
+RELEASE_RUNTIME_TEST_IDS: tuple[str, ...] = (
+    "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_staged_live_qa_build_materializes_validated_browser_links",
+    "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_staged_live_qa_build_fails_closed_for_browser_link_inputs",
+    "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_browser_materializer_rejects_filesystem_metadata_and_specials",
+)
 
 
 class VerificationError(RuntimeError):
@@ -361,6 +389,21 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
             gate_id,
             _backend_contour_command(gate_id, arguments),
             timeout_seconds=_backend_catalog_module().CONTOUR_TIMEOUT_SECONDS[gate_id],
+        )
+    if gate_id == "release-runtime":
+        if arguments:
+            raise VerificationError("release-runtime does not accept extra arguments.")
+        return _run(
+            gate_id,
+            [
+                _python(),
+                _tool("platform_test_runner.py"),
+                "--contour",
+                "backend-privileged",
+                "--focused",
+                *RELEASE_RUNTIME_TEST_IDS,
+            ],
+            timeout_seconds=600,
         )
     if arguments and gate_id not in {"backend", "verification-contract"}:
         raise VerificationError(f"{gate_id} does not accept extra arguments.")

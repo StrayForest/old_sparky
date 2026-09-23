@@ -22,15 +22,37 @@ placement rules; it does not repeat tool arguments.
 | `web-quality` | web owners | Node 26.3.1 and locked dependencies | local feedback + CI |
 | `web-hermetic` | web owners | local/mocked API and Chromium | local feedback + CI |
 | `verification-contract` | platform tooling owners | repository checkout | CI |
+| `release-runtime` | release owners | root test user; fixture checkout on PR/merge_group, task-owned full release checkout on trusted dev | conditional runtime-sensitive/fallback route |
 | `server-smoke` | release owners | exact deployed SHA | deployment workflow |
 | `live-public` | production operators | canonical public origin and dedicated QA identity | explicit/release workflow |
 | `live-user-destructive` | production operators | marked production fixtures and mandatory cleanup | explicit operator workflow |
 | `external-load` | performance operators | external generator to production origin | explicit operator workflow |
 
-The first eight gates are deterministic. `platform_verify.py ci` can execute
-only those gates and never connects to production, creates production
-fixtures, opens a production browser or starts a load generator. The latter
-four remain discoverable governance groups but are workflow-only.
+The first eight gates are deterministic and always part of the normal CI
+aggregate. The conditional `release-runtime` gate is deterministic as well,
+but is intentionally excluded from `platform_verify.py ci`: the classifier
+enables it for an exact runtime-sensitive path change or for a fail-closed
+fallback route. The fallback condition ensures an uncertain route receives
+the release-runtime coverage without granting it production authority.
+On pull requests and `merge_group`, the gate is fixture-only: it builds the
+staged runtime with local small pinned-fixture ZIPs under `python -I`, verifies
+link materialization, manifest/tree/mode invariants and downstream install
+validation, and has no production network, credentials or deployment authority.
+For a classifier-sensitive or fallback route on a canonical `dev` push, or on
+`workflow_dispatch` whose ref is exactly `dev`, the same job additionally runs
+the full `platform_build_release.sh` builder in a root-owned disposable
+checkout. That trusted-dev contour uses the pinned public dependencies and
+production builder path, validates the archive checksum and `RELEASE.json`
+provenance read-only, emits only bounded status/digest data, and removes its
+identified temporary output/cache in an exit trap. It does not receive
+production secrets or SSH material, publish an artifact, or deploy; the
+`status-final` result blocks the pre-deploy security status when this step is
+required. Non-`dev` manual runs and all ordinary/docs routes remain skipped or
+fixture-only as selected by the classifier; there is no schedule trigger.
+`platform_verify.py ci` can execute only the always-on deterministic gates and
+never connects to production, creates production fixtures, opens a production
+browser or starts a load generator. The latter four remain discoverable
+governance groups but are workflow-only.
 
 ## Backend catalog and contours
 
@@ -141,7 +163,10 @@ deployable when its source is the current `dev` push. The routes are:
 
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route
-with `fallback=true` and `deployable=false`. Known `.github/**` and
+with `fallback=true` and `deployable=false`; these routes also run the
+conditional `release-runtime` fixture gate; a sensitive/fallback push to the
+canonical `dev` branch also runs its full trusted-dev builder. Known
+`.github/**` and
 `platform/**` dependency, configuration, migration, workflow and registry
 paths are recognized full routes with `fallback=false`; they are not fallback
 cases merely because they require the full gate set. A known full path with
