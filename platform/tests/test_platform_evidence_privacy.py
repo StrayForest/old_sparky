@@ -516,7 +516,23 @@ class EvidencePrivacyTests(unittest.TestCase):
             "cpu_profile": {
                 "enabled": True,
                 "armed_worker_identities": [{"pid": 987654, "uid": 876543}],
-                "retention": {"available_profiles": 1},
+                "retention": {
+                    "available_profiles": 1,
+                    "ignored_stale_profiles": 2,
+                    "invalid_profiles": 1,
+                },
+                "signal_delivery": {
+                    "arm": {
+                        "requested_count": 2,
+                        "delivered_count": 1,
+                        "rejected_count": 1,
+                        "pidfd_api_available": False,
+                        "rejection_reasons": {
+                            "pidfd_unavailable": 1,
+                            "operator@example.test": 99,
+                        },
+                    },
+                },
             },
             "postgres_stat_statements": {
                 "before": {
@@ -546,6 +562,11 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertNotIn("binding", public_observer)
         self.assertNotIn("by_pid", public_observer["server_ssr_observability"]["event_loop"])
         self.assertNotIn("armed_worker_identities", public_observer["cpu_profile"])
+        self.assertEqual(public_observer["cpu_profile"]["ignored_stale_profiles"], 2)
+        self.assertEqual(
+            public_observer["cpu_profile"]["signal_delivery"]["arm"]["rejection_reasons"],
+            {"pidfd_unavailable": 1},
+        )
         self.assertEqual(public_observer["postgres_stat_statements"]["before"]["rows"][0]["queryid"], "42")
 
         timeout_source = {

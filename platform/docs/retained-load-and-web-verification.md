@@ -74,3 +74,29 @@ identities remain private for evaluation/cleanup only; required evidence uses
 evidence fails. Dispatch inputs use the canonical bounded-ASCII parser and
 private mode-0600 JSON stdin; SSH carries a fixed dispatcher mode and no raw
 input enters reports or artifacts.
+
+The origin observer is supported only as the child of
+[`platform_production_external_fixture_qa.sh`](../tools/platform_production_external_fixture_qa.sh).
+That helper enters the canonical retained-load supervisor first and keeps
+`/run/lock/oldsparky-retained-load-matrix.lock` held through observer
+completion, export and exit; the observer is not a standalone lock owner.
+The Actions concurrency group serializes this workflow, while the host lock
+also covers deployment, cleanup and maintenance callers. Do not launch the
+observer directly on the production host.
+
+When the diagnostic CPU-profile environment is enabled, worker signals are
+sent only through Linux pidfds after the exact UID, parent and procfs
+start-time identity checks. If either pidfd API is unavailable or delivery
+fails, the observer refuses the signal and records a bounded reason; it still
+retains its independent system, journal and database evidence. It never falls
+back to numeric-PID signalling.
+
+Profile artifacts are attributed only when their filename contains the exact
+worker PID and procfs start-time generation captured for the window, the file
+is new or changed after the observer baseline snapshot, and `pstats` can parse
+it. Stale files, same-PID files from an earlier observer, wrong-generation
+files and partial/unparseable files are excluded. The observer preserves all
+caller-owned artifacts for the existing host retention procedure. Public
+projection retains only bounded counts and fixed signal-rejection reasons; raw
+PIDs, start times, identities and filesystem paths do not cross the artifact
+boundary.

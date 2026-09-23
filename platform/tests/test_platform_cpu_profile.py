@@ -23,11 +23,25 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             profiler.flush()
             await profiler.stop()
 
+            self.assertIsNotNone(profiler._start_time_ticks)
             self.assertEqual(
                 sorted(path.name for path in Path(temporary_dir).iterdir()),
                 [
-                    f"ready-vote-cprofile-{os.getpid()}.pstats",
-                    f"ready-vote-cprofile-{os.getpid()}.txt",
+                    f"ready-vote-cprofile-{os.getpid()}-{profiler._start_time_ticks}.pstats",
+                    f"ready-vote-cprofile-{os.getpid()}-{profiler._start_time_ticks}.txt",
                 ],
             )
-            self.assertIn("sum", Path(temporary_dir, f"ready-vote-cprofile-{os.getpid()}.txt").read_text())
+            self.assertIn(
+                "sum",
+                Path(
+                    temporary_dir,
+                    f"ready-vote-cprofile-{os.getpid()}-{profiler._start_time_ticks}.txt",
+                ).read_text(),
+            )
+
+    async def test_stop_before_arm_does_not_write_empty_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            profiler = ReadyVoteCpuProfiler(Path(temporary_dir))
+            await profiler.start()
+            await profiler.stop()
+            self.assertEqual(list(Path(temporary_dir).iterdir()), [])
