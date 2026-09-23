@@ -309,6 +309,18 @@ def classify(
     target_sha = target_sha.lower() if isinstance(target_sha, str) else ""
     event = event if isinstance(event, str) else ""
     branch = branch if isinstance(branch, str) else ""
+    # Only a complete pull-request/push range can prove that a non-sensitive
+    # route is safe.  Dispatch/merge-group events and every unavailable or
+    # malformed range therefore expose the conservative value for later
+    # workflow consumption, even when a caller supplied a plausible file list.
+    runtime_sensitive = (
+        event not in {"pull_request", "push"}
+        or not repository_ready
+        or malformed_reason is not None
+        or not normalised
+        or SHA_RE.fullmatch(target_sha) is None
+        or any(path in RUNTIME_SENSITIVE_FILES for path in normalised)
+    )
 
     if not repository_ready:
         return _build_manifest(
@@ -384,6 +396,7 @@ def classify(
         )
 
     route_class, expected_gates, reason, fallback = _route_for_files(normalised)
+    runtime_sensitive = runtime_sensitive or fallback
     return _build_manifest(
         target_sha=target_sha,
         event=event,
@@ -443,8 +456,13 @@ def validate_manifest(
     files = manifest.get("files")
     if not isinstance(files, list) or any(not isinstance(path, str) for path in files):
         raise ClassifierError("classifier files must be a list of strings")
-    if runtime_sensitive != any(path in RUNTIME_SENSITIVE_FILES for path in files):
-        raise ClassifierError("classifier runtime_sensitive does not match its files")
+    expected_runtime_sensitive = (
+        manifest["fallback"]
+        or event not in {"pull_request", "push"}
+        or any(path in RUNTIME_SENSITIVE_FILES for path in files)
+    )
+    if runtime_sensitive != expected_runtime_sensitive:
+        raise ClassifierError("classifier runtime_sensitive does not match its route")
     digest = manifest.get("digest")
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ClassifierError("classifier digest is malformed")
