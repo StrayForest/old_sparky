@@ -521,6 +521,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
             "DOCS_RESULT": "success",
             "VERIFICATION_CONTRACT_RESULT": "success",
             "STATUS_START_RESULT": "skipped",
+            "WORKFLOW_REF": "refs/heads/feature",
+            "RELEASE_RUNTIME_REAL_RESULT": "skipped",
         }
         status_cases = (
             ("missing", None, "false", "skipped", False),
@@ -565,6 +567,99 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     self.assertEqual(
                         summary["requires_release_runtime"],
                         raw_runtime == "true" or raw_fallback == "true",
+                    )
+
+            trusted_base = {
+                **base_environment,
+                "EVENT_NAME": "push",
+                "ROUTE_EVENT": "push",
+                "ROUTE_CLASS": "full",
+                "ROUTE_FALLBACK": "false",
+                "ROUTE_RUNTIME_SENSITIVE": "true",
+                "EXPECTED_GATES": json.dumps(
+                    [
+                        "backend",
+                        "python-quality",
+                        "security",
+                        "migration",
+                        "docs",
+                        "web-quality",
+                        "web-hermetic",
+                        "verification-contract",
+                    ]
+                ),
+                "BACKEND_RESULT": "success",
+                "PYTHON_QUALITY_RESULT": "success",
+                "SECURITY_RESULT": "success",
+                "MIGRATION_RESULT": "success",
+                "WEB_QUALITY_RESULT": "success",
+                "WEB_HERMETIC_RESULT": "success",
+                "STATUS_START_RESULT": "success",
+                "RELEASE_RUNTIME_RESULT": "success",
+            }
+            trusted_cases = (
+                ("dev push real", "push", "refs/heads/dev", "success", True, True),
+                ("dev push fixture only", "push", "refs/heads/dev", "skipped", False, True),
+                (
+                    "dev manual real",
+                    "workflow_dispatch",
+                    "refs/heads/dev",
+                    "success",
+                    True,
+                    True,
+                ),
+                (
+                    "non-dev manual fixture only",
+                    "workflow_dispatch",
+                    "refs/heads/feature",
+                    "skipped",
+                    True,
+                    False,
+                ),
+                (
+                    "merge group fixture only",
+                    "merge_group",
+                    "refs/heads/gh-readonly-queue/main/pr-1-abc",
+                    "skipped",
+                    True,
+                    False,
+                ),
+            )
+            for (
+                label,
+                event_name,
+                workflow_ref,
+                real_result,
+                expected_passed,
+                expected_requires_real,
+            ) in trusted_cases:
+                with self.subTest(trusted_status_case=label):
+                    environment = os.environ.copy()
+                    environment.update(
+                        {
+                            **trusted_base,
+                            "EVENT_NAME": event_name,
+                            "ROUTE_EVENT": event_name,
+                            "WORKFLOW_REF": workflow_ref,
+                            "RELEASE_RUNTIME_REAL_RESULT": real_result,
+                            "SUMMARY_PATH": str(Path(directory) / f"trusted-{label}.json"),
+                        }
+                    )
+                    completed = subprocess.run(
+                        ["/usr/bin/python3"],
+                        input=status_script,
+                        text=True,
+                        capture_output=True,
+                        env=environment,
+                        check=False,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(completed.stdout.strip(), str(expected_passed).lower())
+                    summary = json.loads(
+                        Path(environment["SUMMARY_PATH"]).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        summary["requires_real_release_runtime"], expected_requires_real
                     )
 
     def test_manifest_is_json_serializable_for_artifact_transport(self) -> None:

@@ -62,6 +62,7 @@ from tools.platform_verify_contract import (
     collect_issues,
     _ci_dependency_issues,
     extract_gate_invocations,
+    release_runtime_workflow_issues,
     security_status_permission_issues,
     workflow_level_permission_issues,
 )
@@ -796,9 +797,56 @@ except lock.VerificationLockError as exc:
         self.assertEqual(ALLOWED_ACTION_OWNERS, frozenset({"actions"}))
         self.assertEqual(action_pin_issues(), [])
         self.assertEqual(workflow_level_permission_issues(), [])
+        workflow_text = SECURITY_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(
-            security_status_permission_issues(SECURITY_WORKFLOW.read_text(encoding="utf-8")),
+            security_status_permission_issues(workflow_text),
             [],
+        )
+        self.assertEqual(release_runtime_workflow_issues(workflow_text), [])
+        missing_manual_route = workflow_text.replace(
+            "(github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&",
+            "(github.event_name == 'push') &&",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "manual route condition" in issue
+                for issue in release_runtime_workflow_issues(missing_manual_route)
+            )
+        )
+        missing_dev_route = workflow_text.replace(
+            "github.ref == 'refs/heads/dev'",
+            "github.ref == 'refs/heads/main'",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "canonical dev ref condition" in issue
+                for issue in release_runtime_workflow_issues(missing_dev_route)
+            )
+        )
+        missing_full_builder = workflow_text.replace(
+            "$build_root/platform/tools/platform_build_release.sh",
+            "$build_root/platform/tools/platform_build_live_qa_runtime.py",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "canonical release builder" in issue
+                for issue in release_runtime_workflow_issues(missing_full_builder)
+            )
+        )
+        release_publishing = workflow_text.replace(
+            "        run: |\n          set -Eeuo pipefail\n          umask 077",
+            "        uses: actions/upload-artifact@" + "a" * 40 + "\n"
+            "        run: |\n          set -Eeuo pipefail\n          umask 077",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "must not publish" in issue
+                for issue in release_runtime_workflow_issues(release_publishing)
+            )
         )
         with tempfile.TemporaryDirectory() as directory:
             action_file = Path(directory) / "action.yml"

@@ -607,11 +607,13 @@ jobs:
           retention-days: 14
 
   release-runtime:
-    name: Conditional release runtime fixture
+    name: Conditional release runtime gate
     needs: classifier
     if: ${{ needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
+    permissions:
+      contents: read
     env:
       PLATFORM_ENVIRONMENT: test
       PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
@@ -620,9 +622,13 @@ jobs:
       PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
       PLATFORM_CELERY_BROKER_URL: redis://127.0.0.1:6379/13
       PLATFORM_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/14
+    outputs:
+      real_runtime_result: ${{ steps.real-runtime.outcome || 'skipped' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -640,6 +646,235 @@ jobs:
         run: >-
           sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
           .venv_platform/bin/python tools/platform_verify.py release-runtime"
+      - name: Run canonical immutable release builder on trusted dev
+        id: real-runtime
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          github.ref == 'refs/heads/dev' &&
+          (needs.classifier.outputs.runtime_sensitive == 'true' ||
+          needs.classifier.outputs.fallback == 'true')
+        timeout-minutes: 40
+        shell: bash
+        env:
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          min_free_bytes=$((5 * 1024 * 1024 * 1024))
+          failure_reason=step_failed
+          release_root=""
+          release_root_id=""
+          artifact_sha256=""
+          disk_before_bytes=""
+          disk_after_bytes=""
+
+          free_bytes() {
+            local disk_path="${runner_temp:-${RUNNER_TEMP}}"
+            local value
+            value="$(df -B1 --output=avail -- "$disk_path" 2>/dev/null | awk 'NR == 2 {print $1}')"
+            [[ "$value" =~ ^[0-9]+$ ]] || return 1
+            printf '%s\n' "$value"
+          }
+
+          cleanup() {
+            local rc=$?
+            local cleanup_rc=0
+            local current_id=""
+            trap - EXIT
+            set +e
+            if [[ -n "$release_root" ]]; then
+              if [[ -d "$release_root" && ! -L "$release_root" ]]; then
+                current_id="$(sudo -n /usr/bin/stat -c '%d:%i' -- "$release_root" 2>/dev/null)"
+                if [[ -n "$release_root_id" && "$current_id" == "$release_root_id" ]]; then
+                  sudo -n /bin/rm -rf -- "$release_root" || cleanup_rc=1
+                else
+                  cleanup_rc=1
+                fi
+              elif [[ -e "$release_root" || -L "$release_root" ]]; then
+                cleanup_rc=1
+              fi
+              [[ ! -e "$release_root" && ! -L "$release_root" ]] || cleanup_rc=1
+            fi
+            disk_after_bytes="$(free_bytes 2>/dev/null || true)"
+            if [[ ! "$disk_after_bytes" =~ ^[0-9]+$ ]] || (( disk_after_bytes < min_free_bytes )); then
+              cleanup_rc=1
+            fi
+            if (( cleanup_rc != 0 )); then
+              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup\n'
+              exit 1
+            fi
+            if (( rc != 0 )); then
+              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=%s\n' "$failure_reason"
+              exit "$rc"
+            fi
+            printf 'RELEASE_RUNTIME_BUILD schema=1 status=passed source_sha=%s artifact_sha256=%s disk_before_bytes=%s disk_after_bytes=%s\n' \
+              "$TARGET_SHA" "$artifact_sha256" "$disk_before_bytes" "$disk_after_bytes"
+            exit 0
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { failure_reason=target_sha_invalid; exit 1; }
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] || { failure_reason=run_id_invalid; exit 1; }
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] || { failure_reason=run_attempt_invalid; exit 1; }
+          runner_temp="$(readlink -f -- "$RUNNER_TEMP")" || { failure_reason=temp_unavailable; exit 1; }
+          [[ -d "$runner_temp" && ! -L "$RUNNER_TEMP" ]] || { failure_reason=temp_unavailable; exit 1; }
+          disk_before_bytes="$(free_bytes)" || { failure_reason=disk_probe_failed; exit 1; }
+          (( disk_before_bytes >= min_free_bytes )) || { failure_reason=insufficient_disk; exit 1; }
+
+          workspace_head="$(git -C "$GITHUB_WORKSPACE" rev-parse --verify HEAD)" || {
+            failure_reason=workspace_head_unavailable
+            exit 1
+          }
+          [[ "$workspace_head" == "$TARGET_SHA" ]] || { failure_reason=workspace_sha_mismatch; exit 1; }
+          [[ -z "$(git -C "$GITHUB_WORKSPACE" status --porcelain=v1 --untracked-files=all)" ]] || {
+            failure_reason=workspace_dirty
+            exit 1
+          }
+
+          release_ref="gha-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          release_root="$(sudo -n /usr/bin/mktemp -d \
+            "$runner_temp/platform-release-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.XXXXXX")" || {
+            failure_reason=temp_create_failed
+            exit 1
+          }
+          case "$release_root" in
+            "$runner_temp/platform-release-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}."*) ;;
+            *) failure_reason=temp_identity_failed; exit 1 ;;
+          esac
+          [[ "$(readlink -f -- "$release_root")" == "$release_root" ]] || {
+            failure_reason=temp_identity_failed
+            exit 1
+          }
+          [[ "$(sudo -n /usr/bin/stat -c '%u:%a' -- "$release_root")" == "0:700" ]] || {
+            failure_reason=temp_permissions_failed
+            exit 1
+          }
+          release_root_id="$(sudo -n /usr/bin/stat -c '%d:%i' -- "$release_root")" || {
+            failure_reason=temp_identity_failed
+            exit 1
+          }
+
+          build_root="$release_root/source"
+          release_output="$build_root/platform/dist/releases"
+          build_log="$release_root/canonical-builder.log"
+          sudo -n /usr/bin/install -d -o root -g root -m 0700 "$build_root"
+          sudo -n /bin/cp -a "$GITHUB_WORKSPACE/." "$build_root/"
+          sudo -n /bin/chown -R root:root "$build_root"
+          [[ "$(sudo -n /usr/bin/git -C "$build_root" rev-parse --verify HEAD)" == "$TARGET_SHA" ]] || {
+            failure_reason=copied_sha_mismatch
+            exit 1
+          }
+          sudo -n /usr/bin/env -i \
+            HOME=/root \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/bin/python3 -m venv "$build_root/platform/.venv_platform" || {
+            failure_reason=python_environment_failed
+            exit 1
+          }
+          sudo -n /usr/bin/install -d -o root -g root -m 0755 "$release_output" || {
+            failure_reason=release_output_failed
+            exit 1
+          }
+          sudo -n /usr/bin/install -o root -g root -m 0600 /dev/null "$build_log" || {
+            failure_reason=build_log_failed
+            exit 1
+          }
+
+          set +e
+          sudo -n /usr/bin/env -i \
+            HOME=/root \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            PLATFORM_RELEASE_OUTPUT_DIR="$release_output" \
+            PLATFORM_WEB_NEXT_COMPRESSION=true \
+            "$build_root/platform/tools/platform_build_release.sh" "$release_ref" \
+            2>&1 | sudo -n /usr/bin/tee "$build_log" >/dev/null
+          builder_status=("${PIPESTATUS[@]}")
+          set -e
+          [[ "${builder_status[1]:-1}" -eq 0 ]] || { failure_reason=build_log_failed; exit 1; }
+          [[ "${builder_status[0]:-1}" -eq 0 ]] || { failure_reason=canonical_builder_failed; exit 1; }
+
+          archive_candidates="$(sudo -n /usr/bin/find "$release_output" -maxdepth 1 -type f \
+            -name "${release_ref}-*.tar.gz" -print)" || {
+            failure_reason=artifact_lookup_failed
+            exit 1
+          }
+          [[ -n "$archive_candidates" && "$archive_candidates" != *$'\n'* ]] || {
+            failure_reason=artifact_count_invalid
+            exit 1
+          }
+          release_archive="$archive_candidates"
+          release_checksum="${release_archive}.sha256"
+          if ! sudo -n /usr/bin/test ! -L "$release_archive" \
+            || ! sudo -n /usr/bin/test ! -L "$release_checksum"; then
+            failure_reason=artifact_symlink
+            exit 1
+          fi
+          if ! sudo -n /usr/bin/test -f "$release_archive" \
+            || ! sudo -n /usr/bin/test -f "$release_checksum"; then
+            failure_reason=artifact_missing
+            exit 1
+          fi
+          archive_name="$(basename -- "$release_archive")"
+          [[ "$archive_name" =~ ^([A-Za-z0-9][A-Za-z0-9._-]{0,179})\.tar\.gz$ ]] || {
+            failure_reason=artifact_name_invalid
+            exit 1
+          }
+          actual_slug="${BASH_REMATCH[1]}"
+          [[ "$actual_slug" == "$release_ref-"* ]] || { failure_reason=artifact_ref_mismatch; exit 1; }
+
+          sudo -n /usr/bin/python3 -I \
+            "$build_root/platform/tools/platform_validate_release_artifact.py" \
+            --artifact "$release_archive" \
+            --checksum "$release_checksum" \
+            --release-slug "$actual_slug" >/dev/null || {
+            failure_reason=artifact_validation_failed
+            exit 1
+          }
+          sudo -n /bin/bash -c \
+            'cd -- "$1" && /usr/bin/sha256sum -c "$2" >/dev/null' \
+            _ "$release_output" "$release_checksum" || {
+            failure_reason=checksum_validation_failed
+            exit 1
+          }
+          sudo -n /usr/bin/python3 -I - "$release_archive" "$actual_slug" "$TARGET_SHA" >/dev/null <<'PY'
+          import json
+          import re
+          import sys
+          import tarfile
+
+          archive_path, expected_slug, expected_commit = sys.argv[1:]
+          with tarfile.open(archive_path, mode="r:gz") as archive:
+              member_name = f"{expected_slug}/RELEASE.json"
+              members = [member for member in archive.getmembers() if member.name == member_name]
+              if len(members) != 1 or not members[0].isreg() or members[0].size > 64 * 1024:
+                  raise SystemExit("release provenance member is invalid")
+              handle = archive.extractfile(members[0])
+              if handle is None:
+                  raise SystemExit("release provenance member is unavailable")
+              payload = json.load(handle)
+          if payload.get("release_slug") != expected_slug:
+              raise SystemExit("release provenance slug mismatch")
+          if payload.get("source_git_commit") != expected_commit:
+              raise SystemExit("release provenance source mismatch")
+          if payload.get("node_version") != "26.3.1":
+              raise SystemExit("release provenance Node version mismatch")
+          if payload.get("npm_version") != "11.16.0":
+              raise SystemExit("release provenance npm version mismatch")
+          if re.fullmatch(r"[0-9a-f]{40,64}", str(payload.get("source_git_commit"))) is None:
+              raise SystemExit("release provenance source format is invalid")
+          PY
+          artifact_sha256="$(sudo -n /usr/bin/sha256sum "$release_archive" | awk '{print $1}')" || {
+            failure_reason=artifact_digest_failed
+            exit 1
+          }
+          [[ "$artifact_sha256" =~ ^[0-9a-f]{64}$ ]] || { failure_reason=artifact_digest_invalid; exit 1; }
 
   status-final:
     if: ${{ always() }}
@@ -675,6 +910,8 @@ jobs:
           MIGRATION_RESULT: ${{ needs.migration.result }}
           VERIFICATION_CONTRACT_RESULT: ${{ needs['verification-contract'].result }}
           RELEASE_RUNTIME_RESULT: ${{ needs['release-runtime'].result }}
+          RELEASE_RUNTIME_REAL_RESULT: ${{ needs['release-runtime'].outputs.real_runtime_result }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           export SUMMARY_PATH="$GITHUB_WORKSPACE/platform-security-summary.json"
@@ -746,12 +983,26 @@ jobs:
               gate for gate in expected if results.get(gate) != "success"
           ] if isinstance(expected, list) else ["classifier expected gates are malformed"]
           release_runtime_result = os.environ.get("RELEASE_RUNTIME_RESULT", "missing")
+          real_runtime_result = os.environ.get("RELEASE_RUNTIME_REAL_RESULT", "skipped")
           requires_release_runtime = runtime_sensitive or raw_fallback == "true"
+          trusted_real_event = (
+              (event_name == "push" and os.environ.get("WORKFLOW_REF") == "refs/heads/dev")
+              or (
+                  event_name == "workflow_dispatch"
+                  and os.environ.get("WORKFLOW_REF") == "refs/heads/dev"
+              )
+          )
+          requires_real_release_runtime = requires_release_runtime and trusted_real_event
           if requires_release_runtime:
               if release_runtime_result != "success":
                   missing_or_failed.append("release-runtime")
           elif release_runtime_result != "skipped":
               route_errors.append("release-runtime must be skipped for a non-sensitive non-fallback route")
+          if requires_real_release_runtime:
+              if real_runtime_result != "success":
+                  missing_or_failed.append("release-runtime-real")
+          elif real_runtime_result not in {"", "skipped"}:
+              route_errors.append("real release-runtime must be skipped outside trusted dev routes")
           passed = (
               os.environ.get("CLASSIFIER_RESULT") == "success"
               and not route_errors
@@ -771,9 +1022,11 @@ jobs:
               "gate_results": results,
               "conditional_gate_results": {
                   "release-runtime": release_runtime_result,
+                  "release-runtime-real": real_runtime_result,
               },
               "runtime_sensitive": runtime_sensitive,
               "requires_release_runtime": requires_release_runtime,
+              "requires_real_release_runtime": requires_real_release_runtime,
               "missing_or_failed": missing_or_failed,
               "route_errors": route_errors,
               "status_start_result": os.environ.get("STATUS_START_RESULT", "missing"),
