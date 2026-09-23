@@ -24,6 +24,20 @@ type DetailState =
   | { status: "not-found" }
   | { status: "error" };
 
+type InitialRequest = {
+  slug: string;
+  inviteCode: string | null;
+  sessionIdentity: string;
+  payload: TournamentDetail;
+  version: number;
+};
+
+type ServerSeed = {
+  slug: string;
+  inviteCode: string | null;
+  payload: TournamentDetail | undefined;
+};
+
 export function TournamentDetailClientPage({
   slug,
   inviteCode,
@@ -32,15 +46,22 @@ export function TournamentDetailClientPage({
   const { status: authStatus, user } = useAuth();
   const { t } = useI18n();
   const sessionIdentity = `${authStatus}:${user?.id ?? "anonymous"}`;
-  const initialRequestRef = useRef(
-    initialTournament
-      ? {
-          slug,
-          inviteCode: inviteCode ?? null,
-          sessionIdentity
-        }
-      : null
-  );
+  const normalizedInviteCode = inviteCode ?? null;
+  const serverSeedVersionRef = useRef(1);
+  const serverSeedRef = useRef<ServerSeed>({
+    slug,
+    inviteCode: normalizedInviteCode,
+    payload: initialTournament
+  });
+  const initialRequestRef = useRef<InitialRequest | null>(initialTournament
+    ? {
+        slug,
+        inviteCode: normalizedInviteCode,
+        sessionIdentity,
+        payload: initialTournament,
+        version: serverSeedVersionRef.current
+      }
+    : null);
   const [state, setState] = useState<DetailState>(() => initialTournament
     ? { status: "ready", tournament: initialTournament }
     : { status: "loading" });
@@ -48,14 +69,44 @@ export function TournamentDetailClientPage({
   const requestGeneration = useRef(0);
   const actorUserId = authStatus === "authenticated" ? user?.id ?? null : null;
 
+  if (
+    serverSeedRef.current.slug !== slug
+    || serverSeedRef.current.inviteCode !== normalizedInviteCode
+    || serverSeedRef.current.payload !== initialTournament
+  ) {
+    serverSeedRef.current = {
+      slug,
+      inviteCode: normalizedInviteCode,
+      payload: initialTournament
+    };
+    const version = ++serverSeedVersionRef.current;
+    requestGeneration.current += 1;
+    initialRequestRef.current = initialTournament
+      ? {
+          slug,
+          inviteCode: normalizedInviteCode,
+          sessionIdentity,
+          payload: initialTournament,
+          version
+        }
+      : null;
+    setRetryGeneration(0);
+    setState(initialTournament
+      ? { status: "ready", tournament: initialTournament }
+      : { status: "loading" });
+  }
+  const serverSeedVersion = serverSeedVersionRef.current;
+
   useEffect(() => {
     const initialRequest = initialRequestRef.current;
     if (
       initialRequest
       && retryGeneration === 0
       && initialRequest.slug === slug
-      && initialRequest.inviteCode === (inviteCode ?? null)
+      && initialRequest.inviteCode === normalizedInviteCode
       && initialRequest.sessionIdentity === sessionIdentity
+      && initialRequest.payload === initialTournament
+      && initialRequest.version === serverSeedVersion
     ) {
       return;
     }
@@ -70,7 +121,7 @@ export function TournamentDetailClientPage({
       participantsLimit: 0,
       workspaceView: "detail",
       includeCurrentUser: false,
-      inviteCode,
+      inviteCode: normalizedInviteCode ?? undefined,
       signal: controller.signal
     })
       .then((workspace) => {
@@ -103,7 +154,16 @@ export function TournamentDetailClientPage({
       });
 
     return () => controller.abort();
-  }, [actorUserId, authStatus, inviteCode, retryGeneration, sessionIdentity, slug]);
+  }, [
+    actorUserId,
+    authStatus,
+    initialTournament,
+    normalizedInviteCode,
+    retryGeneration,
+    serverSeedVersion,
+    sessionIdentity,
+    slug
+  ]);
 
   if (state.status === "loading") {
     return <RouteLoadingShell variant="tournament-detail" />;
@@ -152,6 +212,7 @@ export function TournamentDetailClientPage({
       />
       <main className="main">
         <TournamentDetailViewBoundary
+          key={serverSeedVersion}
           tournament={state.tournament}
           actorUserId={actorUserId}
         />

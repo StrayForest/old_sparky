@@ -213,15 +213,15 @@ test("tournament detail hydrates without participant roster or initial session r
 
   expect(serverHtml).not.toContain("data-testid=\"tournament-participant-roster\"");
   expect(serverHtml).not.toContain("SSR Player");
+  await expect(page.locator(".participants-value").first()).toHaveText("26 / 64");
   await expectWorkspaceRequest({
     slug: publicTournamentSlug,
     participantsLimit: 0,
     participantsOffset: 0,
     workspaceView: "detail",
     includeCurrentUser: false
-  });
+  }, page.locator(".participants-value").first());
   await expect(page.getByTestId("tournament-participant-roster")).toHaveCount(0);
-  await expect(page.locator(".participants-value").first()).toHaveText("26 / 64");
   await expect.poll(() => participantRequests).toEqual([]);
   await expect.poll(() => usersMeRequests).toBe(0);
   await expectNoHorizontalOverflow(page);
@@ -248,8 +248,9 @@ test("tournament detail refetches after the authenticated session changes", asyn
   };
   const response = await page.goto(`/tournaments/${readyTournamentSlug}`);
   expect(response?.status()).toBe(200);
-  await expectWorkspaceRequest(expectedWorkspace);
-  await expect(page.getByRole("button", { name: "Подтвердить участие" })).toBeVisible();
+  const readyButton = page.getByRole("button", { name: "Подтвердить участие" });
+  await expect(readyButton).toBeVisible();
+  await expectWorkspaceRequest(expectedWorkspace, readyButton);
 
   let invalidatedVoteRequests = 0;
   await page.route(
@@ -285,14 +286,15 @@ test("registered detail uses compact workspace state and ready vote avoids full 
 
   const response = await page.goto(`/tournaments/${readyTournamentSlug}`);
   expect(response?.status()).toBe(200);
+  const cancelButton = page.getByRole("button", { name: "Отменить регистрацию" });
+  await expect(cancelButton).toBeVisible();
   await expectWorkspaceRequest({
     slug: readyTournamentSlug,
     participantsLimit: 0,
     participantsOffset: 0,
     workspaceView: "detail",
     includeCurrentUser: false
-  });
-  await expect(page.getByRole("button", { name: "Отменить регистрацию" })).toBeVisible();
+  }, cancelButton);
   await expect(page.getByRole("button", { name: "Подтвердить участие" })).toBeEnabled();
   await expect.poll(() => authBootstrapRequests).toBe(1);
 
@@ -372,7 +374,7 @@ test("bracket page uses the initial workspace and has no background refresh", as
   await expectNoHorizontalOverflow(page);
 });
 
-test("anonymous bearer keeps the exact code across detail, bracket navigation, and reload", async ({ page }) => {
+test("anonymous bearer and invite soft navigation keep the exact code across detail and reload", async ({ page }) => {
   await blockNextRoutePrefetch(page);
   const lowerCaseCode = privateBearerCode.toLowerCase();
   const detailPath = `/tournaments/${privateBearerSlug}?invite_code=${lowerCaseCode}`;
@@ -435,6 +437,66 @@ test("anonymous bearer keeps the exact code across detail, bracket navigation, a
   ]);
   expect(inviteClaimRequests).toBe(0);
   expect(apiRequests.join("\n")).not.toContain(privateBearerCode);
+
+  const inviteTransitionStart = bearerWorkspaceRequests.length;
+  await page.route("**/api/v1/tournaments/invites/claim", async (route) => {
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        tournament: { slug: privateBearerSlug },
+        participant: null,
+        invite: { code: privateBearerCode }
+      })
+    });
+  });
+  await page.goto(`/tournaments/${privateBearerSlug}`);
+  await expect(page.locator(".tournament-invite-gate")).toBeVisible();
+  await expect.poll(() => bearerWorkspaceRequests.length).toBe(inviteTransitionStart + 2);
+  expect(bearerWorkspaceRequests.slice(inviteTransitionStart)).toEqual([
+    {
+      slug: privateBearerSlug,
+      inviteCode: null,
+      workspaceView: "detail"
+    },
+    {
+      slug: privateBearerSlug,
+      inviteCode: null,
+      workspaceView: "detail"
+    }
+  ]);
+
+  await page.getByLabel("Код приглашения").fill(privateBearerCode);
+  await page.getByRole("button", { name: "Открыть турнир" }).click();
+  await expect(page).toHaveURL(`${webBaseUrl}/tournaments/${privateBearerSlug}?invite_code=${privateBearerCode}`);
+  await expect(page.getByTestId("tournament-read-only-registration")).toBeVisible();
+  await expect(page.locator(".tournament-invite-gate")).toHaveCount(0);
+  await expect.poll(() => bearerWorkspaceRequests.length).toBe(inviteTransitionStart + 3);
+  expect(bearerWorkspaceRequests.slice(inviteTransitionStart + 2)).toEqual([{
+    slug: privateBearerSlug,
+    inviteCode: privateBearerCode,
+    workspaceView: "detail"
+  }]);
+
+  const refreshStart = bearerWorkspaceRequests.length;
+  const refreshed = await page.evaluate(() => {
+    const next = (window as Window & {
+      next?: { router?: { refresh: () => void } };
+    }).next;
+    if (!next?.router) {
+      return false;
+    }
+    next.router.refresh();
+    return true;
+  });
+  expect(refreshed).toBe(true);
+  await expect.poll(() => bearerWorkspaceRequests.length).toBe(refreshStart + 1);
+  await expect(page.getByTestId("tournament-read-only-registration")).toBeVisible();
+  expect(bearerWorkspaceRequests.slice(refreshStart)).toEqual([{
+    slug: privateBearerSlug,
+    inviteCode: privateBearerCode,
+    workspaceView: "detail"
+  }]);
   await expectNoHorizontalOverflow(page);
 });
 
@@ -534,8 +596,14 @@ test("duplicate or malformed bearer query values fail closed before the workspac
   expect(inviteClaimRequests).toBe(0);
 });
 
-async function expectWorkspaceRequest(expected: typeof workspaceRequests[number]) {
+async function expectWorkspaceRequest(
+  expected: typeof workspaceRequests[number],
+  ready: import("@playwright/test").Locator
+) {
+  await expect(ready).toBeVisible();
   await expect.poll(() => workspaceRequests).toEqual([expected]);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  expect(workspaceRequests).toEqual([expected]);
 }
 
 function workspacePayload(
