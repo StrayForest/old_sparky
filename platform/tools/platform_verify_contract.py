@@ -129,6 +129,10 @@ _REMOTE_ACTION_RE = re.compile(
     r"(?:/(?P<path>[^@\s]+))?@(?P<ref>[^@\s]+)$",
 )
 _FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_SETUP_PYTHON_USE_RE = re.compile(
+    r"^\s*(?:-\s+)?uses:\s*actions/setup-python@",
+    re.MULTILINE,
+)
 
 
 def _action_definition_paths() -> tuple[Path, ...]:
@@ -860,27 +864,56 @@ def _ci_dependency_issues(security_text: str) -> list[str]:
             if marker not in pip_env_text:
                 issues.append(f"CI pip environment wrapper is missing marker: {marker}")
 
-    python_jobs = (
-        "backend-static",
-        "backend-integration",
-        "backend-privileged",
-        "python-quality",
-        "security",
-        "migration",
-        "verification-contract",
-    )
-    for job_id in python_jobs:
-        block = _workflow_job_block(security_text, job_id)
-        if not block:
-            issues.append(f"platform-security.yml is missing Python CI job: {job_id}")
-            continue
-        if block.count("platform/tools/platform_install_ci_python.sh") != 1:
+    job_blocks = {
+        match.group("job_id"): match.group("body")
+        for match in re.finditer(
+            r"^  (?P<job_id>[A-Za-z0-9_-]+):\n"
+            r"(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            security_text,
+            re.MULTILINE | re.DOTALL,
+        )
+    }
+    setup_python_jobs = {
+        job_id: block
+        for job_id, block in job_blocks.items()
+        if _SETUP_PYTHON_USE_RE.search(block)
+    }
+    if not setup_python_jobs:
+        issues.append("platform-security.yml must contain a Python setup job")
+    for job_id, block in sorted(setup_python_jobs.items()):
+        steps = _workflow_step_blocks(block)
+        setup_steps = tuple(
+            step
+            for step in steps
+            if _SETUP_PYTHON_USE_RE.search(step)
+        )
+        if len(setup_steps) != 1:
+            issues.append(f"Python CI job {job_id} must have exactly one setup-python step")
+            setup_step = ""
+        else:
+            setup_step = setup_steps[0]
+        installer_steps = tuple(
+            step
+            for step in steps
+            if re.search(
+                r"^\s*run:\s*platform/tools/platform_install_ci_python\.sh\s*$",
+                step,
+                re.MULTILINE,
+            )
+        )
+        if len(installer_steps) != 1:
             issues.append(f"Python CI job {job_id} must invoke the canonical installer exactly once")
-        if block.count('python-version: "3.12"') != 1:
+        if len(re.findall(r'^\s+python-version:\s*"3\.12"\s*$', setup_step, re.MULTILINE)) != 1:
             issues.append(f"Python CI job {job_id} must use the Python 3.12 lock target")
-        if block.count("cache: pip") != 1:
+        if len(re.findall(r"^\s+cache:\s*pip\s*$", setup_step, re.MULTILINE)) != 1:
             issues.append(f"Python CI job {job_id} must enable the pip cache")
-        if block.count("cache-dependency-path: platform/requirements-ci.lock.txt") != 1:
+        if len(
+            re.findall(
+                r"^\s+cache-dependency-path:\s*platform/requirements-ci\.lock\.txt\s*$",
+                setup_step,
+                re.MULTILINE,
+            )
+        ) != 1:
             issues.append(f"Python CI job {job_id} cache must use the CI lock digest")
         for marker in (
             "requirements-platform.txt",

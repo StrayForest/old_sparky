@@ -609,7 +609,7 @@ jobs:
   release-runtime:
     name: Conditional release runtime fixture
     needs: classifier
-    if: ${{ needs.classifier.outputs.runtime_sensitive == 'true' }}
+    if: ${{ needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -696,8 +696,11 @@ jobs:
           route_class = os.environ.get("ROUTE_CLASS", "")
           route_event = os.environ.get("ROUTE_EVENT", "")
           event_name = os.environ.get("EVENT_NAME", "")
-          runtime_sensitive = os.environ.get("ROUTE_RUNTIME_SENSITIVE") == "true"
+          raw_runtime_sensitive = os.environ.get("ROUTE_RUNTIME_SENSITIVE", "")
           route_errors = []
+          if raw_runtime_sensitive not in {"true", "false"}:
+              route_errors.append("classifier runtime-sensitive output is missing or malformed")
+          runtime_sensitive = raw_runtime_sensitive == "true"
           try:
               expected = json.loads(os.environ.get("EXPECTED_GATES") or "null")
           except (TypeError, json.JSONDecodeError):
@@ -723,7 +726,8 @@ jobs:
               route_errors.append("classifier reason is missing")
           if os.environ.get("ROUTE_DEPLOYABLE") not in {"true", "false"}:
               route_errors.append("classifier deployable output is missing")
-          if os.environ.get("ROUTE_FALLBACK") not in {"true", "false"}:
+          raw_fallback = os.environ.get("ROUTE_FALLBACK", "")
+          if raw_fallback not in {"true", "false"}:
               route_errors.append("classifier fallback output is missing")
           published_event = os.environ.get("EVENT_NAME") in {"push", "workflow_dispatch"}
           if published_event and os.environ.get("STATUS_START_RESULT") != "success":
@@ -742,10 +746,12 @@ jobs:
               gate for gate in expected if results.get(gate) != "success"
           ] if isinstance(expected, list) else ["classifier expected gates are malformed"]
           release_runtime_result = os.environ.get("RELEASE_RUNTIME_RESULT", "missing")
-          if runtime_sensitive and release_runtime_result != "success":
-              missing_or_failed.append("release-runtime")
-          if not runtime_sensitive and release_runtime_result not in {"skipped", "missing"}:
-              route_errors.append("release-runtime ran for a non-sensitive route")
+          requires_release_runtime = runtime_sensitive or raw_fallback == "true"
+          if requires_release_runtime:
+              if release_runtime_result != "success":
+                  missing_or_failed.append("release-runtime")
+          elif release_runtime_result != "skipped":
+              route_errors.append("release-runtime must be skipped for a non-sensitive non-fallback route")
           passed = (
               os.environ.get("CLASSIFIER_RESULT") == "success"
               and not route_errors
@@ -767,6 +773,7 @@ jobs:
                   "release-runtime": release_runtime_result,
               },
               "runtime_sensitive": runtime_sensitive,
+              "requires_release_runtime": requires_release_runtime,
               "missing_or_failed": missing_or_failed,
               "route_errors": route_errors,
               "status_start_result": os.environ.get("STATUS_START_RESULT", "missing"),

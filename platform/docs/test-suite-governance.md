@@ -31,7 +31,9 @@ placement rules; it does not repeat tool arguments.
 The first eight gates are deterministic and always part of the normal CI
 aggregate. The conditional `release-runtime` gate is deterministic as well,
 but is intentionally excluded from `platform_verify.py ci`: the classifier
-enables it only when the exact release/runtime-sensitive path set changes.
+enables it for an exact runtime-sensitive path change or for a fail-closed
+fallback route. The fallback condition ensures an uncertain route receives
+the release-runtime coverage without granting it production authority.
 The gate builds the staged runtime with local small pinned-fixture ZIPs under
 `python -I`, verifies link materialization, manifest/tree/mode invariants and
 downstream install validation, and has no production network, credentials or
@@ -149,7 +151,8 @@ deployable when its source is the current `dev` push. The routes are:
 
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route
-with `fallback=true` and `deployable=false`. Known `.github/**` and
+with `fallback=true` and `deployable=false`; these routes also run the
+conditional `release-runtime` gate. Known `.github/**` and
 `platform/**` dependency, configuration, migration, workflow and registry
 paths are recognized full routes with `fallback=false`; they are not fallback
 cases merely because they require the full gate set. A known full path with

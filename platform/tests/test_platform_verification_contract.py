@@ -60,6 +60,7 @@ from tools.platform_verify_contract import (
     SECURITY_WORKFLOW,
     action_pin_issues,
     collect_issues,
+    _ci_dependency_issues,
     extract_gate_invocations,
     security_status_permission_issues,
     workflow_level_permission_issues,
@@ -821,6 +822,24 @@ except lock.VerificationLockError as exc:
             self.assertTrue(any("40-character commit SHA" in item for item in action_issues))
             self.assertTrue(any("owner 'unapproved'" in item for item in action_issues))
         self.assertEqual(collect_issues(), [])
+        synthetic_setup_job = SECURITY_WORKFLOW.read_text(encoding="utf-8") + """
+  synthetic-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+"""
+        dependency_issues = _ci_dependency_issues(synthetic_setup_job)
+        self.assertTrue(
+            any(
+                "Python CI job synthetic-python must invoke the canonical installer exactly once"
+                in issue
+                for issue in dependency_issues
+            )
+        )
         with tempfile.TemporaryDirectory() as directory:
             component_dir = Path(directory)
             _write_backend_component_fixture(component_dir)
