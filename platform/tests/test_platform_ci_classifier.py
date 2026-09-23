@@ -190,6 +190,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("expected_gates", workflow)
         self.assertIn("runtime_sensitive: ${{ steps.classify.outputs.runtime_sensitive }}", workflow)
         self.assertIn("release-runtime", workflow)
+        self.assertIn("release-runtime-real", workflow)
+        self.assertIn("name: Conditional release runtime fixture", workflow)
+        self.assertIn("name: Trusted dev immutable release runtime", workflow)
         self.assertIn(
             "needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true'",
             workflow,
@@ -498,6 +501,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
         )
         self.assertIn('release_runtime_result != "success"', status_final)
         self.assertIn('release_runtime_result != "skipped"', status_final)
+        self.assertIn("RELEASE_RUNTIME_REAL_RESULT", status_final)
+        self.assertIn("needs['release-runtime-real']", workflow)
+        self.assertIn("requires_real_release_runtime", status_final)
 
         script_match = re.search(
             r"(?ms)^\s+/usr/bin/python3 - <<'PY'\n(?P<script>.*?)^\s+PY$",
@@ -598,20 +604,79 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 "RELEASE_RUNTIME_RESULT": "success",
             }
             trusted_cases = (
-                ("dev push real", "push", "refs/heads/dev", "success", True, True),
-                ("dev push fixture only", "push", "refs/heads/dev", "skipped", False, True),
                 (
-                    "dev manual real",
-                    "workflow_dispatch",
+                    "dev push real",
+                    "push",
                     "refs/heads/dev",
+                    "true",
+                    "false",
+                    "success",
                     "success",
                     True,
                     True,
                 ),
                 (
+                    "dev push real skipped",
+                    "push",
+                    "refs/heads/dev",
+                    "true",
+                    "false",
+                    "success",
+                    "skipped",
+                    False,
+                    True,
+                ),
+                (
+                    "dev push real failure",
+                    "push",
+                    "refs/heads/dev",
+                    "true",
+                    "false",
+                    "success",
+                    "failure",
+                    False,
+                    True,
+                ),
+                (
+                    "dev manual real",
+                    "workflow_dispatch",
+                    "refs/heads/dev",
+                    "true",
+                    "false",
+                    "success",
+                    "success",
+                    True,
+                    True,
+                ),
+                (
+                    "fallback dev real",
+                    "push",
+                    "refs/heads/dev",
+                    "true",
+                    "true",
+                    "success",
+                    "success",
+                    True,
+                    True,
+                ),
+                (
+                    "ordinary dev both skipped",
+                    "push",
+                    "refs/heads/dev",
+                    "false",
+                    "false",
+                    "skipped",
+                    "skipped",
+                    True,
+                    False,
+                ),
+                (
                     "non-dev manual fixture only",
                     "workflow_dispatch",
                     "refs/heads/feature",
+                    "true",
+                    "false",
+                    "success",
                     "skipped",
                     True,
                     False,
@@ -620,6 +685,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
                     "merge group fixture only",
                     "merge_group",
                     "refs/heads/gh-readonly-queue/main/pr-1-abc",
+                    "true",
+                    "false",
+                    "success",
                     "skipped",
                     True,
                     False,
@@ -629,6 +697,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 label,
                 event_name,
                 workflow_ref,
+                raw_runtime_sensitive,
+                raw_fallback,
+                fixture_result,
                 real_result,
                 expected_passed,
                 expected_requires_real,
@@ -641,6 +712,9 @@ class PlatformCiClassifierTests(unittest.TestCase):
                             "EVENT_NAME": event_name,
                             "ROUTE_EVENT": event_name,
                             "WORKFLOW_REF": workflow_ref,
+                            "ROUTE_RUNTIME_SENSITIVE": raw_runtime_sensitive,
+                            "ROUTE_FALLBACK": raw_fallback,
+                            "RELEASE_RUNTIME_RESULT": fixture_result,
                             "RELEASE_RUNTIME_REAL_RESULT": real_result,
                             "SUMMARY_PATH": str(Path(directory) / f"trusted-{label}.json"),
                         }

@@ -841,6 +841,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn('github.event_name == \'workflow_dispatch\'', workflow)
         self.assertIn("runtime_sensitive", workflow)
         self.assertIn("platform_verify.py release-runtime", workflow)
+        self.assertIn("release-runtime-real:", workflow)
+        self.assertIn("name: Conditional release runtime fixture", workflow)
+        self.assertIn("name: Trusted dev immutable release runtime", workflow)
+        self.assertIn("platform_build_release.sh", workflow)
+        self.assertIn("needs['release-runtime-real'].result", workflow)
 
     def test_server_diagnostics_have_github_dispatch_contours(self) -> None:
         for workflow_name in (

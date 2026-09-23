@@ -607,11 +607,11 @@ jobs:
           retention-days: 14
 
   release-runtime:
-    name: Conditional release runtime gate
+    name: Conditional release runtime fixture
     needs: classifier
     if: ${{ needs.classifier.outputs.runtime_sensitive == 'true' || needs.classifier.outputs.fallback == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
@@ -622,8 +622,6 @@ jobs:
       PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
       PLATFORM_CELERY_BROKER_URL: redis://127.0.0.1:6379/13
       PLATFORM_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/14
-    outputs:
-      real_runtime_result: ${{ steps.real-runtime.outcome || 'skipped' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -646,17 +644,31 @@ jobs:
         run: >-
           sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
           .venv_platform/bin/python tools/platform_verify.py release-runtime"
+
+  release-runtime-real:
+    name: Trusted dev immutable release runtime
+    needs: classifier
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/dev' &&
+      (needs.classifier.outputs.runtime_sensitive == 'true' ||
+      needs.classifier.outputs.fallback == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      TARGET_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Run canonical immutable release builder on trusted dev
-        id: real-runtime
-        if: >-
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-          github.ref == 'refs/heads/dev' &&
-          (needs.classifier.outputs.runtime_sensitive == 'true' ||
-          needs.classifier.outputs.fallback == 'true')
+        id: real-runtime-build
         timeout-minutes: 40
         shell: bash
-        env:
-          TARGET_SHA: ${{ github.sha }}
         run: |
           set -Eeuo pipefail
           umask 077
@@ -880,7 +892,7 @@ jobs:
     if: ${{ always() }}
     permissions:
       statuses: write
-    needs: [classifier, status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract, release-runtime]
+    needs: [classifier, status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract, release-runtime, release-runtime-real]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -910,7 +922,7 @@ jobs:
           MIGRATION_RESULT: ${{ needs.migration.result }}
           VERIFICATION_CONTRACT_RESULT: ${{ needs['verification-contract'].result }}
           RELEASE_RUNTIME_RESULT: ${{ needs['release-runtime'].result }}
-          RELEASE_RUNTIME_REAL_RESULT: ${{ needs['release-runtime'].outputs.real_runtime_result }}
+          RELEASE_RUNTIME_REAL_RESULT: ${{ needs['release-runtime-real'].result }}
           WORKFLOW_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
