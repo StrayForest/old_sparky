@@ -687,7 +687,7 @@ jobs:
               if [[ -d "$release_root" && ! -L "$release_root" ]]; then
                 current_id="$(sudo -n /usr/bin/stat -c '%d:%i' -- "$release_root" 2>/dev/null)"
                 if [[ -n "$release_root_id" && "$current_id" == "$release_root_id" ]]; then
-                  sudo -n /bin/rm -rf -- "$release_root" || cleanup_rc=1
+                  sudo -n /bin/rm -rf -- "$release_root" 2>/dev/null || cleanup_rc=1
                 else
                   cleanup_rc=1
                 fi
@@ -736,7 +736,7 @@ jobs:
 
           release_ref="gha-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           release_root="$(sudo -n /usr/bin/mktemp -d \
-            "$runner_temp/platform-release-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.XXXXXX")" || {
+            "$runner_temp/platform-release-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.XXXXXX" 2>/dev/null)" || {
             failure_reason=temp_create_failed
             exit 1
           }
@@ -748,11 +748,11 @@ jobs:
             failure_reason=temp_identity_failed
             exit 1
           }
-          [[ "$(sudo -n /usr/bin/stat -c '%u:%a' -- "$release_root")" == "0:700" ]] || {
+          [[ "$(sudo -n /usr/bin/stat -c '%u:%a' -- "$release_root" 2>/dev/null)" == "0:700" ]] || {
             failure_reason=temp_permissions_failed
             exit 1
           }
-          release_root_id="$(sudo -n /usr/bin/stat -c '%d:%i' -- "$release_root")" || {
+          release_root_id="$(sudo -n /usr/bin/stat -c '%d:%i' -- "$release_root" 2>/dev/null)" || {
             failure_reason=temp_identity_failed
             exit 1
           }
@@ -760,10 +760,10 @@ jobs:
           build_root="$release_root/source"
           release_output="$build_root/platform/dist/releases"
           build_log="$release_root/canonical-builder.log"
-          sudo -n /usr/bin/install -d -o root -g root -m 0700 "$build_root"
-          sudo -n /bin/cp -a "$GITHUB_WORKSPACE/." "$build_root/"
-          sudo -n /bin/chown -R root:root "$build_root"
-          [[ "$(sudo -n /usr/bin/git -C "$build_root" rev-parse --verify HEAD)" == "$TARGET_SHA" ]] || {
+          sudo -n /usr/bin/install -d -o root -g root -m 0700 "$build_root" 2>/dev/null
+          sudo -n /bin/cp -a "$GITHUB_WORKSPACE/." "$build_root/" 2>/dev/null
+          sudo -n /bin/chown -R root:root "$build_root" 2>/dev/null
+          [[ "$(sudo -n /usr/bin/git -C "$build_root" rev-parse --verify HEAD 2>/dev/null)" == "$TARGET_SHA" ]] || {
             failure_reason=copied_sha_mismatch
             exit 1
           }
@@ -772,15 +772,15 @@ jobs:
             LANG=C.UTF-8 \
             LC_ALL=C.UTF-8 \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            /usr/bin/python3 -m venv "$build_root/platform/.venv_platform" || {
+            /usr/bin/python3 -m venv "$build_root/platform/.venv_platform" 2>/dev/null || {
             failure_reason=python_environment_failed
             exit 1
           }
-          sudo -n /usr/bin/install -d -o root -g root -m 0755 "$release_output" || {
+          sudo -n /usr/bin/install -d -o root -g root -m 0755 "$release_output" 2>/dev/null || {
             failure_reason=release_output_failed
             exit 1
           }
-          sudo -n /usr/bin/install -o root -g root -m 0600 /dev/null "$build_log" || {
+          sudo -n /usr/bin/install -o root -g root -m 0600 /dev/null "$build_log" 2>/dev/null || {
             failure_reason=build_log_failed
             exit 1
           }
@@ -801,7 +801,7 @@ jobs:
           [[ "${builder_status[0]:-1}" -eq 0 ]] || { failure_reason=canonical_builder_failed; exit 1; }
 
           archive_candidates="$(sudo -n /usr/bin/find "$release_output" -maxdepth 1 -type f \
-            -name "${release_ref}-*.tar.gz" -print)" || {
+            -name "${release_ref}-*.tar.gz" -print 2>/dev/null)" || {
             failure_reason=artifact_lookup_failed
             exit 1
           }
@@ -811,13 +811,13 @@ jobs:
           }
           release_archive="$archive_candidates"
           release_checksum="${release_archive}.sha256"
-          if ! sudo -n /usr/bin/test ! -L "$release_archive" \
-            || ! sudo -n /usr/bin/test ! -L "$release_checksum"; then
+          if ! sudo -n /usr/bin/test ! -L "$release_archive" 2>/dev/null \
+            || ! sudo -n /usr/bin/test ! -L "$release_checksum" 2>/dev/null; then
             failure_reason=artifact_symlink
             exit 1
           fi
-          if ! sudo -n /usr/bin/test -f "$release_archive" \
-            || ! sudo -n /usr/bin/test -f "$release_checksum"; then
+          if ! sudo -n /usr/bin/test -f "$release_archive" 2>/dev/null \
+            || ! sudo -n /usr/bin/test -f "$release_checksum" 2>/dev/null; then
             failure_reason=artifact_missing
             exit 1
           fi
@@ -833,17 +833,17 @@ jobs:
             "$build_root/platform/tools/platform_validate_release_artifact.py" \
             --artifact "$release_archive" \
             --checksum "$release_checksum" \
-            --release-slug "$actual_slug" >/dev/null || {
+            --release-slug "$actual_slug" >/dev/null 2>&1 || {
             failure_reason=artifact_validation_failed
             exit 1
           }
           sudo -n /bin/bash -c \
             'cd -- "$1" && /usr/bin/sha256sum -c "$2" >/dev/null' \
-            _ "$release_output" "$release_checksum" || {
+            _ "$release_output" "$release_checksum" >/dev/null 2>&1 || {
             failure_reason=checksum_validation_failed
             exit 1
           }
-          sudo -n /usr/bin/python3 -I - "$release_archive" "$actual_slug" "$TARGET_SHA" >/dev/null <<'PY'
+          sudo -n /usr/bin/python3 -I - "$release_archive" "$actual_slug" "$TARGET_SHA" >/dev/null 2>&1 <<'PY'
           import json
           import re
           import sys
@@ -870,7 +870,7 @@ jobs:
           if re.fullmatch(r"[0-9a-f]{40,64}", str(payload.get("source_git_commit"))) is None:
               raise SystemExit("release provenance source format is invalid")
           PY
-          artifact_sha256="$(sudo -n /usr/bin/sha256sum "$release_archive" | awk '{print $1}')" || {
+          artifact_sha256="$(sudo -n /usr/bin/sha256sum "$release_archive" 2>/dev/null | awk '{print $1}')" || {
             failure_reason=artifact_digest_failed
             exit 1
           }
