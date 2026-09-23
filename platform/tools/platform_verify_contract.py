@@ -1047,26 +1047,28 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
 
 
 def release_runtime_workflow_issues(security_text: str) -> list[str]:
-    """Keep the conditional release gate fixture-only except trusted dev runs."""
+    """Keep fixture and trusted-dev release contours separate and fail-closed."""
 
     issues: list[str] = []
-    block = _workflow_job_block(security_text, "release-runtime")
-    if not block:
-        return ["platform-security.yml is missing release-runtime"]
-    if "needs: classifier" not in block:
-        issues.append("release-runtime must depend on classifier")
-    if "name: Conditional release runtime gate" not in block:
-        issues.append("release-runtime must be named as a gate")
-    if "timeout-minutes: 45" not in block:
-        issues.append("release-runtime must retain a 45-minute job timeout")
-    if "permissions:\n      contents: read" not in block:
-        issues.append("release-runtime must have contents: read permissions")
-    checkout = next(
-        (
-            step
-            for step in _workflow_step_blocks(block)
-            if "actions/checkout@" in step
-        ),
+    fixture = _workflow_job_block(security_text, "release-runtime")
+    real = _workflow_job_block(security_text, "release-runtime-real")
+    if not fixture:
+        issues.append("platform-security.yml is missing release-runtime fixture")
+    if not real:
+        issues.append("platform-security.yml is missing release-runtime-real")
+    if not fixture or not real:
+        return issues
+
+    if "name: Conditional release runtime fixture" not in fixture:
+        issues.append("release-runtime must remain the fixture job")
+    if "needs: classifier" not in fixture:
+        issues.append("release-runtime fixture must depend on classifier")
+    if "timeout-minutes: 15" not in fixture:
+        issues.append("release-runtime fixture must retain a 15-minute timeout")
+    if "permissions:\n      contents: read" not in fixture:
+        issues.append("release-runtime fixture must have contents: read permissions")
+    fixture_checkout = next(
+        (step for step in _workflow_step_blocks(fixture) if "actions/checkout@" in step),
         "",
     )
     for marker, message in (
@@ -1074,18 +1076,23 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         ("fetch-depth: 0", "full checkout history"),
         ("persist-credentials: false", "checkout credential isolation"),
     ):
-        if marker not in checkout:
-            issues.append(f"release-runtime checkout must set {message}")
-    if block.count("platform_verify.py release-runtime") != 1:
+        if marker not in fixture_checkout:
+            issues.append(f"release-runtime fixture checkout must set {message}")
+    if fixture.count("platform_verify.py release-runtime") != 1:
         issues.append("release-runtime fixture must invoke the canonical gate exactly once")
+    if "platform_build_release.sh" in fixture or "RELEASE_RUNTIME_BUILD schema=1" in fixture:
+        issues.append("release-runtime fixture must not run the full release builder")
+    if "real-runtime" in fixture or "release-runtime-real" in fixture:
+        issues.append("release-runtime fixture must not expose the real builder contour")
 
-    real_step = next(
-        (step for step in _workflow_step_blocks(block) if "id: real-runtime" in step),
-        "",
-    )
-    if not real_step:
-        issues.append("release-runtime must define the real-runtime step")
-        return issues
+    if "name: Trusted dev immutable release runtime" not in real:
+        issues.append("release-runtime-real must be named as the trusted-dev builder")
+    if "needs: classifier" not in real:
+        issues.append("release-runtime-real must depend on classifier")
+    if "timeout-minutes: 45" not in real:
+        issues.append("release-runtime-real must retain a 45-minute job timeout")
+    if "permissions:\n      contents: read" not in real:
+        issues.append("release-runtime-real must have contents: read permissions")
     for marker, message in (
         ("github.event_name == 'push'", "push route condition"),
         ("github.event_name == 'workflow_dispatch'", "manual route condition"),
@@ -1093,10 +1100,30 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         ("needs.classifier.outputs.runtime_sensitive == 'true'", "runtime-sensitive condition"),
         ("needs.classifier.outputs.fallback == 'true'", "fallback condition"),
     ):
-        if marker not in real_step:
-            issues.append(f"release-runtime real step is missing {message}")
+        if marker not in real:
+            issues.append(f"release-runtime-real is missing {message}")
+    real_checkout = next(
+        (step for step in _workflow_step_blocks(real) if "actions/checkout@" in step),
+        "",
+    )
+    for marker, message in (
+        ("ref: ${{ github.sha }}", "exact checkout SHA"),
+        ("fetch-depth: 0", "full checkout history"),
+        ("persist-credentials: false", "checkout credential isolation"),
+    ):
+        if marker not in real_checkout:
+            issues.append(f"release-runtime-real checkout must set {message}")
+    if "TARGET_SHA: ${{ github.sha }}" not in real:
+        issues.append("release-runtime-real must bind the builder to the exact workflow SHA")
+    real_step = next(
+        (step for step in _workflow_step_blocks(real) if "id: real-runtime-build" in step),
+        "",
+    )
+    if not real_step:
+        issues.append("release-runtime-real must define the canonical builder step")
+        return issues
     if "timeout-minutes: 40" not in real_step:
-        issues.append("release-runtime real step must have a fixed timeout")
+        issues.append("release-runtime-real builder step must have a fixed timeout")
     for marker, message in (
         ("platform_build_release.sh", "canonical release builder"),
         ("PLATFORM_RELEASE_OUTPUT_DIR=\"$release_output\"", "task-owned release output"),
@@ -1113,17 +1140,21 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         ("RELEASE_RUNTIME_BUILD schema=1", "bounded build diagnostic"),
     ):
         if marker not in real_step:
-            issues.append(f"release-runtime real step is missing {message}")
+            issues.append(f"release-runtime-real builder is missing {message}")
     if "sudo -n /usr/bin/env -i" not in real_step:
-        issues.append("release-runtime real step must use root env isolation")
-    if "secrets." in block or "PROD_SSH_" in block or "SSH_PRIVATE_KEY" in block:
-        issues.append("release-runtime must not receive production credentials")
-    if "actions/upload-artifact@" in block or "actions/attest-build-provenance@" in block:
-        issues.append("release-runtime must not publish or attest an artifact")
-    if "GITHUB_WORKSPACE/platform/dist/releases" in real_step or "/root/old_sparky" in real_step:
-        issues.append("release-runtime must use task-owned output, not production paths")
+        issues.append("release-runtime-real builder must use root env isolation")
+    if "actions/setup-python@" in real:
+        issues.append("release-runtime-real must use its own clean production-style venv setup")
+    if "platform_verify.py release-runtime" in real:
+        issues.append("release-runtime-real must not run the fixture gate")
+    if "secrets." in real or "PROD_SSH_" in real or "SSH_PRIVATE_KEY" in real:
+        issues.append("release-runtime-real must not receive production credentials")
+    if "actions/upload-artifact@" in real or "actions/attest-build-provenance@" in real:
+        issues.append("release-runtime-real must not publish or attest an artifact")
+    if "GITHUB_WORKSPACE/platform/dist/releases" in real or "/root/old_sparky" in real:
+        issues.append("release-runtime-real must use task-owned output, not production paths")
     if "platform_build_live_qa_runtime.py" in real_step:
-        issues.append("release-runtime must call the full canonical builder, not a partial imitation")
+        issues.append("release-runtime-real must call the full canonical builder, not a partial imitation")
     return issues
 
 
