@@ -20,10 +20,26 @@ class ReadyVoteCpuProfilerTests(PlatformIsolatedAsyncioTestCase):
             await profiler.start()
             profiler.arm()
             sum(range(10_000))
-            profiler.flush()
+            with patch(
+                "python_packages.platform_infra.cpu_profile.os.replace",
+                wraps=os.replace,
+            ) as atomic_replace:
+                profiler.flush()
             await profiler.stop()
 
             self.assertIsNotNone(profiler._start_time_ticks)
+            self.assertEqual(atomic_replace.call_count, 2)
+            replace_sources = [Path(call.args[0]) for call in atomic_replace.call_args_list]
+            replace_targets = [Path(call.args[1]) for call in atomic_replace.call_args_list]
+            self.assertEqual(
+                sorted(path.suffixes[-2:] for path in replace_sources),
+                [[".pstats", ".tmp"], [".txt", ".tmp"]],
+            )
+            self.assertEqual(
+                sorted(path.suffix for path in replace_targets),
+                [".pstats", ".txt"],
+            )
+            self.assertTrue(all(path.parent == Path(temporary_dir) for path in replace_sources))
             self.assertEqual(
                 sorted(path.name for path in Path(temporary_dir).iterdir()),
                 [

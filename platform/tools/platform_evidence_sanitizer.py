@@ -66,6 +66,7 @@ SAFE_PROFILE_SIGNAL_REASONS = frozenset(
     {
         "uid_unavailable",
         "invalid_pid",
+        "worker_missing",
         "identity_mismatch",
         "pidfd_unavailable",
         "pidfd_open_failed",
@@ -2200,6 +2201,9 @@ def _project_cpu_profile(value: Any) -> dict[str, Any]:
         available = _copy_bool(phase_source, "pidfd_api_available")
         if available is not None:
             phase_output["pidfd_api_available"] = available
+        availability_reason = phase_source.get("availability_reason")
+        if isinstance(availability_reason, str) and availability_reason in SAFE_PROFILE_SIGNAL_REASONS:
+            phase_output["availability_reason"] = availability_reason
         reasons = _mapping(phase_source.get("rejection_reasons"))
         safe_reasons: dict[str, int] = {}
         for raw_reason, raw_count in reasons.items():

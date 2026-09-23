@@ -13,6 +13,7 @@ from contextlib import suppress
 import os
 from pathlib import Path
 import signal
+import tempfile
 import time
 import pstats
 
@@ -30,6 +31,25 @@ def _process_start_time_ticks() -> int | None:
     except (OSError, UnicodeError, ValueError):
         return None
     return value if value > 0 else None
+
+
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 class ReadyVoteCpuProfiler:
@@ -86,16 +106,52 @@ class ReadyVoteCpuProfiler:
             # evidence.
             return
         stem = self.output_dir / f"ready-vote-cprofile-{pid}-{self._start_time_ticks}"
-        self._profile.dump_stats(str(stem.with_suffix(".pstats")))
-        with stem.with_suffix(".txt").open("w", encoding="utf-8") as stream:
-            stats = pstats.Stats(self._profile, stream=stream)
-            stats.strip_dirs().sort_stats("cumulative").print_stats(100)
-            profiled_seconds = (
-                max(0.0, time.monotonic() - self._armed_at)
-                if self._armed_at is not None
-                else 0.0
+        temporary_paths: list[Path] = []
+        try:
+            pstats_fd, pstats_temporary = tempfile.mkstemp(
+                prefix=f".{stem.name}-",
+                suffix=".pstats.tmp",
+                dir=self.output_dir,
             )
-            stream.write(f"profiled_seconds={profiled_seconds:.6f}\n")
+            pstats_temporary_path = Path(pstats_temporary)
+            temporary_paths.append(pstats_temporary_path)
+            os.close(pstats_fd)
+            self._profile.dump_stats(str(pstats_temporary_path))
+            _fsync_file(pstats_temporary_path)
+
+            text_fd, text_temporary = tempfile.mkstemp(
+                prefix=f".{stem.name}-",
+                suffix=".txt.tmp",
+                dir=self.output_dir,
+            )
+            text_temporary_path = Path(text_temporary)
+            temporary_paths.append(text_temporary_path)
+            with os.fdopen(text_fd, "w", encoding="utf-8") as stream:
+                stats = pstats.Stats(self._profile, stream=stream)
+                stats.strip_dirs().sort_stats("cumulative").print_stats(100)
+                profiled_seconds = (
+                    max(0.0, time.monotonic() - self._armed_at)
+                    if self._armed_at is not None
+                    else 0.0
+                )
+                stream.write(f"profiled_seconds={profiled_seconds:.6f}\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            pstats_path = stem.with_suffix(".pstats")
+            text_path = stem.with_suffix(".txt")
+            os.replace(pstats_temporary_path, pstats_path)
+            temporary_paths.remove(pstats_temporary_path)
+            _fsync_directory(self.output_dir)
+            os.replace(text_temporary_path, text_path)
+            temporary_paths.remove(text_temporary_path)
+            _fsync_directory(self.output_dir)
+        finally:
+            for temporary_path in temporary_paths:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     async def stop(self) -> None:
         self.flush()

@@ -381,25 +381,30 @@ def _signal_api_workers_detailed(
     armed_identities: dict[int, dict[str, object]] | None = None,
     armed_workers: dict[int, dict[str, object]] | None = None,
     process_reader: ProcessReader | None = None,
-) -> tuple[list[int], Counter[str]]:
+) -> tuple[list[int], Counter[str], str | None]:
     process_reader = _read_proc_record if process_reader is None else process_reader
     if armed_identities is not None and armed_workers is not None:
         raise ValueError("provide only one armed worker identity mapping")
     armed = armed_identities if armed_identities is not None else armed_workers
     uid = expected_api_uid() if expected_uid is None else expected_uid
     if uid is None:
-        return [], Counter({"uid_unavailable": 1})
+        # There is no safe identity basis for a request in this case.  Keep
+        # the availability condition separate from worker rejection counts so
+        # requested=delivered+rejected remains true (with zero requested).
+        return [], Counter(), "uid_unavailable"
     current = api_worker_identities(processes, expected_uid=uid)
     reasons: Counter[str] = Counter()
     if armed is not None:
-        before_filter_count = len(current)
-        current = {
-            pid: identity
-            for pid, identity in current.items()
-            if pid in armed and identity == armed[pid]
-        }
-        if before_filter_count > len(current):
-            reasons["identity_mismatch"] += before_filter_count - len(current)
+        live_identities = current
+        current = {}
+        for pid, expected_identity in armed.items():
+            live_identity = live_identities.get(pid)
+            if live_identity is None:
+                reasons["worker_missing"] += 1
+            elif live_identity != expected_identity:
+                reasons["identity_mismatch"] += 1
+            else:
+                current[pid] = live_identity
     signalled: list[int] = []
     for pid, identity in sorted(current.items()):
         delivered, reason = _send_identity_signal(
@@ -412,7 +417,7 @@ def _signal_api_workers_detailed(
             signalled.append(pid)
         else:
             reasons[reason] += 1
-    return signalled, reasons
+    return signalled, reasons, None
 
 
 def signal_api_workers(
@@ -425,7 +430,7 @@ def signal_api_workers(
     process_reader: ProcessReader | None = None,
 ) -> list[int]:
     """Signal only direct API workers with an optional exact armed identity."""
-    signalled, _reasons = _signal_api_workers_detailed(
+    signalled, _reasons, _availability_reason = _signal_api_workers_detailed(
         signum,
         processes=processes,
         expected_uid=expected_uid,
@@ -554,7 +559,7 @@ def cpu_profile_summary(
     for path in profile_paths:
         try:
             stats = Stats(str(path))
-        except (OSError, TypeError, ValueError):
+        except (EOFError, OSError, TypeError, ValueError):
             invalid_profile_count += 1
             continue
         functions: list[dict[str, object]] = []
@@ -609,17 +614,32 @@ def _signal_delivery_summary(
     reasons: Counter[str],
     *,
     requested: int,
+    availability_reason: str | None = None,
 ) -> dict[str, object]:
     """Expose only bounded signal outcome facts; identities stay private."""
 
-    return {
-        "requested_count": max(0, int(requested)),
-        "delivered_count": len(delivered),
-        "rejected_count": sum(reasons.values()),
+    bounded_requested = max(0, int(requested))
+    bounded_delivered = min(len(delivered), bounded_requested)
+    bounded_rejected = sum(reasons.values())
+    # Every worker selected for a signal must be accounted for, even if a
+    # future caller introduces a new pre-delivery rejection path.
+    unaccounted = max(0, bounded_requested - bounded_delivered - bounded_rejected)
+    if unaccounted:
+        reasons = Counter(reasons)
+        reasons["worker_missing"] += unaccounted
+        bounded_rejected += unaccounted
+
+    summary: dict[str, object] = {
+        "requested_count": bounded_requested,
+        "delivered_count": bounded_delivered,
+        "rejected_count": bounded_rejected,
         "rejection_reasons": dict(sorted(reasons.items())),
         "pidfd_api_available": callable(getattr(os, "pidfd_open", None))
         and callable(getattr(signal, "pidfd_send_signal", None)),
     }
+    if availability_reason is not None:
+        summary["availability_reason"] = availability_reason
+    return summary
 
 
 async def postgres_statement_snapshot() -> dict[str, object]:
@@ -1063,9 +1083,11 @@ async def async_main() -> int:
     candidate_worker_count = len(armed_worker_identities)
     profiled_workers: list[int] = []
     arm_reasons: Counter[str] = Counter()
+    arm_availability_reason: str | None = None
     flush_reasons: Counter[str] = Counter()
+    flush_availability_reason: str | None = None
     if profile_dir:
-        profiled_workers, arm_reasons = _signal_api_workers_detailed(
+        profiled_workers, arm_reasons, arm_availability_reason = _signal_api_workers_detailed(
             signal.SIGUSR1,
             armed_identities=armed_worker_identities,
         )
@@ -1085,7 +1107,7 @@ async def async_main() -> int:
         await sampler.stop()
         flushed_workers: list[int] = []
         if profile_dir:
-            flushed_workers, flush_reasons = _signal_api_workers_detailed(
+            flushed_workers, flush_reasons, flush_availability_reason = _signal_api_workers_detailed(
                 signal.SIGUSR2,
                 armed_identities=armed_worker_identities,
             )
@@ -1189,11 +1211,13 @@ async def async_main() -> int:
                     profiled_workers,
                     arm_reasons,
                     requested=candidate_worker_count,
+                    availability_reason=arm_availability_reason,
                 ),
                 "flush": _signal_delivery_summary(
                     flushed_workers,
                     flush_reasons,
                     requested=len(armed_worker_identities),
+                    availability_reason=flush_availability_reason,
                 ),
             },
             "armed_workers": profiled_workers,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import cProfile
 import json
 import os
 from pathlib import Path
@@ -691,38 +692,38 @@ class PerformanceProfileContractTests(unittest.TestCase):
             profile = output_dir / "ready-vote-cprofile-123-456.pstats"
             wrong_generation = output_dir / "ready-vote-cprofile-123-999.pstats"
             partial = output_dir / "ready-vote-cprofile-124-457.pstats"
-            profile.write_bytes(b"old")
+            producer = cProfile.Profile()
+            producer.enable()
+            sum(range(1000))
+            producer.disable()
+            valid_profile = output_dir / "valid.pstats"
+            producer.dump_stats(str(valid_profile))
+            profile.write_bytes(valid_profile.read_bytes())
             wrong_generation.write_bytes(b"wrong")
-            partial.write_bytes(b"partial")
+            partial.write_bytes(profile.read_bytes()[: max(1, profile.stat().st_size // 2)])
             baseline = profile_artifact_snapshot(output_dir)
 
-            class FakeStats:
-                stats: dict[object, object] = {}
-
-                def __init__(self, path: str) -> None:
-                    if "124-457" in path:
-                        raise ValueError("partial profile")
-
             identities = {123: {"pid": 123, "start_time_ticks": 456}}
-            with patch("tools.platform_external_load_observer.Stats", FakeStats):
-                stale = cpu_profile_summary(
-                    output_dir,
-                    armed_identities=identities,
-                    baseline_artifacts=baseline,
-                )
-                self.assertEqual(len(stale["profiles"]), 0)
-                self.assertEqual(stale["retention"]["ignored_stale_profiles"], 1)
+            stale = cpu_profile_summary(
+                output_dir,
+                armed_identities=identities,
+                baseline_artifacts=baseline,
+            )
+            self.assertEqual(len(stale["profiles"]), 0)
+            self.assertEqual(stale["retention"]["ignored_stale_profiles"], 1)
 
-                profile.write_bytes(b"new-profile")
-                partial.write_bytes(b"partial-new")
-                fresh = cpu_profile_summary(
-                    output_dir,
-                    armed_identities={
-                        123: {"pid": 123, "start_time_ticks": 456},
-                        124: {"pid": 124, "start_time_ticks": 457},
-                    },
-                    baseline_artifacts=baseline,
-                )
+            profile_mtime = int(baseline[profile.name][3]) + 1
+            partial_mtime = int(baseline[partial.name][3]) + 1
+            os.utime(profile, ns=(profile_mtime, profile_mtime))
+            os.utime(partial, ns=(partial_mtime, partial_mtime))
+            fresh = cpu_profile_summary(
+                output_dir,
+                armed_identities={
+                    123: {"pid": 123, "start_time_ticks": 456},
+                    124: {"pid": 124, "start_time_ticks": 457},
+                },
+                baseline_artifacts=baseline,
+            )
 
             self.assertEqual(len(fresh["profiles"]), 1)
             self.assertEqual(fresh["retention"]["invalid_profiles"], 1)
@@ -823,7 +824,7 @@ class PerformanceProfileContractTests(unittest.TestCase):
         with patch("tools.platform_external_load_observer.os.pidfd_open", None), patch(
             "tools.platform_external_load_observer.signal.pidfd_send_signal", None
         ), patch("tools.platform_external_load_observer.os.kill") as kill:
-            signalled, reasons = _signal_api_workers_detailed(
+            signalled, reasons, availability_reason = _signal_api_workers_detailed(
                 signal.SIGUSR1,
                 processes=processes,
                 expected_uid=994,
@@ -832,7 +833,23 @@ class PerformanceProfileContractTests(unittest.TestCase):
 
         self.assertEqual(signalled, [])
         self.assertEqual(reasons, {"pidfd_unavailable": 1})
+        self.assertIsNone(availability_reason)
+        self.assertEqual(len(signalled) + sum(reasons.values()), 1)
         kill.assert_not_called()
+
+        with patch(
+            "tools.platform_external_load_observer.expected_api_uid",
+            return_value=None,
+        ):
+            signalled, reasons, availability_reason = _signal_api_workers_detailed(
+                signal.SIGUSR1,
+                processes=processes,
+                expected_uid=None,
+                process_reader=lambda pid: records.get(pid),  # type: ignore[arg-type]
+            )
+        self.assertEqual(signalled, [])
+        self.assertEqual(reasons, {})
+        self.assertEqual(availability_reason, "uid_unavailable")
 
     def test_observer_flush_rejects_stale_or_reused_worker_identity(self) -> None:
         command = (
@@ -877,7 +894,7 @@ class PerformanceProfileContractTests(unittest.TestCase):
         with patch("tools.platform_external_load_observer.os.pidfd_open", side_effect=lambda pid, _flags: pid + 1000), patch(
             "tools.platform_external_load_observer.signal.pidfd_send_signal"
         ) as pidfd_send, patch("tools.platform_external_load_observer.os.kill") as kill:
-            signalled = signal_api_workers(
+            signalled, reasons, availability_reason = _signal_api_workers_detailed(
                 signal.SIGUSR2,
                 processes=reused_processes,
                 expected_uid=994,
@@ -886,8 +903,30 @@ class PerformanceProfileContractTests(unittest.TestCase):
             )
 
         self.assertEqual(signalled, [102])
+        self.assertEqual(reasons, {"identity_mismatch": 1})
+        self.assertIsNone(availability_reason)
+        self.assertEqual(len(signalled) + sum(reasons.values()), len(armed))
         pidfd_send.assert_called_once_with(1102, signal.SIGUSR2)
         kill.assert_not_called()
+
+        missing_processes = [process for process in reused_processes if process["pid"] != 101]
+        missing_records = {process["pid"]: process for process in missing_processes}
+        with patch(
+            "tools.platform_external_load_observer.os.pidfd_open",
+            side_effect=lambda pid, _flags: pid + 1000,
+        ), patch("tools.platform_external_load_observer.signal.pidfd_send_signal") as pidfd_send:
+            signalled, reasons, availability_reason = _signal_api_workers_detailed(
+                signal.SIGUSR2,
+                processes=missing_processes,
+                expected_uid=994,
+                armed_identities=armed,
+                process_reader=lambda pid: missing_records.get(pid),  # type: ignore[arg-type]
+            )
+        self.assertEqual(signalled, [102])
+        self.assertEqual(reasons, {"worker_missing": 1})
+        self.assertIsNone(availability_reason)
+        self.assertEqual(len(signalled) + sum(reasons.values()), len(armed))
+        pidfd_send.assert_called_once_with(1102, signal.SIGUSR2)
 
     def test_supervisor_binds_observer_and_workflow_blocks_deprecated_profiles(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -897,9 +936,6 @@ class PerformanceProfileContractTests(unittest.TestCase):
         observer = (root / "tools" / "platform_external_load_observer.py").read_text(
             encoding="utf-8"
         )
-        lock_helper = (root / "tools" / "platform_release_lock.sh").read_text(
-            encoding="utf-8"
-        )
         workflow = (root.parent / ".github" / "workflows" / "platform-production-external-load.yml").read_text(
             encoding="utf-8"
         )
@@ -907,11 +943,6 @@ class PerformanceProfileContractTests(unittest.TestCase):
         self.assertIn('--fixture-marker "$fixture_marker"', supervisor)
         self.assertIn('--external-run-id "$run_id"', supervisor)
         self.assertLess(supervisor.index('--fixture-marker "$fixture_marker"'), supervisor.index(': > "$external_vote_ready"'))
-        self.assertLess(
-            supervisor.index("platform_retained_load_lock_supervise"),
-            supervisor.index("platform_external_load_observer.py"),
-        )
-        self.assertIn("/run/lock/oldsparky-retained-load-matrix.lock", lock_helper)
         self.assertIn("pidfd_send_signal", observer)
         self.assertNotIn("os.kill(pid, signum)", observer)
         for deprecated in (

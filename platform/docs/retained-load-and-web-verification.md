@@ -75,14 +75,15 @@ evidence fails. Dispatch inputs use the canonical bounded-ASCII parser and
 private mode-0600 JSON stdin; SSH carries a fixed dispatcher mode and no raw
 input enters reports or artifacts.
 
-The origin observer is supported only as the child of
-[`platform_production_external_fixture_qa.sh`](../tools/platform_production_external_fixture_qa.sh).
-That helper enters the canonical retained-load supervisor first and keeps
+The origin observer is a supported integration of the
+[`platform_production_external_fixture_qa.sh`](../tools/platform_production_external_fixture_qa.sh)
+workflow. That workflow enters the canonical retained-load supervisor before
+starting the observer and keeps
 `/run/lock/oldsparky-retained-load-matrix.lock` held through observer
-completion, export and exit; the observer is not a standalone lock owner.
-The Actions concurrency group serializes this workflow, while the host lock
-also covers deployment, cleanup and maintenance callers. Do not launch the
-observer directly on the production host.
+completion, export and exit; the observer does not acquire a second lock.
+The Actions concurrency group serializes this supported workflow, while the
+host lock also covers deployment, cleanup and maintenance callers. Direct
+observer invocation is outside the supported workflow integration.
 
 When the diagnostic CPU-profile environment is enabled, worker signals are
 sent only through Linux pidfds after the exact UID, parent and procfs
