@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import cProfile
 import json
+import marshal
 import os
 from pathlib import Path
 import re
@@ -19,8 +21,11 @@ from tools.platform_external_load import (
     summarize_results,
 )
 from tools.platform_external_load_observer import (
+    _signal_api_workers_detailed,
+    _signal_delivery_summary,
     api_worker_identities,
     cpu_profile_summary,
+    profile_artifact_snapshot,
     signal_api_workers,
 )
 from tools.platform_load import (
@@ -663,8 +668,8 @@ class PerformanceProfileContractTests(unittest.TestCase):
     def test_observer_profiles_are_pid_bound_and_never_deleted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory)
-            bound = output_dir / "ready-vote-cprofile-123.pstats"
-            unbound = output_dir / "ready-vote-cprofile-999.pstats"
+            bound = output_dir / "ready-vote-cprofile-123-456.pstats"
+            unbound = output_dir / "ready-vote-cprofile-999-456.pstats"
             bound.write_bytes(b"profile")
             unbound.write_bytes(b"profile")
 
@@ -674,13 +679,78 @@ class PerformanceProfileContractTests(unittest.TestCase):
                 def __init__(self, *_args: object) -> None:
                     pass
 
+            identities = {123: {"pid": 123, "start_time_ticks": 456}}
             with patch("tools.platform_external_load_observer.Stats", FakeStats):
-                summary = cpu_profile_summary(output_dir, armed_pids=[123])
+                summary = cpu_profile_summary(output_dir, armed_identities=identities)
 
             self.assertEqual(len(summary["profiles"]), 1)
             self.assertEqual(summary["retention"]["ignored_unbound_profiles"], 1)
             self.assertTrue(bound.exists())
             self.assertTrue(unbound.exists())
+
+    def test_observer_profiles_require_changed_exact_generation_and_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            profile = output_dir / "ready-vote-cprofile-123-456.pstats"
+            wrong_generation = output_dir / "ready-vote-cprofile-123-999.pstats"
+            partial = output_dir / "ready-vote-cprofile-124-457.pstats"
+            corrupt = output_dir / "ready-vote-cprofile-125-458.pstats"
+            invalid_marshal = output_dir / "ready-vote-cprofile-126-459.pstats"
+            wrong_shape = output_dir / "ready-vote-cprofile-127-460.pstats"
+            producer = cProfile.Profile()
+            producer.enable()
+            sum(range(1000))
+            producer.disable()
+            valid_profile = output_dir / "valid.pstats"
+            producer.dump_stats(str(valid_profile))
+            profile.write_bytes(valid_profile.read_bytes())
+            wrong_generation.write_bytes(b"wrong")
+            invalid_fixtures = {
+                partial: profile.read_bytes()[: max(1, profile.stat().st_size // 2)],
+                # A real marshal payload with the wrong top-level shape makes
+                # pstats access `.items` on ellipsis and raise AttributeError.
+                corrupt: marshal.dumps(Ellipsis),
+                invalid_marshal: b"not-marshal",
+                wrong_shape: marshal.dumps([]),
+            }
+            for path, contents in invalid_fixtures.items():
+                path.write_bytes(contents)
+            baseline = profile_artifact_snapshot(output_dir)
+
+            identities = {123: {"pid": 123, "start_time_ticks": 456}}
+            stale = cpu_profile_summary(
+                output_dir,
+                armed_identities=identities,
+                baseline_artifacts=baseline,
+            )
+            self.assertEqual(len(stale["profiles"]), 0)
+            self.assertEqual(stale["retention"]["ignored_stale_profiles"], 1)
+
+            profile_mtime = int(baseline[profile.name][3]) + 1
+            partial_mtime = int(baseline[partial.name][3]) + 1
+            os.utime(profile, ns=(profile_mtime, profile_mtime))
+            os.utime(partial, ns=(partial_mtime, partial_mtime))
+            corrupt_mtime = int(baseline[corrupt.name][3]) + 1
+            os.utime(corrupt, ns=(corrupt_mtime, corrupt_mtime))
+            for path in (invalid_marshal, wrong_shape):
+                mtime = int(baseline[path.name][3]) + 1
+                os.utime(path, ns=(mtime, mtime))
+            fresh = cpu_profile_summary(
+                output_dir,
+                armed_identities={
+                    123: {"pid": 123, "start_time_ticks": 456},
+                    124: {"pid": 124, "start_time_ticks": 457},
+                    125: {"pid": 125, "start_time_ticks": 458},
+                    126: {"pid": 126, "start_time_ticks": 459},
+                    127: {"pid": 127, "start_time_ticks": 460},
+                },
+                baseline_artifacts=baseline,
+            )
+
+            self.assertEqual(len(fresh["profiles"]), 1)
+            self.assertEqual(fresh["retention"]["invalid_profiles"], 4)
+            self.assertTrue(profile.exists())
+            self.assertTrue(wrong_generation.exists())
 
     def test_observer_signals_only_direct_workers_and_never_master(self) -> None:
         command = (
@@ -734,18 +804,133 @@ class PerformanceProfileContractTests(unittest.TestCase):
             },
         ]
 
-        with patch("tools.platform_external_load_observer.os.kill") as kill:
+        records = {process["pid"]: process for process in processes}
+
+        def process_reader(pid: int) -> dict[str, object] | None:
+            return records.get(pid)  # type: ignore[arg-type]
+
+        pidfds: list[int] = []
+        sent: list[tuple[int, signal.Signals]] = []
+
+        def pidfd_open(pid: int, _flags: int) -> int:
+            pidfds.append(pid)
+            return pid + 1000
+
+        def pidfd_send_signal(pidfd: int, signum: signal.Signals) -> None:
+            sent.append((pidfd, signum))
+
+        with patch("tools.platform_external_load_observer.os.pidfd_open", pidfd_open), patch(
+            "tools.platform_external_load_observer.signal.pidfd_send_signal",
+            pidfd_send_signal,
+        ), patch("tools.platform_external_load_observer.os.kill") as kill:
             signalled = signal_api_workers(
                 signal.SIGUSR1,
                 processes=processes,
                 expected_uid=994,
+                process_reader=process_reader,
             )
 
         self.assertEqual(signalled, [101, 102])
-        self.assertEqual(
-            [call.args for call in kill.call_args_list],
-            [(101, signal.SIGUSR1), (102, signal.SIGUSR1)],
+        self.assertEqual(pidfds, [101, 102])
+        self.assertEqual(sent, [(1101, signal.SIGUSR1), (1102, signal.SIGUSR1)])
+        kill.assert_not_called()
+
+    def test_observer_rejects_signal_when_pidfd_is_unavailable(self) -> None:
+        command = "/opt/venv/bin/python -m gunicorn apps.platform_api.app.main:app --workers 1"
+        processes = [
+            {"pid": 100, "ppid": 1, "uid": 994, "cmdline": command, "start_time_ticks": 10},
+            {"pid": 101, "ppid": 100, "uid": 994, "cmdline": command, "start_time_ticks": 11},
+        ]
+        records = {process["pid"]: process for process in processes}
+
+        with patch("tools.platform_external_load_observer.os.pidfd_open", None), patch(
+            "tools.platform_external_load_observer.signal.pidfd_send_signal", None
+        ), patch("tools.platform_external_load_observer.os.kill") as kill:
+            signalled, reasons, availability_reason = _signal_api_workers_detailed(
+                signal.SIGUSR1,
+                processes=processes,
+                expected_uid=994,
+                process_reader=lambda pid: records.get(pid),  # type: ignore[arg-type]
+            )
+
+        self.assertEqual(signalled, [])
+        self.assertEqual(reasons, {"pidfd_unavailable": 1})
+        self.assertIsNone(availability_reason)
+        self.assertEqual(len(signalled) + sum(reasons.values()), 1)
+        kill.assert_not_called()
+
+        with patch(
+            "tools.platform_external_load_observer.expected_api_uid",
+            return_value=None,
+        ):
+            signalled, reasons, availability_reason = _signal_api_workers_detailed(
+                signal.SIGUSR1,
+                processes=processes,
+                expected_uid=None,
+                process_reader=lambda pid: records.get(pid),  # type: ignore[arg-type]
+            )
+        self.assertEqual(signalled, [])
+        self.assertEqual(reasons, {})
+        self.assertEqual(availability_reason, "uid_unavailable")
+
+        with patch(
+            "tools.platform_external_load_observer.expected_api_uid",
+            return_value=None,
+        ):
+            signalled, reasons, availability_reason = _signal_api_workers_detailed(
+                signal.SIGUSR2,
+                processes=processes,
+                expected_uid=None,
+                armed_identities={
+                    101: {"pid": 101, "uid": 994, "ppid": 100, "start_time_ticks": 11},
+                    102: {"pid": 102, "uid": 994, "ppid": 100, "start_time_ticks": 12},
+                },
+                process_reader=lambda pid: records.get(pid),  # type: ignore[arg-type]
+            )
+        self.assertEqual(signalled, [])
+        self.assertEqual(reasons, {"uid_unavailable": 2})
+        self.assertIsNone(availability_reason)
+
+        initial_arm = _signal_delivery_summary(
+            [],
+            {},
+            requested=2,
+            availability_reason="uid_unavailable",
         )
+        self.assertEqual(initial_arm["requested_count"], 2)
+        self.assertEqual(initial_arm["delivered_count"], 0)
+        self.assertEqual(initial_arm["rejected_count"], 2)
+        self.assertEqual(initial_arm["rejection_reasons"], {"uid_unavailable": 2})
+        self.assertNotIn("availability_reason", initial_arm)
+
+        flush_after_prior_arm = _signal_delivery_summary(
+            [],
+            {},
+            requested=2,
+            availability_reason="uid_unavailable",
+        )
+        self.assertEqual(flush_after_prior_arm["requested_count"], 2)
+        self.assertEqual(flush_after_prior_arm["rejected_count"], 2)
+        self.assertEqual(flush_after_prior_arm["rejection_reasons"], {"uid_unavailable": 2})
+        self.assertNotIn("availability_reason", flush_after_prior_arm)
+
+        flush_after_no_candidates = _signal_delivery_summary(
+            [],
+            {},
+            requested=0,
+            availability_reason="uid_unavailable",
+        )
+        self.assertEqual(flush_after_no_candidates["requested_count"], 0)
+        self.assertEqual(flush_after_no_candidates["rejected_count"], 0)
+        self.assertEqual(flush_after_no_candidates["availability_reason"], "uid_unavailable")
+
+        overcounted = _signal_delivery_summary(
+            [101],
+            {"worker_missing": 3},
+            requested=2,
+        )
+        self.assertEqual(overcounted["delivered_count"] + overcounted["rejected_count"], 2)
+        self.assertEqual(overcounted["rejection_reasons"], {"worker_missing": 1})
 
     def test_observer_flush_rejects_stale_or_reused_worker_identity(self) -> None:
         command = (
@@ -782,20 +967,54 @@ class PerformanceProfileContractTests(unittest.TestCase):
         reused_processes = [dict(process) for process in armed_processes]
         reused_processes[1]["start_time_ticks"] = 999
 
-        with patch("tools.platform_external_load_observer.os.kill") as kill:
-            signalled = signal_api_workers(
+        records = {process["pid"]: process for process in reused_processes}
+
+        def process_reader(pid: int) -> dict[str, object] | None:
+            return records.get(pid)  # type: ignore[arg-type]
+
+        with patch("tools.platform_external_load_observer.os.pidfd_open", side_effect=lambda pid, _flags: pid + 1000), patch(
+            "tools.platform_external_load_observer.signal.pidfd_send_signal"
+        ) as pidfd_send, patch("tools.platform_external_load_observer.os.kill") as kill:
+            signalled, reasons, availability_reason = _signal_api_workers_detailed(
                 signal.SIGUSR2,
                 processes=reused_processes,
                 expected_uid=994,
                 armed_identities=armed,
+                process_reader=process_reader,
             )
 
         self.assertEqual(signalled, [102])
-        kill.assert_called_once_with(102, signal.SIGUSR2)
+        self.assertEqual(reasons, {"identity_mismatch": 1})
+        self.assertIsNone(availability_reason)
+        self.assertEqual(len(signalled) + sum(reasons.values()), len(armed))
+        pidfd_send.assert_called_once_with(1102, signal.SIGUSR2)
+        kill.assert_not_called()
+
+        missing_processes = [process for process in reused_processes if process["pid"] != 101]
+        missing_records = {process["pid"]: process for process in missing_processes}
+        with patch(
+            "tools.platform_external_load_observer.os.pidfd_open",
+            side_effect=lambda pid, _flags: pid + 1000,
+        ), patch("tools.platform_external_load_observer.signal.pidfd_send_signal") as pidfd_send:
+            signalled, reasons, availability_reason = _signal_api_workers_detailed(
+                signal.SIGUSR2,
+                processes=missing_processes,
+                expected_uid=994,
+                armed_identities=armed,
+                process_reader=lambda pid: missing_records.get(pid),  # type: ignore[arg-type]
+            )
+        self.assertEqual(signalled, [102])
+        self.assertEqual(reasons, {"worker_missing": 1})
+        self.assertIsNone(availability_reason)
+        self.assertEqual(len(signalled) + sum(reasons.values()), len(armed))
+        pidfd_send.assert_called_once_with(1102, signal.SIGUSR2)
 
     def test_supervisor_binds_observer_and_workflow_blocks_deprecated_profiles(self) -> None:
         root = Path(__file__).resolve().parents[1]
         supervisor = (root / "tools" / "platform_production_external_fixture_qa.sh").read_text(
+            encoding="utf-8"
+        )
+        observer = (root / "tools" / "platform_external_load_observer.py").read_text(
             encoding="utf-8"
         )
         workflow = (root.parent / ".github" / "workflows" / "platform-production-external-load.yml").read_text(
@@ -805,6 +1024,8 @@ class PerformanceProfileContractTests(unittest.TestCase):
         self.assertIn('--fixture-marker "$fixture_marker"', supervisor)
         self.assertIn('--external-run-id "$run_id"', supervisor)
         self.assertLess(supervisor.index('--fixture-marker "$fixture_marker"'), supervisor.index(': > "$external_vote_ready"'))
+        self.assertIn("pidfd_send_signal", observer)
+        self.assertNotIn("os.kill(pid, signum)", observer)
         for deprecated in (
             "ready-vote-saturation-ramp-v1",
             "ready-vote-saturation-ramp-v2",

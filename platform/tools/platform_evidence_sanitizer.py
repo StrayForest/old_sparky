@@ -62,6 +62,17 @@ SAFE_CF_ERROR_CLASSES = frozenset(
     {"none", "cf_520", "cf_521", "cf_522", "cf_523", "cf_524", "origin", "other"}
 )
 SAFE_BACKENDS = frozenset({"api", "web", "worker", "qa", "observer", "postgres", "other"})
+SAFE_PROFILE_SIGNAL_REASONS = frozenset(
+    {
+        "uid_unavailable",
+        "invalid_pid",
+        "worker_missing",
+        "identity_mismatch",
+        "pidfd_unavailable",
+        "pidfd_open_failed",
+        "pidfd_send_failed",
+    }
+)
 SAFE_WAIT_STATES = frozenset(
     {"active", "idle", "lock", "io", "lwlock", "client", "ipc", "timeout", "other"}
 )
@@ -2162,13 +2173,50 @@ def _project_cpu_profile(value: Any) -> dict[str, Any]:
     if enabled is not None:
         output["enabled"] = enabled
     retention = _mapping(source.get("retention"))
-    for key in ("max_profiles", "available_profiles", "bound_profiles", "summarized_profiles", "ignored_unbound_profiles", "truncated_profiles"):
+    for key in (
+        "max_profiles",
+        "available_profiles",
+        "bound_profiles",
+        "summarized_profiles",
+        "ignored_unbound_profiles",
+        "ignored_stale_profiles",
+        "invalid_profiles",
+        "truncated_profiles",
+    ):
         number = _copy_int(retention, key)
         if number is not None:
             output[key] = number
     artifacts = _copy_bool(retention, "artifacts_preserved")
     if artifacts is not None:
         output["artifacts_preserved"] = artifacts
+    signal_delivery = _mapping(source.get("signal_delivery"))
+    safe_signal_delivery: dict[str, Any] = {}
+    for phase in ("arm", "flush"):
+        phase_source = _mapping(signal_delivery.get(phase))
+        phase_output: dict[str, Any] = {}
+        for key in ("requested_count", "delivered_count", "rejected_count"):
+            number = _copy_int(phase_source, key)
+            if number is not None:
+                phase_output[key] = number
+        available = _copy_bool(phase_source, "pidfd_api_available")
+        if available is not None:
+            phase_output["pidfd_api_available"] = available
+        availability_reason = phase_source.get("availability_reason")
+        if isinstance(availability_reason, str) and availability_reason in SAFE_PROFILE_SIGNAL_REASONS:
+            phase_output["availability_reason"] = availability_reason
+        reasons = _mapping(phase_source.get("rejection_reasons"))
+        safe_reasons: dict[str, int] = {}
+        for raw_reason, raw_count in reasons.items():
+            reason = str(raw_reason)
+            count = _copy_int(reasons, raw_reason)
+            if reason in SAFE_PROFILE_SIGNAL_REASONS and count is not None:
+                safe_reasons[reason] = count
+        if safe_reasons:
+            phase_output["rejection_reasons"] = dict(sorted(safe_reasons.items()))
+        if phase_output:
+            safe_signal_delivery[phase] = phase_output
+    if safe_signal_delivery:
+        output["signal_delivery"] = safe_signal_delivery
     if output:
         return output
     return {"enabled": False}

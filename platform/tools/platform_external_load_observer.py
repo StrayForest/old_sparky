@@ -16,6 +16,7 @@ import re
 import signal
 import time
 from pstats import Stats
+from typing import Callable
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -69,8 +70,11 @@ from python_packages.platform_infra.db import session_factory
 TIMEOUT_DIAGNOSTIC_ID_RE = re.compile(r"^tdiag-[0-9]{1,32}-[0-9]{5}$")
 FIXTURE_MARKER_RE = re.compile(r"^preprod[0-9]{12}[0-9a-f]{4}$")
 EXTERNAL_RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
-CPROFILE_NAME_RE = re.compile(r"^ready-vote-cprofile-(?P<pid>[0-9]+)\.pstats$")
+CPROFILE_NAME_RE = re.compile(
+    r"^ready-vote-cprofile-(?P<pid>[0-9]+)-(?P<start_time_ticks>[1-9][0-9]*)\.pstats$"
+)
 API_SERVICE_USER = "oldsparky-api"
+ProcessReader = Callable[[int], dict[str, object] | None]
 
 
 def _positive_int(value: object) -> int | None:
@@ -279,11 +283,13 @@ def _live_identity_matches(
     identity: dict[str, object],
     *,
     expected_uid: int,
+    process_reader: ProcessReader | None = None,
 ) -> bool | None:
+    process_reader = _read_proc_record if process_reader is None else process_reader
     pid = _positive_int(identity.get("pid"))
     if pid is None:
         return False
-    process = _read_proc_record(pid)
+    process = process_reader(pid)
     if process is None:
         # A missing proc entry means the process exited between snapshots; it
         # is not safe to signal a possibly reused PID.
@@ -297,7 +303,7 @@ def _live_identity_matches(
     master_start = _positive_int(identity.get("master_start_time_ticks"))
     if master_pid is None or master_start is None or int(process["ppid"]) != master_pid:
         return False
-    master = _read_proc_record(master_pid)
+    master = process_reader(master_pid)
     if master is None:
         return False
     if (
@@ -312,7 +318,7 @@ def _live_identity_matches(
     # tree, so refuse the signal.
     grandparent_pid = _positive_int(master.get("ppid"))
     if grandparent_pid is not None:
-        grandparent = _read_proc_record(grandparent_pid)
+        grandparent = process_reader(grandparent_pid)
         if grandparent is not None and _is_api_gunicorn_process(grandparent):
             return False
     return True
@@ -323,49 +329,99 @@ def _send_identity_signal(
     signum: signal.Signals,
     *,
     expected_uid: int,
-    allow_snapshot_fallback: bool = False,
-) -> bool:
-    """Signal one identity, using pidfd when the live proc entry is available."""
+    process_reader: ProcessReader | None = None,
+) -> tuple[bool, str]:
+    """Signal one identity through pidfd, never through a numeric PID."""
 
     pid = _positive_int(identity.get("pid"))
     if pid is None:
-        return False
-    live_match = _live_identity_matches(identity, expected_uid=expected_uid)
+        return False, "invalid_pid"
+    process_reader = _read_proc_record if process_reader is None else process_reader
+    live_match = _live_identity_matches(
+        identity,
+        expected_uid=expected_uid,
+        process_reader=process_reader,
+    )
     if live_match is not True:
-        # Focused contract tests provide synthetic process rows with no
-        # corresponding /proc entry.  Production calls leave this disabled,
-        # so an exited process can never fall through to a reused PID.
-        if not allow_snapshot_fallback or _read_proc_record(pid) is not None:
-            return False
-        try:
-            os.kill(pid, signum)
-        except (ProcessLookupError, PermissionError, OSError, ValueError):
-            return False
-        return True
+        return False, "identity_mismatch"
     pidfd_open = getattr(os, "pidfd_open", None)
     pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
-    if callable(pidfd_open) and callable(pidfd_send_signal):
-        try:
-            pidfd = pidfd_open(pid, 0)
-        except (OSError, ValueError):
-            return False
-        try:
-            # Bind the descriptor before the final procfs comparison.  Even if
-            # the numeric PID is reused after this point, pidfd targets the
-            # original process or fails without signalling the replacement.
-            if _live_identity_matches(identity, expected_uid=expected_uid) is not True:
-                return False
-            pidfd_send_signal(pidfd, signum)
-            return True
-        except (OSError, ValueError):
-            return False
-        finally:
-            os.close(pidfd)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        return False, "pidfd_unavailable"
     try:
-        os.kill(pid, signum)
-    except (ProcessLookupError, PermissionError, OSError, ValueError):
-        return False
-    return True
+        pidfd = pidfd_open(pid, 0)
+    except (OSError, ValueError):
+        return False, "pidfd_open_failed"
+    try:
+        # Bind the descriptor before the final procfs comparison. Even if the
+        # numeric PID is reused after this point, pidfd targets the original
+        # process or fails without signalling the replacement.
+        if _live_identity_matches(
+            identity,
+            expected_uid=expected_uid,
+            process_reader=process_reader,
+        ) is not True:
+            return False, "identity_mismatch"
+        pidfd_send_signal(pidfd, signum)
+        return True, "pidfd"
+    except (OSError, ValueError):
+        return False, "pidfd_send_failed"
+    finally:
+        try:
+            os.close(pidfd)
+        except OSError:
+            pass
+
+
+def _signal_api_workers_detailed(
+    signum: signal.Signals,
+    *,
+    processes: list[dict[str, object]] | None = None,
+    expected_uid: int | None = None,
+    armed_identities: dict[int, dict[str, object]] | None = None,
+    armed_workers: dict[int, dict[str, object]] | None = None,
+    process_reader: ProcessReader | None = None,
+) -> tuple[list[int], Counter[str], str | None]:
+    process_reader = _read_proc_record if process_reader is None else process_reader
+    if armed_identities is not None and armed_workers is not None:
+        raise ValueError("provide only one armed worker identity mapping")
+    armed = armed_identities if armed_identities is not None else armed_workers
+    uid = expected_api_uid() if expected_uid is None else expected_uid
+    if uid is None:
+        # There is no safe identity basis for a request in this case.  A
+        # previously armed mapping still represents concrete requested
+        # workers, so account for each one as a bounded rejection.  With no
+        # mapping there were no candidates to reject; retain availability as
+        # a diagnostic rather than inventing a worker rejection.
+        if armed:
+            return [], Counter({"uid_unavailable": len(armed)}), None
+        return [], Counter(), "uid_unavailable"
+    current = api_worker_identities(processes, expected_uid=uid)
+    reasons: Counter[str] = Counter()
+    if armed is not None:
+        live_identities = current
+        current = {}
+        for pid, expected_identity in armed.items():
+            live_identity = live_identities.get(pid)
+            if live_identity is None:
+                reasons["worker_missing"] += 1
+            elif live_identity != expected_identity:
+                reasons["identity_mismatch"] += 1
+            else:
+                current[pid] = live_identity
+    signalled: list[int] = []
+    for pid, identity in sorted(current.items()):
+        delivered, reason = _send_identity_signal(
+            identity,
+            signum,
+            expected_uid=uid,
+            process_reader=process_reader,
+        )
+        if delivered:
+            signalled.append(pid)
+        else:
+            reasons[reason] += 1
+    return signalled, reasons, None
 
 
 def signal_api_workers(
@@ -375,31 +431,17 @@ def signal_api_workers(
     expected_uid: int | None = None,
     armed_identities: dict[int, dict[str, object]] | None = None,
     armed_workers: dict[int, dict[str, object]] | None = None,
+    process_reader: ProcessReader | None = None,
 ) -> list[int]:
     """Signal only direct API workers with an optional exact armed identity."""
-
-    if armed_identities is not None and armed_workers is not None:
-        raise ValueError("provide only one armed worker identity mapping")
-    armed = armed_identities if armed_identities is not None else armed_workers
-    uid = expected_api_uid() if expected_uid is None else expected_uid
-    if uid is None:
-        return []
-    current = api_worker_identities(processes, expected_uid=uid)
-    if armed is not None:
-        current = {
-            pid: identity
-            for pid, identity in current.items()
-            if pid in armed and identity == armed[pid]
-        }
-    signalled: list[int] = []
-    for pid, identity in sorted(current.items()):
-        if _send_identity_signal(
-            identity,
-            signum,
-            expected_uid=uid,
-            allow_snapshot_fallback=processes is not None,
-        ):
-            signalled.append(pid)
+    signalled, _reasons, _availability_reason = _signal_api_workers_detailed(
+        signum,
+        processes=processes,
+        expected_uid=expected_uid,
+        armed_identities=armed_identities,
+        armed_workers=armed_workers,
+        process_reader=process_reader,
+    )
     return signalled
 
 
@@ -432,22 +474,88 @@ def load_timeout_diagnostic_ids(path: Path | None) -> set[str] | None:
     }
 
 
+def profile_artifact_snapshot(output_dir: Path | None) -> dict[str, tuple[int, int, int, int]]:
+    """Capture bounded metadata without retaining profile paths or contents."""
+
+    if output_dir is None or not output_dir.is_dir():
+        return {}
+    snapshot: dict[str, tuple[int, int, int, int]] = {}
+    for path in output_dir.glob("ready-vote-cprofile-*.pstats"):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            metadata = path.stat()
+        except OSError:
+            continue
+        snapshot[path.name] = (
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+            int(metadata.st_size),
+            int(metadata.st_mtime_ns),
+        )
+    return snapshot
+
+
 def cpu_profile_summary(
     output_dir: Path | None,
     *,
     armed_pids: list[int] | tuple[int, ...] = (),
+    armed_identities: dict[int, dict[str, object]] | None = None,
+    baseline_artifacts: dict[str, tuple[int, int, int, int]] | None = None,
 ) -> dict[str, object]:
     if output_dir is None or not output_dir.is_dir():
         return {"enabled": False, "profiles": []}
     allowed_pids = {int(pid) for pid in armed_pids}
+    expected_start_times: dict[int, int] = {}
+    if armed_identities is not None:
+        allowed_pids = set()
+        for raw_pid, identity in armed_identities.items():
+            pid = _positive_int(raw_pid)
+            start_time_ticks = _positive_int(identity.get("start_time_ticks"))
+            if pid is not None and start_time_ticks is not None:
+                allowed_pids.add(pid)
+                expected_start_times[pid] = start_time_ticks
     profiles: list[dict[str, object]] = []
     all_profile_paths = sorted(output_dir.glob("ready-vote-cprofile-*.pstats"))
-    bound_profile_paths = [
-        path
-        for path in all_profile_paths
-        if (match := CPROFILE_NAME_RE.fullmatch(path.name)) is not None
-        and int(match.group("pid")) in allowed_pids
-    ]
+    bound_profile_paths: list[Path] = []
+    unbound_profile_count = 0
+    stale_profile_count = 0
+    invalid_profile_count = 0
+    for path in all_profile_paths:
+        if path.is_symlink() or not path.is_file():
+            unbound_profile_count += 1
+            continue
+        match = CPROFILE_NAME_RE.fullmatch(path.name)
+        if match is None:
+            unbound_profile_count += 1
+            continue
+        pid = int(match.group("pid"))
+        start_time_ticks = int(match.group("start_time_ticks"))
+        # An exact worker generation is mandatory. The legacy armed_pids-only
+        # argument is retained for callers during the schema transition, but
+        # cannot authorize a profile by itself.
+        if (
+            pid not in allowed_pids
+            or pid not in expected_start_times
+            or expected_start_times[pid] != start_time_ticks
+        ):
+            unbound_profile_count += 1
+            continue
+        if baseline_artifacts is not None:
+            try:
+                metadata = path.stat()
+            except OSError:
+                continue
+            current_metadata = (
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+                int(metadata.st_size),
+                int(metadata.st_mtime_ns),
+            )
+            if baseline_artifacts.get(path.name) == current_metadata:
+                stale_profile_count += 1
+                continue
+        bound_profile_paths.append(path)
     # Keep the forensic report bounded, but never delete from the shared
     # caller-owned directory.  PID binding prevents a concurrent/old worker's
     # profile from being attributed to this observer window.
@@ -455,7 +563,12 @@ def cpu_profile_summary(
     for path in profile_paths:
         try:
             stats = Stats(str(path))
-        except (OSError, TypeError, ValueError):
+        # pstats/marshal reports truncated streams as EOFError, invalid marshal
+        # bytes as ValueError, and a valid marshal payload with the wrong
+        # shape can surface as AttributeError or TypeError.  These are the
+        # bounded parser failures that must not invalidate other evidence.
+        except (AttributeError, EOFError, OSError, TypeError, ValueError):
+            invalid_profile_count += 1
             continue
         functions: list[dict[str, object]] = []
         for (_filename, line, name), (primitive_calls, total_calls, self_time, cumulative_time, _callers) in sorted(
@@ -489,17 +602,72 @@ def cpu_profile_summary(
         "cleaned_files": 0,
         "cleanup_ok": True,
         "retention": {
-            "mode": "caller_owned_armed_pid_bounded_summary",
+            "mode": "caller_owned_armed_identity_changed_bounded_summary",
             "max_profiles": 32,
             "available_profiles": len(all_profile_paths),
             "bound_profiles": len(bound_profile_paths),
             "summarized_profiles": len(profile_paths),
-            "ignored_unbound_profiles": max(0, len(all_profile_paths) - len(bound_profile_paths)),
+            "ignored_unbound_profiles": unbound_profile_count,
+            "ignored_stale_profiles": stale_profile_count,
+            "invalid_profiles": invalid_profile_count,
             "truncated_profiles": max(0, len(bound_profile_paths) - len(profile_paths)),
             "armed_pids": sorted(allowed_pids),
             "artifacts_preserved": True,
         },
     }
+
+
+def _signal_delivery_summary(
+    delivered: list[int],
+    reasons: Counter[str],
+    *,
+    requested: int,
+    availability_reason: str | None = None,
+) -> dict[str, object]:
+    """Expose only bounded signal outcome facts; identities stay private."""
+
+    bounded_requested = max(0, int(requested))
+    bounded_delivered = min(len(delivered), bounded_requested)
+    reasons = Counter(reasons)
+    bounded_rejected = sum(reasons.values())
+    rejection_capacity = max(0, bounded_requested - bounded_delivered)
+    if bounded_rejected > rejection_capacity:
+        # Keep the public accounting invariant even if a caller supplies
+        # duplicate or otherwise over-counted rejection reasons.
+        bounded_rejected = rejection_capacity
+        limited_reasons: Counter[str] = Counter()
+        remaining = rejection_capacity
+        for reason, count in sorted(reasons.items()):
+            kept = min(max(0, int(count)), remaining)
+            if kept:
+                limited_reasons[reason] = kept
+                remaining -= kept
+            if remaining == 0:
+                break
+        reasons = limited_reasons
+    # Every worker selected for a signal must be accounted for, even if a
+    # future caller introduces a new pre-delivery rejection path.
+    unaccounted = max(0, bounded_requested - bounded_delivered - bounded_rejected)
+    if unaccounted:
+        rejection_reason = (
+            availability_reason
+            if availability_reason == "uid_unavailable"
+            else "worker_missing"
+        )
+        reasons[rejection_reason] += unaccounted
+        bounded_rejected += unaccounted
+
+    summary: dict[str, object] = {
+        "requested_count": bounded_requested,
+        "delivered_count": bounded_delivered,
+        "rejected_count": bounded_rejected,
+        "rejection_reasons": dict(sorted(reasons.items())),
+        "pidfd_api_available": callable(getattr(os, "pidfd_open", None))
+        and callable(getattr(signal, "pidfd_send_signal", None)),
+    }
+    if availability_reason is not None and not unaccounted:
+        summary["availability_reason"] = availability_reason
+    return summary
 
 
 async def postgres_statement_snapshot() -> dict[str, object]:
@@ -938,15 +1106,19 @@ async def async_main() -> int:
     journal_since = started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
     started_monotonic = time.monotonic()
     await sampler.start()
+    profile_baseline = profile_artifact_snapshot(profile_dir) if profile_dir else None
     armed_worker_identities = api_worker_identities() if profile_dir else {}
-    profiled_workers = (
-        signal_api_workers(
+    candidate_worker_count = len(armed_worker_identities)
+    profiled_workers: list[int] = []
+    arm_reasons: Counter[str] = Counter()
+    arm_availability_reason: str | None = None
+    flush_reasons: Counter[str] = Counter()
+    flush_availability_reason: str | None = None
+    if profile_dir:
+        profiled_workers, arm_reasons, arm_availability_reason = _signal_api_workers_detailed(
             signal.SIGUSR1,
             armed_identities=armed_worker_identities,
         )
-        if profile_dir
-        else []
-    )
     armed_worker_identities = {
         pid: armed_worker_identities[pid]
         for pid in profiled_workers
@@ -961,14 +1133,12 @@ async def async_main() -> int:
             await asyncio.sleep(min(1.0, args.interval))
     finally:
         await sampler.stop()
-        flushed_workers = (
-            signal_api_workers(
+        flushed_workers: list[int] = []
+        if profile_dir:
+            flushed_workers, flush_reasons, flush_availability_reason = _signal_api_workers_detailed(
                 signal.SIGUSR2,
                 armed_identities=armed_worker_identities,
             )
-            if profile_dir
-            else []
-        )
     # Nginx buffers access records for up to five seconds. Let the final
     # records reach disk before taking the window's read-only snapshot.
     await asyncio.sleep(6)
@@ -1059,7 +1229,25 @@ async def async_main() -> int:
             timeout_diagnostic_ids=timeout_diagnostic_ids,
         ),
         "cpu_profile": {
-            **cpu_profile_summary(profile_dir, armed_pids=profiled_workers),
+            **cpu_profile_summary(
+                profile_dir,
+                armed_identities=armed_worker_identities,
+                baseline_artifacts=profile_baseline,
+            ),
+            "signal_delivery": {
+                "arm": _signal_delivery_summary(
+                    profiled_workers,
+                    arm_reasons,
+                    requested=candidate_worker_count,
+                    availability_reason=arm_availability_reason,
+                ),
+                "flush": _signal_delivery_summary(
+                    flushed_workers,
+                    flush_reasons,
+                    requested=len(armed_worker_identities),
+                    availability_reason=flush_availability_reason,
+                ),
+            },
             "armed_workers": profiled_workers,
             "flushed_workers": flushed_workers,
             "armed_worker_identities": [

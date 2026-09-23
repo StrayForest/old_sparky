@@ -516,7 +516,32 @@ class EvidencePrivacyTests(unittest.TestCase):
             "cpu_profile": {
                 "enabled": True,
                 "armed_worker_identities": [{"pid": 987654, "uid": 876543}],
-                "retention": {"available_profiles": 1},
+                "retention": {
+                    "available_profiles": 1,
+                    "ignored_stale_profiles": 2,
+                    "invalid_profiles": 1,
+                },
+                "signal_delivery": {
+                    "arm": {
+                        "requested_count": 4,
+                        "delivered_count": 1,
+                        "rejected_count": 3,
+                        "pidfd_api_available": False,
+                        "rejection_reasons": {
+                            "pidfd_unavailable": 1,
+                            "uid_unavailable": 1,
+                            "worker_missing": 1,
+                            "operator@example.test": 99,
+                        },
+                    },
+                    "flush": {
+                        "requested_count": 0,
+                        "delivered_count": 0,
+                        "rejected_count": 0,
+                        "pidfd_api_available": False,
+                        "availability_reason": "uid_unavailable",
+                    },
+                },
             },
             "postgres_stat_statements": {
                 "before": {
@@ -546,6 +571,19 @@ class EvidencePrivacyTests(unittest.TestCase):
         self.assertNotIn("binding", public_observer)
         self.assertNotIn("by_pid", public_observer["server_ssr_observability"]["event_loop"])
         self.assertNotIn("armed_worker_identities", public_observer["cpu_profile"])
+        self.assertEqual(public_observer["cpu_profile"]["ignored_stale_profiles"], 2)
+        self.assertEqual(
+            public_observer["cpu_profile"]["signal_delivery"]["arm"]["rejection_reasons"],
+            {
+                "pidfd_unavailable": 1,
+                "uid_unavailable": 1,
+                "worker_missing": 1,
+            },
+        )
+        self.assertEqual(
+            public_observer["cpu_profile"]["signal_delivery"]["flush"]["availability_reason"],
+            "uid_unavailable",
+        )
         self.assertEqual(public_observer["postgres_stat_statements"]["before"]["rows"][0]["queryid"], "42")
 
         timeout_source = {
