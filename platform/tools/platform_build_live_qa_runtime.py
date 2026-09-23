@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,67 @@ import shutil
 import stat
 import sys
 
-import platform_live_qa_guard as guard
+
+def _validate_import_directory(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+        canonical = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("live-QA runtime tool directory is unavailable") from exc
+    if (
+        canonical != path
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_mode & 0o7000
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (
+            os.geteuid() == 0
+            and (metadata.st_uid != 0 or metadata.st_gid != 0)
+        )
+    ):
+        raise RuntimeError("live-QA runtime tool directory metadata is unsafe")
+
+
+def _validate_import_file(path: Path, *, label: str) -> None:
+    try:
+        metadata = path.lstat()
+        canonical = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"{label} is unavailable") from exc
+    if (
+        canonical != path
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (
+            os.geteuid() == 0
+            and (metadata.st_uid != 0 or metadata.st_gid != 0)
+        )
+    ):
+        raise RuntimeError(f"{label} metadata is unsafe")
+
+
+def _load_staged_guard():
+    """Load the guard beside this staged builder without ambient imports."""
+
+    builder_path = Path(__file__).absolute()
+    _validate_import_file(builder_path, label="staged live-QA runtime builder")
+    tools_directory = builder_path.parent
+    _validate_import_directory(tools_directory)
+
+    guard_path = tools_directory / "platform_live_qa_guard.py"
+    _validate_import_file(guard_path, label="staged live-QA guard")
+    spec = importlib.util.spec_from_file_location("platform_live_qa_guard", guard_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("staged live-QA guard cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+guard = _load_staged_guard()
 
 
 RUNTIME_SOURCE_FILES = (

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -30,6 +31,86 @@ def workflow_job(source: str, name: str) -> str:
 
 
 class PlatformReleaseBuildContractTests(unittest.TestCase):
+    @staticmethod
+    def _copy_staged_live_qa_builder(root: Path) -> tuple[Path, Path]:
+        tools = root / "candidate" / "tools"
+        tools.mkdir(parents=True, mode=0o755)
+        for name in (
+            "platform_build_live_qa_runtime.py",
+            "platform_live_qa_guard.py",
+        ):
+            destination = tools / name
+            shutil.copyfile(TOOLS_DIR / name, destination)
+            os.chmod(destination, 0o644)
+        return (
+            tools / "platform_build_live_qa_runtime.py",
+            tools / "platform_live_qa_guard.py",
+        )
+
+    @staticmethod
+    def _run_staged_live_qa_help(builder: Path, root: Path) -> subprocess.CompletedProcess[str]:
+        decoy = root / "decoy"
+        decoy.mkdir(mode=0o755)
+        (decoy / "platform_live_qa_guard.py").write_text(
+            "raise RuntimeError('ambient guard loaded')\n",
+            encoding="utf-8",
+        )
+        environment = {
+            "HOME": str(root / "home"),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": str(decoy),
+        }
+        return subprocess.run(
+            ["/usr/bin/python3", "-I", str(builder), "--help"],
+            cwd=decoy,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_staged_live_qa_builder_import_is_hermetic(self) -> None:
+        build_script = BUILD_SCRIPT.read_text()
+        runtime_source = (TOOLS_DIR / "platform_build_live_qa_runtime.py").read_text()
+        self.assertIn(
+            '"$ROOT_DIR/.venv_platform/bin/python" -I \\\n'
+            '  "$STAGING_DIR/tools/platform_build_live_qa_runtime.py"',
+            build_script,
+        )
+        self.assertIn("importlib.util.spec_from_file_location", runtime_source)
+        self.assertNotIn("sys.path.insert", runtime_source)
+        self.assertNotIn("PYTHONPATH", runtime_source)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            builder, _guard = self._copy_staged_live_qa_builder(Path(temporary))
+            completed = self._run_staged_live_qa_help(builder, Path(temporary))
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--platform-root", completed.stdout)
+        self.assertNotIn("ambient guard loaded", completed.stderr)
+
+    def test_staged_live_qa_builder_rejects_unsafe_guard_metadata(self) -> None:
+        for mutation in ("symlink", "writable"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                builder, guard = self._copy_staged_live_qa_builder(Path(temporary))
+                if mutation == "symlink":
+                    decoy = Path(temporary) / "guard-decoy.py"
+                    decoy.write_text("# decoy\n", encoding="utf-8")
+                    guard.unlink()
+                    guard.symlink_to(decoy)
+                else:
+                    os.chmod(guard, 0o666)
+
+                completed = self._run_staged_live_qa_help(
+                    builder, Path(temporary)
+                )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("staged live-QA guard", completed.stderr)
+
     def test_systemd_install_prepares_current_release_runtime_before_restart(
         self,
     ) -> None:
