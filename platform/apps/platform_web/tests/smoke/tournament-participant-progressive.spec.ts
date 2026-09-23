@@ -203,7 +203,7 @@ test.afterAll(async () => {
   apiServer = null;
 });
 
-test("tournament detail skips participant roster payload and session refetch", async ({ page }) => {
+test("tournament detail hydrates without participant roster or initial session refetch", async ({ page }) => {
   const documentResponse = await page.goto(`/tournaments/${publicTournamentSlug}`);
   const serverHtml = await documentResponse?.text() ?? "";
   expect(
@@ -224,6 +224,49 @@ test("tournament detail skips participant roster payload and session refetch", a
   await expect(page.locator(".participants-value").first()).toHaveText("26 / 64");
   await expect.poll(() => participantRequests).toEqual([]);
   await expect.poll(() => usersMeRequests).toBe(0);
+  await expectNoHorizontalOverflow(page);
+});
+
+test("tournament detail refetches after the authenticated session changes", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-07-20T16:10:00Z") });
+  await page.context().addCookies([{
+    name: "deadlock_platform_session",
+    value: "lean-detail-session",
+    url: webBaseUrl
+  }, {
+    name: "lean-detail-smoke",
+    value: "1",
+    url: webBaseUrl
+  }]);
+
+  const expectedWorkspace = {
+    slug: readyTournamentSlug,
+    participantsLimit: 0,
+    participantsOffset: 0,
+    workspaceView: "detail",
+    includeCurrentUser: false
+  };
+  const response = await page.goto(`/tournaments/${readyTournamentSlug}`);
+  expect(response?.status()).toBe(200);
+  await expectWorkspaceRequest(expectedWorkspace);
+  await expect(page.getByRole("button", { name: "Подтвердить участие" })).toBeVisible();
+
+  let invalidatedVoteRequests = 0;
+  await page.route(
+    `**/api/v1/tournaments/${readyTournamentSlug}/deadlock/ready-check/vote`,
+    async (route) => {
+      invalidatedVoteRequests += 1;
+      await route.fulfill({
+        status: 401,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "Session is invalid." })
+      });
+    }
+  );
+  await page.getByRole("button", { name: "Подтвердить участие" }).click();
+
+  await expect.poll(() => workspaceRequests).toEqual([expectedWorkspace, expectedWorkspace]);
+  await expect.poll(() => invalidatedVoteRequests).toBe(1);
   await expectNoHorizontalOverflow(page);
 });
 
@@ -349,10 +392,6 @@ test("anonymous bearer keeps the exact code across detail, bracket navigation, a
     slug: privateBearerSlug,
     inviteCode: privateBearerCode,
     workspaceView: "detail"
-  }, {
-    slug: privateBearerSlug,
-    inviteCode: privateBearerCode,
-    workspaceView: "detail"
   }]);
 
   await bracketLink.click();
@@ -370,11 +409,6 @@ test("anonymous bearer keeps the exact code across detail, bracket navigation, a
     {
       slug: privateBearerSlug,
       inviteCode: privateBearerCode,
-      workspaceView: "detail"
-    },
-    {
-      slug: privateBearerSlug,
-      inviteCode: privateBearerCode,
       workspaceView: "bracket"
     }
   ]);
@@ -383,11 +417,6 @@ test("anonymous bearer keeps the exact code across detail, bracket navigation, a
   await expect(page).toHaveURL(`${webBaseUrl}${bracketPath}`);
   await expect(page.getByTestId("bracket-match")).toHaveCount(1);
   expect(bearerWorkspaceRequests).toEqual([
-    {
-      slug: privateBearerSlug,
-      inviteCode: privateBearerCode,
-      workspaceView: "detail"
-    },
     {
       slug: privateBearerSlug,
       inviteCode: privateBearerCode,

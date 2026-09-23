@@ -14,6 +14,7 @@ import type { TournamentDetail } from "@/lib/types";
 type TournamentDetailClientPageProps = {
   slug: string;
   inviteCode?: string;
+  initialTournament?: TournamentDetail;
 };
 
 type DetailState =
@@ -25,17 +26,40 @@ type DetailState =
 
 export function TournamentDetailClientPage({
   slug,
-  inviteCode
+  inviteCode,
+  initialTournament
 }: TournamentDetailClientPageProps) {
   const { status: authStatus, user } = useAuth();
   const { t } = useI18n();
-  const [state, setState] = useState<DetailState>({ status: "loading" });
+  const sessionIdentity = `${authStatus}:${user?.id ?? "anonymous"}`;
+  const initialRequestRef = useRef(
+    initialTournament
+      ? {
+          slug,
+          inviteCode: inviteCode ?? null,
+          sessionIdentity
+        }
+      : null
+  );
+  const [state, setState] = useState<DetailState>(() => initialTournament
+    ? { status: "ready", tournament: initialTournament }
+    : { status: "loading" });
   const [retryGeneration, setRetryGeneration] = useState(0);
   const requestGeneration = useRef(0);
   const actorUserId = authStatus === "authenticated" ? user?.id ?? null : null;
-  const sessionIdentity = `${authStatus}:${actorUserId ?? "anonymous"}`;
 
   useEffect(() => {
+    const initialRequest = initialRequestRef.current;
+    if (
+      initialRequest
+      && retryGeneration === 0
+      && initialRequest.slug === slug
+      && initialRequest.inviteCode === (inviteCode ?? null)
+      && initialRequest.sessionIdentity === sessionIdentity
+    ) {
+      return;
+    }
+    initialRequestRef.current = null;
     const controller = new AbortController();
     const generation = ++requestGeneration.current;
     const requestSlug = slug;

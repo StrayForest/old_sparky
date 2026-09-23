@@ -13,7 +13,11 @@ test("invite-only pages convert missing workspace proof into invite-code flow", 
   const bracketBoard = source("components/bracket/bracket-board.tsx");
 
   expect(detailPage).toContain("TournamentDetailClientPage");
+  expect(detailPage).toContain("initialTournament={initialTournament}");
   expect(detailClientPage).toContain("PlatformApiError");
+  expect(detailClientPage).toContain("initialTournament?: TournamentDetail");
+  expect(detailClientPage).toContain("initialRequestRef");
+  expect(detailClientPage).toContain("retryGeneration === 0");
   expect(detailClientPage).toContain("error.status === 401");
   expect(detailClientPage).toContain("TournamentInviteGate");
   expect(bracketPage).toContain("PlatformApiError");
