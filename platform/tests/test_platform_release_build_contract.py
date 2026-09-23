@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -10,7 +12,9 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import stat
 import unittest
+import zipfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -109,7 +113,343 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 )
 
             self.assertNotEqual(completed.returncode, 0)
-            self.assertIn("staged live-QA guard", completed.stderr)
+            diagnostic = json.loads(completed.stderr)
+            self.assertEqual(diagnostic["phase"], "validate-input")
+            self.assertEqual(diagnostic["reason"], "invalid-input")
+            self.assertEqual(diagnostic["cleanup"], "not-needed")
+            self.assertNotIn("Traceback", completed.stderr)
+
+    @staticmethod
+    def _write_fixture_file(path: Path, payload: bytes, *, mode: int = 0o644) -> None:
+        path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        os.chown(path, 0, 0)
+        os.chmod(path, mode)
+
+    @staticmethod
+    def _write_fixture_zip(
+        path: Path,
+        entries: list[tuple[str, bytes, str]],
+    ) -> None:
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name, payload, kind in entries:
+                if kind == "directory":
+                    info = zipfile.ZipInfo(name.rstrip("/") + "/")
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFDIR | 0o755) << 16
+                    archive.writestr(info, b"")
+                elif kind == "symlink":
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    archive.writestr(info, payload)
+                elif kind == "special":
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFIFO | 0o644) << 16
+                    archive.writestr(info, payload)
+                else:
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFREG | 0o644) << 16
+                    archive.writestr(info, payload)
+        os.chown(path, 0, 0)
+        os.chmod(path, 0o644)
+
+    @classmethod
+    def _prepare_local_runtime_fixture(
+        cls,
+        root: Path,
+        *,
+        webkit_entries: list[tuple[str, bytes, str]] | None = None,
+    ) -> tuple[Path, Path, Path, Path, bytes]:
+        builder, guard = cls._copy_staged_live_qa_builder(root)
+        platform_root = root / "platform"
+        web = platform_root / "apps/platform_web"
+        web.mkdir(mode=0o755, parents=True)
+        node_home = root / "node"
+        (node_home / "bin").mkdir(mode=0o755, parents=True)
+        cls._write_fixture_file(node_home / "bin/node", b"#!/bin/sh\n", mode=0o755)
+        for relative in (
+            "playwright.live.config.ts",
+            "tests/smoke/live-user-journey.spec.ts",
+            "tests/support/live-qa-origin.ts",
+            "tests/support/live-qa-sandbox.ts",
+            "package-lock.json",
+        ):
+            cls._write_fixture_file(web / relative, relative.encode("ascii"))
+        for package in ("@playwright/test", "playwright", "playwright-core"):
+            cls._write_fixture_file(
+                web / "node_modules" / package / "package.json",
+                ("{\"name\":%r}\n" % package).encode("ascii"),
+            )
+
+        sandbox = b"small pinned sandbox fixture\n"
+        archive_entries = {
+            "chromium-1228": [
+                ("chrome-linux64/chrome_sandbox", sandbox, "file"),
+                ("chrome-linux64/chrome", b"chromium\n", "file"),
+            ],
+            "chromium_headless_shell-1228": [("chrome-headless-shell", b"headless\n", "file")],
+            "webkit-2311": webkit_entries
+            or [
+                ("lib/real", b"webkit\n", "file"),
+                ("lib/alias", b"real", "symlink"),
+                ("lib/chain", b"alias", "symlink"),
+            ],
+            "ffmpeg-1011": [("ffmpeg", b"ffmpeg\n", "file")],
+        }
+        archives: list[tuple[str, str, str, int]] = []
+        for name, entries in archive_entries.items():
+            archive = root / f"{name}.zip"
+            cls._write_fixture_zip(archive, entries)
+            archives.append(
+                (
+                    name,
+                    archive.as_uri(),
+                    hashlib.sha256(archive.read_bytes()).hexdigest(),
+                    archive.stat().st_size,
+                )
+            )
+
+        guard_source = guard.read_text(encoding="utf-8")
+        archives_start = guard_source.index("PLAYWRIGHT_ARCHIVES = (")
+        archives_end = guard_source.index(
+            "\n)\nCHROMIUM_SANDBOX_RELATIVE", archives_start
+        ) + 2
+        archive_literal = "PLAYWRIGHT_ARCHIVES = (\n" + "".join(
+            f"    {row!r},\n" for row in archives
+        ) + ")"
+        guard_source = (
+            guard_source[:archives_start]
+            + archive_literal
+            + guard_source[archives_end:]
+        )
+        sandbox_start = guard_source.index("CHROMIUM_SANDBOX_RELATIVE =")
+        sandbox_end = guard_source.index("\nSTATE_NAME_PATTERN", sandbox_start)
+        sandbox_literal = (
+            "CHROMIUM_SANDBOX_RELATIVE = Path("
+            "'browsers/chromium-1228/chrome-linux64/chrome_sandbox')\n"
+            f"CHROMIUM_SANDBOX_SIZE = {len(sandbox)}\n"
+            f"CHROMIUM_SANDBOX_SHA256 = {hashlib.sha256(sandbox).hexdigest()!r}\n"
+        )
+        guard_source = guard_source[:sandbox_start] + sandbox_literal + guard_source[sandbox_end:]
+        guard.write_text(guard_source, encoding="utf-8")
+        os.chown(guard, 0, 0)
+        os.chmod(guard, 0o644)
+        # The installer validates the source member name as well as its tree;
+        # use the canonical staged directory name so this is a real
+        # downstream-contract check rather than a fixture-only tree walk.
+        output = root / "liveqa-runtime"
+        return builder, platform_root, node_home, output, sandbox
+
+    @staticmethod
+    def _run_staged_live_qa_build(
+        builder: Path,
+        platform_root: Path,
+        node_home: Path,
+        output: Path,
+        root: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        decoy = root / "build-decoy"
+        decoy.mkdir(mode=0o755)
+        (decoy / "platform_live_qa_guard.py").write_text(
+            "raise RuntimeError('ambient guard loaded')\n",
+            encoding="utf-8",
+        )
+        environment = {
+            "HOME": str(root / "home"),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": str(decoy),
+        }
+        return subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(builder),
+                "--platform-root",
+                str(platform_root),
+                "--node-home",
+                str(node_home),
+                "--output",
+                str(output),
+            ],
+            cwd=decoy,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def test_staged_live_qa_build_materializes_validated_browser_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builder, platform_root, node_home, output, sandbox = (
+                self._prepare_local_runtime_fixture(root)
+            )
+            completed = self._run_staged_live_qa_build(
+                builder, platform_root, node_home, output, root
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            diagnostic = json.loads(completed.stdout)
+            self.assertEqual(
+                set(diagnostic),
+                {"schema", "phase", "status", "reason", "cleanup", "tree_sha256"},
+            )
+            self.assertEqual(diagnostic["phase"], "complete")
+            self.assertEqual(diagnostic["status"], "passed")
+            self.assertEqual(diagnostic["reason"], "ok")
+            self.assertEqual(diagnostic["cleanup"], "not-needed")
+            manifest = json.loads((output / "runtime-manifest.json").read_text())
+            self.assertEqual(manifest["tree_sha256"], diagnostic["tree_sha256"])
+            self.assertEqual(
+                (output / "browsers/webkit-2311/lib/alias").read_bytes(),
+                b"webkit\n",
+            )
+            self.assertEqual(
+                (output / "browsers/webkit-2311/lib/chain").read_bytes(),
+                b"webkit\n",
+            )
+            self.assertFalse(any(path.is_symlink() for path in output.rglob("*")))
+            self.assertEqual(
+                stat.S_IMODE((output / "browsers/chromium-1228/chrome-linux64/chrome_sandbox").stat().st_mode),
+                0o4755,
+            )
+            self.assertEqual(
+                hashlib.sha256(
+                    (output / "browsers/chromium-1228/chrome-linux64/chrome_sandbox").read_bytes()
+                ).digest(),
+                hashlib.sha256(sandbox).digest(),
+            )
+            for path in output.rglob("*"):
+                metadata = path.lstat()
+                if stat.S_ISREG(metadata.st_mode):
+                    self.assertEqual(metadata.st_nlink, 1, path)
+                    if path.name != "chrome_sandbox":
+                        self.assertIn(stat.S_IMODE(metadata.st_mode), {0o444, 0o555})
+                else:
+                    self.assertTrue(stat.S_ISDIR(metadata.st_mode), path)
+
+            installer_path = TOOLS_DIR / "platform_live_qa_runtime_install.py"
+            spec = importlib.util.spec_from_file_location("fixture_runtime_install", installer_path)
+            self.assertIsNotNone(spec)
+            assert spec is not None and spec.loader is not None
+            installer = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(installer)
+            installer.CHROMIUM_SANDBOX_SIZE = len(sandbox)
+            installer.CHROMIUM_SANDBOX_SHA256 = hashlib.sha256(sandbox).hexdigest()
+            installer._validate_runtime_source(output)
+
+    def test_staged_live_qa_build_fails_closed_for_browser_link_inputs(self) -> None:
+        negative_cases = {
+            "absolute": [("alias", b"/real", "symlink")],
+            "nul": [("alias", b"real\x00tail", "symlink")],
+            "backslash": [("alias", b"..\\real", "symlink")],
+            "escape": [("alias", b"../outside", "symlink")],
+            "dangling": [("alias", b"missing", "symlink")],
+            "cycle": [
+                ("a", b"b", "symlink"),
+                ("b", b"a", "symlink"),
+            ],
+            "chain-nonregular": [
+                ("target", b"", "directory"),
+                ("alias", b"target", "symlink"),
+            ],
+            "special": [
+                ("fifo", b"", "special"),
+            ],
+        }
+        for case, entries in negative_cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                builder, platform_root, node_home, output, _sandbox = (
+                    self._prepare_local_runtime_fixture(root, webkit_entries=entries)
+                )
+                completed = self._run_staged_live_qa_build(
+                    builder, platform_root, node_home, output, root
+                )
+                self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                diagnostic = json.loads(completed.stderr)
+                self.assertEqual(
+                    set(diagnostic),
+                    {"schema", "phase", "status", "reason", "cleanup"},
+                )
+                self.assertEqual(diagnostic["status"], "failed")
+                self.assertEqual(diagnostic["cleanup"], "passed")
+                self.assertNotIn(str(root), completed.stderr)
+                self.assertNotIn("file://", completed.stderr)
+                self.assertNotIn("Traceback", completed.stderr)
+                self.assertFalse(output.exists())
+
+    def test_browser_materializer_rejects_filesystem_metadata_and_specials(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builder, _platform_root, _node_home, _output, _sandbox = (
+                self._prepare_local_runtime_fixture(root)
+            )
+            spec = importlib.util.spec_from_file_location("fixture_runtime_builder", builder)
+            self.assertIsNotNone(spec)
+            assert spec is not None and spec.loader is not None
+            runtime_builder = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(runtime_builder)
+
+            def reset() -> Path:
+                browser = root / "manual-browser"
+                if browser.exists():
+                    shutil.rmtree(browser)
+                browser.mkdir(mode=0o755)
+                return browser
+
+            cases = {
+                "hardlink": lambda browser: (
+                    (browser / "target").write_bytes(b"x"),
+                    os.link(browser / "target", browser / "hard-target"),
+                    (browser / "alias").symlink_to("hard-target"),
+                ),
+                "setid": lambda browser: (
+                    (browser / "target").write_bytes(b"x"),
+                    os.chmod(browser / "target", 0o4644),
+                    (browser / "alias").symlink_to("target"),
+                ),
+                "mode": lambda browser: (
+                    (browser / "target").write_bytes(b"x"),
+                    os.chmod(browser / "target", 0o664),
+                    (browser / "alias").symlink_to("target"),
+                ),
+                "ownership": lambda browser: (
+                    (browser / "target").write_bytes(b"x"),
+                    os.chown(browser / "target", 65534, 65534),
+                    (browser / "alias").symlink_to("target"),
+                ),
+                "symlink-hardlink": lambda browser: (
+                    (browser / "target").write_bytes(b"x"),
+                    (browser / "alias").symlink_to("target"),
+                    os.link(browser / "alias", browser / "alias-hardlink", follow_symlinks=False),
+                ),
+                "symlink-ownership": lambda browser: (
+                    (browser / "target").write_bytes(b"x"),
+                    (browser / "alias").symlink_to("target"),
+                    os.chown(browser / "alias", 65534, 65534, follow_symlinks=False),
+                ),
+            }
+
+            for reason, setup in cases.items():
+                with self.subTest(reason=reason):
+                    browser = reset()
+                    setup(browser)
+                    with self.assertRaises(RuntimeError) as raised:
+                        runtime_builder._materialize_browser_tree(browser, total_before=0)
+                    self.assertEqual(raised.exception.reason, {
+                        "hardlink": "link-hardlink",
+                        "setid": "link-mode",
+                        "mode": "link-mode",
+                        "ownership": "link-ownership",
+                        "symlink-hardlink": "link-hardlink",
+                        "symlink-ownership": "link-ownership",
+                    }[reason])
 
     def test_systemd_install_prepares_current_release_runtime_before_restart(
         self,
@@ -499,6 +839,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertIn(f"platform_verify.py {gate_id}", workflow)
         self.assertIn("DOCS_RESULT", workflow)
         self.assertIn('github.event_name == \'workflow_dispatch\'', workflow)
+        self.assertIn("runtime_sensitive", workflow)
+        self.assertIn("platform_verify.py release-runtime", workflow)
 
     def test_server_diagnostics_have_github_dispatch_contours(self) -> None:
         for workflow_name in (

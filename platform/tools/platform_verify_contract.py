@@ -1360,8 +1360,13 @@ def collect_issues() -> list[str]:
 
     if any(not GATES_BY_ID[gate_id].deterministic for gate_id in DETERMINISTIC_GATE_IDS):
         issues.append("deterministic registry contains a production-only gate")
-    if set(CI_GATE_IDS) != set(DETERMINISTIC_GATE_IDS):
-        issues.append("CI gate list must equal the deterministic registry gates")
+    conditional = {
+        gate_id for gate_id in DETERMINISTIC_GATE_IDS if GATES_BY_ID[gate_id].conditional
+    }
+    if set(CI_GATE_IDS) != set(DETERMINISTIC_GATE_IDS) - conditional:
+        issues.append(
+            "CI gate list must equal deterministic registry gates minus conditional gates"
+        )
 
     try:
         profiles = load_profiles()

@@ -13,6 +13,7 @@ from tools.platform_ci_classifier import (
     DOCS_ONLY_GATE_IDS,
     FULL_GATE_IDS,
     OUT_OF_SCOPE_GATE_IDS,
+    RUNTIME_SENSITIVE_FILES,
     ClassifierError,
     SECURITY_WORKFLOW_NAME,
     SECURITY_WORKFLOW_PATH,
@@ -67,6 +68,31 @@ class PlatformCiClassifierTests(unittest.TestCase):
             expected_target_sha=self.TARGET_SHA,
             require_deployable=True,
         )
+
+    def test_release_runtime_sensitivity_is_exact_and_digest_bound(self) -> None:
+        runtime_path = "platform/tools/platform_build_live_qa_runtime.py"
+        self.assertIn(runtime_path, RUNTIME_SENSITIVE_FILES)
+        runtime = classify(
+            [runtime_path],
+            event="pull_request",
+            target_sha=self.TARGET_SHA,
+        )
+        self.assertTrue(runtime["runtime_sensitive"])
+        validate_manifest(runtime, expected_target_sha=self.TARGET_SHA)
+
+        ordinary = classify(
+            ["platform/apps/platform_web/package.json"],
+            event="pull_request",
+            target_sha=self.TARGET_SHA,
+        )
+        self.assertFalse(ordinary["runtime_sensitive"])
+        validate_manifest(ordinary, expected_target_sha=self.TARGET_SHA)
+
+        tampered = dict(runtime)
+        tampered["runtime_sensitive"] = False
+        tampered["digest"] = manifest_digest(tampered)
+        with self.assertRaises(ClassifierError):
+            validate_manifest(tampered)
 
     def test_out_of_scope_change_is_contract_only_and_never_deployable(self) -> None:
         manifest = classify(
@@ -149,6 +175,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("if: ${{ always() }}", workflow)
         self.assertIn("platform-security-build", workflow)
         self.assertIn("expected_gates", workflow)
+        self.assertIn("runtime_sensitive: ${{ steps.classify.outputs.runtime_sensitive }}", workflow)
+        self.assertIn("release-runtime", workflow)
 
     def test_deploy_consumers_validate_the_exact_classifier_artifact(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")

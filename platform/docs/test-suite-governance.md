@@ -22,13 +22,21 @@ placement rules; it does not repeat tool arguments.
 | `web-quality` | web owners | Node 26.3.1 and locked dependencies | local feedback + CI |
 | `web-hermetic` | web owners | local/mocked API and Chromium | local feedback + CI |
 | `verification-contract` | platform tooling owners | repository checkout | CI |
+| `release-runtime` | release owners | root test user; disposable staged checkout and local ZIP fixtures | conditional runtime-sensitive PR/CI route |
 | `server-smoke` | release owners | exact deployed SHA | deployment workflow |
 | `live-public` | production operators | canonical public origin and dedicated QA identity | explicit/release workflow |
 | `live-user-destructive` | production operators | marked production fixtures and mandatory cleanup | explicit operator workflow |
 | `external-load` | performance operators | external generator to production origin | explicit operator workflow |
 
-The first eight gates are deterministic. `platform_verify.py ci` can execute
-only those gates and never connects to production, creates production
+The first eight gates are deterministic and always part of the normal CI
+aggregate. The conditional `release-runtime` gate is deterministic as well,
+but is intentionally excluded from `platform_verify.py ci`: the classifier
+enables it only when the exact release/runtime-sensitive path set changes.
+The gate builds the staged runtime with local small pinned-fixture ZIPs under
+`python -I`, verifies link materialization, manifest/tree/mode invariants and
+downstream install validation, and has no production network, credentials or
+deployment authority. `platform_verify.py ci` can execute only the always-on
+deterministic gates and never connects to production, creates production
 fixtures, opens a production browser or starts a load generator. The latter
 four remain discoverable governance groups but are workflow-only.
 

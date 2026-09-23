@@ -26,6 +26,7 @@ jobs:
       event: ${{ steps.classify.outputs.event }}
       deployable: ${{ steps.classify.outputs.deployable }}
       fallback: ${{ steps.classify.outputs.fallback }}
+      runtime_sensitive: ${{ steps.classify.outputs.runtime_sensitive }}
       expected_gates: ${{ steps.classify.outputs.expected_gates }}
       target_sha: ${{ steps.classify.outputs.target_sha }}
       digest: ${{ steps.classify.outputs.digest }}
@@ -605,11 +606,46 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  release-runtime:
+    name: Conditional release runtime fixture
+    needs: classifier
+    if: ${{ needs.classifier.outputs.runtime_sensitive == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PLATFORM_ENVIRONMENT: test
+      PLATFORM_DATABASE_URL: postgresql+asyncpg://platform_user:platform_password@127.0.0.1:5432/platformdb_test
+      PLATFORM_DB_SCHEMA: platform
+      PLATFORM_SECRET_KEY: ci-only-release-runtime-test-secret
+      PLATFORM_REDIS_URL: redis://127.0.0.1:6379/15
+      PLATFORM_CELERY_BROKER_URL: redis://127.0.0.1:6379/13
+      PLATFORM_CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/14
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: platform/requirements-ci.lock.txt
+      - name: Install canonical hash-locked Python CI environment
+        run: platform/tools/platform_install_ci_python.sh
+      - name: Provision fixed root-owned global verification lock
+        run: |
+          set -euo pipefail
+          sudo -n "$GITHUB_WORKSPACE/platform/.venv_platform/bin/python" \
+            "$GITHUB_WORKSPACE/platform/tools/platform_verification_lock.py" --provision
+      - name: Run conditional canonical release runtime gate
+        run: >-
+          sudo -EH env XDG_RUNTIME_DIR= bash -lc "cd '$GITHUB_WORKSPACE/platform' &&
+          .venv_platform/bin/python tools/platform_verify.py release-runtime"
+
   status-final:
     if: ${{ always() }}
     permissions:
       statuses: write
-    needs: [classifier, status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract]
+    needs: [classifier, status-start, backend, python-quality, security, web-quality, web-hermetic, docs, migration, verification-contract, release-runtime]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -624,6 +660,7 @@ jobs:
           ROUTE_EVENT: ${{ needs.classifier.outputs.event }}
           ROUTE_DEPLOYABLE: ${{ needs.classifier.outputs.deployable }}
           ROUTE_FALLBACK: ${{ needs.classifier.outputs.fallback }}
+          ROUTE_RUNTIME_SENSITIVE: ${{ needs.classifier.outputs.runtime_sensitive }}
           ROUTE_TARGET_SHA: ${{ needs.classifier.outputs.target_sha }}
           ROUTE_DIGEST: ${{ needs.classifier.outputs.digest }}
           ROUTE_REASON: ${{ needs.classifier.outputs.reason }}
@@ -637,6 +674,7 @@ jobs:
           DOCS_RESULT: ${{ needs.docs.result }}
           MIGRATION_RESULT: ${{ needs.migration.result }}
           VERIFICATION_CONTRACT_RESULT: ${{ needs['verification-contract'].result }}
+          RELEASE_RUNTIME_RESULT: ${{ needs['release-runtime'].result }}
         run: |
           set -euo pipefail
           export SUMMARY_PATH="$GITHUB_WORKSPACE/platform-security-summary.json"
@@ -658,6 +696,7 @@ jobs:
           route_class = os.environ.get("ROUTE_CLASS", "")
           route_event = os.environ.get("ROUTE_EVENT", "")
           event_name = os.environ.get("EVENT_NAME", "")
+          runtime_sensitive = os.environ.get("ROUTE_RUNTIME_SENSITIVE") == "true"
           route_errors = []
           try:
               expected = json.loads(os.environ.get("EXPECTED_GATES") or "null")
@@ -702,6 +741,11 @@ jobs:
           missing_or_failed = [
               gate for gate in expected if results.get(gate) != "success"
           ] if isinstance(expected, list) else ["classifier expected gates are malformed"]
+          release_runtime_result = os.environ.get("RELEASE_RUNTIME_RESULT", "missing")
+          if runtime_sensitive and release_runtime_result != "success":
+              missing_or_failed.append("release-runtime")
+          if not runtime_sensitive and release_runtime_result not in {"skipped", "missing"}:
+              route_errors.append("release-runtime ran for a non-sensitive route")
           passed = (
               os.environ.get("CLASSIFIER_RESULT") == "success"
               and not route_errors
@@ -719,6 +763,10 @@ jobs:
               "manifest_digest": os.environ.get("ROUTE_DIGEST", ""),
               "expected_gates": expected,
               "gate_results": results,
+              "conditional_gate_results": {
+                  "release-runtime": release_runtime_result,
+              },
+              "runtime_sensitive": runtime_sensitive,
               "missing_or_failed": missing_or_failed,
               "route_errors": route_errors,
               "status_start_result": os.environ.get("STATUS_START_RESULT", "missing"),

@@ -56,6 +56,25 @@ DOCS_ONLY_GATE_IDS: tuple[str, ...] = ("docs", "verification-contract")
 OUT_OF_SCOPE_GATE_IDS: tuple[str, ...] = ("verification-contract",)
 KNOWN_EVENTS = frozenset({"pull_request", "push", "merge_group", "workflow_dispatch"})
 
+# Runtime-sensitive changes retain the normal full route, but also enable the
+# root-owned release-runtime fixture gate in the verification job.  Keeping
+# this list exact prevents a docs or ordinary application change from paying
+# for the privileged builder regression while ensuring the builder, guard,
+# install/validator contracts and their hermetic test cannot bypass it.
+RUNTIME_SENSITIVE_FILES = frozenset(
+    {
+        "platform/tools/platform_build_live_qa_runtime.py",
+        "platform/tools/platform_build_release.sh",
+        "platform/tools/platform_live_qa_guard.py",
+        "platform/tools/platform_live_qa_runtime_install.py",
+        "platform/tools/platform_validate_release_artifact.py",
+        "platform/tests/test_platform_release_build_contract.py",
+        "platform/tests/test_platform_live_qa_guard.py",
+        "platform/tests/test_platform_live_qa_runtime_install.py",
+        "platform/tests/test_platform_validate_release_artifact.py",
+    }
+)
+
 # These paths are intentionally narrow.  The repository guide declares these
 # trees outside the active platform, so they receive a repository-contract
 # check but can never authorize a production release.
@@ -86,6 +105,7 @@ _DIGEST_FIELDS = (
     "event",
     "class",
     "expected_gates",
+    "runtime_sensitive",
     "deployable",
     "fallback",
     "reason",
@@ -240,6 +260,7 @@ def _build_manifest(
     reason: str,
     route_class: str,
     expected_gates: Sequence[str],
+    runtime_sensitive: bool = False,
 ) -> dict[str, object]:
     reason = _single_line_output(reason, field="reason")
     deployable = (
@@ -256,6 +277,7 @@ def _build_manifest(
         "event": event,
         "class": route_class,
         "expected_gates": list(expected_gates),
+        "runtime_sensitive": runtime_sensitive,
         "deployable": deployable,
         "fallback": fallback,
         "reason": reason,
@@ -283,6 +305,7 @@ def classify(
 
     raw_files = list(files)
     normalised, malformed_reason = _normalise_files(raw_files)
+    runtime_sensitive = any(path in RUNTIME_SENSITIVE_FILES for path in normalised)
     target_sha = target_sha.lower() if isinstance(target_sha, str) else ""
     event = event if isinstance(event, str) else ""
     branch = branch if isinstance(branch, str) else ""
@@ -297,6 +320,7 @@ def classify(
             reason=fallback_reason or "repository state is shallow or unavailable",
             route_class="full",
             expected_gates=FULL_GATE_IDS,
+            runtime_sensitive=runtime_sensitive,
         )
     if event not in KNOWN_EVENTS:
         return _build_manifest(
@@ -308,6 +332,7 @@ def classify(
             reason="event is missing or unknown",
             route_class="full",
             expected_gates=FULL_GATE_IDS,
+            runtime_sensitive=runtime_sensitive,
         )
     if event == "merge_group":
         return _build_manifest(
@@ -319,6 +344,7 @@ def classify(
             reason="merge_group requires full CI and has no deployment authority",
             route_class="full",
             expected_gates=FULL_GATE_IDS,
+            runtime_sensitive=runtime_sensitive,
         )
     if malformed_reason:
         return _build_manifest(
@@ -330,6 +356,7 @@ def classify(
             reason=malformed_reason,
             route_class="full",
             expected_gates=FULL_GATE_IDS,
+            runtime_sensitive=runtime_sensitive,
         )
     if not SHA_RE.fullmatch(target_sha):
         return _build_manifest(
@@ -341,6 +368,7 @@ def classify(
             reason="target SHA is missing or malformed",
             route_class="full",
             expected_gates=FULL_GATE_IDS,
+            runtime_sensitive=runtime_sensitive,
         )
     if not normalised:
         return _build_manifest(
@@ -352,6 +380,7 @@ def classify(
             reason="changed-file list is missing",
             route_class="full",
             expected_gates=FULL_GATE_IDS,
+            runtime_sensitive=runtime_sensitive,
         )
 
     route_class, expected_gates, reason, fallback = _route_for_files(normalised)
@@ -364,6 +393,7 @@ def classify(
         reason=reason,
         route_class=route_class,
         expected_gates=expected_gates,
+        runtime_sensitive=runtime_sensitive,
     )
 
 
@@ -391,6 +421,9 @@ def validate_manifest(
         raise ClassifierError("classifier manifest class is invalid")
     if tuple(manifest.get("expected_gates", ())) != expected_by_class[route_class]:
         raise ClassifierError("classifier expected gates do not match its class")
+    runtime_sensitive = manifest.get("runtime_sensitive")
+    if not isinstance(runtime_sensitive, bool):
+        raise ClassifierError("classifier runtime_sensitive must be boolean")
     target_sha = manifest.get("target_sha")
     if not isinstance(target_sha, str):
         raise ClassifierError("classifier target_sha must be a string")
@@ -410,6 +443,8 @@ def validate_manifest(
     files = manifest.get("files")
     if not isinstance(files, list) or any(not isinstance(path, str) for path in files):
         raise ClassifierError("classifier files must be a list of strings")
+    if runtime_sensitive != any(path in RUNTIME_SENSITIVE_FILES for path in files):
+        raise ClassifierError("classifier runtime_sensitive does not match its files")
     digest = manifest.get("digest")
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ClassifierError("classifier digest is malformed")
@@ -510,6 +545,7 @@ def _write_github_output(path: Path, manifest: Mapping[str, object]) -> None:
         "target_sha": manifest["target_sha"],
         "digest": manifest["digest"],
         "reason": manifest["reason"],
+        "runtime_sensitive": str(manifest["runtime_sensitive"]).lower(),
     }
     with path.open("a", encoding="utf-8") as output:
         for key, value in values.items():

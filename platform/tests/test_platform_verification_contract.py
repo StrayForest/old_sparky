@@ -708,12 +708,12 @@ except lock.VerificationLockError as exc:
         workflow = (
             Path(__file__).resolve().parents[2] / ".github/workflows/platform-security.yml"
         ).read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("name: Provision fixed root-owned global verification lock"), 3)
-        self.assertEqual(workflow.count("platform/tools/platform_verification_lock.py\" --provision"), 3)
+        self.assertEqual(workflow.count("name: Provision fixed root-owned global verification lock"), 4)
+        self.assertEqual(workflow.count("platform/tools/platform_verification_lock.py\" --provision"), 4)
         self.assertNotIn("RUNNER_TEMP/platform-verification-runtime", workflow)
         self.assertNotIn("PLATFORM_VERIFICATION_RUNTIME_DIR", workflow)
         self.assertNotIn("sudo install -d", workflow)
-        self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 3)
+        self.assertEqual(workflow.count("sudo -EH env XDG_RUNTIME_DIR= bash -lc"), 4)
         verification_block = re.search(
             r"^  verification-contract:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
             workflow,
@@ -724,9 +724,16 @@ except lock.VerificationLockError as exc:
         self.assertNotIn("Provision fixed root-owned global verification lock", verification_block.group("body"))
 
     def test_registry_exposes_deterministic_and_workflow_only_contours(self) -> None:
-        self.assertEqual(set(CI_GATE_IDS), set(DETERMINISTIC_GATE_IDS))
+        conditional = {
+            gate_id
+            for gate_id in DETERMINISTIC_GATE_IDS
+            if GATES_BY_ID[gate_id].conditional
+        }
+        self.assertEqual(set(CI_GATE_IDS), set(DETERMINISTIC_GATE_IDS) - conditional)
         self.assertIn("backend", CI_GATE_IDS)
         self.assertIn("verification-contract", CI_GATE_IDS)
+        self.assertTrue(GATES_BY_ID["release-runtime"].conditional)
+        self.assertFalse(GATES_BY_ID["release-runtime"].ci_required)
         self.assertFalse(GATES_BY_ID["external-load"].deterministic)
         self.assertFalse(GATES_BY_ID["external-load"].local_safe)
         self.assertEqual(registry_payload()["ci_gate_ids"], list(CI_GATE_IDS))
