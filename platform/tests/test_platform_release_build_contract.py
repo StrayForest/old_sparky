@@ -112,12 +112,22 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             self.assertIn(field, workflow)
         self.assertIn('run.get("run_attempt") != int(expected_attempt)', workflow)
         self.assertIn(
-            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status"',
+            '"${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=${page}"',
             workflow,
         )
-        self.assertIn('item.get("context") == "platform-security-build"', workflow)
-        self.assertIn('latest.get("state") != "success"', workflow)
-        self.assertIn('latest.get("target_url") != attempt_url', workflow)
+        self.assertIn("fetch_statuses", workflow)
+        self.assertIn("paginated status response is malformed", workflow)
+        self.assertIn("status pagination exceeded its bound", workflow)
+        self.assertIn('local pages_dir="$output_path.pages"', workflow)
+        self.assertIn('fetch_snapshot "$provenance_dir/$snapshot"', workflow)
+        self.assertIn('rm -rf -- "$pages_dir"', workflow)
+        self.assertNotIn(
+            'local pages_dir="$provenance_dir/pages-$(basename "$output_path")"',
+            workflow,
+        )
+        self.assertNotIn('item.get("context") == "platform-security-build"', workflow)
+        self.assertNotIn('latest.get("state") != "success"', workflow)
+        self.assertNotIn('latest.get("target_url") != attempt_url', workflow)
         self.assertLess(
             workflow.index("Require successful platform security build"),
             workflow.index("Mark production deployment pending"),

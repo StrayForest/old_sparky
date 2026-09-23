@@ -23,6 +23,7 @@ from tools.platform_ci_classifier import (
 )
 from tools.platform_ci_classifier import _write_github_output
 from tools.platform_safe_zip import UnsafeZipError, extract_single_manifest
+from tools.platform_workflow_provenance import ProvenanceError, validate_security_marker
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -202,6 +203,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         }
         statuses = [
             {
+                "id": 9100,
                 "context": "platform-security-build",
                 "state": "success",
                 "description": "Platform security and build passed",
@@ -222,6 +224,64 @@ class PlatformCiClassifierTests(unittest.TestCase):
             expected_run_attempt="2",
             expected_target_sha=self.TARGET_SHA,
         )
+        validate_security_marker(
+            workflow,
+            run,
+            statuses,
+            expected_run_id=1234,
+            expected_attempt=2,
+            expected_target_sha=self.TARGET_SHA,
+            expected_run_url=run["html_url"],
+        )
+        with self.assertRaises(ProvenanceError):
+            validate_security_marker(
+                workflow,
+                run,
+                statuses,
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_target_sha=self.TARGET_SHA,
+                expected_run_url=f"{run['html_url']}/wrong",
+            )
+        invalid_statuses = []
+        missing_creator = dict(statuses[0])
+        missing_creator.pop("creator")
+        invalid_statuses.append(("missing creator", missing_creator))
+        for label, value in (
+            ("null creator", None),
+            (
+                "wrong creator",
+                {"login": "attacker", "type": "User", "id": 1},
+            ),
+            ("wrong context", "other-context"),
+            ("wrong state", "failure"),
+            (
+                "wrong target URL",
+                "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/1",
+            ),
+        ):
+            candidate = dict(statuses[0])
+            if "creator" in label:
+                candidate["creator"] = value
+            else:
+                status_field = {
+                    "wrong context": "context",
+                    "wrong state": "state",
+                    "wrong target URL": "target_url",
+                }[label]
+                candidate[status_field] = value
+            invalid_statuses.append((label, candidate))
+        for label, candidate in invalid_statuses:
+            with self.subTest(status=label):
+                with self.assertRaises(ClassifierError):
+                    validate_security_workflow_run(
+                        workflow,
+                        run,
+                        [candidate],
+                        expected_run_id="1234",
+                        expected_run_attempt="2",
+                        expected_target_sha=self.TARGET_SHA,
+                    )
         mismatches = {
             "run id": ("expected_run_id", "1235"),
             "run attempt": ("expected_run_attempt", "3"),
@@ -292,7 +352,15 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("?per_page=100&page=${page}", auto)
         self.assertIn("for snapshot in first second", auto)
         self.assertIn("if first != second:", auto)
-        self.assertIn("combined-status pagination exceeded its bound", auto)
+        self.assertIn("/commits/${TARGET_SHA}/statuses?per_page=100&page=${page}", auto)
+        self.assertIn("fetch_statuses", auto)
+        self.assertIn("security status list response is malformed", auto)
+        self.assertIn("status pagination response is malformed", auto)
+        self.assertIn("status rows contain duplicate or malformed IDs", auto)
+        self.assertIn("status pagination exceeded its bound", auto)
+        self.assertNotIn("/commits/${TARGET_SHA}/status?per_page=100&page=${page}", auto)
+        self.assertNotIn("/commits/${TARGET_SHA}/status\"", auto)
+        self.assertNotIn("combined-status pagination", auto)
         self.assertIn("deployment run pagination exceeded its bound", auto)
         self.assertIn("deployment job pagination exceeded its bound", auto)
         self.assertIn("contains duplicate IDs", auto)
@@ -312,10 +380,10 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 '"status": "completed"',
                 '"conclusion": "success"',
                 "run_attempt",
-                "platform-security-build",
                 "target_url",
             ):
                 self.assertIn(field, workflow)
+        self.assertIn("platform-security-build", auto)
 
     def test_status_final_is_fail_closed_for_published_statuses_and_routes(self) -> None:
         workflow = SECURITY_WORKFLOW.read_text(encoding="utf-8")

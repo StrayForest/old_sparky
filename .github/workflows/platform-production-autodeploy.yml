@@ -72,8 +72,20 @@ jobs:
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status" \
-            --output "$metadata_dir/status.json"
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=1" \
+            --output "$metadata_dir/statuses.json"
+          /usr/bin/python3 - "$metadata_dir/statuses.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
+              raise SystemExit("security status list response is malformed")
+          ids = [row.get("id") for row in rows]
+          if any(type(row_id) is not int or row_id <= 0 for row_id in ids) or len(ids) != len(set(ids)):
+              raise SystemExit("security status list IDs are malformed or duplicate")
+          PY
           # The validator is loaded from the exact source SHA that produced
           # this completed security run.  It is dependency-free and receives
           # no GitHub token, so this privileged workflow never executes a
@@ -85,7 +97,7 @@ jobs:
           env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 "$PROVENANCE_TOOL" security \
             --workflow "$metadata_dir/workflow.json" \
             --run "$metadata_dir/run.json" \
-            --status "$metadata_dir/status.json" \
+            --status "$metadata_dir/statuses.json" \
             --expected-run-id "$SOURCE_RUN_ID" \
             --expected-attempt "$SOURCE_RUN_ATTEMPT" \
             --expected-target-sha "$TARGET_SHA" \
@@ -105,7 +117,8 @@ jobs:
           trap 'rm -rf -- "$route_dir" "$RUNNER_TEMP/platform-ci-artifact-pages"' EXIT
           fetch_classifier_artifacts() {
             local output_path="$1" page=1 count page_path
-            local pages_dir="$RUNNER_TEMP/platform-ci-artifact-pages/$(basename "$output_path")"
+            local pages_dir
+            pages_dir="$RUNNER_TEMP/platform-ci-artifact-pages/$(basename "$output_path")"
             install -d -m 700 "$pages_dir"
             while :; do
               page_path="$pages_dir/page-${page}.json"
@@ -354,42 +367,36 @@ jobs:
             --header "Accept: application/vnd.github+json"
             --header "X-GitHub-Api-Version: 2022-11-28"
           )
-          # Combined-status and workflow-run APIs are paginated even when the
-          # first response happens to contain fewer than 100 rows.  Require a
-          # stable total_count, bounded pages, regular row shapes and unique
-          # numeric IDs while assembling a complete snapshot. A changed total
-          # or repeated ID is a mutation/ambiguity and fails closed.
-          fetch_combined_status() {
+          # The list-commit-statuses endpoint returns one raw array per page
+          # and has no total_count field. Require bounded pages, regular row
+          # shapes and globally unique numeric IDs while assembling a
+          # complete snapshot. Every row is retained unchanged so the shared
+          # validator can bind creator,
+          # context, state and target URL to the exact run attempt.
+          fetch_statuses() {
             local output_path="$1" page=1 count page_path
             local pages_dir="$output_path.pages"
             install -d -m 700 "$pages_dir"
             while :; do
               page_path="$pages_dir/page-${page}.json"
               curl --fail-with-body --silent --show-error "${api_headers[@]}" \
-                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/status?per_page=100&page=${page}" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100&page=${page}" \
                 --output "$page_path"
-              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
+              count="$(/usr/bin/python3 - "$page_path" <<'PY'
           import json
           from pathlib import Path
           import sys
 
-          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if not isinstance(payload, dict) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 99999:
-              raise SystemExit("combined-status pagination response is malformed")
-          rows = payload.get("statuses")
+          rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
-              raise SystemExit("combined-status page rows are malformed")
+              raise SystemExit("status pagination response is malformed")
           ids = []
           for row in rows:
               if type(row.get("id")) is not int or row["id"] <= 0:
-                  raise SystemExit("combined-status row ID is malformed")
+                  raise SystemExit("status row ID is malformed")
               ids.append(row["id"])
           if len(ids) != len(set(ids)):
-              raise SystemExit("combined-status page contains duplicate IDs")
-          marker = Path(sys.argv[2])
-          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
-              raise SystemExit("combined-status total_count changed during pagination")
-          marker.write_text(str(payload["total_count"]), encoding="ascii")
+              raise SystemExit("status page contains duplicate IDs")
           print(len(rows))
           PY
               )"
@@ -397,7 +404,7 @@ jobs:
                 break
               fi
               ((page += 1))
-              (( page <= 1000 )) || { echo "combined-status pagination exceeded its bound" >&2; exit 1; }
+              (( page <= 1000 )) || { echo "status pagination exceeded its bound" >&2; exit 1; }
             done
             /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
           import json
@@ -406,22 +413,18 @@ jobs:
 
           pages_dir, output_path = map(Path, sys.argv[1:])
           rows = []
-          expected_total = int((pages_dir / "total").read_text(encoding="ascii"))
           seen = set()
           for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
-              payload = json.loads(path.read_text(encoding="utf-8"))
-              page_rows = payload.get("statuses") if isinstance(payload, dict) else None
-              if not isinstance(page_rows, list):
-                  raise SystemExit("combined-status page rows are malformed")
+              page_rows = json.loads(path.read_text(encoding="utf-8"))
+              if not isinstance(page_rows, list) or any(not isinstance(row, dict) for row in page_rows):
+                  raise SystemExit("status pagination response is malformed")
               for row in page_rows:
                   row_id = row.get("id")
                   if type(row_id) is not int or row_id <= 0 or row_id in seen:
-                      raise SystemExit("combined-status rows contain duplicate or malformed IDs")
+                      raise SystemExit("status rows contain duplicate or malformed IDs")
                   seen.add(row_id)
                   rows.append(row)
-          if len(rows) != expected_total:
-              raise SystemExit("combined-status pagination is incomplete")
-          output_path.write_text(json.dumps({"total_count": expected_total, "statuses": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          output_path.write_text(json.dumps(rows, sort_keys=True, separators=(",", ":")), encoding="utf-8")
           PY
           }
           fetch_security_snapshot() {
@@ -433,9 +436,9 @@ jobs:
             curl --fail-with-body --silent --show-error "${api_headers[@]}" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
               --output "$snapshot_dir/run.json"
-            fetch_combined_status "$snapshot_dir/status.json"
+            fetch_statuses "$snapshot_dir/statuses.json"
           }
-          # Read the complete combined status twice immediately before the
+          # Read the complete status list twice immediately before the
           # deployment candidate check. Equality is over the shared validator
           # output, not merely state/URL fields, so mutations cannot suppress a
           # required dispatch.
@@ -446,7 +449,7 @@ jobs:
             env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 "$PROVENANCE_TOOL" security \
               --workflow "$status_dir/first/workflow.json" \
               --run "$status_dir/first/run.json" \
-              --status "$status_dir/first/status.json" \
+              --status "$status_dir/first/statuses.json" \
               --expected-run-id "$SOURCE_RUN_ID" \
               --expected-attempt "$SOURCE_RUN_ATTEMPT" \
               --expected-target-sha "$TARGET_SHA" \
@@ -456,7 +459,7 @@ jobs:
             env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 "$PROVENANCE_TOOL" security \
               --workflow "$status_dir/second/workflow.json" \
               --run "$status_dir/second/run.json" \
-              --status "$status_dir/second/status.json" \
+              --status "$status_dir/second/statuses.json" \
               --expected-run-id "$SOURCE_RUN_ID" \
               --expected-attempt "$SOURCE_RUN_ATTEMPT" \
               --expected-target-sha "$TARGET_SHA" \
@@ -665,12 +668,12 @@ jobs:
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${deployment_run_id}" \
               --output "$deployment_dir/run.json"
             fetch_deployment_jobs "$deployment_run_id" "$deployment_attempt" "$deployment_dir/jobs.json"
-            fetch_combined_status "$deployment_dir/status-$deployment_run_id-$deployment_attempt.json"
+            fetch_statuses "$deployment_dir/statuses-$deployment_run_id-$deployment_attempt.json"
             if env -u GH_TOKEN -u GITHUB_TOKEN /usr/bin/python3 "$PROVENANCE_TOOL" deployment \
               --workflow "$deployment_dir/workflow.json" \
               --run "$deployment_dir/run.json" \
               --jobs "$deployment_dir/jobs.json" \
-              --status "$deployment_dir/status-$deployment_run_id-$deployment_attempt.json" \
+              --status "$deployment_dir/statuses-$deployment_run_id-$deployment_attempt.json" \
               --expected-run-id "$deployment_run_id" \
               --expected-attempt "$deployment_attempt" \
               --expected-target-sha "$TARGET_SHA" \
