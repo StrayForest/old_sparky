@@ -273,6 +273,7 @@ test("tournament detail refetches after the authenticated session changes", asyn
   await expectWorkspaceRequest(page, expectedWorkspace, readyButton);
 
   let invalidatedVoteRequests = 0;
+  const sessionLifecycleGeneration = await readLifecycleGeneration(page);
   holdNextWorkspaceResponse = true;
   await page.route(
     `**/api/v1/tournaments/${readyTournamentSlug}/deadlock/ready-check/vote`,
@@ -291,12 +292,16 @@ test("tournament detail refetches after the authenticated session changes", asyn
   await expect.poll(() => releaseHeldWorkspaceResponse !== null).toBe(true);
   await expect(page.getByRole("heading", { level: 1, name: "Lean Ready Cup", exact: true })).toHaveCount(0);
   await expect(page.getByRole("heading", { level: 1, name: "Загрузка турнира", exact: true })).toBeVisible();
+  await expect.poll(async () => Number(await page.getByTestId("tournament-detail-lifecycle").getAttribute("data-generation")))
+    .toBeGreaterThan(sessionLifecycleGeneration);
+  await expect(page.getByTestId("tournament-detail-lifecycle")).toHaveAttribute("data-settled", "false");
   releaseHeldWorkspaceResponse?.();
   releaseHeldWorkspaceResponse = null;
   await expectWorkspaceRequests(
     page,
     [expectedWorkspace, expectedWorkspace],
-    page.getByRole("button", { name: "Подтвердить участие" })
+    page.getByRole("button", { name: "Подтвердить участие" }),
+    { previousGeneration: sessionLifecycleGeneration }
   );
   await expectNoHorizontalOverflow(page);
 });
@@ -328,12 +333,16 @@ test("registered detail uses compact workspace state and ready vote avoids full 
   await expect(page.getByRole("button", { name: "Подтвердить участие" })).toBeEnabled();
   await expect.poll(() => authBootstrapRequests).toBe(1);
 
-  const workspaceRequestCountBeforeVote = workspaceRequests.length;
+  const workspaceRequestsBeforeVote = [...workspaceRequests];
   await page.getByRole("button", { name: "Подтвердить участие" }).click();
   await expect(page.getByRole("button", { name: "Отменить подтверждение" })).toBeVisible();
   await expect(page.getByText("Участие подтверждено").last()).toBeVisible();
   await expect.poll(() => readyVoteRequests).toBe(1);
-  expect(workspaceRequests).toHaveLength(workspaceRequestCountBeforeVote);
+  await expectWorkspaceRequests(
+    page,
+    workspaceRequestsBeforeVote,
+    page.getByRole("button", { name: "Отменить подтверждение" })
+  );
   await expect.poll(() => participantRequests).toEqual([]);
   await expect.poll(() => usersMeRequests).toBe(0);
   await expect.poll(() => csrfRequests).toBe(1);
@@ -386,13 +395,13 @@ test("bracket page uses the initial workspace and has no background refresh", as
   }]);
   const response = await page.goto(`/tournaments/${publicTournamentSlug}/bracket`);
   expect(response?.status()).toBe(200);
-  expect(workspaceRequests).toEqual([{
+  await expectWorkspaceRequests(page, [{
     slug: publicTournamentSlug,
     participantsLimit: 0,
     participantsOffset: 0,
     workspaceView: "bracket",
     includeCurrentUser: false
-  }]);
+  }], page.locator("main").first(), { lifecycle: false });
   await expect.poll(() => authBootstrapRequests).toBe(1);
   expect(bracketRequests).toBe(0);
   expect(participantRequests).toEqual([]);
@@ -417,14 +426,15 @@ test("anonymous bearer and invite soft navigation keep the exact code across det
   await expect(page.getByTestId("registration-steps").getByRole("button")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Зарегистрироваться" })).toHaveCount(0);
   await expect(page.locator("main a[href^='/profile']")).toHaveCount(0);
+  await waitForWorkspaceQuiescence(page, page.getByTestId("tournament-read-only-registration"));
 
   const bracketLink = page.locator("a.bracket-open-link");
   await expect(bracketLink).toHaveAttribute("href", bracketPath);
-  expect(bearerWorkspaceRequests).toEqual([{
+  await expectBearerWorkspaceRequests(page, [{
     slug: privateBearerSlug,
     inviteCode: privateBearerCode,
     workspaceView: "detail"
-  }]);
+  }], page.getByTestId("tournament-read-only-registration"));
 
   await bracketLink.click();
   await expect(page).toHaveURL(`${webBaseUrl}${bracketPath}`);
@@ -432,7 +442,7 @@ test("anonymous bearer and invite soft navigation keep the exact code across det
   await expect(page.locator("[data-testid='bracket-match'] input")).toHaveCount(0);
   await expect(page.locator("[data-testid='bracket-match'] button")).toHaveCount(0);
   await expect(page.locator("main a[href^='/profile']")).toHaveCount(0);
-  expect(bearerWorkspaceRequests).toEqual([
+  await expectBearerWorkspaceRequests(page, [
     {
       slug: privateBearerSlug,
       inviteCode: privateBearerCode,
@@ -443,12 +453,12 @@ test("anonymous bearer and invite soft navigation keep the exact code across det
       inviteCode: privateBearerCode,
       workspaceView: "bracket"
     }
-  ]);
+  ], page.getByTestId("bracket-match"), { lifecycle: false });
 
   await page.reload();
   await expect(page).toHaveURL(`${webBaseUrl}${bracketPath}`);
   await expect(page.getByTestId("bracket-match")).toHaveCount(1);
-  expect(bearerWorkspaceRequests).toEqual([
+  await expectBearerWorkspaceRequests(page, [
     {
       slug: privateBearerSlug,
       inviteCode: privateBearerCode,
@@ -464,7 +474,7 @@ test("anonymous bearer and invite soft navigation keep the exact code across det
       inviteCode: privateBearerCode,
       workspaceView: "bracket"
     }
-  ]);
+  ], page.getByTestId("bracket-match"), { lifecycle: false });
   expect(inviteClaimRequests).toBe(0);
   expect(apiRequests.join("\n")).not.toContain(privateBearerCode);
 
@@ -483,8 +493,7 @@ test("anonymous bearer and invite soft navigation keep the exact code across det
   await page.goto(`/tournaments/${privateBearerSlug}`);
   await expect(page.locator(".tournament-invite-gate")).toBeVisible();
   await expect.poll(() => bearerWorkspaceRequests.length).toBe(inviteTransitionStart + 2);
-  await waitForWorkspaceQuiescence(page, page.locator(".tournament-invite-gate"));
-  expect(bearerWorkspaceRequests.slice(inviteTransitionStart)).toEqual([
+  await expectBearerWorkspaceRequests(page, [
     {
       slug: privateBearerSlug,
       inviteCode: null,
@@ -495,22 +504,25 @@ test("anonymous bearer and invite soft navigation keep the exact code across det
       inviteCode: null,
       workspaceView: "detail"
     }
-  ]);
+  ], page.locator(".tournament-invite-gate"), {}, () => bearerWorkspaceRequests.slice(inviteTransitionStart));
 
+  const inviteLifecycleGeneration = await readLifecycleGeneration(page);
   await page.getByLabel("Код приглашения").fill(privateBearerCode);
   await page.getByRole("button", { name: "Открыть турнир" }).click();
   await expect(page).toHaveURL(`${webBaseUrl}/tournaments/${privateBearerSlug}?invite_code=${privateBearerCode}`);
   await expect(page.getByTestId("tournament-read-only-registration")).toBeVisible();
   await expect(page.locator(".tournament-invite-gate")).toHaveCount(0);
   await expect.poll(() => bearerWorkspaceRequests.length).toBe(inviteTransitionStart + 3);
-  await waitForWorkspaceQuiescence(page, page.getByTestId("tournament-read-only-registration"));
-  expect(bearerWorkspaceRequests.slice(inviteTransitionStart + 2)).toEqual([{
+  await expectBearerWorkspaceRequests(page, [{
     slug: privateBearerSlug,
     inviteCode: privateBearerCode,
     workspaceView: "detail"
-  }]);
+  }], page.getByTestId("tournament-read-only-registration"), {
+    previousGeneration: inviteLifecycleGeneration
+  }, () => bearerWorkspaceRequests.slice(inviteTransitionStart + 2));
 
   const refreshStart = bearerWorkspaceRequests.length;
+  const refreshLifecycleGeneration = await readLifecycleGeneration(page);
   const refreshed = await page.evaluate(() => {
     const next = (window as Window & {
       next?: { router?: { refresh: () => void } };
@@ -524,12 +536,13 @@ test("anonymous bearer and invite soft navigation keep the exact code across det
   expect(refreshed).toBe(true);
   await expect.poll(() => bearerWorkspaceRequests.length).toBe(refreshStart + 1);
   await expect(page.getByTestId("tournament-read-only-registration")).toBeVisible();
-  await waitForWorkspaceQuiescence(page, page.getByTestId("tournament-read-only-registration"));
-  expect(bearerWorkspaceRequests.slice(refreshStart)).toEqual([{
+  await expectBearerWorkspaceRequests(page, [{
     slug: privateBearerSlug,
     inviteCode: privateBearerCode,
     workspaceView: "detail"
-  }]);
+  }], page.getByTestId("tournament-read-only-registration"), {
+    previousGeneration: refreshLifecycleGeneration
+  }, () => bearerWorkspaceRequests.slice(refreshStart));
   await expectNoHorizontalOverflow(page);
 });
 
@@ -629,13 +642,31 @@ test("duplicate or malformed bearer query values fail closed before the workspac
   expect(inviteClaimRequests).toBe(0);
 });
 
+type WorkspaceQuiescenceOptions = {
+  lifecycle?: boolean;
+  previousGeneration?: number;
+};
+
+async function readLifecycleGeneration(page: import("@playwright/test").Page): Promise<number> {
+  const generation = await page.getByTestId("tournament-detail-lifecycle").getAttribute("data-generation");
+  expect(generation).not.toBeNull();
+  return Number(generation);
+}
+
 async function waitForWorkspaceQuiescence(
   page: import("@playwright/test").Page,
-  ready: import("@playwright/test").Locator
+  ready: import("@playwright/test").Locator,
+  options: WorkspaceQuiescenceOptions = {}
 ) {
   await expect(ready).toBeVisible();
-  await expect.poll(() => workspaceInFlight).toBe(0);
-  await page.waitForLoadState("networkidle");
+  if (options.lifecycle !== false) {
+    const lifecycleMarker = page.getByTestId("tournament-detail-lifecycle");
+    if (options.previousGeneration !== undefined) {
+      await expect.poll(async () => Number(await lifecycleMarker.getAttribute("data-generation")))
+        .toBeGreaterThan(options.previousGeneration);
+    }
+    await expect(lifecycleMarker).toHaveAttribute("data-settled", "true");
+  }
   await expect.poll(() => workspaceInFlight).toBe(0);
 }
 
@@ -652,11 +683,24 @@ async function expectWorkspaceRequest(
 async function expectWorkspaceRequests(
   page: import("@playwright/test").Page,
   expected: typeof workspaceRequests,
-  ready: import("@playwright/test").Locator
+  ready: import("@playwright/test").Locator,
+  options: WorkspaceQuiescenceOptions = {}
 ) {
   await expect.poll(() => workspaceRequests).toEqual(expected);
-  await waitForWorkspaceQuiescence(page, ready);
+  await waitForWorkspaceQuiescence(page, ready, options);
   expect(workspaceRequests).toEqual(expected);
+}
+
+async function expectBearerWorkspaceRequests(
+  page: import("@playwright/test").Page,
+  expected: typeof bearerWorkspaceRequests,
+  ready: import("@playwright/test").Locator,
+  options: WorkspaceQuiescenceOptions = {},
+  actual: () => typeof bearerWorkspaceRequests = () => bearerWorkspaceRequests
+) {
+  await expect.poll(actual).toEqual(expected);
+  await waitForWorkspaceQuiescence(page, ready, options);
+  expect(actual()).toEqual(expected);
 }
 
 function workspacePayload(

@@ -47,6 +47,8 @@ type DetailContext = {
   retryGeneration: number;
 };
 
+const MAX_LIFECYCLE_GENERATION = 1_000_000;
+
 function sameDetailContext(left: DetailContext | null, right: DetailContext): boolean {
   return Boolean(
     left
@@ -55,6 +57,28 @@ function sameDetailContext(left: DetailContext | null, right: DetailContext): bo
     && left.sessionIdentity === right.sessionIdentity
     && left.serverSeedVersion === right.serverSeedVersion
     && left.retryGeneration === right.retryGeneration
+  );
+}
+
+function nextLifecycleGeneration(current: number): number {
+  return current >= MAX_LIFECYCLE_GENERATION ? 1 : current + 1;
+}
+
+function TournamentDetailLifecycleMarker({
+  generation,
+  settled
+}: {
+  generation: number;
+  settled: boolean;
+}) {
+  return (
+    <span
+      aria-hidden="true"
+      data-generation={generation}
+      data-settled={settled ? "true" : "false"}
+      data-testid="tournament-detail-lifecycle"
+      hidden
+    />
   );
 }
 
@@ -95,6 +119,10 @@ export function TournamentDetailClientPage({
     serverSeedVersion: serverSeedVersionRef.current,
     retryGeneration
   });
+  const lifecycleGenerationRef = useRef(0);
+  const lifecycleObservedContextRef = useRef<DetailContext | null>(null);
+  const lifecycleSettledContextRef = useRef<DetailContext | null>(null);
+  const lifecycleSettledRef = useRef(false);
   const actorUserId = authStatus === "authenticated" ? user?.id ?? null : null;
 
   const serverSeedChanged = (
@@ -129,6 +157,15 @@ export function TournamentDetailClientPage({
     serverSeedVersion,
     retryGeneration
   };
+  if (!sameDetailContext(lifecycleObservedContextRef.current, currentContext)) {
+    lifecycleObservedContextRef.current = currentContext;
+    lifecycleGenerationRef.current = nextLifecycleGeneration(lifecycleGenerationRef.current);
+    lifecycleSettledContextRef.current = null;
+    lifecycleSettledRef.current = false;
+  }
+  const lifecycleSettled = lifecycleSettledRef.current
+    && sameDetailContext(lifecycleSettledContextRef.current, currentContext);
+  const lifecycleGeneration = lifecycleGenerationRef.current;
   const displayState = serverSeedChanged
     ? initialTournament
       ? { status: "ready" as const, tournament: initialTournament }
@@ -136,6 +173,12 @@ export function TournamentDetailClientPage({
     : sameDetailContext(stateContextRef.current, currentContext)
       ? state
       : { status: "loading" as const };
+  const settleLifecycle = (context: DetailContext) => {
+    if (sameDetailContext(lifecycleObservedContextRef.current, context)) {
+      lifecycleSettledContextRef.current = context;
+      lifecycleSettledRef.current = true;
+    }
+  };
 
   useEffect(() => {
     const initialRequest = initialRequestRef.current;
@@ -148,6 +191,7 @@ export function TournamentDetailClientPage({
       && initialRequest.version === serverSeedVersion
       && initialRequest.retryGeneration === retryGeneration
     ) {
+      settleLifecycle(currentContext);
       stateContextRef.current = currentContext;
       setState(initialTournament
         ? { status: "ready", tournament: initialTournament }
@@ -161,6 +205,8 @@ export function TournamentDetailClientPage({
     const requestInviteCode = normalizedInviteCode;
     const requestSessionIdentity = sessionIdentity;
     const requestContext = currentContext;
+    lifecycleSettledContextRef.current = null;
+    lifecycleSettledRef.current = false;
     stateContextRef.current = requestContext;
     setState({ status: "loading" });
 
@@ -183,6 +229,7 @@ export function TournamentDetailClientPage({
           ) {
           return;
         }
+        settleLifecycle(requestContext);
         stateContextRef.current = requestContext;
         setState(workspace
           ? { status: "ready", tournament: workspace.tournament }
@@ -200,12 +247,21 @@ export function TournamentDetailClientPage({
           ) {
           return;
         }
+        settleLifecycle(requestContext);
         stateContextRef.current = requestContext;
         if (error instanceof PlatformApiError && (error.status === 401 || error.status === 403)) {
           setState({ status: "invite" });
           return;
         }
         setState({ status: "error" });
+      })
+      .finally(() => {
+        if (
+          requestGeneration.current === generation
+          && sameDetailContext(lifecycleObservedContextRef.current, requestContext)
+        ) {
+          settleLifecycle(requestContext);
+        }
       });
 
     return () => controller.abort();
@@ -221,12 +277,18 @@ export function TournamentDetailClientPage({
   ]);
 
   if (displayState.status === "loading") {
-    return <RouteLoadingShell variant="tournament-detail" />;
+    return (
+      <>
+        <TournamentDetailLifecycleMarker generation={lifecycleGeneration} settled={lifecycleSettled} />
+        <RouteLoadingShell variant="tournament-detail" />
+      </>
+    );
   }
 
   if (displayState.status === "invite") {
     return (
       <>
+        <TournamentDetailLifecycleMarker generation={lifecycleGeneration} settled={lifecycleSettled} />
         <div className="page-noise" aria-hidden="true" />
         <main className="main">
           <TournamentInviteGate slug={slug} />
@@ -236,29 +298,38 @@ export function TournamentDetailClientPage({
   }
 
   if (displayState.status === "not-found") {
-    return <DetailErrorShell title={t("tournament.notFoundTitle")} copy={t("tournament.notFoundCopy")} />;
+    return (
+      <>
+        <TournamentDetailLifecycleMarker generation={lifecycleGeneration} settled={lifecycleSettled} />
+        <DetailErrorShell title={t("tournament.notFoundTitle")} copy={t("tournament.notFoundCopy")} />
+      </>
+    );
   }
 
   if (displayState.status === "error") {
     return (
-      <DetailErrorShell
-        title={t("tournament.loadFailedTitle")}
-        copy={t("tournament.loadFailedCopy")}
-        action={(
-          <button
-            className="primary-action"
-            onClick={() => setRetryGeneration((current) => current + 1)}
-            type="button"
-          >
-            {t("common.retry")}
-          </button>
-        )}
-      />
+      <>
+        <TournamentDetailLifecycleMarker generation={lifecycleGeneration} settled={lifecycleSettled} />
+        <DetailErrorShell
+          title={t("tournament.loadFailedTitle")}
+          copy={t("tournament.loadFailedCopy")}
+          action={(
+            <button
+              className="primary-action"
+              onClick={() => setRetryGeneration((current) => current + 1)}
+              type="button"
+            >
+              {t("common.retry")}
+            </button>
+          )}
+        />
+      </>
     );
   }
 
   return (
     <>
+      <TournamentDetailLifecycleMarker generation={lifecycleGeneration} settled={lifecycleSettled} />
       <div className="page-noise" aria-hidden="true" />
       <Hero
         eyebrow={`Турниры / ${displayState.tournament.title}`}

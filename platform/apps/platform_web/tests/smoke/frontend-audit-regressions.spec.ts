@@ -24,6 +24,13 @@ test("invite-only pages convert missing workspace proof into invite-code flow", 
   expect(detailClientPage).toContain("stateContextRef");
   expect(detailClientPage).toContain("sameDetailContext");
   expect(detailClientPage).toContain("const displayState");
+  expect(detailClientPage).toContain("lifecycleGenerationRef");
+  expect(detailClientPage).toContain("nextLifecycleGeneration");
+  expect(detailClientPage).toContain("data-testid=\"tournament-detail-lifecycle\"");
+  expect(detailClientPage).toContain("data-settled={settled ? \"true\" : \"false\"}");
+  expect(detailClientPage).not.toContain("data-slug");
+  expect(detailClientPage).not.toContain("data-invite");
+  expect(detailClientPage).not.toContain("data-session");
   expect(detailClientPage).toContain("key={serverSeedVersion}");
   expect(detailClientPage).toContain("error.status === 401");
   expect(detailClientPage).toContain("TournamentInviteGate");
