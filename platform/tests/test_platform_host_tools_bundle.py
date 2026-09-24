@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import textwrap
 from types import SimpleNamespace
 import unittest
 import zipfile
@@ -81,6 +82,80 @@ class HostToolsBundleTests(unittest.TestCase):
                 self.assertEqual(metadata.st_nlink, 1)
                 self.assertEqual(metadata.st_mode & 0o777, 0o600)
             self.assertFalse(any(contract.glob(".*.tmp")))
+
+    def test_generated_mode_contract_passes_workflow_consumer(self) -> None:
+        """Keep files.modes aligned with the production shell consumer.
+
+        The manifest intentionally uses JSON numeric Unix modes (292/365),
+        while the workflow compares the text sidecar with `stat -c %a`
+        (444/555).  Generate the real bundle/manifest/contract and execute
+        the exact mode-validation loop extracted from the workflow so either
+        representation cannot drift silently.
+        """
+
+        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
+            "  build-release:", 1
+        )[0]
+        start_marker = '          while read -r expected_mode expected_path; do'
+        end_marker = '          done < "$contract_dir/files.modes"'
+        start = preflight.index(start_marker)
+        end = preflight.index(end_marker, start) + len(end_marker)
+        mode_consumer = textwrap.dedent(preflight[start:end])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source_fixture(root)
+            archive = root / "bundle.zip"
+            summary = bundle.build_bundle(source, SOURCE_SHA, archive)
+            verified = bundle.verify_bundle(archive, expected_source_sha=SOURCE_SHA)
+            contract = root / "contract"
+            bundle.write_contract_files(verified, contract)
+
+            manifest = summary["manifest"]
+            self.assertIsInstance(manifest, dict)
+            modes = (contract / "files.modes").read_text(encoding="ascii").splitlines()
+            self.assertIn("444  capabilities.txt", modes)
+            self.assertTrue(
+                all(
+                    line.startswith("555  ")
+                    for line in modes
+                    if not line.endswith("  capabilities.txt")
+                )
+            )
+            self.assertEqual(
+                next(
+                    record["mode"]
+                    for record in manifest["files"]
+                    if record["path"] == "capabilities.txt"
+                ),
+                bundle.DATA_MODE,
+            )
+            self.assertEqual(
+                next(
+                    record["mode"]
+                    for record in manifest["files"]
+                    if record["path"] == bundle.HOST_TOOL_FILES[0]
+                ),
+                bundle.EXECUTABLE_MODE,
+            )
+
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'set -euo pipefail\ncontract_dir="$1"\n{mode_consumer}',
+                    "mode-check",
+                    str(contract),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_manifest_and_archive_have_exact_closed_member_counts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

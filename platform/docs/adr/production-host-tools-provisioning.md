@@ -13,8 +13,10 @@ The generation directory is `root:root`, regular, link-count 2 and mode
 `0555`.  Every member is a root-owned regular file with link-count 1 and mode
 `0555` (the manifest and capability data are still non-executable `0444`
 content contracts).  The bundle manifest binds the source SHA, toolset version,
-component closure, capabilities, POSIX-relative filenames, modes and SHA-256
-digests.  Its two components are kept explicit:
+component closure, capabilities, POSIX-relative filenames, numeric Unix modes
+and SHA-256 digests.  The generated `files.modes` sidecar serializes those
+modes as the conventional octal text emitted by `stat -c %a` (`444`/`555`) for
+shell preflight consumers.  Its two components are kept explicit:
 
 - `prepare_artifact`: the fixed dispatcher, input guard and artifact-directory
   helper;
