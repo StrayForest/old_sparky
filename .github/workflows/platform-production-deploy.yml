@@ -459,11 +459,10 @@ jobs:
             "$RUNNER_TEMP/host-tools-workflow-attempt.json" \
             "$RUNNER_TEMP/host-tools-workflow-attempt.error"
 
-  # This is a read-only capability gate.  It consumes the attested bundle as
-  # data and checks the already provisioned immutable generation; it never
-  # uploads, installs, or executes bundle/candidate source on production.  The
-  # The checked generation contains platform_workflow_remote_dispatch.py, but
-  # this job inspects it only as data and never invokes repository code.
+  # This is a read-only capability gate. It consumes the attested bundle as
+  # data, checks the already provisioned immutable generation, and then invokes
+  # only that generation's fixed capability command. It never uploads,
+  # installs, or executes candidate/repository source on production.
   host-capability-preflight:
     name: Verify immutable production host capabilities
     needs:
@@ -484,6 +483,7 @@ jobs:
       TARGET_SHA: ${{ github.sha }}
       HOST_TOOLS_ARTIFACT_ID: ${{ needs.build-host-tools.outputs.artifact_id }}
       HOST_TOOLS_ARTIFACT_DIGEST: ${{ needs.build-host-tools.outputs.artifact_digest }}
+      HOST_TOOLS_DISPATCHER: /opt/oldsparky/platform/shared/host-tools/${{ github.sha }}/platform_workflow_remote_dispatch.py
     steps:
       - name: Download and verify exact host-tools artifact
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -495,10 +495,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The installed platform_workflow_remote_dispatch.py is only inspected
-          # through data-only shell checks; this job never invokes repo code.
-          # The downloaded host bundle remains data-only.  This job only
-          # inspects its members and the already-provisioned host generation.
+          # This step validates the downloaded bundle as data. The installed
+          # generation is probed only by the separate final step below, after
+          # the complete remote integrity inventory succeeds.
           umask 077
           [[ "$HOST_TOOLS_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
           [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
@@ -710,12 +709,53 @@ jobs:
           printf '%s\n' "HOST_TOOLS_GENERATION=$generation" >> "$GITHUB_ENV"
           printf '%s\n' "HOST_TOOLS_SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
+      - name: Probe immutable host dispatcher capabilities
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}"
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          expected_generation="/opt/oldsparky/platform/shared/host-tools/$TARGET_SHA"
+          expected_dispatcher="$expected_generation/platform_workflow_remote_dispatch.py"
+          test "$HOST_TOOLS_GENERATION" = "$expected_generation"
+          test "$HOST_TOOLS_DISPATCHER" = "$expected_dispatcher"
+          test -d "$HOST_TOOLS_SSH_DIR" && test ! -L "$HOST_TOOLS_SSH_DIR"
+          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR")" = "directory:1:700"
+          test -f "$HOST_TOOLS_SSH_DIR/config" && test ! -L "$HOST_TOOLS_SSH_DIR/config"
+          test -f "$HOST_TOOLS_SSH_DIR/known_hosts" && test ! -L "$HOST_TOOLS_SSH_DIR/known_hosts"
+          test -f "$HOST_TOOLS_SSH_DIR/id_ed25519" && test ! -L "$HOST_TOOLS_SSH_DIR/id_ed25519"
+          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/config")" = "regular file:1:600"
+          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/known_hosts")" = "regular file:1:600"
+          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
+          remote=(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
+          expected_output="HOST_TOOLS schema=1 source_sha=$TARGET_SHA generation=$TARGET_SHA dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1"
+          # The file-size limit bounds the captured stdout to one 512-byte
+          # block. The dispatcher emits one short, fixed line; anything larger
+          # fails closed instead of being retained or projected to logs.
+          if ! (
+            ulimit -f 1
+            exec /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
+              "${remote[@]}" /usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" host-capabilities
+          ) > "$probe_output" 2>/dev/null < /dev/null; then
+            echo "immutable host capability probe failed" >&2
+            exit 1
+          fi
+          test "$(stat -c '%F:%h:%s' -- "$probe_output")" = "regular file:1:$(stat -c '%s' -- "$probe_output")"
+          test "$(stat -c '%s' -- "$probe_output")" -le 512
+          printf '%s\n' "$expected_output" | cmp -s - "$probe_output"
+
       - name: Remove host capability verifier material
         if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
-          rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip"
+          rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip" \
+            "$RUNNER_TEMP/platform-host-capabilities-output"
           rm -f -- "$RUNNER_TEMP/host-tools-remote-entries.b64" "$RUNNER_TEMP/host-tools-remote-entries" \
             "$RUNNER_TEMP/platform-host-tools-expected-members" "$RUNNER_TEMP/platform-host-tools-actual-members"
           rm -rf -- "$RUNNER_TEMP/host-tools-download" "$RUNNER_TEMP/platform-host-tools-inner"

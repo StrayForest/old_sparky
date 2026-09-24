@@ -534,6 +534,8 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
                 issues.append(f"host capability preflight must use fixed {command} checks")
         if any(marker in host_preflight for marker in ("bash -s", "python -c", "platform_host_tools_install")):
             issues.append("host capability preflight must not execute dynamic or self-installing code")
+        if "platform/tools/platform_workflow_remote_dispatch.py" in host_preflight:
+            issues.append("host capability preflight must not execute repository checkout source")
         if "scp " in host_preflight or "platform-production-deploy-remote" in host_preflight:
             issues.append("host capability preflight must not upload a bundle or deploy artifact")
         if (
@@ -543,6 +545,54 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host capability preflight must always clean its verifier material")
         if "inputs.mode == 'deploy' || inputs.mode == 'preflight'" not in host_preflight:
             issues.append("host capability preflight must cover both production dispatch modes")
+
+        steps = _workflow_step_blocks(host_preflight)
+        integrity_step_index = next(
+            (
+                index
+                for index, step in enumerate(steps)
+                if "- name: Validate root SSH identity and installed generation" in step
+            ),
+            None,
+        )
+        probe_step_index = next(
+            (
+                index
+                for index, step in enumerate(steps)
+                if "- name: Probe immutable host dispatcher capabilities" in step
+            ),
+            None,
+        )
+        if integrity_step_index is None:
+            issues.append("host capability preflight must inventory the installed generation")
+        if probe_step_index is None:
+            issues.append("host capability preflight must execute an immutable capability probe")
+        if (
+            integrity_step_index is not None
+            and probe_step_index is not None
+            and probe_step_index <= integrity_step_index
+        ):
+            issues.append("host capability probe must follow the complete generation inventory")
+        if probe_step_index is not None:
+            probe_step = steps[probe_step_index]
+            for marker in (
+                '/usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" host-capabilities',
+                "/usr/bin/timeout --signal=TERM --kill-after=2s 15s",
+                "ulimit -f 1",
+                "< /dev/null",
+                'expected_output="HOST_TOOLS schema=1 source_sha=$TARGET_SHA generation=$TARGET_SHA '
+                'dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1"',
+                'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
+            ):
+                if marker not in probe_step:
+                    issues.append(f"host capability probe is missing fixed contract marker: {marker}")
+            if not re.search(
+                r'^\s+"\$\{remote\[@\]\}" /usr/bin/python3\.12 -I '
+                r'"\$HOST_TOOLS_DISPATCHER" host-capabilities$',
+                probe_step,
+                re.MULTILINE,
+            ):
+                issues.append("host capability probe must invoke the immutable dispatcher with fixed argv")
 
     if preflight:
         preflight_needs = _workflow_job_needs(preflight)

@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from tools import platform_host_tools_bundle as bundle
 from tools import platform_workflow_remote_dispatch as dispatcher
+from tools.platform_verify_contract import _workflow_step_blocks
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -726,6 +727,45 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertIn("seen_entries", preflight)
         self.assertNotIn("expected_members=(", preflight)
         self.assertNotIn('"$generation"/*', preflight)
+
+        steps = _workflow_step_blocks(preflight)
+        integrity_steps = [
+            step
+            for step in steps
+            if "- name: Validate root SSH identity and installed generation" in step
+        ]
+        probe_steps = [
+            step
+            for step in steps
+            if "- name: Probe immutable host dispatcher capabilities" in step
+        ]
+        self.assertEqual(len(integrity_steps), 1)
+        self.assertEqual(len(probe_steps), 1)
+        self.assertLess(steps.index(integrity_steps[0]), steps.index(probe_steps[0]))
+        probe = probe_steps[0]
+        self.assertEqual(
+            len(
+                re.findall(
+                    r'^\s+"\$\{remote\[@\]\}" /usr/bin/python3\.12 -I '
+                    r'"\$HOST_TOOLS_DISPATCHER" host-capabilities$',
+                    probe,
+                    re.MULTILINE,
+                )
+            ),
+            1,
+        )
+        self.assertIn("/usr/bin/timeout --signal=TERM --kill-after=2s 15s", probe)
+        self.assertIn("ulimit -f 1", probe)
+        self.assertIn("< /dev/null", probe)
+        self.assertIn(
+            'expected_output="HOST_TOOLS schema=1 source_sha=$TARGET_SHA '
+            'generation=$TARGET_SHA dispatcher=2 artifact_prepare=2 supervisor=2 '
+            'input_guard=1 python_isolated=1"',
+            probe,
+        )
+        self.assertIn('printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"', probe)
+        self.assertNotIn("platform/tools/platform_workflow_remote_dispatch.py", probe)
+        self.assertNotIn("platform_host_tools_bundle.py", probe)
 
         expected = set(bundle.HOST_TOOL_FILES) | {"capabilities.txt", "manifest.json"}
         safe_name = re.compile(r"^[A-Za-z0-9_.-]+$")
