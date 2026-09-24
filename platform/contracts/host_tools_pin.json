@@ -1,0 +1,72 @@
+{
+  "closure": [
+    {
+      "mode": 493,
+      "path": "platform/tools/platform_workflow_remote_dispatch.py",
+      "sha256": "a1f0585b9000951fe154e3a56effa64b50713034221d9a7854d452a03cfd937b"
+    },
+    {
+      "mode": 493,
+      "path": "platform/tools/platform_workflow_input_guard.py",
+      "sha256": "bd4763ba7d2db6bcc0b7ee683ef04e0ea64f37178bc11f7522e2b88083cdd799"
+    },
+    {
+      "mode": 493,
+      "path": "platform/tools/platform_prepare_artifact_dir.py",
+      "sha256": "602f8cd98e864ffb57aca66e19a47cf96cf14430df3a06389f867a9c3efeedff"
+    },
+    {
+      "mode": 493,
+      "path": "platform/tools/platform_production_deploy_supervisor.sh",
+      "sha256": "1c613c99a9041e4434edf592cb2e01cd2fb7139f09501ae64c3d362dc0ad07d5"
+    },
+    {
+      "mode": 493,
+      "path": "platform/tools/platform_release_lock.sh",
+      "sha256": "19e4d922af1192fe9a92b07762f365af766ed8524fd992ad0dacf457b63336fa"
+    },
+    {
+      "mode": 493,
+      "path": "platform/tools/platform_release_preflight.sh",
+      "sha256": "65ec1dae072f96165d8076f16aca253a9c4d634e217b419161554575c99cee09"
+    },
+    {
+      "mode": 493,
+      "path": "platform/tools/platform_validate_release_artifact.py",
+      "sha256": "8f32ff12c3d051b473156afc2af099a72d3d5c8ca5025751acbfb13174c49f57"
+    },
+    {
+      "mode": 493,
+      "path": "platform/tools/platform_safe_env_exec.py",
+      "sha256": "8cc1cafe9ce853b55f37d82f90555ee2f6d8b433611570c2cacf2a7940c7da92"
+    },
+    {
+      "mode": 493,
+      "path": "platform/tools/platform_render_service_envs.py",
+      "sha256": "234acec88be597a93d4fe4056631a9fe4c4f52338da0d60de6fc0e3e7c04a94f"
+    },
+    {
+      "mode": 420,
+      "path": "platform/tools/platform_validate_edge_policy.py",
+      "sha256": "872c6b1a5c5e4ad7461b1880fdbd86a30fd1d22b4a11942be121f86b9019fc9e"
+    },
+    {
+      "mode": 420,
+      "path": "platform/tools/platform_configure_shared_env.py",
+      "sha256": "c7f263b5973fb22fa56f5b15dc957fb1bfa90c9d9155e04492e16d3b668784b3"
+    },
+    {
+      "mode": 493,
+      "path": "platform/tools/platform_update_cloudflare_ips.py",
+      "sha256": "018fba78669836bcec3e751082bac9e7421d601cedf1dc0970f4f4550e272f8b"
+    },
+    {
+      "mode": 420,
+      "path": "platform/tools/platform_storage_evidence_summary.py",
+      "sha256": "2fe2c8ebfdea6f24ee6d7c7e1a4539a88fdc70449c66cc50eedf9caab3ae2ebf"
+    }
+  ],
+  "host_tools_sha": "4233e3ce3395da6948192f14e50af2033774f4f0",
+  "repository": "StrayForest/old_sparky",
+  "schema": 1
+}

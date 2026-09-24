@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from contextlib import redirect_stdout
@@ -18,6 +19,7 @@ import zipfile
 from unittest.mock import patch
 
 from tools import platform_host_tools_bundle as bundle
+from tools import platform_host_tools_pin as pin
 from tools import platform_workflow_remote_dispatch as dispatcher
 from tools.platform_verify_contract import _workflow_step_blocks
 
@@ -25,10 +27,268 @@ from tools.platform_verify_contract import _workflow_step_blocks
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOLS_ROOT = REPO_ROOT / "platform" / "tools"
 SOURCE_SHA = "d974c8b0536683d0ca8d6f1aca8331a215023fd4"
+PIN_SHA = "4233e3ce3395da6948192f14e50af2033774f4f0"
 ARTIFACT_DIGEST = "sha256:" + "e" * 64
 
 
 class HostToolsBundleTests(unittest.TestCase):
+    def _current_target_sha(self) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed.stdout.strip()
+
+    def test_repository_pin_declares_installed_generation_and_closure_baseline(self) -> None:
+        contract = json.loads(
+            (REPO_ROOT / pin.PIN_RELATIVE_PATH).read_text(encoding="utf-8")
+        )
+        self.assertEqual(contract["schema"], 1)
+        self.assertEqual(contract["repository"], pin.EXPECTED_REPOSITORY)
+        self.assertEqual(contract["host_tools_sha"], PIN_SHA)
+        self.assertEqual(
+            tuple(record["path"] for record in contract["closure"]),
+            tuple(f"platform/tools/{name}" for name in bundle.HOST_TOOL_FILES),
+        )
+
+    def test_repository_pin_rejects_circular_generation_and_repository_tampering(self) -> None:
+        with self.assertRaises(pin.HostToolsPinError):
+            pin.resolve_pin(
+                REPO_ROOT,
+                target_sha="4b795dec048a9abda4577f32f36586bedfc39045",
+                expected_repository=pin.EXPECTED_REPOSITORY,
+            )
+        with self.assertRaises(pin.HostToolsPinError):
+            pin.resolve_pin(
+                REPO_ROOT,
+                target_sha=PIN_SHA,
+                expected_repository="attacker/old_sparky",
+            )
+
+    def test_repository_pin_rejects_closure_type_path_and_digest_tampering(self) -> None:
+        payload = json.loads(
+            (REPO_ROOT / pin.PIN_RELATIVE_PATH).read_text(encoding="utf-8")
+        )
+        for mutation in (
+            lambda value: {**value, "schema": "1"},
+            lambda value: {**value, "repository": "StrayForest/old_sparky/escape"},
+            lambda value: {**value, "host_tools_sha": 4233},
+            lambda value: {**value, "closure": "not-a-list"},
+            lambda value: {
+                **value,
+                "closure": [
+                    {**value["closure"][0], "path": "../outside.py"},
+                    *value["closure"][1:],
+                ],
+            },
+            lambda value: {
+                **value,
+                "closure": [
+                    {**value["closure"][0], "sha256": "0" * 64},
+                    *value["closure"][1:],
+                ],
+            },
+        ):
+            with self.subTest(mutation=mutation):
+                candidate = mutation(payload)
+                with patch.object(pin, "_read_pin", return_value=candidate):
+                    with self.assertRaises(pin.HostToolsPinError):
+                        pin.resolve_pin(
+                            REPO_ROOT,
+                            target_sha=self._current_target_sha(),
+                            expected_repository=pin.EXPECTED_REPOSITORY,
+                        )
+
+    def test_repository_pin_path_and_duplicate_key_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "platform" / "contracts").mkdir(parents=True)
+            pin_path = root / pin.PIN_RELATIVE_PATH
+            pin_path.write_text('{"schema":1,"schema":1}\n', encoding="utf-8")
+            with self.assertRaises(pin.HostToolsPinError):
+                pin._read_pin(root)
+            pin_path.unlink()
+            pin_path.symlink_to(REPO_ROOT / pin.PIN_RELATIVE_PATH)
+            with self.assertRaises(pin.HostToolsPinError):
+                pin._read_pin(root)
+
+    def test_pin_bump_uses_prior_generation_and_rejects_unpinned_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "repo"
+            cloned = subprocess.run(
+                ["git", "clone", "--no-local", str(REPO_ROOT), str(fixture)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(cloned.returncode, 0, cloned.stderr)
+            commands = (
+                ["remote", "set-url", "origin", "https://github.com/StrayForest/old_sparky.git"],
+                ["config", "user.email", "host-tools-pin-test@example.invalid"],
+                ["config", "user.name", "Host tools pin test"],
+            )
+            for command in commands:
+                configured = subprocess.run(
+                    ["git", "-C", str(fixture), *command],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(configured.returncode, 0, configured.stderr)
+
+            def git(*arguments: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(fixture), *arguments],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                return completed.stdout.strip()
+
+            base_available = subprocess.run(
+                ["git", "-C", str(fixture), "cat-file", "-e", f"{PIN_SHA}^{{commit}}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).returncode == 0
+            if base_available:
+                subprocess.run(
+                    ["git", "-C", str(fixture), "checkout", "--detach", PIN_SHA],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                generation_base = PIN_SHA
+            else:
+                # The CI checkout is intentionally shallow at the PR merge
+                # commit. Build a local base generation when that exact
+                # installed commit object is unavailable; the lifecycle
+                # assertions below remain identical and network-free.
+                for path in (
+                    fixture / pin.PIN_RELATIVE_PATH,
+                    fixture / "platform/tools/platform_host_tools_pin.py",
+                ):
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
+                git("add", "-u")
+                git("commit", "-m", "fixture host-tools base generation")
+                generation_base = git("rev-parse", "HEAD")
+            contract_path = fixture / pin.PIN_RELATIVE_PATH
+            contract_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.loads(
+                (REPO_ROOT / pin.PIN_RELATIVE_PATH).read_text(encoding="utf-8")
+            )
+            payload["host_tools_sha"] = generation_base
+            contract_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            shutil.copyfile(
+                REPO_ROOT / "platform/tools/platform_host_tools_pin.py",
+                fixture / "platform/tools/platform_host_tools_pin.py",
+            )
+
+            git(
+                "add",
+                "platform/contracts/host_tools_pin.json",
+                "platform/tools/platform_host_tools_pin.py",
+            )
+            git("commit", "-m", "add host-tools pin contract")
+            baseline_target = git("rev-parse", "HEAD")
+            self.assertEqual(
+                pin.resolve_pin(fixture, target_sha=baseline_target),
+                generation_base,
+            )
+
+            changed_file = fixture / "platform/tools/platform_storage_evidence_summary.py"
+            changed_file.write_bytes(
+                changed_file.read_bytes() + b"\n# intentional host-tools bump fixture\n"
+            )
+            git("add", str(changed_file.relative_to(fixture)))
+            git("commit", "-m", "change host-tools closure")
+            generation_a = git("rev-parse", "HEAD")
+            with self.assertRaises(pin.HostToolsPinError):
+                pin.resolve_pin(fixture, target_sha=generation_a)
+
+            payload = json.loads(contract_path.read_text(encoding="utf-8"))
+            payload["host_tools_sha"] = generation_a
+            changed_record = next(
+                record
+                for record in payload["closure"]
+                if record["path"] == "platform/tools/platform_storage_evidence_summary.py"
+            )
+            changed_record["sha256"] = hashlib.sha256(
+                changed_file.read_bytes()
+            ).hexdigest()
+            contract_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            git("add", "platform/contracts/host_tools_pin.json")
+            git("commit", "-m", "pin provisioned host-tools generation")
+            pin_commit_b = git("rev-parse", "HEAD")
+            self.assertEqual(
+                git("diff-tree", "--no-commit-id", "--name-only", "-r", pin_commit_b),
+                "platform/contracts/host_tools_pin.json",
+            )
+            self.assertEqual(pin.resolve_pin(fixture, target_sha=pin_commit_b), generation_a)
+
+            changed_again = fixture / "platform/tools/platform_validate_edge_policy.py"
+            changed_again.write_bytes(
+                changed_again.read_bytes() + b"\n# unpinned closure drift fixture\n"
+            )
+            git("add", str(changed_again.relative_to(fixture)))
+            git("commit", "-m", "change host-tools closure without pin")
+            with self.assertRaises(pin.HostToolsPinError):
+                pin.resolve_pin(fixture, target_sha=git("rev-parse", "HEAD"))
+
+    def test_workflow_keeps_application_and_host_generation_sha_separate(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        host_build = workflow.split("  build-host-tools:", 1)[1].split(
+            "  host-capability-preflight:", 1
+        )[0]
+        host_build_step = host_build.split(
+            "      - name: Build and verify deterministic host-tools bundle", 1
+        )[1].split("      - name: Publish exact host-tools bundle", 1)[0]
+        host_preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
+            "  build-release:", 1
+        )[0]
+        preflight = workflow.split("  preflight:", 1)[1].split("  production:", 1)[0]
+        production = workflow.split("  production:", 1)[1]
+        self.assertIn("platform_host_tools_pin.py", host_build)
+        self.assertIn("ref: ${{ steps.resolve_host_tools_pin.outputs.host_tools_sha }}", host_build)
+        self.assertIn('--source-sha "$HOST_TOOLS_SHA"', host_build_step)
+        self.assertNotIn('--source-sha "$TARGET_SHA"', host_build_step)
+        self.assertNotIn("/opt/oldsparky/platform/shared/host-tools/${{ github.sha }}", workflow)
+        self.assertIn("source_sha=$HOST_TOOLS_SHA", host_preflight)
+        self.assertIn("generation=$HOST_TOOLS_SHA", host_preflight)
+        self.assertIn("needs.host-capability-preflight.outputs.host_tools_sha", preflight)
+        self.assertIn("needs.host-capability-preflight.outputs.host_tools_sha", production)
+
+        security = (REPO_ROOT / ".github/workflows/platform-security.yml").read_text(
+            encoding="utf-8"
+        )
+        verification = security.split("  verification-contract:", 1)[1].split(
+            "  release-runtime:", 1
+        )[0]
+        self.assertIn("fetch-depth: 0", verification)
+        self.assertIn("ref: ${{ github.sha }}", verification)
+        self.assertIn(
+            "name: Resolve and verify canonical host-tools pin against full target history",
+            verification,
+        )
+        self.assertIn("platform/tools/platform_host_tools_pin.py resolve", verification)
+        self.assertIn('--target-sha "$TARGET_SHA"', verification)
+        self.assertIn('--expected-repository "$EXPECTED_REPOSITORY"', verification)
+        self.assertIn("test ! -e \"$pin_output\"", verification)
+
     def _source_fixture(self, root: Path) -> Path:
         source_root = root / "source"
         tools = source_root / "platform" / "tools"
@@ -931,8 +1191,8 @@ raise SystemExit(module.main(["host-capabilities"]))
         self.assertIn("ulimit -f 1", probe)
         self.assertIn("< /dev/null", probe)
         self.assertIn(
-            'expected_output="HOST_TOOLS schema=1 source_sha=$TARGET_SHA '
-            'generation=$TARGET_SHA dispatcher=2 artifact_prepare=2 supervisor=2 '
+            'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA '
+            'generation=$HOST_TOOLS_SHA dispatcher=2 artifact_prepare=2 supervisor=2 '
             'input_guard=1 python_isolated=1 python_bytecode_disabled=1"',
             probe,
         )

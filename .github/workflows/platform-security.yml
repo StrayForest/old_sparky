@@ -581,7 +581,32 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Resolve and verify canonical host-tools pin against full target history
+        shell: bash
+        env:
+          TARGET_SHA: ${{ github.sha }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"
+          target_sha_re='^[0-9a-f]{40}$'
+          [[ "$TARGET_SHA" =~ $target_sha_re ]]
+          pin_output="$RUNNER_TEMP/platform-host-tools-pin"
+          trap 'rm -f -- "$pin_output"' EXIT
+          /usr/bin/python3 platform/tools/platform_host_tools_pin.py resolve \
+            --source-root "$GITHUB_WORKSPACE" \
+            --target-sha "$TARGET_SHA" \
+            --expected-repository "$EXPECTED_REPOSITORY" > "$pin_output"
+          test "$(stat -c '%F:%h:%a' -- "$pin_output")" = "regular file:1:600"
+          test "$(wc -l < "$pin_output" | tr -d ' ')" = 1
+          IFS= read -r host_tools_sha < "$pin_output"
+          [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
+          rm -f -- "$pin_output"
+          test ! -e "$pin_output" && test ! -L "$pin_output"
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"

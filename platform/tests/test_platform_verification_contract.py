@@ -62,6 +62,7 @@ from tools.platform_verify_contract import (
     collect_issues,
     _ci_dependency_issues,
     extract_gate_invocations,
+    host_tools_pin_verification_issues,
     release_runtime_workflow_issues,
     security_status_permission_issues,
     workflow_level_permission_issues,
@@ -801,6 +802,35 @@ except lock.VerificationLockError as exc:
         self.assertEqual(
             security_status_permission_issues(workflow_text),
             [],
+        )
+        self.assertEqual(host_tools_pin_verification_issues(workflow_text), [])
+        missing_pin_resolver = workflow_text.replace(
+            "platform/tools/platform_host_tools_pin.py resolve",
+            "platform/tools/platform_host_tools_pin.py inspect",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "canonical host-tools pin resolver exactly once" in issue
+                for issue in host_tools_pin_verification_issues(missing_pin_resolver)
+            )
+        )
+        missing_pin_history = workflow_text.replace(
+            "          ref: ${{ github.sha }}\n"
+            "          fetch-depth: 0\n"
+            "          persist-credentials: false\n"
+            "      - name: Resolve and verify canonical host-tools pin against full target history",
+            "          ref: ${{ github.sha }}\n"
+            "          fetch-depth: 1\n"
+            "          persist-credentials: false\n"
+            "      - name: Resolve and verify canonical host-tools pin against full target history",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "full target history" in issue
+                for issue in host_tools_pin_verification_issues(missing_pin_history)
+            )
         )
         self.assertEqual(release_runtime_workflow_issues(workflow_text), [])
         missing_manual_route = workflow_text.replace(
