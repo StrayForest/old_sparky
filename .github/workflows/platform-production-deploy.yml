@@ -495,6 +495,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The installed platform_workflow_remote_dispatch.py is only inspected
+          # through data-only shell checks; this job never invokes repo code.
           # The downloaded host bundle remains data-only.  This job only
           # inspects its members and the already-provisioned host generation.
           umask 077
