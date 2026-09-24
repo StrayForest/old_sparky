@@ -38,6 +38,9 @@ let holdFirstReadyVoteResponse = false;
 let releaseHeldReadyVoteResponse: (() => void) | null = null;
 let bracketRequests = 0;
 let inviteClaimRequests = 0;
+let workspaceInFlight = 0;
+let holdNextWorkspaceResponse = false;
+let releaseHeldWorkspaceResponse: (() => void) | null = null;
 
 let apiServer: Server | null = null;
 
@@ -79,36 +82,47 @@ test.beforeAll(async () => {
 
     const workspaceMatch = url.pathname.match(/^\/api\/v1\/tournaments\/([^/]+)\/workspace$/);
     if (workspaceMatch) {
-      const slug = workspaceMatch[1] ?? publicTournamentSlug;
-      const inviteCode = url.searchParams.get("invite_code");
-      workspaceRequests.push({
-        slug,
-        participantsLimit: Number(url.searchParams.get("participants_limit") ?? 25),
-        participantsOffset: Number(url.searchParams.get("participants_offset") ?? 0),
-        workspaceView: url.searchParams.get("workspace_view") ?? "bracket",
-        includeCurrentUser: url.searchParams.get("include_current_user") !== "false"
-      });
-      if (slug === privateBearerSlug) {
-        bearerWorkspaceRequests.push({
+      workspaceInFlight += 1;
+      try {
+        const slug = workspaceMatch[1] ?? publicTournamentSlug;
+        const inviteCode = url.searchParams.get("invite_code");
+        workspaceRequests.push({
           slug,
-          inviteCode,
-          workspaceView: url.searchParams.get("workspace_view") ?? "bracket"
+          participantsLimit: Number(url.searchParams.get("participants_limit") ?? 25),
+          participantsOffset: Number(url.searchParams.get("participants_offset") ?? 0),
+          workspaceView: url.searchParams.get("workspace_view") ?? "bracket",
+          includeCurrentUser: url.searchParams.get("include_current_user") !== "false"
         });
-        const bearerStatus = privateBearerStatus(inviteCode);
-        if (bearerStatus !== null) {
-          bearerResponseStatuses.push({ code: inviteCode, status: bearerStatus });
-          respondJson(response, bearerStatus, { detail: "Private tournament access denied." });
-          return;
+        if (slug === privateBearerSlug) {
+          bearerWorkspaceRequests.push({
+            slug,
+            inviteCode,
+            workspaceView: url.searchParams.get("workspace_view") ?? "bracket"
+          });
+          const bearerStatus = privateBearerStatus(inviteCode);
+          if (bearerStatus !== null) {
+            bearerResponseStatuses.push({ code: inviteCode, status: bearerStatus });
+            respondJson(response, bearerStatus, { detail: "Private tournament access denied." });
+            return;
+          }
+          bearerResponseStatuses.push({ code: inviteCode, status: 200 });
         }
-        bearerResponseStatuses.push({ code: inviteCode, status: 200 });
+        if (holdNextWorkspaceResponse) {
+          holdNextWorkspaceResponse = false;
+          await new Promise<void>((resolve) => {
+            releaseHeldWorkspaceResponse = resolve;
+          });
+        }
+        respondJson(response, 200, workspacePayload(
+          slug,
+          hasTestCookie,
+          url.searchParams.get("include_current_user") !== "false",
+          inviteCode,
+          request.headers.cookie?.includes(privateBearerInactiveCookie) ?? false
+        ));
+      } finally {
+        workspaceInFlight -= 1;
       }
-      respondJson(response, 200, workspacePayload(
-        slug,
-        hasTestCookie,
-        url.searchParams.get("include_current_user") !== "false",
-        inviteCode,
-        request.headers.cookie?.includes(privateBearerInactiveCookie) ?? false
-      ));
       return;
     }
 
@@ -184,12 +198,18 @@ test.beforeEach(() => {
   releaseHeldReadyVoteResponse = null;
   bracketRequests = 0;
   inviteClaimRequests = 0;
+  workspaceInFlight = 0;
+  holdNextWorkspaceResponse = false;
+  releaseHeldWorkspaceResponse = null;
 });
 
 test.afterEach(() => {
   holdFirstReadyVoteResponse = false;
   releaseHeldReadyVoteResponse?.();
   releaseHeldReadyVoteResponse = null;
+  holdNextWorkspaceResponse = false;
+  releaseHeldWorkspaceResponse?.();
+  releaseHeldWorkspaceResponse = null;
 });
 
 test.afterAll(async () => {
@@ -203,7 +223,7 @@ test.afterAll(async () => {
   apiServer = null;
 });
 
-test("tournament detail skips participant roster payload and session refetch", async ({ page }) => {
+test("tournament detail hydrates without participant roster or initial session refetch", async ({ page }) => {
   const documentResponse = await page.goto(`/tournaments/${publicTournamentSlug}`);
   const serverHtml = await documentResponse?.text() ?? "";
   expect(
@@ -213,17 +233,76 @@ test("tournament detail skips participant roster payload and session refetch", a
 
   expect(serverHtml).not.toContain("data-testid=\"tournament-participant-roster\"");
   expect(serverHtml).not.toContain("SSR Player");
-  await expectWorkspaceRequest({
+  await expect(page.locator(".participants-value").first()).toHaveText("26 / 64");
+  await expectWorkspaceRequest(page, {
     slug: publicTournamentSlug,
     participantsLimit: 0,
     participantsOffset: 0,
     workspaceView: "detail",
     includeCurrentUser: false
-  });
+  }, page.locator(".participants-value").first());
   await expect(page.getByTestId("tournament-participant-roster")).toHaveCount(0);
-  await expect(page.locator(".participants-value").first()).toHaveText("26 / 64");
   await expect.poll(() => participantRequests).toEqual([]);
   await expect.poll(() => usersMeRequests).toBe(0);
+  await expectNoHorizontalOverflow(page);
+});
+
+test("tournament detail refetches after the authenticated session changes", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-07-20T16:10:00Z") });
+  await page.context().addCookies([{
+    name: "deadlock_platform_session",
+    value: "lean-detail-session",
+    url: webBaseUrl
+  }, {
+    name: "lean-detail-smoke",
+    value: "1",
+    url: webBaseUrl
+  }]);
+
+  const expectedWorkspace = {
+    slug: readyTournamentSlug,
+    participantsLimit: 0,
+    participantsOffset: 0,
+    workspaceView: "detail",
+    includeCurrentUser: false
+  };
+  const response = await page.goto(`/tournaments/${readyTournamentSlug}`);
+  expect(response?.status()).toBe(200);
+  const readyButton = page.getByRole("button", { name: "Подтвердить участие" });
+  await expect(readyButton).toBeVisible();
+  await expectWorkspaceRequest(page, expectedWorkspace, readyButton);
+
+  let invalidatedVoteRequests = 0;
+  const sessionLifecycleGeneration = await readLifecycleGeneration(page);
+  holdNextWorkspaceResponse = true;
+  await page.route(
+    `**/api/v1/tournaments/${readyTournamentSlug}/deadlock/ready-check/vote`,
+    async (route) => {
+      invalidatedVoteRequests += 1;
+      await route.fulfill({
+        status: 401,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "Session is invalid." })
+      });
+    }
+  );
+  await page.getByRole("button", { name: "Подтвердить участие" }).click();
+
+  await expect.poll(() => invalidatedVoteRequests).toBe(1);
+  await expect.poll(() => releaseHeldWorkspaceResponse !== null).toBe(true);
+  await expect(page.getByRole("heading", { level: 1, name: "Lean Ready Cup", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("heading", { level: 1, name: "Загрузка турнира", exact: true })).toBeVisible();
+  await expect.poll(async () => Number(await page.getByTestId("tournament-detail-lifecycle").getAttribute("data-generation")))
+    .toBeGreaterThan(sessionLifecycleGeneration);
+  await expect(page.getByTestId("tournament-detail-lifecycle")).toHaveAttribute("data-settled", "false");
+  releaseHeldWorkspaceResponse?.();
+  releaseHeldWorkspaceResponse = null;
+  await expectWorkspaceRequests(
+    page,
+    [expectedWorkspace, expectedWorkspace],
+    page.getByRole("button", { name: "Подтвердить участие" }),
+    { previousGeneration: sessionLifecycleGeneration }
+  );
   await expectNoHorizontalOverflow(page);
 });
 
@@ -242,23 +321,28 @@ test("registered detail uses compact workspace state and ready vote avoids full 
 
   const response = await page.goto(`/tournaments/${readyTournamentSlug}`);
   expect(response?.status()).toBe(200);
-  await expectWorkspaceRequest({
+  const cancelButton = page.getByRole("button", { name: "Отменить регистрацию" });
+  await expect(cancelButton).toBeVisible();
+  await expectWorkspaceRequest(page, {
     slug: readyTournamentSlug,
     participantsLimit: 0,
     participantsOffset: 0,
     workspaceView: "detail",
     includeCurrentUser: false
-  });
-  await expect(page.getByRole("button", { name: "Отменить регистрацию" })).toBeVisible();
+  }, cancelButton);
   await expect(page.getByRole("button", { name: "Подтвердить участие" })).toBeEnabled();
   await expect.poll(() => authBootstrapRequests).toBe(1);
 
-  const workspaceRequestCountBeforeVote = workspaceRequests.length;
+  const workspaceRequestsBeforeVote = [...workspaceRequests];
   await page.getByRole("button", { name: "Подтвердить участие" }).click();
   await expect(page.getByRole("button", { name: "Отменить подтверждение" })).toBeVisible();
   await expect(page.getByText("Участие подтверждено").last()).toBeVisible();
   await expect.poll(() => readyVoteRequests).toBe(1);
-  expect(workspaceRequests).toHaveLength(workspaceRequestCountBeforeVote);
+  await expectWorkspaceRequests(
+    page,
+    workspaceRequestsBeforeVote,
+    page.getByRole("button", { name: "Отменить подтверждение" })
+  );
   await expect.poll(() => participantRequests).toEqual([]);
   await expect.poll(() => usersMeRequests).toBe(0);
   await expect.poll(() => csrfRequests).toBe(1);
@@ -311,13 +395,13 @@ test("bracket page uses the initial workspace and has no background refresh", as
   }]);
   const response = await page.goto(`/tournaments/${publicTournamentSlug}/bracket`);
   expect(response?.status()).toBe(200);
-  expect(workspaceRequests).toEqual([{
+  await expectWorkspaceRequests(page, [{
     slug: publicTournamentSlug,
     participantsLimit: 0,
     participantsOffset: 0,
     workspaceView: "bracket",
     includeCurrentUser: false
-  }]);
+  }], page.locator("main").first(), { lifecycle: false });
   await expect.poll(() => authBootstrapRequests).toBe(1);
   expect(bracketRequests).toBe(0);
   expect(participantRequests).toEqual([]);
@@ -329,7 +413,7 @@ test("bracket page uses the initial workspace and has no background refresh", as
   await expectNoHorizontalOverflow(page);
 });
 
-test("anonymous bearer keeps the exact code across detail, bracket navigation, and reload", async ({ page }) => {
+test("anonymous bearer and invite soft navigation keep the exact code across detail and reload", async ({ page }) => {
   await blockNextRoutePrefetch(page);
   const lowerCaseCode = privateBearerCode.toLowerCase();
   const detailPath = `/tournaments/${privateBearerSlug}?invite_code=${lowerCaseCode}`;
@@ -342,18 +426,15 @@ test("anonymous bearer keeps the exact code across detail, bracket navigation, a
   await expect(page.getByTestId("registration-steps").getByRole("button")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Зарегистрироваться" })).toHaveCount(0);
   await expect(page.locator("main a[href^='/profile']")).toHaveCount(0);
+  await waitForWorkspaceQuiescence(page, page.getByTestId("tournament-read-only-registration"));
 
   const bracketLink = page.locator("a.bracket-open-link");
   await expect(bracketLink).toHaveAttribute("href", bracketPath);
-  expect(bearerWorkspaceRequests).toEqual([{
+  await expectBearerWorkspaceRequests(page, [{
     slug: privateBearerSlug,
     inviteCode: privateBearerCode,
     workspaceView: "detail"
-  }, {
-    slug: privateBearerSlug,
-    inviteCode: privateBearerCode,
-    workspaceView: "detail"
-  }]);
+  }], page.getByTestId("tournament-read-only-registration"));
 
   await bracketLink.click();
   await expect(page).toHaveURL(`${webBaseUrl}${bracketPath}`);
@@ -361,12 +442,7 @@ test("anonymous bearer keeps the exact code across detail, bracket navigation, a
   await expect(page.locator("[data-testid='bracket-match'] input")).toHaveCount(0);
   await expect(page.locator("[data-testid='bracket-match'] button")).toHaveCount(0);
   await expect(page.locator("main a[href^='/profile']")).toHaveCount(0);
-  expect(bearerWorkspaceRequests).toEqual([
-    {
-      slug: privateBearerSlug,
-      inviteCode: privateBearerCode,
-      workspaceView: "detail"
-    },
+  await expectBearerWorkspaceRequests(page, [
     {
       slug: privateBearerSlug,
       inviteCode: privateBearerCode,
@@ -377,17 +453,12 @@ test("anonymous bearer keeps the exact code across detail, bracket navigation, a
       inviteCode: privateBearerCode,
       workspaceView: "bracket"
     }
-  ]);
+  ], page.getByTestId("bracket-match"), { lifecycle: false });
 
   await page.reload();
   await expect(page).toHaveURL(`${webBaseUrl}${bracketPath}`);
   await expect(page.getByTestId("bracket-match")).toHaveCount(1);
-  expect(bearerWorkspaceRequests).toEqual([
-    {
-      slug: privateBearerSlug,
-      inviteCode: privateBearerCode,
-      workspaceView: "detail"
-    },
+  await expectBearerWorkspaceRequests(page, [
     {
       slug: privateBearerSlug,
       inviteCode: privateBearerCode,
@@ -403,9 +474,75 @@ test("anonymous bearer keeps the exact code across detail, bracket navigation, a
       inviteCode: privateBearerCode,
       workspaceView: "bracket"
     }
-  ]);
+  ], page.getByTestId("bracket-match"), { lifecycle: false });
   expect(inviteClaimRequests).toBe(0);
   expect(apiRequests.join("\n")).not.toContain(privateBearerCode);
+
+  const inviteTransitionStart = bearerWorkspaceRequests.length;
+  await page.route("**/api/v1/tournaments/invites/claim", async (route) => {
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        tournament: { slug: privateBearerSlug },
+        participant: null,
+        invite: { code: privateBearerCode }
+      })
+    });
+  });
+  await page.goto(`/tournaments/${privateBearerSlug}`);
+  await expect(page.locator(".tournament-invite-gate")).toBeVisible();
+  await expect.poll(() => bearerWorkspaceRequests.length).toBe(inviteTransitionStart + 2);
+  await expectBearerWorkspaceRequests(page, [
+    {
+      slug: privateBearerSlug,
+      inviteCode: null,
+      workspaceView: "detail"
+    },
+    {
+      slug: privateBearerSlug,
+      inviteCode: null,
+      workspaceView: "detail"
+    }
+  ], page.locator(".tournament-invite-gate"), {}, () => bearerWorkspaceRequests.slice(inviteTransitionStart));
+
+  const inviteLifecycleGeneration = await readLifecycleGeneration(page);
+  await page.getByLabel("Код приглашения").fill(privateBearerCode);
+  await page.getByRole("button", { name: "Открыть турнир" }).click();
+  await expect(page).toHaveURL(`${webBaseUrl}/tournaments/${privateBearerSlug}?invite_code=${privateBearerCode}`);
+  await expect(page.getByTestId("tournament-read-only-registration")).toBeVisible();
+  await expect(page.locator(".tournament-invite-gate")).toHaveCount(0);
+  await expect.poll(() => bearerWorkspaceRequests.length).toBe(inviteTransitionStart + 3);
+  await expectBearerWorkspaceRequests(page, [{
+    slug: privateBearerSlug,
+    inviteCode: privateBearerCode,
+    workspaceView: "detail"
+  }], page.getByTestId("tournament-read-only-registration"), {
+    previousGeneration: inviteLifecycleGeneration
+  }, () => bearerWorkspaceRequests.slice(inviteTransitionStart + 2));
+
+  const refreshStart = bearerWorkspaceRequests.length;
+  const refreshLifecycleGeneration = await readLifecycleGeneration(page);
+  const refreshed = await page.evaluate(() => {
+    const next = (window as Window & {
+      next?: { router?: { refresh: () => void } };
+    }).next;
+    if (!next?.router) {
+      return false;
+    }
+    next.router.refresh();
+    return true;
+  });
+  expect(refreshed).toBe(true);
+  await expect.poll(() => bearerWorkspaceRequests.length).toBe(refreshStart + 1);
+  await expect(page.getByTestId("tournament-read-only-registration")).toBeVisible();
+  await expectBearerWorkspaceRequests(page, [{
+    slug: privateBearerSlug,
+    inviteCode: privateBearerCode,
+    workspaceView: "detail"
+  }], page.getByTestId("tournament-read-only-registration"), {
+    previousGeneration: refreshLifecycleGeneration
+  }, () => bearerWorkspaceRequests.slice(refreshStart));
   await expectNoHorizontalOverflow(page);
 });
 
@@ -505,8 +642,65 @@ test("duplicate or malformed bearer query values fail closed before the workspac
   expect(inviteClaimRequests).toBe(0);
 });
 
-async function expectWorkspaceRequest(expected: typeof workspaceRequests[number]) {
+type WorkspaceQuiescenceOptions = {
+  lifecycle?: boolean;
+  previousGeneration?: number;
+};
+
+async function readLifecycleGeneration(page: import("@playwright/test").Page): Promise<number> {
+  const generation = await page.getByTestId("tournament-detail-lifecycle").getAttribute("data-generation");
+  expect(generation).not.toBeNull();
+  return Number(generation);
+}
+
+async function waitForWorkspaceQuiescence(
+  page: import("@playwright/test").Page,
+  ready: import("@playwright/test").Locator,
+  options: WorkspaceQuiescenceOptions = {}
+) {
+  await expect(ready).toBeVisible();
+  if (options.lifecycle !== false) {
+    const lifecycleMarker = page.getByTestId("tournament-detail-lifecycle");
+    if (options.previousGeneration !== undefined) {
+      await expect.poll(async () => Number(await lifecycleMarker.getAttribute("data-generation")))
+        .toBeGreaterThan(options.previousGeneration);
+    }
+    await expect(lifecycleMarker).toHaveAttribute("data-settled", "true");
+  }
+  await expect.poll(() => workspaceInFlight).toBe(0);
+}
+
+async function expectWorkspaceRequest(
+  page: import("@playwright/test").Page,
+  expected: typeof workspaceRequests[number],
+  ready: import("@playwright/test").Locator
+) {
   await expect.poll(() => workspaceRequests).toEqual([expected]);
+  await waitForWorkspaceQuiescence(page, ready);
+  expect(workspaceRequests).toEqual([expected]);
+}
+
+async function expectWorkspaceRequests(
+  page: import("@playwright/test").Page,
+  expected: typeof workspaceRequests,
+  ready: import("@playwright/test").Locator,
+  options: WorkspaceQuiescenceOptions = {}
+) {
+  await expect.poll(() => workspaceRequests).toEqual(expected);
+  await waitForWorkspaceQuiescence(page, ready, options);
+  expect(workspaceRequests).toEqual(expected);
+}
+
+async function expectBearerWorkspaceRequests(
+  page: import("@playwright/test").Page,
+  expected: typeof bearerWorkspaceRequests,
+  ready: import("@playwright/test").Locator,
+  options: WorkspaceQuiescenceOptions = {},
+  actual: () => typeof bearerWorkspaceRequests = () => bearerWorkspaceRequests
+) {
+  await expect.poll(actual).toEqual(expected);
+  await waitForWorkspaceQuiescence(page, ready, options);
+  expect(actual()).toEqual(expected);
 }
 
 function workspacePayload(

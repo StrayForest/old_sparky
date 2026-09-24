@@ -13,7 +13,25 @@ test("invite-only pages convert missing workspace proof into invite-code flow", 
   const bracketBoard = source("components/bracket/bracket-board.tsx");
 
   expect(detailPage).toContain("TournamentDetailClientPage");
+  expect(detailPage).toContain("initialTournament={initialTournament}");
   expect(detailClientPage).toContain("PlatformApiError");
+  expect(detailClientPage).toContain("initialTournament?: TournamentDetail");
+  expect(detailClientPage).toContain("initialRequestRef");
+  expect(detailClientPage).toContain("serverSeedVersionRef");
+  expect(detailClientPage).toContain("serverSeedRef.current.payload !== initialTournament");
+  expect(detailClientPage).toContain("initialRequest.payload === initialTournament");
+  expect(detailClientPage).toContain("initialRequest.retryGeneration === retryGeneration");
+  expect(detailClientPage).toContain("stateContextRef");
+  expect(detailClientPage).toContain("sameDetailContext");
+  expect(detailClientPage).toContain("const displayState");
+  expect(detailClientPage).toContain("lifecycleGenerationRef");
+  expect(detailClientPage).toContain("nextLifecycleGeneration");
+  expect(detailClientPage).toContain("data-testid=\"tournament-detail-lifecycle\"");
+  expect(detailClientPage).toContain("data-settled={settled ? \"true\" : \"false\"}");
+  expect(detailClientPage).not.toContain("data-slug");
+  expect(detailClientPage).not.toContain("data-invite");
+  expect(detailClientPage).not.toContain("data-session");
+  expect(detailClientPage).toContain("key={serverSeedVersion}");
   expect(detailClientPage).toContain("error.status === 401");
   expect(detailClientPage).toContain("TournamentInviteGate");
   expect(bracketPage).toContain("PlatformApiError");
