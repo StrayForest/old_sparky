@@ -32,11 +32,21 @@ ARTIFACT_DIGEST = "sha256:" + "e" * 64
 
 
 class HostToolsBundleTests(unittest.TestCase):
+    def _current_target_sha(self) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed.stdout.strip()
+
     def test_repository_pin_resolves_installed_generation_and_closure_baseline(self) -> None:
         self.assertEqual(
             pin.resolve_pin(
                 REPO_ROOT,
-                target_sha=PIN_SHA,
+                target_sha=self._current_target_sha(),
                 expected_repository=pin.EXPECTED_REPOSITORY,
             ),
             PIN_SHA,
@@ -94,7 +104,7 @@ class HostToolsBundleTests(unittest.TestCase):
                     with self.assertRaises(pin.HostToolsPinError):
                         pin.resolve_pin(
                             REPO_ROOT,
-                            target_sha=PIN_SHA,
+                            target_sha=self._current_target_sha(),
                             expected_repository=pin.EXPECTED_REPOSITORY,
                         )
 
@@ -135,16 +145,6 @@ class HostToolsBundleTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(configured.returncode, 0, configured.stderr)
-            contract_path = fixture / pin.PIN_RELATIVE_PATH
-            contract_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(
-                REPO_ROOT / pin.PIN_RELATIVE_PATH,
-                contract_path,
-            )
-            shutil.copyfile(
-                REPO_ROOT / "platform/tools/platform_host_tools_pin.py",
-                fixture / "platform/tools/platform_host_tools_pin.py",
-            )
 
             def git(*arguments: str) -> str:
                 completed = subprocess.run(
@@ -156,6 +156,49 @@ class HostToolsBundleTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 return completed.stdout.strip()
 
+            base_available = subprocess.run(
+                ["git", "-C", str(fixture), "cat-file", "-e", f"{PIN_SHA}^{{commit}}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).returncode == 0
+            if base_available:
+                subprocess.run(
+                    ["git", "-C", str(fixture), "checkout", "--detach", PIN_SHA],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                generation_base = PIN_SHA
+            else:
+                # The CI checkout is intentionally shallow at the PR merge
+                # commit. Build a local base generation when that exact
+                # installed commit object is unavailable; the lifecycle
+                # assertions below remain identical and network-free.
+                for path in (
+                    fixture / pin.PIN_RELATIVE_PATH,
+                    fixture / "platform/tools/platform_host_tools_pin.py",
+                ):
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
+                git("add", "-u")
+                git("commit", "-m", "fixture host-tools base generation")
+                generation_base = git("rev-parse", "HEAD")
+            contract_path = fixture / pin.PIN_RELATIVE_PATH
+            contract_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.loads(
+                (REPO_ROOT / pin.PIN_RELATIVE_PATH).read_text(encoding="utf-8")
+            )
+            payload["host_tools_sha"] = generation_base
+            contract_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            shutil.copyfile(
+                REPO_ROOT / "platform/tools/platform_host_tools_pin.py",
+                fixture / "platform/tools/platform_host_tools_pin.py",
+            )
+
             git(
                 "add",
                 "platform/contracts/host_tools_pin.json",
@@ -163,7 +206,10 @@ class HostToolsBundleTests(unittest.TestCase):
             )
             git("commit", "-m", "add host-tools pin contract")
             baseline_target = git("rev-parse", "HEAD")
-            self.assertEqual(pin.resolve_pin(fixture, target_sha=baseline_target), PIN_SHA)
+            self.assertEqual(
+                pin.resolve_pin(fixture, target_sha=baseline_target),
+                generation_base,
+            )
 
             changed_file = fixture / "platform/tools/platform_storage_evidence_summary.py"
             changed_file.write_bytes(
