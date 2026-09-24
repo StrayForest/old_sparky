@@ -301,6 +301,366 @@ jobs:
             rm -rf -- "$trusted_root"
           fi
           test ! -e "$trusted_root" && test ! -L "$trusted_root"
+
+  # Build only the release-independent host-control data on a secret-free
+  # runner.  This job never installs or executes anything on production.
+  build-host-tools:
+    name: Build deterministic host-tools bundle in CI
+    needs: validate-dispatch
+    if: >-
+      needs.validate-dispatch.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.mode == 'deploy' || inputs.mode == 'preflight')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TARGET_SHA: ${{ github.sha }}
+    outputs:
+      artifact_id: ${{ steps.publish-host-tools.outputs.artifact-id }}
+      artifact_digest: ${{ steps.publish-host-tools.outputs.artifact-digest }}
+    steps:
+      - name: Checkout reviewed host-tools source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require reviewed dev source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/dev"
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all -- platform)"
+
+      - name: Build and verify deterministic host-tools bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/host-tools-artifact"
+          /usr/bin/python3 platform/tools/platform_host_tools_bundle.py build \
+            --source-root "$GITHUB_WORKSPACE" \
+            --source-sha "$TARGET_SHA" \
+            --output "$RUNNER_TEMP/host-tools-artifact/platform-host-tools-bundle.zip"
+          /usr/bin/python3 platform/tools/platform_host_tools_bundle.py verify \
+            --bundle "$RUNNER_TEMP/host-tools-artifact/platform-host-tools-bundle.zip" \
+            --expected-source-sha "$TARGET_SHA" \
+            --contract-dir "$RUNNER_TEMP/host-tools-artifact/contract"
+          test -f "$RUNNER_TEMP/host-tools-artifact/platform-host-tools-bundle.zip"
+          test ! -L "$RUNNER_TEMP/host-tools-artifact/platform-host-tools-bundle.zip"
+          test "$(stat -c '%F:%a' "$RUNNER_TEMP/host-tools-artifact/platform-host-tools-bundle.zip")" = "regular file:600"
+          test "$(stat -c '%s' "$RUNNER_TEMP/host-tools-artifact/platform-host-tools-bundle.zip")" -le 4194304
+          for contract_file in source_sha toolset_version manifest.sha256 capabilities.sha256 files.sha256 files.modes; do
+            test -f "$RUNNER_TEMP/host-tools-artifact/contract/$contract_file"
+            test ! -L "$RUNNER_TEMP/host-tools-artifact/contract/$contract_file"
+          done
+
+      - name: Publish exact host-tools bundle
+        id: publish-host-tools
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-host-tools-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/host-tools-artifact
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest exact host-tools bundle
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ runner.temp }}/host-tools-artifact/platform-host-tools-bundle.zip
+
+      - name: Remove host-tools build data
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -rf -- "$RUNNER_TEMP/host-tools-artifact"
+
+  # This is a read-only capability gate.  It consumes the attested bundle as
+  # data and checks the already provisioned immutable generation; it never
+  # uploads, installs, or executes bundle/candidate source on production.  The
+  # The checked generation contains platform_workflow_remote_dispatch.py, but
+  # this job inspects it only as data and never invokes repository code.
+  host-capability-preflight:
+    name: Verify immutable production host capabilities
+    needs:
+      - validate-dispatch
+      - build-host-tools
+    if: >-
+      needs.validate-dispatch.result == 'success' &&
+      needs.build-host-tools.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.mode == 'deploy' || inputs.mode == 'preflight')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      HOST_TOOLS_ARTIFACT_ID: ${{ needs.build-host-tools.outputs.artifact_id }}
+      HOST_TOOLS_ARTIFACT_DIGEST: ${{ needs.build-host-tools.outputs.artifact_digest }}
+      HOST_TOOLS_ARTIFACT_NAME: platform-host-tools-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Download and verify exact host-tools artifact
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          artifact-ids: ${{ env.HOST_TOOLS_ARTIFACT_ID }}
+          path: ${{ runner.temp }}/host-tools-download
+
+      - name: Validate host-tools artifact envelope and bundle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The installed platform_workflow_remote_dispatch.py is only inspected
+          # through data-only shell checks; this job never invokes repo code.
+          umask 077
+          [[ "$HOST_TOOLS_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          HOST_TOOLS_ARTIFACT_DIGEST="${HOST_TOOLS_ARTIFACT_DIGEST#sha256:}"
+          [[ "$HOST_TOOLS_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          metadata_fields="$(gh api \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --jq '[.id, .name, .expired, .workflow_run.id, .workflow_run.run_attempt, .workflow_run.head_sha] | @tsv' \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}")"
+          expected_metadata_fields="$(printf '%s\t%s\tfalse\t%s\t%s\t%s' \
+            "$HOST_TOOLS_ARTIFACT_ID" "$HOST_TOOLS_ARTIFACT_NAME" "$GITHUB_RUN_ID" \
+            "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA")"
+          test "$metadata_fields" = "$expected_metadata_fields"
+          api_zip="$RUNNER_TEMP/platform-host-tools-artifact.zip"
+          curl --fail-with-body --silent --show-error --location --max-filesize 8388608 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip" \
+            --output "$api_zip"
+          printf '%s  %s\n' "$HOST_TOOLS_ARTIFACT_DIGEST" "$api_zip" | sha256sum -c - >/dev/null 2>/dev/null
+          bundle_path="$RUNNER_TEMP/host-tools-download/platform-host-tools-bundle.zip"
+          test -f "$bundle_path" && test ! -L "$bundle_path"
+          test "$(stat -c '%F:%h:%s' -- "$bundle_path")" = "regular file:1:$(stat -c '%s' -- "$bundle_path")"
+          chmod 600 "$bundle_path"
+          test "$(stat -c '%s' -- "$bundle_path")" -le 4194304
+          contract_dir="$RUNNER_TEMP/host-tools-download/contract"
+          test -d "$contract_dir" && test ! -L "$contract_dir"
+          chmod 700 "$contract_dir"
+          for contract_file in source_sha toolset_version manifest.sha256 capabilities.sha256 files.sha256 files.modes; do
+            contract_path="$contract_dir/$contract_file"
+            test -f "$contract_path" && test ! -L "$contract_path"
+            test "$(stat -c '%F:%h:%s' -- "$contract_path")" = "regular file:1:$(stat -c '%s' -- "$contract_path")"
+            chmod 600 "$contract_path"
+          done
+          IFS= read -r source_sha < "$contract_dir/source_sha"
+          IFS= read -r toolset_version < "$contract_dir/toolset_version"
+          test "$source_sha" = "$TARGET_SHA"
+          test "$toolset_version" = "production-host-tools-v1"
+          IFS= read -r manifest_hash < "$contract_dir/manifest.sha256"
+          IFS= read -r capabilities_hash < "$contract_dir/capabilities.sha256"
+          [[ "$manifest_hash" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$capabilities_hash" =~ ^[0-9a-f]{64}$ ]]
+          bundle_stat="$(stat -c '%s' -- "$bundle_path")"
+          test "$bundle_stat" -gt 0
+          inner_dir="$RUNNER_TEMP/platform-host-tools-inner"
+          install -d -m 700 "$inner_dir"
+          /usr/bin/unzip -qq -n "$bundle_path" -d "$inner_dir"
+          test "$(find "$inner_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 1
+          inner_root="$inner_dir/platform-host-tools"
+          test -d "$inner_root" && test ! -L "$inner_root"
+          expected_members_file="$RUNNER_TEMP/platform-host-tools-expected-members"
+          /usr/bin/python3 - "$inner_root/manifest.json" "$contract_dir/files.sha256" "$expected_members_file" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          manifest_path, contract_path, output_path = map(Path, sys.argv[1:])
+          payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+          safe_member = re.compile(r"^platform_[A-Za-z0-9_.-]+\.(?:py|sh)$")
+          records = payload.get("files")
+          if (
+              type(payload.get("schema")) is not int
+              or payload.get("schema") != 1
+              or not isinstance(records, list)
+          ):
+              raise SystemExit("host-tools manifest schema is invalid")
+          manifest_paths = []
+          for record in records:
+              if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
+                  raise SystemExit("host-tools manifest record is invalid")
+              path = record.get("path")
+              if path != "capabilities.txt" and (not isinstance(path, str) or safe_member.fullmatch(path) is None):
+                  raise SystemExit("host-tools manifest path is unsafe")
+              if path in manifest_paths:
+                  raise SystemExit("host-tools manifest has duplicate paths")
+              manifest_paths.append(path)
+          if "capabilities.txt" not in manifest_paths:
+              raise SystemExit("host-tools capabilities member is missing")
+          contract_paths = []
+          for line in contract_path.read_text(encoding="ascii").splitlines():
+              digest, path = line.split("  ", 1)
+              if path in contract_paths:
+                  raise SystemExit("host-tools contract has duplicate paths")
+              contract_paths.append(path)
+          if sorted(manifest_paths) != sorted(contract_paths):
+              raise SystemExit("host-tools manifest and contract sets differ")
+          expected = sorted(
+              [f"platform-host-tools/{path}" for path in manifest_paths]
+              + ["platform-host-tools/manifest.json"]
+          )
+          output_path.write_text("\n".join(expected) + "\n", encoding="ascii")
+          PY
+          mapfile -t actual_members < <(/usr/bin/zipinfo -Z1 "$bundle_path")
+          for member in "${actual_members[@]}"; do
+            [[ "$member" =~ ^platform-host-tools/(platform_[A-Za-z0-9_.-]+\.(py|sh)|capabilities\.txt|manifest\.json)$ ]]
+          done
+          printf '%s\n' "${actual_members[@]}" | /usr/bin/sort -u > "$RUNNER_TEMP/platform-host-tools-actual-members"
+          test "$(wc -l < "$RUNNER_TEMP/platform-host-tools-actual-members" | tr -d ' ')" = "${#actual_members[@]}"
+          cmp -s "$expected_members_file" "$RUNNER_TEMP/platform-host-tools-actual-members"
+          mapfile -t expected_members < "$expected_members_file"
+          test "$(/usr/bin/sha256sum "$inner_root/manifest.json" | cut -d' ' -f1)" = "$manifest_hash"
+          test "$(/usr/bin/sha256sum "$inner_root/capabilities.txt" | cut -d' ' -f1)" = "$capabilities_hash"
+          grep -Fqx "schema=1" "$inner_root/capabilities.txt"
+          grep -Fqx "toolset_version=production-host-tools-v1" "$inner_root/capabilities.txt"
+          grep -Fqx "source_sha=$TARGET_SHA" "$inner_root/capabilities.txt"
+          grep -Fqx "capability=production_deploy_control" "$inner_root/capabilities.txt"
+          grep -Fqx "capability=python_isolated" "$inner_root/capabilities.txt"
+          grep -Fqx '"schema":1,' "$inner_root/manifest.json" || grep -Fq '"schema":1' "$inner_root/manifest.json"
+          grep -Fq "\"source_sha\":\"$TARGET_SHA\"" "$inner_root/manifest.json"
+          grep -Fq "\"generation\":\"$TARGET_SHA\"" "$inner_root/manifest.json"
+          grep -Fq '"toolset_version":"production-host-tools-v1"' "$inner_root/manifest.json"
+          expected_count=0
+          while read -r expected_hash expected_path; do
+            [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^capabilities\.txt$ ]]
+            test -f "$inner_root/$expected_path" && test ! -L "$inner_root/$expected_path"
+            test "$(stat -c '%F:%h:%a' -- "$inner_root/$expected_path")" = "regular file:1:$(case "$expected_path" in capabilities.txt) echo 444 ;; *) echo 555 ;; esac)"
+            test "$(/usr/bin/sha256sum "$inner_root/$expected_path" | cut -d' ' -f1)" = "$expected_hash"
+            expected_count=$((expected_count + 1))
+          done < "$contract_dir/files.sha256"
+          test "$expected_count" -eq $(( ${#expected_members[@]} - 1 ))
+          test "$(wc -l < "$contract_dir/files.modes" | tr -d ' ')" = "$(( ${#expected_members[@]} - 1 ))"
+          while read -r expected_mode expected_path; do
+            case "$expected_path" in
+              capabilities.txt) test "$expected_mode" = 444 ;;
+              platform_[A-Za-z0-9_.-]*.py|platform_[A-Za-z0-9_.-]*.sh) test "$expected_mode" = 555 ;;
+              *) echo "host-tools contract path is invalid" >&2; exit 1 ;;
+            esac
+          done < "$contract_dir/files.modes"
+
+      - name: Validate root SSH identity and installed generation
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PROD_SSH_HOST:-}" || -z "${PROD_SSH_USER:-}" || -z "${PROD_SSH_KEY:-}" ]]; then
+            echo "Production SSH configuration is incomplete." >&2
+            exit 1
+          fi
+          ssh_dir="$RUNNER_TEMP/platform-host-capability-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          ssh_scan="$ssh_dir/known_hosts.scan"
+          ssh-keyscan -T 10 -t ed25519 "$PROD_SSH_HOST" > "$ssh_scan"
+          test -s "$ssh_scan" && test "$(wc -l < "$ssh_scan" | tr -d ' ')" = 1
+          test "$(ssh-keygen -lf "$ssh_scan" -E sha256 | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+            printf '  UserKnownHostsFile %s\n' "$ssh_dir/known_hosts"
+          } > "$ssh_dir/config"
+          chmod 600 "$ssh_dir/config"
+          generation="/opt/oldsparky/platform/shared/host-tools/$TARGET_SHA"
+          remote=(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$ssh_dir/config" -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          test "$("${remote[@]}" /usr/bin/id -u | tr -d '\r\n')" = 0
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$generation" = "/opt/oldsparky/platform/shared/host-tools/$TARGET_SHA" ]]
+          "${remote[@]}" /usr/bin/test -d "$generation"
+          "${remote[@]}" /usr/bin/test ! -L "$generation"
+          test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation")" = "directory:0:0:2:555"
+          contract_dir="$RUNNER_TEMP/host-tools-download/contract"
+          while read -r expected_hash expected_path; do
+            [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^capabilities\.txt$|^manifest\.json$ ]]
+            remote_path="$generation/$expected_path"
+            "${remote[@]}" /usr/bin/test -f "$remote_path"
+            "${remote[@]}" /usr/bin/test ! -L "$remote_path"
+            case "$expected_path" in
+              capabilities.txt|manifest.json) expected_mode=444 ;;
+              *) expected_mode=555 ;;
+            esac
+            test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_path")" = "regular file:0:0:1:$expected_mode"
+            remote_digest="$("${remote[@]}" /usr/bin/sha256sum -- "$remote_path")"
+            test "${remote_digest%% *}" = "$expected_hash"
+          done < "$contract_dir/files.sha256"
+          IFS= read -r expected_manifest_hash < "$contract_dir/manifest.sha256"
+          IFS= read -r expected_capabilities_hash < "$contract_dir/capabilities.sha256"
+          test "$("${remote[@]}" /usr/bin/sha256sum -- "$generation/manifest.json")" = "$expected_manifest_hash  $generation/manifest.json"
+          test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/manifest.json")" = "regular file:0:0:1:444"
+          test "$("${remote[@]}" /usr/bin/sha256sum -- "$generation/capabilities.txt")" = "$expected_capabilities_hash  $generation/capabilities.txt"
+          test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/capabilities.txt")" = "regular file:0:0:1:444"
+          declare -A expected_entries=([capabilities.txt]=1 [manifest.json]=1)
+          while read -r expected_mode expected_path; do
+            remote_path="$generation/$expected_path"
+            remote_mode="$("${remote[@]}" /usr/bin/stat -c '%a' -- "$remote_path")"
+            test "$remote_mode" = "$expected_mode"
+            expected_entries["$expected_path"]=1
+          done < "$contract_dir/files.modes"
+          expected_entry_count="${#expected_entries[@]}"
+          inventory_encoded="$RUNNER_TEMP/host-tools-remote-entries.b64"
+          inventory_file="$RUNNER_TEMP/host-tools-remote-entries"
+          # NUL-delimited find output is base64-wrapped before it crosses the
+          # SSH boundary.  This preserves dotfiles and makes newline/control
+          # names observable instead of allowing line-oriented ambiguity.
+          "${remote[@]}" /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -print0 \
+            | /usr/bin/base64 -w 0 > "$inventory_encoded"
+          test "$(stat -c '%F:%h' -- "$inventory_encoded")" = "regular file:1"
+          test "$(stat -c '%s' -- "$inventory_encoded")" -le 16384
+          /usr/bin/base64 --decode "$inventory_encoded" > "$inventory_file"
+          test "$(stat -c '%F:%h' -- "$inventory_file")" = "regular file:1"
+          mapfile -d '' -t remote_names < "$inventory_file"
+          test "${#remote_names[@]}" -eq "$expected_entry_count"
+          declare -A seen_entries=()
+          for remote_path in "${remote_names[@]}"; do
+            [[ "$remote_path" == "$generation/"* ]]
+            relative_path="${remote_path#"$generation/"}"
+            [[ "$relative_path" =~ ^[A-Za-z0-9_.-]+$ ]]
+            [[ -n "${expected_entries[$relative_path]+present}" ]]
+            [[ -z "${seen_entries[$relative_path]+present}" ]]
+            seen_entries["$relative_path"]=1
+            unset "expected_entries[$relative_path]"
+          done
+          test "${#expected_entries[@]}" -eq 0
+          printf '%s\n' "HOST_TOOLS_GENERATION=$generation" >> "$GITHUB_ENV"
+          printf '%s\n' "HOST_TOOLS_SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Remove host capability verifier material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip"
+          rm -f -- "$RUNNER_TEMP/host-tools-remote-entries.b64" "$RUNNER_TEMP/host-tools-remote-entries" \
+            "$RUNNER_TEMP/platform-host-tools-expected-members" "$RUNNER_TEMP/platform-host-tools-actual-members"
+          rm -rf -- "$RUNNER_TEMP/host-tools-download" "$RUNNER_TEMP/platform-host-tools-inner"
+          ssh_dir="$RUNNER_TEMP/platform-host-capability-ssh"
+          if [[ -d "$ssh_dir" && ! -L "$ssh_dir" ]]; then
+            rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/config" "$ssh_dir/control.sock" "$ssh_dir/control-master" "$ssh_dir/control-master.sock"
+            rmdir -- "$ssh_dir"
+          fi
+          test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
+          printf '%s\n' 'HOST_TOOLS_SSH_DIR=' >> "$GITHUB_ENV"
   # Candidate checkout and release construction are isolated from the
   # environment-approved deployment jobs.  This job never receives SSH
   # material and only publishes an immutable archive plus provenance.
@@ -309,9 +669,11 @@ jobs:
     needs:
       - validate-dispatch
       - validate-classifier
+      - host-capability-preflight
     if: >-
       needs.validate-dispatch.result == 'success' &&
       needs.validate-classifier.result == 'success' &&
+      needs.host-capability-preflight.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.mode == 'deploy'
     runs-on: ubuntu-latest
@@ -664,9 +1026,12 @@ jobs:
   # It has no checkout and never executes candidate source.
   preflight:
     name: Production preflight
-    needs: validate-dispatch
+    needs:
+      - validate-dispatch
+      - host-capability-preflight
     if: >-
       needs.validate-dispatch.result == 'success' &&
+      needs.host-capability-preflight.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.mode == 'preflight'
     runs-on: ubuntu-latest
@@ -683,6 +1048,7 @@ jobs:
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+      HOST_TOOLS_DISPATCHER: /opt/oldsparky/platform/shared/host-tools/${{ github.sha }}/platform_workflow_remote_dispatch.py
     steps:
       - name: Download closed preflight handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -768,7 +1134,7 @@ jobs:
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
             -F "$PREFLIGHT_SSH_DIR/config" -i "$PREFLIGHT_SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            /usr/bin/python3.12 /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
+            /usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" \
             production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
@@ -801,11 +1167,13 @@ jobs:
       - validate-classifier
       - build-release
       - validate-security-provenance
+      - host-capability-preflight
     if: >-
       needs.validate-dispatch.result == 'success' &&
       needs.validate-classifier.result == 'success' &&
       needs.build-release.result == 'success' &&
       needs.validate-security-provenance.result == 'success' &&
+      needs.host-capability-preflight.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.mode == 'deploy'
     runs-on: ubuntu-latest
@@ -827,6 +1195,8 @@ jobs:
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
       PUBLISHED_ARTIFACT_ID: ${{ needs.build-release.outputs.artifact_id }}
       PUBLISHED_ARTIFACT_DIGEST: ${{ needs.build-release.outputs.artifact_digest }}
+      HOST_TOOLS_GENERATION: /opt/oldsparky/platform/shared/host-tools/${{ github.sha }}
+      HOST_TOOLS_DISPATCHER: /opt/oldsparky/platform/shared/host-tools/${{ github.sha }}/platform_workflow_remote_dispatch.py
     steps:
       - name: Download closed deployment handoff
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -1155,7 +1525,7 @@ jobs:
           }
           require_current_dev_head
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            /usr/bin/python3.12 /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py production-prepare-artifact < "$input_path"
+            /usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" production-prepare-artifact < "$input_path"
           scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_ARTIFACT" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
           scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_PROVENANCE" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
           scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_CHECKSUM" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
@@ -1177,7 +1547,7 @@ jobs:
           umask 077; : > "$remote_log"; : > "$remote_error"; chmod 600 "$remote_log" "$remote_error"
           set +e
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            /usr/bin/python3.12 /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
+            /usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
           public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport) release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"

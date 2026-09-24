@@ -121,6 +121,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         )
         external_source = workflow_modes[1][0]
         cleanup_source = workflow_modes[2][0]
+        deploy_source = workflow_modes[3][0]
         self.assertLess(
             external_source.index("platform_workflow_input_guard.py external"),
             external_source.index('printf \'%s\\n\' "$PROD_SSH_KEY"'),
@@ -133,6 +134,8 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             expected_dispatcher = (
                 dispatcher
                 if workflow_source is source
+                else '"$HOST_TOOLS_DISPATCHER"'
+                if workflow_source is deploy_source
                 else "/opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py"
             )
             for mode in modes:
@@ -638,7 +641,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             tools_root = Path(directory)
             helper = tools_root / "platform_production_deploy_supervisor.sh"
             helper.write_text("#!/bin/sh\n", encoding="utf-8")
-            helper.chmod(0o755)
+            helper.chmod(0o555)
             stdin = TextIOWrapper(
                 BytesIO((json.dumps(valid) + "\n").encode("utf-8")),
                 encoding="utf-8",
@@ -646,6 +649,7 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
                 patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_root), \
                 patch.object(platform_workflow_remote_dispatch, "DEPLOY_HELPER", helper), \
+                patch.object(platform_workflow_remote_dispatch, "_trusted_generation", return_value=True), \
                 patch.object(
                     platform_workflow_remote_dispatch.subprocess,
                     "run",

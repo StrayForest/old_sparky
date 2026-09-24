@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-09-12
+- Last reviewed: 2026-09-24
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -63,6 +63,33 @@ to `dev`. The chain is:
    head. If `dev` moved from `TARGET_SHA` (the A→B race), the workflow aborts
    closed; only then does it transfer and install the artifact and run
    production smoke.
+6. Before the expensive release build, `build-host-tools` creates and attests
+   the deterministic release-independent host-tools handoff. The
+   environment-approved `host-capability-preflight` verifies that exact
+   artifact and the already provisioned
+   `/opt/oldsparky/platform/shared/host-tools/<TARGET_SHA>` generation. It
+   requires the configured SSH identity to be root and checks the generation's
+   owner, mode, link count, type, capabilities and every digest with fixed
+   absolute tools. This is a read-only gate: it never SCPs or executes the
+   bundle and fails before release build, attestation, pending status or
+   production artifact transfer when the generation is absent or mismatched.
+   The one-time out-of-band provisioning and rollback procedure is the owner of
+   [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
+
+The security workflow also has a separate `workflow_run` status finalizer. It
+uses only `statuses: write`, no checkout or secrets, and always overwrites the
+`platform-security-build` context for the completed run's exact `head_sha` and
+`/attempts/<run_attempt>` URL. Only a `success` conclusion publishes the fixed
+description `Platform security and build passed`; every other conclusion is a
+failure with the fixed description `Platform security or build failed`.
+Because the write is idempotent and does not inspect older statuses, repeated
+or superseded attempts cannot preserve a stale result. GitHub may suppress the
+`workflow_run` event during an outage or force-cancel; the bounded operator
+recovery is to wait five minutes, then inspect the exact run and commit status.
+If the status is still pending, an authorized repository maintainer may post a
+failure status for that exact SHA with `gh api
+repos/StrayForest/old_sparky/statuses/<sha> -f state=failure -f
+context=platform-security-build`; never post success manually.
 
 The dispatch `mode`, runtime profile, release slug, target SHA and artifact
 directory are checked by the bounded ASCII input guard before production host
@@ -129,6 +156,14 @@ apply to `mode=deploy`; provide the originating security `run_id` and
 `run_attempt`. A missing, malformed, fallback or non-deployable manifest blocks
 deployment. `mode=preflight` remains available without that release artifact
 guard and performs no install.
+
+Both `mode=deploy` and the read-only `mode=preflight` require the immutable
+host-tools capability gate. Manual dispatch cannot provision or repair that
+generation: operators must use the approved out-of-band host-image/console
+procedure, retain the previous valid generation, and repeat the reviewed
+`dev` operation only after the exact post-copy inventory passes. There is no
+workflow self-installer or legacy `current/tools` fallback for the production
+dispatcher.
 
 For a read-only production gate without an install, an operator may dispatch
 `mode=preflight` explicitly. A manual fallback must never be used to bypass a

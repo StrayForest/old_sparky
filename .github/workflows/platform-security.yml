@@ -1240,11 +1240,6 @@ jobs:
             state=success
             description="Platform security and build passed"
           fi
-          if [[ "$state" == "success" && "$ROUTE_DEPLOYABLE" != "true" ]]; then
-            description="Platform security passed; route=$ROUTE_CLASS is non-deployable"
-          elif [[ "$state" == "success" && "$ROUTE_FALLBACK" == "true" ]]; then
-            description="Platform security passed; fail-closed fallback route is non-deployable"
-          fi
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
           if [[ "$EVENT_NAME" == "push" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
             curl --fail-with-body --silent --show-error \

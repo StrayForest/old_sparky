@@ -1,0 +1,86 @@
+name: Platform security status finalizer
+
+on:
+  workflow_run:
+    workflows: [Platform security and build]
+    types: [completed]
+
+# This workflow has no source checkout, candidate data, or repository secret inputs.
+# It exists outside the cancellable security workflow so a cancelled/skipped
+# run still receives a terminal commit status whenever GitHub starts workflow_run.
+jobs:
+  finalize-status:
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    env:
+      TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}
+    steps:
+      - name: Publish the exact completed run as a terminal status
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          attempt_url="$(/usr/bin/python3 - "$SOURCE_RUN_URL" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$GITHUB_REPOSITORY" <<'PY'
+          import re
+          import sys
+          from urllib.parse import urlsplit
+
+          base, run_id, attempt, repository = sys.argv[1:]
+          expected = f"https://github.com/{repository}/actions/runs/{run_id}"
+          parsed = urlsplit(base)
+          if (
+              base != expected
+              or parsed.scheme != "https"
+              or parsed.netloc != "github.com"
+              or parsed.query
+              or parsed.fragment
+              or not re.fullmatch(r"[1-9][0-9]{0,31}", attempt)
+          ):
+              raise SystemExit("workflow run URL is not canonical")
+          print(f"{expected}/attempts/{attempt}")
+          PY
+          )"
+          case "$SOURCE_CONCLUSION" in
+            success)
+              state=success
+              description="Platform security and build passed"
+              ;;
+            cancelled|failure|skipped|timed_out|action_required|neutral|stale|startup_failure)
+              state=failure
+              description="Platform security or build failed"
+              ;;
+            *)
+              state=failure
+              description="Platform security or build failed"
+              ;;
+          esac
+          payload="$(/usr/bin/python3 - "$state" "$description" "$attempt_url" <<'PY'
+          import json
+          import sys
+
+          print(json.dumps({
+              "state": sys.argv[1],
+              "context": "platform-security-build",
+              "description": sys.argv[2],
+              "target_url": sys.argv[3],
+          }))
+          PY
+          )"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            --data "$payload"
