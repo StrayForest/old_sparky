@@ -580,7 +580,11 @@ and size-based rotation bounds text log files.
   the current `dev` HEAD. The auto-deploy gate refuses stale successful CI
   results and skips SHAs that already report `platform-production-deploy=success`.
   The manual `Platform production deploy` workflow remains an operator fallback;
-  direct server invocation is recovery/rollback-only.
+  direct server invocation is recovery/rollback-only. The deploy workflow also
+  requires a release-independent, root-owned host-tools generation for the
+  exact target SHA before building or transferring a release; its one-time
+  out-of-band provisioning and rollback contract is in the
+  [production host-tools provisioning ADR](adr/production-host-tools-provisioning.md).
 
 ## Deferred / operator-owned work
 

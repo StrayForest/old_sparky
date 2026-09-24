@@ -40,6 +40,11 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertIn("artifact_id:", jobs["build-release"])
         self.assertNotRegex(jobs["build-release"], r"secrets\.PROD_SSH_")
         self.assertNotIn("environment: production", jobs["build-release"])
+        self.assertIn("needs.host-capability-preflight.result == 'success'", jobs["preflight"])
+        self.assertIn('/usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER"', jobs["preflight"])
+        self.assertNotIn("current/tools/platform_workflow_remote_dispatch.py", jobs["preflight"])
+        self.assertIn("inputs.mode == 'deploy' || inputs.mode == 'preflight'", jobs["build-host-tools"])
+        self.assertIn("inputs.mode == 'deploy' || inputs.mode == 'preflight'", jobs["host-capability-preflight"])
         self.assertIn("needs:\n      - validate-dispatch\n      - build-release", source)
         self.assertIn("needs.build-release.result == 'success'", jobs["production"])
         self.assertIn("path: trusted-classifier", jobs["production"])
@@ -121,6 +126,10 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
                 if job_name == "production":
                     self.assertIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
                     self.assertIn("path: trusted-classifier", body, f"{workflow_name}:{job_name}")
+                    self.assertNotIn("ref: ${{ env.TARGET_SHA }}", body, f"{workflow_name}:{job_name}")
+                elif job_name == "host-capability-preflight":
+                    self.assertNotIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
+                    self.assertNotIn("platform_host_tools_bundle.py", body, f"{workflow_name}:{job_name}")
                     self.assertNotIn("ref: ${{ env.TARGET_SHA }}", body, f"{workflow_name}:{job_name}")
                 else:
                     self.assertNotIn("actions/checkout@", body, f"{workflow_name}:{job_name}")

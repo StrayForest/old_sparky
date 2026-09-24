@@ -1128,7 +1128,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         )
         self.assertIn("deadlock-web did not recover after runtime profile", workflow)
         lock_helper = workflow.index(
-            'lock_helper="$runtime/current/tools/platform_release_lock.sh"'
+            'lock_helper="$host_tools_dir/platform_release_lock.sh"'
         )
         release_supervisor = workflow.index(
             "platform_release_lock_supervise", lock_helper
@@ -1195,7 +1195,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
 
     def test_production_preflight_requires_edge_parity_before_preflight_exit(self) -> None:
         workflow = DEPLOY_SUPERVISOR.read_text()
-        preflight_start = workflow.index('"$current/tools/platform_release_preflight.sh"')
+        preflight_start = workflow.index('"$host_tools_dir/platform_release_preflight.sh"')
         preflight_exit = workflow.index(
             'if [[ "$deploy_mode" == "preflight" ]]',
             preflight_start,

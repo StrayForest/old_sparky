@@ -422,8 +422,8 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
     The classifier artifact is validated in a separate, secret-free job before
     the release build. The release artifact is constructed in a separate,
     non-environment job. The production job is an artifact consumer only: it
-    receives the production environment and SSH secrets, but checks out only
-    the immutable trusted validator source and never candidate source. Keep
+    receives the production environment and SSH secrets, but never checks out
+    or executes repository/candidate source. Keep
     these checks textual and dependency-free so the contract can run before
     any CI environment is provisioned.
     """
@@ -434,6 +434,8 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         for job_id in (
             "validate-dispatch",
             "validate-classifier",
+            "build-host-tools",
+            "host-capability-preflight",
             "build-release",
             "preflight",
             "production",
@@ -459,7 +461,14 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("deployment dispatch validation must create the canonical handoff")
         if 'case "$DEPLOY_MODE" in' not in validator:
             issues.append("deployment dispatch validation must validate mode before branches")
-    for branch in ("validate-classifier", "build-release", "preflight", "production"):
+    for branch in (
+        "validate-classifier",
+        "build-host-tools",
+        "host-capability-preflight",
+        "build-release",
+        "preflight",
+        "production",
+    ):
         branch_job = jobs[branch]
         if branch_job and "needs: validate-dispatch" not in branch_job and "- validate-dispatch" not in branch_job:
             issues.append(f"production deploy {branch} job must depend on dispatch validation")
@@ -483,6 +492,68 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("classifier prerequisite must cleanup its trusted checkout")
     elif jobs["build-release"]:
         issues.append("classifier prerequisite job is required before candidate build")
+
+    host_build = jobs["build-host-tools"]
+    host_preflight = jobs["host-capability-preflight"]
+    preflight = jobs["preflight"]
+    if host_build:
+        if "environment: production" in host_build or _production_job_secret_names(host_build):
+            issues.append("host-tools bundle builder must be secret-free")
+        if "actions/checkout@" not in host_build or "ref: ${{ env.TARGET_SHA }}" not in host_build:
+            issues.append("host-tools bundle builder must checkout the exact target source")
+        if "platform_host_tools_bundle.py build" not in host_build:
+            issues.append("host-tools bundle builder must invoke the canonical deterministic builder")
+        if "actions/upload-artifact@" not in host_build or "actions/attest-build-provenance@" not in host_build:
+            issues.append("host-tools bundle builder must publish and attest its exact bundle")
+        if "artifact_id:" not in host_build or "artifact_digest:" not in host_build:
+            issues.append("host-tools bundle builder must expose exact artifact outputs")
+        if "id: publish-host-tools" not in host_build:
+            issues.append("host-tools bundle upload must have a stable output step")
+        if "if: ${{ always() }}" not in host_build or "Remove host-tools build data" not in host_build:
+            issues.append("host-tools bundle builder must always clean its temporary data")
+        if "inputs.mode == 'deploy' || inputs.mode == 'preflight'" not in host_build:
+            issues.append("host-tools bundle builder must cover both production dispatch modes")
+    if host_preflight:
+        if "environment: production" not in host_preflight:
+            issues.append("host capability preflight must own the production environment")
+        if "- build-host-tools" not in host_preflight:
+            issues.append("host capability preflight must wait for the exact host-tools artifact")
+        if "needs.build-host-tools.result == 'success'" not in host_preflight:
+            issues.append("host capability preflight must propagate bundle-builder failure")
+        if "actions/download-artifact@" not in host_preflight or "artifact-ids:" not in host_preflight:
+            issues.append("host capability preflight must download the exact bundle artifact")
+        if "actions/checkout@" in host_preflight:
+            issues.append("host capability preflight must not checkout repository source")
+        if "platform_host_tools_bundle.py" in host_preflight:
+            issues.append("host capability preflight must not execute the bundle verifier")
+        for command in ("/usr/bin/zipinfo", "/usr/bin/unzip", "files.sha256", "files.modes"):
+            if command not in host_preflight:
+                issues.append(f"host capability preflight must validate bundle data with {command}")
+        for command in ("/usr/bin/id -u", "/usr/bin/stat", "/usr/bin/sha256sum", "/usr/bin/test"):
+            if command not in host_preflight:
+                issues.append(f"host capability preflight must use fixed {command} checks")
+        if any(marker in host_preflight for marker in ("bash -s", "python -c", "platform_host_tools_install")):
+            issues.append("host capability preflight must not execute dynamic or self-installing code")
+        if "scp " in host_preflight or "platform-production-deploy-remote" in host_preflight:
+            issues.append("host capability preflight must not upload a bundle or deploy artifact")
+        if (
+            "if: ${{ always() }}" not in host_preflight
+            or "Remove host capability verifier material" not in host_preflight
+        ):
+            issues.append("host capability preflight must always clean its verifier material")
+        if "inputs.mode == 'deploy' || inputs.mode == 'preflight'" not in host_preflight:
+            issues.append("host capability preflight must cover both production dispatch modes")
+
+    if preflight:
+        preflight_needs = _workflow_job_needs(preflight)
+        if "host-capability-preflight" not in preflight_needs:
+            issues.append("production preflight must wait for the immutable host capability gate")
+        if "needs.host-capability-preflight.result == 'success'" not in preflight:
+            issues.append("production preflight must propagate host capability failure")
+        if "python3.12 -I \"$HOST_TOOLS_DISPATCHER\"" not in preflight:
+            issues.append("production preflight must invoke the immutable host-tools dispatcher")
+        if "current/tools/platform_workflow_remote_dispatch.py" in preflight:
+            issues.append("production preflight must not use the mutable dispatcher fallback")
 
     # Candidate checkout/build/publish belongs only to a fresh, non-secret job.
     if build:
@@ -529,6 +600,11 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("candidate build job must depend on classifier validation")
         if "needs.validate-classifier.result == 'success'" not in build:
             issues.append("candidate build job must require successful classifier validation")
+        if (
+            "- host-capability-preflight" not in build
+            or "needs.host-capability-preflight.result == 'success'" not in build
+        ):
+            issues.append("candidate build job must wait for the immutable host capability gate")
 
     job_env = re.search(
         r"^    env:\n(?P<body>.*?)(?=^    steps:\n)",
@@ -544,6 +620,10 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         issues.append("production secret job must not checkout candidate source")
     if "ref: ${{ steps.trusted_classifier_default.outputs.sha }}" not in production:
         issues.append("production secret job must checkout only the trusted validator")
+    if "current/tools/platform_workflow_remote_dispatch.py" in production:
+        issues.append("production secret job must invoke only the immutable host-tools dispatcher")
+    if "python3.12 -I \"$HOST_TOOLS_DISPATCHER\"" not in production:
+        issues.append("production secret job must invoke the immutable host-tools dispatcher with python isolated mode")
     if "platform_production_classifier_artifact.py" not in production:
         issues.append("production secret job must invoke the canonical classifier parser")
     candidate_markers = (
@@ -563,12 +643,18 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
     # The production consumer must wait for both validation and a successful
     # candidate build. A skipped or failed build must never become a deploy.
     production_needs = _workflow_job_needs(production)
-    for dependency in ("validate-dispatch", "validate-classifier", "build-release"):
+    for dependency in (
+        "validate-dispatch",
+        "validate-classifier",
+        "host-capability-preflight",
+        "build-release",
+    ):
         if dependency not in production_needs:
             issues.append(f"production deploy job must need {dependency}")
     for expression in (
         "needs.validate-dispatch.result == 'success'",
         "needs.validate-classifier.result == 'success'",
+        "needs.host-capability-preflight.result == 'success'",
         "needs.build-release.result == 'success'",
         "inputs.mode == 'deploy'",
     ):

@@ -117,9 +117,6 @@ pass() {
 
 load_env_as_data() {
   local safe_env_tool="$SCRIPT_DIR/platform_safe_env_exec.py"
-  if [[ ! -f "$safe_env_tool" ]]; then
-    safe_env_tool="$CURRENT_TARGET/tools/platform_safe_env_exec.py"
-  fi
   [[ -f "$safe_env_tool" && ! -L "$safe_env_tool" ]] \
     || fail "Safe environment parser is missing or unsafe."
   local encoded_assignments
@@ -179,10 +176,8 @@ pass
 
 [[ -d "$SHARED_DIR/env" ]] || fail "Rendered service env directory is missing: $SHARED_DIR/env"
 RENDER_SERVICE_ENVS_TOOL="$SCRIPT_DIR/platform_render_service_envs.py"
-if [[ ! -f "$RENDER_SERVICE_ENVS_TOOL" ]]; then
-  RENDER_SERVICE_ENVS_TOOL="$CURRENT_TARGET/tools/platform_render_service_envs.py"
-fi
-[[ -f "$RENDER_SERVICE_ENVS_TOOL" ]] || fail "Service env renderer is missing."
+[[ -f "$RENDER_SERVICE_ENVS_TOOL" && ! -L "$RENDER_SERVICE_ENVS_TOOL" ]] \
+  || fail "Service env renderer is missing or unsafe."
 "$PYTHON_BIN" "$RENDER_SERVICE_ENVS_TOOL" \
   --source "$ENV_FILE" \
   --output-dir "$SHARED_DIR/env" \
@@ -191,9 +186,8 @@ fi
 pass
 
 SAFE_ENV_TOOL="$SCRIPT_DIR/platform_safe_env_exec.py"
-if [[ ! -f "$SAFE_ENV_TOOL" ]]; then
-  SAFE_ENV_TOOL="$CURRENT_TARGET/tools/platform_safe_env_exec.py"
-fi
+[[ -f "$SAFE_ENV_TOOL" && ! -L "$SAFE_ENV_TOOL" ]] \
+  || fail "Safe environment parser is missing or unsafe."
 "$PYTHON_BIN" -I - \
   "$ENV_FILE" "$SAFE_ENV_TOOL" "$CURRENT_TARGET/tools/platform_deploy_smoke.py" \
   2>/dev/null <<'PY' \
@@ -222,10 +216,8 @@ pass
 
 if [[ "$REQUIRE_EDGE_PARITY" -eq 1 ]]; then
   EDGE_POLICY_TOOL="$SCRIPT_DIR/platform_validate_edge_policy.py"
-  if [[ ! -f "$EDGE_POLICY_TOOL" ]]; then
-    EDGE_POLICY_TOOL="$CURRENT_TARGET/tools/platform_validate_edge_policy.py"
-  fi
-  [[ -f "$EDGE_POLICY_TOOL" ]] || fail "Edge policy validator is missing."
+  [[ -f "$EDGE_POLICY_TOOL" && ! -L "$EDGE_POLICY_TOOL" ]] \
+    || fail "Edge policy validator is missing or unsafe."
   "$PYTHON_BIN" "$EDGE_POLICY_TOOL" \
     --json >/dev/null \
     || fail "Cloudflare/Nginx/UFW trust-range parity check failed."

@@ -35,6 +35,7 @@ esac
 
 runtime=/opt/oldsparky/platform
 current="$runtime/current"
+host_tools_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 storage_summary_tool=""
 artifact_path=""
 provenance_path="$artifact_dir/RELEASE.provenance.json"
@@ -73,11 +74,51 @@ restart_api_and_wait() {
   return 1
 }
 
+[[ "$host_tools_dir" =~ ^/opt/oldsparky/platform/shared/host-tools/[0-9a-f]{40}$ ]] \
+  || fail "trusted host-tools generation path is invalid"
+[[ -d "$host_tools_dir" && ! -L "$host_tools_dir" ]] \
+  || fail "trusted host-tools generation directory is unsafe"
+[[ "$(/usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$host_tools_dir" 2>/dev/null)" \
+  == "directory:0:0:2:555" ]] \
+  || fail "trusted host-tools generation metadata is unsafe"
+
+require_host_helper() {
+  local path="$1"
+  [[ -f "$path" && ! -L "$path" && -x "$path" ]] || fail "trusted host helper is missing"
+  [[ "$(/usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$path" 2>/dev/null)" \
+    == "regular file:0:0:1:555" ]] \
+    || fail "trusted host helper metadata is unsafe"
+}
+
+for host_helper in \
+  platform_workflow_remote_dispatch.py \
+  platform_workflow_input_guard.py \
+  platform_prepare_artifact_dir.py \
+  platform_production_deploy_supervisor.sh \
+  platform_release_lock.sh \
+  platform_release_preflight.sh \
+  platform_release_install.sh \
+  platform_release_transaction.py \
+  platform_release_restore_runtime.sh \
+  platform_validate_release_artifact.py \
+  platform_validate_wheelhouse.py \
+  platform_deploy_smoke.py \
+  platform_deploy_smoke_impl.py \
+  platform_safe_env_exec.py \
+  platform_render_service_envs.py \
+  platform_validate_edge_policy.py \
+  platform_update_cloudflare_ips.py \
+  platform_backup_restore_drill.py \
+  platform_storage_evidence_summary.py \
+  platform_configure_shared_env.py; do
+  require_host_helper "$host_tools_dir/$host_helper"
+done
+
 # Lock order is release -> retained-load.  Both locks use the shared pathname
 # supervisors with util-linux `--close`, so this body and every candidate child
 # have no release or retained-load lock FD.  Each supervised body revalidates
 # the exact exclusive WRITE FLOCK owner in /proc/locks before mutation.
-lock_helper="$runtime/current/tools/platform_release_lock.sh"
+lock_helper="$host_tools_dir/platform_release_lock.sh"
 if [[ ! -f "$lock_helper" || -L "$lock_helper" || ! -x "$lock_helper" ]]; then
   fail "the canonical release lock helper is missing or unsafe"
 fi
@@ -117,24 +158,13 @@ trap cleanup EXIT
 test "$(id -u)" -eq 0 || fail "deployment user must be root"
 test -L "$current" || fail "current release symlink is missing"
 test -L "$runtime/previous" || fail "previous release symlink is missing"
-if [[ ! -f "$current/tools/platform_release_preflight.sh" \
-  || -L "$current/tools/platform_release_preflight.sh" \
-  || ! -x "$current/tools/platform_release_preflight.sh" ]]; then
-  fail "release preflight tool is missing"
-fi
-if [[ ! -f "$current/tools/platform_deploy_smoke.py" \
-  || -L "$current/tools/platform_deploy_smoke.py" \
-  || ! -x "$current/tools/platform_deploy_smoke.py" ]]; then
-  fail "deploy smoke tool is missing"
-fi
-
 for service in deadlock-api deadlock-worker deadlock-web; do
   systemctl is-active --quiet "$service" || fail "$service is not active before deployment"
 done
 
 nginx -t >/dev/null
 
-"$current/tools/platform_release_preflight.sh" \
+"$host_tools_dir/platform_release_preflight.sh" \
   --require-previous \
   --require-verified-backup \
   --require-edge-parity \
@@ -166,7 +196,7 @@ artifact_slug="${artifact_name%.tar.gz}"
   || fail "CI release artifact digest mismatch"
 bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"
 chmod 0700 "$bootstrap_dir"
-"$current/tools/platform_validate_release_artifact.py" \
+"$host_tools_dir/platform_validate_release_artifact.py" \
   --artifact "$artifact_path" \
   --checksum "$artifact_checksum" \
   --release-slug "$artifact_slug" \
@@ -204,7 +234,7 @@ then
   fail "CI release source commit does not match target SHA"
 fi
 
-"$current/tools/platform_release_preflight.sh" \
+"$host_tools_dir/platform_release_preflight.sh" \
   --app-dir "$runtime" \
   --require-previous \
   --require-verified-backup \
@@ -215,13 +245,7 @@ candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh
 if [[ ! -f "$candidate_deploy" || -L "$candidate_deploy" || ! -x "$candidate_deploy" ]]; then
   fail "candidate release deploy tool is missing"
 fi
-storage_summary_tool="$bootstrap_dir/$artifact_slug/tools/platform_storage_evidence_summary.py"
-if [[ ! -f "$storage_summary_tool" || -L "$storage_summary_tool" ]]; then
-  storage_summary_tool="$current/tools/platform_storage_evidence_summary.py"
-fi
-if [[ ! -f "$storage_summary_tool" || -L "$storage_summary_tool" ]]; then
-  fail "storage evidence summary helper is missing or unsafe"
-fi
+storage_summary_tool="$host_tools_dir/platform_storage_evidence_summary.py"
 candidate_status=0
 LC_ALL=C.UTF-8 "$candidate_deploy" \
   --artifact "$artifact_path" \
@@ -279,7 +303,7 @@ platform_release_lock_supervisor_holds \
 
 case "$runtime_profile" in
   baseline)
-    "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile baseline \
@@ -341,7 +365,7 @@ case "$runtime_profile" in
         --only PLATFORM_PERF_LOG_MUTATIONS
       )
     fi
-    "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -384,7 +408,7 @@ case "$runtime_profile" in
           --only PLATFORM_PERF_LOG_MUTATIONS
         )
       fi
-      "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -406,7 +430,7 @@ case "$runtime_profile" in
     fi
     ;;
   ready-vote-adaptive-v2)
-    "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -437,7 +461,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile ready-vote-static-8 \
@@ -477,7 +501,7 @@ case "$runtime_profile" in
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
       --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
     )
-    "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -490,7 +514,7 @@ case "$runtime_profile" in
     grep -qx 'PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=true' "$api_env" \
       || fail "web SSR diagnostic API auth bootstrap log gate is not enabled"
     if ! restart_api_and_wait; then
-      "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -511,7 +535,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$web_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -535,7 +559,7 @@ case "$runtime_profile" in
     fi
     ;;
   web-ssr-native-transport)
-    "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -543,7 +567,7 @@ case "$runtime_profile" in
     restart_web_and_wait
     ;;
   web-ssr-workers-2)
-    "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -574,7 +598,7 @@ case "$runtime_profile" in
       --only PLATFORM_SSR_PERF_SAMPLE_RATE
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
     )
-    "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -591,7 +615,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -613,7 +637,7 @@ case "$runtime_profile" in
     fi
     ;;
   api-3x16)
-    "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile api-3x16 \
@@ -636,7 +660,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -664,7 +688,7 @@ case "$runtime_profile" in
     fi
     ;;
   api-1x48)
-    "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile api-1x48 \
@@ -687,7 +711,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" "$current/tools/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
