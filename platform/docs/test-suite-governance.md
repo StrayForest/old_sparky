@@ -50,17 +50,20 @@ artifact, or deploy; `status-final` independently requires the fixture job and
 this real job on the routes where each is required. Non-`dev` manual runs and
 all ordinary/docs routes keep the real job skipped as selected by the
 classifier; there is no schedule trigger.
-The canonical builder emits allowlisted `RELEASE_BUILD_PHASE` markers for
-each release phase into a private root-owned `0600` log. The real job reads
-that log through `platform_release_build_diagnostics.py` before identity-
-checked cleanup and prints only the normalized phase, reason, cleanup state
-and builder/parser return codes. Missing, malformed, oversized, mutable or
-untrusted logs fail closed; the raw builder log is never printed or uploaded,
-and is removed with the identified temporary root after successful cleanup.
-Cleanup-identity failures remain fail-closed for operator investigation. The
-builder's cleanup trap preserves the original failure status and emits a
-failed `complete` marker, so diagnostic success cannot turn a failed build
-into a green gate.
+The canonical builder keeps its ordinary build output in a private root-owned
+`0600` raw log and emits only allowlisted `RELEASE_BUILD_PHASE` markers to a
+separate root-owned `0600` marker stream. The real job reads only that bounded
+marker stream through `platform_release_build_diagnostics.py` before
+identity-checked cleanup and prints only the normalized phase, reason, cleanup
+state and builder/parser return codes. Missing, malformed, oversized, mutable
+or untrusted marker streams fail closed; the raw builder log is never parsed,
+printed or uploaded, and both files are removed with the identified temporary
+root after successful cleanup. Cleanup-identity failures remain fail-closed
+for operator investigation. The builder's cleanup trap preserves the original
+failure status and emits a failed `complete` marker, so diagnostic success
+cannot turn a failed build into a green gate. A parser rejection is reported
+only with the bounded reason enum `oversized`, `metadata`, `control`,
+`encoding`, `marker`, `sequence` or `missing`.
 `platform_verify.py ci` can execute only the always-on deterministic gates and
 never connects to production, creates production fixtures, opens a production
 browser or starts a load generator. The latter four remain discoverable

@@ -1139,6 +1139,8 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         ("consistency", "builder marker/result consistency"),
         ("diagnostic_sanitizer", "diagnostic sanitizer failure route"),
         ('/usr/bin/install -o root -g root -m 0600 /dev/null "$build_log"', "root-only diagnostic log"),
+        ('/usr/bin/install -o root -g root -m 0600 /dev/null "$marker_log"', "root-only marker stream"),
+        ('--marker-log "$marker_log"', "dedicated marker-stream parser input"),
         ("min_free_bytes", "disk preflight"),
         ("disk_after_bytes", "post-cleanup disk check"),
         ("trap cleanup EXIT", "guaranteed cleanup"),
@@ -1154,7 +1156,7 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
         issues.append("release-runtime-real must use its own clean production-style venv setup")
     if "platform_verify.py release-runtime" in real:
         issues.append("release-runtime-real must not run the fixture gate")
-    if "tee" in real or 'cat "$build_log"' in real or "BASH_COMMAND" in real:
+    if "tee" in real or 'cat "$build_log"' in real or '--log "$build_log"' in real or "BASH_COMMAND" in real:
         issues.append("release-runtime-real must not expose raw builder diagnostics")
     builder_path = PLATFORM_ROOT / "tools" / "platform_build_release.sh"
     try:

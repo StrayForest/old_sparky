@@ -906,13 +906,18 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("parser_rc", workflow)
         self.assertIn("consistency", workflow)
         self.assertIn("diagnostic_sanitizer", workflow)
+        self.assertIn("platform_release_phase_telemetry.py", workflow)
+        self.assertIn('PLATFORM_RELEASE_PHASE_LOG=\"$marker_log\"', workflow)
         real = workflow_job(workflow, "release-runtime-real")
         self.assertIn("builder_started=0", real)
         self.assertIn("local builder_run_ready=0", real)
         self.assertIn(
-            'if (( builder_started == 1 )) && [[ -n "$canonical_rc" && -n "$build_log" ]]',
+            'if (( builder_started == 1 )) && [[ -n "$canonical_rc" ]]',
             real,
         )
+        self.assertIn('--marker-log "$marker_log"', real)
+        self.assertNotIn('diagnostic_parser --log "$build_log"', real)
+        self.assertIn('/usr/bin/install -o root -g root -m 0600 /dev/null "$marker_log"', real)
         self.assertIn(
             "if (( builder_run_ready == 1 && parser_rc != 0 )); then",
             real,
@@ -1003,6 +1008,28 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertEqual(late_validation.returncode, 0, late_validation.stderr)
         self.assertIn("canonical_builder_rc=0", late_validation.stdout)
 
+        for reject_reason, expected_rc in (("sequence", 1), ("https://example.invalid", 1)):
+            with self.subTest(reject_reason=reject_reason):
+                parser_rejection = subprocess.run(
+                    [
+                        "/usr/bin/python3",
+                        "-I",
+                        "-",
+                        "RELEASE_BUILD_DIAGNOSTIC schema=1 phase=unknown status=failed "
+                        f"reason=build_failed cleanup=unknown reject_reason={reject_reason}",
+                        "2",
+                        "1",
+                    ],
+                    input=sanitizer,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(parser_rejection.returncode, expected_rc)
+                self.assertIn("reject_reason=", parser_rejection.stdout)
+                self.assertNotIn("https://example.invalid", parser_rejection.stdout)
+
         run_start = real.index("        run: |\n") + len("        run: |\n")
         run_lines = []
         for line in real[run_start:].splitlines():
@@ -1026,6 +1053,7 @@ artifact_sha256=""
 disk_before_bytes=""
 disk_after_bytes=""
 build_log=""
+marker_log=""
 canonical_builder_rc=""
 builder_started=0
 diagnostic_parser=/no/such/parser
@@ -1054,8 +1082,10 @@ cleanup
             builder_log = Path(builder_temporary) / "canonical-builder.log"
             builder_log.write_text("builder output is private\n")
             builder_run = cleanup_fixture.replace(temporary, builder_temporary).replace(
-                'build_log=""\ncanonical_builder_rc=""\nbuilder_started=0',
-                f'build_log={str(builder_log)!r}\ncanonical_builder_rc=0\nbuilder_started=1',
+                'build_log=""\nmarker_log=""\ncanonical_builder_rc=""\nbuilder_started=0',
+                f'build_log={str(builder_log)!r}\n'
+                f'marker_log={str(Path(builder_temporary) / "missing-phase.log")!r}\n'
+                'canonical_builder_rc=0\nbuilder_started=1',
             )
             builder_parser_failure = subprocess.run(
                 ["/bin/bash"],
