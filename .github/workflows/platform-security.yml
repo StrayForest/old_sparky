@@ -680,6 +680,10 @@ jobs:
           artifact_sha256=""
           disk_before_bytes=""
           disk_after_bytes=""
+          build_log=""
+          canonical_builder_rc=""
+          builder_started=0
+          diagnostic_parser="$GITHUB_WORKSPACE/platform/tools/platform_release_build_diagnostics.py"
 
           free_bytes() {
             local disk_path="${runner_temp:-${RUNNER_TEMP}}"
@@ -690,11 +694,139 @@ jobs:
           }
 
           cleanup() {
-            local rc=$?
+            local workflow_rc=$?
+            local canonical_rc="$canonical_builder_rc"
             local cleanup_rc=0
             local current_id=""
+            local diagnostic_line=""
+            local parser_rc=127
+            local safe_diagnostic=""
+            local sanitizer_rc=1
+            local builder_run_ready=0
             trap - EXIT
             set +e
+            if (( builder_started == 1 )) && [[ -n "$canonical_rc" && -n "$build_log" ]] \
+              && sudo -n /usr/bin/test -f "$build_log" 2>/dev/null; then
+              builder_run_ready=1
+              diagnostic_line="$(sudo -n /usr/bin/python3 -I "$diagnostic_parser" --log "$build_log" 2>/dev/null)"
+              parser_rc=$?
+            fi
+            if (( builder_run_ready == 1 )); then
+              safe_diagnostic="$('/usr/bin/python3' -I - "$diagnostic_line" "$canonical_rc" "$parser_rc" <<'PY'
+          import re
+          import sys
+
+
+          PHASES = {
+              "canonical-preflight",
+              "node-runtime",
+              "source-stage",
+              "web-dependencies",
+              "live-qa-runtime",
+              "python-wheelhouse",
+              "dependency-baseline",
+              "web-build",
+              "release-metadata",
+              "artifact-promote",
+              "artifact-validate",
+              "cleanup",
+              "complete",
+          }
+          REASONS = {"ok", "build_failed", "cleanup_failed", "interrupted"}
+          CLEANUP_STATES = {"not-run", "passed", "failed"}
+          REQUIRED = {"schema", "phase", "status", "reason", "cleanup"}
+          OPTIONAL = {"failed_phase", "source_sha", "artifact_sha256"}
+          line, canonical_rc, parser_rc = sys.argv[1:]
+          safe = {
+              "phase": "unknown",
+              "status": "failed",
+              "reason": "build_failed",
+              "cleanup": "unknown",
+          }
+          valid = False
+          fields = {}
+          if re.fullmatch(r"[0-9]+", canonical_rc) is None:
+              canonical_display = "unknown"
+          else:
+              canonical_display = canonical_rc
+          if re.fullmatch(r"[0-9]+", parser_rc) is None:
+              parser_display = "1"
+          else:
+              parser_display = parser_rc
+          parts = line.split()
+          if parts and parts[0] == "RELEASE_BUILD_DIAGNOSTIC":
+              valid = True
+              for token in parts[1:]:
+                  if "=" not in token:
+                      valid = False
+                      break
+                  key, value = token.split("=", 1)
+                  if key in fields or re.fullmatch(r"[a-z0-9_]+", key) is None:
+                      valid = False
+                      break
+                  fields[key] = value
+              valid = valid and set(fields) == REQUIRED | (set(fields) & OPTIONAL)
+              valid = valid and fields.get("schema") == "1"
+              valid = valid and fields.get("phase") in PHASES
+              valid = valid and fields.get("status") in {"passed", "failed"}
+              valid = valid and fields.get("reason") in REASONS
+              valid = valid and fields.get("cleanup") in CLEANUP_STATES
+              if valid:
+                  phase = fields["phase"]
+                  status = fields["status"]
+                  reason = fields["reason"]
+                  cleanup = fields["cleanup"]
+                  failed_phase = fields.get("failed_phase")
+                  source_sha = fields.get("source_sha")
+                  artifact_sha = fields.get("artifact_sha256")
+                  valid = failed_phase is None or failed_phase in PHASES
+                  valid = valid and (
+                      source_sha is None
+                      or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_sha) is not None
+                  )
+                  valid = valid and (
+                      artifact_sha is None
+                      or re.fullmatch(r"[0-9a-f]{64}", artifact_sha) is not None
+                  )
+                  if status == "passed":
+                      valid = valid and reason == "ok" and failed_phase is None
+                      if phase == "complete":
+                          valid = valid and cleanup == "passed" and source_sha is not None and artifact_sha is not None
+                      elif phase == "cleanup":
+                          valid = valid and cleanup == "passed" and source_sha is None and artifact_sha is None
+                      else:
+                          valid = valid and cleanup == "not-run" and source_sha is None and artifact_sha is None
+                  else:
+                      valid = valid and reason != "ok" and source_sha is None and artifact_sha is None
+                      if phase == "complete":
+                          valid = valid and cleanup in {"passed", "failed"} and failed_phase is not None
+                      elif phase == "cleanup":
+                          valid = valid and reason == "cleanup_failed" and cleanup == "failed"
+                      else:
+                          valid = False
+                  if valid:
+                      safe.update({key: fields[key] for key in safe if fields.get(key)})
+                      if failed_phase is not None:
+                          safe["failed_phase"] = failed_phase
+          consistency = "unknown"
+          if valid and parser_rc == "0" and re.fullmatch(r"[0-9]+", canonical_rc):
+              consistency = "match" if ((canonical_rc == "0") == (safe["status"] == "passed")) else "mismatch"
+          sanitizer_rc = 0 if valid and consistency == "match" else 1
+          print(
+              "RELEASE_RUNTIME_BUILD_DIAGNOSTIC schema=1 "
+              f"canonical_builder_rc={canonical_display} parser_rc={parser_display} "
+              f"phase={safe['phase']} status={safe['status']} "
+              f"reason={safe['reason']} cleanup={safe['cleanup']} consistency={consistency}"
+              + (f" failed_phase={safe['failed_phase']}" if "failed_phase" in safe else "")
+          )
+          raise SystemExit(sanitizer_rc)
+          PY
+              )"
+              sanitizer_rc=$?
+            else
+              safe_diagnostic="RELEASE_RUNTIME_BUILD_DIAGNOSTIC schema=1 canonical_builder_rc=${canonical_rc:-unknown} parser_rc=127 phase=unknown status=failed reason=build_failed cleanup=unknown consistency=not-run"
+            fi
+            printf '%s\n' "$safe_diagnostic"
             if [[ -n "$release_root" ]]; then
               if [[ -d "$release_root" && ! -L "$release_root" ]]; then
                 current_id="$(sudo -n /usr/bin/stat -c '%d:%i' -- "$release_root" 2>/dev/null)"
@@ -716,9 +848,21 @@ jobs:
               printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=cleanup\n'
               exit 1
             fi
-            if (( rc != 0 )); then
+            if (( builder_run_ready == 1 && parser_rc != 0 )); then
+              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=diagnostic_parser\n'
+              exit 1
+            fi
+            if (( builder_run_ready == 1 && sanitizer_rc != 0 )); then
+              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=diagnostic_sanitizer\n'
+              exit 1
+            fi
+            if (( workflow_rc != 0 )); then
               printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=%s\n' "$failure_reason"
-              exit "$rc"
+              exit "$workflow_rc"
+            fi
+            if (( builder_run_ready == 0 )); then
+              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=builder_not_started\n'
+              exit 1
             fi
             printf 'RELEASE_RUNTIME_BUILD schema=1 status=passed source_sha=%s artifact_sha256=%s disk_before_bytes=%s disk_after_bytes=%s\n' \
               "$TARGET_SHA" "$artifact_sha256" "$disk_before_bytes" "$disk_after_bytes"
@@ -797,20 +941,27 @@ jobs:
             exit 1
           }
 
+          builder_started=1
           set +e
-          sudo -n /usr/bin/env -i \
-            HOME=/root \
-            LANG=C.UTF-8 \
-            LC_ALL=C.UTF-8 \
-            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            PLATFORM_RELEASE_OUTPUT_DIR="$release_output" \
-            PLATFORM_WEB_NEXT_COMPRESSION=true \
-            "$build_root/platform/tools/platform_build_release.sh" "$release_ref" \
-            2>&1 | sudo -n /usr/bin/tee "$build_log" >/dev/null
-          builder_status=("${PIPESTATUS[@]}")
+          sudo -n /bin/bash -c \
+            'build_log="$1"
+             release_output="$2"
+             builder="$3"
+             release_ref="$4"
+             exec >"$build_log" 2>&1
+             exec /usr/bin/env -i \
+               HOME=/root \
+               LANG=C.UTF-8 \
+               LC_ALL=C.UTF-8 \
+               PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+               PLATFORM_RELEASE_OUTPUT_DIR="$release_output" \
+               PLATFORM_WEB_NEXT_COMPRESSION=true \
+               "$builder" "$release_ref"' \
+            _ "$build_log" "$release_output" \
+            "$build_root/platform/tools/platform_build_release.sh" "$release_ref"
+          canonical_builder_rc=$?
           set -e
-          [[ "${builder_status[1]:-1}" -eq 0 ]] || { failure_reason=build_log_failed; exit 1; }
-          [[ "${builder_status[0]:-1}" -eq 0 ]] || { failure_reason=canonical_builder_failed; exit 1; }
+          [[ "$canonical_builder_rc" -eq 0 ]] || { failure_reason=canonical_builder_failed; exit "$canonical_builder_rc"; }
 
           archive_candidates="$(sudo -n /usr/bin/find "$release_output" -maxdepth 1 -type f \
             -name "${release_ref}-*.tar.gz" -print 2>/dev/null)" || {
