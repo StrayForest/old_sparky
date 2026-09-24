@@ -474,6 +474,26 @@ def _dispatch_deterministic(gate_id: str, arguments: Sequence[str]) -> int:
     if gate_id == "web-quality":
         commands = (
             (
+                "web-quality/shutdown-guard",
+                [
+                    _tool("platform_web_npm.sh"),
+                    "--prefix",
+                    "apps/platform_web",
+                    "run",
+                    "test:shutdown-guard",
+                ],
+            ),
+            (
+                "web-quality/ssr-stream-diagnostics",
+                [
+                    _tool("platform_web_npm.sh"),
+                    "--prefix",
+                    "apps/platform_web",
+                    "run",
+                    "test:ssr-stream-diagnostics",
+                ],
+            ),
+            (
                 "web-quality/dependency-audit",
                 [_tool("platform_web_npm.sh"), "--prefix", "apps/platform_web", "audit", "--audit-level=high"],
             ),

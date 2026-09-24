@@ -16,6 +16,8 @@
     "test:smoke": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test",
     "test:source-contract": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.source-contract.config.ts",
     "test:hermetic": "../../tools/platform_web_hermetic.sh",
+    "test:shutdown-guard": "../../tools/platform_node.sh tests/shutdown-guard-contract.cjs",
+    "test:ssr-stream-diagnostics": "../../tools/platform_node.sh tests/ssr-stream-diagnostics-contract.cjs",
     "test:participant-progressive": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.participant.config.ts",
     "test:live": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-launch.spec.ts",
     "test:live:webkit": "../../tools/platform_node.sh ./node_modules/@playwright/test/cli.js test --config=playwright.live.config.ts tests/smoke/live-launch.spec.ts --project=live-webkit-mobile",
