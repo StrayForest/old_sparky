@@ -469,32 +469,61 @@ jobs:
           test "$bundle_stat" -gt 0
           inner_dir="$RUNNER_TEMP/platform-host-tools-inner"
           install -d -m 700 "$inner_dir"
-          expected_members=(
-            platform-host-tools/capabilities.txt
-            platform-host-tools/platform_workflow_remote_dispatch.py
-            platform-host-tools/platform_workflow_input_guard.py
-            platform-host-tools/platform_prepare_artifact_dir.py
-            platform-host-tools/platform_production_deploy_supervisor.sh
-            platform-host-tools/platform_release_lock.sh
-            platform-host-tools/platform_release_preflight.sh
-            platform-host-tools/platform_validate_release_artifact.py
-            platform-host-tools/platform_safe_env_exec.py
-            platform-host-tools/platform_render_service_envs.py
-            platform-host-tools/platform_validate_edge_policy.py
-            platform-host-tools/platform_update_cloudflare_ips.py
-            platform-host-tools/platform_configure_shared_env.py
-            platform-host-tools/platform_storage_evidence_summary.py
-            platform-host-tools/manifest.json
-          )
-          mapfile -t actual_members < <(/usr/bin/zipinfo -Z1 "$bundle_path")
-          test "${#actual_members[@]}" -eq "${#expected_members[@]}"
-          for index in "${!expected_members[@]}"; do
-            test "${actual_members[$index]}" = "${expected_members[$index]}"
-          done
           /usr/bin/unzip -qq -n "$bundle_path" -d "$inner_dir"
           test "$(find "$inner_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 1
           inner_root="$inner_dir/platform-host-tools"
           test -d "$inner_root" && test ! -L "$inner_root"
+          expected_members_file="$RUNNER_TEMP/platform-host-tools-expected-members"
+          /usr/bin/python3 - "$inner_root/manifest.json" "$contract_dir/files.sha256" "$expected_members_file" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          manifest_path, contract_path, output_path = map(Path, sys.argv[1:])
+          payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+          safe_member = re.compile(r"^platform_[A-Za-z0-9_.-]+\.(?:py|sh)$")
+          records = payload.get("files")
+          if (
+              type(payload.get("schema")) is not int
+              or payload.get("schema") != 1
+              or not isinstance(records, list)
+          ):
+              raise SystemExit("host-tools manifest schema is invalid")
+          manifest_paths = []
+          for record in records:
+              if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
+                  raise SystemExit("host-tools manifest record is invalid")
+              path = record.get("path")
+              if path != "capabilities.txt" and (not isinstance(path, str) or safe_member.fullmatch(path) is None):
+                  raise SystemExit("host-tools manifest path is unsafe")
+              if path in manifest_paths:
+                  raise SystemExit("host-tools manifest has duplicate paths")
+              manifest_paths.append(path)
+          if "capabilities.txt" not in manifest_paths:
+              raise SystemExit("host-tools capabilities member is missing")
+          contract_paths = []
+          for line in contract_path.read_text(encoding="ascii").splitlines():
+              digest, path = line.split("  ", 1)
+              if path in contract_paths:
+                  raise SystemExit("host-tools contract has duplicate paths")
+              contract_paths.append(path)
+          if sorted(manifest_paths) != sorted(contract_paths):
+              raise SystemExit("host-tools manifest and contract sets differ")
+          expected = sorted(
+              [f"platform-host-tools/{path}" for path in manifest_paths]
+              + ["platform-host-tools/manifest.json"]
+          )
+          output_path.write_text("\n".join(expected) + "\n", encoding="ascii")
+          PY
+          mapfile -t actual_members < <(/usr/bin/zipinfo -Z1 "$bundle_path")
+          for member in "${actual_members[@]}"; do
+            [[ "$member" =~ ^platform-host-tools/(platform_[A-Za-z0-9_.-]+\.(py|sh)|capabilities\.txt|manifest\.json)$ ]]
+          done
+          printf '%s\n' "${actual_members[@]}" | /usr/bin/sort -u > "$RUNNER_TEMP/platform-host-tools-actual-members"
+          test "$(wc -l < "$RUNNER_TEMP/platform-host-tools-actual-members" | tr -d ' ')" = "${#actual_members[@]}"
+          cmp -s "$expected_members_file" "$RUNNER_TEMP/platform-host-tools-actual-members"
+          mapfile -t expected_members < "$expected_members_file"
           test "$(/usr/bin/sha256sum "$inner_root/manifest.json" | cut -d' ' -f1)" = "$manifest_hash"
           test "$(/usr/bin/sha256sum "$inner_root/capabilities.txt" | cut -d' ' -f1)" = "$capabilities_hash"
           grep -Fqx "schema=1" "$inner_root/capabilities.txt"
@@ -594,7 +623,7 @@ jobs:
           # NUL-delimited find output is base64-wrapped before it crosses the
           # SSH boundary.  This preserves dotfiles and makes newline/control
           # names observable instead of allowing line-oriented ambiguity.
-          "${remote[@]}" /usr/bin/find "$generation" -mindepth 1 -maxdepth 1 -printf '%f\0' \
+          "${remote[@]}" /usr/bin/find -- "$generation" -mindepth 1 -maxdepth 1 -print0 \
             | /usr/bin/base64 -w 0 > "$inventory_encoded"
           test "$(stat -c '%F:%h' -- "$inventory_encoded")" = "regular file:1"
           test "$(stat -c '%s' -- "$inventory_encoded")" -le 16384
@@ -603,7 +632,9 @@ jobs:
           mapfile -d '' -t remote_names < "$inventory_file"
           test "${#remote_names[@]}" -eq "$expected_entry_count"
           declare -A seen_entries=()
-          for relative_path in "${remote_names[@]}"; do
+          for remote_path in "${remote_names[@]}"; do
+            [[ "$remote_path" == "$generation/"* ]]
+            relative_path="${remote_path#"$generation/"}"
             [[ "$relative_path" =~ ^[A-Za-z0-9_.-]+$ ]]
             [[ -n "${expected_entries[$relative_path]+present}" ]]
             [[ -z "${seen_entries[$relative_path]+present}" ]]
@@ -620,7 +651,8 @@ jobs:
         run: |
           set -euo pipefail
           rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip"
-          rm -f -- "$RUNNER_TEMP/host-tools-remote-entries.b64" "$RUNNER_TEMP/host-tools-remote-entries"
+          rm -f -- "$RUNNER_TEMP/host-tools-remote-entries.b64" "$RUNNER_TEMP/host-tools-remote-entries" \
+            "$RUNNER_TEMP/platform-host-tools-expected-members" "$RUNNER_TEMP/platform-host-tools-actual-members"
           rm -rf -- "$RUNNER_TEMP/host-tools-download" "$RUNNER_TEMP/platform-host-tools-inner"
           ssh_dir="$RUNNER_TEMP/platform-host-capability-ssh"
           if [[ -d "$ssh_dir" && ! -L "$ssh_dir" ]]; then

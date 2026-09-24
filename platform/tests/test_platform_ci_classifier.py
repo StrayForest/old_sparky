@@ -212,6 +212,15 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertNotIn("secrets.", workflow)
         self.assertIn("TARGET_SHA: ${{ github.event.workflow_run.head_sha }}", workflow)
         self.assertIn("statuses/${TARGET_SHA}", workflow)
+        self.assertIn("attempt_url=", workflow)
+        self.assertIn("SOURCE_RUN_URL", workflow)
+        self.assertIn("SOURCE_RUN_UPDATED_AT", workflow)
+        self.assertIn("/attempts/{attempt}", workflow)
+        self.assertIn("commits/${TARGET_SHA}/statuses?per_page=100", workflow)
+        self.assertIn("preserve_success", workflow)
+        self.assertIn("int(match.group(2)) >= int(source_attempt)", workflow)
+        self.assertIn("newer_status", workflow)
+        self.assertIn("source_conclusion == \"success\"", workflow)
         self.assertIn('case "$SOURCE_CONCLUSION" in', workflow)
         self.assertIn("success)", workflow)
         for conclusion in (
@@ -232,6 +241,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
             workflow.index("name: Platform security status finalizer"),
             workflow.index("TARGET_SHA: ${{ github.event.workflow_run.head_sha }}"),
         )
+
         pending_at = security.index("--data", security.index("Mark platform security build pending"))
         first_gate_at = security.index("  backend-static:")
         final_at = security.index("  status-final:")
@@ -335,6 +345,18 @@ class PlatformCiClassifierTests(unittest.TestCase):
             expected_target_sha=self.TARGET_SHA,
             expected_run_url=run["html_url"],
         )
+        superseded_status = [dict(statuses[0])]
+        superseded_status[0]["target_url"] = f"{run['html_url']}/attempts/3"
+        with self.assertRaises(ProvenanceError):
+            validate_security_marker(
+                workflow,
+                run,
+                superseded_status,
+                expected_run_id=1234,
+                expected_attempt=2,
+                expected_target_sha=self.TARGET_SHA,
+                expected_run_url=run["html_url"],
+            )
         with self.assertRaises(ProvenanceError):
             validate_security_marker(
                 workflow,

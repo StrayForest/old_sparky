@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -98,6 +99,24 @@ class HostToolsBundleTests(unittest.TestCase):
                 [record["path"] for record in summary["manifest"]["files"]],
                 sorted(record["path"] for record in summary["manifest"]["files"]),
             )
+
+    def test_archive_member_set_accepts_shuffled_order_but_keeps_canonical_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source_fixture(root)
+            original = root / "original.zip"
+            bundle.build_bundle(source, SOURCE_SHA, original)
+            shuffled = root / "shuffled.zip"
+            with zipfile.ZipFile(original) as source_zip, zipfile.ZipFile(
+                shuffled, "w", compression=zipfile.ZIP_STORED
+            ) as target_zip:
+                infos = list(reversed(source_zip.infolist()))
+                for info in infos:
+                    target_zip.writestr(info, source_zip.read(info))
+            verified = bundle.verify_bundle(shuffled, expected_source_sha=SOURCE_SHA)
+            paths = {record["path"] for record in verified["manifest"]["files"]}
+            self.assertIn("platform_configure_shared_env.py", paths)
+            self.assertIn("platform_update_cloudflare_ips.py", paths)
 
     def test_tampered_archive_and_metadata_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -310,13 +329,37 @@ class HostToolsBundleTests(unittest.TestCase):
         python_import = re.compile(
             r"from\s+(?:\.\s*)?(?P<module>platform_[A-Za-z0-9_]+)\s+import"
         )
-        graph = {
-            name: (
-                {match.group("name") for match in reference.finditer(text)}
-                | {f"{match.group('module')}.py" for match in python_import.finditer(text)}
-            ) & names
-            for name, text in tools.items()
+        boundary_allowlist = {
+            # Candidate/runtime or separately provisioned operator helpers.
+            "platform_release_deploy.sh",
+            "platform_run_api.sh",
+            "platform_run_worker.sh",
+            "platform_run_web.sh",
+            "platform_run_alembic.sh",
+            "platform_deploy_smoke.py",
+            "platform_backup_restore_drill.py",
+            # Dispatcher-owned external workflows intentionally outside this bundle.
+            "platform_production_external_fixture_qa.sh",
+            "platform_production_retained_load_cleanup_qa.sh",
+            "platform_live_launch_supervisor.sh",
+            "platform_live_user_qa_dispatch.py",
+            "platform_live_launch_trusted.sh",
         }
+
+        def build_graph(contents: dict[str, str]) -> dict[str, set[str]]:
+            return {
+                name: (
+                    {match.group("name") for match in reference.finditer(text)}
+                    | {f"{match.group('module')}.py" for match in python_import.finditer(text)}
+                )
+                for name, text in contents.items()
+            }
+
+        graph = build_graph(tools)
+        discovered = set().union(*graph.values())
+        local_tools = {path.name for path in TOOLS_ROOT.glob("platform_*")}
+        self.assertTrue(discovered <= local_tools)
+        self.assertEqual(discovered - names - boundary_allowlist, set())
         reachable = set()
         frontier = {"platform_workflow_remote_dispatch.py", "platform_production_deploy_supervisor.sh"}
         while frontier:
@@ -324,9 +367,17 @@ class HostToolsBundleTests(unittest.TestCase):
             if name in reachable:
                 continue
             reachable.add(name)
-            frontier.update(graph[name] - reachable)
+            frontier.update((graph[name] & names) - reachable)
         self.assertEqual(reachable, names)
         self.assertNotIn("platform_release_restore_runtime.sh", names)
+
+        mutated = dict(tools)
+        mutated["platform_release_preflight.sh"] += (
+            '\n"$SCRIPT_DIR/platform_unlisted_local.py"\n'
+        )
+        mutated_discovered = set().union(*build_graph(mutated).values())
+        self.assertIn("platform_unlisted_local.py", mutated_discovered - names)
+        self.assertNotEqual(mutated_discovered - names - boundary_allowlist, set())
 
     def test_remote_capability_inventory_is_nul_safe_and_exact(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
@@ -336,13 +387,14 @@ class HostToolsBundleTests(unittest.TestCase):
             "  build-release:", 1
         )[0]
         self.assertIn(
-            "find \"$generation\" -mindepth 1 -maxdepth 1 -printf '%f\\0'",
+            "find -- \"$generation\" -mindepth 1 -maxdepth 1 -print0",
             preflight,
         )
         self.assertIn("base64 --decode", preflight)
         self.assertIn("mapfile -d '' -t remote_names", preflight)
         self.assertIn('test "${#remote_names[@]}" -eq "$expected_entry_count"', preflight)
         self.assertIn("seen_entries", preflight)
+        self.assertNotIn("expected_members=(", preflight)
         self.assertNotIn('"$generation"/*', preflight)
 
         expected = set(bundle.HOST_TOOL_FILES) | {"capabilities.txt", "manifest.json"}
@@ -361,6 +413,33 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertFalse(accepted(sorted(expected | {"symlink"})))
         self.assertFalse(accepted(sorted(expected | {"bad\nname"})))
         self.assertTrue(accepted(sorted(expected)))
+
+    def test_remote_inventory_shell_fixture_carries_dotfiles_and_extras_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            generation = Path(temporary) / "generation"
+            generation.mkdir()
+            (generation / "manifest.json").write_text("{}\n", encoding="ascii")
+            (generation / "capabilities.txt").write_text("\n", encoding="ascii")
+            (generation / ".unexpected").write_text("extra\n", encoding="ascii")
+            remote_command = (
+                "/usr/bin/find -- "
+                + shlex.quote(str(generation))
+                + " -mindepth 1 -maxdepth 1 -print0"
+            )
+            completed = subprocess.run(
+                ["/bin/sh", "-c", remote_command],
+                check=True,
+                capture_output=True,
+            )
+            remote_paths = completed.stdout.rstrip(b"\0").split(b"\0")
+            names = [
+                path.decode("utf-8").removeprefix(f"{generation}/")
+                for path in remote_paths
+            ]
+            self.assertIn(".unexpected", names)
+            expected = {"manifest.json", "capabilities.txt"}
+            self.assertNotEqual(set(names), expected)
+            self.assertEqual(len(names), 3)
 
     def test_host_capability_probe_checks_closed_generation_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
