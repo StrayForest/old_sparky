@@ -916,7 +916,8 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             real,
         )
         self.assertIn('--marker-log "$marker_log"', real)
-        self.assertNotIn('diagnostic_parser --log "$build_log"', real)
+        self.assertNotIn('diagnostic_parser --marker-log "$build_log"', real)
+        self.assertNotIn("--" + "log", real)
         self.assertIn('/usr/bin/install -o root -g root -m 0600 /dev/null "$marker_log"', real)
         self.assertIn(
             "if (( builder_run_ready == 1 && parser_rc != 0 )); then",

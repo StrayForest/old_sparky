@@ -328,7 +328,7 @@ def extract(path: Path) -> Marker:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[0] not in {"--log", "--marker-log"}:
+    if len(argv) != 2 or argv[0] != "--marker-log":
         print(_safe_failure("marker"))
         return 2
     try:

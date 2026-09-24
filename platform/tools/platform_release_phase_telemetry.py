@@ -240,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--append", action="store_true")
-    parser.add_argument("--log", type=Path, required=True)
+    parser.add_argument("--marker-log", type=Path, required=True)
     parser.add_argument("--marker")
     try:
         args = parser.parse_args(argv)
@@ -249,9 +249,9 @@ def main(argv: list[str] | None = None) -> int:
         ):
             return 1
         if args.check:
-            check(args.log)
+            check(args.marker_log)
         else:
-            append(args.log, args.marker)
+            append(args.marker_log, args.marker)
     except (TelemetryError, OSError, ValueError, SystemExit):
         return 1
     return 0

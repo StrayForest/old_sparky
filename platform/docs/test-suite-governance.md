@@ -53,13 +53,17 @@ classifier; there is no schedule trigger.
 The canonical builder keeps its ordinary build output in a private root-owned
 `0600` raw log and emits only allowlisted `RELEASE_BUILD_PHASE` markers to a
 separate root-owned `0600` marker stream. The real job reads only that bounded
-marker stream through `platform_release_build_diagnostics.py` before
+marker stream through `platform_release_build_diagnostics.py`'s explicit
+`--marker-log` interface before
 identity-checked cleanup and prints only the normalized phase, reason, cleanup
 state and builder/parser return codes. Missing, malformed, oversized, mutable
 or untrusted marker streams fail closed; the raw builder log is never parsed,
 printed or uploaded, and both files are removed with the identified temporary
 root after successful cleanup. Cleanup-identity failures remain fail-closed
-for operator investigation. The builder's cleanup trap preserves the original
+for operator investigation. The workflow contract verifies the exact
+identity-checked cleanup path; deletion-failure simulation is intentionally
+not mocked because it would replace the root-owned filesystem boundary with a
+test double. The builder's cleanup trap preserves the original
 failure status and emits a failed `complete` marker, so diagnostic success
 cannot turn a failed build into a green gate. A parser rejection is reported
 only with the bounded reason enum `oversized`, `metadata`, `control`,

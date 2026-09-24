@@ -42,7 +42,7 @@ setup_phase_telemetry() {
     return 1
   fi
   if ! /usr/bin/python3 -I "$PHASE_TELEMETRY_WRITER" \
-    --check --log "$PHASE_LOG_PATH" >/dev/null 2>&1; then
+    --check --marker-log "$PHASE_LOG_PATH" >/dev/null 2>&1; then
     return 1
   fi
   PHASE_TELEMETRY_ENABLED=1
@@ -71,7 +71,7 @@ emit_phase_marker() {
     marker="RELEASE_BUILD_PHASE schema=1 phase=$phase status=passed reason=ok cleanup=$cleanup"
   fi
   if [[ "$PHASE_TELEMETRY_ENABLED" -eq 1 ]] && ! /usr/bin/python3 -I \
-    "$PHASE_TELEMETRY_WRITER" --append --log "$PHASE_LOG_PATH" --marker "$marker" \
+    "$PHASE_TELEMETRY_WRITER" --append --marker-log "$PHASE_LOG_PATH" --marker "$marker" \
     >/dev/null 2>&1; then
     return 1
   fi

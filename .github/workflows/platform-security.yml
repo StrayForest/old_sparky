@@ -965,7 +965,7 @@ jobs:
             exit 1
           }
           sudo -n /usr/bin/python3 -I "$build_root/platform/tools/platform_release_phase_telemetry.py" \
-            --check --log "$marker_log" >/dev/null 2>&1 || {
+            --check --marker-log "$marker_log" >/dev/null 2>&1 || {
             failure_reason=marker_log_failed
             exit 1
           }

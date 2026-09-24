@@ -57,7 +57,7 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                 "/usr/bin/python3",
                 "-I",
                 str(parser),
-                "--log",
+                "--marker-log",
                 str(path),
             ],
             check=False,
@@ -139,6 +139,15 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                 "RELEASE_BUILD_DIAGNOSTIC schema=1 phase=complete status=passed "
                 "reason=ok cleanup=passed "
                 f"source_sha={'a' * 40} artifact_sha256={'b' * 64}",
+            )
+            legacy_option = "--" + "log"
+            rejected_legacy_option = self._run_parser(
+                success, option=legacy_option
+            )
+            self.assertNotEqual(rejected_legacy_option.returncode, 0)
+            self.assertEqual(
+                rejected_legacy_option.stdout.strip(),
+                diagnostics._safe_failure("marker"),
             )
 
             failure = root / "failure.log"
@@ -413,10 +422,10 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                     timeout=10,
                 )
 
-            checked = run_writer("--check", "--log", str(phase_log))
+            checked = run_writer("--check", "--marker-log", str(phase_log))
             self.assertEqual(checked.returncode, 0, checked.stderr)
             appended = run_writer(
-                "--append", "--log", str(phase_log), "--marker", marker
+                "--append", "--marker-log", str(phase_log), "--marker", marker
             )
             self.assertEqual(appended.returncode, 0, appended.stderr)
             self.assertEqual(phase_log.read_bytes(), f"{marker}\n".encode("ascii"))
@@ -425,7 +434,7 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
             self._write_log(malformed, b"")
             rejected_marker = run_writer(
                 "--append",
-                "--log",
+                "--marker-log",
                 str(malformed),
                 "--marker",
                 marker.replace("reason=ok", "reason=unexpected"),
@@ -433,7 +442,7 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
             self.assertNotEqual(rejected_marker.returncode, 0)
             rejected_control = run_writer(
                 "--append",
-                "--log",
+                "--marker-log",
                 str(malformed),
                 "--marker",
                 f"{marker}\x01",
@@ -443,23 +452,23 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
             oversized_stream = phase_root / "oversized-stream.log"
             self._write_log(oversized_stream, b"x" * diagnostics.MAX_MARKER_STREAM_BYTES)
             rejected_oversized = run_writer(
-                "--append", "--log", str(oversized_stream), "--marker", marker
+                "--append", "--marker-log", str(oversized_stream), "--marker", marker
             )
             self.assertNotEqual(rejected_oversized.returncode, 0)
 
             symlink_stream = phase_root / "symlink-stream.log"
             symlink_stream.symlink_to(phase_log)
             self.assertNotEqual(
-                run_writer("--check", "--log", str(symlink_stream)).returncode, 0
+                run_writer("--check", "--marker-log", str(symlink_stream)).returncode, 0
             )
             wrong_mode = phase_root / "wrong-mode.log"
             self._write_log(wrong_mode, b"", mode=0o644)
             self.assertNotEqual(
-                run_writer("--check", "--log", str(wrong_mode)).returncode, 0
+                run_writer("--check", "--marker-log", str(wrong_mode)).returncode, 0
             )
             missing_writer_log = phase_root / "missing.log"
             self.assertNotEqual(
-                run_writer("--check", "--log", str(missing_writer_log)).returncode, 0
+                run_writer("--check", "--marker-log", str(missing_writer_log)).returncode, 0
             )
 
             before = phase_log.stat()
@@ -472,9 +481,43 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                     diagnostics._read_marker_stream(phase_log)
             self.assertEqual(raised.exception.reject_reason, "metadata")
 
+            short_write_log = phase_root / "short-write.log"
+            self._write_log(short_write_log, b"")
+            real_write = telemetry.os.write
+            first_short_write = True
+
+            def short_write(descriptor: int, payload: memoryview) -> int:
+                nonlocal first_short_write
+                if first_short_write and len(payload) > 1:
+                    first_short_write = False
+                    return real_write(descriptor, payload[:1])
+                return real_write(descriptor, payload)
+
+            with mock.patch.object(telemetry.os, "write", side_effect=short_write):
+                telemetry.append(short_write_log, marker)
+            self.assertEqual(short_write_log.read_bytes(), f"{marker}\n".encode("ascii"))
+
+            write_error_log = phase_root / "write-error.log"
+            self._write_log(write_error_log, b"")
+            with mock.patch.object(
+                telemetry.os, "write", side_effect=OSError(5, "write")
+            ):
+                with self.assertRaises(telemetry.TelemetryError):
+                    telemetry.append(write_error_log, marker)
+            self.assertEqual(write_error_log.read_bytes(), b"")
+
+            fsync_error_log = phase_root / "fsync-error.log"
+            self._write_log(fsync_error_log, b"")
+            with mock.patch.object(
+                telemetry.os, "fsync", side_effect=OSError(5, "fsync")
+            ):
+                with self.assertRaises(telemetry.TelemetryError):
+                    telemetry.append(fsync_error_log, marker)
+            self.assertEqual(fsync_error_log.read_bytes(), f"{marker}\n".encode("ascii"))
+
             writer_before = phase_log.stat()
             writer_changed = list(writer_before)
-            writer_changed[6] += 1
+            writer_changed[1] += 1
             with mock.patch.object(
                 telemetry.os,
                 "fstat",
@@ -595,6 +638,71 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
             parsed_marker_stream = self._run_parser(phase_log)
             self.assertEqual(parsed_marker_stream.returncode, 0, parsed_marker_stream.stderr)
             self.assertIn("failed_phase=canonical-preflight", parsed_marker_stream.stdout)
+
+            # Exercise the real writer/parser subprocess boundary with a
+            # builder-shaped failure: the raw log is deliberately larger than
+            # the parser's marker bound, while the separate marker stream
+            # remains small and reports the artifact-validation rc=2 phase.
+            integration_root = root / "artifact-validate-fixture"
+            integration_root.mkdir(mode=0o700)
+            os.chmod(integration_root, 0o700)
+            integration_marker_log = integration_root / "phase.log"
+            self._write_log(integration_marker_log, b"")
+            integration_source = integration_root / "markers.txt"
+            integration_source.write_bytes(
+                self._failure_markers(
+                    "artifact-validate", include_failed_phase=True
+                )
+            )
+            integration_raw_log = integration_root / "builder.log"
+            integration_builder = integration_root / "builder-fixture.sh"
+            integration_builder.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -Eeuo pipefail\n"
+                "umask 077\n"
+                "raw_log=\"$1\"\n"
+                "marker_log=\"$2\"\n"
+                "marker_source=\"$3\"\n"
+                "writer=\"$4\"\n"
+                "/usr/bin/dd if=/dev/zero bs=1048576 count=4 status=none >\"$raw_log\"\n"
+                "/usr/bin/printf x >>\"$raw_log\"\n"
+                "/usr/bin/python3 -I \"$writer\" --check --marker-log \"$marker_log\"\n"
+                "while IFS= read -r marker; do\n"
+                "  /usr/bin/python3 -I \"$writer\" --append --marker-log \"$marker_log\" --marker \"$marker\"\n"
+                "done <\"$marker_source\"\n"
+                "exit 2\n",
+                encoding="ascii",
+            )
+            os.chmod(integration_builder, 0o700)
+            integrated = subprocess.run(
+                [
+                    str(integration_builder),
+                    str(integration_raw_log),
+                    str(integration_marker_log),
+                    str(integration_source),
+                    str(phase_writer),
+                ],
+                cwd=platform,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(integrated.returncode, 2, integrated.stderr)
+            self.assertGreater(
+                integration_raw_log.stat().st_size, 4 * 1024 * 1024
+            )
+            parsed_artifact_failure = self._run_parser(integration_marker_log)
+            self.assertEqual(
+                parsed_artifact_failure.returncode,
+                0,
+                parsed_artifact_failure.stderr,
+            )
+            self.assertIn(
+                "phase=complete status=failed reason=build_failed cleanup=passed "
+                "failed_phase=artifact-validate",
+                parsed_artifact_failure.stdout,
+            )
 
         self.assertEqual(completed.returncode, 3, completed.stderr)
         self.assertIn(
