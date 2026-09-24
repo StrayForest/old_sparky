@@ -11,6 +11,7 @@ import {
   normalizeTournamentInviteCode,
   PlatformApiError
 } from "@/lib/platform-api";
+import type { TournamentDetail } from "@/lib/types";
 
 export const metadata: Metadata = {
   title: "Турнир"
@@ -35,6 +36,7 @@ export default async function TournamentDetailPage({
   const resolvedSearchParams = await searchParams;
   const inviteCode = normalizeTournamentInviteCode(resolvedSearchParams?.invite_code);
   const cookieHeader = (await cookies()).toString();
+  let initialTournament: TournamentDetail | undefined;
 
   // Resolve existence before returning the client shell. A definitive API
   // 404 must become a document-level 404; otherwise an unknown slug commits
@@ -55,13 +57,20 @@ export default async function TournamentDetailPage({
     if (!workspace) {
       notFound();
     }
+    initialTournament = workspace.tournament;
   } catch (error) {
     if (!(error instanceof PlatformApiError && (error.status === 401 || error.status === 403))) {
       throw error;
     }
   }
 
-  const rendered = <TournamentDetailClientPage slug={slug} inviteCode={inviteCode} />;
+  const rendered = (
+    <TournamentDetailClientPage
+      slug={slug}
+      inviteCode={inviteCode}
+      initialTournament={initialTournament}
+    />
+  );
   if (isSsrDiagnosticsEnabled()) {
     await recordSsrStage("page_component", performance.now() - startedAt);
   }

@@ -967,7 +967,7 @@ test("authenticated header stays resolved across client navigation without a bro
   expect(browserMeRequests).toBe(0);
 });
 
-test("authenticated tournament keeps header SSR and defers one workspace request to the browser", async ({ page }, testInfo) => {
+test("authenticated tournament hydrates from one SSR workspace request", async ({ page }, testInfo) => {
   const countScope = ssrCountScope(testInfo);
   await resetSsrRequestCounts(page, countScope);
   let browserWorkspaceRequests = 0;
@@ -1003,13 +1003,11 @@ test("authenticated tournament keeps header SSR and defers one workspace request
 
   expect(bootstrapCount).toBeGreaterThanOrEqual(1);
   expect(usersMeCount).toBe(0);
-  // React Strict Mode may replay the client effect in next dev; the request
-  // must still be present and the production build runs this once.
-  expect(workspaceCount).toBeGreaterThanOrEqual(1);
-  // Next dev intentionally replays effects under React Strict Mode; the
-  // production build executes the browser fetch once. The server-side
-  // request counter above remains the no-duplicate contract.
-  expect(browserWorkspaceRequests).toBeGreaterThanOrEqual(1);
+  await expect.poll(
+    () => readSsrRequestCount(page, countScope, "/api/v1/tournaments/night-veil-open-5/workspace")
+  ).toBe(1);
+  expect(workspaceCount).toBe(1);
+  expect(browserWorkspaceRequests).toBe(0);
 });
 
 test("status and rank filters operate on typed tournament data", async ({ page }) => {

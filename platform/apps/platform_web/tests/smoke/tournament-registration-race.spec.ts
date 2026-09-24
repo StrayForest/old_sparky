@@ -46,11 +46,12 @@ async function navigateToTournamentB(page: Page) {
   await expect(page.getByRole("heading", { level: 1, name: "Citadel Clash #3", exact: true })).toBeVisible();
 }
 
-test("a delayed A workspace response cannot replace the B tournament", async ({ page }) => {
+test("a delayed A client refetch cannot replace the B tournament", async ({ page }) => {
   await authenticateTestUser(page);
   const aStarted = deferred();
   const releaseA = deferred();
   const aFinished = deferred();
+  let joinAttempted = false;
 
   await page.route("**/api/v1/tournaments/night-veil-open-5/workspace*", async (route) => {
     aStarted.resolve();
@@ -63,15 +64,33 @@ test("a delayed A workspace response cannot replace the B tournament", async ({ 
       aFinished.resolve();
     }
   });
+  await page.route("**/api/v1/tournaments/night-veil-open-5/join", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    joinAttempted = true;
+    await route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "Session is invalid." })
+    });
+  });
 
   await page.goto(TOURNAMENT_A);
+  const steps = page.getByTestId("registration-steps");
+  await expect(steps.getByRole("button", { name: "Зарегистрироваться" })).toBeVisible();
+  await steps.getByRole("button", { name: "Зарегистрироваться" }).click();
+  await expect.poll(() => joinAttempted).toBe(true);
+  // SSR supplied the initial detail; this is the genuine client refetch after
+  // the 401 invalidates the session identity.
   await aStarted.promise;
   await navigateToTournamentB(page);
 
   releaseA.resolve();
   await aFinished.promise;
   await expect(page.getByRole("heading", { level: 1, name: "Citadel Clash #3", exact: true })).toBeVisible();
-  await expect(page.getByTestId("registration-steps")).toContainText("Регистрация закрыта");
+  await expect(page.getByTestId("registration-steps")).toContainText("20 мая");
 });
 
 test("a delayed A registration response cannot alter B controls", async ({ page }) => {
