@@ -1,4 +1,5 @@
 "use strict";
+/* eslint-disable @typescript-eslint/no-require-imports */
 
 const { spawn } = require("node:child_process");
 const path = require("node:path");
