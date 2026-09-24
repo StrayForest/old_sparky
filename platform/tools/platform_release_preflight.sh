@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -71,7 +72,7 @@ if [[ -n "$CURRENT_TARGET" && -d "$CURRENT_TARGET" ]]; then
   if [[ "$candidate_slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]]; then
     PUBLIC_RELEASE_SLUG="$candidate_slug"
     candidate_sha="$({
-      /usr/bin/python3 -I - "$CURRENT_TARGET/RELEASE.json" <<'PY'
+      /usr/bin/python3 -I -B - "$CURRENT_TARGET/RELEASE.json" <<'PY'
 import json
 import re
 import sys
@@ -121,7 +122,7 @@ load_env_as_data() {
     || fail "Safe environment parser is missing or unsafe."
   local encoded_assignments
   encoded_assignments="$(
-    /usr/bin/python3 -I "$safe_env_tool" export-b64 --path "$ENV_FILE" 2>/dev/null
+    /usr/bin/python3 -I -B "$safe_env_tool" export-b64 --path "$ENV_FILE" 2>/dev/null
   )" || fail "Canonical environment could not be parsed safely."
   local key encoded value
   while IFS=$'\t' read -r key encoded; do
@@ -178,7 +179,7 @@ pass
 RENDER_SERVICE_ENVS_TOOL="$SCRIPT_DIR/platform_render_service_envs.py"
 [[ -f "$RENDER_SERVICE_ENVS_TOOL" && ! -L "$RENDER_SERVICE_ENVS_TOOL" ]] \
   || fail "Service env renderer is missing or unsafe."
-"$PYTHON_BIN" "$RENDER_SERVICE_ENVS_TOOL" \
+"$PYTHON_BIN" -B "$RENDER_SERVICE_ENVS_TOOL" \
   --source "$ENV_FILE" \
   --output-dir "$SHARED_DIR/env" \
   --verify >/dev/null 2>/dev/null \
@@ -188,7 +189,7 @@ pass
 SAFE_ENV_TOOL="$SCRIPT_DIR/platform_safe_env_exec.py"
 [[ -f "$SAFE_ENV_TOOL" && ! -L "$SAFE_ENV_TOOL" ]] \
   || fail "Safe environment parser is missing or unsafe."
-"$PYTHON_BIN" -I - \
+"$PYTHON_BIN" -I -B - \
   "$ENV_FILE" "$SAFE_ENV_TOOL" "$CURRENT_TARGET/tools/platform_deploy_smoke.py" \
   2>/dev/null <<'PY' \
   || fail "Deploy smoke dotenv interpretation diverges from the strict runtime parser."
@@ -218,7 +219,7 @@ if [[ "$REQUIRE_EDGE_PARITY" -eq 1 ]]; then
   EDGE_POLICY_TOOL="$SCRIPT_DIR/platform_validate_edge_policy.py"
   [[ -f "$EDGE_POLICY_TOOL" && ! -L "$EDGE_POLICY_TOOL" ]] \
     || fail "Edge policy validator is missing or unsafe."
-  "$PYTHON_BIN" "$EDGE_POLICY_TOOL" \
+  "$PYTHON_BIN" -B "$EDGE_POLICY_TOOL" \
     --json >/dev/null \
     || fail "Cloudflare/Nginx/UFW trust-range parity check failed."
   pass
@@ -250,7 +251,7 @@ CONFIG_CHECK_OUTPUT="$(
   PLATFORM_ENV_FILE="$ENV_FILE" \
   PLATFORM_PYTHON_BIN="$PYTHON_BIN" \
   PYTHONPATH="$CURRENT_TARGET" \
-  "$PYTHON_BIN" -c \
+  "$PYTHON_BIN" -B -c \
     "from python_packages.platform_infra.config import get_settings, validate_platform_settings; validate_platform_settings(get_settings(), require_api_secret=True); print('platform-config-ok')" \
     2>/dev/null
 )"
@@ -263,7 +264,7 @@ DB_CHECK_OUTPUT="$(
   PLATFORM_ENV_FILE="$ENV_FILE" \
   PLATFORM_PYTHON_BIN="$PYTHON_BIN" \
   PYTHONPATH="$CURRENT_TARGET" \
-  "$PYTHON_BIN" -c "import asyncio; from python_packages.platform_infra.db import warm_up_engine; asyncio.run(warm_up_engine()); print('platform-db-ok')" \
+  "$PYTHON_BIN" -B -c "import asyncio; from python_packages.platform_infra.db import warm_up_engine; asyncio.run(warm_up_engine()); print('platform-db-ok')" \
   2>/dev/null
 )"
 [[ "$DB_CHECK_OUTPUT" == *"platform-db-ok"* ]] || fail "Database warm-up check failed."
@@ -275,12 +276,12 @@ pass
 ALEMBIC_CURRENT="$(
   cd "$CURRENT_TARGET" && \
   PYTHONPATH="$CURRENT_TARGET" \
-  "$PYTHON_BIN" -m alembic current 2>/dev/null | tail -n 1 | awk '{print $1}'
+  "$PYTHON_BIN" -B -m alembic current 2>/dev/null | tail -n 1 | awk '{print $1}'
 )"
 ALEMBIC_HEAD="$(
   cd "$CURRENT_TARGET" && \
   PYTHONPATH="$CURRENT_TARGET" \
-  "$PYTHON_BIN" -m alembic heads 2>/dev/null | tail -n 1 | awk '{print $1}'
+  "$PYTHON_BIN" -B -m alembic heads 2>/dev/null | tail -n 1 | awk '{print $1}'
 )"
 
 [[ -n "$ALEMBIC_CURRENT" ]] || fail "Could not resolve current Alembic revision."
@@ -289,7 +290,7 @@ ALEMBIC_HEAD="$(
 pass
 
 if [[ "$REQUIRE_VERIFIED_BACKUP" -eq 1 ]]; then
-  "$PYTHON_BIN" "$CURRENT_TARGET/tools/platform_backup_restore_drill.py" \
+  "$PYTHON_BIN" -B "$CURRENT_TARGET/tools/platform_backup_restore_drill.py" \
     --output-dir "$SHARED_DIR/backups" \
     --check-latest \
     --max-age-hours "$BACKUP_MAX_AGE_HOURS" >/dev/null 2>/dev/null

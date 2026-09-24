@@ -71,7 +71,7 @@ timeout_diagnostics="${9:-false}"
   echo "Target SHA must be a lowercase 40-character commit SHA." >&2
   exit 1
 }
-"$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_workflow_input_guard.py" email \
+"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" email \
   --value "$control_email" || {
   echo "Control email is invalid." >&2
   exit 1
@@ -119,7 +119,7 @@ test -L "$RUNTIME_ROOT/current" || {
   exit 1
 }
 
-release_sha="$($SYSTEM_PYTHON -I - "$RUNTIME_ROOT/current/RELEASE.json" <<'PY'
+release_sha="$($SYSTEM_PYTHON -I -B - "$RUNTIME_ROOT/current/RELEASE.json" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -133,12 +133,12 @@ test "$release_sha" = "$target_sha" || {
   exit 1
 }
 
-platform_environment="$($SYSTEM_PYTHON -I "$TOOLS_DIR/platform_safe_env_exec.py" print-public-value PLATFORM_ENVIRONMENT)"
+platform_environment="$($SYSTEM_PYTHON -I -B "$TOOLS_DIR/platform_safe_env_exec.py" print-public-value PLATFORM_ENVIRONMENT)"
 test "$platform_environment" = "production" || {
   echo "Production external-load fixture requires PLATFORM_ENVIRONMENT=production." >&2
   exit 1
 }
-platform_origin="$($SYSTEM_PYTHON -I "$TOOLS_DIR/platform_safe_env_exec.py" print-public-value PLATFORM_WEB_ORIGIN)"
+platform_origin="$($SYSTEM_PYTHON -I -B "$TOOLS_DIR/platform_safe_env_exec.py" print-public-value PLATFORM_WEB_ORIGIN)"
 test "$platform_origin" = "$EXPECTED_ORIGIN" || {
   echo "Production external-load fixture requires the canonical origin." >&2
   exit 1
@@ -213,12 +213,12 @@ set -e
 # The command log can contain exception text, request values or credential
 # material from a failed setup.  Reduce it to one bounded fixed-schema record
 # before anything is exported, then remove the raw source.
-"$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_evidence_sanitizer.py" \
+"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_evidence_sanitizer.py" \
   --input "$run_root/qa-command.log" --output "$log_path"
 rm -f -- "$run_root/qa-command.log"
 test ! -e "$run_root/qa-command.log"
 
-"$SYSTEM_PYTHON" -I - "$external_vote_report" "$external_vote_summary" \
+"$SYSTEM_PYTHON" -I -B - "$external_vote_report" "$external_vote_summary" \
   "$qa_status" \
   "$external_vote_tournament_count" "$external_vote_users_per_tournament" <<'PY'
 import json
@@ -284,7 +284,7 @@ if [[ "$qa_status" == "0" && -s "$external_vote_manifest" ]]; then
   # exact, independently validated match prevents a stale/shared fixture from
   # being presented as origin evidence for this external run.
   fixture_marker=""
-  if ! fixture_marker="$($SYSTEM_PYTHON -I - "$external_vote_manifest" "$external_vote_report" <<'PY'
+  if ! fixture_marker="$($SYSTEM_PYTHON -I -B - "$external_vote_manifest" "$external_vote_report" <<'PY'
 import json
 import re
 from pathlib import Path
@@ -364,7 +364,7 @@ PY
   else
     # Preserve a debuggable fixed-schema failure without exporting the raw
     # observer stderr (which may contain paths, IDs or SQL diagnostics).
-    "$SYSTEM_PYTHON" -I - "$server_observability_log" "$observer_status" <<'PY'
+    "$SYSTEM_PYTHON" -I -B - "$server_observability_log" "$observer_status" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -404,7 +404,7 @@ summaries=("$run_root"/*/matrix-summary.json)
 shopt -u nullglob
 if (( ${#summaries[@]} != 1 )); then
   summary_path="$run_root/matrix-summary.json"
-  "$SYSTEM_PYTHON" -I - "$summary_path" "$run_id" "$qa_status" <<'PY'
+  "$SYSTEM_PYTHON" -I -B - "$summary_path" "$run_id" "$qa_status" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -433,7 +433,7 @@ find "$run_root" -xdev -type f -links 1 \
   -exec chown root:root -- {} + \
   -exec chmod 0600 -- {} +
 
-"$SYSTEM_PYTHON" -I - "$summary_path" "$export_dir/matrix-summary.json" <<'PY'
+"$SYSTEM_PYTHON" -I -B - "$summary_path" "$export_dir/matrix-summary.json" <<'PY'
 import json
 from pathlib import Path
 import sys

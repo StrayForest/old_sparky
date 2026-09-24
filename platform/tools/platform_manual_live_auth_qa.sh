@@ -46,7 +46,7 @@ fi
 COMMAND="$1"
 shift
 
-GUARD=("$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_live_qa_guard.py")
+GUARD=("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_live_qa_guard.py")
 if [[ -z "${PLATFORM_LIVE_QA_LOCK_FD:-}" ]]; then
   exec "${GUARD[@]}" locked-exec \
     --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
@@ -58,13 +58,13 @@ fi
 "${GUARD[@]}" verify-provenance \
   --platform-root "$PLATFORM_ROOT" \
   --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" >/dev/null
-"$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
+"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
 "${GUARD[@]}" preflight \
   --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
   --mode manual-prepare
 
 run_database_command() {
-  exec "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+  exec "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
     --pythonpath "$PLATFORM_ROOT" \
     -- "$QA_PYTHON" "$TOOLS_DIR/platform_manual_live_auth_qa.py" \
     --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" "$@"

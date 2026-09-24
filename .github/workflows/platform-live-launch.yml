@@ -194,7 +194,7 @@ jobs:
             -F "$SSH_DIR/config" \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            /usr/bin/python3.12 \
+            /usr/bin/python3.12 -I -B \
             /root/.oldsparky/liveqa/platform_workflow_remote_dispatch.py \
             live-launch < "$input_path" > "$raw_report" 2>&1
           ssh_status="$?"

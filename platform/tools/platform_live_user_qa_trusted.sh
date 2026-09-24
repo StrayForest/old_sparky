@@ -3,6 +3,7 @@ set +x
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PYTHONDONTWRITEBYTECODE=1
 
 # This fixed entrypoint is the only shell program allowed to cross from the
 # secret-bearing workflow into the immutable, release-bound live-QA payload.
@@ -34,10 +35,10 @@ fi
 # Verify the active generation, root entrypoints and complete payload before
 # opening the release lock.  The verifier itself is root-installed and
 # digest-bound; no candidate/current/tools helper is crossed here.
-/usr/bin/python3.12 -I "$DISPATCHER" verify "$TARGET_SHA"
+/usr/bin/python3.12 -I -B "$DISPATCHER" verify "$TARGET_SHA"
 
 # Hold the canonical release lock for the complete credential-bearing QA
 # contour, including its exact cleanup/recovery work.  The guard validates
 # that this active release names TARGET_SHA before entering the dispatcher.
 exec "$RELEASE_LOCK_EXEC" --expected-sha "$TARGET_SHA" -- \
-  /usr/bin/python3.12 -I "$DISPATCHER" run "$TARGET_SHA" "$@"
+  /usr/bin/python3.12 -I -B "$DISPATCHER" run "$TARGET_SHA" "$@"

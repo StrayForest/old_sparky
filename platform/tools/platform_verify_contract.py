@@ -576,18 +576,18 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         if probe_step_index is not None:
             probe_step = steps[probe_step_index]
             for marker in (
-                '/usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" host-capabilities',
+                '/usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-capabilities',
                 "/usr/bin/timeout --signal=TERM --kill-after=2s 15s",
                 "ulimit -f 1",
                 "< /dev/null",
                 'expected_output="HOST_TOOLS schema=1 source_sha=$TARGET_SHA generation=$TARGET_SHA '
-                'dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1"',
+                'dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"',
                 'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
             ):
                 if marker not in probe_step:
                     issues.append(f"host capability probe is missing fixed contract marker: {marker}")
             if not re.search(
-                r'^\s+"\$\{remote\[@\]\}" /usr/bin/python3\.12 -I '
+                r'^\s+"\$\{remote\[@\]\}" /usr/bin/python3\.12 -I -B '
                 r'"\$HOST_TOOLS_DISPATCHER" host-capabilities$',
                 probe_step,
                 re.MULTILINE,
@@ -600,7 +600,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("production preflight must wait for the immutable host capability gate")
         if "needs.host-capability-preflight.result == 'success'" not in preflight:
             issues.append("production preflight must propagate host capability failure")
-        if "python3.12 -I \"$HOST_TOOLS_DISPATCHER\"" not in preflight:
+        if "python3.12 -I -B \"$HOST_TOOLS_DISPATCHER\"" not in preflight:
             issues.append("production preflight must invoke the immutable host-tools dispatcher")
         if "current/tools/platform_workflow_remote_dispatch.py" in preflight:
             issues.append("production preflight must not use the mutable dispatcher fallback")
@@ -672,7 +672,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         issues.append("production secret job must checkout only the trusted validator")
     if "current/tools/platform_workflow_remote_dispatch.py" in production:
         issues.append("production secret job must invoke only the immutable host-tools dispatcher")
-    if "python3.12 -I \"$HOST_TOOLS_DISPATCHER\"" not in production:
+    if "python3.12 -I -B \"$HOST_TOOLS_DISPATCHER\"" not in production:
         issues.append("production secret job must invoke the immutable host-tools dispatcher with python isolated mode")
     if "platform_production_classifier_artifact.py" not in production:
         issues.append("production secret job must invoke the canonical classifier parser")

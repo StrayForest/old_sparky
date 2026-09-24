@@ -196,7 +196,7 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
                         PLATFORM_ROOT / "tools/platform_live_user_qa_trusted.sh"
                     ).read_text(encoding="utf-8")
                     verify_position = trusted_helper.index(
-                        '/usr/bin/python3.12 -I "$DISPATCHER" verify "$TARGET_SHA"'
+                        '/usr/bin/python3.12 -I -B "$DISPATCHER" verify "$TARGET_SHA"'
                     )
                     lock_position = trusted_helper.index(
                         'exec "$RELEASE_LOCK_EXEC" --expected-sha "$TARGET_SHA"'

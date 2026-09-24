@@ -3,6 +3,7 @@ set +x
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PYTHONDONTWRITEBYTECODE=1
 
 # Fixed root-owned entrypoint for the legacy live-launch signal.  It shares the
 # digest-bound generation with live-user QA but remains a separate signal: it
@@ -47,10 +48,10 @@ fi
 
 # The digest verifier binds the active SHA, pointer, complete tree manifest and
 # every root entrypoint before the canonical release lock is opened.
-/usr/bin/python3.12 -I "$DISPATCHER" verify "$TARGET_SHA"
+/usr/bin/python3.12 -I -B "$DISPATCHER" verify "$TARGET_SHA"
 
 # The release lock covers the complete credential-bearing launch contour,
 # including provisioning, browser execution and their exact cleanup paths.
 exec "$RELEASE_LOCK_EXEC" --app-dir "$APP_DIR" --expected-sha "$TARGET_SHA" -- \
-  /usr/bin/python3.12 -I "$DISPATCHER" run-launch \
+  /usr/bin/python3.12 -I -B "$DISPATCHER" run-launch \
   "$TARGET_SHA" "$BASE_URL" "$PROVISION" "$MARKER"
