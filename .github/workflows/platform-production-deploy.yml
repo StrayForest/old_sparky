@@ -148,14 +148,170 @@ jobs:
           rm -f -- "$RUNNER_TEMP/platform-production-deploy-input.json"
           test ! -e "$RUNNER_TEMP/platform-production-deploy-input.json"
 
+  # Validate the exact classifier data on a fresh, secret-free runner before
+  # the expensive candidate build.  The trusted validator is checked out from
+  # the immutable default-branch commit; the deployment candidate is never run.
+  validate-classifier:
+    name: Validate exact classifier artifact before build
+    needs: validate-dispatch
+    if: >-
+      needs.validate-dispatch.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'deploy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    env:
+      TARGET_SHA: ${{ github.sha }}
+      CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
+      CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
+    steps:
+      - name: Resolve immutable default-branch classifier source
+        id: trusted_classifier_default
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_BRANCH: dev
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          trusted_ref="$RUNNER_TEMP/platform-trusted-classifier-ref.json"
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/${TRUSTED_BRANCH}" \
+            --output "$trusted_ref"
+          /usr/bin/python3 - "$trusted_ref" "$GITHUB_OUTPUT" "$TRUSTED_BRANCH" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          branch = sys.argv[3]
+          obj = payload.get("object") if isinstance(payload, dict) else None
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if (
+              payload.get("ref") != f"refs/heads/{branch}"
+              or not isinstance(obj, dict)
+              or obj.get("type") != "commit"
+              or not isinstance(sha, str)
+              or re.fullmatch(r"[0-9a-f]{40}", sha) is None
+          ):
+              raise SystemExit("trusted classifier source is not an immutable commit")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"sha={sha}\n")
+          PY
+          rm -f -- "$trusted_ref"
+      - name: Checkout trusted classifier validator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.trusted_classifier_default.outputs.sha }}
+          path: trusted-classifier
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate exact classifier artifact before candidate build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          trusted_root="$GITHUB_WORKSPACE/trusted-classifier"
+          trusted_tool="$trusted_root/platform/tools/platform_production_classifier_artifact.py"
+          test -f "$trusted_tool" && test ! -L "$trusted_tool"
+          test "$(git -C "$trusted_root" rev-parse HEAD)" = "${{ steps.trusted_classifier_default.outputs.sha }}"
+          expected_name="platform-ci-route-${CLASSIFIER_RUN_ID}-${CLASSIFIER_RUN_ATTEMPT}"
+          route_dir="$(mktemp -d "$RUNNER_TEMP/platform-ci-route.XXXXXX")"
+          trap 'rm -rf -- "$route_dir"' EXIT
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          fetch_classifier_artifacts() {
+            local pages_dir="$1" page=1 summary count total expected_total=""
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              curl --fail --silent --show-error --location \
+                --max-filesize 4194304 \
+                "${api_headers[@]}" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${CLASSIFIER_RUN_ID}/artifacts?per_page=100&page=${page}" \
+                --output "$page_path"
+              chmod 600 "$page_path"
+              summary="$(/usr/bin/python3 "$trusted_tool" page "$page_path")"
+              [[ "$summary" =~ ^count=([0-9]+)\ total=([0-9]+)$ ]] || {
+                echo "classifier artifact pagination summary is malformed" >&2
+                exit 1
+              }
+              count="${BASH_REMATCH[1]}"
+              total="${BASH_REMATCH[2]}"
+              if [[ -n "$expected_total" ]]; then
+                test "$total" = "$expected_total" || {
+                  echo "classifier artifact total changed during pagination" >&2
+                  exit 1
+                }
+              else
+                expected_total="$total"
+              fi
+              if (( count < 100 )); then
+                break
+              fi
+              ((page += 1))
+              (( page <= 100 )) || {
+                echo "classifier artifact pagination exceeded its bound" >&2
+                exit 1
+              }
+            done
+          }
+          first_pages="$route_dir/artifacts-first"
+          second_pages="$route_dir/artifacts-second"
+          fetch_classifier_artifacts "$first_pages"
+          fetch_classifier_artifacts "$second_pages"
+          artifact_id="$(
+            /usr/bin/python3 "$trusted_tool" metadata \
+              "$first_pages" "$second_pages" \
+              --expected-name "$expected_name" \
+              --run-id "$CLASSIFIER_RUN_ID" \
+              --run-attempt "$CLASSIFIER_RUN_ATTEMPT" \
+              --target-sha "$TARGET_SHA"
+          )"
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "classifier artifact id is malformed" >&2
+            exit 1
+          }
+          curl --fail --silent --show-error --location \
+            --max-filesize 4194304 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
+            --output "$route_dir/artifact.zip"
+          /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" --target-sha "$TARGET_SHA"
+      - name: Remove trusted classifier validator
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_root="$GITHUB_WORKSPACE/trusted-classifier"
+          if [[ -d "$trusted_root" && ! -L "$trusted_root" ]]; then
+            rm -rf -- "$trusted_root"
+          fi
+          test ! -e "$trusted_root" && test ! -L "$trusted_root"
   # Candidate checkout and release construction are isolated from the
   # environment-approved deployment jobs.  This job never receives SSH
   # material and only publishes an immutable archive plus provenance.
   build-release:
     name: Build immutable release artifact in CI
-    needs: validate-dispatch
+    needs:
+      - validate-dispatch
+      - validate-classifier
     if: >-
       needs.validate-dispatch.result == 'success' &&
+      needs.validate-classifier.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.mode == 'deploy'
     runs-on: ubuntu-latest
@@ -636,16 +792,18 @@ jobs:
           printf '%s\n' 'PREFLIGHT_SSH_DIR=' >> "$GITHUB_ENV"
 
   # This environment-approved job consumes only the exact handoff and the
-  # immutable archive.  It has no checkout: candidate code is never executed
-  # on the runner that receives PROD_SSH_KEY.
+  # immutable archive. It checks out only the exact trusted validator source;
+  # candidate code is never executed on the runner that receives PROD_SSH_KEY.
   production:
     name: Deploy production
     needs:
       - validate-dispatch
+      - validate-classifier
       - build-release
       - validate-security-provenance
     if: >-
       needs.validate-dispatch.result == 'success' &&
+      needs.validate-classifier.result == 'success' &&
       needs.build-release.result == 'success' &&
       needs.validate-security-provenance.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
@@ -718,258 +876,145 @@ jobs:
           test "${{ needs.validate-security-provenance.outputs.security_ready }}" = "true"
           echo "exact platform security provenance accepted: snapshot=$security_digest"
 
-      - name: Require deployable exact classifier artifact
+      - name: Resolve immutable default-branch classifier source
+        id: trusted_classifier_default
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TRUSTED_BRANCH: dev
         run: |
           set -euo pipefail
-          expected_name="platform-ci-route-${CLASSIFIER_RUN_ID}-${CLASSIFIER_RUN_ATTEMPT}"
-          route_dir="$(mktemp -d "$RUNNER_TEMP/platform-ci-route.XXXXXX")"
-          trap 'rm -rf -- "$route_dir"' EXIT
-          fetch_classifier_artifacts() {
-            local output_path="$1" page=1 count page_path
-            local pages_dir
-            pages_dir="$route_dir/artifact-pages-$(basename "$output_path")"
-            install -d -m 700 "$pages_dir"
-            while :; do
-              page_path="$pages_dir/page-${page}.json"
-              curl --fail-with-body --silent --show-error \
-                --header "Authorization: Bearer $GH_TOKEN" \
-                --header "Accept: application/vnd.github+json" \
-                --header "X-GitHub-Api-Version: 2022-11-28" \
-                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${CLASSIFIER_RUN_ID}/artifacts?per_page=100&page=${page}" \
-                --output "$page_path"
-              count="$(/usr/bin/python3 - "$page_path" "$pages_dir/total" <<'PY'
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          trusted_ref="$RUNNER_TEMP/platform-trusted-classifier-ref.json"
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/heads/${TRUSTED_BRANCH}" \
+            --output "$trusted_ref"
+          /usr/bin/python3 - "$trusted_ref" "$GITHUB_OUTPUT" "$TRUSTED_BRANCH" <<'PY'
           import json
           from pathlib import Path
           import re
           import sys
 
-          page_path, total_path = sys.argv[1:]
-          payload = json.loads(Path(page_path).read_text(encoding="utf-8"))
-          if not isinstance(payload, dict) or type(payload.get("total_count")) is not int or not 0 <= payload["total_count"] <= 10_000:
-              raise SystemExit("classifier artifact pagination total_count is malformed or excessive")
-          rows = payload.get("artifacts")
-          if not isinstance(rows, list) or len(rows) > 100 or any(not isinstance(row, dict) for row in rows):
-              raise SystemExit("classifier artifact pagination page is malformed")
-          ids = []
-          for row in rows:
-              if type(row.get("id")) is not int or row["id"] <= 0:
-                  raise SystemExit("classifier artifact row ID is malformed")
-              if not isinstance(row.get("name"), str) or not row["name"].isascii() or not 1 <= len(row["name"]) <= 256:
-                  raise SystemExit("classifier artifact row name is malformed")
-              if type(row.get("expired")) is not bool:
-                  raise SystemExit("classifier artifact expired flag is malformed")
-              workflow_run = row.get("workflow_run")
-              if not isinstance(workflow_run, dict) or type(workflow_run.get("id")) is not int or workflow_run["id"] <= 0:
-                  raise SystemExit("classifier artifact workflow identity is malformed")
-              if not isinstance(workflow_run.get("head_sha"), str) or re.fullmatch(r"[0-9a-f]{40}", workflow_run["head_sha"]) is None:
-                  raise SystemExit("classifier artifact workflow SHA is malformed")
-              if "run_attempt" in workflow_run and (type(workflow_run["run_attempt"]) is not int or workflow_run["run_attempt"] <= 0):
-                  raise SystemExit("classifier artifact workflow attempt is malformed")
-              ids.append(row["id"])
-          if len(ids) != len(set(ids)):
-              raise SystemExit("classifier artifact page contains duplicate IDs")
-          marker = Path(total_path)
-          if marker.exists() and marker.read_text(encoding="ascii") != str(payload["total_count"]):
-              raise SystemExit("classifier artifact total_count changed during pagination")
-          marker.write_text(str(payload["total_count"]), encoding="ascii")
-          print(len(rows))
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          branch = sys.argv[3]
+          obj = payload.get("object") if isinstance(payload, dict) else None
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if (
+              payload.get("ref") != f"refs/heads/{branch}"
+              or not isinstance(obj, dict)
+              or obj.get("type") != "commit"
+              or not isinstance(sha, str)
+              or re.fullmatch(r"[0-9a-f]{40}", sha) is None
+          ):
+              raise SystemExit("trusted classifier source is not an immutable commit")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"sha={sha}\n")
           PY
-              )"
+          rm -f -- "$trusted_ref"
+
+      - name: Checkout trusted classifier validator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.trusted_classifier_default.outputs.sha }}
+          path: trusted-classifier
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Revalidate deployable exact classifier artifact immediately before production writes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The trusted parser validates classifier-manifest.json as data and
+          # never executes the downloaded payload.
+          umask 077
+          trusted_root="$GITHUB_WORKSPACE/trusted-classifier"
+          trusted_tool="$trusted_root/platform/tools/platform_production_classifier_artifact.py"
+          test -f "$trusted_tool" && test ! -L "$trusted_tool"
+          test "$(git -C "$trusted_root" rev-parse HEAD)" = "${{ steps.trusted_classifier_default.outputs.sha }}"
+          expected_name="platform-ci-route-${CLASSIFIER_RUN_ID}-${CLASSIFIER_RUN_ATTEMPT}"
+          route_dir="$(mktemp -d "$RUNNER_TEMP/platform-ci-route.XXXXXX")"
+          trap 'rm -rf -- "$route_dir"' EXIT
+          api_headers=(
+            --header "Authorization: Bearer $GH_TOKEN"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          fetch_classifier_artifacts() {
+            local pages_dir="$1" page=1 summary count total expected_total=""
+            install -d -m 700 "$pages_dir"
+            while :; do
+              page_path="$pages_dir/page-${page}.json"
+              curl --fail --silent --show-error --location \
+                --max-filesize 4194304 \
+                "${api_headers[@]}" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${CLASSIFIER_RUN_ID}/artifacts?per_page=100&page=${page}" \
+                --output "$page_path"
+              chmod 600 "$page_path"
+              summary="$(/usr/bin/python3 "$trusted_tool" page "$page_path")"
+              [[ "$summary" =~ ^count=([0-9]+)\ total=([0-9]+)$ ]] || {
+                echo "classifier artifact pagination summary is malformed" >&2
+                exit 1
+              }
+              count="${BASH_REMATCH[1]}"
+              total="${BASH_REMATCH[2]}"
+              if [[ -n "$expected_total" ]]; then
+                test "$total" = "$expected_total" || {
+                  echo "classifier artifact total changed during pagination" >&2
+                  exit 1
+                }
+              else
+                expected_total="$total"
+              fi
               if (( count < 100 )); then
                 break
               fi
               ((page += 1))
-              (( page <= 100 )) || { echo "classifier artifact pagination exceeded its bound" >&2; exit 1; }
+              (( page <= 100 )) || {
+                echo "classifier artifact pagination exceeded its bound" >&2
+                exit 1
+              }
             done
-            /usr/bin/python3 - "$pages_dir" "$output_path" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          pages_dir, output_path = map(Path, sys.argv[1:])
-          expected_total = int((pages_dir / "total").read_text(encoding="ascii"))
-          rows = []
-          seen = set()
-          for path in sorted(pages_dir.glob("page-*.json"), key=lambda item: int(item.stem.split("-")[-1])):
-              payload = json.loads(path.read_text(encoding="utf-8"))
-              page_rows = payload.get("artifacts") if isinstance(payload, dict) else None
-              if not isinstance(page_rows, list):
-                  raise SystemExit("classifier artifact page is malformed")
-              for row in page_rows:
-                  row_id = row.get("id")
-                  if type(row_id) is not int or row_id <= 0 or row_id in seen:
-                      raise SystemExit("classifier artifact rows contain duplicate or malformed IDs")
-                  seen.add(row_id)
-                  rows.append(row)
-          if len(rows) > expected_total:
-              raise SystemExit("classifier artifact pagination returned excess rows")
-          if len(rows) != expected_total:
-              raise SystemExit("classifier artifact pagination is incomplete")
-          Path(output_path).write_text(json.dumps({"total_count": expected_total, "artifacts": rows}, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-          PY
           }
-          fetch_classifier_artifacts "$route_dir/artifacts-first.json"
-          fetch_classifier_artifacts "$route_dir/artifacts-second.json"
-          artifacts_metadata="$route_dir/platform-classifier-artifacts.json"
-          /usr/bin/python3 - "$route_dir/artifacts-first.json" "$route_dir/artifacts-second.json" "$artifacts_metadata" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          first_path, second_path, output_path = sys.argv[1:]
-          first = json.loads(Path(first_path).read_text(encoding="utf-8"))
-          second = json.loads(Path(second_path).read_text(encoding="utf-8"))
-
-          def identity(row):
-              workflow_run = row.get("workflow_run")
-              return (
-                  row.get("id"),
-                  row.get("name"),
-                  row.get("expired"),
-                  workflow_run.get("id") if isinstance(workflow_run, dict) else None,
-                  workflow_run.get("head_sha") if isinstance(workflow_run, dict) else None,
-                  workflow_run.get("run_attempt") if isinstance(workflow_run, dict) else None,
-              )
-
-          first_rows = sorted((identity(row) for row in first["artifacts"]), key=lambda value: value[0])
-          second_rows = sorted((identity(row) for row in second["artifacts"]), key=lambda value: value[0])
-          if first["total_count"] != second["total_count"] or first_rows != second_rows:
-              raise SystemExit("classifier artifact listing changed during validation")
-          Path(output_path).write_text(json.dumps(second, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-          PY
-          artifact_id="$(/usr/bin/python3 "$artifacts_metadata" "$expected_name" "$CLASSIFIER_RUN_ID" "$CLASSIFIER_RUN_ATTEMPT" "$TARGET_SHA" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          expected_name, run_id, attempt, target_sha = sys.argv[2:]
-          matches = [row for row in payload["artifacts"] if row.get("name") == expected_name and row.get("expired") is False]
-          if len(matches) != 1:
-              raise SystemExit("expected exactly one unexpired classifier artifact")
-          selected = matches[0]
-          workflow_run = selected.get("workflow_run")
-          if not isinstance(workflow_run, dict) or workflow_run.get("id") != int(run_id) or workflow_run.get("head_sha") != target_sha:
-              raise SystemExit("classifier artifact is not bound to the exact run and target SHA")
-          if "run_attempt" in workflow_run and workflow_run.get("run_attempt") != int(attempt):
-              raise SystemExit("classifier artifact is not bound to the exact run attempt")
-          if type(selected.get("id")) is not int or selected["id"] <= 0:
-              raise SystemExit("classifier artifact ID is malformed")
-          print(selected["id"])
-          PY
+          first_pages="$route_dir/artifacts-first"
+          second_pages="$route_dir/artifacts-second"
+          fetch_classifier_artifacts "$first_pages"
+          fetch_classifier_artifacts "$second_pages"
+          artifact_id="$(
+            /usr/bin/python3 "$trusted_tool" metadata \
+              "$first_pages" "$second_pages" \
+              --expected-name "$expected_name" \
+              --run-id "$CLASSIFIER_RUN_ID" \
+              --run-attempt "$CLASSIFIER_RUN_ATTEMPT" \
+              --target-sha "$TARGET_SHA"
           )"
-          [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || { echo "classifier artifact id is malformed" >&2; exit 1; }
-          curl --fail-with-body --silent --show-error --location --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" --output "$route_dir/artifact.zip"
-          # This fresh secret-bearing job cannot import candidate helpers.  The
-          # small self-contained bounded extractor below is a reviewed,
-          # data-only boundary: it accepts
-          # exactly one regular manifest and never follows an archive or output
-          # symlink.  Every archive/member/expansion bound is checked before and
-          # during streaming; the shell trap removes all temporary material.
-          /usr/bin/python3 - "$route_dir/artifact.zip" "$route_dir/unpacked" <<'PY'
-          import os
-          from pathlib import Path
-          import shutil
-          import stat
-          import sys
-          import zipfile
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "classifier artifact id is malformed" >&2
+            exit 1
+          }
+          curl --fail --silent --show-error --location \
+            --max-filesize 4194304 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
+            --output "$route_dir/artifact.zip"
+          /usr/bin/python3 "$trusted_tool" manifest "$route_dir/artifact.zip" --target-sha "$TARGET_SHA"
 
-          archive_path, destination = map(Path, sys.argv[1:])
-          MAX_ARCHIVE_BYTES = 4 * 1024 * 1024
-          MAX_ENTRIES = 8
-          MAX_MEMBER_BYTES = 256 * 1024
-          MAX_TOTAL_BYTES = 512 * 1024
-          MAX_COMPRESSION_RATIO = 100
-
-          def reject(condition, message):
-              if condition:
-                  raise SystemExit(message)
-
-          try:
-              archive_metadata = archive_path.lstat()
-              reject(
-                  not stat.S_ISREG(archive_metadata.st_mode)
-                  or stat.S_ISLNK(archive_metadata.st_mode)
-                  or archive_metadata.st_nlink != 1,
-                  "classifier artifact archive is not a regular file",
-              )
-              reject(archive_metadata.st_size > MAX_ARCHIVE_BYTES, "classifier artifact ZIP is oversized")
-              os.mkdir(destination, 0o700)
-              with zipfile.ZipFile(archive_path, allowZip64=False) as bundle:
-                  members = bundle.infolist()
-                  reject(not members or len(members) > MAX_ENTRIES, "classifier artifact ZIP inventory is invalid")
-                  names = [member.filename for member in members]
-                  reject(len(set(names)) != len(names), "classifier artifact ZIP has duplicate entries")
-                  reject(names != ["classifier-manifest.json"], "classifier artifact ZIP inventory is invalid")
-                  member = members[0]
-                  name = member.filename
-                  reject(not name.isascii(), "classifier artifact ZIP name is not ASCII")
-                  reject(any(ord(char) < 0x20 or ord(char) == 0x7f for char in name), "classifier artifact ZIP name has control characters")
-                  reject("\\" in name or name.startswith("/"), "classifier artifact ZIP name is unsafe")
-                  reject(".." in Path(name).parts or "." in Path(name).parts, "classifier artifact ZIP name traverses")
-                  reject(member.is_dir() or name.endswith("/"), "classifier artifact ZIP entry is a directory")
-                  reject(member.file_size > MAX_MEMBER_BYTES or member.file_size > MAX_TOTAL_BYTES, "classifier artifact ZIP member is oversized")
-                  reject(member.compress_size == 0 and member.file_size != 0, "classifier artifact ZIP ratio is invalid")
-                  if member.file_size and member.compress_size:
-                      reject(member.file_size > member.compress_size * MAX_COMPRESSION_RATIO, "classifier artifact ZIP ratio is unsafe")
-                  reject(bool(member.flag_bits & 0x1), "classifier artifact ZIP is encrypted")
-                  reject(member.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED), "classifier artifact ZIP compression is unsupported")
-                  mode = (member.external_attr >> 16) & 0o170000
-                  reject(mode not in (0, stat.S_IFREG), "classifier artifact ZIP entry is not regular")
-                  target = destination / name
-                  descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                  try:
-                      copied = 0
-                      with bundle.open(member, "r") as source, os.fdopen(descriptor, "wb") as output:
-                          descriptor = -1
-                          while True:
-                              chunk = source.read(64 * 1024)
-                              if not chunk:
-                                  break
-                              copied += len(chunk)
-                              reject(copied > MAX_MEMBER_BYTES or copied > MAX_TOTAL_BYTES, "classifier artifact member expanded beyond limit")
-                              output.write(chunk)
-                      reject(copied != member.file_size, "classifier artifact member size changed")
-                  finally:
-                      if descriptor >= 0:
-                          os.close(descriptor)
-              metadata = target.lstat()
-              reject(not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600, "classifier manifest extraction is unsafe")
-          except (OSError, EOFError, OverflowError, zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError) as exc:
-              shutil.rmtree(destination, ignore_errors=True)
-              raise SystemExit("classifier artifact ZIP is invalid") from exc
-          PY
-          manifest_path="$route_dir/unpacked/classifier-manifest.json"
-          test -f "$manifest_path" && test ! -L "$manifest_path"
-          /usr/bin/python3 - "$manifest_path" "$TARGET_SHA" <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-          import sys
-
-          manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          target_sha = sys.argv[2]
-          expected_gates = ["backend", "python-quality", "security", "migration", "docs", "web-quality", "web-hermetic", "verification-contract"]
-          fields = ("schema", "version", "target_sha", "event", "class", "expected_gates", "runtime_sensitive", "deployable", "fallback", "reason", "files")
-          if manifest.get("schema") != 1 or manifest.get("version") != 1 or manifest.get("target_sha") != target_sha:
-              raise SystemExit("classifier manifest schema or target SHA is invalid")
-          if manifest.get("event") != "push" or manifest.get("class") != "full":
-              raise SystemExit("production deployment requires a full push classifier route")
-          if manifest.get("expected_gates") != expected_gates or manifest.get("fallback") is not False or manifest.get("deployable") is not True:
-              raise SystemExit("classifier route is not deployable")
-          if not isinstance(manifest.get("reason"), str) or not manifest["reason"] or not isinstance(manifest.get("files"), list) or not isinstance(manifest.get("runtime_sensitive"), bool):
-              raise SystemExit("classifier manifest fields are malformed")
-          digest = hashlib.sha256(json.dumps({field: manifest[field] for field in fields}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-          if manifest.get("digest") != digest:
-              raise SystemExit("classifier digest does not match manifest")
-          require_deployable = True
-          if not require_deployable:
-              raise SystemExit("internal deployability guard is disabled")
-          PY
+      - name: Remove trusted classifier validator
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_root="$GITHUB_WORKSPACE/trusted-classifier"
+          if [[ -d "$trusted_root" && ! -L "$trusted_root" ]]; then
+            rm -rf -- "$trusted_root"
+          fi
+          test ! -e "$trusted_root" && test ! -L "$trusted_root"
 
       - name: Mark production deployment pending
         shell: bash
