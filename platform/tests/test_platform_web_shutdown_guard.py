@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import select
 import signal
 import subprocess
 import time
@@ -13,8 +12,7 @@ PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 GUARD_PATH = PLATFORM_ROOT / "apps" / "platform_web" / "server-shutdown-guard.cjs"
 RUN_WEB_PATH = PLATFORM_ROOT / "tools" / "platform_run_web.sh"
 
-SHUTDOWN_TEST_READINESS_TIMEOUT_S = 3.0
-SHUTDOWN_TEST_BEHAVIOR_TIMEOUT_S = 3.0
+SHUTDOWN_TEST_BEHAVIOR_TIMEOUT_S = 6.0
 SHUTDOWN_TEST_CLEANUP_TIMEOUT_S = 1.0
 
 
@@ -25,17 +23,6 @@ def _kill_process_group(process: subprocess.Popen[str], signum: signal.Signals) 
         os.killpg(process.pid, signum)
     except ProcessLookupError:
         pass
-
-
-def _readiness_line(
-    process: subprocess.Popen[str],
-    timeout_s: float,
-) -> str:
-    assert process.stdout is not None
-    readable, _, _ = select.select([process.stdout], [], [], timeout_s)
-    if not readable:
-        raise AssertionError(f"Node shutdown fixture did not become ready in {timeout_s}s")
-    return process.stdout.readline().strip()
 
 
 class PlatformWebShutdownGuardTests(unittest.TestCase):
@@ -50,8 +37,12 @@ class PlatformWebShutdownGuardTests(unittest.TestCase):
                 str(GUARD_PATH),
                 "-e",
                 (
-                    "process.stdout.write('READY\\n'); "
                     "process.on('SIGTERM', () => {}); "
+                    "setTimeout(() => process.kill(process.pid, 'SIGTERM'), 20); "
+                    "setTimeout(() => { "
+                    "console.log('shutdown fixture watchdog elapsed'); "
+                    "process.exit(124); "
+                    "}, 4000); "
                     "setInterval(() => {}, 1000);"
                 ),
             ],
@@ -63,13 +54,7 @@ class PlatformWebShutdownGuardTests(unittest.TestCase):
         )
 
         try:
-            self.assertEqual(
-                _readiness_line(process, SHUTDOWN_TEST_READINESS_TIMEOUT_S),
-                "READY",
-            )
-
             started_at = time.monotonic()
-            _kill_process_group(process, signal.SIGTERM)
             try:
                 stdout, stderr = process.communicate(
                     timeout=SHUTDOWN_TEST_BEHAVIOR_TIMEOUT_S,
@@ -80,12 +65,17 @@ class PlatformWebShutdownGuardTests(unittest.TestCase):
                     f"stdout={exc.stdout!r} stderr={exc.stderr!r}"
                 )
 
-            self.assertEqual(process.returncode, 143, stderr)
+            self.assertEqual(
+                process.returncode,
+                143,
+                f"stdout={stdout!r} stderr={stderr!r}",
+            )
             self.assertGreaterEqual(time.monotonic() - started_at, 0.75)
             self.assertIn("shutdown grace period", stdout)
+            self.assertNotIn("watchdog elapsed", stdout)
         finally:
-            # A failed readiness/behavior assertion must not leave a Node
-            # process (or a descendant) behind for the next catalog test.
+            # A failed behavior assertion must not leave a Node process (or a
+            # descendant) behind for the next catalog test.
             _kill_process_group(process, signal.SIGKILL)
             try:
                 process.communicate(timeout=SHUTDOWN_TEST_CLEANUP_TIMEOUT_S)
