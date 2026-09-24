@@ -33,6 +33,8 @@ PHASE_INDEX = {phase: index for index, phase in enumerate(PHASES)}
 STATUSES = frozenset({"passed", "failed"})
 REASONS = frozenset({"ok", "build_failed", "cleanup_failed", "interrupted"})
 CLEANUP_STATES = frozenset({"not-run", "passed", "failed"})
+BUILD_PHASES = PHASES[:-2]
+SOURCE_SHA_LENGTHS = frozenset({40, 64})
 REQUIRED_FIELDS = frozenset({"schema", "phase", "status", "reason", "cleanup"})
 OPTIONAL_FIELDS = frozenset({"failed_phase", "source_sha", "artifact_sha256"})
 
@@ -170,11 +172,10 @@ def _parse_marker(line: str) -> Marker:
     artifact_sha256 = fields.get("artifact_sha256")
     if failed_phase is not None and failed_phase not in PHASE_INDEX:
         raise DiagnosticError
-    if source_sha is not None and not all(
-        character in "0123456789abcdef" for character in source_sha
+    if source_sha is not None and (
+        len(source_sha) not in SOURCE_SHA_LENGTHS
+        or not all(character in "0123456789abcdef" for character in source_sha)
     ):
-        raise DiagnosticError
-    if source_sha is not None and len(source_sha) != 40:
         raise DiagnosticError
     if artifact_sha256 is not None or artifact_sha256 == "":
         if artifact_sha256 is None or len(artifact_sha256) != 64 or not all(
@@ -216,6 +217,62 @@ def _parse_marker(line: str) -> Marker:
     )
 
 
+def _validate_sequence(markers: list[Marker]) -> None:
+    phases = tuple(marker.phase for marker in markers)
+    terminal = markers[-1]
+
+    if terminal.status == "passed":
+        if phases != PHASES or any(marker.status != "passed" for marker in markers):
+            raise DiagnosticError
+        return
+
+    if (
+        terminal.phase != "complete"
+        or terminal.status != "failed"
+        or len(markers) < 2
+        or phases[-2] != "cleanup"
+        or terminal.failed_phase not in BUILD_PHASES
+    ):
+        raise DiagnosticError
+
+    cleanup = markers[-2]
+    passed = markers[:-2]
+    failed_index = PHASE_INDEX[terminal.failed_phase]
+    passed_phases = tuple(marker.phase for marker in passed)
+    expected_prefix = PHASES[:failed_index]
+    # artifact-validate is marked before its final validation and can therefore
+    # legitimately be present when a later validation/cleanup error is reported.
+    final_phase_prefix = PHASES[: failed_index + 1]
+    if passed_phases != expected_prefix and not (
+        terminal.failed_phase == "artifact-validate"
+        and passed_phases == final_phase_prefix
+    ):
+        raise DiagnosticError
+    if any(marker.status != "passed" for marker in passed):
+        raise DiagnosticError
+    if cleanup.failed_phase is not None and cleanup.failed_phase != terminal.failed_phase:
+        raise DiagnosticError
+
+    if cleanup.status == "passed":
+        if (
+            cleanup.reason != "ok"
+            or cleanup.cleanup != "passed"
+            or terminal.reason not in {"build_failed", "interrupted"}
+            or terminal.cleanup != "passed"
+        ):
+            raise DiagnosticError
+    elif cleanup.status == "failed":
+        if (
+            cleanup.reason != "cleanup_failed"
+            or cleanup.cleanup != "failed"
+            or terminal.reason != "cleanup_failed"
+            or terminal.cleanup != "failed"
+        ):
+            raise DiagnosticError
+    else:
+        raise DiagnosticError
+
+
 def extract(path: Path) -> Marker:
     payload = _read_bounded_log(path)
     if any(byte < 0x20 and byte != 0x0A or byte == 0x7F for byte in payload):
@@ -240,6 +297,7 @@ def extract(path: Path) -> Marker:
         markers.append(marker)
     if not markers or markers[-1].phase != "complete":
         raise DiagnosticError
+    _validate_sequence(markers)
     return markers[-1]
 
 

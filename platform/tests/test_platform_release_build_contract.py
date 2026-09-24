@@ -912,6 +912,32 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 self.assertIn(
                     f"canonical_builder_rc={canonical_rc or 'unknown'}", sanitized.stdout
                 )
+        for name, source_sha, expected_rc in (
+            ("source-64", "c" * 64, 0),
+            ("source-39", "a" * 39, 1),
+            ("source-41", "a" * 41, 1),
+            ("source-63", "a" * 63, 1),
+            ("source-65", "a" * 65, 1),
+            ("source-uppercase", "A" * 40, 1),
+        ):
+            with self.subTest(source_sha=name):
+                marker = passed_marker.replace(
+                    "source_sha=" + "a" * 40,
+                    "source_sha=" + source_sha,
+                )
+                sanitized = subprocess.run(
+                    ["/usr/bin/python3", "-I", "-", marker, "0", "0"],
+                    input=sanitizer,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(sanitized.returncode, expected_rc, sanitized.stderr)
+                self.assertIn(
+                    "phase=complete" if expected_rc == 0 else "phase=unknown",
+                    sanitized.stdout,
+                )
         late_validation = subprocess.run(
             ["/usr/bin/python3", "-I", "-", passed_marker, "0", "0"],
             input=sanitizer,

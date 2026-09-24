@@ -63,7 +63,7 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _success_markers() -> bytes:
+    def _success_markers(source_sha: str = "a" * 40) -> bytes:
         phases = (
             "canonical-preflight",
             "node-runtime",
@@ -85,8 +85,41 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
             (
                 "RELEASE_BUILD_PHASE schema=1 phase=cleanup status=passed reason=ok cleanup=passed",
                 "RELEASE_BUILD_PHASE schema=1 phase=complete status=passed reason=ok cleanup=passed "
-                f"source_sha={'a' * 40} artifact_sha256={'b' * 64}",
+                f"source_sha={source_sha} artifact_sha256={'b' * 64}",
             )
+        )
+        return ("\n".join(lines) + "\n").encode("ascii")
+
+    @staticmethod
+    def _failure_markers(
+        failed_phase: str,
+        *,
+        include_failed_phase: bool = False,
+        cleanup_failed: bool = False,
+    ) -> bytes:
+        failed_index = diagnostics.PHASE_INDEX[failed_phase]
+        prefix_end = failed_index + 1 if include_failed_phase else failed_index
+        lines = [
+            f"RELEASE_BUILD_PHASE schema=1 phase={phase} status=passed reason=ok cleanup=not-run"
+            for phase in diagnostics.PHASES[:prefix_end]
+        ]
+        if cleanup_failed:
+            lines.append(
+                "RELEASE_BUILD_PHASE schema=1 phase=cleanup status=failed "
+                f"reason=cleanup_failed cleanup=failed failed_phase={failed_phase}"
+            )
+            complete_reason = "cleanup_failed"
+            complete_cleanup = "failed"
+        else:
+            lines.append(
+                "RELEASE_BUILD_PHASE schema=1 phase=cleanup status=passed "
+                "reason=ok cleanup=passed"
+            )
+            complete_reason = "build_failed"
+            complete_cleanup = "passed"
+        lines.append(
+            "RELEASE_BUILD_PHASE schema=1 phase=complete status=failed "
+            f"reason={complete_reason} cleanup={complete_cleanup} failed_phase={failed_phase}"
         )
         return ("\n".join(lines) + "\n").encode("ascii")
 
@@ -105,17 +138,7 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
             )
 
             failure = root / "failure.log"
-            self._write_log(
-                failure,
-                (
-                    "RELEASE_BUILD_PHASE schema=1 phase=canonical-preflight "
-                    "status=passed reason=ok cleanup=not-run\n"
-                    "RELEASE_BUILD_PHASE schema=1 phase=cleanup status=passed "
-                    "reason=ok cleanup=passed\n"
-                    "RELEASE_BUILD_PHASE schema=1 phase=complete status=failed "
-                    "reason=build_failed cleanup=passed failed_phase=canonical-preflight\n"
-                ).encode("ascii"),
-            )
+            self._write_log(failure, self._failure_markers("canonical-preflight"))
             parsed_failure = self._run_parser(failure)
             self.assertEqual(parsed_failure.returncode, 0, parsed_failure.stderr)
             self.assertEqual(
@@ -123,6 +146,77 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                 "RELEASE_BUILD_DIAGNOSTIC schema=1 phase=complete status=failed "
                 "reason=build_failed cleanup=passed failed_phase=canonical-preflight",
             )
+
+            success_64 = root / "success-64.log"
+            self._write_log(success_64, self._success_markers(source_sha="c" * 64))
+            parsed_success_64 = self._run_parser(success_64)
+            self.assertEqual(parsed_success_64.returncode, 0, parsed_success_64.stderr)
+            self.assertIn(f"source_sha={'c' * 64}", parsed_success_64.stdout)
+
+            for failed_phase in ("canonical-preflight", "web-build"):
+                with self.subTest(failed_phase=failed_phase):
+                    prefix = root / f"failure-{failed_phase}.log"
+                    self._write_log(prefix, self._failure_markers(failed_phase))
+                    parsed_prefix = self._run_parser(prefix)
+                    self.assertEqual(parsed_prefix.returncode, 0, parsed_prefix.stderr)
+                    self.assertIn(
+                        f"failed_phase={failed_phase}", parsed_prefix.stdout
+                    )
+
+            cleanup_failure = root / "cleanup-failure.log"
+            self._write_log(
+                cleanup_failure,
+                self._failure_markers(
+                    "artifact-validate",
+                    include_failed_phase=True,
+                    cleanup_failed=True,
+                ),
+            )
+            parsed_cleanup_failure = self._run_parser(cleanup_failure)
+            self.assertEqual(
+                parsed_cleanup_failure.returncode,
+                0,
+                parsed_cleanup_failure.stderr,
+            )
+            self.assertIn("reason=cleanup_failed", parsed_cleanup_failure.stdout)
+
+    def test_parser_rejects_incomplete_or_out_of_prefix_sequences(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = {
+                "single-complete": (
+                    "RELEASE_BUILD_PHASE schema=1 phase=complete status=passed "
+                    "reason=ok cleanup=passed source_sha="
+                    + "a" * 40
+                    + " artifact_sha256="
+                    + "b" * 64
+                    + "\n"
+                ).encode("ascii"),
+                "missing-middle": b"\n".join(
+                    line
+                    for line in self._success_markers().splitlines()
+                    if b"phase=web-dependencies" not in line
+                )
+                + b"\n",
+            }
+            out_of_prefix = self._failure_markers("web-build").decode("ascii").splitlines()
+            out_of_prefix.insert(
+                -2,
+                "RELEASE_BUILD_PHASE schema=1 phase=web-build status=failed "
+                "reason=build_failed cleanup=passed failed_phase=web-build",
+            )
+            cases["out-of-prefix-failure"] = (
+                "\n".join(out_of_prefix) + "\n"
+            ).encode("ascii")
+
+            for name, payload in cases.items():
+                with self.subTest(case=name):
+                    path = root / f"{name}.log"
+                    self._write_log(path, payload)
+                    parsed = self._run_parser(path)
+                    self.assertNotEqual(parsed.returncode, 0)
+                    self.assertEqual(parsed.stdout.strip(), diagnostics._safe_failure())
+                    self.assertEqual(parsed.stderr, "")
 
     def test_parser_rejects_unsafe_metadata_and_marker_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -187,6 +281,21 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                 with self.subTest(case=name):
                     path = root / filename
                     self._write_log(path, payload)
+                    parsed = self._run_parser(path)
+                    self.assertNotEqual(parsed.returncode, 0)
+                    self.assertEqual(parsed.stdout.strip(), diagnostics._safe_failure())
+                    self.assertEqual(parsed.stderr, "")
+
+            for name, source_sha in (
+                ("source-39", "a" * 39),
+                ("source-41", "a" * 41),
+                ("source-63", "a" * 63),
+                ("source-65", "a" * 65),
+                ("source-uppercase", "A" * 40),
+            ):
+                with self.subTest(case=name):
+                    path = root / f"{name}.log"
+                    self._write_log(path, self._success_markers(source_sha=source_sha))
                     parsed = self._run_parser(path)
                     self.assertNotEqual(parsed.returncode, 0)
                     self.assertEqual(parsed.stdout.strip(), diagnostics._safe_failure())

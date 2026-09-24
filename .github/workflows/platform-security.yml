@@ -782,7 +782,7 @@ jobs:
                   valid = failed_phase is None or failed_phase in PHASES
                   valid = valid and (
                       source_sha is None
-                      or re.fullmatch(r"[0-9a-f]{40}", source_sha) is not None
+                      or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_sha) is not None
                   )
                   valid = valid and (
                       artifact_sha is None
