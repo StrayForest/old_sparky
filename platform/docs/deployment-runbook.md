@@ -73,6 +73,13 @@ to `dev`. The chain is:
    absolute tools. This is a read-only gate: it never SCPs or executes the
    bundle and fails before release build, attestation, pending status or
    production artifact transfer when the generation is absent or mismatched.
+   The artifact API binding uses its ID, name, run ID, source SHA and digest;
+   because nested `workflow_run.run_attempt` may be absent, the secret-free
+   host-tools build gate validates the exact current attempt through the
+   authoritative GitHub attempt endpoint with bounded typed JSON and rejects
+   missing, malformed or mismatched fields. Raw artifact metadata is bounded
+   before parsing by the reviewed canonical verifier, which also matches
+   `size_in_bytes` to the downloaded archive byte size.
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
 

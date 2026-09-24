@@ -23,6 +23,7 @@ import zipfile
 SCHEMA = 1
 TOOLSET_VERSION = "production-host-tools-v1"
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
+MAX_ARTIFACT_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_FILE_BYTES = 512 * 1024
 MAX_FILE_COUNT = 32
 MEMBER_ROOT = "platform-host-tools"
@@ -478,6 +479,48 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _read_bounded_json(path: Path, *, description: str) -> object:
+    """Read one untrusted JSON response through a bounded, no-follow fd."""
+
+    if not isinstance(path, Path):
+        raise HostToolsBundleError(f"{description} path is invalid")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise HostToolsBundleError(f"{description} is unsafe")
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = None
+            raw = stream.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
+            raise HostToolsBundleError(f"{description} is oversized")
+    except HostToolsBundleError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HostToolsBundleError(f"{description} is unavailable") from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    try:
+        return json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_strict_object,
+        )
+    except HostToolsBundleError:
+        raise
+    except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise HostToolsBundleError(f"{description} is invalid") from exc
+
+
 def write_contract_files(summary: dict[str, object], output_dir: Path) -> None:
     """Write bounded scalar/checksum files for shell-only remote preflight."""
 
@@ -548,14 +591,27 @@ def verify_artifact_metadata(
     run_id: str,
     run_attempt: str,
     source_sha: str,
+    expected_branch: str,
+    artifact_digest: str,
+    archive_path: Path,
 ) -> None:
     """Validate the exact GitHub artifact envelope without executing data."""
 
     if not all(
         isinstance(value, str) and value
-        for value in (artifact_id, artifact_name, run_id, run_attempt, source_sha)
+        for value in (
+            artifact_id,
+            artifact_name,
+            run_id,
+            run_attempt,
+            source_sha,
+            expected_branch,
+            artifact_digest,
+        )
     ):
         raise HostToolsBundleError("host-tools artifact metadata arguments are invalid")
+    if not isinstance(archive_path, Path):
+        raise HostToolsBundleError("host-tools artifact archive argument is invalid")
     if not re.fullmatch(r"[1-9][0-9]{0,31}", artifact_id):
         raise HostToolsBundleError("host-tools artifact id is invalid")
     if not re.fullmatch(r"[1-9][0-9]{0,31}", run_id) or not re.fullmatch(
@@ -564,21 +620,9 @@ def verify_artifact_metadata(
         raise HostToolsBundleError("host-tools workflow identity is invalid")
     if SOURCE_SHA_RE.fullmatch(source_sha) is None:
         raise HostToolsBundleError("host-tools source SHA is invalid")
-    try:
-        metadata_stat = metadata_path.lstat()
-        if (
-            not stat.S_ISREG(metadata_stat.st_mode)
-            or stat.S_ISLNK(metadata_stat.st_mode)
-            or metadata_stat.st_nlink != 1
-            or metadata_stat.st_size > MAX_FILE_BYTES
-        ):
-            raise HostToolsBundleError("host-tools artifact metadata is unsafe")
-        payload = json.loads(
-            metadata_path.read_text(encoding="utf-8"),
-            object_pairs_hook=_strict_object,
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise HostToolsBundleError("host-tools artifact metadata is invalid") from exc
+    if expected_branch != "dev" or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_digest) is None:
+        raise HostToolsBundleError("host-tools artifact binding arguments are invalid")
+    payload = _read_bounded_json(metadata_path, description="host-tools artifact metadata")
     if not isinstance(payload, dict):
         raise HostToolsBundleError("host-tools artifact metadata is invalid")
     if (
@@ -588,20 +632,104 @@ def verify_artifact_metadata(
         or payload.get("name") != artifact_name
         or type(payload.get("expired")) is not bool
         or payload.get("expired") is not False
+        or type(payload.get("digest")) is not str
+        or payload.get("digest") != artifact_digest
+        or type(payload.get("size_in_bytes")) is not int
+        or payload.get("size_in_bytes") <= 0
+        or payload.get("size_in_bytes") > MAX_ARTIFACT_ARCHIVE_BYTES
     ):
         raise HostToolsBundleError("host-tools artifact identity is invalid")
+    try:
+        archive_stat = archive_path.lstat()
+    except OSError as exc:
+        raise HostToolsBundleError("host-tools artifact archive is unavailable") from exc
+    if (
+        not stat.S_ISREG(archive_stat.st_mode)
+        or stat.S_ISLNK(archive_stat.st_mode)
+        or archive_stat.st_nlink != 1
+        or archive_stat.st_size != payload["size_in_bytes"]
+    ):
+        raise HostToolsBundleError("host-tools artifact archive size is invalid")
     workflow_run = payload.get("workflow_run")
     if not isinstance(workflow_run, dict):
         raise HostToolsBundleError("host-tools artifact workflow binding is invalid")
     if (
         type(workflow_run.get("id")) is not int
         or workflow_run.get("id") != int(run_id)
-        or type(workflow_run.get("run_attempt")) is not int
-        or workflow_run.get("run_attempt") != int(run_attempt)
         or type(workflow_run.get("head_sha")) is not str
         or workflow_run.get("head_sha") != source_sha
+        or type(workflow_run.get("head_branch")) is not str
+        or workflow_run.get("head_branch") != expected_branch
     ):
         raise HostToolsBundleError("host-tools artifact workflow binding is invalid")
+    # The artifact API's nested workflow_run object omits run_attempt.  When
+    # GitHub supplies it, keep the field fail-closed rather than trusting a
+    # coerced bool/string value; the authoritative attempt is validated from
+    # the dedicated workflow-run-attempt endpoint below.
+    if "run_attempt" in workflow_run and (
+        type(workflow_run.get("run_attempt")) is not int
+        or workflow_run.get("run_attempt") != int(run_attempt)
+    ):
+        raise HostToolsBundleError("host-tools artifact workflow binding is invalid")
+
+
+def verify_workflow_attempt(
+    metadata_path: Path,
+    *,
+    run_id: str,
+    run_attempt: str,
+    source_sha: str,
+    repository: str,
+    expected_branch: str,
+    expected_event: str,
+) -> None:
+    """Validate the authoritative GitHub workflow-run-attempt response."""
+
+    values = (run_id, run_attempt, source_sha, repository, expected_branch, expected_event)
+    if not all(isinstance(value, str) and value for value in values):
+        raise HostToolsBundleError("host-tools workflow attempt arguments are invalid")
+    if not re.fullmatch(r"[1-9][0-9]{0,31}", run_id) or not re.fullmatch(
+        r"[1-9][0-9]{0,31}", run_attempt
+    ):
+        raise HostToolsBundleError("host-tools workflow identity is invalid")
+    if SOURCE_SHA_RE.fullmatch(source_sha) is None:
+        raise HostToolsBundleError("host-tools source SHA is invalid")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repository):
+        raise HostToolsBundleError("host-tools repository identity is invalid")
+    if expected_branch != "dev" or expected_event not in {
+        "push",
+        "workflow_dispatch",
+    }:
+        raise HostToolsBundleError("host-tools workflow route is invalid")
+    payload = _read_bounded_json(
+        metadata_path,
+        description="host-tools workflow attempt metadata",
+    )
+    if not isinstance(payload, dict):
+        raise HostToolsBundleError("host-tools workflow attempt metadata is invalid")
+    repository_payload = payload.get("repository")
+    if not isinstance(repository_payload, dict):
+        raise HostToolsBundleError("host-tools workflow attempt provenance is invalid")
+    owner = repository.split("/", 1)[0]
+    name = repository.split("/", 1)[1]
+    owner_payload = repository_payload.get("owner")
+    if (
+        type(payload.get("id")) is not int
+        or payload.get("id") != int(run_id)
+        or type(payload.get("run_attempt")) is not int
+        or payload.get("run_attempt") != int(run_attempt)
+        or payload.get("head_sha") != source_sha
+        or type(payload.get("head_sha")) is not str
+        or payload.get("head_branch") != expected_branch
+        or type(payload.get("head_branch")) is not str
+        or payload.get("event") != expected_event
+        or type(payload.get("event")) is not str
+        or repository_payload.get("full_name") != repository
+        or repository_payload.get("name") != name
+        or not isinstance(owner_payload, dict)
+        or owner_payload.get("login") != owner
+    ):
+        raise HostToolsBundleError("host-tools workflow attempt provenance is invalid")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -622,6 +750,17 @@ def _parser() -> argparse.ArgumentParser:
     metadata.add_argument("--run-id", required=True)
     metadata.add_argument("--run-attempt", required=True)
     metadata.add_argument("--source-sha", required=True)
+    metadata.add_argument("--expected-branch", required=True)
+    metadata.add_argument("--artifact-digest", required=True)
+    metadata.add_argument("--archive", required=True)
+    attempt = subparsers.add_parser("verify-workflow-attempt")
+    attempt.add_argument("--metadata", required=True)
+    attempt.add_argument("--run-id", required=True)
+    attempt.add_argument("--run-attempt", required=True)
+    attempt.add_argument("--source-sha", required=True)
+    attempt.add_argument("--repository", required=True)
+    attempt.add_argument("--expected-branch", required=True)
+    attempt.add_argument("--expected-event", required=True)
     return parser
 
 
@@ -649,15 +788,30 @@ def main(argv: list[str] | None = None) -> int:
                 f"manifest_sha256={summary['manifest_sha256']}"
             )
             return 0
-        verify_artifact_metadata(
-            Path(arguments.metadata),
-            artifact_id=arguments.artifact_id,
-            artifact_name=arguments.artifact_name,
-            run_id=arguments.run_id,
-            run_attempt=arguments.run_attempt,
-            source_sha=arguments.source_sha,
-        )
-        print("HOST_TOOLS_BUNDLE schema=1 artifact_metadata=verified")
+        if arguments.command == "verify-artifact-metadata":
+            verify_artifact_metadata(
+                Path(arguments.metadata),
+                artifact_id=arguments.artifact_id,
+                artifact_name=arguments.artifact_name,
+                run_id=arguments.run_id,
+                run_attempt=arguments.run_attempt,
+                source_sha=arguments.source_sha,
+                expected_branch=arguments.expected_branch,
+                artifact_digest=arguments.artifact_digest,
+                archive_path=Path(arguments.archive),
+            )
+            print("HOST_TOOLS_BUNDLE schema=1 artifact_metadata=verified")
+        else:
+            verify_workflow_attempt(
+                Path(arguments.metadata),
+                run_id=arguments.run_id,
+                run_attempt=arguments.run_attempt,
+                source_sha=arguments.source_sha,
+                repository=arguments.repository,
+                expected_branch=arguments.expected_branch,
+                expected_event=arguments.expected_event,
+            )
+            print("HOST_TOOLS_BUNDLE schema=1 workflow_attempt=verified")
         return 0
     except (HostToolsBundleError, OSError, ValueError):
         print("host-tools bundle is invalid", file=sys.stderr)

@@ -314,6 +314,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
+      actions: read
       contents: read
       id-token: write
       attestations: write
@@ -370,6 +371,78 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Verify exact host-tools artifact metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOST_TOOLS_ARTIFACT_ID: ${{ steps.publish-host-tools.outputs.artifact-id }}
+          HOST_TOOLS_ARTIFACT_DIGEST: ${{ steps.publish-host-tools.outputs.artifact-digest }}
+          HOST_TOOLS_ARTIFACT_NAME: platform-host-tools-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$HOST_TOOLS_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_REF" = "refs/heads/dev"
+          HOST_TOOLS_ARTIFACT_DIGEST="${HOST_TOOLS_ARTIFACT_DIGEST#sha256:}"
+          [[ "$HOST_TOOLS_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          metadata_path="$RUNNER_TEMP/host-tools-artifact-metadata.json"
+          metadata_error="$RUNNER_TEMP/host-tools-artifact-metadata.error"
+          if ! curl --fail --silent --show-error --location --max-filesize 524288 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}" \
+            --output "$metadata_path" 2> "$metadata_error"; then
+            rm -f -- "$metadata_path" "$metadata_error"
+            echo "host-tools artifact metadata request failed" >&2
+            exit 1
+          fi
+          rm -f -- "$metadata_error"
+          test "$(stat -c '%F:%a:%h' -- "$metadata_path")" = "regular file:600:1"
+          api_zip="$RUNNER_TEMP/platform-host-tools-artifact.zip"
+          curl --fail-with-body --silent --show-error --location --max-filesize 8388608 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip" \
+            --output "$api_zip"
+          /usr/bin/python3 platform/tools/platform_host_tools_bundle.py verify-artifact-metadata \
+            --metadata "$metadata_path" \
+            --artifact-id "$HOST_TOOLS_ARTIFACT_ID" \
+            --artifact-name "$HOST_TOOLS_ARTIFACT_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-sha "$TARGET_SHA" \
+            --expected-branch dev \
+            --artifact-digest "sha256:${HOST_TOOLS_ARTIFACT_DIGEST}" \
+            --archive "$api_zip"
+          printf '%s  %s\n' "$HOST_TOOLS_ARTIFACT_DIGEST" "$api_zip" | sha256sum -c - >/dev/null 2>/dev/null
+          attempt_json="$RUNNER_TEMP/host-tools-workflow-attempt.json"
+          attempt_error="$RUNNER_TEMP/host-tools-workflow-attempt.error"
+          if ! curl --fail --silent --show-error --location --max-filesize 524288 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --output "$attempt_json" 2> "$attempt_error"; then
+            rm -f -- "$attempt_json" "$attempt_error"
+            echo "host-tools workflow attempt metadata request failed" >&2
+            exit 1
+          fi
+          rm -f -- "$attempt_error"
+          /usr/bin/python3 platform/tools/platform_host_tools_bundle.py verify-workflow-attempt \
+            --metadata "$attempt_json" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-sha "$TARGET_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --expected-branch dev \
+            --expected-event workflow_dispatch
+
       - name: Attest exact host-tools bundle
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
@@ -380,12 +453,16 @@ jobs:
         shell: bash
         run: |
           rm -rf -- "$RUNNER_TEMP/host-tools-artifact"
+          rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip" \
+            "$RUNNER_TEMP/host-tools-artifact-metadata.json" \
+            "$RUNNER_TEMP/host-tools-artifact-metadata.error" \
+            "$RUNNER_TEMP/host-tools-workflow-attempt.json" \
+            "$RUNNER_TEMP/host-tools-workflow-attempt.error"
 
-  # This is a read-only capability gate.  It consumes the attested bundle as
-  # data and checks the already provisioned immutable generation; it never
-  # uploads, installs, or executes bundle/candidate source on production.  The
-  # The checked generation contains platform_workflow_remote_dispatch.py, but
-  # this job inspects it only as data and never invokes repository code.
+  # This is a read-only capability gate. It consumes the attested bundle as
+  # data, checks the already provisioned immutable generation, and then invokes
+  # only that generation's fixed capability command. It never uploads,
+  # installs, or executes candidate/repository source on production.
   host-capability-preflight:
     name: Verify immutable production host capabilities
     needs:
@@ -406,7 +483,7 @@ jobs:
       TARGET_SHA: ${{ github.sha }}
       HOST_TOOLS_ARTIFACT_ID: ${{ needs.build-host-tools.outputs.artifact_id }}
       HOST_TOOLS_ARTIFACT_DIGEST: ${{ needs.build-host-tools.outputs.artifact_digest }}
-      HOST_TOOLS_ARTIFACT_NAME: platform-host-tools-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+      HOST_TOOLS_DISPATCHER: /opt/oldsparky/platform/shared/host-tools/${{ github.sha }}/platform_workflow_remote_dispatch.py
     steps:
       - name: Download and verify exact host-tools artifact
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
@@ -416,33 +493,20 @@ jobs:
 
       - name: Validate host-tools artifact envelope and bundle
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # The installed platform_workflow_remote_dispatch.py is only inspected
-          # through data-only shell checks; this job never invokes repo code.
+          # This step validates the downloaded bundle as data. The installed
+          # generation is probed only by the separate final step below, after
+          # the complete remote integrity inventory succeeds.
           umask 077
           [[ "$HOST_TOOLS_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REPOSITORY" = "StrayForest/old_sparky"
+          test "$GITHUB_REF" = "refs/heads/dev"
           HOST_TOOLS_ARTIFACT_DIGEST="${HOST_TOOLS_ARTIFACT_DIGEST#sha256:}"
           [[ "$HOST_TOOLS_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
-          metadata_fields="$(gh api \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            --jq '[.id, .name, .expired, .workflow_run.id, .workflow_run.run_attempt, .workflow_run.head_sha] | @tsv' \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}")"
-          expected_metadata_fields="$(printf '%s\t%s\tfalse\t%s\t%s\t%s' \
-            "$HOST_TOOLS_ARTIFACT_ID" "$HOST_TOOLS_ARTIFACT_NAME" "$GITHUB_RUN_ID" \
-            "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA")"
-          test "$metadata_fields" = "$expected_metadata_fields"
-          api_zip="$RUNNER_TEMP/platform-host-tools-artifact.zip"
-          curl --fail-with-body --silent --show-error --location --max-filesize 8388608 \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${HOST_TOOLS_ARTIFACT_ID}/zip" \
-            --output "$api_zip"
-          printf '%s  %s\n' "$HOST_TOOLS_ARTIFACT_DIGEST" "$api_zip" | sha256sum -c - >/dev/null 2>/dev/null
           bundle_path="$RUNNER_TEMP/host-tools-download/platform-host-tools-bundle.zip"
           test -f "$bundle_path" && test ! -L "$bundle_path"
           test "$(stat -c '%F:%h:%s' -- "$bundle_path")" = "regular file:1:$(stat -c '%s' -- "$bundle_path")"
@@ -645,12 +709,53 @@ jobs:
           printf '%s\n' "HOST_TOOLS_GENERATION=$generation" >> "$GITHUB_ENV"
           printf '%s\n' "HOST_TOOLS_SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
+      - name: Probe immutable host dispatcher capabilities
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${PROD_SSH_HOST:-}" && test -n "${PROD_SSH_USER:-}" && test -n "${PROD_SSH_KEY:-}"
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          expected_generation="/opt/oldsparky/platform/shared/host-tools/$TARGET_SHA"
+          expected_dispatcher="$expected_generation/platform_workflow_remote_dispatch.py"
+          test "$HOST_TOOLS_GENERATION" = "$expected_generation"
+          test "$HOST_TOOLS_DISPATCHER" = "$expected_dispatcher"
+          test -d "$HOST_TOOLS_SSH_DIR" && test ! -L "$HOST_TOOLS_SSH_DIR"
+          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR")" = "directory:1:700"
+          test -f "$HOST_TOOLS_SSH_DIR/config" && test ! -L "$HOST_TOOLS_SSH_DIR/config"
+          test -f "$HOST_TOOLS_SSH_DIR/known_hosts" && test ! -L "$HOST_TOOLS_SSH_DIR/known_hosts"
+          test -f "$HOST_TOOLS_SSH_DIR/id_ed25519" && test ! -L "$HOST_TOOLS_SSH_DIR/id_ed25519"
+          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/config")" = "regular file:1:600"
+          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/known_hosts")" = "regular file:1:600"
+          test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
+          remote=(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
+          expected_output="HOST_TOOLS schema=1 source_sha=$TARGET_SHA generation=$TARGET_SHA dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1"
+          # The file-size limit bounds the captured stdout to one 512-byte
+          # block. The dispatcher emits one short, fixed line; anything larger
+          # fails closed instead of being retained or projected to logs.
+          if ! (
+            ulimit -f 1
+            exec /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
+              "${remote[@]}" /usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" host-capabilities
+          ) > "$probe_output" 2>/dev/null < /dev/null; then
+            echo "immutable host capability probe failed" >&2
+            exit 1
+          fi
+          test "$(stat -c '%F:%h:%s' -- "$probe_output")" = "regular file:1:$(stat -c '%s' -- "$probe_output")"
+          test "$(stat -c '%s' -- "$probe_output")" -le 512
+          printf '%s\n' "$expected_output" | cmp -s - "$probe_output"
+
       - name: Remove host capability verifier material
         if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
-          rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip"
+          rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip" \
+            "$RUNNER_TEMP/platform-host-capabilities-output"
           rm -f -- "$RUNNER_TEMP/host-tools-remote-entries.b64" "$RUNNER_TEMP/host-tools-remote-entries" \
             "$RUNNER_TEMP/platform-host-tools-expected-members" "$RUNNER_TEMP/platform-host-tools-actual-members"
           rm -rf -- "$RUNNER_TEMP/host-tools-download" "$RUNNER_TEMP/platform-host-tools-inner"

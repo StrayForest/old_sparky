@@ -703,6 +703,37 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn('/usr/bin/python3 "$artifacts_metadata"', workflow)
         self.assertIn("/usr/bin/python3 \"$trusted_tool\" metadata", workflow)
         self.assertIn("/usr/bin/python3 \"$trusted_tool\" manifest", workflow)
+        host_build = self._workflow_step_run(
+            workflow, "Verify exact host-tools artifact metadata"
+        )
+        host_preflight = self._workflow_step_run(
+            workflow, "Validate host-tools artifact envelope and bundle"
+        )
+        self.assertIn(
+            "actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}",
+            host_build,
+        )
+        self.assertIn("platform/tools/platform_host_tools_bundle.py", host_build)
+        self.assertIn("verify-artifact-metadata", host_build)
+        self.assertIn("--max-filesize 524288", host_build)
+        self.assertIn('--archive "$api_zip"', host_build)
+        self.assertNotIn("--jq", host_build)
+        self.assertNotIn("@tsv", host_build)
+        self.assertIn("host-tools workflow attempt metadata request failed", host_build)
+        self.assertIn("verify-workflow-attempt", host_build)
+        self.assertNotIn(".workflow_run.run_attempt", host_build)
+        self.assertIn('"sha256:${HOST_TOOLS_ARTIFACT_DIGEST}"', host_build)
+        self.assertIn("sha256sum -c", host_build)
+        self.assertNotIn("actions/checkout@", host_preflight)
+        self.assertNotIn("platform_host_tools_bundle.py", host_preflight)
+        host_tool_source = (TOOLS_DIR / "platform_host_tools_bundle.py").read_text()
+        self.assertIn("size_in_bytes", host_tool_source)
+        self.assertIn("workflow_run.get(\"head_branch\")", host_tool_source)
+        self.assertIn('payload.get("head_branch") != expected_branch', host_tool_source)
+        self.assertIn("payload.get(\"digest\")", host_tool_source)
+        self.assertIn("object_pairs_hook=_strict_object", host_tool_source)
+        self.assertIn("host-tools workflow attempt provenance is invalid", host_tool_source)
+        self.assertNotIn('payload.get("ref") != "refs/heads/dev"', host_tool_source)
 
         target_sha = "a" * 40
         expected_name = "platform-ci-route-123-1"
@@ -714,7 +745,6 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 "id": 123,
                 "head_branch": "dev",
                 "head_sha": target_sha,
-                "run_attempt": 1,
             },
         }
         expired = {
@@ -795,6 +825,33 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 self.assertEqual(valid.stdout.strip(), "42")
             finally:
                 owned.cleanup()
+
+            for invalid_attempt in (False, "1", 1.0, 2):
+                invalid_selected = json.loads(json.dumps(selected))
+                invalid_selected["workflow_run"]["run_attempt"] = invalid_attempt
+                invalid_payload = {"total_count": 2, "artifacts": [invalid_selected, expired]}
+                invalid_first, invalid_second, owned = metadata_tree(
+                    first_payload=invalid_payload
+                )
+                try:
+                    invalid = run_tool(
+                        "metadata",
+                        str(invalid_first),
+                        str(invalid_second),
+                        "--expected-name",
+                        expected_name,
+                        "--run-id",
+                        "123",
+                        "--run-attempt",
+                        "1",
+                        "--target-sha",
+                        target_sha,
+                    )
+                    with self.subTest(invalid_attempt=invalid_attempt):
+                        self.assertNotEqual(invalid.returncode, 0)
+                        self.assertIn("provenance", invalid.stderr)
+                finally:
+                    owned.cleanup()
 
             malformed_first, malformed_second, owned = metadata_tree(
                 first_payload=valid_payload,
