@@ -703,26 +703,37 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn('/usr/bin/python3 "$artifacts_metadata"', workflow)
         self.assertIn("/usr/bin/python3 \"$trusted_tool\" metadata", workflow)
         self.assertIn("/usr/bin/python3 \"$trusted_tool\" manifest", workflow)
+        host_build = self._workflow_step_run(
+            workflow, "Verify exact host-tools artifact metadata"
+        )
         host_preflight = self._workflow_step_run(
             workflow, "Validate host-tools artifact envelope and bundle"
         )
         self.assertIn(
             "actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}",
-            host_preflight,
+            host_build,
         )
-        self.assertIn("host-tools workflow attempt metadata request failed", host_preflight)
-        self.assertIn("host-tools workflow attempt provenance is invalid", host_preflight)
-        self.assertIn("object_pairs_hook=reject_duplicate_keys", host_preflight)
-        self.assertNotIn(".workflow_run.run_attempt", host_preflight)
-        self.assertIn(".workflow_run.head_branch", host_preflight)
-        self.assertIn(".workflow_run.head_sha", host_preflight)
-        self.assertIn(".digest", host_preflight)
-        self.assertIn("sha256:${HOST_TOOLS_ARTIFACT_DIGEST}", host_preflight)
-        self.assertIn("metadata is oversized", host_preflight)
-        self.assertIn('test "$metadata_fields" = "$expected_metadata_fields"', host_preflight)
-        self.assertIn('payload.get("head_branch") != "dev"', host_preflight)
-        self.assertNotIn('payload.get("ref") != "refs/heads/dev"', host_preflight)
-        self.assertIn("sha256sum -c", host_preflight)
+        self.assertIn("platform/tools/platform_host_tools_bundle.py", host_build)
+        self.assertIn("verify-artifact-metadata", host_build)
+        self.assertIn("--max-filesize 524288", host_build)
+        self.assertIn('--archive "$api_zip"', host_build)
+        self.assertNotIn("--jq", host_build)
+        self.assertNotIn("@tsv", host_build)
+        self.assertIn("host-tools workflow attempt metadata request failed", host_build)
+        self.assertIn("verify-workflow-attempt", host_build)
+        self.assertNotIn(".workflow_run.run_attempt", host_build)
+        self.assertIn('"sha256:${HOST_TOOLS_ARTIFACT_DIGEST}"', host_build)
+        self.assertIn("sha256sum -c", host_build)
+        self.assertNotIn("actions/checkout@", host_preflight)
+        self.assertNotIn("platform_host_tools_bundle.py", host_preflight)
+        host_tool_source = (TOOLS_DIR / "platform_host_tools_bundle.py").read_text()
+        self.assertIn("size_in_bytes", host_tool_source)
+        self.assertIn("workflow_run.get(\"head_branch\")", host_tool_source)
+        self.assertIn('payload.get("head_branch") != expected_branch', host_tool_source)
+        self.assertIn("payload.get(\"digest\")", host_tool_source)
+        self.assertIn("object_pairs_hook=_strict_object", host_tool_source)
+        self.assertIn("host-tools workflow attempt provenance is invalid", host_tool_source)
+        self.assertNotIn('payload.get("ref") != "refs/heads/dev"', host_tool_source)
 
         target_sha = "a" * 40
         expected_name = "platform-ci-route-123-1"

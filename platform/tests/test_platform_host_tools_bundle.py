@@ -249,6 +249,8 @@ class HostToolsBundleTests(unittest.TestCase):
     def test_artifact_metadata_binding_is_exact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             metadata = Path(temporary) / "metadata.json"
+            archive = Path(temporary) / "artifact.zip"
+            archive.write_bytes(b"zip")
             metadata.write_text(
                 json.dumps(
                     {
@@ -256,6 +258,7 @@ class HostToolsBundleTests(unittest.TestCase):
                         "name": "platform-host-tools-bundle-99-1",
                         "expired": False,
                         "digest": ARTIFACT_DIGEST,
+                        "size_in_bytes": 3,
                         "workflow_run": {
                             "id": 99,
                             "run_attempt": 1,
@@ -275,6 +278,7 @@ class HostToolsBundleTests(unittest.TestCase):
                 source_sha=SOURCE_SHA,
                 expected_branch="dev",
                 artifact_digest=ARTIFACT_DIGEST,
+                archive_path=archive,
             )
             metadata.write_text(
                 json.dumps(
@@ -283,6 +287,7 @@ class HostToolsBundleTests(unittest.TestCase):
                         "name": "platform-host-tools-bundle-99-1",
                         "expired": False,
                         "digest": ARTIFACT_DIGEST,
+                        "size_in_bytes": 3,
                         "workflow_run": {
                             "id": 99,
                             "head_branch": "dev",
@@ -304,6 +309,7 @@ class HostToolsBundleTests(unittest.TestCase):
                 source_sha=SOURCE_SHA,
                 expected_branch="dev",
                 artifact_digest=ARTIFACT_DIGEST,
+                archive_path=archive,
             )
             for invalid_attempt in (False, "1", 1.0, 2):
                 invalid_payload = json.loads(metadata.read_text(encoding="utf-8"))
@@ -320,6 +326,7 @@ class HostToolsBundleTests(unittest.TestCase):
                             source_sha=SOURCE_SHA,
                             expected_branch="dev",
                             artifact_digest=ARTIFACT_DIGEST,
+                            archive_path=archive,
                         )
             metadata.write_text(
                 json.dumps(
@@ -328,6 +335,7 @@ class HostToolsBundleTests(unittest.TestCase):
                         "name": "platform-host-tools-bundle-99-1",
                         "expired": False,
                         "digest": ARTIFACT_DIGEST,
+                        "size_in_bytes": 3,
                         "workflow_run": {
                             "id": 99,
                             "run_attempt": 1,
@@ -348,6 +356,7 @@ class HostToolsBundleTests(unittest.TestCase):
                     source_sha=SOURCE_SHA,
                     expected_branch="dev",
                     artifact_digest=ARTIFACT_DIGEST,
+                    archive_path=archive,
                 )
             attempt = Path(temporary) / "attempt.json"
             attempt.write_text(
@@ -358,6 +367,7 @@ class HostToolsBundleTests(unittest.TestCase):
                         "head_sha": SOURCE_SHA,
                         "head_branch": "dev",
                         "event": "workflow_dispatch",
+                        "ref": None,
                         "repository": {
                             "full_name": "StrayForest/old_sparky",
                             "name": "old_sparky",
@@ -399,6 +409,7 @@ class HostToolsBundleTests(unittest.TestCase):
                             "head_sha": SOURCE_SHA,
                             "head_branch": "dev",
                             "event": "workflow_dispatch",
+                            "ref": None,
                             "repository": {
                                 "full_name": "StrayForest/old_sparky",
                                 "name": "old_sparky",
@@ -447,6 +458,7 @@ class HostToolsBundleTests(unittest.TestCase):
                             "head_sha": SOURCE_SHA,
                             "head_branch": "dev",
                             "event": "workflow_dispatch",
+                            "ref": None,
                             "repository": {
                                 "full_name": "StrayForest/old_sparky",
                                 "name": "old_sparky",
@@ -481,6 +493,7 @@ class HostToolsBundleTests(unittest.TestCase):
             metadata.write_text(
                 '{"id":123,"id":124,"name":"platform-host-tools-bundle-99-1",'
                 f'"expired":false,"digest":"{ARTIFACT_DIGEST}",'
+                '"size_in_bytes":3,'
                 '"workflow_run":{"id":99,"run_attempt":1,"head_branch":"dev",'
                 f'"head_sha":"{SOURCE_SHA}"}}',
                 encoding="utf-8",
@@ -495,6 +508,7 @@ class HostToolsBundleTests(unittest.TestCase):
                     source_sha=SOURCE_SHA,
                     expected_branch="dev",
                     artifact_digest=ARTIFACT_DIGEST,
+                    archive_path=archive,
                 )
 
             valid_metadata = {
@@ -502,17 +516,71 @@ class HostToolsBundleTests(unittest.TestCase):
                 "name": "platform-host-tools-bundle-99-1",
                 "expired": False,
                 "digest": ARTIFACT_DIGEST,
+                "size_in_bytes": 3,
                 "workflow_run": {
                     "id": 99,
                     "head_branch": "dev",
                     "head_sha": SOURCE_SHA,
                 },
             }
+            for missing_field in (
+                "id",
+                "name",
+                "expired",
+                "digest",
+                "size_in_bytes",
+                "workflow_run",
+            ):
+                missing_metadata = json.loads(json.dumps(valid_metadata))
+                missing_metadata.pop(missing_field)
+                metadata.write_text(json.dumps(missing_metadata), encoding="utf-8")
+                with self.subTest(missing_artifact_field=missing_field):
+                    with self.assertRaises(bundle.HostToolsBundleError):
+                        bundle.verify_artifact_metadata(
+                            metadata,
+                            artifact_id="123",
+                            artifact_name="platform-host-tools-bundle-99-1",
+                            run_id="99",
+                            run_attempt="1",
+                            source_sha=SOURCE_SHA,
+                            expected_branch="dev",
+                            artifact_digest=ARTIFACT_DIGEST,
+                            archive_path=archive,
+                        )
             for field, invalid in (
-                ("digest", "sha256:" + "f" * 64),
+                ("id", False),
+                ("id", "123"),
+                ("name", 123),
+                ("expired", 0),
                 ("expired", True),
-                ("workflow_run", {"id": 99, "head_branch": "feature", "head_sha": SOURCE_SHA}),
-                ("workflow_run", {"id": 100, "head_branch": "dev", "head_sha": SOURCE_SHA}),
+                ("digest", "sha256:" + "f" * 64),
+                ("digest", False),
+                ("size_in_bytes", False),
+                ("size_in_bytes", "3"),
+                ("size_in_bytes", 3.0),
+                ("size_in_bytes", 0),
+                ("size_in_bytes", bundle.MAX_ARTIFACT_ARCHIVE_BYTES + 1),
+                ("size_in_bytes", 4),
+                (
+                    "workflow_run",
+                    {"id": 99, "head_branch": "feature", "head_sha": SOURCE_SHA},
+                ),
+                (
+                    "workflow_run",
+                    {"id": 100, "head_branch": "dev", "head_sha": SOURCE_SHA},
+                ),
+                (
+                    "workflow_run",
+                    {"id": "99", "head_branch": "dev", "head_sha": SOURCE_SHA},
+                ),
+                (
+                    "workflow_run",
+                    {"id": 99, "head_branch": True, "head_sha": SOURCE_SHA},
+                ),
+                (
+                    "workflow_run",
+                    {"id": 99, "head_branch": "dev", "head_sha": False},
+                ),
             ):
                 invalid_metadata = json.loads(json.dumps(valid_metadata))
                 invalid_metadata[field] = invalid
@@ -528,7 +596,35 @@ class HostToolsBundleTests(unittest.TestCase):
                             source_sha=SOURCE_SHA,
                             expected_branch="dev",
                             artifact_digest=ARTIFACT_DIGEST,
+                            archive_path=archive,
                         )
+
+            metadata.write_text("{", encoding="utf-8")
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.verify_artifact_metadata(
+                    metadata,
+                    artifact_id="123",
+                    artifact_name="platform-host-tools-bundle-99-1",
+                    run_id="99",
+                    run_attempt="1",
+                    source_sha=SOURCE_SHA,
+                    expected_branch="dev",
+                    artifact_digest=ARTIFACT_DIGEST,
+                    archive_path=archive,
+                )
+            metadata.write_bytes(b"{" + b"x" * bundle.MAX_FILE_BYTES)
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.verify_artifact_metadata(
+                    metadata,
+                    artifact_id="123",
+                    artifact_name="platform-host-tools-bundle-99-1",
+                    run_id="99",
+                    run_attempt="1",
+                    source_sha=SOURCE_SHA,
+                    expected_branch="dev",
+                    artifact_digest=ARTIFACT_DIGEST,
+                    archive_path=archive,
+                )
 
     def test_host_path_references_stay_inside_declared_components(self) -> None:
         supervisor = (TOOLS_ROOT / "platform_production_deploy_supervisor.sh").read_text()
