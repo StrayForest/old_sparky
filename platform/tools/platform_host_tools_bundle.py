@@ -541,7 +541,12 @@ def write_contract_files(summary: dict[str, object], output_dir: Path) -> None:
             f"{record['sha256']}  {record['path']}\n" for record in records
         ),
         "files.modes": "".join(
-            f"{record['mode']}  {record['path']}\n" for record in records
+            # This sidecar is consumed by the shell preflight together with
+            # `stat -c %a`, whose output is the conventional octal text form
+            # (444/555).  Keep the JSON manifest's numeric Unix-mode values
+            # unchanged; only this line-oriented text contract is formatted
+            # for its shell consumer.
+            f"{record['mode']:o}  {record['path']}\n" for record in records
         ),
         "source_sha": f"{manifest['source_sha']}\n",
         "toolset_version": f"{manifest['toolset_version']}\n",
