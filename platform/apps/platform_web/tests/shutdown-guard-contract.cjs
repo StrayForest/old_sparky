@@ -1,8 +1,7 @@
 "use strict";
-/* eslint-disable @typescript-eslint/no-require-imports */
 
-const { spawn } = require("node:child_process");
-const path = require("node:path");
+const childProcess = process.getBuiltinModule("node:child_process");
+const path = process.getBuiltinModule("node:path");
 
 const guardPath = path.resolve(__dirname, "..", "server-shutdown-guard.cjs");
 const graceMs = 1_000;
@@ -42,7 +41,7 @@ function signalProcessGroup(child, signal) {
 }
 
 async function main() {
-  const child = spawn(
+  const child = childProcess.spawn(
     process.execPath,
     ["--require", guardPath, "-e", fixtureSource],
     {
