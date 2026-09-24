@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import stat
 import zipfile
+import zlib
 
 
 MAX_ARCHIVE_BYTES = 4 * 1024 * 1024
@@ -104,7 +105,15 @@ def extract_single_manifest(archive_path: Path, destination: Path) -> Path:
             finally:
                 if descriptor >= 0:
                     os.close(descriptor)
-    except (OSError, EOFError, OverflowError, zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError) as exc:
+    except (
+        OSError,
+        EOFError,
+        OverflowError,
+        RuntimeError,
+        zlib.error,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as exc:
         if isinstance(exc, UnsafeZipError):
             raise
         raise UnsafeZipError("classifier artifact ZIP is invalid") from exc

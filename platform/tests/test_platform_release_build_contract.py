@@ -728,13 +728,20 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             },
         }
 
-        def run_tool(*arguments: str) -> subprocess.CompletedProcess[str]:
+        def run_tool(
+            *arguments: str,
+            environment: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            child_environment = os.environ.copy()
+            if environment is not None:
+                child_environment.update(environment)
             return subprocess.run(
                 ["/usr/bin/python3", str(tool), *arguments],
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=10,
+                env=child_environment,
             )
 
         def write_page(directory: Path, payload: object, *, raw: bytes | None = None) -> None:
@@ -964,6 +971,27 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 os.chmod(archive, 0o600)
                 return archive
 
+            def write_corrupted_deflate_archive() -> Path:
+                archive = root / "corrupted-deflate.zip"
+                payload = b"".join(
+                    hashlib.sha256(f"corrupt-member-{index}".encode()).digest()
+                    for index in range(512)
+                )
+                with zipfile.ZipFile(
+                    archive, "w", compression=zipfile.ZIP_DEFLATED
+                ) as bundle:
+                    bundle.writestr("classifier-manifest.json", payload)
+                    info = bundle.infolist()[0]
+                encoded_name = info.filename.encode("utf-8")
+                compressed_offset = (
+                    info.header_offset + 30 + len(encoded_name) + len(info.extra)
+                )
+                archive_bytes = bytearray(archive.read_bytes())
+                archive_bytes[compressed_offset] ^= 0xFF
+                archive.write_bytes(archive_bytes)
+                os.chmod(archive, 0o600)
+                return archive
+
             for runtime_sensitive in (False, True):
                 with self.subTest(runtime_sensitive=runtime_sensitive):
                     payload = manifest_payload(runtime_sensitive)
@@ -975,6 +1003,25 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("classifier manifest accepted", result.stdout)
+
+            classifier_tmp = root / "classifier-tmp"
+            classifier_tmp.mkdir(mode=0o700)
+            corrupted_result = run_tool(
+                "manifest",
+                str(write_corrupted_deflate_archive()),
+                "--target-sha",
+                target_sha,
+                environment={"TMPDIR": str(classifier_tmp)},
+            )
+            self.assertEqual(corrupted_result.returncode, 1)
+            self.assertEqual(corrupted_result.stdout, "")
+            self.assertEqual(
+                corrupted_result.stderr,
+                "classifier validation rejected: archive\n",
+            )
+            self.assertNotIn("Traceback", corrupted_result.stderr)
+            self.assertNotIn(str(root), corrupted_result.stderr)
+            self.assertEqual(list(classifier_tmp.iterdir()), [])
 
             wrong_manifest = manifest_payload(False)
             wrong_manifest["target_sha"] = "b" * 40
