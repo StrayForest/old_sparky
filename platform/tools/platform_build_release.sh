@@ -28,6 +28,25 @@ CHECKSUM_ID=""
 BUILD_COMPLETE=0
 SOURCE_GIT_COMMIT=""
 ARTIFACT_SHA256=""
+PHASE_LOG_PATH="${PLATFORM_RELEASE_PHASE_LOG:-}"
+PHASE_TELEMETRY_WRITER="$ROOT_DIR/tools/platform_release_phase_telemetry.py"
+PHASE_TELEMETRY_ENABLED=0
+
+setup_phase_telemetry() {
+  if [[ -z "$PHASE_LOG_PATH" ]]; then
+    return 0
+  fi
+  if [[ "$PHASE_LOG_PATH" != /* || "$PHASE_LOG_PATH" == *$'\n'* \
+    || "$PHASE_LOG_PATH" == *$'\r'* || "$PHASE_LOG_PATH" == *$'\t'* \
+    || ! -f "$PHASE_TELEMETRY_WRITER" || -L "$PHASE_TELEMETRY_WRITER" ]]; then
+    return 1
+  fi
+  if ! /usr/bin/python3 -I "$PHASE_TELEMETRY_WRITER" \
+    --check --marker-log "$PHASE_LOG_PATH" >/dev/null 2>&1; then
+    return 1
+  fi
+  PHASE_TELEMETRY_ENABLED=1
+}
 
 emit_phase_marker() {
   local phase="$1"
@@ -35,6 +54,7 @@ emit_phase_marker() {
   local reason="$3"
   local cleanup="$4"
   local failed_phase="${5:-}"
+  local marker=""
   case "$reason" in
     ok|build_failed|cleanup_failed|interrupted) ;;
     *) reason="build_failed" ;;
@@ -44,15 +64,18 @@ emit_phase_marker() {
     *) cleanup="not-run" ;;
   esac
   if [[ "$phase" == "complete" && "$status" == "passed" ]]; then
-    printf 'RELEASE_BUILD_PHASE schema=1 phase=complete status=passed reason=ok cleanup=passed source_sha=%s artifact_sha256=%s\n' \
-      "$SOURCE_GIT_COMMIT" "$ARTIFACT_SHA256" || true
+    marker="RELEASE_BUILD_PHASE schema=1 phase=complete status=passed reason=ok cleanup=passed source_sha=$SOURCE_GIT_COMMIT artifact_sha256=$ARTIFACT_SHA256"
   elif [[ "$status" == "failed" ]]; then
-    printf 'RELEASE_BUILD_PHASE schema=1 phase=%s status=failed reason=%s cleanup=%s failed_phase=%s\n' \
-      "$phase" "$reason" "$cleanup" "${failed_phase:-$CURRENT_PHASE}" || true
+    marker="RELEASE_BUILD_PHASE schema=1 phase=$phase status=failed reason=$reason cleanup=$cleanup failed_phase=${failed_phase:-$CURRENT_PHASE}"
   else
-    printf 'RELEASE_BUILD_PHASE schema=1 phase=%s status=passed reason=ok cleanup=%s\n' \
-      "$phase" "$cleanup" || true
+    marker="RELEASE_BUILD_PHASE schema=1 phase=$phase status=passed reason=ok cleanup=$cleanup"
   fi
+  if [[ "$PHASE_TELEMETRY_ENABLED" -eq 1 ]] && ! /usr/bin/python3 -I \
+    "$PHASE_TELEMETRY_WRITER" --append --marker-log "$PHASE_LOG_PATH" --marker "$marker" \
+    >/dev/null 2>&1; then
+    return 1
+  fi
+  printf '%s\n' "$marker" || true
 }
 
 mark_phase_passed() {
@@ -114,15 +137,28 @@ cleanup_staging() {
     fi
   fi
   if [[ "$cleanup_rc" -ne 0 ]]; then
-    emit_phase_marker cleanup failed cleanup_failed failed "$CURRENT_PHASE"
-    emit_phase_marker complete failed cleanup_failed failed "$CURRENT_PHASE"
+    if ! emit_phase_marker cleanup failed cleanup_failed failed "$CURRENT_PHASE"; then
+      cleanup_rc=1
+    fi
+    if ! emit_phase_marker complete failed cleanup_failed failed "$CURRENT_PHASE"; then
+      cleanup_rc=1
+    fi
     [[ "$rc" -ne 0 ]] || rc=1
   else
-    emit_phase_marker cleanup passed ok passed
+    if ! emit_phase_marker cleanup passed ok passed; then
+      cleanup_rc=1
+    fi
     if [[ "$rc" -eq 0 && "$BUILD_COMPLETE" -eq 1 ]]; then
-      emit_phase_marker complete passed ok passed
+      if ! emit_phase_marker complete passed ok passed; then
+        cleanup_rc=1
+      fi
     else
-      emit_phase_marker complete failed "${FAILURE_REASON:-build_failed}" passed "$CURRENT_PHASE"
+      if ! emit_phase_marker complete failed "${FAILURE_REASON:-build_failed}" passed "$CURRENT_PHASE"; then
+        cleanup_rc=1
+      fi
+    fi
+    if [[ "$cleanup_rc" -ne 0 ]]; then
+      [[ "$rc" -ne 0 ]] || rc=1
     fi
   fi
   exit "$rc"
@@ -186,6 +222,10 @@ if [[ "$OUTPUT_DIR" != /* ]]; then
 fi
 if [[ -n "$DEPENDENCY_BASELINE" && "$DEPENDENCY_BASELINE" != /* ]]; then
   echo "Dependency baseline must be an absolute release directory." >&2
+  exit 1
+fi
+if ! setup_phase_telemetry; then
+  echo "Release phase telemetry setup failed." >&2
   exit 1
 fi
 if [[ "$EUID" -ne 0 ]]; then

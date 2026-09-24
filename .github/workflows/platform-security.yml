@@ -681,6 +681,7 @@ jobs:
           disk_before_bytes=""
           disk_after_bytes=""
           build_log=""
+          marker_log=""
           canonical_builder_rc=""
           builder_started=0
           diagnostic_parser="$GITHUB_WORKSPACE/platform/tools/platform_release_build_diagnostics.py"
@@ -705,11 +706,15 @@ jobs:
             local builder_run_ready=0
             trap - EXIT
             set +e
-            if (( builder_started == 1 )) && [[ -n "$canonical_rc" && -n "$build_log" ]] \
-              && sudo -n /usr/bin/test -f "$build_log" 2>/dev/null; then
+            if (( builder_started == 1 )) && [[ -n "$canonical_rc" ]]; then
               builder_run_ready=1
-              diagnostic_line="$(sudo -n /usr/bin/python3 -I "$diagnostic_parser" --log "$build_log" 2>/dev/null)"
-              parser_rc=$?
+              if [[ -n "$marker_log" ]] && sudo -n /usr/bin/test -f "$marker_log" 2>/dev/null; then
+                diagnostic_line="$(sudo -n /usr/bin/python3 -I "$diagnostic_parser" --marker-log "$marker_log" 2>/dev/null)"
+                parser_rc=$?
+              else
+                diagnostic_line="RELEASE_BUILD_DIAGNOSTIC schema=1 phase=unknown status=failed reason=build_failed cleanup=unknown reject_reason=missing"
+                parser_rc=1
+              fi
             fi
             if (( builder_run_ready == 1 )); then
               safe_diagnostic="$('/usr/bin/python3' -I - "$diagnostic_line" "$canonical_rc" "$parser_rc" <<'PY'
@@ -735,7 +740,8 @@ jobs:
           REASONS = {"ok", "build_failed", "cleanup_failed", "interrupted"}
           CLEANUP_STATES = {"not-run", "passed", "failed"}
           REQUIRED = {"schema", "phase", "status", "reason", "cleanup"}
-          OPTIONAL = {"failed_phase", "source_sha", "artifact_sha256"}
+          OPTIONAL = {"failed_phase", "source_sha", "artifact_sha256", "reject_reason"}
+          REJECT_REASONS = {"oversized", "metadata", "control", "encoding", "marker", "sequence", "missing"}
           line, canonical_rc, parser_rc = sys.argv[1:]
           safe = {
               "phase": "unknown",
@@ -779,7 +785,9 @@ jobs:
                   failed_phase = fields.get("failed_phase")
                   source_sha = fields.get("source_sha")
                   artifact_sha = fields.get("artifact_sha256")
+                  reject_reason = fields.get("reject_reason")
                   valid = failed_phase is None or failed_phase in PHASES
+                  valid = valid and (reject_reason is None or reject_reason in REJECT_REASONS)
                   valid = valid and (
                       source_sha is None
                       or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_sha) is not None
@@ -789,7 +797,7 @@ jobs:
                       or re.fullmatch(r"[0-9a-f]{64}", artifact_sha) is not None
                   )
                   if status == "passed":
-                      valid = valid and reason == "ok" and failed_phase is None
+                      valid = valid and reason == "ok" and failed_phase is None and reject_reason is None
                       if phase == "complete":
                           valid = valid and cleanup == "passed" and source_sha is not None and artifact_sha is not None
                       elif phase == "cleanup":
@@ -802,12 +810,18 @@ jobs:
                           valid = valid and cleanup in {"passed", "failed"} and failed_phase is not None
                       elif phase == "cleanup":
                           valid = valid and reason == "cleanup_failed" and cleanup == "failed"
+                      elif phase == "unknown":
+                          valid = valid and reject_reason is not None and cleanup == "unknown"
                       else:
                           valid = False
                   if valid:
                       safe.update({key: fields[key] for key in safe if fields.get(key)})
+                      if reject_reason is not None:
+                          safe["reject_reason"] = reject_reason
                       if failed_phase is not None:
                           safe["failed_phase"] = failed_phase
+          if parser_rc != "0" and "reject_reason" not in safe:
+              safe["reject_reason"] = "marker"
           consistency = "unknown"
           if valid and parser_rc == "0" and re.fullmatch(r"[0-9]+", canonical_rc):
               consistency = "match" if ((canonical_rc == "0") == (safe["status"] == "passed")) else "mismatch"
@@ -817,6 +831,7 @@ jobs:
               f"canonical_builder_rc={canonical_display} parser_rc={parser_display} "
               f"phase={safe['phase']} status={safe['status']} "
               f"reason={safe['reason']} cleanup={safe['cleanup']} consistency={consistency}"
+              + (f" reject_reason={safe['reject_reason']}" if "reject_reason" in safe else "")
               + (f" failed_phase={safe['failed_phase']}" if "failed_phase" in safe else "")
           )
           raise SystemExit(sanitizer_rc)
@@ -824,7 +839,7 @@ jobs:
               )"
               sanitizer_rc=$?
             else
-              safe_diagnostic="RELEASE_RUNTIME_BUILD_DIAGNOSTIC schema=1 canonical_builder_rc=${canonical_rc:-unknown} parser_rc=127 phase=unknown status=failed reason=build_failed cleanup=unknown consistency=not-run"
+              safe_diagnostic="RELEASE_RUNTIME_BUILD_DIAGNOSTIC schema=1 canonical_builder_rc=${canonical_rc:-unknown} parser_rc=127 phase=unknown status=failed reason=build_failed cleanup=unknown reject_reason=missing consistency=not-run"
             fi
             printf '%s\n' "$safe_diagnostic"
             if [[ -n "$release_root" ]]; then
@@ -849,7 +864,11 @@ jobs:
               exit 1
             fi
             if (( builder_run_ready == 1 && parser_rc != 0 )); then
-              printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=diagnostic_parser\n'
+              if [[ "$canonical_rc" =~ ^[1-9][0-9]*$ ]]; then
+                printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=canonical_builder_failed diagnostic=diagnostic_parser canonical_builder_rc=%s\n' "$canonical_rc"
+              else
+                printf 'RELEASE_RUNTIME_BUILD schema=1 status=failed reason=diagnostic_parser\n'
+              fi
               exit 1
             fi
             if (( builder_run_ready == 1 && sanitizer_rc != 0 )); then
@@ -916,6 +935,7 @@ jobs:
           build_root="$release_root/source"
           release_output="$build_root/platform/dist/releases"
           build_log="$release_root/canonical-builder.log"
+          marker_log="$release_root/canonical-builder-phase.log"
           sudo -n /usr/bin/install -d -o root -g root -m 0700 "$build_root" 2>/dev/null
           sudo -n /bin/cp -a "$GITHUB_WORKSPACE/." "$build_root/" 2>/dev/null
           sudo -n /bin/chown -R root:root "$build_root" 2>/dev/null
@@ -940,6 +960,15 @@ jobs:
             failure_reason=build_log_failed
             exit 1
           }
+          sudo -n /usr/bin/install -o root -g root -m 0600 /dev/null "$marker_log" 2>/dev/null || {
+            failure_reason=marker_log_failed
+            exit 1
+          }
+          sudo -n /usr/bin/python3 -I "$build_root/platform/tools/platform_release_phase_telemetry.py" \
+            --check --marker-log "$marker_log" >/dev/null 2>&1 || {
+            failure_reason=marker_log_failed
+            exit 1
+          }
 
           builder_started=1
           set +e
@@ -948,6 +977,7 @@ jobs:
              release_output="$2"
              builder="$3"
              release_ref="$4"
+             marker_log="$5"
              exec >"$build_log" 2>&1
              exec /usr/bin/env -i \
                HOME=/root \
@@ -955,10 +985,11 @@ jobs:
                LC_ALL=C.UTF-8 \
                PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
                PLATFORM_RELEASE_OUTPUT_DIR="$release_output" \
+               PLATFORM_RELEASE_PHASE_LOG="$marker_log" \
                PLATFORM_WEB_NEXT_COMPRESSION=true \
                "$builder" "$release_ref"' \
             _ "$build_log" "$release_output" \
-            "$build_root/platform/tools/platform_build_release.sh" "$release_ref"
+            "$build_root/platform/tools/platform_build_release.sh" "$release_ref" "$marker_log"
           canonical_builder_rc=$?
           set -e
           [[ "$canonical_builder_rc" -eq 0 ]] || { failure_reason=canonical_builder_failed; exit "$canonical_builder_rc"; }

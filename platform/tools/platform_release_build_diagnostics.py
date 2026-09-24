@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+MAX_MARKER_STREAM_BYTES = 16 * 1024
+# Kept as a source-compatible name for callers that still size raw logs; the
+# parser itself now consumes only the much smaller dedicated marker stream.
 MAX_LOG_BYTES = 4 * 1024 * 1024
 MAX_MARKER_BYTES = 1024
 MARKER_PREFIX = "RELEASE_BUILD_PHASE"
@@ -37,10 +40,19 @@ BUILD_PHASES = PHASES[:-2]
 SOURCE_SHA_LENGTHS = frozenset({40, 64})
 REQUIRED_FIELDS = frozenset({"schema", "phase", "status", "reason", "cleanup"})
 OPTIONAL_FIELDS = frozenset({"failed_phase", "source_sha", "artifact_sha256"})
+REJECT_REASONS = frozenset(
+    {"oversized", "metadata", "control", "encoding", "marker", "sequence", "missing"}
+)
 
 
 class DiagnosticError(ValueError):
-    """The log is not a trusted release-builder telemetry stream."""
+    """The marker stream is not a trusted release-builder telemetry stream."""
+
+    def __init__(self, reject_reason: str = "marker") -> None:
+        if reject_reason not in REJECT_REASONS:
+            reject_reason = "marker"
+        self.reject_reason = reject_reason
+        super().__init__(reject_reason)
 
 
 @dataclass(frozen=True)
@@ -70,33 +82,41 @@ class Marker:
         return f"{OUTPUT_PREFIX} " + " ".join(fields)
 
 
-def _safe_failure() -> str:
+def _safe_failure(reject_reason: str = "missing") -> str:
+    if reject_reason not in REJECT_REASONS:
+        reject_reason = "marker"
     return (
         f"{OUTPUT_PREFIX} schema=1 phase=unknown status=failed "
-        "reason=build_failed cleanup=unknown"
+        f"reason=build_failed cleanup=unknown reject_reason={reject_reason}"
     )
 
 
-def _read_bounded_log(path: Path) -> bytes:
+def _read_marker_stream(path: Path) -> bytes:
     try:
         before = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise DiagnosticError("missing") from exc
     except OSError as exc:
-        raise DiagnosticError from exc
+        raise DiagnosticError("metadata") from exc
     if (
         not stat.S_ISREG(before.st_mode)
         or before.st_uid != 0
         or before.st_gid != 0
         or before.st_nlink != 1
         or stat.S_IMODE(before.st_mode) != 0o600
-        or before.st_size > MAX_LOG_BYTES
+        or before.st_size > MAX_MARKER_STREAM_BYTES
     ):
-        raise DiagnosticError
+        raise DiagnosticError(
+            "oversized" if before.st_size > MAX_MARKER_STREAM_BYTES else "metadata"
+        )
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise DiagnosticError("missing") from exc
     except OSError as exc:
-        raise DiagnosticError from exc
+        raise DiagnosticError("metadata") from exc
     try:
         opened = os.fstat(descriptor)
         if (
@@ -104,17 +124,19 @@ def _read_bounded_log(path: Path) -> bytes:
             != (before.st_dev, before.st_ino, before.st_uid, before.st_nlink)
             or opened.st_gid != 0
             or stat.S_IMODE(opened.st_mode) != 0o600
-            or opened.st_size > MAX_LOG_BYTES
+            or opened.st_size > MAX_MARKER_STREAM_BYTES
         ):
-            raise DiagnosticError
+            raise DiagnosticError(
+                "oversized" if opened.st_size > MAX_MARKER_STREAM_BYTES else "metadata"
+            )
         payload = bytearray()
         while True:
             chunk = os.read(descriptor, 65536)
             if not chunk:
                 break
             payload.extend(chunk)
-            if len(payload) > MAX_LOG_BYTES:
-                raise DiagnosticError
+            if len(payload) > MAX_MARKER_STREAM_BYTES:
+                raise DiagnosticError("oversized")
         after = os.fstat(descriptor)
         if (
             (after.st_dev, after.st_ino, after.st_uid, after.st_nlink)
@@ -123,88 +145,92 @@ def _read_bounded_log(path: Path) -> bytes:
             or stat.S_IMODE(after.st_mode) != 0o600
             or after.st_size != len(payload)
         ):
-            raise DiagnosticError
+            raise DiagnosticError("metadata")
         return bytes(payload)
     except OSError as exc:
-        raise DiagnosticError from exc
+        raise DiagnosticError("metadata") from exc
     finally:
         try:
             os.close(descriptor)
         except OSError as exc:
-            raise DiagnosticError from exc
+            raise DiagnosticError("metadata") from exc
 
 
 def _parse_marker(line: str) -> Marker:
     try:
         encoded = line.encode("ascii")
     except UnicodeEncodeError as exc:
-        raise DiagnosticError from exc
+        raise DiagnosticError("marker") from exc
     if len(encoded) > MAX_MARKER_BYTES or line != line.strip(" "):
-        raise DiagnosticError
+        raise DiagnosticError("marker")
     tokens = line.split(" ")
     if not tokens or tokens[0] != MARKER_PREFIX:
-        raise DiagnosticError
+        raise DiagnosticError("marker")
     fields: dict[str, str] = {}
     for token in tokens[1:]:
         if "=" not in token:
-            raise DiagnosticError
+            raise DiagnosticError("marker")
         key, value = token.split("=", 1)
         if not key or key in fields or key not in REQUIRED_FIELDS | OPTIONAL_FIELDS:
-            raise DiagnosticError
+            raise DiagnosticError("marker")
         if not value or any(character in value for character in ("\t", "\r", "\n")):
-            raise DiagnosticError
+            raise DiagnosticError("marker")
         fields[key] = value
     if set(fields) != REQUIRED_FIELDS | (set(fields) & OPTIONAL_FIELDS):
-        raise DiagnosticError
+        raise DiagnosticError("marker")
     if fields.get("schema") != "1":
-        raise DiagnosticError
+        raise DiagnosticError("marker")
     phase = fields.get("phase", "")
     status = fields.get("status", "")
     reason = fields.get("reason", "")
     cleanup = fields.get("cleanup", "")
     if phase not in PHASE_INDEX or status not in STATUSES or reason not in REASONS:
-        raise DiagnosticError
+        raise DiagnosticError("marker")
     if cleanup not in CLEANUP_STATES:
-        raise DiagnosticError
+        raise DiagnosticError("marker")
 
     failed_phase = fields.get("failed_phase")
     source_sha = fields.get("source_sha")
     artifact_sha256 = fields.get("artifact_sha256")
     if failed_phase is not None and failed_phase not in PHASE_INDEX:
-        raise DiagnosticError
+        raise DiagnosticError("marker")
     if source_sha is not None and (
         len(source_sha) not in SOURCE_SHA_LENGTHS
         or not all(character in "0123456789abcdef" for character in source_sha)
     ):
-        raise DiagnosticError
+        raise DiagnosticError("marker")
     if artifact_sha256 is not None or artifact_sha256 == "":
         if artifact_sha256 is None or len(artifact_sha256) != 64 or not all(
             character in "0123456789abcdef" for character in artifact_sha256
         ):
-            raise DiagnosticError
+            raise DiagnosticError("marker")
 
     if status == "passed":
         if reason != "ok" or failed_phase is not None:
-            raise DiagnosticError
+            raise DiagnosticError("marker")
         if phase == "complete":
             if cleanup != "passed" or source_sha is None or artifact_sha256 is None:
-                raise DiagnosticError
+                raise DiagnosticError("marker")
         elif phase == "cleanup":
             if cleanup != "passed" or source_sha is not None or artifact_sha256 is not None:
-                raise DiagnosticError
+                raise DiagnosticError("marker")
         elif cleanup != "not-run" or source_sha is not None or artifact_sha256 is not None:
-            raise DiagnosticError
+            raise DiagnosticError("marker")
     else:
         if reason == "ok" or source_sha is not None or artifact_sha256 is not None:
-            raise DiagnosticError
+            raise DiagnosticError("marker")
         if phase == "complete":
-            if cleanup not in {"passed", "failed"} or failed_phase is None:
-                raise DiagnosticError
+            if cleanup not in {"passed", "failed"} or failed_phase not in BUILD_PHASES:
+                raise DiagnosticError("marker")
         elif phase == "cleanup":
-            if cleanup != "failed" or reason != "cleanup_failed":
-                raise DiagnosticError
+            if (
+                cleanup != "failed"
+                or reason != "cleanup_failed"
+                or failed_phase not in BUILD_PHASES
+            ):
+                raise DiagnosticError("marker")
         elif cleanup not in {"passed", "failed"}:
-            raise DiagnosticError
+            raise DiagnosticError("marker")
 
     return Marker(
         phase=phase,
@@ -223,7 +249,7 @@ def _validate_sequence(markers: list[Marker]) -> None:
 
     if terminal.status == "passed":
         if phases != PHASES or any(marker.status != "passed" for marker in markers):
-            raise DiagnosticError
+            raise DiagnosticError("sequence")
         return
 
     if (
@@ -233,7 +259,7 @@ def _validate_sequence(markers: list[Marker]) -> None:
         or phases[-2] != "cleanup"
         or terminal.failed_phase not in BUILD_PHASES
     ):
-        raise DiagnosticError
+        raise DiagnosticError("sequence")
 
     cleanup = markers[-2]
     passed = markers[:-2]
@@ -247,11 +273,11 @@ def _validate_sequence(markers: list[Marker]) -> None:
         terminal.failed_phase == "artifact-validate"
         and passed_phases == final_phase_prefix
     ):
-        raise DiagnosticError
+        raise DiagnosticError("sequence")
     if any(marker.status != "passed" for marker in passed):
-        raise DiagnosticError
+        raise DiagnosticError("sequence")
     if cleanup.failed_phase is not None and cleanup.failed_phase != terminal.failed_phase:
-        raise DiagnosticError
+        raise DiagnosticError("sequence")
 
     if cleanup.status == "passed":
         if (
@@ -260,7 +286,7 @@ def _validate_sequence(markers: list[Marker]) -> None:
             or terminal.reason not in {"build_failed", "interrupted"}
             or terminal.cleanup != "passed"
         ):
-            raise DiagnosticError
+            raise DiagnosticError("sequence")
     elif cleanup.status == "failed":
         if (
             cleanup.reason != "cleanup_failed"
@@ -268,47 +294,53 @@ def _validate_sequence(markers: list[Marker]) -> None:
             or terminal.reason != "cleanup_failed"
             or terminal.cleanup != "failed"
         ):
-            raise DiagnosticError
+            raise DiagnosticError("sequence")
     else:
-        raise DiagnosticError
+        raise DiagnosticError("sequence")
 
 
 def extract(path: Path) -> Marker:
-    payload = _read_bounded_log(path)
+    payload = _read_marker_stream(path)
     if any(byte < 0x20 and byte != 0x0A or byte == 0x7F for byte in payload):
-        raise DiagnosticError
+        raise DiagnosticError("control")
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise DiagnosticError from exc
+        raise DiagnosticError("encoding") from exc
 
     markers: list[Marker] = []
     previous_index = -1
     seen_phases: set[str] = set()
     for line in text.splitlines():
         if not line.startswith(MARKER_PREFIX):
-            continue
+            raise DiagnosticError("marker")
         marker = _parse_marker(line)
         current_index = PHASE_INDEX[marker.phase]
         if marker.phase in seen_phases or current_index <= previous_index:
-            raise DiagnosticError
+            raise DiagnosticError("sequence")
         seen_phases.add(marker.phase)
         previous_index = current_index
         markers.append(marker)
     if not markers or markers[-1].phase != "complete":
-        raise DiagnosticError
+        raise DiagnosticError("sequence")
     _validate_sequence(markers)
     return markers[-1]
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[0] != "--log":
-        print(_safe_failure())
+    if len(argv) != 2 or argv[0] != "--marker-log":
+        print(_safe_failure("marker"))
         return 2
     try:
         marker = extract(Path(argv[1]))
-    except (DiagnosticError, OSError, ValueError):
-        print(_safe_failure())
+    except DiagnosticError as exc:
+        print(_safe_failure(exc.reject_reason))
+        return 1
+    except OSError:
+        print(_safe_failure("metadata"))
+        return 1
+    except ValueError:
+        print(_safe_failure("marker"))
         return 1
     print(marker.normalized())
     return 0
