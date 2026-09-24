@@ -200,6 +200,18 @@ deployable when its source is the current `dev` push. The routes are:
 | known `full` platform/workflow path | all first eight gates | `false` | deployable only for a non-fallback push to current `dev` |
 | unknown or malformed full fallback | all first eight gates | `true` | never deployable; fail-closed verification only |
 
+Host-tools lifecycle files are full-route platform/workflow paths, never a
+docs-only or reduced route. `platform/contracts/host_tools_pin.json` is the
+single bounded pin contract: application-only changes keep the reviewed
+`HOST_TOOLS_SHA`, while a host-control closure edit must update the pin and its
+closure baseline. The practical bump is commit A (closure change), out-of-band
+provision/self-test of A, then commit B (pin-only host-control change) pointing
+at A with A's exact baseline; B is never self-pinned. The pin resolver checks the exact lowercase commit,
+repository, reachability, ancestry, path set, modes and digests; the
+host-tools contract tests therefore fail before a closure edit can merge
+without an intentional pin bump. `TARGET_SHA` remains the classifier,
+release-artifact, provenance, migration and deployed-receipt identity.
+
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route
 with `fallback=true` and `deployable=false`; these routes also run the

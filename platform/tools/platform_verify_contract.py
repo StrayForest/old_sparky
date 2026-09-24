@@ -497,12 +497,30 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
     host_preflight = jobs["host-capability-preflight"]
     preflight = jobs["preflight"]
     if host_build:
+        host_build_step = next(
+            (
+                step
+                for step in _workflow_step_blocks(host_build)
+                if "- name: Build and verify deterministic host-tools bundle" in step
+            ),
+            "",
+        )
         if "environment: production" in host_build or _production_job_secret_names(host_build):
             issues.append("host-tools bundle builder must be secret-free")
         if "actions/checkout@" not in host_build or "ref: ${{ env.TARGET_SHA }}" not in host_build:
-            issues.append("host-tools bundle builder must checkout the exact target source")
-        if "platform_host_tools_bundle.py build" not in host_build:
+            issues.append("host-tools bundle builder must checkout the exact target source as pin metadata")
+        if "fetch-depth: 0" not in host_build or "path: target-source" not in host_build:
+            issues.append("host-tools bundle builder must retain complete target history for pin validation")
+        if "platform_host_tools_pin.py" not in host_build or "resolve_host_tools_pin" not in host_build:
+            issues.append("host-tools bundle builder must resolve the repository-owned host-tools pin")
+        if "path: host-tools-source" not in host_build or "ref: ${{ steps.resolve_host_tools_pin.outputs.host_tools_sha }}" not in host_build:
+            issues.append("host-tools bundle builder must checkout the exact pinned host-tools source")
+        if "platform_host_tools_bundle.py" not in host_build or '"$host_tools_source/platform/tools/platform_host_tools_bundle.py"' not in host_build:
             issues.append("host-tools bundle builder must invoke the canonical deterministic builder")
+        if '--source-sha "$HOST_TOOLS_SHA"' not in host_build_step or '--expected-source-sha "$HOST_TOOLS_SHA"' not in host_build_step:
+            issues.append("host-tools bundle manifest must bind to HOST_TOOLS_SHA")
+        if '--source-sha "$TARGET_SHA"' in host_build_step or '--expected-source-sha "$TARGET_SHA"' in host_build_step:
+            issues.append("host-tools bundle must not bind its generation to TARGET_SHA")
         if "actions/upload-artifact@" not in host_build or "actions/attest-build-provenance@" not in host_build:
             issues.append("host-tools bundle builder must publish and attest its exact bundle")
         if "artifact_id:" not in host_build or "artifact_digest:" not in host_build:
@@ -522,6 +540,10 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("host capability preflight must propagate bundle-builder failure")
         if "actions/download-artifact@" not in host_preflight or "artifact-ids:" not in host_preflight:
             issues.append("host capability preflight must download the exact bundle artifact")
+        if "HOST_TOOLS_SHA: ${{ needs.build-host-tools.outputs.host_tools_sha }}" not in host_preflight:
+            issues.append("host capability preflight must consume the pinned HOST_TOOLS_SHA output")
+        if "/opt/oldsparky/platform/shared/host-tools/${{ needs.build-host-tools.outputs.host_tools_sha }}" not in host_preflight:
+            issues.append("host capability preflight must address the pinned host-tools generation")
         if "actions/checkout@" in host_preflight:
             issues.append("host capability preflight must not checkout repository source")
         if "platform_host_tools_bundle.py" in host_preflight:
@@ -580,7 +602,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
                 "/usr/bin/timeout --signal=TERM --kill-after=2s 15s",
                 "ulimit -f 1",
                 "< /dev/null",
-                'expected_output="HOST_TOOLS schema=1 source_sha=$TARGET_SHA generation=$TARGET_SHA '
+                'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA '
                 'dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"',
                 'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
             ):
@@ -604,6 +626,10 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("production preflight must invoke the immutable host-tools dispatcher")
         if "current/tools/platform_workflow_remote_dispatch.py" in preflight:
             issues.append("production preflight must not use the mutable dispatcher fallback")
+        if "HOST_TOOLS_SHA: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}" not in preflight:
+            issues.append("production preflight must consume the pinned HOST_TOOLS_SHA output")
+        if "/opt/oldsparky/platform/shared/host-tools/${{ github.sha }}" in preflight:
+            issues.append("production preflight must not derive host-tools path from TARGET_SHA")
 
     # Candidate checkout/build/publish belongs only to a fresh, non-secret job.
     if build:
@@ -672,6 +698,10 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         issues.append("production secret job must checkout only the trusted validator")
     if "current/tools/platform_workflow_remote_dispatch.py" in production:
         issues.append("production secret job must invoke only the immutable host-tools dispatcher")
+    if "HOST_TOOLS_SHA: ${{ needs.host-capability-preflight.outputs.host_tools_sha }}" not in production:
+        issues.append("production secret job must consume the pinned HOST_TOOLS_SHA output")
+    if "/opt/oldsparky/platform/shared/host-tools/${{ github.sha }}" in production:
+        issues.append("production secret job must not derive host-tools path from TARGET_SHA")
     if "python3.12 -I -B \"$HOST_TOOLS_DISPATCHER\"" not in production:
         issues.append("production secret job must invoke the immutable host-tools dispatcher with python isolated mode")
     if "platform_production_classifier_artifact.py" not in production:

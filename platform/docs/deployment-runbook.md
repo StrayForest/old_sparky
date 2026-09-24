@@ -63,11 +63,14 @@ to `dev`. The chain is:
    head. If `dev` moved from `TARGET_SHA` (the A→B race), the workflow aborts
    closed; only then does it transfer and install the artifact and run
    production smoke.
-6. Before the expensive release build, `build-host-tools` creates and attests
-   the deterministic release-independent host-tools handoff. The
-   environment-approved `host-capability-preflight` verifies that exact
+6. Before the expensive release build, `build-host-tools` resolves the
+   repository-owned `platform/contracts/host_tools_pin.json` from the exact
+   target source, validates its repository/commit ancestry and closure
+   baseline, then checks out and runs the pinned `HOST_TOOLS_SHA` helper to
+   create and attest the deterministic release-independent host-tools handoff.
+   The environment-approved `host-capability-preflight` verifies that exact
    artifact and the already provisioned
-   `/opt/oldsparky/platform/shared/host-tools/<TARGET_SHA>` generation. It
+   `/opt/oldsparky/platform/shared/host-tools/<HOST_TOOLS_SHA>` generation. It
    requires the configured SSH identity to be root and checks the generation's
    owner, mode, link count, type, capabilities and every digest with fixed
    absolute tools. The v2 capability contract requires
@@ -75,7 +78,10 @@ to `dev`. The chain is:
    `/usr/bin/python3.12 -I -B`. This is a read-only gate: it never SCPs or executes the
    bundle and fails before release build, attestation, pending status or
    production artifact transfer when the generation is absent or mismatched.
-   The artifact API binding uses its ID, name, run ID, source SHA and digest;
+   The host-tools manifest/source/generation are bound to `HOST_TOOLS_SHA`;
+   the release artifact, provenance, migration and deployed receipt remain
+   bound to application `TARGET_SHA`. The artifact API binding uses its ID,
+   name, run ID, application source SHA and digest;
    because nested `workflow_run.run_attempt` may be absent, the secret-free
    host-tools build gate validates the exact current attempt through the
    authoritative GitHub attempt endpoint with bounded typed JSON and rejects
@@ -135,13 +141,16 @@ gh run list \
 gh run watch <run-id> --repo StrayForest/old_sparky --exit-status
 ```
 
-The deploy workflow checks out the exact GitHub commit, builds the immutable
-release and wheelhouse in CI, publishes and attests the artifact, verifies its
-digest and source commit, then transfers that exact artifact to production.
+The deploy workflow checks out the exact GitHub commit for the application
+release, builds the immutable release and wheelhouse in CI, publishes and
+attests the artifact, verifies its digest and `TARGET_SHA` provenance, then
+transfers that exact artifact to production. Host control is selected only by
+the reviewed `HOST_TOOLS_SHA` pin and is never copied from or rebuilt from the
+application checkout in a secret-bearing job.
 The VPS performs no source checkout or dependency/build resolution; it only
 revalidates the artifact and invokes the guarded release state machine. Record
 the Actions run URL/ID, target SHA, release slug and final smoke result in the
-handoff.
+handoff. Record both `TARGET_SHA` and `HOST_TOOLS_SHA` in the release receipt.
 
 The production Alembic wrapper keeps the exact `upgrade head` allowlist and,
 after the release transaction has quiesced writers, runs the catalog recovery
@@ -171,8 +180,14 @@ host-tools capability gate. Manual dispatch cannot provision or repair that
 generation: operators must use the approved out-of-band host-image/console
 procedure, retain the previous valid generation, and repeat the reviewed
 `dev` operation only after the exact post-copy inventory passes. There is no
-workflow self-installer or legacy `current/tools` fallback for the production
-dispatcher.
+workflow self-installer, uploaded installer, copied generation or legacy
+`current/tools` fallback for the production dispatcher. Later application
+SHAs reuse the pinned generation. An intentional host-tools bump uses two
+reviewed commits: A changes the closure and is provisioned/self-tested at its
+exact SHA out of band; B is pin-only with respect to host control, points at A
+and records A's exact closure baseline, then merges only after provisioning.
+The resolver rejects the old pin at A and rejects any later closure drift
+without another bump, so the pin never targets B's own merge SHA.
 
 For a read-only production gate without an install, an operator may dispatch
 `mode=preflight` explicitly. A manual fallback must never be used to bypass a
