@@ -285,6 +285,17 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             timeout=60,
         )
 
+    @staticmethod
+    def _manifest_padding_entries(count: int) -> list[tuple[str, bytes, str]]:
+        return [
+            (
+                f"lib/manifest-padding-{index:04d}-{'x' * 210}",
+                b"x",
+                "file",
+            )
+            for index in range(count)
+        ]
+
     def test_staged_live_qa_build_materializes_validated_browser_links(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -343,6 +354,49 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             installer.CHROMIUM_SANDBOX_SIZE = len(sandbox)
             installer.CHROMIUM_SANDBOX_SHA256 = hashlib.sha256(sandbox).hexdigest()
             installer._validate_runtime_source(output)
+
+    def test_staged_live_qa_manifest_between_legacy_and_runtime_bounds_is_valid(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builder, platform_root, node_home, output, _sandbox = (
+                self._prepare_local_runtime_fixture(
+                    root,
+                    webkit_entries=self._manifest_padding_entries(500),
+                )
+            )
+            completed = self._run_staged_live_qa_build(
+                builder, platform_root, node_home, output, root
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            manifest_size = (output / "runtime-manifest.json").stat().st_size
+            self.assertGreater(manifest_size, 64 * 1024)
+            self.assertLessEqual(manifest_size, 256 * 1024)
+
+    def test_staged_live_qa_manifest_over_bound_reports_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builder, platform_root, node_home, output, _sandbox = (
+                self._prepare_local_runtime_fixture(
+                    root,
+                    webkit_entries=self._manifest_padding_entries(900),
+                )
+            )
+            completed = self._run_staged_live_qa_build(
+                builder, platform_root, node_home, output, root
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            diagnostic = json.loads(completed.stderr)
+            self.assertEqual(diagnostic["phase"], "manifest")
+            self.assertEqual(diagnostic["reason"], "size-limit")
+            self.assertEqual(diagnostic["cleanup"], "passed")
+            self.assertNotIn(str(root), completed.stderr)
+            self.assertNotIn("file://", completed.stderr)
+            self.assertNotIn("Traceback", completed.stderr)
+            self.assertFalse(output.exists())
 
     def test_staged_live_qa_build_fails_closed_for_browser_link_inputs(self) -> None:
         negative_cases = {

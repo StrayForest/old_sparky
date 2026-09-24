@@ -124,6 +124,126 @@ class LiveQaRuntimeInstallTests(unittest.TestCase):
                 verified = runtime.verify(app_dir, source_sha)
                 self.assertEqual(verified["source_sha"], source_sha)
 
+    def test_active_manifest_between_legacy_and_active_bounds_is_accepted(self) -> None:
+        source_sha = "d" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.runtime_tree(Path(temporary), source_sha) as (
+                app_dir,
+                release,
+                trusted,
+                _payload_root,
+            ):
+                runtime.install(app_dir, release)
+                manifest_path = trusted / "active-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+                manifest["files"].update(
+                    {
+                        f"manifest-padding-{index:04d}-{'x' * 70}": "0" * 64
+                        for index in range(900)
+                    }
+                )
+                manifest_path.write_text(
+                    json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                os.chmod(manifest_path, 0o444)
+                self.assertGreater(manifest_path.stat().st_size, 64 * 1024)
+                self.assertLessEqual(
+                    manifest_path.stat().st_size,
+                    runtime.MAX_ACTIVE_MANIFEST_BYTES,
+                )
+                self.assertEqual(runtime._read_manifest()["source_sha"], source_sha)
+
+    def test_active_manifest_over_active_bound_is_rejected(self) -> None:
+        source_sha = "e" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.runtime_tree(Path(temporary), source_sha) as (
+                app_dir,
+                release,
+                trusted,
+                _payload_root,
+            ):
+                runtime.install(app_dir, release)
+                manifest_path = trusted / "active-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+                manifest["files"].update(
+                    {
+                        f"manifest-padding-{index:04d}-{'x' * 70}": "0" * 64
+                        for index in range(3200)
+                    }
+                )
+                manifest_path.write_text(
+                    json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                os.chmod(manifest_path, 0o444)
+                self.assertGreater(
+                    manifest_path.stat().st_size,
+                    runtime.MAX_ACTIVE_MANIFEST_BYTES,
+                )
+                with self.assertRaisesRegex(
+                    runtime.InstallerError,
+                    "metadata is unsafe|size bound",
+                ):
+                    runtime._read_manifest()
+
+    def test_release_json_reader_keeps_the_canonical_64k_bound(self) -> None:
+        source_sha = "f" * 40
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            with self.runtime_tree(Path(temporary), source_sha) as (
+                app_dir,
+                release,
+                _trusted,
+                _payload_root,
+            ):
+                release_json = release / "RELEASE.json"
+                release_json.write_text(
+                    json.dumps(
+                        {
+                            "source_git_commit": source_sha,
+                            "release_slug": release.name,
+                            "padding": "x" * (runtime.MAX_RELEASE_JSON_BYTES + 1),
+                        }
+                    ),
+                    encoding="ascii",
+                )
+                os.chmod(release_json, 0o444)
+                with self.assertRaisesRegex(
+                    runtime.InstallerError,
+                    "metadata is unsafe|size bound",
+                ):
+                    runtime._safe_release(app_dir, release)
+
+    def test_active_manifest_reader_rejects_symlink_hardlink_and_wrong_mode(self) -> None:
+        cases = ("symlink", "hardlink", "mode")
+        for case in cases:
+            with self.subTest(case=case):
+                source_sha = ("1" if case == "symlink" else "2" if case == "hardlink" else "3") * 40
+                with tempfile.TemporaryDirectory(dir="/root") as temporary:
+                    with self.runtime_tree(Path(temporary), source_sha) as (
+                        app_dir,
+                        release,
+                        trusted,
+                        _payload_root,
+                    ):
+                        runtime.install(app_dir, release)
+                        manifest_path = trusted / "active-manifest.json"
+                        if case == "symlink":
+                            target = trusted / "manifest-target.json"
+                            target.write_bytes(manifest_path.read_bytes())
+                            os.chmod(target, 0o444)
+                            manifest_path.unlink()
+                            manifest_path.symlink_to(target)
+                        elif case == "hardlink":
+                            os.link(manifest_path, trusted / "manifest-second-link")
+                        else:
+                            os.chmod(manifest_path, 0o644)
+                        with self.assertRaisesRegex(
+                            runtime.InstallerError,
+                            "metadata is unsafe",
+                        ):
+                            runtime._read_manifest()
+
 
 if __name__ == "__main__":
     unittest.main()

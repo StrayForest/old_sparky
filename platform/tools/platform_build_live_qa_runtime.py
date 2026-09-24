@@ -117,6 +117,9 @@ SANDBOX_SHA256 = (
 SANDBOX_SIZE = guard.CHROMIUM_SANDBOX_SIZE if guard is not None else 0
 RUNTIME_FILE_LIMIT = 768 * 1024 * 1024
 RUNTIME_TOTAL_LIMIT = 2 * 1024 * 1024 * 1024
+MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES = (
+    guard.MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES if guard is not None else 256 * 1024
+)
 
 
 class RuntimeBuildError(RuntimeError):
@@ -765,15 +768,27 @@ def build(platform_root: Path, node_home: Path, output: Path) -> dict[str, objec
             "tree_sha256": tree_sha256,
             "files": files,
         }
+        manifest_raw = (
+            json.dumps(
+                manifest,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+        if len(manifest_raw) > MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES:
+            raise RuntimeBuildError(
+                "live-QA runtime manifest exceeds its size bound",
+                reason="size-limit",
+                phase="manifest",
+            )
         manifest_path = output / "runtime-manifest.json"
         manifest_path.parent.mkdir(mode=0o555, exist_ok=True)
         # The output root is immutable, so briefly permit root to publish the
         # manifest and then restore the final read-only contract.
         os.chmod(output, 0o755)
-        manifest_path.write_text(
-            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="ascii",
-        )
+        manifest_path.write_bytes(manifest_raw)
         os.chown(manifest_path, 0, 0)
         os.chmod(manifest_path, 0o444)
         descriptor = os.open(manifest_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))

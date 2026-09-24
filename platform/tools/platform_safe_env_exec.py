@@ -18,7 +18,7 @@ import re
 import shlex
 import stat
 import sys
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 PRODUCTION_ENV_FILE = Path("/opt/oldsparky/platform/shared/.env.platform")
@@ -36,6 +36,8 @@ LIVE_QA_SANDBOX_SHA256 = (
 )
 ACTIVE_PYTHON = PRODUCTION_SHARED_DIR / "venv/bin/python"
 MAX_ENV_BYTES = 256 * 1024
+MAX_RELEASE_JSON_BYTES = 64 * 1024
+MAX_ACTIVE_MANIFEST_BYTES = 256 * 1024
 KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 ALLOWED_PREFIXES = ("PLATFORM_", "NEXT_PUBLIC_PLATFORM_")
 PUBLIC_VALUE_NAMES = frozenset({"PLATFORM_ENVIRONMENT", "PLATFORM_WEB_ORIGIN"})
@@ -67,6 +69,90 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _file_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_bounded_json(
+    path: Path,
+    *,
+    metadata: os.stat_result,
+    maximum: int,
+    validate_metadata: Callable[[os.stat_result], None],
+    unavailable_message: str,
+    invalid_message: str,
+) -> object:
+    """Read one trusted JSON file through an identity-bound descriptor."""
+
+    validate_metadata(metadata)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise SafeEnvError(unavailable_message) from exc
+    try:
+        try:
+            opened = os.fstat(descriptor)
+            validate_metadata(opened)
+            if _file_fingerprint(opened) != _file_fingerprint(metadata):
+                raise SafeEnvError("trusted JSON changed while opening")
+            chunks: list[bytes] = []
+            remaining = maximum + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            validate_metadata(after)
+        except OSError as exc:
+            raise SafeEnvError(unavailable_message) from exc
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    if len(raw) > maximum:
+        raise SafeEnvError("trusted JSON exceeds its size limit")
+    if _file_fingerprint(after) != _file_fingerprint(opened):
+        raise SafeEnvError("trusted JSON changed while reading")
+    try:
+        return json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise SafeEnvError(invalid_message) from exc
+
+
+def _validate_active_manifest_metadata(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o7000
+        or stat.S_IMODE(metadata.st_mode) != 0o444
+        or metadata.st_size > MAX_ACTIVE_MANIFEST_BYTES
+    ):
+        raise SafeEnvError("installed live-QA active manifest metadata is unsafe")
+
+
+def _validate_release_json_metadata(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o7000
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or metadata.st_size > MAX_RELEASE_JSON_BYTES
+    ):
+        raise SafeEnvError("active production release metadata is unsafe")
+
+
 def _read_liveqa_manifest() -> dict[str, object]:
     """Return the active installed payload only after pointer/SHA validation."""
 
@@ -92,26 +178,21 @@ def _read_liveqa_manifest() -> dict[str, object]:
     ):
         raise SafeEnvError("installed live-QA payload root metadata is unsafe")
     if (
-        stat.S_ISLNK(manifest_metadata.st_mode)
-        or not stat.S_ISREG(manifest_metadata.st_mode)
-        or manifest_metadata.st_uid != 0
-        or manifest_metadata.st_gid != 0
-        or manifest_metadata.st_nlink != 1
-        or manifest_metadata.st_mode & 0o7000
-        or stat.S_IMODE(manifest_metadata.st_mode) != 0o444
-        or not stat.S_ISLNK(pointer_metadata.st_mode)
+        not stat.S_ISLNK(pointer_metadata.st_mode)
         or pointer_metadata.st_uid != 0
         or pointer_metadata.st_gid != 0
         or pointer_metadata.st_nlink != 1
     ):
         raise SafeEnvError("installed live-QA active manifest metadata is unsafe")
-    try:
-        payload = json.loads(
-            LIVE_QA_ACTIVE_MANIFEST.read_text(encoding="ascii"),
-            object_pairs_hook=_strict_object,
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise SafeEnvError("installed live-QA manifest is invalid") from exc
+    _validate_active_manifest_metadata(manifest_metadata)
+    payload = _read_bounded_json(
+        LIVE_QA_ACTIVE_MANIFEST,
+        metadata=manifest_metadata,
+        maximum=MAX_ACTIVE_MANIFEST_BYTES,
+        validate_metadata=_validate_active_manifest_metadata,
+        unavailable_message="installed live-QA manifest is unavailable or unsafe",
+        invalid_message="installed live-QA manifest is invalid",
+    )
     expected = {"version", "source_sha", "release_slug", "payload", "payload_tree_sha256", "files"}
     source_sha = payload.get("source_sha") if isinstance(payload, dict) else None
     if (
@@ -146,18 +227,19 @@ def _read_liveqa_manifest() -> dict[str, object]:
             or release_metadata.st_gid != 0
             or release_metadata.st_mode & 0o7000
             or stat.S_IMODE(release_metadata.st_mode) & 0o022
-            or stat.S_ISLNK(release_json_metadata.st_mode)
             or not stat.S_ISREG(release_json_metadata.st_mode)
-            or release_json_metadata.st_uid != 0
-            or release_json_metadata.st_gid != 0
-            or release_json_metadata.st_nlink != 1
-            or release_json_metadata.st_mode & 0o7000
-            or stat.S_IMODE(release_json_metadata.st_mode) & 0o022
-            or release_json_metadata.st_size > MAX_ENV_BYTES
         ):
             raise SafeEnvError("active production release metadata is unsafe")
-        release = json.loads(release_json.read_text(encoding="ascii"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        _validate_release_json_metadata(release_json_metadata)
+        release = _read_bounded_json(
+            release_json,
+            metadata=release_json_metadata,
+            maximum=MAX_RELEASE_JSON_BYTES,
+            validate_metadata=_validate_release_json_metadata,
+            unavailable_message="active production release metadata is unavailable",
+            invalid_message="active production release metadata is invalid",
+        )
+    except OSError as exc:
         raise SafeEnvError("active production release metadata is unavailable") from exc
     if (
         not isinstance(release, dict)

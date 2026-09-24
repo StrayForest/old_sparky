@@ -43,6 +43,10 @@ LIVE_QA_BROWSER_ROOTS = frozenset(
     }
 )
 MAX_RELEASE_JSON_BYTES = 64 * 1024
+# Keep this standalone validator bound local: it runs with ``python -I`` while
+# validating an artifact and must not import the live-QA runtime bootstrap just
+# to share one size constant.
+MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES = 256 * 1024
 MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
@@ -545,9 +549,9 @@ def _validate_liveqa_runtime(
     manifest_file = archive.extractfile(manifest_member)
     if manifest_file is None:
         raise ArtifactError("liveqa-runtime manifest is unavailable")
-    raw = manifest_file.read(64 * 1024 + 1)
+    raw = manifest_file.read(MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES + 1)
     manifest_file.close()
-    if len(raw) > 64 * 1024:
+    if len(raw) > MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES:
         raise ArtifactError("liveqa-runtime manifest is too large")
     try:
         manifest = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)

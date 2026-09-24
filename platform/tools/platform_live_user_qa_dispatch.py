@@ -40,7 +40,8 @@ PAYLOAD_ROOT = TRUSTED_LIVE_QA_ROOT / "releases"
 ACTIVE_POINTER = TRUSTED_LIVE_QA_ROOT / "active"
 PAYLOAD_FILE_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
-MAX_MANIFEST_BYTES = 256 * 1024
+MAX_RELEASE_JSON_BYTES = 64 * 1024
+MAX_ACTIVE_MANIFEST_BYTES = 256 * 1024
 MAX_PAYLOAD_FILE_BYTES = 768 * 1024 * 1024
 MAX_PAYLOAD_BYTES = 2 * 1024 * 1024 * 1024
 MAX_PAYLOAD_FILES = 200_000
@@ -65,6 +66,24 @@ def _regular(
     allow_sandbox: bool = False,
 ) -> os.stat_result:
     metadata = path.lstat()
+    _validate_regular_metadata(
+        path,
+        metadata,
+        mode=mode,
+        maximum=maximum,
+        allow_sandbox=allow_sandbox,
+    )
+    return metadata
+
+
+def _validate_regular_metadata(
+    path: Path,
+    metadata: os.stat_result,
+    *,
+    mode: int | None = None,
+    maximum: int = 1024 * 1024,
+    allow_sandbox: bool = False,
+) -> None:
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
@@ -84,7 +103,63 @@ def _regular(
         or metadata.st_size > maximum
     ):
         raise RuntimeError("installed live-user helper metadata is unsafe")
-    return metadata
+
+
+def _file_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_bounded_regular(
+    path: Path,
+    *,
+    metadata: os.stat_result,
+    maximum: int,
+    mode: int | None = None,
+) -> bytes:
+    """Read a trusted regular file through an identity-bound descriptor."""
+
+    _validate_regular_metadata(path, metadata, mode=mode, maximum=maximum)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise RuntimeError("installed live-user helper is unavailable or unsafe") from exc
+    try:
+        try:
+            opened = os.fstat(descriptor)
+            _validate_regular_metadata(path, opened, mode=mode, maximum=maximum)
+            if _file_fingerprint(opened) != _file_fingerprint(metadata):
+                raise RuntimeError("installed live-user helper changed while opening")
+            chunks: list[bytes] = []
+            remaining = maximum + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            _validate_regular_metadata(path, after, mode=mode, maximum=maximum)
+        except OSError as exc:
+            raise RuntimeError("installed live-user helper is unavailable or unsafe") from exc
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    if len(raw) > maximum:
+        raise RuntimeError("installed live-user helper exceeds its size bound")
+    if _file_fingerprint(after) != _file_fingerprint(opened):
+        raise RuntimeError("installed live-user helper changed while reading")
+    return raw
 
 
 def _directory(path: Path, *, mode: int | None = None) -> os.stat_result:
@@ -149,8 +224,17 @@ def _active_release_identity() -> tuple[str, str]:
     ):
         raise RuntimeError("active production release metadata is unsafe")
     release_json = release / "RELEASE.json"
-    _regular(release_json, maximum=64 * 1024)
-    payload = json.loads(release_json.read_text(encoding="ascii"))
+    release_json_metadata = _regular(
+        release_json,
+        maximum=MAX_RELEASE_JSON_BYTES,
+    )
+    payload = json.loads(
+        _read_bounded_regular(
+            release_json,
+            metadata=release_json_metadata,
+            maximum=MAX_RELEASE_JSON_BYTES,
+        ).decode("ascii")
+    )
     value = payload.get("source_git_commit") if isinstance(payload, dict) else None
     if not isinstance(value, str) or SHA_RE.fullmatch(value) is None:
         raise RuntimeError("active release source identity is invalid")
@@ -196,19 +280,17 @@ def _open_and_hash(path: Path, *, maximum: int, allow_sandbox: bool = False) -> 
 def _read_manifest(target_sha: str) -> dict[str, object]:
     _trusted_directory_chain(TRUSTED_LIVE_QA_ROOT)
     _directory(PAYLOAD_ROOT, mode=0o755)
-    _regular(ACTIVE_MANIFEST, mode=0o444, maximum=MAX_MANIFEST_BYTES)
-    descriptor = os.open(
+    metadata = _regular(
         ACTIVE_MANIFEST,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
+        mode=0o444,
+        maximum=MAX_ACTIVE_MANIFEST_BYTES,
     )
-    try:
-        raw = os.read(descriptor, MAX_MANIFEST_BYTES + 1)
-    finally:
-        os.close(descriptor)
-    if len(raw) > MAX_MANIFEST_BYTES:
-        raise RuntimeError("installed live-QA manifest is too large")
+    raw = _read_bounded_regular(
+        ACTIVE_MANIFEST,
+        metadata=metadata,
+        maximum=MAX_ACTIVE_MANIFEST_BYTES,
+        mode=0o444,
+    )
     try:
         payload = json.loads(
             raw.decode("ascii"),
@@ -370,11 +452,20 @@ def _verify_install(target_sha: str) -> dict[str, object]:
 def _validate_bundle_and_mailbox() -> None:
     """Validate every secret-bearing input before executing the supervisor."""
 
-    _regular(BUNDLE, mode=0o600, maximum=64 * 1024)
+    bundle_metadata = _regular(
+        BUNDLE,
+        mode=0o600,
+        maximum=MAX_RELEASE_JSON_BYTES,
+    )
     _regular(MAILBOX_HELPER, mode=0o500, maximum=256 * 1024)
     try:
         bundle = json.loads(
-            BUNDLE.read_text(encoding="ascii"),
+            _read_bounded_regular(
+                BUNDLE,
+                metadata=bundle_metadata,
+                maximum=MAX_RELEASE_JSON_BYTES,
+                mode=0o600,
+            ).decode("ascii"),
             object_pairs_hook=lambda pairs: _strict_object(pairs),
         )
     except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError) as exc:

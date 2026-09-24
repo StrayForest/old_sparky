@@ -218,6 +218,68 @@ class LiveQaGuardTests(unittest.TestCase):
             )
             (app_dir / pointer_name).symlink_to(release)
 
+    def make_installed_payload_fixture(
+        self, root: Path, *, file_count: int
+    ) -> tuple[Path, Path, Path, str]:
+        """Create a valid active payload with a deterministically sized manifest."""
+
+        trusted = root / "liveqa"
+        releases = trusted / "releases"
+        source_sha = "a" * 40
+        payload = releases / source_sha
+        trusted.mkdir(mode=0o700)
+        releases.mkdir(mode=0o755)
+        payload.mkdir(mode=0o555)
+        files_root = payload / "manifest-files"
+        files_root.mkdir(mode=0o555)
+        os.chmod(trusted, 0o700)
+        os.chmod(releases, 0o755)
+        os.chmod(payload, 0o555)
+        os.chmod(files_root, 0o555)
+
+        for index in range(file_count):
+            path = files_root / f"manifest-padding-{index:04d}-{'x' * 100}"
+            path.write_bytes(b"x")
+            os.chown(path, 0, 0)
+            os.chmod(path, 0o444)
+        active = trusted / "active"
+        active.symlink_to(payload)
+
+        digest = hashlib.sha256()
+        files: dict[str, str] = {}
+        for path in sorted(payload.rglob("*")):
+            relative = path.relative_to(payload).as_posix()
+            digest.update(relative.encode("utf-8") + b"\0")
+            if path.is_dir():
+                digest.update(b"d\0")
+                continue
+            file_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            files[relative] = file_digest
+            digest.update(b"f\0" + bytes.fromhex(file_digest))
+        manifest = {
+            "version": 1,
+            "source_sha": source_sha,
+            "release_slug": "manifest-size-test",
+            "payload": str(payload),
+            "payload_tree_sha256": digest.hexdigest(),
+            "files": files,
+        }
+        manifest_path = trusted / "active-manifest.json"
+        manifest_path.write_bytes(
+            (
+                json.dumps(
+                    manifest,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("ascii")
+        )
+        os.chown(manifest_path, 0, 0)
+        os.chmod(manifest_path, 0o444)
+        return trusted, releases, payload, source_sha
+
     def extract_test_zip(self, source: Path, target: Path) -> None:
         def copy_archive(**kwargs: object) -> None:
             shutil.copyfile(source, Path(kwargs["archive"]))
@@ -569,6 +631,54 @@ class LiveQaGuardTests(unittest.TestCase):
                 json.loads(manifest.read_text(encoding="ascii")),
                 {"version": 1, "tree_sha256": "a" * 64},
             )
+
+    def test_active_manifest_between_legacy_and_active_bounds_is_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            trusted, releases, payload, source_sha = self.make_installed_payload_fixture(
+                Path(temporary), file_count=430
+            )
+            manifest = trusted / "active-manifest.json"
+            self.assertGreater(manifest.stat().st_size, guard.MAX_JSON_BYTES)
+            self.assertLess(manifest.stat().st_size, 100 * 1024)
+            self.assertLessEqual(
+                manifest.stat().st_size, guard.MAX_ACTIVE_MANIFEST_BYTES
+            )
+            with (
+                mock.patch.object(guard, "TRUSTED_SECRET_ROOT", trusted),
+                mock.patch.object(guard, "TRUSTED_PAYLOAD_ROOT", releases),
+                mock.patch.object(guard, "TRUSTED_ACTIVE_MANIFEST", manifest),
+                mock.patch.object(guard, "TRUSTED_ACTIVE_POINTER", trusted / "active"),
+                mock.patch.object(
+                    guard, "_active_release_commit", return_value=source_sha
+                ),
+            ):
+                self.assertEqual(
+                    guard._validate_installed_payload_root(
+                        payload, target_sha=source_sha
+                    ),
+                    source_sha,
+                )
+
+    def test_active_manifest_over_active_bound_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            trusted, releases, payload, source_sha = self.make_installed_payload_fixture(
+                Path(temporary), file_count=1800
+            )
+            manifest = trusted / "active-manifest.json"
+            self.assertGreater(manifest.stat().st_size, guard.MAX_ACTIVE_MANIFEST_BYTES)
+            with (
+                mock.patch.object(guard, "TRUSTED_SECRET_ROOT", trusted),
+                mock.patch.object(guard, "TRUSTED_PAYLOAD_ROOT", releases),
+                mock.patch.object(guard, "TRUSTED_ACTIVE_MANIFEST", manifest),
+                mock.patch.object(guard, "TRUSTED_ACTIVE_POINTER", trusted / "active"),
+                mock.patch.object(
+                    guard, "_active_release_commit", return_value=source_sha
+                ),
+                self.assertRaisesRegex(
+                    guard.GuardError, "installed live-QA payload manifest is unavailable"
+                ),
+            ):
+                guard._validate_installed_payload_root(payload, target_sha=source_sha)
 
     def test_chromium_apparmor_contract_requires_global_restriction_and_profiles(
         self,
