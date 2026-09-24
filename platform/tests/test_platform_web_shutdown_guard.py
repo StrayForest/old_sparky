@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-import signal
 import subprocess
-import time
 import unittest
 
 
@@ -12,76 +11,36 @@ PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 GUARD_PATH = PLATFORM_ROOT / "apps" / "platform_web" / "server-shutdown-guard.cjs"
 RUN_WEB_PATH = PLATFORM_ROOT / "tools" / "platform_run_web.sh"
 
-SHUTDOWN_TEST_BEHAVIOR_TIMEOUT_S = 6.0
-SHUTDOWN_TEST_CLEANUP_TIMEOUT_S = 1.0
-
-
-def _kill_process_group(process: subprocess.Popen[str], signum: signal.Signals) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signum)
-    except ProcessLookupError:
-        pass
-
 
 class PlatformWebShutdownGuardTests(unittest.TestCase):
-    def test_guard_bounds_a_stuck_sigterm_handler(self) -> None:
-        env = os.environ.copy()
-        env["PLATFORM_WEB_SHUTDOWN_GRACE_MS"] = "1000"
-
-        process = subprocess.Popen(
-            [
-                "node",
-                "--require",
-                str(GUARD_PATH),
-                "-e",
-                (
-                    "process.on('SIGTERM', () => {}); "
-                    "setTimeout(() => process.kill(process.pid, 'SIGTERM'), 20); "
-                    "setTimeout(() => { "
-                    "console.log('shutdown fixture watchdog elapsed'); "
-                    "process.exit(124); "
-                    "}, 4000); "
-                    "setInterval(() => {}, 1000);"
-                ),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            text=True,
-            start_new_session=True,
+    def test_shutdown_runtime_contract_is_owned_by_pinned_web_gate(self) -> None:
+        package = json.loads(
+            (PLATFORM_ROOT / "apps" / "platform_web" / "package.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            package["scripts"]["test:shutdown-guard"],
+            "../../tools/platform_node.sh tests/shutdown-guard-contract.cjs",
         )
 
-        try:
-            started_at = time.monotonic()
-            try:
-                stdout, stderr = process.communicate(
-                    timeout=SHUTDOWN_TEST_BEHAVIOR_TIMEOUT_S,
-                )
-            except subprocess.TimeoutExpired as exc:
-                self.fail(
-                    "Node shutdown fixture exceeded its behavior deadline; "
-                    f"stdout={exc.stdout!r} stderr={exc.stderr!r}"
-                )
+        verifier = (PLATFORM_ROOT / "tools" / "platform_verify.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(verifier.count('"web-quality/shutdown-guard"'), 1)
+        self.assertEqual(verifier.count('"test:shutdown-guard"'), 1)
+        catalog = (PLATFORM_ROOT / "tools" / "platform_test_catalog.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("shutdown-guard-contract.cjs", catalog)
 
-            self.assertEqual(
-                process.returncode,
-                143,
-                f"stdout={stdout!r} stderr={stderr!r}",
-            )
-            self.assertGreaterEqual(time.monotonic() - started_at, 0.75)
-            self.assertIn("shutdown grace period", stdout)
-            self.assertNotIn("watchdog elapsed", stdout)
-        finally:
-            # A failed behavior assertion must not leave a Node process (or a
-            # descendant) behind for the next catalog test.
-            _kill_process_group(process, signal.SIGKILL)
-            try:
-                process.communicate(timeout=SHUTDOWN_TEST_CLEANUP_TIMEOUT_S)
-            except subprocess.TimeoutExpired:
-                _kill_process_group(process, signal.SIGKILL)
-                process.communicate(timeout=SHUTDOWN_TEST_CLEANUP_TIMEOUT_S)
+        workflow = (PLATFORM_ROOT.parent / ".github" / "workflows" / "platform-security.yml").read_text(
+            encoding="utf-8"
+        )
+        web_quality = workflow.split("  web-quality:\n", 1)[1].split("\n  docs:\n", 1)[0]
+        self.assertIn('node-version: "26.3.1"', web_quality)
+        self.assertIn("platform_verify.py web-quality", web_quality)
+        self.assertNotIn("test:shutdown-guard", web_quality)
 
     def test_web_runner_preloads_shutdown_guard(self) -> None:
         runner = RUN_WEB_PATH.read_text(encoding="utf-8")

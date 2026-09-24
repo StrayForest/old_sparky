@@ -28,6 +28,17 @@ placement rules; it does not repeat tool arguments.
 | `live-user-destructive` | production operators | marked production fixtures and mandatory cleanup | explicit operator workflow |
 | `external-load` | performance operators | external generator to production origin | explicit operator workflow |
 
+The `web-quality` gate runs the one runtime shutdown-signal contract,
+`apps/platform_web/tests/shutdown-guard-contract.cjs`, through the locked
+`platform_node.sh` helper after CI provisions Node 26.3.1. The contract
+self-signals only after the guard preload, has a bounded in-child watchdog,
+and cleans up its detached process group on failure. The backend tool contour
+keeps source/ownership assertions for this contract but does not execute its
+Node process; this prevents an unpinned backend runner from duplicating the
+web runtime check. The focused local command is
+`tools/platform_web_npm.sh --prefix apps/platform_web run test:shutdown-guard`
+from `platform/`; the helper fails closed unless Node 26.3.1 is selected.
+
 The first eight gates are deterministic and always part of the normal CI
 aggregate. The conditional `release-runtime` gate is deterministic as well,
 but is intentionally excluded from `platform_verify.py ci`: the classifier
