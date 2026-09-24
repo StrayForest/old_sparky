@@ -42,33 +42,16 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return completed.stdout.strip()
 
-    def test_repository_pin_resolves_installed_generation_and_closure_baseline(self) -> None:
+    def test_repository_pin_declares_installed_generation_and_closure_baseline(self) -> None:
         contract = json.loads(
             (REPO_ROOT / pin.PIN_RELATIVE_PATH).read_text(encoding="utf-8")
         )
+        self.assertEqual(contract["schema"], 1)
+        self.assertEqual(contract["repository"], pin.EXPECTED_REPOSITORY)
         self.assertEqual(contract["host_tools_sha"], PIN_SHA)
         self.assertEqual(
             tuple(record["path"] for record in contract["closure"]),
             tuple(f"platform/tools/{name}" for name in bundle.HOST_TOOL_FILES),
-        )
-        # The security workflow's DB-free checkout is intentionally shallow;
-        # it cannot prove reachability of the historical installed commit.
-        # The resolver success path is exercised by the local A/B fixture
-        # below, while full-history checkouts validate the real pin here.
-        if subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{PIN_SHA}^{{commit}}"],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).returncode != 0:
-            return
-        self.assertEqual(
-            pin.resolve_pin(
-                REPO_ROOT,
-                target_sha=self._current_target_sha(),
-                expected_repository=pin.EXPECTED_REPOSITORY,
-            ),
-            PIN_SHA,
         )
 
     def test_repository_pin_rejects_circular_generation_and_repository_tampering(self) -> None:
@@ -288,6 +271,24 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertIn("generation=$HOST_TOOLS_SHA", host_preflight)
         self.assertIn("needs.host-capability-preflight.outputs.host_tools_sha", preflight)
         self.assertIn("needs.host-capability-preflight.outputs.host_tools_sha", production)
+
+        security = (REPO_ROOT / ".github/workflows/platform-security.yml").read_text(
+            encoding="utf-8"
+        )
+        verification = security.split("  verification-contract:", 1)[1].split(
+            "  release-runtime:", 1
+        )[0]
+        self.assertIn("fetch-depth: 0", verification)
+        self.assertIn("ref: ${{ github.sha }}", verification)
+        self.assertIn(
+            "name: Resolve and verify canonical host-tools pin against full target history",
+            verification,
+        )
+        self.assertIn("platform/tools/platform_host_tools_pin.py resolve", verification)
+        self.assertIn('--target-sha "$TARGET_SHA"', verification)
+        self.assertIn('--expected-repository "$EXPECTED_REPOSITORY"', verification)
+        self.assertIn("test ! -e \"$pin_output\"", verification)
+
     def _source_fixture(self, root: Path) -> Path:
         source_root = root / "source"
         tools = source_root / "platform" / "tools"

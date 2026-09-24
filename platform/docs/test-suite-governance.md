@@ -212,6 +212,12 @@ host-tools contract tests therefore fail before a closure edit can merge
 without an intentional pin bump. `TARGET_SHA` remains the classifier,
 release-artifact, provenance, migration and deployed-receipt identity.
 
+The `verification-contract` CI job owns the real installed-pin resolve: it
+checks out the exact target with `fetch-depth: 0` and runs the canonical
+resolver against the repository and target SHA. The fast DB-free backend
+contour stays shallow and proves the static contract plus the synthetic A/B
+pin-bump lifecycle; it does not silently skip historical ancestry proof.
+
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route
 with `fallback=true` and `deployable=false`; these routes also run the

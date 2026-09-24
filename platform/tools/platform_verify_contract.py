@@ -1248,6 +1248,79 @@ def _backend_workflow_issues(security_text: str) -> list[str]:
     return issues
 
 
+def host_tools_pin_verification_issues(security_text: str) -> list[str]:
+    """Require real host-tools pin verification on a full-history CI job.
+
+    The ordinary backend contours intentionally keep their shallow checkout
+    for fast DB-free feedback.  The repository's historical installed pin
+    needs ancestry proof, so the non-secret verification-contract job owns one
+    explicit full-history resolve against the exact workflow SHA.
+    """
+
+    issues: list[str] = []
+    block = _workflow_job_block(security_text, "verification-contract")
+    if not block:
+        return ["platform-security.yml is missing verification-contract host-tools pin owner"]
+
+    checkout_steps = tuple(
+        step
+        for step in _workflow_step_blocks(block)
+        if "actions/checkout@" in step
+    )
+    if len(checkout_steps) != 1:
+        issues.append(
+            "verification-contract must have exactly one checkout for real host-tools pin verification"
+        )
+    else:
+        checkout = checkout_steps[0]
+        for marker, description in (
+            ("ref: ${{ github.sha }}", "the exact workflow SHA"),
+            ("fetch-depth: 0", "full target history"),
+            ("persist-credentials: false", "disabled checkout credentials"),
+        ):
+            if marker not in checkout:
+                issues.append(
+                    f"verification-contract checkout must include {description}"
+                )
+
+    resolver_steps = tuple(
+        step
+        for step in _workflow_step_blocks(block)
+        if "platform_host_tools_pin.py resolve" in step
+    )
+    if len(resolver_steps) != 1:
+        issues.append(
+            "verification-contract must run the canonical host-tools pin resolver exactly once"
+        )
+        return issues
+
+    resolver = resolver_steps[0]
+    for marker, description in (
+        (
+            "name: Resolve and verify canonical host-tools pin against full target history",
+            "an explicit full-history host-tools pin step",
+        ),
+        (
+            "/usr/bin/python3 platform/tools/platform_host_tools_pin.py resolve",
+            "the canonical resolver entrypoint",
+        ),
+        ('--source-root "$GITHUB_WORKSPACE"', "the checked-out target source"),
+        ('--target-sha "$TARGET_SHA"', "TARGET_SHA"),
+        ('--expected-repository "$EXPECTED_REPOSITORY"', "the expected repository"),
+        ('test "$EXPECTED_REPOSITORY" = "StrayForest/old_sparky"', "the repository allow-list"),
+        ("target_sha_re='^[0-9a-f]{40}$'", "the full lowercase target SHA check"),
+        ('test "$(stat -c \'%F:%h:%a\' -- "$pin_output")" = "regular file:1:600"', "the bounded resolver output file check"),
+        ('test "$(wc -l < "$pin_output" | tr -d \' \')" = 1', "the single-line resolver output check"),
+        ('[[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]', "the lowercase host-tools SHA check"),
+        ('trap \'rm -f -- "$pin_output"\' EXIT', "resolver output cleanup"),
+    ):
+        if marker not in resolver:
+            issues.append(f"verification-contract pin step must include {description}")
+    if "secrets." in block or "environment:" in block:
+        issues.append("verification-contract host-tools pin proof must remain non-secret")
+    return issues
+
+
 def release_runtime_workflow_issues(security_text: str) -> list[str]:
     """Keep fixture and trusted-dev release contours separate and fail-closed."""
 
@@ -1424,6 +1497,7 @@ def collect_issues() -> list[str]:
                 f"found {invocations.count(gate_id)}"
             )
     issues.extend(_backend_workflow_issues(security_text))
+    issues.extend(host_tools_pin_verification_issues(security_text))
     issues.extend(release_runtime_workflow_issues(security_text))
     issues.extend(
         _backend_timeout_budget_issues(
