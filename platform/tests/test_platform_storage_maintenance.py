@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from tools import platform_storage_maintenance as maintenance
+from tools.platform_disk_policy import BYTES_PER_GIB, snapshot_from_usage
 from tools.platform_storage_maintenance import (
     apply_artifact_retention_plan,
     build_artifact_retention_plan,
@@ -194,7 +195,63 @@ class PlatformStorageMaintenanceTests(unittest.TestCase):
         self.assertTrue(fresh_result.exists())
         self.assertTrue(unrelated.exists())
 
+    def test_parser_defaults_match_health_disk_policy(self) -> None:
+        with mock.patch.object(maintenance.sys, "argv", ["platform_storage_maintenance.py"]):
+            args = maintenance.parse_args()
+
+        self.assertEqual(args.minimum_free_gib, 5.0)
+        self.assertEqual(args.maximum_used_percent, 85.0)
+
+    def test_disk_snapshot_uses_available_free_for_conservative_percent(self) -> None:
+        snapshot = snapshot_from_usage(
+            SimpleNamespace(
+                total=100 * BYTES_PER_GIB,
+                free=15 * BYTES_PER_GIB,
+            )
+        )
+        with mock.patch.object(
+            maintenance, "disk_snapshot_for_path", return_value=snapshot
+        ):
+            result = maintenance.disk_snapshot(self.root)
+
+        self.assertEqual(result["used_bytes"], 85 * BYTES_PER_GIB)
+        self.assertEqual(result["free_bytes"], 15 * BYTES_PER_GIB)
+        self.assertEqual(result["used_percent"], 85.0)
+
+    def test_storage_gate_accepts_exact_boundaries_and_fails_closed(self) -> None:
+        cases = (
+            (100 * BYTES_PER_GIB, 15 * BYTES_PER_GIB, True),
+            (20 * BYTES_PER_GIB, 5 * BYTES_PER_GIB, True),
+            (100 * BYTES_PER_GIB, 14 * BYTES_PER_GIB, False),
+            (20 * BYTES_PER_GIB, 4 * BYTES_PER_GIB, False),
+            (0, 0, False),
+        )
+        for total, free, expected in cases:
+            with self.subTest(total=total, free=free):
+                snapshot = snapshot_from_usage(
+                    SimpleNamespace(total=total, free=free)
+                )
+                self.assertEqual(
+                    maintenance.disk_is_healthy(
+                        snapshot,
+                        min_free_bytes=5 * BYTES_PER_GIB,
+                        max_used_percent=85.0,
+                    ),
+                    expected,
+                )
+
     def test_operational_files_define_bounded_maintenance(self) -> None:
+        health_service = (
+            REPO_ROOT / "platform/deploy/systemd/deadlock-health-monitor.service"
+        ).read_text()
+        self.assertEqual(
+            [line for line in health_service.splitlines() if line.startswith("ExecStart=")],
+            [
+                "ExecStart=/opt/oldsparky/platform/shared/venv/bin/python "
+                "/opt/oldsparky/platform/current/tools/platform_health_monitor.py "
+                "--disk-min-free-gib 5 --disk-max-used-percent 85"
+            ],
+        )
         service = (
             REPO_ROOT / "platform/deploy/systemd/deadlock-maintenance.service"
         ).read_text()

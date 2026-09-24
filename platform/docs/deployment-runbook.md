@@ -16,7 +16,8 @@ Use this document for the normal immutable release path. CSP mode changes and pr
    by the automatic deployment workflow; a docs-only or out-of-scope run is a
    successful non-deployable no-op. Do not substitute a manually run local test.
 3. Confirm migration expand/rollback compatibility.
-4. Confirm services are healthy, disk has at least 5 GiB free and is below 85%, and `current`/`previous` releases are protected.
+4. Confirm services are healthy, disk has at least 5 GiB available and is at
+   most 85% conservative use, and `current`/`previous` releases are protected.
 5. Create a fresh restore-verified backup.
 
 The active GitHub `Protect dev` ruleset does not require a pull-request

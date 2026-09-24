@@ -6,7 +6,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatch
+import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -15,6 +17,36 @@ import stat
 import subprocess
 import sys
 from typing import Any, Iterator
+
+
+def _load_staged_disk_policy() -> Any:
+    helper_path = Path(__file__).resolve().with_name("platform_disk_policy.py")
+    spec = importlib.util.spec_from_file_location(
+        "_oldsparky_platform_disk_policy", helper_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("platform disk policy helper is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    from .platform_disk_policy import (
+        DEFAULT_MAX_USED_PERCENT,
+        DEFAULT_MIN_FREE_GIB,
+        is_healthy as disk_is_healthy,
+        minimum_free_bytes as minimum_free_bytes_for_gib,
+        snapshot_for_path as disk_snapshot_for_path,
+    )
+except ImportError:  # Direct execution from the tools directory.
+    _disk_policy = _load_staged_disk_policy()
+    DEFAULT_MAX_USED_PERCENT = _disk_policy.DEFAULT_MAX_USED_PERCENT
+    DEFAULT_MIN_FREE_GIB = _disk_policy.DEFAULT_MIN_FREE_GIB
+    disk_is_healthy = _disk_policy.is_healthy
+    minimum_free_bytes_for_gib = _disk_policy.minimum_free_bytes
+    disk_snapshot_for_path = _disk_policy.snapshot_for_path
 
 try:
     from . import platform_live_qa_guard as live_qa_guard
@@ -100,8 +132,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--failed-build-max-age-days", type=int, default=1)
     parser.add_argument("--report-keep", type=int, default=30)
     parser.add_argument("--live-qa-runtime-keep", type=int, default=1)
-    parser.add_argument("--minimum-free-gib", type=float, default=5.0)
-    parser.add_argument("--maximum-used-percent", type=float, default=85.0)
+    parser.add_argument(
+        "--minimum-free-gib", type=float, default=DEFAULT_MIN_FREE_GIB
+    )
+    parser.add_argument(
+        "--maximum-used-percent", type=float, default=DEFAULT_MAX_USED_PERCENT
+    )
     parser.add_argument("--skip-backup", action="store_true")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true", dest="as_json")
@@ -122,9 +158,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--report-keep must be at least 1")
     if not 1 <= args.live_qa_runtime_keep <= 100:
         parser.error("--live-qa-runtime-keep must be between 1 and 100")
-    if args.minimum_free_gib < 0:
-        parser.error("--minimum-free-gib must not be negative")
-    if not 0 < args.maximum_used_percent <= 100:
+    if not math.isfinite(args.minimum_free_gib) or args.minimum_free_gib < 0:
+        parser.error("--minimum-free-gib must be finite and non-negative")
+    if (
+        not math.isfinite(args.maximum_used_percent)
+        or not 0 < args.maximum_used_percent <= 100
+    ):
         parser.error("--maximum-used-percent must be within (0, 100]")
     return args
 
@@ -371,13 +410,9 @@ def live_qa_runtime_plan_summary(
 
 
 def disk_snapshot(path: Path) -> dict[str, int | float]:
-    usage = shutil.disk_usage(path)
-    return {
-        "total_bytes": usage.total,
-        "used_bytes": usage.used,
-        "free_bytes": usage.free,
-        "used_percent": round(usage.used * 100 / usage.total, 2),
-    }
+    """Preserve the maintenance JSON shape while sharing policy semantics."""
+
+    return disk_snapshot_for_path(path).as_dict()
 
 
 def run_backup(app_dir: Path, *, keep: int) -> dict[str, Any]:
@@ -552,7 +587,7 @@ def _plan_and_maybe_apply(
 def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
     started_at = datetime.now(UTC)
     app_dir = args.app_dir.resolve(strict=True)
-    disk_before = disk_snapshot(Path("/"))
+    disk_before_snapshot = disk_snapshot_for_path(Path("/"))
 
     if args.apply:
         # Fixed global order: release transaction lock, retained-load lock,
@@ -611,12 +646,15 @@ def run_maintenance(args: argparse.Namespace) -> dict[str, Any]:
         transient_reclaimed,
     ) = maintenance_result
 
-    disk_after = disk_snapshot(Path("/"))
-    minimum_free_bytes = int(args.minimum_free_gib * 1024**3)
-    storage_ok = (
-        int(disk_after["free_bytes"]) >= minimum_free_bytes
-        and float(disk_after["used_percent"]) <= args.maximum_used_percent
+    disk_after_snapshot = disk_snapshot_for_path(Path("/"))
+    minimum_free_bytes = minimum_free_bytes_for_gib(args.minimum_free_gib)
+    storage_ok = disk_is_healthy(
+        disk_after_snapshot,
+        min_free_bytes=minimum_free_bytes,
+        max_used_percent=args.maximum_used_percent,
     )
+    disk_before = disk_before_snapshot.as_dict()
+    disk_after = disk_after_snapshot.as_dict()
     completed_at = datetime.now(UTC)
     return {
         "ok": storage_ok,

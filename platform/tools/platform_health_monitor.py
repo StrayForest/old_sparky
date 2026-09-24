@@ -4,15 +4,55 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+import importlib.util
 import json
+import math
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+
+def _load_staged_disk_policy() -> Any:
+    helper_path = Path(__file__).resolve().with_name("platform_disk_policy.py")
+    spec = importlib.util.spec_from_file_location(
+        "_oldsparky_platform_disk_policy", helper_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("platform disk policy helper is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    from .platform_disk_policy import (
+        DEFAULT_MAX_USED_PERCENT,
+        DEFAULT_MIN_FREE_GIB,
+        is_healthy,
+        minimum_free_bytes,
+        snapshot_for_path,
+    )
+except ImportError:  # Direct execution from the tools directory.
+    try:
+        from tools.platform_disk_policy import (
+            DEFAULT_MAX_USED_PERCENT,
+            DEFAULT_MIN_FREE_GIB,
+            is_healthy,
+            minimum_free_bytes,
+            snapshot_for_path,
+        )
+    except ImportError:
+        _disk_policy = _load_staged_disk_policy()
+        DEFAULT_MAX_USED_PERCENT = _disk_policy.DEFAULT_MAX_USED_PERCENT
+        DEFAULT_MIN_FREE_GIB = _disk_policy.DEFAULT_MIN_FREE_GIB
+        is_healthy = _disk_policy.is_healthy
+        minimum_free_bytes = _disk_policy.minimum_free_bytes
+        snapshot_for_path = _disk_policy.snapshot_for_path
 
 
 DEFAULT_SERVICES = ("deadlock-api", "deadlock-worker", "deadlock-web", "nginx")
@@ -36,7 +76,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backup-dir", type=Path, default=Path("/opt/oldsparky/platform/shared/backups"))
     parser.add_argument("--backup-max-age-hours", type=float, default=36.0)
     parser.add_argument("--disk-path", type=Path, default=Path("/opt/oldsparky/platform"))
-    parser.add_argument("--disk-max-used-percent", type=float, default=80.0)
+    parser.add_argument("--disk-min-free-gib", type=float, default=DEFAULT_MIN_FREE_GIB)
+    parser.add_argument(
+        "--disk-max-used-percent", type=float, default=DEFAULT_MAX_USED_PERCENT
+    )
     parser.add_argument("--memory-min-available-percent", type=float, default=10.0)
     parser.add_argument(
         "--certificate",
@@ -46,7 +89,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--certificate-min-days", type=int, default=30)
     parser.add_argument("--http-timeout", type=float, default=5.0)
     parser.add_argument("--service", action="append", dest="services")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not math.isfinite(args.disk_min_free_gib) or args.disk_min_free_gib < 0:
+        parser.error("--disk-min-free-gib must be finite and non-negative")
+    if (
+        not math.isfinite(args.disk_max_used_percent)
+        or not 0 < args.disk_max_used_percent <= 100
+    ):
+        parser.error("--disk-max-used-percent must be within (0, 100]")
+    return args
 
 
 def check_service(name: str) -> Check:
@@ -80,21 +131,37 @@ def check_api_ready(url: str, *, timeout: float) -> Check:
         return Check("api_ready", False, {"error": type(exc).__name__})
 
 
-def check_disk(path: Path, *, max_used_percent: float) -> Check:
+def check_disk(
+    path: Path,
+    *,
+    min_free_gib: float = DEFAULT_MIN_FREE_GIB,
+    max_used_percent: float = DEFAULT_MAX_USED_PERCENT,
+) -> Check:
     try:
-        usage = shutil.disk_usage(path)
+        snapshot = snapshot_for_path(path)
     except OSError as exc:
         return Check("disk", False, {"error": type(exc).__name__, "path": str(path)})
-    used_percent = ((usage.total - usage.free) / usage.total) * 100 if usage.total else 100.0
+    try:
+        min_free_bytes = minimum_free_bytes(min_free_gib)
+    except ValueError:
+        return Check("disk", False, {"error": "invalid_threshold", "path": str(path)})
+    detail: dict[str, Any] = {
+        "path": str(path),
+        "used_percent": round(snapshot.used_percent, 1),
+        "free_gib": round(snapshot.free_bytes / (1024**3), 2),
+        "minimum_free_gib": min_free_gib,
+        "threshold_percent": max_used_percent,
+    }
+    if not snapshot.valid:
+        detail["error"] = "invalid_usage"
     return Check(
         "disk",
-        used_percent < max_used_percent,
-        {
-            "path": str(path),
-            "used_percent": round(used_percent, 1),
-            "free_gib": round(usage.free / (1024**3), 2),
-            "threshold_percent": max_used_percent,
-        },
+        is_healthy(
+            snapshot,
+            min_free_bytes=min_free_bytes,
+            max_used_percent=max_used_percent,
+        ),
+        detail,
     )
 
 
@@ -194,7 +261,11 @@ def run_checks(args: argparse.Namespace) -> list[Check]:
     checks.extend(
         [
             check_api_ready(args.api_ready_url, timeout=args.http_timeout),
-            check_disk(args.disk_path, max_used_percent=args.disk_max_used_percent),
+            check_disk(
+                args.disk_path,
+                min_free_gib=args.disk_min_free_gib,
+                max_used_percent=args.disk_max_used_percent,
+            ),
             check_memory(min_available_percent=args.memory_min_available_percent),
             check_backup(args.backup_dir, max_age_hours=args.backup_max_age_hours),
             check_certificate(args.certificate, min_days=args.certificate_min_days),
