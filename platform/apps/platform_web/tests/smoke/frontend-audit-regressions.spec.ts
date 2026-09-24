@@ -20,8 +20,11 @@ test("invite-only pages convert missing workspace proof into invite-code flow", 
   expect(detailClientPage).toContain("serverSeedVersionRef");
   expect(detailClientPage).toContain("serverSeedRef.current.payload !== initialTournament");
   expect(detailClientPage).toContain("initialRequest.payload === initialTournament");
+  expect(detailClientPage).toContain("initialRequest.retryGeneration === retryGeneration");
+  expect(detailClientPage).toContain("stateContextRef");
+  expect(detailClientPage).toContain("sameDetailContext");
+  expect(detailClientPage).toContain("const displayState");
   expect(detailClientPage).toContain("key={serverSeedVersion}");
-  expect(detailClientPage).toContain("retryGeneration === 0");
   expect(detailClientPage).toContain("error.status === 401");
   expect(detailClientPage).toContain("TournamentInviteGate");
   expect(bracketPage).toContain("PlatformApiError");

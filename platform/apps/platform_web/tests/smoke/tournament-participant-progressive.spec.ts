@@ -38,6 +38,9 @@ let holdFirstReadyVoteResponse = false;
 let releaseHeldReadyVoteResponse: (() => void) | null = null;
 let bracketRequests = 0;
 let inviteClaimRequests = 0;
+let workspaceInFlight = 0;
+let holdNextWorkspaceResponse = false;
+let releaseHeldWorkspaceResponse: (() => void) | null = null;
 
 let apiServer: Server | null = null;
 
@@ -79,36 +82,47 @@ test.beforeAll(async () => {
 
     const workspaceMatch = url.pathname.match(/^\/api\/v1\/tournaments\/([^/]+)\/workspace$/);
     if (workspaceMatch) {
-      const slug = workspaceMatch[1] ?? publicTournamentSlug;
-      const inviteCode = url.searchParams.get("invite_code");
-      workspaceRequests.push({
-        slug,
-        participantsLimit: Number(url.searchParams.get("participants_limit") ?? 25),
-        participantsOffset: Number(url.searchParams.get("participants_offset") ?? 0),
-        workspaceView: url.searchParams.get("workspace_view") ?? "bracket",
-        includeCurrentUser: url.searchParams.get("include_current_user") !== "false"
-      });
-      if (slug === privateBearerSlug) {
-        bearerWorkspaceRequests.push({
+      workspaceInFlight += 1;
+      try {
+        const slug = workspaceMatch[1] ?? publicTournamentSlug;
+        const inviteCode = url.searchParams.get("invite_code");
+        workspaceRequests.push({
           slug,
-          inviteCode,
-          workspaceView: url.searchParams.get("workspace_view") ?? "bracket"
+          participantsLimit: Number(url.searchParams.get("participants_limit") ?? 25),
+          participantsOffset: Number(url.searchParams.get("participants_offset") ?? 0),
+          workspaceView: url.searchParams.get("workspace_view") ?? "bracket",
+          includeCurrentUser: url.searchParams.get("include_current_user") !== "false"
         });
-        const bearerStatus = privateBearerStatus(inviteCode);
-        if (bearerStatus !== null) {
-          bearerResponseStatuses.push({ code: inviteCode, status: bearerStatus });
-          respondJson(response, bearerStatus, { detail: "Private tournament access denied." });
-          return;
+        if (slug === privateBearerSlug) {
+          bearerWorkspaceRequests.push({
+            slug,
+            inviteCode,
+            workspaceView: url.searchParams.get("workspace_view") ?? "bracket"
+          });
+          const bearerStatus = privateBearerStatus(inviteCode);
+          if (bearerStatus !== null) {
+            bearerResponseStatuses.push({ code: inviteCode, status: bearerStatus });
+            respondJson(response, bearerStatus, { detail: "Private tournament access denied." });
+            return;
+          }
+          bearerResponseStatuses.push({ code: inviteCode, status: 200 });
         }
-        bearerResponseStatuses.push({ code: inviteCode, status: 200 });
+        if (holdNextWorkspaceResponse) {
+          holdNextWorkspaceResponse = false;
+          await new Promise<void>((resolve) => {
+            releaseHeldWorkspaceResponse = resolve;
+          });
+        }
+        respondJson(response, 200, workspacePayload(
+          slug,
+          hasTestCookie,
+          url.searchParams.get("include_current_user") !== "false",
+          inviteCode,
+          request.headers.cookie?.includes(privateBearerInactiveCookie) ?? false
+        ));
+      } finally {
+        workspaceInFlight -= 1;
       }
-      respondJson(response, 200, workspacePayload(
-        slug,
-        hasTestCookie,
-        url.searchParams.get("include_current_user") !== "false",
-        inviteCode,
-        request.headers.cookie?.includes(privateBearerInactiveCookie) ?? false
-      ));
       return;
     }
 
@@ -184,12 +198,18 @@ test.beforeEach(() => {
   releaseHeldReadyVoteResponse = null;
   bracketRequests = 0;
   inviteClaimRequests = 0;
+  workspaceInFlight = 0;
+  holdNextWorkspaceResponse = false;
+  releaseHeldWorkspaceResponse = null;
 });
 
 test.afterEach(() => {
   holdFirstReadyVoteResponse = false;
   releaseHeldReadyVoteResponse?.();
   releaseHeldReadyVoteResponse = null;
+  holdNextWorkspaceResponse = false;
+  releaseHeldWorkspaceResponse?.();
+  releaseHeldWorkspaceResponse = null;
 });
 
 test.afterAll(async () => {
@@ -214,7 +234,7 @@ test("tournament detail hydrates without participant roster or initial session r
   expect(serverHtml).not.toContain("data-testid=\"tournament-participant-roster\"");
   expect(serverHtml).not.toContain("SSR Player");
   await expect(page.locator(".participants-value").first()).toHaveText("26 / 64");
-  await expectWorkspaceRequest({
+  await expectWorkspaceRequest(page, {
     slug: publicTournamentSlug,
     participantsLimit: 0,
     participantsOffset: 0,
@@ -250,9 +270,10 @@ test("tournament detail refetches after the authenticated session changes", asyn
   expect(response?.status()).toBe(200);
   const readyButton = page.getByRole("button", { name: "Подтвердить участие" });
   await expect(readyButton).toBeVisible();
-  await expectWorkspaceRequest(expectedWorkspace, readyButton);
+  await expectWorkspaceRequest(page, expectedWorkspace, readyButton);
 
   let invalidatedVoteRequests = 0;
+  holdNextWorkspaceResponse = true;
   await page.route(
     `**/api/v1/tournaments/${readyTournamentSlug}/deadlock/ready-check/vote`,
     async (route) => {
@@ -266,8 +287,17 @@ test("tournament detail refetches after the authenticated session changes", asyn
   );
   await page.getByRole("button", { name: "Подтвердить участие" }).click();
 
-  await expect.poll(() => workspaceRequests).toEqual([expectedWorkspace, expectedWorkspace]);
   await expect.poll(() => invalidatedVoteRequests).toBe(1);
+  await expect.poll(() => releaseHeldWorkspaceResponse !== null).toBe(true);
+  await expect(page.getByRole("heading", { level: 1, name: "Lean Ready Cup", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("heading", { level: 1, name: "Загрузка турнира", exact: true })).toBeVisible();
+  releaseHeldWorkspaceResponse?.();
+  releaseHeldWorkspaceResponse = null;
+  await expectWorkspaceRequests(
+    page,
+    [expectedWorkspace, expectedWorkspace],
+    page.getByRole("button", { name: "Подтвердить участие" })
+  );
   await expectNoHorizontalOverflow(page);
 });
 
@@ -288,7 +318,7 @@ test("registered detail uses compact workspace state and ready vote avoids full 
   expect(response?.status()).toBe(200);
   const cancelButton = page.getByRole("button", { name: "Отменить регистрацию" });
   await expect(cancelButton).toBeVisible();
-  await expectWorkspaceRequest({
+  await expectWorkspaceRequest(page, {
     slug: readyTournamentSlug,
     participantsLimit: 0,
     participantsOffset: 0,
@@ -453,6 +483,7 @@ test("anonymous bearer and invite soft navigation keep the exact code across det
   await page.goto(`/tournaments/${privateBearerSlug}`);
   await expect(page.locator(".tournament-invite-gate")).toBeVisible();
   await expect.poll(() => bearerWorkspaceRequests.length).toBe(inviteTransitionStart + 2);
+  await waitForWorkspaceQuiescence(page, page.locator(".tournament-invite-gate"));
   expect(bearerWorkspaceRequests.slice(inviteTransitionStart)).toEqual([
     {
       slug: privateBearerSlug,
@@ -472,6 +503,7 @@ test("anonymous bearer and invite soft navigation keep the exact code across det
   await expect(page.getByTestId("tournament-read-only-registration")).toBeVisible();
   await expect(page.locator(".tournament-invite-gate")).toHaveCount(0);
   await expect.poll(() => bearerWorkspaceRequests.length).toBe(inviteTransitionStart + 3);
+  await waitForWorkspaceQuiescence(page, page.getByTestId("tournament-read-only-registration"));
   expect(bearerWorkspaceRequests.slice(inviteTransitionStart + 2)).toEqual([{
     slug: privateBearerSlug,
     inviteCode: privateBearerCode,
@@ -492,6 +524,7 @@ test("anonymous bearer and invite soft navigation keep the exact code across det
   expect(refreshed).toBe(true);
   await expect.poll(() => bearerWorkspaceRequests.length).toBe(refreshStart + 1);
   await expect(page.getByTestId("tournament-read-only-registration")).toBeVisible();
+  await waitForWorkspaceQuiescence(page, page.getByTestId("tournament-read-only-registration"));
   expect(bearerWorkspaceRequests.slice(refreshStart)).toEqual([{
     slug: privateBearerSlug,
     inviteCode: privateBearerCode,
@@ -596,14 +629,34 @@ test("duplicate or malformed bearer query values fail closed before the workspac
   expect(inviteClaimRequests).toBe(0);
 });
 
-async function expectWorkspaceRequest(
-  expected: typeof workspaceRequests[number],
+async function waitForWorkspaceQuiescence(
+  page: import("@playwright/test").Page,
   ready: import("@playwright/test").Locator
 ) {
   await expect(ready).toBeVisible();
+  await expect.poll(() => workspaceInFlight).toBe(0);
+  await page.waitForLoadState("networkidle");
+  await expect.poll(() => workspaceInFlight).toBe(0);
+}
+
+async function expectWorkspaceRequest(
+  page: import("@playwright/test").Page,
+  expected: typeof workspaceRequests[number],
+  ready: import("@playwright/test").Locator
+) {
   await expect.poll(() => workspaceRequests).toEqual([expected]);
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  await waitForWorkspaceQuiescence(page, ready);
   expect(workspaceRequests).toEqual([expected]);
+}
+
+async function expectWorkspaceRequests(
+  page: import("@playwright/test").Page,
+  expected: typeof workspaceRequests,
+  ready: import("@playwright/test").Locator
+) {
+  await expect.poll(() => workspaceRequests).toEqual(expected);
+  await waitForWorkspaceQuiescence(page, ready);
+  expect(workspaceRequests).toEqual(expected);
 }
 
 function workspacePayload(

@@ -30,6 +30,7 @@ type InitialRequest = {
   sessionIdentity: string;
   payload: TournamentDetail;
   version: number;
+  retryGeneration: number;
 };
 
 type ServerSeed = {
@@ -37,6 +38,25 @@ type ServerSeed = {
   inviteCode: string | null;
   payload: TournamentDetail | undefined;
 };
+
+type DetailContext = {
+  slug: string;
+  inviteCode: string | null;
+  sessionIdentity: string;
+  serverSeedVersion: number;
+  retryGeneration: number;
+};
+
+function sameDetailContext(left: DetailContext | null, right: DetailContext): boolean {
+  return Boolean(
+    left
+    && left.slug === right.slug
+    && left.inviteCode === right.inviteCode
+    && left.sessionIdentity === right.sessionIdentity
+    && left.serverSeedVersion === right.serverSeedVersion
+    && left.retryGeneration === right.retryGeneration
+  );
+}
 
 export function TournamentDetailClientPage({
   slug,
@@ -53,27 +73,36 @@ export function TournamentDetailClientPage({
     inviteCode: normalizedInviteCode,
     payload: initialTournament
   });
+  const [retryGeneration, setRetryGeneration] = useState(0);
+  const [state, setState] = useState<DetailState>(() => initialTournament
+    ? { status: "ready", tournament: initialTournament }
+    : { status: "loading" });
   const initialRequestRef = useRef<InitialRequest | null>(initialTournament
     ? {
         slug,
         inviteCode: normalizedInviteCode,
         sessionIdentity,
         payload: initialTournament,
-        version: serverSeedVersionRef.current
+        version: serverSeedVersionRef.current,
+        retryGeneration
       }
     : null);
-  const [state, setState] = useState<DetailState>(() => initialTournament
-    ? { status: "ready", tournament: initialTournament }
-    : { status: "loading" });
-  const [retryGeneration, setRetryGeneration] = useState(0);
   const requestGeneration = useRef(0);
+  const stateContextRef = useRef<DetailContext>({
+    slug,
+    inviteCode: normalizedInviteCode,
+    sessionIdentity,
+    serverSeedVersion: serverSeedVersionRef.current,
+    retryGeneration
+  });
   const actorUserId = authStatus === "authenticated" ? user?.id ?? null : null;
 
-  if (
+  const serverSeedChanged = (
     serverSeedRef.current.slug !== slug
     || serverSeedRef.current.inviteCode !== normalizedInviteCode
     || serverSeedRef.current.payload !== initialTournament
-  ) {
+  );
+  if (serverSeedChanged) {
     serverSeedRef.current = {
       slug,
       inviteCode: normalizedInviteCode,
@@ -87,34 +116,52 @@ export function TournamentDetailClientPage({
           inviteCode: normalizedInviteCode,
           sessionIdentity,
           payload: initialTournament,
-          version
+          version,
+          retryGeneration
         }
       : null;
-    setRetryGeneration(0);
-    setState(initialTournament
-      ? { status: "ready", tournament: initialTournament }
-      : { status: "loading" });
   }
   const serverSeedVersion = serverSeedVersionRef.current;
+  const currentContext: DetailContext = {
+    slug,
+    inviteCode: normalizedInviteCode,
+    sessionIdentity,
+    serverSeedVersion,
+    retryGeneration
+  };
+  const displayState = serverSeedChanged
+    ? initialTournament
+      ? { status: "ready" as const, tournament: initialTournament }
+      : { status: "loading" as const }
+    : sameDetailContext(stateContextRef.current, currentContext)
+      ? state
+      : { status: "loading" as const };
 
   useEffect(() => {
     const initialRequest = initialRequestRef.current;
     if (
       initialRequest
-      && retryGeneration === 0
       && initialRequest.slug === slug
       && initialRequest.inviteCode === normalizedInviteCode
       && initialRequest.sessionIdentity === sessionIdentity
       && initialRequest.payload === initialTournament
       && initialRequest.version === serverSeedVersion
+      && initialRequest.retryGeneration === retryGeneration
     ) {
+      stateContextRef.current = currentContext;
+      setState(initialTournament
+        ? { status: "ready", tournament: initialTournament }
+        : { status: "loading" });
       return;
     }
     initialRequestRef.current = null;
     const controller = new AbortController();
     const generation = ++requestGeneration.current;
     const requestSlug = slug;
+    const requestInviteCode = normalizedInviteCode;
     const requestSessionIdentity = sessionIdentity;
+    const requestContext = currentContext;
+    stateContextRef.current = requestContext;
     setState({ status: "loading" });
 
     void getTournamentWorkspace(requestSlug, {}, {
@@ -127,12 +174,16 @@ export function TournamentDetailClientPage({
       .then((workspace) => {
         if (
           controller.signal.aborted
-          || requestGeneration.current !== generation
-          || requestSlug !== slug
-          || requestSessionIdentity !== sessionIdentity
-        ) {
+            || requestGeneration.current !== generation
+            || requestSlug !== slug
+            || requestInviteCode !== normalizedInviteCode
+            || requestSessionIdentity !== sessionIdentity
+            || requestContext.serverSeedVersion !== serverSeedVersion
+            || requestContext.retryGeneration !== retryGeneration
+          ) {
           return;
         }
+        stateContextRef.current = requestContext;
         setState(workspace
           ? { status: "ready", tournament: workspace.tournament }
           : { status: "not-found" });
@@ -140,12 +191,16 @@ export function TournamentDetailClientPage({
       .catch((error: unknown) => {
         if (
           controller.signal.aborted
-          || requestGeneration.current !== generation
-          || requestSlug !== slug
-          || requestSessionIdentity !== sessionIdentity
-        ) {
+            || requestGeneration.current !== generation
+            || requestSlug !== slug
+            || requestInviteCode !== normalizedInviteCode
+            || requestSessionIdentity !== sessionIdentity
+            || requestContext.serverSeedVersion !== serverSeedVersion
+            || requestContext.retryGeneration !== retryGeneration
+          ) {
           return;
         }
+        stateContextRef.current = requestContext;
         if (error instanceof PlatformApiError && (error.status === 401 || error.status === 403)) {
           setState({ status: "invite" });
           return;
@@ -165,11 +220,11 @@ export function TournamentDetailClientPage({
     slug
   ]);
 
-  if (state.status === "loading") {
+  if (displayState.status === "loading") {
     return <RouteLoadingShell variant="tournament-detail" />;
   }
 
-  if (state.status === "invite") {
+  if (displayState.status === "invite") {
     return (
       <>
         <div className="page-noise" aria-hidden="true" />
@@ -180,11 +235,11 @@ export function TournamentDetailClientPage({
     );
   }
 
-  if (state.status === "not-found") {
+  if (displayState.status === "not-found") {
     return <DetailErrorShell title={t("tournament.notFoundTitle")} copy={t("tournament.notFoundCopy")} />;
   }
 
-  if (state.status === "error") {
+  if (displayState.status === "error") {
     return (
       <DetailErrorShell
         title={t("tournament.loadFailedTitle")}
@@ -206,14 +261,14 @@ export function TournamentDetailClientPage({
     <>
       <div className="page-noise" aria-hidden="true" />
       <Hero
-        eyebrow={`Турниры / ${state.tournament.title}`}
-        title={state.tournament.title}
+        eyebrow={`Турниры / ${displayState.tournament.title}`}
+        title={displayState.tournament.title}
         subtitle="Проверьте параметры турнира, расписание и текущий этап."
       />
       <main className="main">
         <TournamentDetailViewBoundary
           key={serverSeedVersion}
-          tournament={state.tournament}
+          tournament={displayState.tournament}
           actorUserId={actorUserId}
         />
       </main>
