@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import tarfile
 import tempfile
@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
+from tools import platform_build_live_qa_runtime
 from tools import platform_validate_release_artifact as validator
 from tools import platform_live_qa_guard
 from tools import platform_live_qa_runtime_install
@@ -133,6 +134,8 @@ class ArchiveBuilder:
             f"{runtime}/browsers",
             f"{runtime}/browsers/chromium-1228",
             f"{runtime}/browsers/chromium-1228/chrome-linux64",
+            f"{runtime}/browsers/chromium-1228/chrome-linux64/resources",
+            f"{runtime}/browsers/chromium-1228/chrome-linux64/resources/accessibility",
             f"{runtime}/browsers/chromium_headless_shell-1228",
             f"{runtime}/browsers/webkit-2311",
             f"{runtime}/browsers/ffmpeg-1011",
@@ -149,6 +152,8 @@ class ArchiveBuilder:
             "web/node_modules/@playwright/test/package.json": b'{"name":"@playwright/test"}\n',
             "web/node_modules/playwright/package.json": b'{"name":"playwright"}\n',
             "web/node_modules/playwright-core/package.json": b'{"name":"playwright-core"}\n',
+            "browsers/chromium-1228/chrome-linux64/resources.pak": b"pak\n",
+            "browsers/chromium-1228/chrome-linux64/resources/accessibility/ax": b"ax\n",
         }
         for relative, content in files.items():
             self.add_file(f"{runtime}/{relative}", content, mode=0o555 if relative == "node/bin/node" else 0o444)
@@ -186,36 +191,77 @@ class ArchiveBuilder:
         self.entries.append((member, None))
         return member
 
-    def write(self) -> Path:
-        runtime_prefix = f"{RELEASE_SLUG}/liveqa-runtime/"
-        digest = hashlib.sha256()
-        files: dict[str, str] = {}
-        for member, content in sorted(self.entries, key=lambda item: item[0].name):
-            if not member.name.startswith(runtime_prefix) or member.name.endswith(
-                "/runtime-manifest.json"
-            ):
-                continue
-            relative = member.name.removeprefix(runtime_prefix)
-            digest.update(relative.encode() + b"\0")
-            if member.isdir():
-                digest.update(b"d\0")
+    def replace_liveqa_runtime(self, source: Path) -> None:
+        runtime_prefix = f"{RELEASE_SLUG}/liveqa-runtime"
+        self.entries = [
+            (member, content)
+            for member, content in self.entries
+            if member.name != runtime_prefix
+            and not member.name.startswith(f"{runtime_prefix}/")
+        ]
+        paths = [
+            source,
+            *sorted(
+                source.rglob("*"),
+                key=lambda path: PurePosixPath(
+                    path.relative_to(source).as_posix()
+                ).parts,
+            ),
+        ]
+        for path in paths:
+            relative_path = path.relative_to(source)
+            relative = (
+                relative_path.as_posix() if relative_path.parts else ""
+            )
+            name = f"{runtime_prefix}/{relative}" if relative else runtime_prefix
+            metadata = path.lstat()
+            mode = metadata.st_mode & 0o7777
+            if path.is_dir():
+                self.add_directory(name, mode=mode)
+            elif path.is_file():
+                self.add_file(name, path.read_bytes(), mode=mode)
             else:
-                assert content is not None
-                file_digest = hashlib.sha256(content).hexdigest()
-                files[relative] = file_digest
-                digest.update(b"f\0" + bytes.fromhex(file_digest))
-        manifest = {
-            "version": 1,
-            "node_version": validator.PINNED_NODE_VERSION,
-            "package_lock_sha256": hashlib.sha256(b"{}\n").hexdigest(),
-            "tree_sha256": digest.hexdigest(),
-            "files": files,
-        }
-        self.add_file(
-            f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json",
-            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n",
-            mode=0o444,
-        )
+                raise AssertionError(f"unexpected runtime fixture member: {path}")
+
+    def write(self, *, regenerate_runtime_manifest: bool = True) -> Path:
+        runtime_prefix = f"{RELEASE_SLUG}/liveqa-runtime/"
+        if regenerate_runtime_manifest:
+            digest = hashlib.sha256()
+            files: dict[str, str] = {}
+            runtime_entries = [
+                (member, content)
+                for member, content in self.entries
+                if member.name.startswith(runtime_prefix)
+                and not member.name.endswith("/runtime-manifest.json")
+            ]
+            for member, content in sorted(
+                runtime_entries,
+                key=lambda item: PurePosixPath(
+                    item[0].name.removeprefix(runtime_prefix)
+                ).parts,
+            ):
+                relative = member.name.removeprefix(runtime_prefix)
+                digest.update(relative.encode() + b"\0")
+                if member.isdir():
+                    digest.update(b"d\0")
+                else:
+                    assert content is not None
+                    file_digest = hashlib.sha256(content).hexdigest()
+                    files[relative] = file_digest
+                    digest.update(b"f\0" + bytes.fromhex(file_digest))
+            manifest = {
+                "version": 1,
+                "node_version": validator.PINNED_NODE_VERSION,
+                "package_lock_sha256": hashlib.sha256(b"{}\n").hexdigest(),
+                "tree_sha256": digest.hexdigest(),
+                "files": files,
+            }
+            self.add_file(
+                f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json",
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+                + b"\n",
+                mode=0o444,
+            )
         with tarfile.open(self.artifact, "w:gz") as archive:
             for member, content in self.entries:
                 archive.addfile(
@@ -257,6 +303,88 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
                 f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json"
             )
             return artifact, manifest.size
+
+    def _rewrite_archive(
+        self,
+        source: Path,
+        destination: Path,
+        replacements: dict[str, bytes],
+    ) -> None:
+        with (
+            tarfile.open(source, "r:gz") as input_archive,
+            tarfile.open(destination, "w:gz") as output_archive,
+        ):
+            for member in input_archive.getmembers():
+                content: bytes | None = None
+                if member.isfile():
+                    extracted = input_archive.extractfile(member)
+                    assert extracted is not None
+                    content = extracted.read()
+                    content = replacements.get(member.name, content)
+                    member.size = len(content)
+                output_archive.addfile(
+                    member,
+                    None if content is None else io.BytesIO(content),
+                )
+
+    def test_runtime_manifest_order_is_explicit_and_shared(self) -> None:
+        names = ("resources/accessibility", "resources.pak")
+        string_order = sorted(names)
+        component_order = sorted(names, key=lambda name: PurePosixPath(name).parts)
+        self.assertNotEqual(string_order, component_order)
+        self.assertEqual(component_order, ["resources/accessibility", "resources.pak"])
+
+        consumers = (
+            platform_build_live_qa_runtime,
+            platform_live_qa_runtime_install,
+            validator,
+        )
+        for consumer in consumers:
+            with self.subTest(consumer=consumer.__name__):
+                for name in names:
+                    self.assertEqual(
+                        consumer._runtime_path_order_key(name),
+                        PurePosixPath(name).parts,
+                    )
+                source = Path(consumer.__file__).read_text(encoding="utf-8")
+                self.assertIn("PurePosixPath(relative).parts", source)
+
+    def test_runtime_manifest_digest_rejects_content_or_digest_tampering(self) -> None:
+        artifact = ArchiveBuilder(self.root / "untampered.tar.gz").write()
+        manifest_name = f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json"
+
+        with tarfile.open(artifact, "r:gz") as archive:
+            manifest_member = archive.extractfile(manifest_name)
+            assert manifest_member is not None
+            manifest = json.loads(manifest_member.read())
+
+        tampered_digest = self.root / "tampered-digest.tar.gz"
+        manifest["tree_sha256"] = "0" * 64
+        self._rewrite_archive(
+            artifact,
+            tampered_digest,
+            {
+                manifest_name: json.dumps(
+                    manifest, sort_keys=True, separators=(",", ":")
+                ).encode()
+                + b"\n"
+            },
+        )
+        with self.assertRaisesRegex(
+            validator.ArtifactError, "content digest does not match"
+        ):
+            validator.validate_archive(tampered_digest, release_slug=RELEASE_SLUG)
+
+        tampered_content = self.root / "tampered-content.tar.gz"
+        self._rewrite_archive(
+            artifact,
+            tampered_content,
+            {
+                f"{RELEASE_SLUG}/liveqa-runtime/node/bin/node": b"tampered\n",
+            },
+        )
+        with self.assertRaisesRegex(validator.ArtifactError, "content digest"):
+            validator.validate_archive(tampered_content, release_slug=RELEASE_SLUG)
 
     def test_valid_archive_checksum_and_safe_extraction(self) -> None:
         sandbox = chromium_sandbox_fixture.read_bytes()

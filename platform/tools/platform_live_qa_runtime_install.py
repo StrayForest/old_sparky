@@ -584,6 +584,16 @@ def _copy_tree(
     return digests
 
 
+def _runtime_path_order_key(relative: str) -> tuple[str, ...]:
+    """Order manifest paths by POSIX components, independent of host OS.
+
+    Keep this tiny contract local because the installer is copied into the
+    trusted runtime and must not rely on ambient imports.
+    """
+
+    return PurePosixPath(relative).parts
+
+
 def _tree_digest(
     root: Path,
     *,
@@ -596,7 +606,12 @@ def _tree_digest(
     files: dict[str, str] = {}
     count = 0
     total = 0
-    for path in sorted(root.rglob("*")):
+    for path in sorted(
+        root.rglob("*"),
+        key=lambda candidate: _runtime_path_order_key(
+            candidate.relative_to(root).as_posix()
+        ),
+    ):
         relative = path.relative_to(root).as_posix()
         if relative in ignored:
             continue

@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-12
+- Last reviewed: 2026-09-24
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
@@ -37,8 +37,12 @@ the release-runtime coverage without granting it production authority.
 On pull requests and `merge_group`, `release-runtime` is fixture-only: it
 builds the staged runtime with local small pinned-fixture ZIPs under
 `python -I`, verifies link materialization, manifest/tree/mode invariants and
-downstream install validation, and has no production network, credentials or
-deployment authority. A separate `release-runtime-real` job runs only for a
+downstream install validation. Runtime manifest trees use one explicit POSIX
+component-order key across the builder, installer and standalone artifact
+validator; the fixture gate includes a divergent-path parity regression and a
+builder-to-tar-to-standalone-validator check. The gate has no production
+network, credentials or deployment authority. A separate `release-runtime-real`
+job runs only for a
 classifier-sensitive or fallback `push` to canonical `dev`, or for
 `workflow_dispatch` whose ref is exactly `dev`. It starts on a fresh runner,
 checks out the exact workflow SHA, creates the production-style clean root venv

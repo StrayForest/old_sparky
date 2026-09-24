@@ -399,6 +399,16 @@ def _validate_structure(
     return by_name, symlink_targets
 
 
+def _runtime_path_order_key(relative: str) -> tuple[str, ...]:
+    """Order manifest paths by POSIX components, independent of host OS.
+
+    Keep this tiny contract local because the validator runs standalone with
+    ``python -I``.
+    """
+
+    return PurePosixPath(relative).parts
+
+
 def _runtime_digest(
     archive: tarfile.TarFile,
     by_name: dict[str, tarfile.TarInfo],
@@ -410,9 +420,11 @@ def _runtime_digest(
     prefix = f"{release_slug}/{LIVE_QA_RUNTIME_ROOT}/"
     digest = hashlib.sha256()
     files: dict[str, str] = {}
-    for name in sorted(by_name):
-        if not name.startswith(prefix):
-            continue
+    runtime_names = (name for name in by_name if name.startswith(prefix))
+    for name in sorted(
+        runtime_names,
+        key=lambda candidate: _runtime_path_order_key(candidate[len(prefix) :]),
+    ):
         relative = name[len(prefix) :]
         if relative == "runtime-manifest.json":
             continue
