@@ -22,6 +22,7 @@ from tools import platform_workflow_remote_dispatch as dispatcher
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOLS_ROOT = REPO_ROOT / "platform" / "tools"
 SOURCE_SHA = "d974c8b0536683d0ca8d6f1aca8331a215023fd4"
+ARTIFACT_DIGEST = "sha256:" + "e" * 64
 
 
 class HostToolsBundleTests(unittest.TestCase):
@@ -254,9 +255,11 @@ class HostToolsBundleTests(unittest.TestCase):
                         "id": 123,
                         "name": "platform-host-tools-bundle-99-1",
                         "expired": False,
+                        "digest": ARTIFACT_DIGEST,
                         "workflow_run": {
                             "id": 99,
                             "run_attempt": 1,
+                            "head_branch": "dev",
                             "head_sha": SOURCE_SHA,
                         },
                     }
@@ -270,6 +273,70 @@ class HostToolsBundleTests(unittest.TestCase):
                 run_id="99",
                 run_attempt="1",
                 source_sha=SOURCE_SHA,
+                expected_branch="dev",
+                artifact_digest=ARTIFACT_DIGEST,
+            )
+            metadata.write_text(
+                json.dumps(
+                    {
+                        "id": 123,
+                        "name": "platform-host-tools-bundle-99-1",
+                        "expired": False,
+                        "digest": ARTIFACT_DIGEST,
+                        "workflow_run": {
+                            "id": 99,
+                            "head_branch": "dev",
+                            "head_sha": SOURCE_SHA,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # GitHub's artifact API omits workflow_run.run_attempt.  The
+            # artifact envelope remains valid; the dedicated attempt payload
+            # below is the authoritative source for that field.
+            bundle.verify_artifact_metadata(
+                metadata,
+                artifact_id="123",
+                artifact_name="platform-host-tools-bundle-99-1",
+                run_id="99",
+                run_attempt="1",
+                source_sha=SOURCE_SHA,
+                expected_branch="dev",
+                artifact_digest=ARTIFACT_DIGEST,
+            )
+            for invalid_attempt in (False, "1", 1.0, 2):
+                invalid_payload = json.loads(metadata.read_text(encoding="utf-8"))
+                invalid_payload["workflow_run"]["run_attempt"] = invalid_attempt
+                metadata.write_text(json.dumps(invalid_payload), encoding="utf-8")
+                with self.subTest(invalid_attempt=invalid_attempt):
+                    with self.assertRaises(bundle.HostToolsBundleError):
+                        bundle.verify_artifact_metadata(
+                            metadata,
+                            artifact_id="123",
+                            artifact_name="platform-host-tools-bundle-99-1",
+                            run_id="99",
+                            run_attempt="1",
+                            source_sha=SOURCE_SHA,
+                            expected_branch="dev",
+                            artifact_digest=ARTIFACT_DIGEST,
+                        )
+            metadata.write_text(
+                json.dumps(
+                    {
+                        "id": 123,
+                        "name": "platform-host-tools-bundle-99-1",
+                        "expired": False,
+                        "digest": ARTIFACT_DIGEST,
+                        "workflow_run": {
+                            "id": 99,
+                            "run_attempt": 1,
+                            "head_branch": "dev",
+                            "head_sha": SOURCE_SHA,
+                        },
+                    }
+                ),
+                encoding="utf-8",
             )
             with self.assertRaises(bundle.HostToolsBundleError):
                 bundle.verify_artifact_metadata(
@@ -279,10 +346,142 @@ class HostToolsBundleTests(unittest.TestCase):
                     run_id="99",
                     run_attempt="2",
                     source_sha=SOURCE_SHA,
+                    expected_branch="dev",
+                    artifact_digest=ARTIFACT_DIGEST,
+                )
+            attempt = Path(temporary) / "attempt.json"
+            attempt.write_text(
+                json.dumps(
+                    {
+                        "id": 99,
+                        "run_attempt": 1,
+                        "head_sha": SOURCE_SHA,
+                        "head_branch": "dev",
+                        "event": "workflow_dispatch",
+                        "repository": {
+                            "full_name": "StrayForest/old_sparky",
+                            "name": "old_sparky",
+                            "owner": {"login": "StrayForest"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            bundle.verify_workflow_attempt(
+                attempt,
+                run_id="99",
+                run_attempt="1",
+                source_sha=SOURCE_SHA,
+                repository="StrayForest/old_sparky",
+                expected_branch="dev",
+                expected_event="workflow_dispatch",
+            )
+            for missing_field in ("id", "run_attempt", "head_sha", "repository", "head_branch", "event"):
+                missing_payload = json.loads(attempt.read_text(encoding="utf-8"))
+                missing_payload.pop(missing_field)
+                attempt.write_text(json.dumps(missing_payload), encoding="utf-8")
+                with self.subTest(missing_attempt_field=missing_field):
+                    with self.assertRaises(bundle.HostToolsBundleError):
+                        bundle.verify_workflow_attempt(
+                            attempt,
+                            run_id="99",
+                            run_attempt="1",
+                            source_sha=SOURCE_SHA,
+                            repository="StrayForest/old_sparky",
+                            expected_branch="dev",
+                            expected_event="workflow_dispatch",
+                        )
+                attempt.write_text(
+                    json.dumps(
+                        {
+                            "id": 99,
+                            "run_attempt": 1,
+                            "head_sha": SOURCE_SHA,
+                            "head_branch": "dev",
+                            "event": "workflow_dispatch",
+                            "repository": {
+                                "full_name": "StrayForest/old_sparky",
+                                "name": "old_sparky",
+                                "owner": {"login": "StrayForest"},
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            for field, invalid in (
+                ("id", 100),
+                ("run_attempt", False),
+                ("run_attempt", "1"),
+                ("run_attempt", 1.0),
+                ("head_sha", "b" * 40),
+                ("head_branch", "feature"),
+                ("event", "push"),
+                (
+                    "repository",
+                    {
+                        "full_name": "attacker/old_sparky",
+                        "name": "old_sparky",
+                        "owner": {"login": "attacker"},
+                    },
+                ),
+            ):
+                invalid_payload = json.loads(attempt.read_text(encoding="utf-8"))
+                invalid_payload[field] = invalid
+                attempt.write_text(json.dumps(invalid_payload), encoding="utf-8")
+                with self.subTest(attempt_field=field, invalid=invalid):
+                    with self.assertRaises(bundle.HostToolsBundleError):
+                        bundle.verify_workflow_attempt(
+                            attempt,
+                            run_id="99",
+                            run_attempt="1",
+                            source_sha=SOURCE_SHA,
+                            repository="StrayForest/old_sparky",
+                            expected_branch="dev",
+                            expected_event="workflow_dispatch",
+                        )
+                attempt.write_text(
+                    json.dumps(
+                        {
+                            "id": 99,
+                            "run_attempt": 1,
+                            "head_sha": SOURCE_SHA,
+                            "head_branch": "dev",
+                            "event": "workflow_dispatch",
+                            "repository": {
+                                "full_name": "StrayForest/old_sparky",
+                                "name": "old_sparky",
+                                "owner": {"login": "StrayForest"},
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            attempt.write_text("{" + "x" * (bundle.MAX_FILE_BYTES + 1), encoding="utf-8")
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.verify_workflow_attempt(
+                    attempt,
+                    run_id="99",
+                    run_attempt="1",
+                    source_sha=SOURCE_SHA,
+                    repository="StrayForest/old_sparky",
+                    expected_branch="dev",
+                    expected_event="workflow_dispatch",
+                )
+            attempt.unlink()
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.verify_workflow_attempt(
+                    attempt,
+                    run_id="99",
+                    run_attempt="1",
+                    source_sha=SOURCE_SHA,
+                    repository="StrayForest/old_sparky",
+                    expected_branch="dev",
+                    expected_event="workflow_dispatch",
                 )
             metadata.write_text(
                 '{"id":123,"id":124,"name":"platform-host-tools-bundle-99-1",'
-                '"expired":false,"workflow_run":{"id":99,"run_attempt":1,'
+                f'"expired":false,"digest":"{ARTIFACT_DIGEST}",'
+                '"workflow_run":{"id":99,"run_attempt":1,"head_branch":"dev",'
                 f'"head_sha":"{SOURCE_SHA}"}}',
                 encoding="utf-8",
             )
@@ -294,7 +493,42 @@ class HostToolsBundleTests(unittest.TestCase):
                     run_id="99",
                     run_attempt="1",
                     source_sha=SOURCE_SHA,
+                    expected_branch="dev",
+                    artifact_digest=ARTIFACT_DIGEST,
                 )
+
+            valid_metadata = {
+                "id": 123,
+                "name": "platform-host-tools-bundle-99-1",
+                "expired": False,
+                "digest": ARTIFACT_DIGEST,
+                "workflow_run": {
+                    "id": 99,
+                    "head_branch": "dev",
+                    "head_sha": SOURCE_SHA,
+                },
+            }
+            for field, invalid in (
+                ("digest", "sha256:" + "f" * 64),
+                ("expired", True),
+                ("workflow_run", {"id": 99, "head_branch": "feature", "head_sha": SOURCE_SHA}),
+                ("workflow_run", {"id": 100, "head_branch": "dev", "head_sha": SOURCE_SHA}),
+            ):
+                invalid_metadata = json.loads(json.dumps(valid_metadata))
+                invalid_metadata[field] = invalid
+                metadata.write_text(json.dumps(invalid_metadata), encoding="utf-8")
+                with self.subTest(artifact_field=field, invalid=invalid):
+                    with self.assertRaises(bundle.HostToolsBundleError):
+                        bundle.verify_artifact_metadata(
+                            metadata,
+                            artifact_id="123",
+                            artifact_name="platform-host-tools-bundle-99-1",
+                            run_id="99",
+                            run_attempt="1",
+                            source_sha=SOURCE_SHA,
+                            expected_branch="dev",
+                            artifact_digest=ARTIFACT_DIGEST,
+                        )
 
     def test_host_path_references_stay_inside_declared_components(self) -> None:
         supervisor = (TOOLS_ROOT / "platform_production_deploy_supervisor.sh").read_text()

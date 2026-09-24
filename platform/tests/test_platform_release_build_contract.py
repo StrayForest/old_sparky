@@ -703,6 +703,26 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertNotIn('/usr/bin/python3 "$artifacts_metadata"', workflow)
         self.assertIn("/usr/bin/python3 \"$trusted_tool\" metadata", workflow)
         self.assertIn("/usr/bin/python3 \"$trusted_tool\" manifest", workflow)
+        host_preflight = self._workflow_step_run(
+            workflow, "Validate host-tools artifact envelope and bundle"
+        )
+        self.assertIn(
+            "actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}",
+            host_preflight,
+        )
+        self.assertIn("host-tools workflow attempt metadata request failed", host_preflight)
+        self.assertIn("host-tools workflow attempt provenance is invalid", host_preflight)
+        self.assertIn("object_pairs_hook=reject_duplicate_keys", host_preflight)
+        self.assertNotIn(".workflow_run.run_attempt", host_preflight)
+        self.assertIn(".workflow_run.head_branch", host_preflight)
+        self.assertIn(".workflow_run.head_sha", host_preflight)
+        self.assertIn(".digest", host_preflight)
+        self.assertIn("sha256:${HOST_TOOLS_ARTIFACT_DIGEST}", host_preflight)
+        self.assertIn("metadata is oversized", host_preflight)
+        self.assertIn('test "$metadata_fields" = "$expected_metadata_fields"', host_preflight)
+        self.assertIn('payload.get("head_branch") != "dev"', host_preflight)
+        self.assertNotIn('payload.get("ref") != "refs/heads/dev"', host_preflight)
+        self.assertIn("sha256sum -c", host_preflight)
 
         target_sha = "a" * 40
         expected_name = "platform-ci-route-123-1"
@@ -714,7 +734,6 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 "id": 123,
                 "head_branch": "dev",
                 "head_sha": target_sha,
-                "run_attempt": 1,
             },
         }
         expired = {
@@ -795,6 +814,33 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 self.assertEqual(valid.stdout.strip(), "42")
             finally:
                 owned.cleanup()
+
+            for invalid_attempt in (False, "1", 1.0, 2):
+                invalid_selected = json.loads(json.dumps(selected))
+                invalid_selected["workflow_run"]["run_attempt"] = invalid_attempt
+                invalid_payload = {"total_count": 2, "artifacts": [invalid_selected, expired]}
+                invalid_first, invalid_second, owned = metadata_tree(
+                    first_payload=invalid_payload
+                )
+                try:
+                    invalid = run_tool(
+                        "metadata",
+                        str(invalid_first),
+                        str(invalid_second),
+                        "--expected-name",
+                        expected_name,
+                        "--run-id",
+                        "123",
+                        "--run-attempt",
+                        "1",
+                        "--target-sha",
+                        target_sha,
+                    )
+                    with self.subTest(invalid_attempt=invalid_attempt):
+                        self.assertNotEqual(invalid.returncode, 0)
+                        self.assertIn("provenance", invalid.stderr)
+                finally:
+                    owned.cleanup()
 
             malformed_first, malformed_second, owned = metadata_tree(
                 first_payload=valid_payload,

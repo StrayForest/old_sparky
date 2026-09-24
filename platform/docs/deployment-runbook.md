@@ -73,6 +73,10 @@ to `dev`. The chain is:
    absolute tools. This is a read-only gate: it never SCPs or executes the
    bundle and fails before release build, attestation, pending status or
    production artifact transfer when the generation is absent or mismatched.
+   The artifact API binding uses its ID, name, run ID, source SHA and digest;
+   because nested `workflow_run.run_attempt` may be absent, the gate validates
+   the exact current attempt through the authoritative GitHub attempt endpoint
+   with bounded typed JSON and rejects missing, malformed or mismatched fields.
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
 

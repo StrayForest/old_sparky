@@ -41,7 +41,11 @@ use only fixed absolute `/usr/bin/id`, `/usr/bin/stat`, `/usr/bin/sha256sum`,
 exact generation path. The SSH
 identity invariant is explicit: the configured deployment identity must
 return `id -u == 0`; a non-root identity is a closed failure, not an implicit
-sudo fallback.
+sudo fallback. GitHub's artifact metadata is bound by artifact ID, name,
+source SHA and digest; because its nested `workflow_run` object may omit
+`run_attempt`, the capability job validates the exact attempt through the
+authoritative `/actions/runs/<run_id>/attempts/<run_attempt>` response with
+bounded typed JSON checks.
 
 The release build is downstream of this gate.  The production consumer invokes
 only the exact immutable dispatcher path with `/usr/bin/python3.12 -I`:
