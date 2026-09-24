@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -278,8 +279,23 @@ class HostToolsBundleTests(unittest.TestCase):
                 member.write_text("placeholder\n", encoding="ascii")
                 os.chmod(member, 0o444)
             os.chmod(generation, 0o555)
+
+            real_lstat = Path.lstat
+
+            def root_owned_lstat(path: Path) -> SimpleNamespace | os.stat_result:
+                metadata = real_lstat(path)
+                if path == generation or path.parent == generation:
+                    return SimpleNamespace(
+                        st_mode=metadata.st_mode,
+                        st_uid=0,
+                        st_gid=0,
+                        st_nlink=metadata.st_nlink,
+                    )
+                return metadata
+
             output = StringIO()
-            with patch.object(dispatcher, "ACTIVE_TOOLS_DIR", generation), \
+            with patch.object(Path, "lstat", autospec=True, side_effect=root_owned_lstat), \
+                patch.object(dispatcher, "ACTIVE_TOOLS_DIR", generation), \
                 patch.object(dispatcher, "HOST_TOOLS_ROOT", host_root), \
                 patch.object(dispatcher, "__file__", str(generation / bundle.HOST_TOOL_FILES[0])), \
                 redirect_stdout(output):
@@ -287,7 +303,8 @@ class HostToolsBundleTests(unittest.TestCase):
             self.assertRegex(output.getvalue(), r"^HOST_TOOLS schema=1 source_sha=[0-9a-f]{40} ")
             self.assertNotIn(str(generation), output.getvalue())
             os.chmod(generation / bundle.HOST_TOOL_FILES[-1], 0o554)
-            with patch.object(dispatcher, "ACTIVE_TOOLS_DIR", generation), \
+            with patch.object(Path, "lstat", autospec=True, side_effect=root_owned_lstat), \
+                patch.object(dispatcher, "ACTIVE_TOOLS_DIR", generation), \
                 patch.object(dispatcher, "HOST_TOOLS_ROOT", host_root), \
                 patch.object(dispatcher, "__file__", str(generation / bundle.HOST_TOOL_FILES[0])):
                 self.assertEqual(dispatcher._host_capabilities(), 2)
