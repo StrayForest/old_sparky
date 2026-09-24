@@ -210,6 +210,16 @@ and [dependency caching](https://docs.github.com/en/actions/using-workflows/cach
 
 Use the lowest suitable layer in the test pyramid:
 
+The host disk policy is a shared release/operations contract owned by
+`tools/platform_disk_policy.py`. The health-monitor unit test and storage-
+maintenance privileged test must cover exact 5 GiB and 85% boundaries,
+fail-closed invalid usage, the conservative `total - available` formula and
+their systemd/CLI wiring. A threshold or formula change requires updating the
+policy helper, both consumers, the runbook owner in
+[`operations-runbook.md`](operations-runbook.md), and the executable catalog
+snapshot in the same change; it must not be hidden by a route-specific test
+skip.
+
 1. Put domain and API behavior in the auto-discovered `platform/tests/test_*.py`
    tree. A new ordinary backend test requires no workflow or filename-list
    edit.

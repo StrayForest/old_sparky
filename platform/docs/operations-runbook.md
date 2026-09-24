@@ -68,7 +68,7 @@ and user identity to be idle, accepts only root-owned non-symlink
 `runtime-<40 lowercase hex>` trees with the published read-only manifest
 contract, and always retains at least the newest valid unprotected fallback.
 The keep count is a hard cap for unprotected caches, not an age window.
-Maintenance fails below 5 GiB free or above 85% disk use.
+Health monitoring and storage maintenance share one conservative hard gate: available free space must be at least 5 GiB and conservative use (`total - available`, including filesystem-reserved headroom) must be at most 85%; exact 5 GiB and 85% boundaries pass, and 80% is not a failure threshold.
 The host sweep uses seven-day `--test-artifact-max-age-days` transient retention; GitHub Actions keeps machine-readable CI evidence for fourteen days. Keep workflow uploads at fourteen days and do not broaden host retention to match it.
 
 Application services write structured JSON to journald. Nginx remains the
@@ -591,7 +591,7 @@ The external-load workflow always invokes this supervisor, even when the filesys
 ## Alert thresholds
 
 - failed/restarted service;
-- disk below 5 GiB free or above 85%;
+- disk below 5 GiB available or above 85% conservative use (the exact boundary is allowed);
 - newest backup older than 24 hours or not restore-verified;
 - sustained Celery queue growth or retry exhaustion;
 - repeated 5xx/security delivery errors;

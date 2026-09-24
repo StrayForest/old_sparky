@@ -9,7 +9,7 @@ Type=oneshot
 User=root
 Group=root
 WorkingDirectory=/opt/oldsparky/platform/current
-ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_health_monitor.py
+ExecStart=/opt/oldsparky/platform/shared/venv/bin/python /opt/oldsparky/platform/current/tools/platform_health_monitor.py --disk-min-free-gib 5 --disk-max-used-percent 85
 Nice=10
 CPUQuota=20%
 MemoryMax=128M
@@ -20,4 +20,3 @@ ProtectSystem=strict
 ProtectHome=true
 NoNewPrivileges=true
 LockPersonality=true
-
