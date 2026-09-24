@@ -43,19 +43,12 @@ PRODUCTION_DEPLOY_CONTROL_FILES = (
     "platform_production_deploy_supervisor.sh",
     "platform_release_lock.sh",
     "platform_release_preflight.sh",
-    "platform_release_install.sh",
-    "platform_release_transaction.py",
-    "platform_release_restore_runtime.sh",
     "platform_validate_release_artifact.py",
-    "platform_validate_wheelhouse.py",
-    "platform_deploy_smoke.py",
-    "platform_deploy_smoke_impl.py",
     "platform_safe_env_exec.py",
     "platform_render_service_envs.py",
     "platform_validate_edge_policy.py",
-    "platform_update_cloudflare_ips.py",
-    "platform_backup_restore_drill.py",
     "platform_configure_shared_env.py",
+    "platform_update_cloudflare_ips.py",
     "platform_storage_evidence_summary.py",
 )
 HOST_TOOL_FILES = PREPARE_ARTIFACT_FILES + PRODUCTION_DEPLOY_CONTROL_FILES
@@ -341,7 +334,12 @@ def _validate_manifest(payload: object, expected_source_sha: str | None) -> dict
         raise HostToolsBundleError("host-tools source SHA is invalid")
     if expected_source_sha is not None and source_sha != expected_source_sha:
         raise HostToolsBundleError("host-tools source SHA does not match target")
-    if payload.get("schema") != SCHEMA or payload.get("toolset_version") != TOOLSET_VERSION:
+    if (
+        type(payload.get("schema")) is not int
+        or payload.get("schema") != SCHEMA
+        or type(payload.get("toolset_version")) is not str
+        or payload.get("toolset_version") != TOOLSET_VERSION
+    ):
         raise HostToolsBundleError("host-tools manifest version is invalid")
     if payload.get("generation") != source_sha:
         raise HostToolsBundleError("host-tools generation is not source-bound")
@@ -354,11 +352,19 @@ def _validate_manifest(payload: object, expected_source_sha: str | None) -> dict
     }:
         raise HostToolsBundleError("host-tools component closure is invalid")
     limits = payload.get("limits")
-    if limits != {
+    expected_limits = {
         "max_bundle_bytes": MAX_BUNDLE_BYTES,
         "max_file_bytes": MAX_FILE_BYTES,
         "max_file_count": MAX_FILE_COUNT,
-    }:
+    }
+    if (
+        not isinstance(limits, dict)
+        or set(limits) != set(expected_limits)
+        or any(
+            type(limits[key]) is not int or limits[key] != expected_limits[key]
+            for key in expected_limits
+        )
+    ):
         raise HostToolsBundleError("host-tools limits are invalid")
     records = payload.get("files")
     if not isinstance(records, list) or len(records) != len(HOST_TOOL_FILES) + 1:

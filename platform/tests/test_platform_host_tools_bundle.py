@@ -56,7 +56,7 @@ class HostToolsBundleTests(unittest.TestCase):
             contract = root / "contract"
             bundle.write_contract_files(first_summary, contract)
             self.assertIn(
-                "platform_validate_wheelhouse.py", (contract / "files.sha256").read_text()
+                "platform_configure_shared_env.py", (contract / "files.sha256").read_text()
             )
             self.assertEqual((contract / "source_sha").read_text(), f"{SOURCE_SHA}\n")
             self.assertEqual(
@@ -132,6 +132,36 @@ class HostToolsBundleTests(unittest.TestCase):
                 target_zip.writestr(info, source_zip.read(info))
             with self.assertRaises(bundle.HostToolsBundleError):
                 bundle.verify_bundle(duplicate, expected_source_sha=SOURCE_SHA)
+
+    def test_manifest_numeric_fields_reject_bool_float_and_string_coercion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source_fixture(root)
+            archive = root / "bundle.zip"
+            bundle.build_bundle(source, SOURCE_SHA, archive)
+            with zipfile.ZipFile(archive) as source_zip:
+                infos = list(source_zip.infolist())
+                members = {info.filename: source_zip.read(info) for info in source_zip.infolist()}
+
+            for field, values in (
+                ("schema", (True, 1.0, "1")),
+                ("limits", ({"max_bundle_bytes": True, "max_file_bytes": 512 * 1024, "max_file_count": 13},
+                             {"max_bundle_bytes": 4 * 1024 * 1024, "max_file_bytes": 512 * 1024.0, "max_file_count": 13},
+                             {"max_bundle_bytes": 4 * 1024 * 1024, "max_file_bytes": 512 * 1024, "max_file_count": "13"})),
+            ):
+                for value in values:
+                    with self.subTest(field=field, value=value):
+                        manifest = json.loads(members[f"{bundle.MEMBER_ROOT}/manifest.json"])
+                        manifest[field] = value
+                        tampered = root / f"tampered-{field}-{len(str(value))}.zip"
+                        with zipfile.ZipFile(tampered, "w", compression=zipfile.ZIP_STORED) as target:
+                            for info in infos:
+                                payload = members[info.filename]
+                                if info.filename.endswith("/manifest.json"):
+                                    payload = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                                target.writestr(info, payload)
+                        with self.assertRaises(bundle.HostToolsBundleError):
+                            bundle.verify_bundle(tampered, expected_source_sha=SOURCE_SHA)
 
     def test_source_links_and_special_files_fail_closed(self) -> None:
         for mutation in ("symlink", "hardlink", "fifo"):
@@ -262,6 +292,75 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertNotIn("platform_release_deploy.sh", bundle.HOST_TOOL_FILES)
         self.assertNotIn("platform_run_api.sh", bundle.HOST_TOOL_FILES)
         self.assertIn("platform_prepare_artifact_dir.py", dispatcher)
+
+    def test_declared_host_tools_are_the_recursive_static_runtime_closure(self) -> None:
+        names = set(bundle.HOST_TOOL_FILES)
+        tools = {name: (TOOLS_ROOT / name).read_text(encoding="utf-8") for name in names}
+        # Ignore the supervisor's metadata-only helper inventory.  Dependencies
+        # must instead be discovered from fixed host-tools path expressions and
+        # imports; candidate/runtime paths are intentionally outside this set.
+        supervisor = tools["platform_production_deploy_supervisor.sh"]
+        supervisor = re.sub(r"for host_helper in \\\n.*?done\n", "", supervisor, flags=re.DOTALL)
+        tools["platform_production_deploy_supervisor.sh"] = supervisor
+        reference = re.compile(
+            r"(?:\$host_tools_dir/|\$SCRIPT_DIR/|ACTIVE_TOOLS_DIR\s*/\s*['\"]|"
+            r"with_name\(['\"]|from\s+(?:\.\s*)?)(?P<name>"
+            r"platform_[A-Za-z0-9_.-]+\.(?:py|sh))"
+        )
+        python_import = re.compile(
+            r"from\s+(?:\.\s*)?(?P<module>platform_[A-Za-z0-9_]+)\s+import"
+        )
+        graph = {
+            name: (
+                {match.group("name") for match in reference.finditer(text)}
+                | {f"{match.group('module')}.py" for match in python_import.finditer(text)}
+            ) & names
+            for name, text in tools.items()
+        }
+        reachable = set()
+        frontier = {"platform_workflow_remote_dispatch.py", "platform_production_deploy_supervisor.sh"}
+        while frontier:
+            name = frontier.pop()
+            if name in reachable:
+                continue
+            reachable.add(name)
+            frontier.update(graph[name] - reachable)
+        self.assertEqual(reachable, names)
+        self.assertNotIn("platform_release_restore_runtime.sh", names)
+
+    def test_remote_capability_inventory_is_nul_safe_and_exact(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
+            "  build-release:", 1
+        )[0]
+        self.assertIn(
+            "find \"$generation\" -mindepth 1 -maxdepth 1 -printf '%f\\0'",
+            preflight,
+        )
+        self.assertIn("base64 --decode", preflight)
+        self.assertIn("mapfile -d '' -t remote_names", preflight)
+        self.assertIn('test "${#remote_names[@]}" -eq "$expected_entry_count"', preflight)
+        self.assertIn("seen_entries", preflight)
+        self.assertNotIn('"$generation"/*', preflight)
+
+        expected = set(bundle.HOST_TOOL_FILES) | {"capabilities.txt", "manifest.json"}
+        safe_name = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+        def accepted(names: list[str]) -> bool:
+            return (
+                len(names) == len(expected)
+                and all(safe_name.fullmatch(name) and name in expected for name in names)
+                and len(set(names)) == len(names)
+                and set(names) == expected
+            )
+
+        self.assertFalse(accepted(sorted(expected | {".unexpected"})))
+        self.assertFalse(accepted(sorted(expected | {"nested/child"})))
+        self.assertFalse(accepted(sorted(expected | {"symlink"})))
+        self.assertFalse(accepted(sorted(expected | {"bad\nname"})))
+        self.assertTrue(accepted(sorted(expected)))
 
     def test_host_capability_probe_checks_closed_generation_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

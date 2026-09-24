@@ -76,6 +76,17 @@ to `dev`. The chain is:
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
 
+The security workflow also has a separate `workflow_run` status finalizer. It
+uses only `statuses: write`, no checkout or secrets, and posts the terminal
+`platform-security-build` state for the completed run's exact `head_sha`.
+Success remains green; `cancelled`, `skipped`, failed and unknown conclusions
+are failure states. GitHub may suppress all jobs while a run is being forcibly
+cancelled, so the bounded operator recovery is to wait five minutes for the
+finalizer, then inspect the exact run and commit status. If the status is still
+pending, an authorized repository maintainer may post a failure status for
+that exact SHA with `gh api repos/StrayForest/old_sparky/statuses/<sha> -f
+state=failure -f context=platform-security-build`; never post success manually.
+
 The dispatch `mode`, runtime profile, release slug, target SHA and artifact
 directory are checked by the bounded ASCII input guard before production host
 access or secret-file setup. They cross SSH only as a mode-600 JSON handoff to

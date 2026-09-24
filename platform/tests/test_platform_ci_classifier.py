@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SECURITY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-security.yml"
 AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+STATUS_FINALIZER_WORKFLOW = REPO_ROOT / ".github/workflows/platform-security-status-finalizer.yml"
 
 
 class PlatformCiClassifierTests(unittest.TestCase):
@@ -198,6 +199,45 @@ class PlatformCiClassifierTests(unittest.TestCase):
             workflow,
         )
         self.assertNotIn("schedule:", workflow)
+
+    def test_cancel_safe_status_finalizer_covers_every_terminal_conclusion(self) -> None:
+        workflow = STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8")
+        security = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("workflow_run:", workflow)
+        self.assertIn("workflows: [Platform security and build]", workflow)
+        self.assertIn("types: [completed]", workflow)
+        self.assertIn("if: ${{ always() }}", workflow)
+        self.assertIn("permissions:\n      statuses: write", workflow)
+        self.assertNotIn("actions/checkout", workflow)
+        self.assertNotIn("secrets.", workflow)
+        self.assertIn("TARGET_SHA: ${{ github.event.workflow_run.head_sha }}", workflow)
+        self.assertIn("statuses/${TARGET_SHA}", workflow)
+        self.assertIn('case "$SOURCE_CONCLUSION" in', workflow)
+        self.assertIn("success)", workflow)
+        for conclusion in (
+            "cancelled",
+            "failure",
+            "skipped",
+            "timed_out",
+            "action_required",
+            "neutral",
+            "stale",
+            "startup_failure",
+        ):
+            self.assertIn(conclusion, workflow)
+        self.assertIn("state=failure", workflow)
+        self.assertIn('"context": "platform-security-build"', workflow)
+        self.assertIn("SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}", workflow)
+        self.assertLess(
+            workflow.index("name: Platform security status finalizer"),
+            workflow.index("TARGET_SHA: ${{ github.event.workflow_run.head_sha }}"),
+        )
+        pending_at = security.index("--data", security.index("Mark platform security build pending"))
+        first_gate_at = security.index("  backend-static:")
+        final_at = security.index("  status-final:")
+        self.assertLess(pending_at, first_gate_at)
+        self.assertLess(first_gate_at, final_at)
+        self.assertIn("needs: [classifier, status-start", security)
 
     def test_deploy_consumers_validate_the_exact_classifier_artifact(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")

@@ -477,18 +477,11 @@ jobs:
             platform-host-tools/platform_production_deploy_supervisor.sh
             platform-host-tools/platform_release_lock.sh
             platform-host-tools/platform_release_preflight.sh
-            platform-host-tools/platform_release_install.sh
-            platform-host-tools/platform_release_transaction.py
-            platform-host-tools/platform_release_restore_runtime.sh
             platform-host-tools/platform_validate_release_artifact.py
-            platform-host-tools/platform_validate_wheelhouse.py
-            platform-host-tools/platform_deploy_smoke.py
-            platform-host-tools/platform_deploy_smoke_impl.py
             platform-host-tools/platform_safe_env_exec.py
             platform-host-tools/platform_render_service_envs.py
             platform-host-tools/platform_validate_edge_policy.py
             platform-host-tools/platform_update_cloudflare_ips.py
-            platform-host-tools/platform_backup_restore_drill.py
             platform-host-tools/platform_configure_shared_env.py
             platform-host-tools/platform_storage_evidence_summary.py
             platform-host-tools/manifest.json
@@ -595,14 +588,28 @@ jobs:
             test "$remote_mode" = "$expected_mode"
             expected_entries["$expected_path"]=1
           done < "$contract_dir/files.modes"
-          remote_entries="$("${remote[@]}" /usr/bin/stat -c '%n' -- "$generation"/*)"
-          test "${#remote_entries}" -le 4096
-          while IFS= read -r remote_path; do
-            [[ "$remote_path" == "$generation/"* ]]
-            relative_path="${remote_path#"$generation/"}"
+          expected_entry_count="${#expected_entries[@]}"
+          inventory_encoded="$RUNNER_TEMP/host-tools-remote-entries.b64"
+          inventory_file="$RUNNER_TEMP/host-tools-remote-entries"
+          # NUL-delimited find output is base64-wrapped before it crosses the
+          # SSH boundary.  This preserves dotfiles and makes newline/control
+          # names observable instead of allowing line-oriented ambiguity.
+          "${remote[@]}" /usr/bin/find "$generation" -mindepth 1 -maxdepth 1 -printf '%f\0' \
+            | /usr/bin/base64 -w 0 > "$inventory_encoded"
+          test "$(stat -c '%F:%h' -- "$inventory_encoded")" = "regular file:1"
+          test "$(stat -c '%s' -- "$inventory_encoded")" -le 16384
+          /usr/bin/base64 --decode "$inventory_encoded" > "$inventory_file"
+          test "$(stat -c '%F:%h' -- "$inventory_file")" = "regular file:1"
+          mapfile -d '' -t remote_names < "$inventory_file"
+          test "${#remote_names[@]}" -eq "$expected_entry_count"
+          declare -A seen_entries=()
+          for relative_path in "${remote_names[@]}"; do
+            [[ "$relative_path" =~ ^[A-Za-z0-9_.-]+$ ]]
             [[ -n "${expected_entries[$relative_path]+present}" ]]
+            [[ -z "${seen_entries[$relative_path]+present}" ]]
+            seen_entries["$relative_path"]=1
             unset "expected_entries[$relative_path]"
-          done < <(printf '%s\n' "$remote_entries")
+          done
           test "${#expected_entries[@]}" -eq 0
           printf '%s\n' "HOST_TOOLS_GENERATION=$generation" >> "$GITHUB_ENV"
           printf '%s\n' "HOST_TOOLS_SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
@@ -613,6 +620,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f -- "$RUNNER_TEMP/platform-host-tools-artifact.zip"
+          rm -f -- "$RUNNER_TEMP/host-tools-remote-entries.b64" "$RUNNER_TEMP/host-tools-remote-entries"
           rm -rf -- "$RUNNER_TEMP/host-tools-download" "$RUNNER_TEMP/platform-host-tools-inner"
           ssh_dir="$RUNNER_TEMP/platform-host-capability-ssh"
           if [[ -d "$ssh_dir" && ! -L "$ssh_dir" ]]; then

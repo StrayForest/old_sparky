@@ -448,14 +448,14 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 156,
     "module_digest": "6e5cd0f6a5eca58538acb894e22c71da8067538ecb11bc745a67e09569aa8d42",
-    "test_count": 1329,
-    "test_id_digest": "01bf16e4fe339e168e7b01d68fe117deaa8a2b8f4a3e48627c1049dd47c8617c",
-    "backend_test_count": 1290,
-    "backend_test_id_digest": "93bc8af17c9d84ac22b4dd19599a2f009baa11d818d27abdb832c52f76375977",
-    "verification_test_count": 39,
-    "verification_test_id_digest": "a22c826f040efcd9b5518d87070ef1c1152843e5c6595145e0f3268fe7cc9306",
-    "verification_classifier_test_count": 18,
-    "verification_classifier_test_id_digest": "2c65657404b34cae9567a636e4c5c887c1052115ac52614ac221f534cbe94a62",
+    "test_count": 1333,
+    "test_id_digest": "dba49bed1c1f7f444d09116c764dff26fecf9f59e40fc677e5dcc48ec85e1f3a",
+    "backend_test_count": 1293,
+    "backend_test_id_digest": "9d5519fbd530082bb306c883f60409f3a6e74aabd251090bd8feea1edac86738",
+    "verification_test_count": 40,
+    "verification_test_id_digest": "4fc36820c5ffc1615fea86f303133bef03d4d65308fcda07528325bba3d919a0",
+    "verification_classifier_test_count": 19,
+    "verification_classifier_test_id_digest": "d2968c9b7c5fada0b507067e4f9272968edc0d89fd9311bc4d825cbafd366039",
 }
 # Keep each executable contour's boundary independently snapshotted.  The
 # aggregate snapshot proves total ownership, while these entries make a
@@ -480,8 +480,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     "backend-tool-contract": {
         "module_count": 43,
         "module_digest": "8ddc3938dc9c06a91659b342700481d7d4ee74a6f7874feef62f9796fe05e016",
-        "test_count": 294,
-        "test_id_digest": "248c750089f1f4eafe146fe9fcc29cbf5310533289d0405390d4e4c2edeb840a",
+        "test_count": 297,
+        "test_id_digest": "03e1009e5ebcb322068db19ff91cab7d05507910a3193376b30fa82b120914b8",
     },
     "backend-integration": {
         "module_count": 41,
@@ -504,8 +504,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     VERIFICATION_CONTOUR: {
         "module_count": 2,
         "module_digest": "b2a31b179b655a3aafcfd5c2ebc5dd0f09645024663d5985815355c2a2b984ee",
-        "test_count": 39,
-        "test_id_digest": "a22c826f040efcd9b5518d87070ef1c1152843e5c6595145e0f3268fe7cc9306",
+        "test_count": 40,
+        "test_id_digest": "4fc36820c5ffc1615fea86f303133bef03d4d65308fcda07528325bba3d919a0",
     },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])

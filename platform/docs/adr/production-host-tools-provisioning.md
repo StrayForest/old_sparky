@@ -19,13 +19,15 @@ digests.  Its two components are kept explicit:
 - `prepare_artifact`: the fixed dispatcher, input guard and artifact-directory
   helper;
 - `production_deploy_control`: the supervisor, release lock/preflight,
-  release transaction helpers, standalone artifact/wheelhouse validators,
-  safe-environment/render/smoke helpers, edge-policy/update helpers,
-  backup/restore evidence and shared-environment configuration.
+  standalone artifact validator, safe-environment/render helpers,
+  edge-policy/update helpers and shared-environment/storage evidence
+  configuration.
 
 Application runtime files, current-release run wrappers and the candidate
-release deploy closure are not host-tools members.  They remain governed by
-the release artifact and are never substituted into the trusted generation.
+release deploy closure are not host-tools members. Release installation,
+transaction recovery, wheelhouse validation, deploy smoke and backup/restore
+drill helpers remain candidate/runtime or operator-owned tools and are never
+substituted into the trusted generation.
 
 ## Workflow boundary
 
@@ -34,8 +36,9 @@ secret-free runner.  The environment-approved capability job downloads the
 exact artifact ID and digest, verifies the closed manifest offline, and checks
 the already-installed generation.  It does not upload, install or execute any
 bundle member and it does not check out candidate source.  The remote checks
-use only fixed absolute `/usr/bin/id`, `/usr/bin/stat`, `/usr/bin/sha256sum`
-and `/usr/bin/test` operations against the exact generation path.  The SSH
+use only fixed absolute `/usr/bin/id`, `/usr/bin/stat`, `/usr/bin/sha256sum`,
+`/usr/bin/test`, `/usr/bin/find` and `/usr/bin/base64` operations against the
+exact generation path. The SSH
 identity invariant is explicit: the configured deployment identity must
 return `id -u == 0`; a non-root identity is a closed failure, not an implicit
 sudo fallback.
