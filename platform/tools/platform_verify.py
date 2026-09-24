@@ -230,8 +230,11 @@ CI_GATE_IDS = tuple(gate.id for gate in GATES if gate.ci_required)
 
 RELEASE_RUNTIME_TEST_IDS: tuple[str, ...] = (
     "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_staged_live_qa_build_materializes_validated_browser_links",
+    "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_staged_live_qa_builder_output_passes_standalone_artifact_validator",
     "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_staged_live_qa_build_fails_closed_for_browser_link_inputs",
     "tests.test_platform_release_build_contract.PlatformReleaseBuildContractTests.test_browser_materializer_rejects_filesystem_metadata_and_specials",
+    "tests.test_platform_validate_release_artifact.PlatformReleaseArtifactValidationTests.test_runtime_manifest_order_is_explicit_and_shared",
+    "tests.test_platform_validate_release_artifact.PlatformReleaseArtifactValidationTests.test_runtime_manifest_digest_rejects_content_or_digest_tampering",
 )
 
 

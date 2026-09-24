@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import os
 import shutil
 import stat
@@ -989,6 +989,13 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             runtime / "browsers",
             runtime / "browsers" / "chromium-1228",
             runtime / "browsers" / "chromium-1228" / "chrome-linux64",
+            runtime / "browsers" / "chromium-1228" / "chrome-linux64" / "resources",
+            runtime
+            / "browsers"
+            / "chromium-1228"
+            / "chrome-linux64"
+            / "resources"
+            / "accessibility",
             runtime / "browsers" / "chromium_headless_shell-1228",
             runtime / "browsers" / "webkit-2311",
             runtime / "browsers" / "ffmpeg-1011",
@@ -1007,6 +1014,8 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             "web/node_modules/@playwright/test/package.json": b'{"name":"@playwright/test"}\n',
             "web/node_modules/playwright/package.json": b'{"name":"playwright"}\n',
             "web/node_modules/playwright-core/package.json": b'{"name":"playwright-core"}\n',
+            "browsers/chromium-1228/chrome-linux64/resources.pak": b"pak\n",
+            "browsers/chromium-1228/chrome-linux64/resources/accessibility/ax": b"ax\n",
         }
         for relative, content in files.items():
             path = runtime / relative
@@ -1030,7 +1039,9 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         manifest_files: dict[str, str] = {}
         runtime_members = sorted(
             runtime.rglob("*"),
-            key=lambda path: path.relative_to(runtime).as_posix(),
+            key=lambda path: PurePosixPath(
+                path.relative_to(runtime).as_posix()
+            ).parts,
         )
         for path in runtime_members:
             relative = path.relative_to(runtime).as_posix()

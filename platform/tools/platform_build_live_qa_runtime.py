@@ -625,12 +625,27 @@ def _regular_usage(root: Path, *, exclude: Path | None = None) -> int:
     return total
 
 
+def _runtime_path_order_key(relative: str) -> tuple[str, ...]:
+    """Order manifest paths by POSIX components, independent of host OS.
+
+    Keep this tiny contract local because the builder is staged and executed
+    with ``python -I``.
+    """
+
+    return PurePosixPath(relative).parts
+
+
 def _tree_digest(root: Path) -> tuple[str, dict[str, str]]:
     digest = hashlib.sha256()
     files: dict[str, str] = {}
     count = 0
     total = 0
-    for path in sorted(root.rglob("*")):
+    for path in sorted(
+        root.rglob("*"),
+        key=lambda candidate: _runtime_path_order_key(
+            candidate.relative_to(root).as_posix()
+        ),
+    ):
         relative = path.relative_to(root).as_posix()
         metadata = path.lstat()
         if stat.S_ISLNK(metadata.st_mode):

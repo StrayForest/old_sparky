@@ -17,6 +17,13 @@ import textwrap
 import unittest
 import zipfile
 
+from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
+from tests.test_platform_validate_release_artifact import (
+    ArchiveBuilder as ReleaseArtifactFixtureBuilder,
+    RELEASE_SLUG,
+    VALIDATOR_SCRIPT,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILD_SCRIPT = REPO_ROOT / "platform/tools/platform_build_release.sh"
@@ -163,6 +170,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         root: Path,
         *,
         webkit_entries: list[tuple[str, bytes, str]] | None = None,
+        sandbox: bytes | None = None,
     ) -> tuple[Path, Path, Path, Path, bytes]:
         builder, guard = cls._copy_staged_live_qa_builder(root)
         platform_root = root / "platform"
@@ -185,11 +193,19 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 ("{\"name\":%r}\n" % package).encode("ascii"),
             )
 
-        sandbox = b"small pinned sandbox fixture\n"
+        sandbox = sandbox if sandbox is not None else b"small pinned sandbox fixture\n"
         archive_entries = {
             "chromium-1228": [
                 ("chrome-linux64/chrome_sandbox", sandbox, "file"),
                 ("chrome-linux64/chrome", b"chromium\n", "file"),
+                ("chrome-linux64/resources", b"", "directory"),
+                ("chrome-linux64/resources/accessibility", b"", "directory"),
+                ("chrome-linux64/resources.pak", b"pak\n", "file"),
+                (
+                    "chrome-linux64/resources/accessibility/ax",
+                    b"ax\n",
+                    "file",
+                ),
             ],
             "chromium_headless_shell-1228": [("chrome-headless-shell", b"headless\n", "file")],
             "webkit-2311": webkit_entries
@@ -354,6 +370,60 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             installer.CHROMIUM_SANDBOX_SIZE = len(sandbox)
             installer.CHROMIUM_SANDBOX_SHA256 = hashlib.sha256(sandbox).hexdigest()
             installer._validate_runtime_source(output)
+
+    def test_staged_live_qa_builder_output_passes_standalone_artifact_validator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builder, platform_root, node_home, output, _sandbox = (
+                self._prepare_local_runtime_fixture(
+                    root,
+                    sandbox=chromium_sandbox_fixture.read_bytes(),
+                )
+            )
+            completed = self._run_staged_live_qa_build(
+                builder, platform_root, node_home, output, root
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            manifest = json.loads((output / "runtime-manifest.json").read_text())
+            self.assertIn(
+                "browsers/chromium-1228/chrome-linux64/resources.pak",
+                manifest["files"],
+            )
+            self.assertIn(
+                "browsers/chromium-1228/chrome-linux64/resources/accessibility/ax",
+                manifest["files"],
+            )
+
+            artifact = root / f"{RELEASE_SLUG}.tar.gz"
+            artifact_builder = ReleaseArtifactFixtureBuilder(artifact)
+            artifact_builder.replace_liveqa_runtime(output)
+            artifact_builder.write(regenerate_runtime_manifest=False)
+            checksum = Path(f"{artifact}.sha256")
+            checksum.write_text(
+                f"{hashlib.sha256(artifact.read_bytes()).hexdigest()}  {artifact.name}\n",
+                encoding="ascii",
+            )
+            validated = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    str(VALIDATOR_SCRIPT),
+                    "--artifact",
+                    str(artifact),
+                    "--checksum",
+                    str(checksum),
+                    "--release-slug",
+                    RELEASE_SLUG,
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(validated.returncode, 0, validated.stderr)
 
     def test_staged_live_qa_manifest_between_legacy_and_runtime_bounds_is_valid(
         self,
