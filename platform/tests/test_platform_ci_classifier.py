@@ -200,7 +200,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         )
         self.assertNotIn("schedule:", workflow)
 
-    def test_cancel_safe_status_finalizer_covers_every_terminal_conclusion(self) -> None:
+    def test_cancel_safe_status_finalizer_overwrites_every_terminal_conclusion(self) -> None:
         workflow = STATUS_FINALIZER_WORKFLOW.read_text(encoding="utf-8")
         security = SECURITY_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("workflow_run:", workflow)
@@ -214,13 +214,12 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("statuses/${TARGET_SHA}", workflow)
         self.assertIn("attempt_url=", workflow)
         self.assertIn("SOURCE_RUN_URL", workflow)
-        self.assertIn("SOURCE_RUN_UPDATED_AT", workflow)
         self.assertIn("/attempts/{attempt}", workflow)
-        self.assertIn("commits/${TARGET_SHA}/statuses?per_page=100", workflow)
-        self.assertIn("preserve_success", workflow)
-        self.assertIn("int(match.group(2)) >= int(source_attempt)", workflow)
-        self.assertIn("newer_status", workflow)
-        self.assertIn("source_conclusion == \"success\"", workflow)
+        self.assertNotIn("commits/${TARGET_SHA}/statuses?per_page=100", workflow)
+        self.assertNotIn("preserve_success", workflow)
+        self.assertNotIn("updated_at", workflow)
+        self.assertNotIn("status_rows", workflow)
+        self.assertNotIn("pagination", workflow)
         self.assertIn('case "$SOURCE_CONCLUSION" in', workflow)
         self.assertIn("success)", workflow)
         for conclusion in (
@@ -235,6 +234,8 @@ class PlatformCiClassifierTests(unittest.TestCase):
         ):
             self.assertIn(conclusion, workflow)
         self.assertIn("state=failure", workflow)
+        self.assertIn('description="Platform security or build failed"', workflow)
+        self.assertIn('description="Platform security and build passed"', workflow)
         self.assertIn('"context": "platform-security-build"', workflow)
         self.assertIn("SOURCE_RUN_URL: ${{ github.event.workflow_run.html_url }}", workflow)
         self.assertLess(
@@ -248,6 +249,74 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertLess(pending_at, first_gate_at)
         self.assertLess(first_gate_at, final_at)
         self.assertIn("needs: [classifier, status-start", security)
+
+    def test_successful_reduced_routes_keep_canonical_status_and_noop_autodeploy(self) -> None:
+        security = SECURITY_WORKFLOW.read_text(encoding="utf-8")
+        auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn('description="Platform security and build passed"', security)
+        self.assertNotIn("Platform security passed; route=", security)
+        self.assertNotIn("fail-closed fallback route", security)
+        self.assertIn('"$ROUTE_DEPLOYABLE" != "true"', auto)
+        self.assertIn('echo "deploy=false" >> "$GITHUB_OUTPUT"', auto)
+        self.assertIn("Dispatch production deployment", auto)
+        self.assertIn("steps.gate.outputs.deploy == 'true'", auto)
+
+        for files in (
+            ["platform/docs/deployment-runbook.md"],
+            ["README.md"],
+            ["unknown-root-config.toml"],
+        ):
+            with self.subTest(files=files):
+                manifest = classify(
+                    files,
+                    event="push",
+                    target_sha=self.TARGET_SHA,
+                    branch="dev",
+                )
+                self.assertFalse(manifest["deployable"])
+                self.assertIn(manifest["class"], {"docs-only", "out-of-scope", "full"})
+                status = {
+                    "id": 9101,
+                    "context": "platform-security-build",
+                    "state": "success",
+                    "description": "Platform security and build passed",
+                    "target_url": "https://github.com/StrayForest/old_sparky/actions/runs/1234/attempts/2",
+                    "updated_at": "2026-09-11T10:00:00Z",
+                    "creator": {
+                        "login": "github-actions[bot]",
+                        "type": "Bot",
+                        "id": 41898282,
+                    },
+                }
+                validate_security_marker(
+                    {
+                        "id": 77,
+                        "path": SECURITY_WORKFLOW_PATH,
+                        "name": SECURITY_WORKFLOW_NAME,
+                    },
+                    {
+                        "id": 1234,
+                        "workflow_id": 77,
+                        "name": SECURITY_WORKFLOW_NAME,
+                        "run_attempt": 2,
+                        "event": "push",
+                        "head_branch": "dev",
+                        "head_sha": self.TARGET_SHA,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "html_url": "https://github.com/StrayForest/old_sparky/actions/runs/1234",
+                        "repository": {
+                            "full_name": "StrayForest/old_sparky",
+                            "name": "old_sparky",
+                            "owner": {"login": "StrayForest"},
+                        },
+                    },
+                    [status],
+                    expected_run_id=1234,
+                    expected_attempt=2,
+                    expected_target_sha=self.TARGET_SHA,
+                    expected_run_url="https://github.com/StrayForest/old_sparky/actions/runs/1234",
+                )
 
     def test_deploy_consumers_validate_the_exact_classifier_artifact(self) -> None:
         auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")

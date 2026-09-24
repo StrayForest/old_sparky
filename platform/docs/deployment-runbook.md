@@ -77,15 +77,19 @@ to `dev`. The chain is:
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
 
 The security workflow also has a separate `workflow_run` status finalizer. It
-uses only `statuses: write`, no checkout or secrets, and posts the terminal
-`platform-security-build` state for the completed run's exact `head_sha`.
-Success remains green; `cancelled`, `skipped`, failed and unknown conclusions
-are failure states. GitHub may suppress all jobs while a run is being forcibly
-cancelled, so the bounded operator recovery is to wait five minutes for the
-finalizer, then inspect the exact run and commit status. If the status is still
-pending, an authorized repository maintainer may post a failure status for
-that exact SHA with `gh api repos/StrayForest/old_sparky/statuses/<sha> -f
-state=failure -f context=platform-security-build`; never post success manually.
+uses only `statuses: write`, no checkout or secrets, and always overwrites the
+`platform-security-build` context for the completed run's exact `head_sha` and
+`/attempts/<run_attempt>` URL. Only a `success` conclusion publishes the fixed
+description `Platform security and build passed`; every other conclusion is a
+failure with the fixed description `Platform security or build failed`.
+Because the write is idempotent and does not inspect older statuses, repeated
+or superseded attempts cannot preserve a stale result. GitHub may suppress the
+`workflow_run` event during an outage or force-cancel; the bounded operator
+recovery is to wait five minutes, then inspect the exact run and commit status.
+If the status is still pending, an authorized repository maintainer may post a
+failure status for that exact SHA with `gh api
+repos/StrayForest/old_sparky/statuses/<sha> -f state=failure -f
+context=platform-security-build`; never post success manually.
 
 The dispatch `mode`, runtime profile, release slug, target SHA and artifact
 directory are checked by the bounded ASCII input guard before production host

@@ -448,14 +448,14 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
     "module_count": 156,
     "module_digest": "6e5cd0f6a5eca58538acb894e22c71da8067538ecb11bc745a67e09569aa8d42",
-    "test_count": 1335,
-    "test_id_digest": "1e9ac2e1719691ef1059573461501bd0b87c349b2683d0bb838db1d7f1a49141",
+    "test_count": 1336,
+    "test_id_digest": "362cbd87ce9913e284dfc3f08eae48e0ae4404e9dd1c929617e1527537388446",
     "backend_test_count": 1295,
     "backend_test_id_digest": "4974a35eb6046bee7a1d9813c36e73b93b722c90fb70d952c9370312bd0b2104",
-    "verification_test_count": 40,
-    "verification_test_id_digest": "4fc36820c5ffc1615fea86f303133bef03d4d65308fcda07528325bba3d919a0",
-    "verification_classifier_test_count": 19,
-    "verification_classifier_test_id_digest": "d2968c9b7c5fada0b507067e4f9272968edc0d89fd9311bc4d825cbafd366039",
+    "verification_test_count": 41,
+    "verification_test_id_digest": "56d6cdf495c979459051449f2bf17f35e90cd74abdf8662b7d0ddb1be61e29e9",
+    "verification_classifier_test_count": 20,
+    "verification_classifier_test_id_digest": "e04321fae25b656fc3d7691fa4e4a9a188934f45a47289e39a2d015c702e8acf",
 }
 # Keep each executable contour's boundary independently snapshotted.  The
 # aggregate snapshot proves total ownership, while these entries make a
@@ -504,8 +504,8 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
     VERIFICATION_CONTOUR: {
         "module_count": 2,
         "module_digest": "b2a31b179b655a3aafcfd5c2ebc5dd0f09645024663d5985815355c2a2b984ee",
-        "test_count": 40,
-        "test_id_digest": "4fc36820c5ffc1615fea86f303133bef03d4d65308fcda07528325bba3d919a0",
+        "test_count": 41,
+        "test_id_digest": "56d6cdf495c979459051449f2bf17f35e90cd74abdf8662b7d0ddb1be61e29e9",
     },
 }
 EXPECTED_MODULE_COUNT = int(EXPECTED_SNAPSHOT["module_count"])
