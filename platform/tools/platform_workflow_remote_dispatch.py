@@ -17,6 +17,60 @@ import stat
 import subprocess  # nosec B404 - all argv below is fixed or validated data.
 import sys
 
+
+def _is_immutable_host_tools_dispatcher(path: Path) -> bool:
+    """Recognize the release-independent host-tools dispatcher path."""
+
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return bool(
+        resolved.name == "platform_workflow_remote_dispatch.py"
+        and re.fullmatch(r"[0-9a-f]{40}", resolved.parent.name) is not None
+        and resolved.parent.parent.name == "host-tools"
+    )
+
+
+def _invoked_with_explicit_bytecode_flag() -> bool:
+    """Require a literal interpreter ``-B`` flag for immutable generations.
+
+    ``sys.dont_write_bytecode`` is also enabled by ``PYTHONDONTWRITEBYTECODE``
+    (and therefore cannot prove that the caller supplied the required
+    interpreter flag).  The production host is Linux, so inspect the kernel's
+    immutable process command line before importing any sibling module.  A
+    missing or unreadable command line fails closed.
+    """
+
+    try:
+        argv = Path("/proc/self/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    argv = [argument for argument in argv if argument]
+    if len(argv) < 2:
+        return False
+    script_argument = os.fsencode(str(Path(__file__)))
+    try:
+        script_index = argv.index(script_argument, 1)
+    except ValueError:
+        # The regression test executes the fixed source through ``-c`` so it
+        # can patch only local metadata checks.  Keep the same explicit-flag
+        # contract for that interpreter contour.
+        try:
+            script_index = argv.index(b"-c", 1)
+        except ValueError:
+            return False
+    return b"-B" in argv[1:script_index]
+
+
+# ``-I`` isolates imports, but it does not disable Python's implicit
+# ``__pycache__`` writes.  A generation is root-owned and immutable by
+# contract; fail before importing the sibling guard if an operator invokes
+# this entrypoint without ``-B``.  This also prevents a truncated pyc from
+# being left behind when the caller applies a tight output/file-size limit.
+if _is_immutable_host_tools_dispatcher(Path(__file__)) and not _invoked_with_explicit_bytecode_flag():
+    raise SystemExit(2)
+
 try:
     from platform_workflow_input_guard import (
         DELETE_CONFIRMATION,
@@ -77,6 +131,7 @@ HOST_TOOL_FILES = (
     "platform_configure_shared_env.py",
     "platform_storage_evidence_summary.py",
 )
+HOST_TOOLS_INVENTORY = frozenset((*HOST_TOOL_FILES, "manifest.json", "capabilities.txt"))
 
 
 def _fail() -> int:
@@ -180,8 +235,13 @@ def _trusted_generation() -> bool:
 def _host_capabilities() -> int:
     """Return one bounded token only from an exact immutable generation."""
 
+    try:
+        inventory = {entry.name for entry in ACTIVE_TOOLS_DIR.iterdir()}
+    except OSError:
+        return 2
     if (
         not _trusted_generation()
+        or inventory != HOST_TOOLS_INVENTORY
         or not all(
             _trusted_host_helper(ACTIVE_TOOLS_DIR / name)
             for name in HOST_TOOL_FILES
@@ -193,7 +253,8 @@ def _host_capabilities() -> int:
     print(
         "HOST_TOOLS schema=1 "
         f"source_sha={ACTIVE_TOOLS_DIR.name} generation={ACTIVE_TOOLS_DIR.name} "
-        "dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1"
+        "dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 "
+        "python_isolated=1 python_bytecode_disabled=1"
     )
     return 0
 
@@ -433,6 +494,9 @@ def _prepare_deployment(payload: dict[str, str]) -> int:
         SUDO,
         "-n",
         "--",
+        sys.executable,
+        "-I",
+        "-B",
         str(ARTIFACT_DIR_HELPER),
         payload["artifact_remote_dir"],
     ]

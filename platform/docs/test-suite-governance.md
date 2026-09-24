@@ -394,8 +394,15 @@ bounded ASCII grammar. The runner writes the accepted fields to a mode-0600
 JSON handoff; an invalid value stops before SSH credentials, keyscan or an SSH
 command is reached. SSH carries only the fixed
 `platform_workflow_remote_dispatch.py` mode on its command line and the JSON on
-stdin. The remote dispatcher validates the closed schema again before passing
-values as data to a fixed-argv helper, and no email, marker or parser detail is
+stdin. Every immutable dispatcher invocation is explicit
+`/usr/bin/python3.12 -I -B`; `-I` supplies import isolation and `-B` prevents
+bytecode writes into root-owned generations. The remote dispatcher rejects a
+host-generation invocation without `-B` before loading sibling code and emits
+`python_bytecode_disabled=1` in its capability contract. The host capability
+test runs under a bounded file-size limit and compares the complete inventory
+before and after the self-test, including the absence of `__pycache__`/`.pyc`.
+The remote dispatcher validates the closed schema again before passing values
+as data to a fixed-argv helper, and no email, marker or parser detail is
 printed into a public report. The adversarial workflow contract covers shell
 punctuation, quoting, newlines, command substitutions, option-like prefixes,
 Unicode/control/NUL-equivalent values and overlong values.

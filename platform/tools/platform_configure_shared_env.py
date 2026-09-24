@@ -423,6 +423,7 @@ def sync_runtime_envs(env_file: Path) -> bool:
     subprocess.run(
         [
             sys.executable,
+            "-B",
             str(renderer),
             "--source",
             str(env_file),

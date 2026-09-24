@@ -21,7 +21,7 @@ import zipfile
 
 
 SCHEMA = 1
-TOOLSET_VERSION = "production-host-tools-v1"
+TOOLSET_VERSION = "production-host-tools-v2"
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_FILE_BYTES = 512 * 1024
@@ -64,6 +64,7 @@ CAPABILITIES = (
     "production_supervisor",
     "production_deploy_control",
     "python_isolated",
+    "python_bytecode_disabled",
 )
 EXECUTABLE_MODE = 0o555
 DATA_MODE = 0o444

@@ -208,7 +208,7 @@ jobs:
             -o ServerAliveCountMax=3 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            /usr/bin/python3.12 \
+            /usr/bin/python3.12 -I -B \
             /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
             retained-cleanup < "$input_path" > "$ssh_output_file" 2>&1
           remote_status="$?"
@@ -285,7 +285,7 @@ jobs:
             -o ServerAliveCountMax=3 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            /usr/bin/python3.12 \
+            /usr/bin/python3.12 -I -B \
             /opt/oldsparky/platform/current/tools/platform_workflow_remote_dispatch.py \
             retained-cleanup-exports < "$input_path" >/dev/null 2>&1
           cleanup_export_status="$?"

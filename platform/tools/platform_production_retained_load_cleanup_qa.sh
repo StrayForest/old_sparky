@@ -62,7 +62,7 @@ cleanup_run_id="$5"
   echo "GitHub run ids must be numeric." >&2
   exit 1
 }
-"$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_workflow_input_guard.py" email \
+"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_workflow_input_guard.py" email \
   --value "$control_email" || {
   echo "Control email is invalid." >&2
   exit 1
@@ -103,7 +103,7 @@ test -L "$RUNTIME_ROOT/current" || {
   echo "Active production release is missing." >&2
   exit 1
 }
-release_sha="$($SYSTEM_PYTHON -I - "$RUNTIME_ROOT/current/RELEASE.json" <<'PY'
+release_sha="$($SYSTEM_PYTHON -I -B - "$RUNTIME_ROOT/current/RELEASE.json" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -116,12 +116,12 @@ test "$release_sha" = "$target_sha" || {
   echo "Active production release does not match the cleanup workflow SHA." >&2
   exit 1
 }
-platform_environment="$($SYSTEM_PYTHON -I "$TOOLS_DIR/platform_safe_env_exec.py" print-public-value PLATFORM_ENVIRONMENT)"
+platform_environment="$($SYSTEM_PYTHON -I -B "$TOOLS_DIR/platform_safe_env_exec.py" print-public-value PLATFORM_ENVIRONMENT)"
 test "$platform_environment" = "production" || {
   echo "Production retained cleanup requires PLATFORM_ENVIRONMENT=production." >&2
   exit 1
 }
-platform_origin="$($SYSTEM_PYTHON -I "$TOOLS_DIR/platform_safe_env_exec.py" print-public-value PLATFORM_WEB_ORIGIN)"
+platform_origin="$($SYSTEM_PYTHON -I -B "$TOOLS_DIR/platform_safe_env_exec.py" print-public-value PLATFORM_WEB_ORIGIN)"
 test "$platform_origin" = "$EXPECTED_ORIGIN" || {
   echo "Production retained cleanup requires the canonical production origin." >&2
   exit 1
@@ -140,7 +140,7 @@ if [[ ! -e "$run_root" ]]; then
   raw_log_path="$export_dir/cleanup-raw.log"
   result_path="$export_dir/cleanup-summary.json"
   set +e
-  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
     --pythonpath "$PLATFORM_ROOT" \
     -- "$QA_PYTHON" "$TOOLS_DIR/platform_cleanup_retained_orphan.py" \
     --load-run-id "$load_run_id" \
@@ -150,7 +150,7 @@ if [[ ! -e "$run_root" ]]; then
     > "$raw_log_path" 2>&1
   cleanup_status="$?"
   set -e
-  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_evidence_sanitizer.py" \
+  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_evidence_sanitizer.py" \
     --input "$raw_log_path" --output "$log_path"
   rm -f -- "$raw_log_path"
   test ! -e "$raw_log_path"
@@ -251,7 +251,7 @@ if (( recovery_needed == 1 )) || {
     exit 0
   fi
   if (( profile_count == 1 )); then
-    "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+    "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
       --pythonpath "$PLATFORM_ROOT" \
       -- "$QA_PYTHON" "$TOOLS_DIR/platform_recover_retained_report.py" \
       --run-root "$run_root" \
@@ -287,7 +287,7 @@ raw_log_path="$export_dir/cleanup-raw.log"
 result_path="$export_dir/cleanup-summary.json"
 
 set +e
-"$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
   --pythonpath "$PLATFORM_ROOT" \
   -- "$QA_PYTHON" "$TOOLS_DIR/platform_cleanup_retained_matrix.py" \
   --summary "$summary_path" \
@@ -298,7 +298,7 @@ set +e
   > "$raw_log_path" 2>&1
 cleanup_status="$?"
 set -e
-"$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_evidence_sanitizer.py" \
+"$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_evidence_sanitizer.py" \
   --input "$raw_log_path" --output "$log_path"
 rm -f -- "$raw_log_path"
 test ! -e "$raw_log_path"

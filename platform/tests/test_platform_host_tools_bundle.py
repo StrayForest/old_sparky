@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 import re
+import resource
 import shlex
 import shutil
 import subprocess
@@ -308,6 +309,7 @@ class HostToolsBundleTests(unittest.TestCase):
                 [
                     "/usr/bin/python3",
                     "-I",
+                    "-B",
                     str(staged / "platform_workflow_remote_dispatch.py"),
                     "host-capabilities",
                 ],
@@ -321,6 +323,102 @@ class HostToolsBundleTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 2)
             self.assertNotIn("ModuleNotFoundError", completed.stderr)
             self.assertNotIn("ambient guard loaded", completed.stderr)
+
+            # Exercise the real installed bundle contour in a writable
+            # staging tree. The dispatcher is still invoked with the exact
+            # production flags, while metadata checks are patched only in
+            # this child so the test does not touch /opt or require root.
+            source = self._source_fixture(root)
+            archive = root / "platform-host-tools-bundle.zip"
+            bundle.build_bundle(source, SOURCE_SHA, archive)
+            installed = root / "shared" / "host-tools" / SOURCE_SHA
+            installed.parent.mkdir(parents=True)
+            with zipfile.ZipFile(archive) as source_zip:
+                source_zip.extractall(installed.parent.parent.parent)
+            extracted = installed.parent.parent.parent / bundle.MEMBER_ROOT
+            extracted.rename(installed)
+            for path in installed.iterdir():
+                os.chmod(path, 0o755 if path.name in bundle.HOST_TOOL_FILES else 0o644)
+            os.chmod(installed, 0o755)
+
+            def inventory() -> dict[str, bytes]:
+                return {
+                    str(path.relative_to(installed)): path.read_bytes()
+                    for path in installed.rglob("*")
+                    if path.is_file()
+                }
+
+            before = inventory()
+            child = """
+from pathlib import Path
+import sys
+import types
+
+dispatcher_path = Path(sys.argv[1])
+host_tools_root = Path(sys.argv[2])
+sys.path.insert(0, str(dispatcher_path.parent))
+module = types.ModuleType("staged_dispatcher")
+module.__file__ = str(dispatcher_path)
+exec(compile(dispatcher_path.read_text(encoding="utf-8"), str(dispatcher_path), "exec"), module.__dict__)
+module.HOST_TOOLS_ROOT = host_tools_root
+module.ACTIVE_TOOLS_DIR = dispatcher_path.parent
+module._trusted_generation = lambda: True
+module._trusted_host_helper = lambda _path: True
+module._trusted_data = lambda _path: True
+raise SystemExit(module.main(["host-capabilities"]))
+"""
+
+            def limited_run(*flags: str) -> subprocess.CompletedProcess[str]:
+                def limit_file_size() -> None:
+                    resource.setrlimit(resource.RLIMIT_FSIZE, (512, 512))
+
+                environment = os.environ.copy()
+                # The defense environment is supplemental; the immutable
+                # dispatcher must still see the literal interpreter flag.
+                environment["PYTHONDONTWRITEBYTECODE"] = "1"
+                return subprocess.run(
+                    [
+                        "/usr/bin/python3.12",
+                        *flags,
+                        "-c",
+                        child,
+                        str(installed / "platform_workflow_remote_dispatch.py"),
+                        str(installed.parent),
+                    ],
+                    cwd=root,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                    preexec_fn=limit_file_size,
+                )
+
+            expected = (
+                f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
+                "dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 "
+                "python_isolated=1 python_bytecode_disabled=1\n"
+            )
+            bounded = limited_run("-I", "-B")
+            self.assertEqual(bounded.returncode, 0, bounded.stderr)
+            self.assertEqual(bounded.stdout, expected)
+            self.assertEqual(inventory(), before)
+            self.assertFalse(any(path.name == "__pycache__" for path in installed.rglob("*")))
+            self.assertFalse(any(path.suffix == ".pyc" for path in installed.rglob("*")))
+
+            # Omitting -B must be rejected before the sibling import can
+            # create a truncated pyc under the same tight file-size limit.
+            without_bytecode_flag = limited_run("-I")
+            self.assertEqual(without_bytecode_flag.returncode, 2)
+            self.assertEqual(inventory(), before)
+            self.assertFalse(any(path.name == "__pycache__" for path in installed.rglob("*")))
+            self.assertFalse(any(path.suffix == ".pyc" for path in installed.rglob("*")))
+
+            extra_directory = installed / "__pycache__"
+            extra_directory.mkdir()
+            self.assertEqual(limited_run("-I", "-B").returncode, 2)
+            extra_directory.rmdir()
+            self.assertEqual(inventory(), before)
 
     def test_artifact_metadata_binding_is_exact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -821,7 +919,7 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertEqual(
             len(
                 re.findall(
-                    r'^\s+"\$\{remote\[@\]\}" /usr/bin/python3\.12 -I '
+                    r'^\s+"\$\{remote\[@\]\}" /usr/bin/python3\.12 -I -B '
                     r'"\$HOST_TOOLS_DISPATCHER" host-capabilities$',
                     probe,
                     re.MULTILINE,
@@ -835,12 +933,43 @@ class HostToolsBundleTests(unittest.TestCase):
         self.assertIn(
             'expected_output="HOST_TOOLS schema=1 source_sha=$TARGET_SHA '
             'generation=$TARGET_SHA dispatcher=2 artifact_prepare=2 supervisor=2 '
-            'input_guard=1 python_isolated=1"',
+            'input_guard=1 python_isolated=1 python_bytecode_disabled=1"',
             probe,
         )
         self.assertIn('printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"', probe)
         self.assertNotIn("platform/tools/platform_workflow_remote_dispatch.py", probe)
         self.assertNotIn("platform_host_tools_bundle.py", probe)
+
+        # All trusted dispatcher call sites must carry both isolation flags;
+        # an isolated interpreter without -B can write a truncated pyc into
+        # an immutable/root-owned generation under a tight file-size limit.
+        invocation_sources = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml",
+            REPO_ROOT / ".github/workflows/platform-production-external-load.yml",
+            REPO_ROOT / ".github/workflows/platform-production-retained-load-cleanup.yml",
+            REPO_ROOT / ".github/workflows/platform-live-launch.yml",
+            TOOLS_ROOT / "platform_live_user_qa_trusted.sh",
+            TOOLS_ROOT / "platform_live_launch_trusted.sh",
+        )
+        for source_path in invocation_sources:
+            lines = source_path.read_text(encoding="utf-8").splitlines()
+            for index, line in enumerate(lines):
+                if "platform_workflow_remote_dispatch.py" not in line:
+                    continue
+                window = "\n".join(lines[max(0, index - 1) : index + 1])
+                if "python3.12" not in window:
+                    continue
+                self.assertIn("-I -B", window, source_path.name)
+            for line in lines:
+                if "python3.12" in line and "HOST_TOOLS_DISPATCHER" in line:
+                    self.assertIn("-I -B", line, source_path.name)
+            if source_path.name in {
+                "platform_live_user_qa_trusted.sh",
+                "platform_live_launch_trusted.sh",
+            }:
+                for line in lines:
+                    if '"$DISPATCHER"' in line and "python3.12" in line:
+                        self.assertIn("-I -B", line, source_path.name)
 
         expected = set(bundle.HOST_TOOL_FILES) | {"capabilities.txt", "manifest.json"}
         safe_name = re.compile(r"^[A-Za-z0-9_.-]+$")

@@ -524,7 +524,7 @@ jobs:
           IFS= read -r source_sha < "$contract_dir/source_sha"
           IFS= read -r toolset_version < "$contract_dir/toolset_version"
           test "$source_sha" = "$TARGET_SHA"
-          test "$toolset_version" = "production-host-tools-v1"
+          test "$toolset_version" = "production-host-tools-v2"
           IFS= read -r manifest_hash < "$contract_dir/manifest.sha256"
           IFS= read -r capabilities_hash < "$contract_dir/capabilities.sha256"
           [[ "$manifest_hash" =~ ^[0-9a-f]{64}$ ]]
@@ -591,14 +591,15 @@ jobs:
           test "$(/usr/bin/sha256sum "$inner_root/manifest.json" | cut -d' ' -f1)" = "$manifest_hash"
           test "$(/usr/bin/sha256sum "$inner_root/capabilities.txt" | cut -d' ' -f1)" = "$capabilities_hash"
           grep -Fqx "schema=1" "$inner_root/capabilities.txt"
-          grep -Fqx "toolset_version=production-host-tools-v1" "$inner_root/capabilities.txt"
+          grep -Fqx "toolset_version=production-host-tools-v2" "$inner_root/capabilities.txt"
           grep -Fqx "source_sha=$TARGET_SHA" "$inner_root/capabilities.txt"
           grep -Fqx "capability=production_deploy_control" "$inner_root/capabilities.txt"
           grep -Fqx "capability=python_isolated" "$inner_root/capabilities.txt"
+          grep -Fqx "capability=python_bytecode_disabled" "$inner_root/capabilities.txt"
           grep -Fqx '"schema":1,' "$inner_root/manifest.json" || grep -Fq '"schema":1' "$inner_root/manifest.json"
           grep -Fq "\"source_sha\":\"$TARGET_SHA\"" "$inner_root/manifest.json"
           grep -Fq "\"generation\":\"$TARGET_SHA\"" "$inner_root/manifest.json"
-          grep -Fq '"toolset_version":"production-host-tools-v1"' "$inner_root/manifest.json"
+          grep -Fq '"toolset_version":"production-host-tools-v2"' "$inner_root/manifest.json"
           expected_count=0
           while read -r expected_hash expected_path; do
             [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]
@@ -733,14 +734,14 @@ jobs:
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
           remote=(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
           probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
-          expected_output="HOST_TOOLS schema=1 source_sha=$TARGET_SHA generation=$TARGET_SHA dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1"
+          expected_output="HOST_TOOLS schema=1 source_sha=$TARGET_SHA generation=$TARGET_SHA dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"
           # The file-size limit bounds the captured stdout to one 512-byte
           # block. The dispatcher emits one short, fixed line; anything larger
           # fails closed instead of being retained or projected to logs.
           if ! (
             ulimit -f 1
             exec /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
-              "${remote[@]}" /usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" host-capabilities
+              "${remote[@]}" /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-capabilities
           ) > "$probe_output" 2>/dev/null < /dev/null; then
             echo "immutable host capability probe failed" >&2
             exit 1
@@ -1239,7 +1240,7 @@ jobs:
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
             -F "$PREFLIGHT_SSH_DIR/config" -i "$PREFLIGHT_SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            /usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" \
+            /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" \
             production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
@@ -1630,7 +1631,7 @@ jobs:
           }
           require_current_dev_head
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            /usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" production-prepare-artifact < "$input_path"
+            /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" production-prepare-artifact < "$input_path"
           scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_ARTIFACT" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
           scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_PROVENANCE" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
           scp -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$RELEASE_CHECKSUM" "$PROD_SSH_USER@$PROD_SSH_HOST:$ARTIFACT_REMOTE_DIR/"
@@ -1652,7 +1653,7 @@ jobs:
           umask 077; : > "$remote_log"; : > "$remote_error"; chmod 600 "$remote_log" "$remote_error"
           set +e
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -F "$SSH_DIR/config" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            /usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER" production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
+            /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
           public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport) release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"

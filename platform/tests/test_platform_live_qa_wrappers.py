@@ -79,6 +79,10 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         self.assertIn("platform_live_user_qa_dispatch.py verify", supervisor)
         self.assertIn("liveqa-[a-z0-9-]{6,56}", supervisor)
         self.assertIn("platform_provision_live_csp_qa.sh", supervisor)
+        self.assertEqual(
+            supervisor.count("/usr/bin/python3.12 -I -B - <<'PY'"),
+            1,
+        )
         self.assertIn("Provisioning requires a fresh liveqa marker", supervisor)
         self.assertNotIn("Refusing to replace the existing live QA bundle", source)
         self.assertIn("PLATFORM_LIVE_QA_INSTALL_ROOT", supervisor)
@@ -671,6 +675,43 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                     valid["mode"],
                     valid["artifact_remote_dir"],
                     valid["runtime_profile"],
+                ],
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            tools_root = Path(directory)
+            helper = tools_root / "platform_prepare_artifact_dir.py"
+            helper.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            helper.chmod(0o555)
+            stdin = TextIOWrapper(
+                BytesIO((json.dumps(valid) + "\n").encode("utf-8")),
+                encoding="utf-8",
+            )
+            with patch.object(platform_workflow_remote_dispatch.sys, "stdin", stdin), \
+                patch.object(platform_workflow_remote_dispatch, "ACTIVE_TOOLS_DIR", tools_root), \
+                patch.object(platform_workflow_remote_dispatch, "ARTIFACT_DIR_HELPER", helper), \
+                patch.object(platform_workflow_remote_dispatch, "_trusted_generation", return_value=True), \
+                patch.object(platform_workflow_remote_dispatch.sys, "executable", "/usr/bin/python3.12"), \
+                patch.object(
+                    platform_workflow_remote_dispatch.subprocess,
+                    "run",
+                    return_value=type("Result", (), {"returncode": 0})(),
+                ) as run:
+                self.assertEqual(
+                    platform_workflow_remote_dispatch.main(["production-prepare-artifact"]),
+                    0,
+                )
+            self.assertEqual(
+                run.call_args.args[0],
+                [
+                    "/usr/bin/sudo",
+                    "-n",
+                    "--",
+                    "/usr/bin/python3.12",
+                    "-I",
+                    "-B",
+                    str(helper),
+                    valid["artifact_remote_dir"],
                 ],
             )
 

@@ -46,7 +46,7 @@ if [[ -n "${PLATFORM_LIVE_CSP_ALLOW_LOOPBACK:-}" ]]; then
   exit 1
 fi
 
-GUARD=("$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_live_qa_guard.py")
+GUARD=("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_live_qa_guard.py")
 if [[ -z "${PLATFORM_LIVE_QA_LOCK_FD:-}" ]]; then
   LOCK_COMMAND="locked-exec"
   if (( $# == 2 )) && [[ "$1" == "recover" ]]; then
@@ -75,14 +75,14 @@ fi
   --bundle-path "$PLATFORM_LIVE_CSP_QA_BUNDLE" \
   --mode automated
 if (( TRUSTED_MODE == 1 )); then
-  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
+  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
 fi
 EXPECTED_LIVE_ORIGIN="$(
-  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" \
+  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" \
     print-public-value PLATFORM_WEB_ORIGIN
 )"
 EXPECTED_ENVIRONMENT="$(
-  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" \
+  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" \
     print-public-value PLATFORM_ENVIRONMENT
 )"
 if [[ "$EXPECTED_ENVIRONMENT" != "production" \

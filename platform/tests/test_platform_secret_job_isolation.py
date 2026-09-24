@@ -41,7 +41,7 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertNotRegex(jobs["build-release"], r"secrets\.PROD_SSH_")
         self.assertNotIn("environment: production", jobs["build-release"])
         self.assertIn("needs.host-capability-preflight.result == 'success'", jobs["preflight"])
-        self.assertIn('/usr/bin/python3.12 -I "$HOST_TOOLS_DISPATCHER"', jobs["preflight"])
+        self.assertIn('/usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER"', jobs["preflight"])
         self.assertNotIn("current/tools/platform_workflow_remote_dispatch.py", jobs["preflight"])
         self.assertIn("inputs.mode == 'deploy' || inputs.mode == 'preflight'", jobs["build-host-tools"])
         self.assertIn("inputs.mode == 'deploy' || inputs.mode == 'preflight'", jobs["host-capability-preflight"])

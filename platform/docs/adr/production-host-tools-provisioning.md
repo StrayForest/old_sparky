@@ -55,7 +55,11 @@ is fetched as bounded raw JSON and validated by the reviewed canonical verifier
 to a delimiter-encoded shell string.
 
 The release build is downstream of this gate.  The production consumer invokes
-only the exact immutable dispatcher path with `/usr/bin/python3.12 -I`:
+only the exact immutable dispatcher path with `/usr/bin/python3.12 -I -B`.
+Toolset v2 publishes the explicit `python_bytecode_disabled` capability.  The
+dispatcher also rejects a host-generation invocation that omits `-B` before
+loading its sibling guard, so a failed caller cannot leave a truncated
+`__pycache__` member in the generation:
 
 `/opt/oldsparky/platform/shared/host-tools/<target-sha>/platform_workflow_remote_dispatch.py`
 
@@ -114,13 +118,14 @@ staging and must leave the prior generation untouched.  The harmless post-copy
 self-test is the fixed installed entrypoint, with no candidate input:
 
 ```bash
-/usr/bin/python3.12 -I \
+/usr/bin/python3.12 -I -B \
   /opt/oldsparky/platform/shared/host-tools/$MERGE_SHA/platform_workflow_remote_dispatch.py \
   host-capabilities
 ```
 
-The self-test must print only the bounded `HOST_TOOLS schema=1 ...` contract
-and return zero.  A non-zero result, any metadata/digest mismatch or an
+The self-test must print only the bounded `HOST_TOOLS schema=1 ...` contract,
+including `python_bytecode_disabled=1`, and return zero.  It must not create
+`__pycache__` or `.pyc` entries.  A non-zero result, any metadata/digest mismatch or an
 interrupted staging action is a failed provisioning attempt: quarantine/remove
 only that identified incomplete staging/generation through the approved
 authority, retain the previous valid generation, record post-failure hashes and

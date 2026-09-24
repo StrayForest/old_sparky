@@ -464,7 +464,7 @@ EXPECTED_SNAPSHOT: Mapping[str, object] = {
 # registry so a future owner change must explain itself in the same change.
 CONTOUR_RATIONALE: Mapping[str, str] = {
     "backend-unit": "pure unit/domain/backend behavior without external operator resources",
-    "backend-tool-contract": "hermetic repository tools and contract tests without root-owned host state",
+    "backend-tool-contract": "hermetic repository tools, immutable host-tools bytecode/inventory and contract tests without root-owned host state",
     "backend-integration": "PostgreSQL/Redis workflows and concurrency behavior",
     "backend-privileged": "root/service-identity, release/install/systemd, artifact ownership and privileged wrappers",
     "performance-contract": "deterministic load, observer and acceptance contracts",

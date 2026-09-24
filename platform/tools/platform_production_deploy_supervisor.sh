@@ -6,6 +6,10 @@ set +x
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# Explicit ``-B`` flags below are the primary contract.  Keep this defense
+# for nested non-isolated helpers as well, so no Python child writes into the
+# root-owned immutable generation.
+export PYTHONDONTWRITEBYTECODE=1
 
 invalid_input() {
   printf '%s\n' 'ERROR: deployment input is invalid' >&2
@@ -189,13 +193,13 @@ artifact_slug="${artifact_name%.tar.gz}"
   || fail "CI release artifact digest mismatch"
 bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"
 chmod 0700 "$bootstrap_dir"
-"$host_tools_dir/platform_validate_release_artifact.py" \
+/usr/bin/python3 -I -B "$host_tools_dir/platform_validate_release_artifact.py" \
   --artifact "$artifact_path" \
   --checksum "$artifact_checksum" \
   --release-slug "$artifact_slug" \
   --extract-to "$bootstrap_dir" \
   || fail "CI release artifact provenance is invalid"
-if ! /usr/bin/python3 - "$artifact_path" "$artifact_slug" "$target_sha" "$provenance_path" <<'PY'
+if ! /usr/bin/python3 -I -B - "$artifact_path" "$artifact_slug" "$target_sha" "$provenance_path" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -251,7 +255,7 @@ if (( candidate_status != 0 )); then
     printf '{"schema":1,"kind":"candidate_activation_failure","status":"failed","error_class":"activation","exit_status":%s,"target_sha":"%s"}\n' \
       "$candidate_status" "$target_sha"
     printf 'state=held\n' \
-      | /usr/bin/python3 -I "$storage_summary_tool" --mode lock
+      | /usr/bin/python3 -I -B "$storage_summary_tool" --mode lock
     emit_candidate_disk() {
       local category="$1"
       local path="$2"
@@ -259,12 +263,12 @@ if (( candidate_status != 0 )); then
       disk_output="$(df -B1 --output=size,used,avail,pcent -- "$path" 2>/dev/null)" \
         || return 1
       printf '%s\n' "$disk_output" \
-        | /usr/bin/python3 -I "$storage_summary_tool" --mode df --category "$category" \
+        | /usr/bin/python3 -I -B "$storage_summary_tool" --mode df --category "$category" \
         || return 1
       inode_output="$(df --output=iused,iavail,ipcent -- "$path" 2>/dev/null)" \
         || return 1
       printf '%s\n' "$inode_output" \
-        | /usr/bin/python3 -I "$storage_summary_tool" --mode inode --category "$category" \
+        | /usr/bin/python3 -I -B "$storage_summary_tool" --mode inode --category "$category" \
         || return 1
     }
     emit_candidate_disk root /
@@ -278,7 +282,7 @@ if (( candidate_status != 0 )); then
         --no-pager 2>/dev/null)" \
         || return 1
       printf '%s\n' "$service_output" \
-        | /usr/bin/python3 -I "$storage_summary_tool" --mode service --service "$service" \
+        | /usr/bin/python3 -I -B "$storage_summary_tool" --mode service --service "$service" \
         || return 1
     done
   }
@@ -296,7 +300,7 @@ platform_release_lock_supervisor_holds \
 
 case "$runtime_profile" in
   baseline)
-    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile baseline \
@@ -358,7 +362,7 @@ case "$runtime_profile" in
         --only PLATFORM_PERF_LOG_MUTATIONS
       )
     fi
-    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -401,7 +405,7 @@ case "$runtime_profile" in
           --only PLATFORM_PERF_LOG_MUTATIONS
         )
       fi
-      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -423,7 +427,7 @@ case "$runtime_profile" in
     fi
     ;;
   ready-vote-adaptive-v2)
-    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -454,7 +458,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile ready-vote-static-8 \
@@ -494,7 +498,7 @@ case "$runtime_profile" in
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
       --only PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED
     )
-    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -507,7 +511,7 @@ case "$runtime_profile" in
     grep -qx 'PLATFORM_PERF_AUTH_BOOTSTRAP_LOG_ENABLED=true' "$api_env" \
       || fail "web SSR diagnostic API auth bootstrap log gate is not enabled"
     if ! restart_api_and_wait; then
-      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -528,7 +532,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$web_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -552,7 +556,7 @@ case "$runtime_profile" in
     fi
     ;;
   web-ssr-native-transport)
-    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -560,7 +564,7 @@ case "$runtime_profile" in
     restart_web_and_wait
     ;;
   web-ssr-workers-2)
-    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -591,7 +595,7 @@ case "$runtime_profile" in
       --only PLATFORM_SSR_PERF_SAMPLE_RATE
       --only PLATFORM_SSR_PERF_EVENT_LOOP_INTERVAL_SECONDS
     )
-    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile "$runtime_profile" \
@@ -608,7 +612,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -630,7 +634,7 @@ case "$runtime_profile" in
     fi
     ;;
   api-3x16)
-    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile api-3x16 \
@@ -653,7 +657,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \
@@ -681,7 +685,7 @@ case "$runtime_profile" in
     fi
     ;;
   api-1x48)
-    "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+    "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
       --apply \
       --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
       --profile api-1x48 \
@@ -704,7 +708,7 @@ case "$runtime_profile" in
       sleep 1
     done
     if [[ "$api_ready" != true ]]; then
-      "$runtime/shared/venv/bin/python" "$host_tools_dir/platform_configure_shared_env.py" \
+      "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \
         --apply \
         --confirm APPLY_PUBLIC_PRODUCTION_BASELINE \
         --profile baseline \

@@ -58,7 +58,7 @@ if (( $# != 0 )) && ! { (( $# == 2 )) \
   exit 2
 fi
 
-GUARD=("$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_live_qa_guard.py")
+GUARD=("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_live_qa_guard.py")
 if [[ -z "${PLATFORM_LIVE_QA_LOCK_FD:-}" ]]; then
   LOCK_COMMAND="locked-exec"
   if (( $# == 2 )) && [[ "$1" == "recover" || "$1" == "recover-setup" ]]; then
@@ -77,7 +77,7 @@ if (( TRUSTED_MODE == 1 )); then
     echo "Trusted live-user QA requires an exact installed source SHA." >&2
     exit 1
   fi
-  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
+  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
 else
   SOURCE_COMMIT="$(
     "${GUARD[@]}" verify-provenance \
@@ -87,11 +87,11 @@ else
 fi
 
 EXPECTED_LIVE_ORIGIN="$(
-  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" \
+  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" \
     print-public-value PLATFORM_WEB_ORIGIN
 )"
 EXPECTED_ENVIRONMENT="$(
-  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" \
+  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" \
     print-public-value PLATFORM_ENVIRONMENT
 )"
 if [[ "$EXPECTED_ENVIRONMENT" != "production" \
@@ -106,7 +106,7 @@ if [[ -n "${PLAYWRIGHT_LIVE_BASE_URL:-}" \
 fi
 
 safe_database_python() {
-  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
     --pythonpath "$PLATFORM_ROOT" \
     -- "$QA_PYTHON" "$@"
 }

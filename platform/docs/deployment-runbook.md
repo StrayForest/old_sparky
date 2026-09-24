@@ -70,7 +70,9 @@ to `dev`. The chain is:
    `/opt/oldsparky/platform/shared/host-tools/<TARGET_SHA>` generation. It
    requires the configured SSH identity to be root and checks the generation's
    owner, mode, link count, type, capabilities and every digest with fixed
-   absolute tools. This is a read-only gate: it never SCPs or executes the
+   absolute tools. The v2 capability contract requires
+   `python_bytecode_disabled=1`; every immutable dispatcher call uses
+   `/usr/bin/python3.12 -I -B`. This is a read-only gate: it never SCPs or executes the
    bundle and fails before release build, attestation, pending status or
    production artifact transfer when the generation is absent or mismatched.
    The artifact API binding uses its ID, name, run ID, source SHA and digest;

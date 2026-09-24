@@ -64,7 +64,7 @@ if [[ -n "$previous" || -z "$BUNDLE_PATH" || -z "$HELPER_PATH" \
   exit 2
 fi
 
-GUARD=("$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_live_qa_guard.py")
+GUARD=("$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_live_qa_guard.py")
 if [[ -z "${PLATFORM_LIVE_QA_LOCK_FD:-}" ]]; then
   exec "${GUARD[@]}" locked-exec \
     --bundle-path "$BUNDLE_PATH" \
@@ -81,11 +81,11 @@ else
   "${GUARD[@]}" preflight \
     --bundle-path "$BUNDLE_PATH" \
     --mode provision
-  "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
+  "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" validate-runtime
 fi
 
 cd "$PLATFORM_ROOT"
-exec "$SYSTEM_PYTHON" -I "$TOOLS_DIR/platform_safe_env_exec.py" exec \
+exec "$SYSTEM_PYTHON" -I -B "$TOOLS_DIR/platform_safe_env_exec.py" exec \
   --pythonpath "$PLATFORM_ROOT" \
   -- "$QA_PYTHON" "$TOOLS_DIR/platform_provision_live_csp_qa.py" \
   provision "$@"

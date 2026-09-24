@@ -3,6 +3,7 @@ set +x
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PYTHONDONTWRITEBYTECODE=1
 
 # This supervisor is copied into the digest-bound live-QA generation.  It is
 # never executed from a source checkout or active release tools directory.
@@ -73,11 +74,11 @@ done
 # The runtime verifier is the only operation that reads the active generation
 # manifest here; it is root-installed in the same generation and its output is
 # deliberately discarded.  This protects direct/replayed supervisor calls.
-/usr/bin/python3.12 -I \
+/usr/bin/python3.12 -I -B \
   /root/.oldsparky/liveqa/platform_live_user_qa_dispatch.py verify "$target_sha"
 
 identity_report() {
-  /usr/bin/python3.12 - <<'PY'
+  /usr/bin/python3.12 -I -B - <<'PY'
 import grp
 import json
 import pwd
