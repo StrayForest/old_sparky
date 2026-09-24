@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import stat
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 
@@ -26,6 +29,84 @@ class SafeEnvExecTests(unittest.TestCase):
         "/root/.oldsparky/liveqa/releases/"
         "0123456789abcdef0123456789abcdef01234567"
     )
+
+    @contextmanager
+    def active_payload_fixture(self, *, file_count: int = 0):
+        with tempfile.TemporaryDirectory(dir="/root") as temporary:
+            root = Path(temporary)
+            production = root / "production"
+            production_releases = production / "releases"
+            production_release = production_releases / "release-under-test"
+            production_release.mkdir(mode=0o755, parents=True)
+            production_releases.mkdir(mode=0o755, exist_ok=True)
+            os.chmod(production_releases, 0o755)
+            (production_release / "RELEASE.json").write_text(
+                json.dumps({"source_git_commit": "a" * 40}) + "\n",
+                encoding="ascii",
+            )
+            os.chmod(production_release / "RELEASE.json", 0o444)
+            (production / "current").symlink_to(production_release)
+
+            trusted = root / "liveqa"
+            payload_root = trusted / "releases"
+            payload = payload_root / ("a" * 40)
+            payload.mkdir(mode=0o555, parents=True)
+            files: dict[str, str] = {}
+            for index in range(file_count):
+                relative = f"manifest-files/entry-{index:04d}-{'x' * 70}"
+                path = payload / relative
+                path.parent.mkdir(mode=0o555, exist_ok=True)
+                path.write_bytes(b"x")
+                os.chmod(path.parent, 0o555)
+                os.chmod(path, 0o444)
+                files[relative] = hashlib.sha256(b"x").hexdigest()
+            os.chmod(payload, 0o555)
+            payload_tree_digest = hashlib.sha256()
+            for path in sorted(payload.rglob("*")):
+                relative = path.relative_to(payload).as_posix()
+                metadata = path.lstat()
+                payload_tree_digest.update(relative.encode("utf-8") + b"\0")
+                if stat.S_ISDIR(metadata.st_mode):
+                    payload_tree_digest.update(b"d\0")
+                else:
+                    payload_tree_digest.update(
+                        b"f\0" + bytes.fromhex(files[relative])
+                    )
+
+            trusted.mkdir(mode=0o700, exist_ok=True)
+            os.chmod(trusted, 0o700)
+            os.chmod(payload_root, 0o755)
+            (trusted / "active").symlink_to(f"releases/{'a' * 40}")
+            manifest = trusted / "active-manifest.json"
+            manifest.write_bytes(
+                (
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "source_sha": "a" * 40,
+                            "release_slug": "release-under-test",
+                            "payload": str(payload),
+                            "payload_tree_sha256": payload_tree_digest.hexdigest(),
+                            "files": files,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("ascii")
+            )
+            os.chown(manifest, 0, 0)
+            os.chmod(manifest, 0o444)
+            with mock.patch.multiple(
+                safe_env,
+                PRODUCTION_RUNTIME_ROOT=production,
+                ACTIVE_PLATFORM_ROOT=production / "current",
+                LIVE_QA_ROOT=trusted,
+                LIVE_QA_RELEASE_ROOT=payload_root,
+                LIVE_QA_ACTIVE_MANIFEST=manifest,
+                LIVE_QA_ACTIVE_POINTER=trusted / "active",
+            ):
+                yield manifest, payload
 
     def test_production_path_requires_root_owned_fixed_components(self) -> None:
         self.assertEqual(safe_env._production_component_owners(), (0, 0, 0, 0, 0))
@@ -190,6 +271,63 @@ class SafeEnvExecTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(safe_env.SafeEnvError, "metadata is unsafe"):
             safe_env._validate_env_file(metadata)
+
+    def test_active_manifest_between_release_and_active_bounds_is_accepted(self) -> None:
+        with self.active_payload_fixture(file_count=900) as (manifest, _payload):
+            self.assertGreater(manifest.stat().st_size, safe_env.MAX_RELEASE_JSON_BYTES)
+            self.assertLessEqual(manifest.stat().st_size, safe_env.MAX_ACTIVE_MANIFEST_BYTES)
+            payload = safe_env._read_liveqa_manifest()
+            self.assertEqual(payload["source_sha"], "a" * 40)
+
+    def test_active_manifest_over_active_bound_is_rejected(self) -> None:
+        with self.active_payload_fixture(file_count=3200) as (manifest, _payload):
+            self.assertGreater(manifest.stat().st_size, safe_env.MAX_ACTIVE_MANIFEST_BYTES)
+            with self.assertRaisesRegex(safe_env.SafeEnvError, "size limit|metadata is unsafe"):
+                safe_env._read_liveqa_manifest()
+
+    def test_active_manifest_rejects_symlink_hardlink_and_wrong_mode(self) -> None:
+        with self.active_payload_fixture(file_count=1) as (manifest, _payload):
+            replacement = manifest.with_name("replacement.json")
+            replacement.write_bytes(manifest.read_bytes())
+            os.chmod(replacement, 0o444)
+            manifest.unlink()
+            manifest.symlink_to(replacement)
+            with self.assertRaisesRegex(safe_env.SafeEnvError, "metadata is unsafe"):
+                safe_env._read_liveqa_manifest()
+
+        with self.active_payload_fixture(file_count=1) as (manifest, _payload):
+            os.link(manifest, manifest.with_name("second-link"))
+            with self.assertRaisesRegex(safe_env.SafeEnvError, "metadata is unsafe"):
+                safe_env._read_liveqa_manifest()
+
+        with self.active_payload_fixture(file_count=1) as (manifest, _payload):
+            os.chmod(manifest, 0o644)
+            with self.assertRaisesRegex(safe_env.SafeEnvError, "metadata is unsafe"):
+                safe_env._read_liveqa_manifest()
+
+    def test_active_manifest_rejects_deterministic_replacement_before_open(self) -> None:
+        with self.active_payload_fixture(file_count=1) as (manifest, _payload):
+            replacement = manifest.with_name("replacement.json")
+            replacement.write_bytes(manifest.read_bytes())
+            os.chmod(replacement, 0o444)
+            real_open = os.open
+
+            def replace_before_open(path, flags, *args, **kwargs):
+                if Path(path) == manifest:
+                    os.replace(replacement, manifest)
+                return real_open(path, flags, *args, **kwargs)
+
+            with (
+                mock.patch.object(safe_env.os, "open", side_effect=replace_before_open),
+                self.assertRaisesRegex(safe_env.SafeEnvError, "changed while opening"),
+            ):
+                safe_env._read_liveqa_manifest()
+
+    def test_active_manifest_source_contract_uses_bounded_descriptor_reader(self) -> None:
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("LIVE_QA_ACTIVE_MANIFEST.read_text", source)
+        self.assertIn("O_NOFOLLOW", source)
+        self.assertIn("os.fstat(descriptor)", source)
 
 
 if __name__ == "__main__":

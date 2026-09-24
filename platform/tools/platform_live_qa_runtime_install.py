@@ -51,7 +51,9 @@ ENTRYPOINT_TEMP_PATTERN = re.compile(
 )
 MANIFEST_TEMP_PATTERN = re.compile(r"^\.active-manifest\.json\.[0-9a-f]{32}\.tmp$")
 POINTER_TEMP_PATTERN = re.compile(r"^\.active\.[0-9a-f]{32}\.tmp$")
-MAX_MANIFEST_BYTES = 256 * 1024
+MAX_RELEASE_JSON_BYTES = 64 * 1024
+MAX_RUNTIME_MANIFEST_BYTES = 256 * 1024
+MAX_ACTIVE_MANIFEST_BYTES = 256 * 1024
 MAX_FILE_BYTES = 768 * 1024 * 1024
 MAX_RUNTIME_BYTES = 2 * 1024 * 1024 * 1024
 MAX_FILES = 200_000
@@ -222,6 +224,24 @@ def _regular(
     allow_sandbox: bool = False,
 ) -> os.stat_result:
     metadata = _metadata(path)
+    _validate_regular_metadata(
+        path,
+        metadata,
+        mode=mode,
+        maximum=maximum,
+        allow_sandbox=allow_sandbox,
+    )
+    return metadata
+
+
+def _validate_regular_metadata(
+    path: Path,
+    metadata: os.stat_result,
+    *,
+    mode: int | None = None,
+    maximum: int = MAX_FILE_BYTES,
+    allow_sandbox: bool = False,
+) -> None:
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
@@ -241,7 +261,63 @@ def _regular(
         or metadata.st_size > maximum
     ):
         raise InstallerError("trusted live-QA file metadata is unsafe")
-    return metadata
+
+
+def _file_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_bounded_regular(
+    path: Path,
+    *,
+    metadata: os.stat_result,
+    maximum: int,
+    mode: int | None = None,
+) -> bytes:
+    """Read a root-owned regular file through an identity-bound descriptor."""
+
+    _validate_regular_metadata(path, metadata, mode=mode, maximum=maximum)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise InstallerError("trusted live-QA file is unavailable or unsafe") from exc
+    try:
+        try:
+            opened = os.fstat(descriptor)
+            _validate_regular_metadata(path, opened, mode=mode, maximum=maximum)
+            if _file_fingerprint(opened) != _file_fingerprint(metadata):
+                raise InstallerError("trusted live-QA file changed while opening")
+            chunks: list[bytes] = []
+            remaining = maximum + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            _validate_regular_metadata(path, after, mode=mode, maximum=maximum)
+        except OSError as exc:
+            raise InstallerError("trusted live-QA file is unavailable or unsafe") from exc
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    if len(raw) > maximum:
+        raise InstallerError("trusted live-QA file exceeds its size bound")
+    if _file_fingerprint(after) != _file_fingerprint(opened):
+        raise InstallerError("trusted live-QA file changed while reading")
+    return raw
 
 
 def _sandbox_digest(path: Path) -> str:
@@ -320,9 +396,18 @@ def _safe_release(app_dir: Path, release: Path) -> tuple[Path, str, str]:
         raise InstallerError("release slug is invalid")
     _directory(resolved)
     release_json = resolved / "RELEASE.json"
-    _regular(release_json, maximum=MAX_MANIFEST_BYTES)
+    release_json_metadata = _regular(
+        release_json,
+        maximum=MAX_RELEASE_JSON_BYTES,
+    )
     try:
-        payload = json.loads(release_json.read_text(encoding="ascii"))
+        payload = json.loads(
+            _read_bounded_regular(
+                release_json,
+                metadata=release_json_metadata,
+                maximum=MAX_RELEASE_JSON_BYTES,
+            ).decode("ascii")
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise InstallerError("release metadata is invalid") from exc
     source_sha = payload.get("source_git_commit") if isinstance(payload, dict) else None
@@ -597,10 +682,19 @@ def _validate_runtime_source(root: Path) -> None:
             ) or "/node_modules/" in package_relative:
                 raise InstallerError("live-QA runtime contains an unreviewed web member")
     manifest_path = root / RUNTIME_MANIFEST_RELATIVE
-    _regular(manifest_path, mode=0o444, maximum=MAX_MANIFEST_BYTES)
+    manifest_metadata = _regular(
+        manifest_path,
+        mode=0o444,
+        maximum=MAX_RUNTIME_MANIFEST_BYTES,
+    )
     try:
         manifest = json.loads(
-            manifest_path.read_text(encoding="ascii"),
+            _read_bounded_regular(
+                manifest_path,
+                metadata=manifest_metadata,
+                maximum=MAX_RUNTIME_MANIFEST_BYTES,
+                mode=0o444,
+            ).decode("ascii"),
             object_pairs_hook=_strict_object,
         )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -654,7 +748,7 @@ def _normalize_tree(root: Path) -> None:
 
 def _write_manifest(path: Path, payload: dict[str, object], *, mode: int = 0o444) -> None:
     raw = (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
-    if len(raw) > MAX_MANIFEST_BYTES:
+    if len(raw) > MAX_ACTIVE_MANIFEST_BYTES:
         raise InstallerError("trusted live-QA manifest exceeds its bound")
     temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
     descriptor = os.open(
@@ -680,11 +774,19 @@ def _write_manifest(path: Path, payload: dict[str, object], *, mode: int = 0o444
 
 def _read_manifest() -> dict[str, object]:
     _trusted_chain(TRUSTED_ROOT)
-    metadata = _regular(ACTIVE_MANIFEST, mode=0o444, maximum=MAX_MANIFEST_BYTES)
-    del metadata
+    metadata = _regular(
+        ACTIVE_MANIFEST,
+        mode=0o444,
+        maximum=MAX_ACTIVE_MANIFEST_BYTES,
+    )
     try:
         payload = json.loads(
-            ACTIVE_MANIFEST.read_text(encoding="ascii"),
+            _read_bounded_regular(
+                ACTIVE_MANIFEST,
+                metadata=metadata,
+                maximum=MAX_ACTIVE_MANIFEST_BYTES,
+                mode=0o444,
+            ).decode("ascii"),
             object_pairs_hook=_strict_object,
         )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -824,7 +926,7 @@ def _cleanup_temporary_files() -> int:
             if not stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0:
                 raise InstallerError("interrupted trusted live-QA pointer is unsafe")
         else:
-            _regular(entry, maximum=MAX_MANIFEST_BYTES)
+            _regular(entry, maximum=MAX_ACTIVE_MANIFEST_BYTES)
         os.unlink(entry)
         removed += 1
     if removed:
@@ -1053,7 +1155,7 @@ def install(app_dir: Path, release: Path) -> dict[str, object]:
         for temporary in temporary_paths:
             try:
                 if os.path.lexists(temporary):
-                    _regular(temporary, maximum=MAX_MANIFEST_BYTES)
+                    _regular(temporary, maximum=MAX_ACTIVE_MANIFEST_BYTES)
                     os.unlink(temporary)
             except (OSError, InstallerError):
                 # A replacement or unexpected object is never followed or

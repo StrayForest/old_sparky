@@ -341,6 +341,57 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         ):
             validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
 
+    def test_manifest_reader_bounds_and_descriptor_contracts_are_partitioned(self) -> None:
+        self.assertEqual(validator.MAX_RELEASE_JSON_BYTES, 64 * 1024)
+        self.assertEqual(
+            validator.MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES,
+            256 * 1024,
+        )
+        self.assertEqual(platform_safe_env_exec.MAX_RELEASE_JSON_BYTES, 64 * 1024)
+        self.assertEqual(
+            platform_safe_env_exec.MAX_ACTIVE_MANIFEST_BYTES,
+            256 * 1024,
+        )
+        self.assertEqual(
+            platform_live_qa_runtime_install.MAX_RELEASE_JSON_BYTES,
+            64 * 1024,
+        )
+        self.assertEqual(
+            platform_live_qa_runtime_install.MAX_RUNTIME_MANIFEST_BYTES,
+            256 * 1024,
+        )
+        self.assertEqual(
+            platform_live_qa_runtime_install.MAX_ACTIVE_MANIFEST_BYTES,
+            256 * 1024,
+        )
+        self.assertEqual(
+            platform_live_user_qa_dispatch.MAX_RELEASE_JSON_BYTES,
+            64 * 1024,
+        )
+        self.assertEqual(
+            platform_live_user_qa_dispatch.MAX_ACTIVE_MANIFEST_BYTES,
+            256 * 1024,
+        )
+        safe_env_source = (
+            REPO_ROOT / "platform/tools/platform_safe_env_exec.py"
+        ).read_text(encoding="utf-8")
+        installer_source = (
+            REPO_ROOT / "platform/tools/platform_live_qa_runtime_install.py"
+        ).read_text(encoding="utf-8")
+        dispatch_source = (
+            REPO_ROOT / "platform/tools/platform_live_user_qa_dispatch.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("LIVE_QA_ACTIVE_MANIFEST.read_text", safe_env_source)
+        self.assertNotIn("manifest_path.read_text", installer_source)
+        self.assertNotIn("ACTIVE_MANIFEST.read_text", installer_source)
+        self.assertNotIn("release_json.read_text", installer_source)
+        self.assertNotIn("ACTIVE_MANIFEST.read_text", dispatch_source)
+        self.assertNotIn("release_json.read_text", dispatch_source)
+        self.assertNotIn("BUNDLE.read_text", dispatch_source)
+        for source in (safe_env_source, installer_source, dispatch_source):
+            self.assertIn("O_NOFOLLOW", source)
+            self.assertIn("os.fstat(descriptor)", source)
+
     def test_cli_checks_checksum_before_archive_parsing(self) -> None:
         artifact = self.root / f"{RELEASE_SLUG}.tar.gz"
         artifact.write_bytes(b"not a tar")
