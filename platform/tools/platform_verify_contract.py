@@ -419,17 +419,25 @@ def _production_job_secret_names(job_block: str) -> set[str]:
 def _production_secret_scope_issues(production_text: str) -> list[str]:
     """Verify the immutable-candidate to secret-bearing production DAG.
 
-    The release artifact is constructed in a separate, non-environment job.
-    The production job is an artifact consumer only: it receives the
-    production environment and SSH secrets, but never checks out or executes
-    candidate source. Keep these checks textual and dependency-free so the
-    contract can run before any CI environment is provisioned.
+    The classifier artifact is validated in a separate, secret-free job before
+    the release build. The release artifact is constructed in a separate,
+    non-environment job. The production job is an artifact consumer only: it
+    receives the production environment and SSH secrets, but checks out only
+    the immutable trusted validator source and never candidate source. Keep
+    these checks textual and dependency-free so the contract can run before
+    any CI environment is provisioned.
     """
 
     issues: list[str] = []
     jobs = {
         job_id: _workflow_job_block(production_text, job_id)
-        for job_id in ("validate-dispatch", "build-release", "preflight", "production")
+        for job_id in (
+            "validate-dispatch",
+            "validate-classifier",
+            "build-release",
+            "preflight",
+            "production",
+        )
     }
     for job_id, job in jobs.items():
         if not job:
@@ -438,6 +446,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         return issues
 
     validator = jobs["validate-dispatch"]
+    classifier = jobs["validate-classifier"]
     build = jobs["build-release"]
     production = jobs["production"]
 
@@ -450,12 +459,30 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("deployment dispatch validation must create the canonical handoff")
         if 'case "$DEPLOY_MODE" in' not in validator:
             issues.append("deployment dispatch validation must validate mode before branches")
-    for branch in ("build-release", "preflight", "production"):
+    for branch in ("validate-classifier", "build-release", "preflight", "production"):
         branch_job = jobs[branch]
         if branch_job and "needs: validate-dispatch" not in branch_job and "- validate-dispatch" not in branch_job:
             issues.append(f"production deploy {branch} job must depend on dispatch validation")
         if branch_job and "needs.validate-dispatch.result == 'success'" not in branch_job:
             issues.append(f"production deploy {branch} job must propagate dispatch-validation failure")
+
+    if classifier:
+        if "actions/checkout@" not in classifier:
+            issues.append("classifier prerequisite must checkout the trusted validator")
+        if "platform_production_classifier_artifact.py" not in classifier:
+            issues.append("classifier prerequisite must invoke the canonical parser")
+        if "ref: ${{ steps.trusted_classifier_default.outputs.sha }}" not in classifier:
+            issues.append("classifier prerequisite must pin validator checkout to trusted dev SHA")
+        if "ref: ${{ env.TARGET_SHA }}" in classifier:
+            issues.append("classifier prerequisite must not checkout candidate source")
+        if "environment: production" in classifier or _production_job_secret_names(classifier):
+            issues.append("classifier prerequisite must be secret-free")
+        if "--max-filesize 4194304" not in classifier:
+            issues.append("classifier prerequisite API reads must be bounded")
+        if "if: ${{ always() }}" not in classifier or "Remove trusted classifier validator" not in classifier:
+            issues.append("classifier prerequisite must cleanup its trusted checkout")
+    elif jobs["build-release"]:
+        issues.append("classifier prerequisite job is required before candidate build")
 
     # Candidate checkout/build/publish belongs only to a fresh, non-secret job.
     if build:
@@ -498,6 +525,10 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             issues.append("candidate build job artifact name must be bound to this run")
         if "if: ${{ always() }}" not in build or "Remove candidate build tree" not in build:
             issues.append("candidate build job must always remove its build tree")
+        if "- validate-classifier" not in build:
+            issues.append("candidate build job must depend on classifier validation")
+        if "needs.validate-classifier.result == 'success'" not in build:
+            issues.append("candidate build job must require successful classifier validation")
 
     job_env = re.search(
         r"^    env:\n(?P<body>.*?)(?=^    steps:\n)",
@@ -509,8 +540,12 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
 
     if "environment: production" not in production:
         issues.append("production deploy job must own the production environment")
-    if "actions/checkout@" in production:
+    if "ref: ${{ env.TARGET_SHA }}" in production:
         issues.append("production secret job must not checkout candidate source")
+    if "ref: ${{ steps.trusted_classifier_default.outputs.sha }}" not in production:
+        issues.append("production secret job must checkout only the trusted validator")
+    if "platform_production_classifier_artifact.py" not in production:
+        issues.append("production secret job must invoke the canonical classifier parser")
     candidate_markers = (
         "platform_build_release.sh",
         "platform_build_release.py",
@@ -528,11 +563,12 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
     # The production consumer must wait for both validation and a successful
     # candidate build. A skipped or failed build must never become a deploy.
     production_needs = _workflow_job_needs(production)
-    for dependency in ("validate-dispatch", "build-release"):
+    for dependency in ("validate-dispatch", "validate-classifier", "build-release"):
         if dependency not in production_needs:
             issues.append(f"production deploy job must need {dependency}")
     for expression in (
         "needs.validate-dispatch.result == 'success'",
+        "needs.validate-classifier.result == 'success'",
         "needs.build-release.result == 'success'",
         "inputs.mode == 'deploy'",
     ):
@@ -1497,8 +1533,10 @@ def collect_issues() -> list[str]:
     for marker in ("classifier_run_id", "classifier_run_attempt"):
         if marker not in auto_text or marker not in production_text:
             issues.append(f"exact classifier provenance input is missing: {marker}")
-    if "require_deployable" not in production_text:
-        issues.append("production deploy must independently require a deployable classifier route")
+    if "platform_production_classifier_artifact.py" not in production_text:
+        issues.append("production deploy must independently invoke the canonical classifier parser")
+    if "manifest \"$route_dir/artifact.zip\" --target-sha \"$TARGET_SHA\"" not in production_text:
+        issues.append("production deploy must revalidate the exact classifier manifest before writes")
 
     if not GOVERNANCE_DOC.is_file():
         issues.append("test-suite-governance.md is missing")

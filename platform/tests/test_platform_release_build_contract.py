@@ -679,6 +679,388 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             workflow.index("Mark production deployment pending"),
         )
 
+    def test_production_classifier_artifact_reader_is_data_only_and_bounded(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text()
+        tool = TOOLS_DIR / "platform_production_classifier_artifact.py"
+        self.assertTrue(tool.is_file())
+        self.assertIn("platform_production_classifier_artifact.py", workflow)
+        self.assertIn("trusted_classifier_default.outputs.sha", workflow)
+        self.assertIn("validate-classifier", workflow)
+        prerequisite = workflow_job(workflow, "validate-classifier")
+        build = workflow_job(workflow, "build-release")
+        production = workflow_job(workflow, "production")
+        self.assertIn("platform_production_classifier_artifact.py", prerequisite)
+        self.assertIn("platform_production_classifier_artifact.py", production)
+        self.assertIn("- validate-classifier", build)
+        self.assertIn("- validate-classifier", production)
+        self.assertIn("needs.validate-classifier.result == 'success'", build)
+        self.assertIn("needs.validate-classifier.result == 'success'", production)
+        self.assertNotIn("env.TARGET_SHA", prerequisite)
+        self.assertNotIn("env.TARGET_SHA", production)
+        self.assertNotIn("self-contained bounded extractor", production)
+        self.assertNotIn('/usr/bin/python3 "$artifacts_metadata"', workflow)
+        self.assertIn("/usr/bin/python3 \"$trusted_tool\" metadata", workflow)
+        self.assertIn("/usr/bin/python3 \"$trusted_tool\" manifest", workflow)
+
+        target_sha = "a" * 40
+        expected_name = "platform-ci-route-123-1"
+        selected = {
+            "id": 42,
+            "name": expected_name,
+            "expired": False,
+            "workflow_run": {
+                "id": 123,
+                "head_branch": "dev",
+                "head_sha": target_sha,
+                "run_attempt": 1,
+            },
+        }
+        expired = {
+            "id": 43,
+            "name": "platform-backend-aggregate-123-1",
+            "expired": True,
+            "workflow_run": {
+                "id": 123,
+                "head_branch": "dev",
+                "head_sha": target_sha,
+            },
+        }
+
+        def run_tool(
+            *arguments: str,
+            environment: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            child_environment = os.environ.copy()
+            if environment is not None:
+                child_environment.update(environment)
+            return subprocess.run(
+                ["/usr/bin/python3", str(tool), *arguments],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+                env=child_environment,
+            )
+
+        def write_page(directory: Path, payload: object, *, raw: bytes | None = None) -> None:
+            directory.mkdir(mode=0o700, exist_ok=True)
+            path = directory / "page-1.json"
+            path.write_bytes(
+                json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                if raw is None
+                else raw
+            )
+            os.chmod(path, 0o600)
+
+        def metadata_tree(
+            *,
+            first_payload: object,
+            second_payload: object | None = None,
+            first_raw: bytes | None = None,
+            second_raw: bytes | None = None,
+        ) -> tuple[Path, Path, tempfile.TemporaryDirectory[str]]:
+            temporary = tempfile.TemporaryDirectory()
+            root = Path(temporary.name)
+            write_page(root / "first", first_payload, raw=first_raw)
+            write_page(
+                root / "second",
+                first_payload if second_payload is None else second_payload,
+                raw=second_raw,
+            )
+            return root / "first", root / "second", temporary
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            valid_payload = {"total_count": 2, "artifacts": [selected, expired]}
+            first_pages, second_pages, owned = metadata_tree(
+                first_payload=valid_payload
+            )
+            try:
+                valid = run_tool(
+                    "metadata",
+                    str(first_pages),
+                    str(second_pages),
+                    "--expected-name",
+                    expected_name,
+                    "--run-id",
+                    "123",
+                    "--run-attempt",
+                    "1",
+                    "--target-sha",
+                    target_sha,
+                )
+                self.assertEqual(valid.returncode, 0, valid.stderr)
+                self.assertEqual(valid.stdout.strip(), "42")
+            finally:
+                owned.cleanup()
+
+            malformed_first, malformed_second, owned = metadata_tree(
+                first_payload=valid_payload,
+                first_raw=b"not-json",
+            )
+            try:
+                malformed = run_tool(
+                    "metadata",
+                    str(malformed_first),
+                    str(malformed_second),
+                    "--expected-name",
+                    expected_name,
+                    "--run-id",
+                    "123",
+                    "--run-attempt",
+                    "1",
+                    "--target-sha",
+                    target_sha,
+                )
+                self.assertNotEqual(malformed.returncode, 0)
+                self.assertIn("json", malformed.stderr)
+                self.assertNotIn("Traceback", malformed.stderr)
+            finally:
+                owned.cleanup()
+
+            duplicate_first, duplicate_second, owned = metadata_tree(
+                first_payload=valid_payload,
+                first_raw=b'{"total_count":2,"total_count":2,"artifacts":[]}',
+            )
+            try:
+                duplicate = run_tool(
+                    "metadata",
+                    str(duplicate_first),
+                    str(duplicate_second),
+                    "--expected-name",
+                    expected_name,
+                    "--run-id",
+                    "123",
+                    "--run-attempt",
+                    "1",
+                    "--target-sha",
+                    target_sha,
+                )
+                self.assertNotEqual(duplicate.returncode, 0)
+                self.assertIn("duplicate_keys", duplicate.stderr)
+            finally:
+                owned.cleanup()
+
+            oversized_first, oversized_second, owned = metadata_tree(
+                first_payload=valid_payload,
+                first_raw=b"{" + b"x" * (4 * 1024 * 1024),
+            )
+            try:
+                oversized = run_tool(
+                    "metadata",
+                    str(oversized_first),
+                    str(oversized_second),
+                    "--expected-name",
+                    expected_name,
+                    "--run-id",
+                    "123",
+                    "--run-attempt",
+                    "1",
+                    "--target-sha",
+                    target_sha,
+                )
+                self.assertNotEqual(oversized.returncode, 0)
+                self.assertIn("oversized", oversized.stderr)
+            finally:
+                owned.cleanup()
+
+            sentinel = root / "metadata-executed"
+            malicious = (
+                f"__import__('pathlib').Path({str(sentinel)!r})"
+                ".write_text('executed')\n"
+            ).encode("utf-8")
+            malicious_first, malicious_second, owned = metadata_tree(
+                first_payload=valid_payload,
+                first_raw=malicious,
+            )
+            try:
+                malicious_result = run_tool(
+                    "metadata",
+                    str(malicious_first),
+                    str(malicious_second),
+                    "--expected-name",
+                    expected_name,
+                    "--run-id",
+                    "123",
+                    "--run-attempt",
+                    "1",
+                    "--target-sha",
+                    target_sha,
+                )
+                self.assertNotEqual(malicious_result.returncode, 0)
+                self.assertFalse(sentinel.exists())
+                self.assertNotIn("Traceback", malicious_result.stderr)
+            finally:
+                owned.cleanup()
+
+            wrong_type_first, wrong_type_second, owned = metadata_tree(
+                first_payload={"total_count": True, "artifacts": []}
+            )
+            try:
+                wrong_type = run_tool(
+                    "metadata",
+                    str(wrong_type_first),
+                    str(wrong_type_second),
+                    "--expected-name",
+                    expected_name,
+                    "--run-id",
+                    "123",
+                    "--run-attempt",
+                    "1",
+                    "--target-sha",
+                    target_sha,
+                )
+                self.assertNotEqual(wrong_type.returncode, 0)
+                self.assertIn("schema", wrong_type.stderr)
+            finally:
+                owned.cleanup()
+
+            expected_gates = [
+                "backend",
+                "python-quality",
+                "security",
+                "migration",
+                "docs",
+                "web-quality",
+                "web-hermetic",
+                "verification-contract",
+            ]
+
+            def manifest_payload(runtime_sensitive: bool) -> dict[str, object]:
+                payload: dict[str, object] = {
+                    "schema": 1,
+                    "version": 1,
+                    "target_sha": target_sha,
+                    "event": "push",
+                    "class": "full",
+                    "expected_gates": expected_gates,
+                    "runtime_sensitive": runtime_sensitive,
+                    "deployable": True,
+                    "fallback": False,
+                    "reason": "platform change requires full verification",
+                    "files": ["platform/tools/example.py"],
+                }
+                payload["digest"] = hashlib.sha256(
+                    json.dumps(
+                        {field: payload[field] for field in (
+                            "schema",
+                            "version",
+                            "target_sha",
+                            "event",
+                            "class",
+                            "expected_gates",
+                            "runtime_sensitive",
+                            "deployable",
+                            "fallback",
+                            "reason",
+                            "files",
+                        )},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                return payload
+
+            def write_archive(raw: bytes) -> Path:
+                archive = root / f"manifest-{len(list(root.glob('manifest-*.zip')))}.zip"
+                with zipfile.ZipFile(archive, "w") as bundle:
+                    bundle.writestr("classifier-manifest.json", raw)
+                os.chmod(archive, 0o600)
+                return archive
+
+            def write_corrupted_deflate_archive() -> Path:
+                archive = root / "corrupted-deflate.zip"
+                payload = b"".join(
+                    hashlib.sha256(f"corrupt-member-{index}".encode()).digest()
+                    for index in range(512)
+                )
+                with zipfile.ZipFile(
+                    archive, "w", compression=zipfile.ZIP_DEFLATED
+                ) as bundle:
+                    bundle.writestr("classifier-manifest.json", payload)
+                    info = bundle.infolist()[0]
+                encoded_name = info.filename.encode("utf-8")
+                compressed_offset = (
+                    info.header_offset + 30 + len(encoded_name) + len(info.extra)
+                )
+                archive_bytes = bytearray(archive.read_bytes())
+                archive_bytes[compressed_offset] ^= 0xFF
+                archive.write_bytes(archive_bytes)
+                os.chmod(archive, 0o600)
+                return archive
+
+            for runtime_sensitive in (False, True):
+                with self.subTest(runtime_sensitive=runtime_sensitive):
+                    payload = manifest_payload(runtime_sensitive)
+                    result = run_tool(
+                        "manifest",
+                        str(write_archive(json.dumps(payload, separators=(",", ":")).encode())),
+                        "--target-sha",
+                        target_sha,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("classifier manifest accepted", result.stdout)
+
+            classifier_tmp = root / "classifier-tmp"
+            classifier_tmp.mkdir(mode=0o700)
+            corrupted_result = run_tool(
+                "manifest",
+                str(write_corrupted_deflate_archive()),
+                "--target-sha",
+                target_sha,
+                environment={"TMPDIR": str(classifier_tmp)},
+            )
+            self.assertEqual(corrupted_result.returncode, 1)
+            self.assertEqual(corrupted_result.stdout, "")
+            self.assertEqual(
+                corrupted_result.stderr,
+                "classifier validation rejected: archive\n",
+            )
+            self.assertNotIn("Traceback", corrupted_result.stderr)
+            self.assertNotIn(str(root), corrupted_result.stderr)
+            self.assertEqual(list(classifier_tmp.iterdir()), [])
+
+            wrong_manifest = manifest_payload(False)
+            wrong_manifest["target_sha"] = "b" * 40
+            wrong_result = run_tool(
+                "manifest",
+                str(write_archive(json.dumps(wrong_manifest, separators=(",", ":")).encode())),
+                "--target-sha",
+                target_sha,
+            )
+            self.assertNotEqual(wrong_result.returncode, 0)
+            self.assertIn("provenance", wrong_result.stderr)
+
+            duplicate_manifest = write_archive(
+                b'{"schema":1,"schema":1,"version":1}'
+            )
+            duplicate_manifest_result = run_tool(
+                "manifest",
+                str(duplicate_manifest),
+                "--target-sha",
+                target_sha,
+            )
+            self.assertNotEqual(duplicate_manifest_result.returncode, 0)
+            self.assertIn("duplicate_keys", duplicate_manifest_result.stderr)
+
+            manifest_sentinel = root / "manifest-executed"
+            malicious_manifest = (
+                f"__import__('pathlib').Path({str(manifest_sentinel)!r})"
+                ".write_text('executed')\n"
+            ).encode("utf-8")
+            malicious_manifest_result = run_tool(
+                "manifest",
+                str(write_archive(malicious_manifest)),
+                "--target-sha",
+                target_sha,
+            )
+            self.assertNotEqual(malicious_manifest_result.returncode, 0)
+            self.assertFalse(manifest_sentinel.exists())
+            self.assertNotIn("Traceback", malicious_manifest_result.stderr)
+
     def test_production_web_compression_is_explicit_and_enabled_by_default(self) -> None:
         workflow = (
             REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
@@ -827,6 +1209,20 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         ).read_text()
         supervisor = DEPLOY_SUPERVISOR.read_text()
         workflow += "\n" + supervisor
+        deploy_workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text()
+        self.assertLess(
+            deploy_workflow.index("validate-classifier:"),
+            deploy_workflow.index("build-release:"),
+        )
+        build_job = workflow_job(deploy_workflow, "build-release")
+        self.assertIn("- validate-classifier", build_job)
+        self.assertIn("needs.validate-classifier.result == 'success'", build_job)
+        self.assertIn(
+            "platform_production_classifier_artifact.py",
+            deploy_workflow,
+        )
         self.assertIn("Build immutable release artifact in CI", workflow)
         self.assertIn("actions/upload-artifact", workflow)
         self.assertIn("actions/download-artifact", workflow)

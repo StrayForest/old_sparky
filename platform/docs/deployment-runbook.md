@@ -50,13 +50,19 @@ to `dev`. The chain is:
    successful deploy attempt has its exact bot-authored marker.
 4. When those checks pass, the auto-deploy workflow dispatches
    `Platform production deploy` with `mode=deploy` on `dev`.
-5. The production workflow independently downloads and validates the same exact
-   classifier artifact and exact-SHA security/build check before packaging, SSH
-   or any production release side effect, then builds and attests the immutable
-   artifact. Immediately before its first production-host write, it re-reads
-   the authoritative `dev` branch head. If `dev` moved from `TARGET_SHA` (the
-   A→B race), the workflow aborts closed; only then does it transfer and install
-   the artifact and run production smoke.
+5. A secret-free prerequisite independently downloads and validates the exact
+   classifier artifact before the expensive candidate build is allowed to run.
+   The production environment then repeats that exact-SHA validation immediately
+   before its first production write, followed by the security/build check and
+   immutable artifact consumption. The classifier artifact is treated as
+   bounded mode-0600 JSON data, never executed as Python; malformed, oversized,
+   stale or non-deployable data aborts closed without printing the payload.
+   Both checks execute one canonical parser from an immutable trusted `dev`
+   checkout, never candidate source. Immediately before its first
+   production-host write, the workflow re-reads the authoritative `dev` branch
+   head. If `dev` moved from `TARGET_SHA` (the A→B race), the workflow aborts
+   closed; only then does it transfer and install the artifact and run
+   production smoke.
 
 The dispatch `mode`, runtime profile, release slug, target SHA and artifact
 directory are checked by the bounded ASCII input guard before production host

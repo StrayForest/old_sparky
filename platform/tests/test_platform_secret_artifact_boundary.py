@@ -161,23 +161,23 @@ class SecretArtifactBoundaryTests(unittest.TestCase):
             encoding="utf-8"
         )
         production = _job_blocks(source)["production"]
-        self.assertIn("self-contained bounded extractor", production)
-        self.assertNotIn("actions/checkout@", production)
-        for marker in (
-            "MAX_ARCHIVE_BYTES",
-            "MAX_MEMBER_BYTES",
-            "MAX_COMPRESSION_RATIO",
-            "allowZip64=False",
-            "infolist()",
-            "duplicate entries",
-            "O_NOFOLLOW",
-            "external_attr",
-            "member expanded beyond limit",
-            "classifier manifest extraction is unsafe",
-            "classifier digest does not match manifest",
-            "rm -rf -- \"$route_dir\"",
-        ):
-            self.assertIn(marker, production)
+        prerequisite = _job_blocks(source)["validate-classifier"]
+        validator = (
+            REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("O_NOFOLLOW", validator)
+        self.assertIn("object_pairs_hook=_reject_duplicate_keys", validator)
+        self.assertIn("type(manifest.get(\"runtime_sensitive\")) is not bool", validator)
+        for job in (prerequisite, production):
+            with self.subTest(job="production" if job is production else "validate-classifier"):
+                self.assertIn("platform_production_classifier_artifact.py", job)
+                self.assertIn("trusted_classifier_default.outputs.sha", job)
+                self.assertIn("actions/checkout@", job)
+                self.assertNotIn("env.TARGET_SHA", job)
+                self.assertIn("--max-filesize 4194304", job)
+                self.assertIn("rm -rf -- \"$route_dir\"", job)
+        self.assertIn("- validate-classifier", _job_blocks(source)["build-release"])
+        self.assertNotIn("/usr/bin/python3 \"$artifacts_metadata\"", production)
         self.assertNotIn("bundle.namelist()", production)
 
 

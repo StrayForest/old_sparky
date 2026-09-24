@@ -207,26 +207,38 @@ class PlatformCiClassifierTests(unittest.TestCase):
             self.assertIn("target_sha", workflow)
             self.assertIn("platform-ci-route", workflow)
             self.assertIn("digest", workflow)
-            self.assertIn("runtime_sensitive", workflow)
+        self.assertIn("runtime_sensitive", auto)
+        classifier_tool = (
+            REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("runtime_sensitive", classifier_tool)
+        self.assertIn("object_pairs_hook=_reject_duplicate_keys", classifier_tool)
+        self.assertIn("type(manifest.get(\"deployable\")) is not bool", classifier_tool)
         self.assertIn("classifier_run_id", auto)
         self.assertIn("classifier_run_attempt", auto)
-        self.assertIn("require_deployable", production)
+        self.assertIn("platform_production_classifier_artifact.py", production)
 
     def test_classifier_artifact_enumeration_covers_large_and_mutating_pages(self) -> None:
-        for workflow in (
-            AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8"),
-            PRODUCTION_WORKFLOW.read_text(encoding="utf-8"),
-        ):
-            with self.subTest(workflow="production" if workflow.find("CLASSIFIER_RUN_ID") >= 0 else "auto"):
-                self.assertIn("?per_page=100&page=${page}", workflow)
-                self.assertIn("fetch_classifier_artifacts", workflow)
-                self.assertIn("total_count", workflow)
-                self.assertIn("contains duplicate IDs", workflow)
-                self.assertIn("pagination returned excess rows", workflow)
-                self.assertIn("pagination is incomplete", workflow)
-                self.assertIn("listing changed during validation", workflow)
-                self.assertIn("pagination exceeded its bound", workflow)
-                self.assertIn("<= 10_000", workflow)
+        auto = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+        production = PRODUCTION_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("?per_page=100&page=${page}", auto)
+        self.assertIn("fetch_classifier_artifacts", auto)
+        self.assertIn("total_count", auto)
+        self.assertIn("contains duplicate IDs", auto)
+        self.assertIn("pagination returned excess rows", auto)
+        self.assertIn("pagination is incomplete", auto)
+        self.assertIn("listing changed during validation", auto)
+        self.assertIn("pagination exceeded its bound", auto)
+        self.assertIn("<= 10_000", auto)
+        self.assertIn("?per_page=100&page=${page}", production)
+        self.assertIn("fetch_classifier_artifacts", production)
+        classifier_tool = (
+            REPO_ROOT / "platform/tools/platform_production_classifier_artifact.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("MAX_ARTIFACT_ROWS = 10_000", classifier_tool)
+        self.assertIn("MAX_PAGES = 100", classifier_tool)
+        self.assertIn("duplicate_keys", classifier_tool)
+        self.assertIn("len(rows) != expected_total", classifier_tool)
 
     def test_security_run_provenance_accepts_only_the_exact_completed_run(self) -> None:
         workflow = {
