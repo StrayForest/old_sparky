@@ -269,7 +269,6 @@ class HostToolsBundleTests(unittest.TestCase):
             generation = host_root / SOURCE_SHA
             generation.mkdir(parents=True)
             os.chmod(host_root, 0o755)
-            os.chmod(generation, 0o555)
             for name in bundle.HOST_TOOL_FILES:
                 member = generation / name
                 member.write_text("#!/usr/bin/python3\n", encoding="ascii")
@@ -278,6 +277,7 @@ class HostToolsBundleTests(unittest.TestCase):
                 member = generation / name
                 member.write_text("placeholder\n", encoding="ascii")
                 os.chmod(member, 0o444)
+            os.chmod(generation, 0o555)
             output = StringIO()
             with patch.object(dispatcher, "ACTIVE_TOOLS_DIR", generation), \
                 patch.object(dispatcher, "HOST_TOOLS_ROOT", host_root), \
