@@ -240,6 +240,24 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         )
         return checksum
 
+    def _runtime_manifest_sized_archive(
+        self, name: str, *, padding_count: int
+    ) -> tuple[Path, int]:
+        artifact = self.root / name
+        builder = ArchiveBuilder(artifact)
+        for index in range(padding_count):
+            builder.add_file(
+                f"{RELEASE_SLUG}/liveqa-runtime/browsers/chromium-1228/"
+                f"chrome-linux64/manifest-padding-{index:04d}-{'x' * 210}",
+                b"x",
+            )
+        builder.write()
+        with tarfile.open(artifact, "r:gz") as archive:
+            manifest = archive.getmember(
+                f"{RELEASE_SLUG}/liveqa-runtime/runtime-manifest.json"
+            )
+            return artifact, manifest.size
+
     def test_valid_archive_checksum_and_safe_extraction(self) -> None:
         sandbox = chromium_sandbox_fixture.read_bytes()
         self.assertEqual(len(sandbox), chromium_sandbox_fixture.EXPECTED_SIZE)
@@ -299,6 +317,29 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
             release / "apps/platform_web/.next/standalone/server.js",
         )
         self.assertEqual((release / "server-link").read_text(), "console.log('ok');\n")
+
+    def test_runtime_manifest_may_exceed_release_json_bound_within_runtime_bound(
+        self,
+    ) -> None:
+        artifact, manifest_size = self._runtime_manifest_sized_archive(
+            "runtime-manifest-within-bound.tar.gz", padding_count=500
+        )
+        self.assertEqual(validator.MAX_RELEASE_JSON_BYTES, 64 * 1024)
+        self.assertGreater(manifest_size, validator.MAX_RELEASE_JSON_BYTES)
+        self.assertLessEqual(
+            manifest_size, validator.MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES
+        )
+        validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
+
+    def test_runtime_manifest_over_runtime_bound_is_rejected(self) -> None:
+        artifact, manifest_size = self._runtime_manifest_sized_archive(
+            "runtime-manifest-over-bound.tar.gz", padding_count=800
+        )
+        self.assertGreater(manifest_size, validator.MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES)
+        with self.assertRaisesRegex(
+            validator.ArtifactError, "liveqa-runtime manifest is too large"
+        ):
+            validator.validate_archive(artifact, release_slug=RELEASE_SLUG)
 
     def test_cli_checks_checksum_before_archive_parsing(self) -> None:
         artifact = self.root / f"{RELEASE_SLUG}.tar.gz"

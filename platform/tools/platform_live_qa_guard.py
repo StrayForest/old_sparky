@@ -103,6 +103,8 @@ RUNTIME_TOMBSTONE_NAME_PATTERN = re.compile(
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 UUID_PATTERN = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 MAX_JSON_BYTES = 64 * 1024
+MAX_LIVE_QA_RUNTIME_MANIFEST_BYTES = 256 * 1024
+MAX_ACTIVE_MANIFEST_BYTES = 256 * 1024
 MAX_ZIP_ENTRIES = 20_000
 MAX_ZIP_MEMBER_BYTES = 768 * 1024 * 1024
 MAX_ZIP_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
@@ -734,11 +736,29 @@ def _validate_installed_payload_root(
             or releases_metadata.st_gid != 0
             or releases_metadata.st_mode & 0o7000
             or stat.S_IMODE(releases_metadata.st_mode) != 0o755
-            or manifest_metadata.st_size > MAX_JSON_BYTES
+            or manifest_metadata.st_size > MAX_ACTIVE_MANIFEST_BYTES
         ):
             raise GuardError("installed live-QA payload root metadata is unsafe")
-        raw = TRUSTED_ACTIVE_MANIFEST.read_text(encoding="ascii")
-        manifest = json.loads(raw, object_pairs_hook=_strict_object)
+        descriptor = os.open(
+            TRUSTED_ACTIVE_MANIFEST,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            raw = os.read(descriptor, MAX_ACTIVE_MANIFEST_BYTES + 1)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            len(raw) > MAX_ACTIVE_MANIFEST_BYTES
+            or _fingerprint(opened) != _fingerprint(manifest_metadata)
+            or _fingerprint(after) != _fingerprint(opened)
+        ):
+            raise GuardError("installed live-QA payload manifest changed while reading")
+        raw_text = raw.decode("ascii")
+        manifest = json.loads(raw_text, object_pairs_hook=_strict_object)
     except (OSError, UnicodeError, json.JSONDecodeError, GuardError) as exc:
         raise GuardError("installed live-QA payload manifest is unavailable") from exc
     if (
