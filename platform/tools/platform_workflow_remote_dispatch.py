@@ -494,6 +494,9 @@ def _prepare_deployment(payload: dict[str, str]) -> int:
         SUDO,
         "-n",
         "--",
+        sys.executable,
+        "-I",
+        "-B",
         str(ARTIFACT_DIR_HELPER),
         payload["artifact_remote_dir"],
     ]

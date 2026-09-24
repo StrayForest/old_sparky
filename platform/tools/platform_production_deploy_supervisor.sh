@@ -199,7 +199,7 @@ chmod 0700 "$bootstrap_dir"
   --release-slug "$artifact_slug" \
   --extract-to "$bootstrap_dir" \
   || fail "CI release artifact provenance is invalid"
-if ! /usr/bin/python3 -B - "$artifact_path" "$artifact_slug" "$target_sha" "$provenance_path" <<'PY'
+if ! /usr/bin/python3 -I -B - "$artifact_path" "$artifact_slug" "$target_sha" "$provenance_path" <<'PY'
 import hashlib
 import json
 from pathlib import Path

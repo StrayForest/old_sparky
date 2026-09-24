@@ -78,7 +78,7 @@ done
   /root/.oldsparky/liveqa/platform_live_user_qa_dispatch.py verify "$target_sha"
 
 identity_report() {
-  /usr/bin/python3.12 -B - <<'PY'
+  /usr/bin/python3.12 -I -B - <<'PY'
 import grp
 import json
 import pwd

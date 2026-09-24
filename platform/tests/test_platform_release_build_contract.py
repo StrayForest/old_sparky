@@ -1342,6 +1342,14 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         remote_script = supervisor
         self.assertNotIn("platform_build_release.sh", remote_script)
         self.assertNotIn("pip install -r platform/requirements-platform.lock.txt", remote_script)
+        self.assertIn(
+            '/usr/bin/python3 -I -B - "$artifact_path" "$artifact_slug"',
+            remote_script,
+        )
+        self.assertNotIn(
+            '/usr/bin/python3 -B - "$artifact_path" "$artifact_slug"',
+            remote_script,
+        )
         validator = (REPO_ROOT / "platform/tools/platform_validate_release_artifact.py").read_text()
         self.assertIn("source_git_commit", workflow)
         self.assertIn("expected source commit", validator)
@@ -1694,6 +1702,17 @@ cleanup
         self.assertIn("platform_load.py", workflow)
         self.assertIn("profile_id", workflow)
         self.assertIn("platform_external_load_observer.py", supervisor)
+        self.assertIn("export PYTHONDONTWRITEBYTECODE=1", supervisor)
+        self.assertIn(
+            '"$QA_PYTHON" -B "$TOOLS_DIR/platform_prepare_external_vote_fixture.py"',
+            supervisor,
+        )
+        self.assertIn('"$QA_PYTHON" -B "${observer_args[@]}"', supervisor)
+        self.assertNotIn(
+            '"$QA_PYTHON" "$TOOLS_DIR/platform_prepare_external_vote_fixture.py"',
+            supervisor,
+        )
+        self.assertNotIn('"$QA_PYTHON" "${observer_args[@]}"', supervisor)
         self.assertIn(
             'platform_workflow_input_guard.py" email',
             supervisor,

@@ -17,6 +17,10 @@ EXTERNAL_CONFIRMATION="RUN-PRODUCTION-EXTERNAL-LOAD"
 TIMEOUT_DIAGNOSTICS_CONFIRMATION="RUN-PRODUCTION-TIMEOUT-DIAGNOSTICS"
 EXPECTED_ORIGIN="https://old-sparky.com"
 MAX_RUNTIME="180m"
+# Explicit ``-B`` flags below are the primary contract.  Keep this defense
+# for the venv-backed fixture and observer children as well, so no Python
+# child writes into the root-owned active release.
+export PYTHONDONTWRITEBYTECODE=1
 
 if [[ "$EUID" -ne 0 ]]; then
   echo "Production external-load fixture supervisor must run as root." >&2
@@ -196,7 +200,7 @@ timeout_diagnostic_ids_path="$export_dir/timeout-diagnostic-ids.json"
 set +e
 timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
   env PLATFORM_RUNTIME_SERVICE=qa \
-  "$QA_PYTHON" "$TOOLS_DIR/platform_prepare_external_vote_fixture.py" \
+  "$QA_PYTHON" -B "$TOOLS_DIR/platform_prepare_external_vote_fixture.py" \
     --env-file "$RUNTIME_ROOT/shared/.env.platform" \
     --origin "$EXPECTED_ORIGIN" \
     --local-origin "http://127.0.0.1:8010" \
@@ -323,7 +327,7 @@ PY
   fi
   timeout --signal=TERM --kill-after=30s "$MAX_RUNTIME" \
     env PLATFORM_RUNTIME_SERVICE=observer \
-    "$QA_PYTHON" "${observer_args[@]}" \
+    "$QA_PYTHON" -B "${observer_args[@]}" \
       > "$external_vote_observer_log" 2>&1 &
   observer_pid="$!"
   set -e
