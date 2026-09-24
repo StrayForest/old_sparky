@@ -32,7 +32,8 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         source = _workflow("platform-production-deploy.yml")
         jobs = _job_blocks(source)
         self.assertIn("if: ${{ always() }}", jobs["validate-dispatch"])
-        self.assertIn("needs: validate-dispatch", jobs["build-release"])
+        self.assertIn("      - validate-dispatch\n", jobs["build-release"])
+        self.assertIn("      - validate-classifier\n", jobs["build-release"])
         self.assertIn("actions/checkout@", jobs["build-release"])
         self.assertIn("platform_build_release.sh", jobs["build-release"])
         self.assertIn("actions/upload-artifact@", jobs["build-release"])
@@ -41,7 +42,8 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
         self.assertNotIn("environment: production", jobs["build-release"])
         self.assertIn("needs:\n      - validate-dispatch\n      - build-release", source)
         self.assertIn("needs.build-release.result == 'success'", jobs["production"])
-        self.assertNotIn("actions/checkout@", jobs["production"])
+        self.assertIn("path: trusted-classifier", jobs["production"])
+        self.assertNotIn("ref: ${{ env.TARGET_SHA }}", jobs["production"])
         self.assertIn("actions/download-artifact@", jobs["production"])
         self.assertIn("PUBLISHED_ARTIFACT_ID", jobs["production"])
         self.assertNotIn("id-token: write", jobs["production"])
@@ -84,7 +86,6 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
 
     def test_candidate_jobs_never_receive_production_ssh_secrets(self) -> None:
         candidate_markers = (
-            "actions/checkout@",
             "platform_build_release.sh",
             "platform_load.py",
             "platform_live_launch_report.py",
@@ -117,7 +118,12 @@ class ProductionSecretJobIsolationTests(unittest.TestCase):
             }
             self.assertTrue(secret_jobs, workflow_name)
             for job_name, body in secret_jobs.items():
-                self.assertNotIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
+                if job_name == "production":
+                    self.assertIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
+                    self.assertIn("path: trusted-classifier", body, f"{workflow_name}:{job_name}")
+                    self.assertNotIn("ref: ${{ env.TARGET_SHA }}", body, f"{workflow_name}:{job_name}")
+                else:
+                    self.assertNotIn("actions/checkout@", body, f"{workflow_name}:{job_name}")
                 self.assertNotRegex(
                     body,
                     r"platform_(?:build_release|load|live_launch_report)\.py|platform_build_release\.sh",
