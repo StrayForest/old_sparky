@@ -226,6 +226,7 @@ KNOWN_TEST_MODULES = frozenset(
     test_platform_secret_scan
     test_platform_secret_job_isolation
     test_platform_security_reports
+    test_platform_ssh_host_key_scan
     test_platform_slugs
     test_platform_ssr_observability
     test_platform_stats_api
@@ -363,6 +364,7 @@ TOOL_MODULES = frozenset(
         "test_platform_secret_scan",
         "test_platform_secret_job_isolation",
         "test_platform_security_reports",
+        "test_platform_ssh_host_key_scan",
         "test_platform_storage_evidence_privacy",
         "test_platform_update_shared_env",
         "test_platform_validate_edge_policy",
@@ -446,12 +448,12 @@ TEST_CONTOUR_OVERRIDES: Mapping[tuple[str, str, str], str] = {}
 # the sorted current IDs to these digests; a new test therefore needs an
 # explicit catalog update instead of silently inheriting a module default.
 EXPECTED_SNAPSHOT: Mapping[str, object] = {
-    "module_count": 156,
-    "module_digest": "6e5cd0f6a5eca58538acb894e22c71da8067538ecb11bc745a67e09569aa8d42",
-    "test_count": 1341,
-    "test_id_digest": "f73d8003cc0a259c349a7e0064112d6d2a8ebe5e22e9e58221938eb03b0ca109",
-    "backend_test_count": 1300,
-    "backend_test_id_digest": "10635eaf51c18fb5248a3a174f8a63a40b7148761a7ee9c7c4814392b5822c49",
+    "module_count": 157,
+    "module_digest": "d427658b2ad8beee8d4a314c5f1d8ea3f7776b5bd8ed8b64667f295a557233a9",
+    "test_count": 1343,
+    "test_id_digest": "47e2de632b61a93efe7be96abffbc443c6e855bf60f9ef4c2e9f03ad87fbd10e",
+    "backend_test_count": 1302,
+    "backend_test_id_digest": "deb10bcd5c71f37a3ce480240fb90dc66c8fadfbfbf0215afc3a3387c126ac1c",
     "verification_test_count": 41,
     "verification_test_id_digest": "56d6cdf495c979459051449f2bf17f35e90cd74abdf8662b7d0ddb1be61e29e9",
     "verification_classifier_test_count": 20,
@@ -478,10 +480,10 @@ EXPECTED_CONTOUR_SNAPSHOT: Mapping[str, Mapping[str, object]] = {
         "test_id_digest": "b4562feed9869d37ca4e0fec1a4aae800b4e8b8f9f127501b5a791a724b8c891",
     },
     "backend-tool-contract": {
-        "module_count": 43,
-        "module_digest": "8ddc3938dc9c06a91659b342700481d7d4ee74a6f7874feef62f9796fe05e016",
-        "test_count": 304,
-        "test_id_digest": "aef12c05ba47a15428cb1363fe47b7640854eb87e076391ae8352b47122fa5c1",
+        "module_count": 44,
+        "module_digest": "693edb2005c56249ac84c9d1d7367b64e2e3291ef18c6bc05e41ea98967ea406",
+        "test_count": 306,
+        "test_id_digest": "d4efc96badfd876858e45b701ca9e92f9fd14038da320065ed793ba96b522682",
     },
     "backend-integration": {
         "module_count": 41,
