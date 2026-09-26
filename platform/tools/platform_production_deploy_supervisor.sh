@@ -45,10 +45,22 @@ artifact_path=""
 provenance_path="$artifact_dir/RELEASE.provenance.json"
 bootstrap_dir=""
 
+failure_class="preflight"
+failure_phase="preflight"
+failure_reason="internal"
+
+set_failure_context() {
+  failure_class="$1"
+  failure_phase="$2"
+  failure_reason="$3"
+}
+
 fail() {
   # Failure detail remains private machine state. The runner only
-  # accepts the fixed RELEASE_DEPLOY line below.
+  # accepts the fixed, token-only RELEASE_DEPLOY line below.
   printf '%s\n' 'ERROR: deployment failed' >&2
+  printf 'RELEASE_DEPLOY schema=1 status=failed class=%s phase=%s reason=%s release_slug=%s source_sha=%s\n' \
+    "$failure_class" "$failure_phase" "$failure_reason" "$release_slug" "$target_sha"
   exit 1
 }
 
@@ -94,6 +106,7 @@ require_host_helper() {
     || fail "trusted host helper metadata is unsafe"
 }
 
+set_failure_context preflight preflight host_tools_invalid
 for host_helper in \
   platform_workflow_remote_dispatch.py \
   platform_workflow_input_guard.py \
@@ -111,6 +124,7 @@ for host_helper in \
   require_host_helper "$host_tools_dir/$host_helper"
 done
 
+set_failure_context preflight preflight lock
 # Lock order is release -> retained-load.  Both locks use the shared pathname
 # supervisors with util-linux `--close`, so this body and every candidate child
 # have no release or retained-load lock FD.  Each supervised body revalidates
@@ -152,15 +166,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+set_failure_context preflight preflight environment
 test "$(id -u)" -eq 0 || fail "deployment user must be root"
 test -L "$current" || fail "current release symlink is missing"
 test -L "$runtime/previous" || fail "previous release symlink is missing"
+set_failure_context preflight preflight service_state
 for service in deadlock-api deadlock-worker deadlock-web; do
   systemctl is-active --quiet "$service" || fail "$service is not active before deployment"
 done
 
+set_failure_context preflight preflight nginx_config
 nginx -t >/dev/null
 
+set_failure_context preflight preflight preflight_failed
 "$host_tools_dir/platform_release_preflight.sh" \
   --require-previous \
   --require-verified-backup \
@@ -174,23 +192,41 @@ if [[ "$deploy_mode" == "preflight" ]]; then
 fi
 
 [[ "$deploy_mode" == "deploy" ]] || fail "unsupported deployment mode"
+set_failure_context artifact artifact artifact_missing
 if [[ ! -d "$artifact_dir" || -L "$artifact_dir" ]]; then
   fail "CI release artifact directory is missing"
 fi
 
+artifact_count="$(find "$artifact_dir" -maxdepth 1 -type f -name '*.tar.gz' -printf 'x\n' | wc -l)"
+if [[ "$artifact_count" != "1" ]]; then
+  set_failure_context artifact artifact artifact_count_invalid
+  fail "CI release artifact count is invalid"
+fi
 artifact_path="$(find "$artifact_dir" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
-test -n "$artifact_path" || fail "CI release artifact is missing"
-artifact_checksum="${artifact_path}.sha256"
+artifact_checksum="$artifact_path.sha256"
 if [[ ! -f "$artifact_checksum" || -L "$artifact_checksum" ]]; then
+  set_failure_context artifact artifact checksum_missing
   fail "CI release checksum is missing"
 fi
 if [[ ! -f "$provenance_path" || -L "$provenance_path" ]]; then
+  set_failure_context artifact provenance provenance_missing
   fail "CI release provenance is missing"
 fi
 artifact_name="$(basename "$artifact_path")"
-artifact_slug="${artifact_name%.tar.gz}"
+artifact_slug="$(basename "$artifact_path" .tar.gz)"
+if [[ ! "$artifact_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}\.tar\.gz$ ]]; then
+  set_failure_context artifact artifact artifact_name_invalid
+  fail "CI release artifact name is invalid"
+fi
+if [[ "$artifact_slug" != "$release_slug" ]]; then
+  set_failure_context artifact provenance release_slug_mismatch
+  fail "CI release artifact slug does not match the deployment slug"
+fi
 (cd "$artifact_dir" && sha256sum -c "$(basename "$artifact_checksum")") \
-  || fail "CI release artifact digest mismatch"
+  || {
+    set_failure_context artifact artifact checksum_mismatch
+    fail "CI release artifact digest mismatch"
+  }
 bootstrap_dir="$(mktemp -d /tmp/old-sparky-release-bootstrap.XXXXXX)"
 chmod 0700 "$bootstrap_dir"
 /usr/bin/python3 -I -B "$host_tools_dir/platform_validate_release_artifact.py" \
@@ -198,7 +234,10 @@ chmod 0700 "$bootstrap_dir"
   --checksum "$artifact_checksum" \
   --release-slug "$artifact_slug" \
   --extract-to "$bootstrap_dir" \
-  || fail "CI release artifact provenance is invalid"
+  || {
+    set_failure_context artifact artifact validation_failed
+    fail "CI release artifact provenance is invalid"
+  }
 if ! /usr/bin/python3 -I -B - "$artifact_path" "$artifact_slug" "$target_sha" "$provenance_path" <<'PY'
 import hashlib
 import json
@@ -208,29 +247,80 @@ import sys
 import tarfile
 
 artifact, slug, expected_commit, provenance_path = sys.argv[1:]
-provenance = json.loads(Path(provenance_path).read_text(encoding="utf-8"))
-if not re.fullmatch(r"[0-9a-f]{64}", str(provenance.get("artifact_digest"))):
-    raise SystemExit("published artifact digest is invalid")
-if provenance.get("source_git_commit") != expected_commit:
-    raise SystemExit("provenance source commit does not match expected commit")
-if provenance.get("artifact_file") != Path(artifact).name:
-    raise SystemExit("provenance artifact name does not match uploaded artifact")
-actual_sha256 = hashlib.sha256(Path(artifact).read_bytes()).hexdigest()
-if provenance.get("artifact_sha256") != actual_sha256:
-    raise SystemExit("provenance artifact checksum does not match uploaded artifact")
-with tarfile.open(Path(artifact), mode="r:gz") as archive:
-    member = archive.getmember(f"{slug}/RELEASE.json")
-    handle = archive.extractfile(member)
-    if handle is None:
-        raise SystemExit("RELEASE.json is missing")
-    payload = json.load(handle)
-if payload.get("source_git_commit") != expected_commit:
-    raise SystemExit("release source commit does not match expected commit")
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+def reject():
+    raise ValueError
+
+try:
+    provenance = json.loads(
+        Path(provenance_path).read_text(encoding="utf-8"),
+        object_pairs_hook=strict_object,
+    )
+    if (
+        not isinstance(provenance, dict)
+        or set(provenance)
+        != {"schema", "artifact_file", "artifact_sha256", "source_git_commit"}
+        or type(provenance["schema"]) is not int
+        or provenance["schema"] != 1
+    ):
+        reject()
+    artifact_name = Path(artifact).name
+    if (
+        not isinstance(provenance["artifact_file"], str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}\.tar\.gz", artifact_name)
+        is None
+        or provenance["artifact_file"] != artifact_name
+        or artifact_name != f"{slug}.tar.gz"
+    ):
+        reject()
+    if (
+        not isinstance(provenance["artifact_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", provenance["artifact_sha256"]) is None
+    ):
+        reject()
+    if (
+        not isinstance(expected_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", expected_commit) is None
+        or not isinstance(provenance["source_git_commit"], str)
+        or provenance["source_git_commit"] != expected_commit
+    ):
+        reject()
+    if (
+        not isinstance(slug, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", slug) is None
+    ):
+        reject()
+    actual_sha256 = hashlib.sha256(Path(artifact).read_bytes()).hexdigest()
+    if provenance["artifact_sha256"] != actual_sha256:
+        reject()
+    with tarfile.open(Path(artifact), mode="r:gz") as archive:
+        member = archive.getmember(f"{slug}/RELEASE.json")
+        handle = archive.extractfile(member)
+        if handle is None:
+            reject()
+        payload = json.load(handle, object_pairs_hook=strict_object)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("release_slug") != slug
+        or payload.get("source_git_commit") != expected_commit
+    ):
+        reject()
+except (OSError, KeyError, TypeError, ValueError, UnicodeError, tarfile.TarError):
+    raise SystemExit("release provenance is invalid")
 PY
 then
+  set_failure_context artifact provenance provenance_invalid
   fail "CI release source commit does not match target SHA"
 fi
 
+set_failure_context preflight preflight preflight_failed
 "$host_tools_dir/platform_release_preflight.sh" \
   --app-dir "$runtime" \
   --require-previous \
@@ -238,6 +328,7 @@ fi
   --require-edge-parity \
   --backup-max-age-hours 24 >/dev/null 2>/dev/null
 
+set_failure_context deployment candidate candidate_missing
 candidate_deploy="$bootstrap_dir/$artifact_slug/tools/platform_release_deploy.sh"
 if [[ ! -f "$candidate_deploy" || -L "$candidate_deploy" || ! -x "$candidate_deploy" ]]; then
   fail "candidate release deploy tool is missing"
@@ -251,6 +342,7 @@ LC_ALL=C.UTF-8 "$candidate_deploy" \
   --edge-host old-sparky.com \
   --expected-csp-mode enforce >/dev/null 2>/dev/null || candidate_status=$?
 if (( candidate_status != 0 )); then
+  set_failure_context deployment candidate activation_failed
   summarize_candidate_failure() {
     printf '{"schema":1,"kind":"candidate_activation_failure","status":"failed","error_class":"activation","exit_status":%s,"target_sha":"%s"}\n' \
       "$candidate_status" "$target_sha"
@@ -296,8 +388,12 @@ fi
 # remains held by this shell for all runtime-profile writes,
 # restarts/readiness checks and final smoke evidence below.
 platform_release_lock_supervisor_holds \
-  || fail "the platform release lock was lost"
+  || {
+    set_failure_context deployment candidate lock_lost
+    fail "the platform release lock was lost"
+  }
 
+set_failure_context deployment readiness runtime_profile_failed
 case "$runtime_profile" in
   baseline)
     "$runtime/shared/venv/bin/python" -B "$host_tools_dir/platform_configure_shared_env.py" \

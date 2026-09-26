@@ -1393,6 +1393,202 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("Retained active state is invalid", recover)
         self.assertNotIn('for service in deadlock-api deadlock-worker deadlock-web; do', recover)
 
+    def test_supervisor_provenance_consumer_matches_canonical_ci_schema(self) -> None:
+        """Execute the supervisor consumer against the CI-produced provenance.
+
+        The supervisor is a root-side host helper, so this test extracts and
+        executes its actual isolated Python consumer rather than reproducing
+        the contract in a second test-only implementation.  The provenance
+        producer is likewise extracted from the canonical CI builder step.
+        """
+
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        build_step = self._workflow_step_run(
+            workflow, "Build immutable release artifact in CI"
+        )
+        producer_match = re.search(
+            r"""/usr/bin/python3 - .*? <<'PY'\n"""
+            r"(?P<script>.*?)\nPY(?:\n|$)",
+            build_step,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(producer_match)
+        producer = textwrap.dedent(producer_match.group("script"))
+
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        consumer_match = re.search(
+            r"""if ! /usr/bin/python3 -I -B - "\$artifact_path" "\$artifact_slug" "\$target_sha" "\$provenance_path" <<'PY'\n"""
+            r"(?P<script>.*?)\nPY(?:\n|$)",
+            supervisor,
+            re.DOTALL,
+        )
+        if consumer_match is None:
+            consumer_match = re.search(
+                r"<<'PY'\n(?P<script>.*?)\nPY(?:\n|$)",
+                supervisor,
+                re.DOTALL,
+            )
+        self.assertIsNotNone(consumer_match)
+        consumer = textwrap.dedent(consumer_match.group("script"))
+
+        target_sha = "a" * 40
+        release_slug = "gha-10917370996-1"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / f"{release_slug}.tar.gz"
+            release_payload = json.dumps(
+                {
+                    "release_slug": release_slug,
+                    "source_git_commit": target_sha,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            with tarfile.open(artifact, mode="w:gz") as archive:
+                member = tarfile.TarInfo(f"{release_slug}/RELEASE.json")
+                member.size = len(release_payload)
+                archive.addfile(member, io.BytesIO(release_payload))
+
+            provenance = root / "RELEASE.provenance.json"
+            produced = subprocess.run(
+                ["/usr/bin/python3", "-I", "-", str(artifact), target_sha],
+                input=producer,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(produced.returncode, 0, produced.stderr)
+            # The canonical builder writes next to the archive.  Keep the
+            # expected path explicit so this test cannot accidentally consume
+            # a hand-written fixture.
+            self.assertTrue(provenance.is_file())
+            canonical = json.loads(provenance.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(canonical),
+                {"schema", "artifact_file", "artifact_sha256", "source_git_commit"},
+            )
+
+            def consume(
+                *,
+                slug: str = release_slug,
+                source_sha: str = target_sha,
+            ) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        "/usr/bin/python3",
+                        "-I",
+                        "-B",
+                        "-",
+                        str(artifact),
+                        slug,
+                        source_sha,
+                        str(provenance),
+                    ],
+                    input=consumer,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+
+            accepted = consume()
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+            for mutation in (
+                "old-artifact-digest",
+                "missing-artifact-sha256",
+                "artifact-sha256-type",
+                "artifact-sha256-non-hex",
+                "wrong-artifact-sha256",
+                "artifact-file-mismatch",
+                "artifact-file-type",
+                "source-type",
+                "source-non-hex",
+                "source-mismatch",
+                "additional-field",
+                "schema-type",
+                "slug-invalid",
+                "target-sha-invalid",
+            ):
+                candidate = dict(canonical)
+                if mutation == "old-artifact-digest":
+                    candidate["artifact_digest"] = candidate.pop("artifact_sha256")
+                elif mutation == "missing-artifact-sha256":
+                    candidate.pop("artifact_sha256")
+                elif mutation == "artifact-sha256-type":
+                    candidate["artifact_sha256"] = 123
+                elif mutation == "artifact-sha256-non-hex":
+                    candidate["artifact_sha256"] = "g" * 64
+                elif mutation == "wrong-artifact-sha256":
+                    candidate["artifact_sha256"] = "0" * 64
+                elif mutation == "artifact-file-mismatch":
+                    candidate["artifact_file"] = "other.tar.gz"
+                elif mutation == "artifact-file-type":
+                    candidate["artifact_file"] = 123
+                elif mutation == "source-type":
+                    candidate["source_git_commit"] = 123
+                elif mutation == "source-non-hex":
+                    candidate["source_git_commit"] = "g" * 40
+                elif mutation == "source-mismatch":
+                    candidate["source_git_commit"] = "b" * 40
+                else:
+                    if mutation == "additional-field":
+                        candidate["unexpected"] = "rejected"
+                    elif mutation == "schema-type":
+                        candidate["schema"] = "1"
+                provenance.write_text(
+                    json.dumps(candidate, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(mutation=mutation):
+                    if mutation == "slug-invalid":
+                        rejected = consume(slug="bad/slug")
+                    elif mutation == "target-sha-invalid":
+                        rejected = consume(source_sha="a" * 39)
+                    else:
+                        rejected = consume()
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertNotIn("Traceback", rejected.stderr)
+
+    def test_supervisor_failure_marker_is_stable_and_sanitized(self) -> None:
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        marker_start = supervisor.index("failure_class=")
+        marker_end = supervisor.index("\nrestart_web_and_wait()", marker_start)
+        marker_functions = supervisor[marker_start:marker_end]
+        fixture = f"""set -u
+target_sha={'a' * 40}
+release_slug=gha-10917370996-1
+{marker_functions}
+set +e
+set_failure_context artifact provenance provenance_invalid
+fail 'private stderr must not cross the public channel'
+"""
+        completed = subprocess.run(
+            ["/bin/bash"],
+            input=fixture,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(
+            completed.stdout,
+            "RELEASE_DEPLOY schema=1 status=failed class=artifact "
+            "phase=provenance reason=provenance_invalid "
+            f"release_slug=gha-10917370996-1 source_sha={'a' * 40}\n",
+        )
+        self.assertEqual(completed.stderr, "ERROR: deployment failed\n")
+        self.assertNotIn("private stderr", completed.stdout + completed.stderr)
+
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("phase=(artifact|provenance|preflight|candidate|readiness)", workflow)
+        self.assertIn("reason=(internal|host_tools_invalid|lock|environment", workflow)
+
     def test_production_env_contract_matches_runtime_policy(self) -> None:
         example = (REPO_ROOT / "platform/.env.platform.example").read_text()
         preflight = (REPO_ROOT / "platform/tools/platform_release_preflight.sh").read_text()
