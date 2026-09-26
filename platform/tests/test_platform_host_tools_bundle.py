@@ -1437,7 +1437,9 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
         )
         self.assertIn("/usr/bin/timeout --signal=TERM --kill-after=2s 15s", probe)
         self.assertIn("ulimit -f 1", probe)
+        self.assertIn("remote=(ssh -n -T ", probe)
         self.assertIn("< /dev/null", probe)
+        self.assertIn("/usr/bin/head -c 512", probe)
         self.assertIn(
             'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA '
             'generation=$HOST_TOOLS_SHA dispatcher=2 artifact_prepare=2 supervisor=2 '
@@ -1445,6 +1447,17 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
             probe,
         )
         self.assertIn('printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"', probe)
+        for marker in (
+            "command_rc=",
+            "expected_bytes=",
+            "actual_bytes=",
+            "expected_sha256=",
+            "actual_sha256=",
+            "actual_cr_count=",
+            "actual_lf_count=",
+            "exact_one_line=",
+        ):
+            self.assertIn(marker, probe)
         self.assertNotIn("platform/tools/platform_workflow_remote_dispatch.py", probe)
         self.assertNotIn("platform_host_tools_bundle.py", probe)
 
@@ -1522,6 +1535,222 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
             expected = {"manifest.json", "capabilities.txt"}
             self.assertNotEqual(set(names), expected)
             self.assertEqual(len(names), 3)
+
+    def test_host_capability_probe_is_strict_and_bounds_diagnostics(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
+            "  build-release:", 1
+        )[0]
+        probe_steps = [
+            step
+            for step in _workflow_step_blocks(preflight)
+            if "- name: Probe immutable host dispatcher capabilities" in step
+        ]
+        self.assertEqual(len(probe_steps), 1)
+        run_marker = "        run: |\n"
+        self.assertIn(run_marker, probe_steps[0])
+        shell_block = probe_steps[0].split(run_marker, 1)[1]
+        shell_block = "\n".join(
+            line[10:] if line.startswith("          ") else line
+            for line in shell_block.splitlines()
+        )
+        self.assertIn("remote=(ssh -n -T ", shell_block)
+        self.assertIn(
+            '"${remote[@]}" /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-capabilities',
+            shell_block,
+        )
+        self.assertIn("< /dev/null", shell_block)
+        self.assertIn("ulimit -f 1", shell_block)
+        self.assertIn("printf '%s\\n' \"$expected_output\" | cmp -s - \"$probe_output\"", shell_block)
+
+        expected_line = (
+            f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
+            "dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 "
+            "python_isolated=1 python_bytecode_disabled=1"
+        )
+        expected_payload = (expected_line + "\n").encode("ascii")
+        expected_sha256 = hashlib.sha256(expected_payload).hexdigest()
+        self.assertEqual(len(expected_payload), 228)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            ssh_dir = root / "ssh"
+            ssh_dir.mkdir(mode=0o700)
+            for name in ("config", "known_hosts", "id_ed25519"):
+                path = ssh_dir / name
+                path.write_text("fixture\n", encoding="ascii")
+                path.chmod(0o600)
+            payload_path = root / "probe-payload"
+            output_path = runner_temp / "platform-host-capabilities-output"
+            invocation_log = root / "ssh-invocations.jsonl"
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+arguments = sys.argv[1:]
+destination_index = next(
+    (index for index, argument in enumerate(arguments) if "@" in argument),
+    None,
+)
+if destination_index is None:
+    raise SystemExit("missing destination")
+command = arguments[destination_index + 1 :]
+expected_command = [
+    "/usr/bin/python3.12",
+    "-I",
+    "-B",
+    os.environ["FAKE_EXPECTED_DISPATCHER"],
+    "host-capabilities",
+]
+if command != expected_command:
+    raise SystemExit("unexpected remote command")
+with Path(os.environ["FAKE_SSH_LOG"]).open("a", encoding="ascii") as log:
+    json.dump(arguments, log)
+    log.write("\\n")
+if sys.stdin.read() != "":
+    raise SystemExit("stdin was not at EOF")
+stderr_text = os.environ.get("FAKE_SSH_STDERR", "")
+if stderr_text:
+    sys.stderr.write(stderr_text)
+sys.stdout.buffer.write(Path(os.environ["FAKE_PROBE_PAYLOAD"]).read_bytes())
+sys.stdout.flush()
+raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            fake_stat = fake_bin / "stat"
+            fake_stat.write_text(
+                """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+format_value = sys.argv[sys.argv.index("-c") + 1]
+path = Path(sys.argv[-1])
+if path == Path(os.environ["FAKE_SSH_DIR"]):
+    print("directory:1:700")
+elif path.parent == Path(os.environ["FAKE_SSH_DIR"]):
+    print("regular file:1:600")
+else:
+    completed = subprocess.run(
+        ["/usr/bin/stat", "-c", format_value, "--", str(path)],
+        check=False,
+    )
+    raise SystemExit(completed.returncode)
+""",
+                encoding="utf-8",
+            )
+            fake_stat.chmod(0o755)
+
+            expected_generation = f"/opt/oldsparky/platform/shared/host-tools/{SOURCE_SHA}"
+            expected_dispatcher = f"{expected_generation}/platform_workflow_remote_dispatch.py"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "RUNNER_TEMP": str(runner_temp),
+                    "PROD_SSH_HOST": "production.example.test",
+                    "PROD_SSH_USER": "operator",
+                    "PROD_SSH_KEY": "fixture-key",
+                    "HOST_TOOLS_SHA": SOURCE_SHA,
+                    "HOST_TOOLS_GENERATION": expected_generation,
+                    "HOST_TOOLS_DISPATCHER": expected_dispatcher,
+                    "HOST_TOOLS_SSH_DIR": str(ssh_dir),
+                    "FAKE_SSH_DIR": str(ssh_dir),
+                    "FAKE_SSH_LOG": str(invocation_log),
+                    "FAKE_PROBE_PAYLOAD": str(payload_path),
+                    "FAKE_EXPECTED_DISPATCHER": expected_dispatcher,
+                    "FAKE_SSH_STDERR": "",
+                    "FAKE_SSH_RC": "0",
+                    "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+                }
+            )
+
+            def invoke(
+                payload: bytes,
+                *,
+                stderr_text: str = "",
+                ssh_rc: int = 0,
+            ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+                payload_path.write_bytes(payload)
+                invocation_log.write_text("", encoding="ascii")
+                env["FAKE_SSH_STDERR"] = stderr_text
+                env["FAKE_SSH_RC"] = str(ssh_rc)
+                completed = subprocess.run(
+                    ["bash", "-c", shell_block],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    input="",
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                invocations = [
+                    json.loads(line)
+                    for line in invocation_log.read_text(encoding="ascii").splitlines()
+                ]
+                return completed, invocations
+
+            passed, invocations = invoke(expected_payload, stderr_text="RAW_STDERR_SENTINEL")
+            self.assertEqual(passed.returncode, 0, passed.stderr)
+            self.assertEqual(passed.stdout, "")
+            self.assertEqual(passed.stderr, "")
+            self.assertEqual(len(invocations), 1)
+            self.assertIn("-n", invocations[0])
+            self.assertIn("-T", invocations[0])
+
+            malformed_payloads = {
+                "prepended banner": b"RAW_SENTINEL\n" + expected_payload,
+                "appended banner": expected_payload + b"RAW_SENTINEL\n",
+                "crlf": expected_payload.replace(b"\n", b"\r\n"),
+                "hostname": b"RAW_SENTINEL production.example.test\n",
+                "duplicate output": expected_payload + expected_payload,
+            }
+            diagnostic_pattern = re.compile(
+                r"immutable host capability probe diagnostics: command_rc=[0-9]+ "
+                r"expected_bytes=228 actual_bytes=[0-9]+ "
+                r"expected_sha256=[0-9a-f]{64} actual_sha256=[0-9a-f]{64} "
+                r"expected_cr_count=0 actual_cr_count=[0-9]+ "
+                r"expected_lf_count=1 actual_lf_count=[0-9]+ exact_one_line=[01]\n$"
+            )
+            for label, payload in malformed_payloads.items():
+                with self.subTest(payload=label):
+                    failed, invocations = invoke(payload)
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertEqual(failed.stdout, "")
+                    self.assertEqual(len(invocations), 1)
+                    self.assertRegex(failed.stderr, diagnostic_pattern)
+                    self.assertIn(f"expected_sha256={expected_sha256}", failed.stderr)
+                    self.assertNotIn("RAW_SENTINEL", failed.stderr)
+                    self.assertNotIn(expected_line, failed.stderr)
+
+            first_failure, _ = invoke(malformed_payloads["appended banner"])
+            second_failure, _ = invoke(malformed_payloads["appended banner"])
+            self.assertEqual(first_failure.stderr, second_failure.stderr)
+
+            remote_failure, invocations = invoke(b"", ssh_rc=7)
+            self.assertNotEqual(remote_failure.returncode, 0)
+            self.assertEqual(len(invocations), 1)
+            self.assertIn("command_rc=7", remote_failure.stderr)
+            self.assertNotIn("RAW_SENTINEL", remote_failure.stderr)
+
+            oversized, invocations = invoke(b"RAW_SENTINEL" * 200)
+            self.assertNotEqual(oversized.returncode, 0)
+            self.assertEqual(len(invocations), 1)
+            self.assertLessEqual(output_path.stat().st_size, 512)
+            self.assertRegex(oversized.stderr, diagnostic_pattern)
+            self.assertNotIn("RAW_SENTINEL", oversized.stderr)
 
     def test_host_capability_probe_checks_closed_generation_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

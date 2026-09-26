@@ -806,23 +806,56 @@ jobs:
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/config")" = "regular file:1:600"
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/known_hosts")" = "regular file:1:600"
           test "$(stat -c '%F:%h:%a' -- "$HOST_TOOLS_SSH_DIR/id_ed25519")" = "regular file:1:600"
-          remote=(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          remote=(ssh -n -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$HOST_TOOLS_SSH_DIR/config" -i "$HOST_TOOLS_SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
           probe_output="$RUNNER_TEMP/platform-host-capabilities-output"
           expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"
-          # The file-size limit bounds the captured stdout to one 512-byte
-          # block. The dispatcher emits one short, fixed line; anything larger
-          # fails closed instead of being retained or projected to logs.
-          if ! (
+          expected_bytes="$(printf '%s\n' "$expected_output" | wc -c | tr -d '[:space:]')"
+          expected_sha256="$(printf '%s\n' "$expected_output" | sha256sum | cut -d' ' -f1)"
+          # The file-size limit bounds the remote process, while ``head`` caps
+          # retained stdout at 512 bytes. The dispatcher emits one short, fixed
+          # line; anything larger fails closed instead of being retained or
+          # projected to logs.
+          probe_rc=0
+          if (
             ulimit -f 1
             exec /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
               "${remote[@]}" /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-capabilities
-          ) > "$probe_output" 2>/dev/null < /dev/null; then
-            echo "immutable host capability probe failed" >&2
+          ) 2>/dev/null < /dev/null | /usr/bin/head -c 512 > "$probe_output"; then
+            :
+          else
+            probe_rc="$?"
+          fi
+          probe_file_ok=0
+          if [[ -f "$probe_output" && ! -L "$probe_output" ]] \
+            && [[ "$(stat -c '%F:%h' -- "$probe_output")" == "regular file:1" ]]; then
+            probe_file_ok=1
+          fi
+          if [[ "$probe_file_ok" -eq 1 ]]; then
+            actual_bytes="$(LC_ALL=C wc -c < "$probe_output" | tr -d '[:space:]')"
+            actual_sha256="$(sha256sum -- "$probe_output" | cut -d' ' -f1)"
+            actual_cr_count="$(LC_ALL=C tr -cd '\r' < "$probe_output" | wc -c | tr -d '[:space:]')"
+            actual_lf_count="$(LC_ALL=C tr -cd '\n' < "$probe_output" | wc -c | tr -d '[:space:]')"
+          else
+            actual_bytes=0
+            actual_sha256="$(printf '' | sha256sum | cut -d' ' -f1)"
+            actual_cr_count=0
+            actual_lf_count=0
+          fi
+          exact_one_line=0
+          if [[ "$actual_cr_count" -eq 0 && "$actual_lf_count" -eq 1 ]]; then
+            exact_one_line=1
+          fi
+          probe_match=0
+          if [[ "$probe_file_ok" -eq 1 && "$actual_bytes" -le 512 ]] \
+            && printf '%s\n' "$expected_output" | cmp -s - "$probe_output"; then
+            probe_match=1
+          fi
+          if [[ "$probe_rc" -ne 0 || "$probe_file_ok" -ne 1 || "$actual_bytes" -gt 512 || "$probe_match" -ne 1 ]]; then
+            printf 'immutable host capability probe diagnostics: command_rc=%s expected_bytes=%s actual_bytes=%s expected_sha256=%s actual_sha256=%s expected_cr_count=0 actual_cr_count=%s expected_lf_count=1 actual_lf_count=%s exact_one_line=%s\n' \
+              "$probe_rc" "$expected_bytes" "$actual_bytes" "$expected_sha256" \
+              "$actual_sha256" "$actual_cr_count" "$actual_lf_count" "$exact_one_line" >&2
             exit 1
           fi
-          test "$(stat -c '%F:%h:%s' -- "$probe_output")" = "regular file:1:$(stat -c '%s' -- "$probe_output")"
-          test "$(stat -c '%s' -- "$probe_output")" -le 512
-          printf '%s\n' "$expected_output" | cmp -s - "$probe_output"
 
       - name: Remove host capability verifier material
         if: ${{ always() }}

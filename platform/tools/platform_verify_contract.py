@@ -601,10 +601,20 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
                 '/usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" host-capabilities',
                 "/usr/bin/timeout --signal=TERM --kill-after=2s 15s",
                 "ulimit -f 1",
+                "remote=(ssh -n -T ",
                 "< /dev/null",
+                ") 2>/dev/null < /dev/null | /usr/bin/head -c 512 > \"$probe_output\"",
                 'expected_output="HOST_TOOLS schema=1 source_sha=$HOST_TOOLS_SHA generation=$HOST_TOOLS_SHA '
                 'dispatcher=2 artifact_prepare=2 supervisor=2 input_guard=1 python_isolated=1 python_bytecode_disabled=1"',
                 'printf \'%s\\n\' "$expected_output" | cmp -s - "$probe_output"',
+                "command_rc=",
+                "expected_bytes=",
+                "actual_bytes=",
+                "expected_sha256=",
+                "actual_sha256=",
+                "actual_cr_count=",
+                "actual_lf_count=",
+                "exact_one_line=",
             ):
                 if marker not in probe_step:
                     issues.append(f"host capability probe is missing fixed contract marker: {marker}")
