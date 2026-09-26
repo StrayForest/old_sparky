@@ -470,6 +470,12 @@ directory are absent, clears `SSH_DIR` through `GITHUB_ENV`, and gates any
 later artifact action on cleanup success. Cleanup is never
 `continue-on-error`, so a cleanup failure keeps the job failed without
 replacing the primary operation result.
+Their host-key setup uses the same bounded two-attempt contract: each fresh
+mode-600 scan file is limited by `timeout --foreground 4s` around
+`ssh-keyscan -T 3`, with a visible 0.5-second backoff and exact pinned
+Ed25519/fingerprint validation. The SSH contract test discovers every workflow
+site dynamically and exercises first-attempt recovery, persistent failure,
+wrong/multiple/malformed output, attempt bounds and candidate cleanup.
 
 Every retained result identifies its source SHA, profile ID/version/digest,
 runner, fixture shape, offered logical actions, HTTP attempts and acceptance
