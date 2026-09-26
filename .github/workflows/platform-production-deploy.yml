@@ -707,7 +707,9 @@ jobs:
           } > "$ssh_dir/config"
           chmod 600 "$ssh_dir/config"
           generation="/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA"
-          remote=(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$ssh_dir/config" -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
+          # Every call through this array is read-only; keep runner-side
+          # sidecars on the runner instead of allowing SSH to consume stdin.
+          remote=(ssh -n -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -F "$ssh_dir/config" -i "$ssh_dir/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST")
           test "$("${remote[@]}" /usr/bin/id -u | tr -d '\r\n')" = 0
           [[ "$HOST_TOOLS_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$generation" = "/opt/oldsparky/platform/shared/host-tools/$HOST_TOOLS_SHA" ]]
@@ -715,6 +717,11 @@ jobs:
           "${remote[@]}" /usr/bin/test ! -L "$generation"
           test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation")" = "directory:0:0:2:555"
           contract_dir="$RUNNER_TEMP/host-tools-download/contract"
+          expected_payload_count="$(wc -l < "$contract_dir/files.sha256" | tr -d ' ')"
+          expected_mode_payload_count="$(wc -l < "$contract_dir/files.modes" | tr -d ' ')"
+          test "$expected_payload_count" -gt 0
+          test "$expected_mode_payload_count" -eq "$expected_payload_count"
+          digest_count=0
           while read -r expected_hash expected_path; do
             [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]]
             [[ "$expected_path" =~ ^platform_[A-Za-z0-9_.-]+\.(py|sh)$|^capabilities\.txt$|^manifest\.json$ ]]
@@ -728,7 +735,9 @@ jobs:
             test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$remote_path")" = "regular file:0:0:1:$expected_mode"
             remote_digest="$("${remote[@]}" /usr/bin/sha256sum -- "$remote_path")"
             test "${remote_digest%% *}" = "$expected_hash"
+            digest_count=$((digest_count + 1))
           done < "$contract_dir/files.sha256"
+          test "$digest_count" -eq "$expected_payload_count"
           IFS= read -r expected_manifest_hash < "$contract_dir/manifest.sha256"
           IFS= read -r expected_capabilities_hash < "$contract_dir/capabilities.sha256"
           test "$("${remote[@]}" /usr/bin/sha256sum -- "$generation/manifest.json")" = "$expected_manifest_hash  $generation/manifest.json"
@@ -736,12 +745,17 @@ jobs:
           test "$("${remote[@]}" /usr/bin/sha256sum -- "$generation/capabilities.txt")" = "$expected_capabilities_hash  $generation/capabilities.txt"
           test "$("${remote[@]}" /usr/bin/stat -c '%F:%u:%g:%h:%a' -- "$generation/capabilities.txt")" = "regular file:0:0:1:444"
           declare -A expected_entries=([capabilities.txt]=1 [manifest.json]=1)
+          mode_count=0
           while read -r expected_mode expected_path; do
             remote_path="$generation/$expected_path"
             remote_mode="$("${remote[@]}" /usr/bin/stat -c '%a' -- "$remote_path")"
             test "$remote_mode" = "$expected_mode"
             expected_entries["$expected_path"]=1
+            mode_count=$((mode_count + 1))
           done < "$contract_dir/files.modes"
+          test "$mode_count" -eq "$expected_payload_count"
+          printf '%s\n' "Verified host-tools remote digest entries: $digest_count"
+          printf '%s\n' "Verified host-tools remote mode entries: $mode_count"
           expected_entry_count="${#expected_entries[@]}"
           inventory_encoded="$RUNNER_TEMP/host-tools-remote-entries.b64"
           inventory_file="$RUNNER_TEMP/host-tools-remote-entries"

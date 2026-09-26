@@ -1143,6 +1143,254 @@ raise SystemExit(module.main(["host-capabilities"]))
         self.assertIn("platform_unlisted_local.py", mutated_discovered - names)
         self.assertNotEqual(mutated_discovered - names - boundary_allowlist, set())
 
+    def test_remote_integrity_block_processes_every_digest_and_mode_sidecar_row(self) -> None:
+        """Execute the active YAML block against an SSH that consumes stdin.
+
+        The sidecars contain one row for each of the 13 host helpers plus
+        ``capabilities.txt``.  A remote SSH command without ``-n`` inherits
+        the sidecar as stdin and steals rows from the enclosing ``while``;
+        this fixture therefore fails on the vulnerable block and passes only
+        when the read-only SSH array is detached from runner stdin.
+        """
+
+        workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        preflight = workflow.split("  host-capability-preflight:", 1)[1].split(
+            "  build-release:", 1
+        )[0]
+        integrity_steps = [
+            step
+            for step in _workflow_step_blocks(preflight)
+            if "- name: Validate root SSH identity and installed generation" in step
+        ]
+        self.assertEqual(len(integrity_steps), 1)
+        run_marker = "        run: |\n"
+        self.assertIn(run_marker, integrity_steps[0])
+        shell_block = integrity_steps[0].split(run_marker, 1)[1]
+        shell_block = "\n".join(
+            line[10:] if line.startswith("          ") else line
+            for line in shell_block.splitlines()
+        )
+        self.assertIn("remote=(ssh -n ", shell_block)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source_fixture(root)
+            archive = root / "host-tools.zip"
+            summary = bundle.build_bundle(source, SOURCE_SHA, archive)
+            verified = bundle.verify_bundle(archive, expected_source_sha=SOURCE_SHA)
+            self.assertIsInstance(summary["manifest"], dict)
+
+            runner_temp = root / "runner-temp"
+            contract = runner_temp / "host-tools-download" / "contract"
+            contract.mkdir(parents=True)
+            bundle.write_contract_files(verified, contract)
+
+            unpacked = root / "remote-unpacked"
+            unpacked.mkdir()
+            with zipfile.ZipFile(archive) as bundle_zip:
+                bundle_zip.extractall(unpacked)
+            generation_root = unpacked / "platform-host-tools"
+            self.assertTrue(generation_root.is_dir())
+            os.chmod(generation_root, 0o555)
+            for member in generation_root.iterdir():
+                os.chmod(
+                    member,
+                    0o444
+                    if member.name in {"capabilities.txt", "manifest.json"}
+                    else 0o555,
+                )
+
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            ssh_log = root / "ssh.log"
+            fake_ssh = fake_bin / "ssh"
+            fake_ssh.write_text(
+                """#!/usr/bin/env python3
+from pathlib import Path
+import hashlib
+import os
+import sys
+
+if "-n" not in sys.argv[1:]:
+    sys.stdin.readline()
+arguments = sys.argv[1:]
+destination = next(
+    (index for index, argument in enumerate(arguments) if "@" in argument),
+    None,
+)
+if destination is None:
+    raise SystemExit("fake SSH destination is missing")
+command = arguments[destination + 1 :]
+log_path = Path(os.environ["FAKE_SSH_LOG"])
+with log_path.open("a", encoding="utf-8") as log:
+    log.write(" ".join(command) + "\\n")
+remote_path = command[-1] if command else ""
+if command[0] == "/usr/bin/id":
+    print("0")
+elif command[0] == "/usr/bin/test":
+    pass
+elif command[0] == "/usr/bin/stat":
+    format_value = command[2]
+    if format_value == "%a":
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(f"mode:{Path(remote_path).name}\\n")
+        print(
+            "444"
+            if remote_path.endswith("/capabilities.txt")
+            or remote_path.endswith("/manifest.json")
+            else "555"
+        )
+    elif remote_path.endswith("/" + os.environ["FAKE_SOURCE_SHA"]):
+        print("directory:0:0:2:555")
+    else:
+        mode = (
+            "444"
+            if remote_path.endswith("/capabilities.txt")
+            or remote_path.endswith("/manifest.json")
+            else "555"
+        )
+        print(f"regular file:0:0:1:{mode}")
+elif command[0] == "/usr/bin/sha256sum":
+    local_path = Path(os.environ["FAKE_GENERATION"]) / Path(remote_path).name
+    digest = hashlib.sha256(local_path.read_bytes()).hexdigest()
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(f"digest:{local_path.name}\\n")
+    print(f"{digest}  {remote_path}")
+elif command[0] == "/usr/bin/find":
+    remote_generation = command[2]
+    for local_path in sorted(Path(os.environ["FAKE_GENERATION"]).glob("*")):
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(f"inventory:{local_path.name}\\n")
+        sys.stdout.buffer.write(
+            f"{remote_generation}/{local_path.name}\\0".encode("utf-8")
+        )
+else:
+    raise SystemExit(f"unexpected fake SSH command: {command!r}")
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            fake_keyscan = fake_bin / "ssh-keyscan"
+            fake_keyscan.write_text(
+                """#!/usr/bin/env python3
+import os
+print(f"{os.environ['FAKE_SSH_HOST']} ssh-ed25519 AAAA")
+""",
+                encoding="utf-8",
+            )
+            fake_keyscan.chmod(0o755)
+            fake_keygen = fake_bin / "ssh-keygen"
+            fake_keygen.write_text(
+                """#!/usr/bin/env python3
+print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
+""",
+                encoding="utf-8",
+            )
+            fake_keygen.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_ENV": str(root / "github-env"),
+                    "PROD_SSH_HOST": "production.example.test",
+                    "PROD_SSH_USER": "operator",
+                    "PROD_SSH_KEY": "fixture-key",
+                    "HOST_TOOLS_SHA": SOURCE_SHA,
+                    "FAKE_SSH_HOST": "production.example.test",
+                    "FAKE_SSH_LOG": str(ssh_log),
+                    "FAKE_GENERATION": str(generation_root),
+                    "FAKE_SOURCE_SHA": SOURCE_SHA,
+                    "PATH": f"{fake_bin}:{env['PATH']}",
+                }
+            )
+
+            def run_block(block: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", "-c", block],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    input="",
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            completed = run_block(shell_block)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            expected_names = set(bundle.HOST_TOOL_FILES) | {"capabilities.txt"}
+            log_lines = ssh_log.read_text(encoding="utf-8").splitlines()
+            digest_records = [
+                line.removeprefix("digest:")
+                for line in log_lines
+                if line.startswith("digest:")
+            ]
+            mode_records = [
+                line.removeprefix("mode:")
+                for line in log_lines
+                if line.startswith("mode:")
+            ]
+            self.assertEqual(len(digest_records), len(expected_names) + 2)
+            self.assertEqual(
+                digest_records[: len(expected_names)], sorted(expected_names)
+            )
+            self.assertEqual(len(mode_records), len(expected_names))
+            self.assertEqual(set(mode_records), expected_names)
+            inventory_records = [
+                line.removeprefix("inventory:")
+                for line in log_lines
+                if line.startswith("inventory:")
+            ]
+            expected_inventory = expected_names | {"manifest.json"}
+            self.assertEqual(len(inventory_records), len(expected_inventory))
+            self.assertEqual(set(inventory_records), expected_inventory)
+
+            # Preserve the intentional stdin handoff used by the production
+            # dispatcher while proving the read-only verifier is detached.
+            self.assertIn('production-prepare-artifact < "$input_path"', workflow)
+            self.assertIn('production-deploy < "$input_path"', workflow)
+
+            # Re-run the active block with only the protective ``-n`` removed.
+            # The adversarial fake consumes one sidecar row per SSH call, so
+            # the digest count guard must fail closed before inventory.
+            ssh_log.write_text("", encoding="utf-8")
+            vulnerable = shell_block.replace("remote=(ssh -n ", "remote=(ssh ", 1)
+            self.assertNotEqual(run_block(vulnerable).returncode, 0)
+            vulnerable_digests = [
+                line
+                for line in ssh_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith("digest:")
+            ]
+            self.assertLess(len(vulnerable_digests), len(expected_names))
+
+            digest_sidecar = contract / "files.sha256"
+            mode_sidecar = contract / "files.modes"
+            original_digest = digest_sidecar.read_text(encoding="ascii")
+            original_modes = mode_sidecar.read_text(encoding="ascii")
+            digest_lines = original_digest.splitlines(keepends=True)
+            mode_lines = original_modes.splitlines(keepends=True)
+
+            def assert_block_fails(
+                *, digest_text: str = original_digest, mode_text: str = original_modes
+            ) -> None:
+                digest_sidecar.write_text(digest_text, encoding="ascii")
+                mode_sidecar.write_text(mode_text, encoding="ascii")
+                ssh_log.write_text("", encoding="utf-8")
+                failed = run_block(shell_block)
+                self.assertNotEqual(failed.returncode, 0, failed.stderr)
+
+            malformed_digest = digest_lines[0].replace(
+                digest_lines[0].split("  ", 1)[0], "not-a-digest", 1
+            )
+            assert_block_fails(digest_text=malformed_digest + "".join(digest_lines[1:]))
+            assert_block_fails(digest_text="".join(digest_lines[:-1]))
+
+            malformed_mode = "444  ../unexpected\n" + "".join(mode_lines[1:])
+            assert_block_fails(mode_text=malformed_mode)
+            assert_block_fails(mode_text="".join(mode_lines[:-1]))
+
     def test_remote_capability_inventory_is_nul_safe_and_exact(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-production-deploy.yml").read_text(
             encoding="utf-8"
