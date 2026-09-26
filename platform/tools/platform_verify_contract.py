@@ -618,6 +618,14 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
             ):
                 if marker not in probe_step:
                     issues.append(f"host capability probe is missing fixed contract marker: {marker}")
+            ssh_dir_stat = 'test "$(stat -c \'%F:%a\' -- "$HOST_TOOLS_SSH_DIR")" = "directory:700"'
+            if ssh_dir_stat not in probe_step:
+                issues.append("host capability probe must accept real SSH directory link counts")
+            ssh_dir_owner = 'test "$(stat -c \'%u:%g\' -- "$HOST_TOOLS_SSH_DIR")" = "$(id -u):$(id -g)"'
+            if ssh_dir_owner not in probe_step:
+                issues.append("host capability probe must retain SSH directory ownership checks")
+            if 'stat -c \'%F:%h:%a\' -- "$HOST_TOOLS_SSH_DIR"' in probe_step:
+                issues.append("host capability probe must not require SSH directory nlink 1")
             if not re.search(
                 r'^\s+"\$\{remote\[@\]\}" /usr/bin/python3\.12 -I -B '
                 r'"\$HOST_TOOLS_DISPATCHER" host-capabilities$',

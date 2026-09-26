@@ -1564,6 +1564,30 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
         self.assertIn("< /dev/null", shell_block)
         self.assertIn("ulimit -f 1", shell_block)
         self.assertIn("printf '%s\\n' \"$expected_output\" | cmp -s - \"$probe_output\"", shell_block)
+        self.assertIn(
+            'stat -c \'%u:%g\' -- "$HOST_TOOLS_SSH_DIR"',
+            shell_block,
+        )
+        for filename in ("config", "known_hosts", "id_ed25519"):
+            self.assertIn(
+                f'test "$(stat -c \'%F:%h:%a\' -- "$HOST_TOOLS_SSH_DIR/{filename}")" = "regular file:1:600"',
+                shell_block,
+            )
+
+        cleanup_steps = [
+            step
+            for step in _workflow_step_blocks(preflight)
+            if "- name: Remove host capability verifier material" in step
+        ]
+        self.assertEqual(len(cleanup_steps), 1)
+        self.assertIn(run_marker, cleanup_steps[0])
+        cleanup_shell_block = cleanup_steps[0].split(run_marker, 1)[1]
+        cleanup_shell_block = "\n".join(
+            line[10:] if line.startswith("          ") else line
+            for line in cleanup_shell_block.splitlines()
+        )
+        self.assertIn('"$RUNNER_TEMP/platform-host-capabilities-output"', cleanup_shell_block)
+        self.assertIn('rmdir -- "$ssh_dir"', cleanup_shell_block)
 
         expected_line = (
             f"HOST_TOOLS schema=1 source_sha={SOURCE_SHA} generation={SOURCE_SHA} "
@@ -1578,7 +1602,7 @@ print("256 SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y (ED25519)")
             root = Path(temporary)
             runner_temp = root / "runner-temp"
             runner_temp.mkdir()
-            ssh_dir = root / "ssh"
+            ssh_dir = runner_temp / "platform-host-capability-ssh"
             ssh_dir.mkdir(mode=0o700)
             for name in ("config", "known_hosts", "id_ed25519"):
                 path = ssh_dir / name
@@ -1629,37 +1653,14 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 encoding="utf-8",
             )
             fake_ssh.chmod(0o755)
-            fake_stat = fake_bin / "stat"
-            fake_stat.write_text(
-                """#!/usr/bin/env python3
-import os
-from pathlib import Path
-import subprocess
-import sys
-
-format_value = sys.argv[sys.argv.index("-c") + 1]
-path = Path(sys.argv[-1])
-if path == Path(os.environ["FAKE_SSH_DIR"]):
-    print("directory:1:700")
-elif path.parent == Path(os.environ["FAKE_SSH_DIR"]):
-    print("regular file:1:600")
-else:
-    completed = subprocess.run(
-        ["/usr/bin/stat", "-c", format_value, "--", str(path)],
-        check=False,
-    )
-    raise SystemExit(completed.returncode)
-""",
-                encoding="utf-8",
-            )
-            fake_stat.chmod(0o755)
-
+            self.assertEqual([path.name for path in fake_bin.iterdir()], ["ssh"])
             expected_generation = f"/opt/oldsparky/platform/shared/host-tools/{SOURCE_SHA}"
             expected_dispatcher = f"{expected_generation}/platform_workflow_remote_dispatch.py"
             env = os.environ.copy()
             env.update(
                 {
                     "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_ENV": str(root / "github-env"),
                     "PROD_SSH_HOST": "production.example.test",
                     "PROD_SSH_USER": "operator",
                     "PROD_SSH_KEY": "fixture-key",
@@ -1667,7 +1668,6 @@ else:
                     "HOST_TOOLS_GENERATION": expected_generation,
                     "HOST_TOOLS_DISPATCHER": expected_dispatcher,
                     "HOST_TOOLS_SSH_DIR": str(ssh_dir),
-                    "FAKE_SSH_DIR": str(ssh_dir),
                     "FAKE_SSH_LOG": str(invocation_log),
                     "FAKE_PROBE_PAYLOAD": str(payload_path),
                     "FAKE_EXPECTED_DISPATCHER": expected_dispatcher,
@@ -1676,6 +1676,23 @@ else:
                     "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
                 }
             )
+
+            cleanup_files = (
+                runner_temp / "platform-host-tools-artifact.zip",
+                runner_temp / "platform-host-capabilities-output",
+                runner_temp / "host-tools-remote-entries.b64",
+                runner_temp / "host-tools-remote-entries",
+                runner_temp / "platform-host-tools-expected-members",
+                runner_temp / "platform-host-tools-actual-members",
+            )
+            cleanup_directories = (
+                runner_temp / "host-tools-download",
+                runner_temp / "platform-host-tools-inner",
+            )
+            for path in cleanup_files:
+                path.write_bytes(b"fixture")
+            for path in cleanup_directories:
+                path.mkdir()
 
             def invoke(
                 payload: bytes,
@@ -1702,55 +1719,110 @@ else:
                 ]
                 return completed, invocations
 
-            passed, invocations = invoke(expected_payload, stderr_text="RAW_STDERR_SENTINEL")
-            self.assertEqual(passed.returncode, 0, passed.stderr)
-            self.assertEqual(passed.stdout, "")
-            self.assertEqual(passed.stderr, "")
-            self.assertEqual(len(invocations), 1)
-            self.assertIn("-n", invocations[0])
-            self.assertIn("-T", invocations[0])
+            try:
+                passed, invocations = invoke(expected_payload, stderr_text="RAW_STDERR_SENTINEL")
+                self.assertEqual(passed.returncode, 0, passed.stderr)
+                self.assertEqual(passed.stdout, "")
+                self.assertEqual(passed.stderr, "")
+                self.assertEqual(len(invocations), 1)
+                self.assertIn("-n", invocations[0])
+                self.assertIn("-T", invocations[0])
+                self.assertEqual(
+                    subprocess.run(
+                        ["/usr/bin/stat", "-c", "%F:%h:%a", "--", str(ssh_dir)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip(),
+                    "directory:2:700",
+                )
+                self.assertEqual(
+                    subprocess.run(
+                        ["/usr/bin/stat", "-c", "%u:%g", "--", str(ssh_dir)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip(),
+                    f"{os.getuid()}:{os.getgid()}",
+                )
 
-            malformed_payloads = {
-                "prepended banner": b"RAW_SENTINEL\n" + expected_payload,
-                "appended banner": expected_payload + b"RAW_SENTINEL\n",
-                "crlf": expected_payload.replace(b"\n", b"\r\n"),
-                "hostname": b"RAW_SENTINEL production.example.test\n",
-                "duplicate output": expected_payload + expected_payload,
-            }
-            diagnostic_pattern = re.compile(
-                r"immutable host capability probe diagnostics: command_rc=[0-9]+ "
-                r"expected_bytes=228 actual_bytes=[0-9]+ "
-                r"expected_sha256=[0-9a-f]{64} actual_sha256=[0-9a-f]{64} "
-                r"expected_cr_count=0 actual_cr_count=[0-9]+ "
-                r"expected_lf_count=1 actual_lf_count=[0-9]+ exact_one_line=[01]\n$"
-            )
-            for label, payload in malformed_payloads.items():
-                with self.subTest(payload=label):
-                    failed, invocations = invoke(payload)
-                    self.assertNotEqual(failed.returncode, 0)
-                    self.assertEqual(failed.stdout, "")
-                    self.assertEqual(len(invocations), 1)
-                    self.assertRegex(failed.stderr, diagnostic_pattern)
-                    self.assertIn(f"expected_sha256={expected_sha256}", failed.stderr)
-                    self.assertNotIn("RAW_SENTINEL", failed.stderr)
-                    self.assertNotIn(expected_line, failed.stderr)
+                # The former assertion rejected the real directory created by
+                # ``install -d`` (nlink 2) and exited before the SSH boundary.
+                invocation_log.write_text("", encoding="ascii")
+                old_base = shell_block.replace(
+                    'stat -c \'%F:%a\' -- "$HOST_TOOLS_SSH_DIR"',
+                    'stat -c \'%F:%h:%a\' -- "$HOST_TOOLS_SSH_DIR"',
+                    1,
+                ).replace('= "directory:700"', '= "directory:1:700"', 1)
+                vulnerable = subprocess.run(
+                    ["bash", "-c", old_base],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    input="",
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(vulnerable.returncode, 0)
+                self.assertEqual(invocation_log.read_text(encoding="ascii"), "")
 
-            first_failure, _ = invoke(malformed_payloads["appended banner"])
-            second_failure, _ = invoke(malformed_payloads["appended banner"])
-            self.assertEqual(first_failure.stderr, second_failure.stderr)
+                malformed_payloads = {
+                    "prepended banner": b"RAW_SENTINEL\n" + expected_payload,
+                    "appended banner": expected_payload + b"RAW_SENTINEL\n",
+                    "crlf": expected_payload.replace(b"\n", b"\r\n"),
+                    "hostname": b"RAW_SENTINEL production.example.test\n",
+                    "duplicate output": expected_payload + expected_payload,
+                }
+                diagnostic_pattern = re.compile(
+                    r"immutable host capability probe diagnostics: command_rc=[0-9]+ "
+                    r"expected_bytes=228 actual_bytes=[0-9]+ "
+                    r"expected_sha256=[0-9a-f]{64} actual_sha256=[0-9a-f]{64} "
+                    r"expected_cr_count=0 actual_cr_count=[0-9]+ "
+                    r"expected_lf_count=1 actual_lf_count=[0-9]+ exact_one_line=[01]\n$"
+                )
+                for label, payload in malformed_payloads.items():
+                    with self.subTest(payload=label):
+                        failed, invocations = invoke(payload)
+                        self.assertNotEqual(failed.returncode, 0)
+                        self.assertEqual(failed.stdout, "")
+                        self.assertEqual(len(invocations), 1)
+                        self.assertRegex(failed.stderr, diagnostic_pattern)
+                        self.assertIn(f"expected_sha256={expected_sha256}", failed.stderr)
+                        self.assertNotIn("RAW_SENTINEL", failed.stderr)
+                        self.assertNotIn(expected_line, failed.stderr)
 
-            remote_failure, invocations = invoke(b"", ssh_rc=7)
-            self.assertNotEqual(remote_failure.returncode, 0)
-            self.assertEqual(len(invocations), 1)
-            self.assertIn("command_rc=7", remote_failure.stderr)
-            self.assertNotIn("RAW_SENTINEL", remote_failure.stderr)
+                first_failure, _ = invoke(malformed_payloads["appended banner"])
+                second_failure, _ = invoke(malformed_payloads["appended banner"])
+                self.assertEqual(first_failure.stderr, second_failure.stderr)
 
-            oversized, invocations = invoke(b"RAW_SENTINEL" * 200)
-            self.assertNotEqual(oversized.returncode, 0)
-            self.assertEqual(len(invocations), 1)
-            self.assertLessEqual(output_path.stat().st_size, 512)
-            self.assertRegex(oversized.stderr, diagnostic_pattern)
-            self.assertNotIn("RAW_SENTINEL", oversized.stderr)
+                remote_failure, invocations = invoke(b"", ssh_rc=7)
+                self.assertNotEqual(remote_failure.returncode, 0)
+                self.assertEqual(len(invocations), 1)
+                self.assertIn("command_rc=7", remote_failure.stderr)
+                self.assertNotIn("RAW_SENTINEL", remote_failure.stderr)
+
+                oversized, invocations = invoke(b"RAW_SENTINEL" * 200)
+                self.assertNotEqual(oversized.returncode, 0)
+                self.assertEqual(len(invocations), 1)
+                self.assertLessEqual(output_path.stat().st_size, 512)
+                self.assertRegex(oversized.stderr, diagnostic_pattern)
+                self.assertNotIn("RAW_SENTINEL", oversized.stderr)
+            finally:
+                cleanup_result = subprocess.run(
+                    ["bash", "-c", cleanup_shell_block],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    input="",
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(cleanup_result.returncode, 0, cleanup_result.stderr)
+                for path in (*cleanup_files, *cleanup_directories, output_path, ssh_dir):
+                    self.assertFalse(
+                        path.exists() or path.is_symlink(),
+                        f"cleanup left temporary artifact: {path}",
+                    )
 
     def test_host_capability_probe_checks_closed_generation_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
