@@ -174,7 +174,7 @@ jobs:
             --output "$RUNNER_TEMP/platform-host-tools-summary-metadata.json"
           curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 8388608 \
             --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/zip" \
+            --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/actions/artifacts/$summary_id/zip" \
             --output "$RUNNER_TEMP/platform-host-tools-summary.zip"
@@ -362,7 +362,7 @@ jobs:
             "$api/actions/artifacts/$ARTIFACT_ID" \
             --output "$RUNNER_TEMP/platform-host-tools-candidate-metadata.json"
           curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 8388608 \
-            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/zip" \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/actions/artifacts/$ARTIFACT_ID/zip" \
             --output "$RUNNER_TEMP/platform-host-tools-candidate-outer.zip"
@@ -417,7 +417,7 @@ jobs:
             "$api/actions/artifacts/$EVIDENCE_ARTIFACT_ID" \
             --output "$RUNNER_TEMP/platform-host-tools-evidence-metadata.json"
           curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 8388608 \
-            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/zip" \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/actions/artifacts/$EVIDENCE_ARTIFACT_ID/zip" \
             --output "$RUNNER_TEMP/platform-host-tools-evidence-outer.zip"

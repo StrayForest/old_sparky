@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from contextlib import redirect_stdout
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 import re
 import resource
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import threading
 from types import SimpleNamespace
 import unittest
 import zipfile
@@ -24,6 +26,7 @@ from tools import platform_host_tools_pin as pin
 from tools import platform_workflow_remote_dispatch as dispatcher
 from tools.platform_verify_contract import (
     _workflow_step_blocks,
+    host_tools_candidate_artifact_zip_curl_blocks,
     host_tools_candidate_workflow_issues,
 )
 
@@ -36,6 +39,114 @@ ARTIFACT_DIGEST = "sha256:" + "e" * 64
 
 
 class HostToolsBundleTests(unittest.TestCase):
+    def _assert_artifact_zip_transport_contract(self) -> None:
+        with BytesIO() as buffer:
+            with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("fixture.txt", b"artifact ZIP fixture")
+            zip_payload = buffer.getvalue()
+
+        endpoint = "/repos/StrayForest/old_sparky/actions/artifacts/123/zip"
+        requests: list[dict[str, str | None]] = []
+
+        class ArtifactHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                requests.append(
+                    {
+                        "path": self.path,
+                        "authorization": self.headers.get("Authorization"),
+                        "accept": self.headers.get("Accept"),
+                        "api_version": self.headers.get("X-GitHub-Api-Version"),
+                    }
+                )
+                if self.path == endpoint:
+                    if self.headers.get("Accept") != "application/vnd.github+json":
+                        body = b"unsupported media type\n"
+                        self.send_response(415)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    self.send_response(302)
+                    self.send_header("Location", "/fixture.zip")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if self.path == "/fixture.zip":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(len(zip_payload)))
+                    self.end_headers()
+                    self.wfile.write(zip_payload)
+                    return
+                body = b"not found\n"
+                self.send_response(404)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ArtifactHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+
+                def download(accept: str, output: Path) -> subprocess.CompletedProcess[str]:
+                    return subprocess.run(
+                        [
+                            "curl",
+                            "--fail-with-body",
+                            "--silent",
+                            "--show-error",
+                            "--location",
+                            "--max-time",
+                            "10",
+                            "--max-filesize",
+                            "8388608",
+                            "--header",
+                            "Authorization: Bearer fixture-token",
+                            "--header",
+                            f"Accept: {accept}",
+                            "--header",
+                            "X-GitHub-Api-Version: 2022-11-28",
+                            f"http://127.0.0.1:{server.server_port}{endpoint}",
+                            "--output",
+                            str(output),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        env={"PATH": os.environ.get("PATH", ""), "LC_ALL": "C"},
+                        check=False,
+                    )
+
+                successful = download("application/vnd.github+json", root / "artifact.zip")
+                self.assertEqual(successful.returncode, 0, successful.stderr)
+                self.assertEqual((root / "artifact.zip").read_bytes(), zip_payload)
+                self.assertEqual(
+                    [request["path"] for request in requests],
+                    [endpoint, "/fixture.zip"],
+                )
+                for request in requests:
+                    self.assertEqual(request["authorization"], "Bearer fixture-token")
+                    self.assertEqual(request["accept"], "application/vnd.github+json")
+                    self.assertEqual(request["api_version"], "2022-11-28")
+
+                requests.clear()
+                rejected = download("application/zip", root / "rejected.zip")
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(requests[0]["path"], endpoint)
+                self.assertEqual(requests[0]["accept"], "application/zip")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
     def _current_target_sha(self) -> str:
         completed = subprocess.run(
             ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
@@ -2302,6 +2413,22 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         self.assertNotIn(candidate.CANDIDATE_ARTIFACT_PREFIX, production_text)
         self.assertNotIn(candidate.EVIDENCE_ARTIFACT_PREFIX, production_text)
         self.assertEqual(host_tools_candidate_workflow_issues(), [])
+        artifact_zip_blocks = host_tools_candidate_artifact_zip_curl_blocks(workflow)
+        self.assertEqual(len(artifact_zip_blocks), 3)
+        for block in artifact_zip_blocks:
+            broken_workflow = workflow.replace(
+                block,
+                block.replace("application/vnd.github+json", "application/zip", 1),
+                1,
+            )
+            self.assertTrue(
+                any(
+                    "must request application/vnd.github+json" in issue
+                    for issue in host_tools_candidate_workflow_issues(broken_workflow)
+                ),
+                block,
+            )
+        self._assert_artifact_zip_transport_contract()
 
         # Exercise the exact trusted workflow invocation in isolated,
         # bytecode-free mode.  A candidate-side module with the same name is
