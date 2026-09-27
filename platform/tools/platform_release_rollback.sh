@@ -167,7 +167,7 @@ transaction_json() {
 json_field() {
   local field="$1"
   /usr/bin/python3 -I -c \
-    'import json,sys; value=json.load(sys.stdin)[sys.argv[1]]; print("" if value is None else value)' \
+    'import json,sys; value=json.load(sys.stdin).get(sys.argv[1]); print("" if value is None else value)' \
     "$field" 2>/dev/null
 }
 
@@ -376,9 +376,35 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
     trap '' HUP INT TERM
     recover_rollback_to_original
     trap - HUP INT TERM
-  else
+  elif [[ "$PENDING_OPERATION" == "rollback" ]]; then
+    trap '' HUP INT TERM
     recover_rollback_before_runtime
+    trap - HUP INT TERM
     public_status passed recovery
+  elif [[ "$PENDING_OPERATION" == "install" ]]; then
+    # First-install recovery has no rollback target.  Keep it on the generic
+    # transaction state machine, which restores an absent current/previous
+    # pointer pair and the created venv without invoking rollback-specific
+    # systemd/runtime helpers.  A legacy receipt or a paired systemd receipt
+    # is outside this owner and remains fail-closed for the release-recover or
+    # immutable recovery-bootstrap path to handle with its strict correlation.
+    operation_id="$(transaction_json | json_field operation_id)"
+    if [[ -z "$operation_id" ]]; then
+      public_status failed transaction >&2
+      exit 1
+    fi
+    if [[ -e "$SYSTEMD_STATE_RECEIPT" || -L "$SYSTEMD_STATE_RECEIPT" ]]; then
+      public_status failed systemd_state >&2
+      exit 1
+    fi
+    trap '' HUP INT TERM
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+      --state "$TRANSACTION_STATE"
+    trap - HUP INT TERM
+    public_status passed recovery
+  else
+    public_status failed transaction >&2
+    exit 1
   fi
   exit 0
 fi

@@ -1778,6 +1778,7 @@ def main() -> int:
                     json.dumps(
                         {
                             "operation": record["operation"],
+                            "operation_id": record["operation_id"],
                             "phase": record["phase"],
                             "app_dir": record["app_dir"],
                             "current_before": record["current_before"],

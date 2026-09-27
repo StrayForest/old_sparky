@@ -146,6 +146,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tests/test_platform_recovery_bootstrap.py",
         "platform/tests/test_platform_release_recovery_boundaries.py",
         "platform/tests/test_platform_release_systemd_state.py",
+        "platform/tests/test_platform_release_venv_rollback.py",
         "platform/tests/test_platform_live_qa_guard.py",
         "platform/tests/test_platform_live_qa_runtime_install.py",
         "platform/tests/test_platform_ssh_host_key_scan.py",

@@ -591,6 +591,67 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
                 self.assertFalse(any(self.shared_dir.glob(".venv-install-*")))
                 self.assertFalse((self.shared_dir / TRANSACTION_STATE_NAME).exists())
 
+    def test_first_install_interruption_uses_install_recovery_fallback(self) -> None:
+        artifact = self.build_artifact("first-install", pip_result="new")
+        injected = self.write_injected_script(
+            INSTALL_SCRIPT,
+            "platform_release_install_first_bootstrap.sh",
+            "    /usr/bin/python3 -I \"$TRANSACTION_TOOL\" rename \\\n"
+            "      --state \"$TRANSACTION_STATE\" \\\n"
+            "      --mode activate-created\n",
+            '/bin/kill -KILL "$$" # test first-install interruption\n',
+        )
+
+        result = self.run_script(
+            injected,
+            str(artifact),
+            str(self.app_dir),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        state = self.shared_dir / TRANSACTION_STATE_NAME
+        self.assertTrue(state.is_file())
+        record = json.loads(state.read_text(encoding="ascii"))
+        self.assertEqual(record["operation"], "install")
+        self.assertEqual(len(record["operation_id"]), 32)
+        self.assertIsNone(record["current_before"])
+        self.assertIsNone(record["previous_before"])
+        self.assertTrue((self.shared_dir / "venv").is_dir())
+
+        systemd_state = self.shared_dir / ".release-systemd-state.json"
+        systemd_state.write_text("unexpected\n", encoding="ascii")
+        systemd_state.chmod(0o600)
+        blocked = self.run_script(
+            ROLLBACK_SCRIPT,
+            "--recover-pending",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertTrue(state.exists())
+        self.assertTrue((self.shared_dir / "venv").is_dir())
+        systemd_state.unlink()
+
+        recovered = self.run_script(
+            ROLLBACK_SCRIPT,
+            "--recover-pending",
+            "--app-dir",
+            str(self.app_dir),
+            check=False,
+        )
+
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(os.path.lexists(self.app_dir / "current"))
+        self.assertFalse(os.path.lexists(self.app_dir / "previous"))
+        self.assertFalse((self.shared_dir / "venv").exists())
+        self.assertFalse(state.exists())
+        self.assertFalse(
+            (self.releases_dir / f"first-install-{BUILT_AT}").exists()
+        )
+        self.assertFalse(any(self.shared_dir.glob(".venv-install-*")))
+
     def test_rollback_interruptions_restore_exact_original_state(self) -> None:
         current_release, previous_release, snapshot = self.prepare_rollback_fixture()
         cases = (

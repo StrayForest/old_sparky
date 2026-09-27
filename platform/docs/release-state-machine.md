@@ -155,6 +155,11 @@ the recovery handoff needed for this cross-release boundary.
   durable. Recovery is invoked through the shared bundle, including when
   `current` already resolves to the previous release. A missing, stale or
   malformed systemd-state receipt never authorizes an enable/start operation.
+- An interrupted first install with a new operation ID and no systemd receipt
+  is recovered by the generic transaction state machine, including the valid
+  case where `current_before` and `previous_before` are absent. It never enters
+  rollback-specific recovery; a paired systemd receipt is retained for the
+  operation-aware release-recover path instead.
 - A legacy v2 install receipt in `recovery-restored` has no operation ID and is
   not upgraded in place. Only the immutable recovery-bootstrap bridge may
   consume it, and only when the systemd receipt is absent, the candidate is
