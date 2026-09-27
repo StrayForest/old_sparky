@@ -19,9 +19,13 @@ import zipfile
 from unittest.mock import patch
 
 from tools import platform_host_tools_bundle as bundle
+from tools import platform_host_tools_candidate as candidate
 from tools import platform_host_tools_pin as pin
 from tools import platform_workflow_remote_dispatch as dispatcher
-from tools.platform_verify_contract import _workflow_step_blocks
+from tools.platform_verify_contract import (
+    _workflow_step_blocks,
+    host_tools_candidate_workflow_issues,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1869,6 +1873,311 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 patch.object(dispatcher, "HOST_TOOLS_ROOT", host_root), \
                 patch.object(dispatcher, "__file__", str(generation / bundle.HOST_TOOL_FILES[0])):
                 self.assertEqual(dispatcher._host_capabilities(), 2)
+
+    def _candidate_event_fixture(self) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]], dict[str, object]]:
+        base_sha = "1" * 40
+        candidate_sha = "2" * 40
+        run = {
+            "id": 9001,
+            "run_attempt": 2,
+            "workflow_id": candidate.SECURITY_WORKFLOW_ID,
+            "name": candidate.SECURITY_WORKFLOW_NAME,
+            "path": candidate.SECURITY_WORKFLOW_PATH,
+            "event": "pull_request",
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": candidate_sha,
+            "head_branch": "codex/host-tools-bump",
+            "repository": {"full_name": candidate.REPOSITORY},
+            "head_repository": {"full_name": candidate.REPOSITORY},
+        }
+        event = {"workflow_run": {**run, "pull_requests": [{"number": 115}]}}
+        pull_requests = [{"number": 115}]
+        repository = {
+            "full_name": candidate.REPOSITORY,
+            "owner": {"login": "StrayForest"},
+        }
+        pr = {
+            "number": 115,
+            "state": "open",
+            "draft": False,
+            "base": {"ref": "dev", "sha": base_sha, "repo": repository},
+            "head": {
+                "ref": "codex/host-tools-bump",
+                "sha": candidate_sha,
+                "label": "StrayForest:codex/host-tools-bump",
+                "repo": repository,
+            },
+            "merge_commit_sha": "3" * 40,
+        }
+        return event, run, pull_requests, pr
+
+    def test_candidate_event_context_binds_canonical_run_pr_and_base(self) -> None:
+        event, run, pull_requests, pr = self._candidate_event_fixture()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {
+                "event": root / "event.json",
+                "run": root / "run.json",
+                "pull_requests": root / "pull_requests.json",
+                "pr": root / "pr.json",
+                "context": root / "context.json",
+                "output": root / "output",
+            }
+            paths["event"].write_text(json.dumps(event), encoding="utf-8")
+            paths["run"].write_text(json.dumps(run), encoding="utf-8")
+            paths["pull_requests"].write_text(json.dumps(pull_requests), encoding="utf-8")
+            paths["pr"].write_text(json.dumps(pr), encoding="utf-8")
+            context = candidate.validate_context(
+                paths["event"],
+                paths["run"],
+                paths["pull_requests"],
+                paths["pr"],
+                output=paths["context"],
+            )
+            self.assertEqual(context.run_id, "9001")
+            self.assertEqual(context.run_attempt, "2")
+            self.assertEqual(context.base_sha, "1" * 40)
+            self.assertEqual(json.loads(paths["context"].read_text())["pull_request"]["number"], 115)
+
+    def test_candidate_context_rejects_stale_fork_ref_tag_merge_and_pr_state(self) -> None:
+        event, run, pull_requests, pr = self._candidate_event_fixture()
+        mutations = (
+            ("wrong-workflow", lambda value: {**value, "workflow_id": candidate.SECURITY_WORKFLOW_ID + 1}),
+            ("wrong-conclusion", lambda value: {**value, "conclusion": "failure"}),
+            ("wrong-event", lambda value: {**value, "event": "push"}),
+            ("fork-run", lambda value: {**value, "head_repository": {"full_name": "attacker/old_sparky"}}),
+            ("missing-head-repository", lambda value: {key: item for key, item in value.items() if key != "head_repository"}),
+        )
+        for label, mutation in mutations:
+            with self.subTest(label=label):
+                mutated_run = mutation(run)
+                mutated_event = {"workflow_run": {**mutated_run, "pull_requests": [{"number": 115}]}}
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    event_path = root / "event.json"
+                    run_path = root / "run.json"
+                    prs_path = root / "prs.json"
+                    pr_path = root / "pr.json"
+                    event_path.write_text(json.dumps(mutated_event), encoding="utf-8")
+                    run_path.write_text(json.dumps(mutated_run), encoding="utf-8")
+                    prs_path.write_text(json.dumps(pull_requests), encoding="utf-8")
+                    pr_path.write_text(json.dumps(pr), encoding="utf-8")
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.validate_context(
+                            event_path,
+                            run_path,
+                            prs_path,
+                            pr_path,
+                            output=root / "context.json",
+                        )
+
+        for label, mutation in (
+            ("fork-pr", lambda value: {**value, "head": {**value["head"], "repo": {"full_name": "attacker/old_sparky", "owner": {"login": "attacker"}}}}),
+            ("tag-ref", lambda value: {**value, "head": {**value["head"], "ref": "refs/tags/v1"}}),
+            ("synthetic-merge", lambda value: {**value, "merge_commit_sha": value["head"]["sha"]}),
+            ("draft", lambda value: {**value, "draft": True}),
+            ("closed", lambda value: {**value, "state": "closed"}),
+            ("wrong-base", lambda value: {**value, "base": {**value["base"], "ref": "main"}}),
+        ):
+            with self.subTest(label=label):
+                mutated_pr = mutation(pr)
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    event_path = root / "event.json"
+                    run_path = root / "run.json"
+                    prs_path = root / "prs.json"
+                    pr_path = root / "pr.json"
+                    event_path.write_text(json.dumps(event), encoding="utf-8")
+                    run_path.write_text(json.dumps(run), encoding="utf-8")
+                    prs_path.write_text(json.dumps(pull_requests), encoding="utf-8")
+                    pr_path.write_text(json.dumps(mutated_pr), encoding="utf-8")
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.validate_context(
+                            event_path,
+                            run_path,
+                            prs_path,
+                            pr_path,
+                            output=root / "context.json",
+                        )
+
+    def test_candidate_jobs_and_final_summary_are_closed_and_successful(self) -> None:
+        context = candidate.RunContext(
+            repository=candidate.REPOSITORY,
+            workflow_id=candidate.SECURITY_WORKFLOW_ID,
+            workflow_name=candidate.SECURITY_WORKFLOW_NAME,
+            workflow_path=candidate.SECURITY_WORKFLOW_PATH,
+            run_id="9001",
+            run_attempt="2",
+            candidate_sha="2" * 40,
+            head_ref="codex/host-tools-bump",
+            base_sha="1" * 40,
+            pull_request="115",
+        )
+        summary = {
+            "schema": 1,
+            "tested_sha": context.candidate_sha,
+            "event": "pull_request",
+            "route_event": "pull_request",
+            "class": "full",
+            "reason": "platform or workflow change requires the full deterministic suite",
+            "deployable": False,
+            "fallback": False,
+            "manifest_digest": "a" * 64,
+            "expected_gates": list(candidate.FULL_GATE_IDS),
+            "gate_results": {gate: "success" for gate in candidate.FULL_GATE_IDS},
+            "conditional_gate_results": {"release-runtime": "skipped", "release-runtime-real": "skipped"},
+            "runtime_sensitive": False,
+            "requires_release_runtime": False,
+            "requires_real_release_runtime": False,
+            "missing_or_failed": [],
+            "route_errors": [],
+            "status_start_result": "skipped",
+            "passed": True,
+        }
+        jobs = [
+            {
+                "id": index + 1,
+                "name": name,
+                "status": "completed",
+                "conclusion": "skipped" if name in candidate.CONDITIONAL_JOB_NAMES else "success",
+            }
+            for index, name in enumerate(sorted(candidate.EXPECTED_JOB_NAMES))
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "jobs.json"
+            path.write_text(json.dumps({"total_count": len(jobs), "jobs": jobs}), encoding="utf-8")
+            candidate.verify_jobs(path, context, summary)
+            for label, changed in (
+                ("extra-job", {**jobs[0], "name": "attacker-job"}),
+                ("failed-required", {**jobs[0], "conclusion": "failure"}),
+            ):
+                bad_jobs = list(jobs)
+                bad_jobs[0] = changed
+                path.write_text(json.dumps({"total_count": len(bad_jobs), "jobs": bad_jobs}), encoding="utf-8")
+                with self.subTest(label=label):
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.verify_jobs(path, context, summary)
+            for label, field, value in (
+                ("deployable", "deployable", True),
+                ("wrong-class", "class", "docs-only"),
+                ("missing-failure", "missing_or_failed", ["security"]),
+            ):
+                bad_summary = {**summary, field: value}
+                with self.subTest(label=label):
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate._validate_summary(bad_summary, context)
+
+    def test_candidate_artifact_metadata_binds_outer_digest_size_and_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "artifact.zip"
+            archive.write_bytes(b"exact outer artifact")
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            payload = {
+                "id": 123,
+                "name": "candidate",
+                "expired": False,
+                "digest": f"sha256:{digest}",
+                "size_in_bytes": archive.stat().st_size,
+                "workflow_run": {
+                    "id": 456,
+                    "run_attempt": 3,
+                    "head_sha": "a" * 40,
+                    "head_branch": "dev",
+                },
+            }
+            self.assertEqual(
+                candidate._verify_artifact_metadata(
+                    payload,
+                    archive,
+                    expected_id="123",
+                    expected_name="candidate",
+                    expected_run_id="456",
+                    expected_run_attempt="3",
+                    expected_head_sha="a" * 40,
+                    expected_head_ref="dev",
+                ),
+                f"sha256:{digest}",
+            )
+            outer = root / "outer.zip"
+            with zipfile.ZipFile(outer, "w", compression=zipfile.ZIP_DEFLATED) as opened:
+                opened.writestr("platform-host-tools-bundle.zip", b"inner bundle")
+            candidate._verify_closed_archive(
+                outer,
+                expected_member="platform-host-tools-bundle.zip",
+                maximum_member_bytes=1024,
+                expected_member_digest=hashlib.sha256(b"inner bundle").hexdigest(),
+            )
+            with zipfile.ZipFile(outer, "a", compression=zipfile.ZIP_DEFLATED) as opened:
+                opened.writestr("unexpected", b"extra")
+            with self.assertRaises(candidate.CandidateError):
+                candidate._verify_closed_archive(
+                    outer,
+                    expected_member="platform-host-tools-bundle.zip",
+                    maximum_member_bytes=1024,
+                )
+            for label, mutation in (
+                ("digest", lambda value: {**value, "digest": "sha256:" + "0" * 64}),
+                ("size", lambda value: {**value, "size_in_bytes": value["size_in_bytes"] + 1}),
+                ("attempt", lambda value: {**value, "workflow_run": {**value["workflow_run"], "run_attempt": 4}}),
+            ):
+                with self.subTest(label=label):
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate._verify_artifact_metadata(
+                            mutation(payload),
+                            archive,
+                            expected_id="123",
+                            expected_name="candidate",
+                            expected_run_id="456",
+                            expected_run_attempt="3",
+                            expected_head_sha="a" * 40,
+                            expected_head_ref="dev",
+                        )
+
+    def test_candidate_ancestry_requires_base_ancestor_and_strict_pin(self) -> None:
+        head = subprocess.check_output(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], text=True).strip()
+        host = subprocess.check_output(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD^"], text=True).strip()
+        base = subprocess.check_output(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD^^"], text=True).strip()
+        candidate.verify_ancestry(REPO_ROOT, base_sha=base, host_tools_sha=host, candidate_sha=head)
+        with self.assertRaises(candidate.CandidateError):
+            candidate.verify_ancestry(REPO_ROOT, base_sha=head, host_tools_sha=host, candidate_sha=head)
+        with self.assertRaises(candidate.CandidateError):
+            candidate.verify_ancestry(REPO_ROOT, base_sha=base, host_tools_sha=head, candidate_sha=head)
+
+    def test_candidate_workflow_is_workflow_run_only_trusted_and_non_deployable(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/platform-host-tools-candidate.yml").read_text(encoding="utf-8")
+        self.assertIn("workflow_run:", workflow)
+        self.assertNotIn("pull_request_target", workflow)
+        self.assertNotIn("\n  pull_request:", workflow)
+        self.assertIn("cancel-in-progress: true", workflow)
+        self.assertIn("github.event.workflow_run.head_sha", workflow)
+        self.assertIn("github.event.workflow_run.pull_requests[0].number", workflow)
+        self.assertIn("actions: read", workflow)
+        self.assertIn("pull-requests: read", workflow)
+        self.assertIn("id-token: write", workflow)
+        self.assertIn("attestations: write", workflow)
+        self.assertNotIn("secrets.", workflow)
+        self.assertNotIn("environment:", workflow)
+        self.assertNotIn("actions: write", workflow)
+        self.assertNotIn("contents: write", workflow)
+        self.assertNotIn("statuses: write", workflow)
+        self.assertNotIn("pull_request_target", workflow)
+        self.assertIn("overwrite: false", workflow)
+        self.assertIn("retention-days: 30", workflow)
+        self.assertIn("Attest exact inner host-tools ZIP", workflow)
+        self.assertIn("Verify uploaded evidence artifact envelope", workflow)
+        self.assertIn("github.ref == 'refs/heads/dev'", workflow)
+        self.assertIn("Recheck PR, security run, attempt, and head before attestation", workflow)
+        self.assertIn("Recheck PR, security run, attempt, and head before upload", workflow)
+        self.assertNotRegex(workflow, r"python3[^\n]*candidate-data/platform/")
+        production_text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (REPO_ROOT / ".github/workflows").glob("platform-production-*.yml")
+        )
+        self.assertNotIn(candidate.CANDIDATE_ARTIFACT_PREFIX, production_text)
+        self.assertNotIn(candidate.EVIDENCE_ARTIFACT_PREFIX, production_text)
+        self.assertEqual(host_tools_candidate_workflow_issues(), [])
 
 
 if __name__ == "__main__":

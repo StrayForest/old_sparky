@@ -1,0 +1,471 @@
+name: Platform host-tools candidate
+
+on:
+  workflow_run:
+    workflows: [Platform security and build]
+    types: [completed]
+
+# This is a read-only, non-deployable handoff.  Only a completed canonical
+# security run can enter this default-branch workflow.
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: platform-host-tools-candidate-pr-${{ github.event.workflow_run.pull_requests[0].number }}-head-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  build-candidate:
+    name: Build trusted host-tools PR candidate
+    if: >-
+      github.ref == 'refs/heads/dev' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == 'StrayForest/old_sparky' &&
+      github.event.workflow_run.workflow_id == 339062797 &&
+      github.event.workflow_run.name == 'Platform security and build' &&
+      github.event.workflow_run.path == '.github/workflows/platform-security.yml'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      id-token: write
+      attestations: write
+    env:
+      REPOSITORY: StrayForest/old_sparky
+      DEFAULT_BRANCH: dev
+      SECURITY_WORKFLOW_ID: "339062797"
+      SECURITY_WORKFLOW_NAME: Platform security and build
+      SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Resolve immutable trusted default-branch commit T
+        id: trusted
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "$REPOSITORY"
+          test "$GITHUB_SERVER_URL" = "https://github.com"
+          test "$GITHUB_API_URL" = "https://api.github.com"
+          ref_json="$RUNNER_TEMP/platform-host-tools-trusted-ref.json"
+          curl --fail-with-body --silent --show-error --location \
+            --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" \
+            --output "$ref_json"
+          /usr/bin/python3 - "$ref_json" "$GITHUB_OUTPUT" "$DEFAULT_BRANCH" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          branch = sys.argv[3]
+          obj = payload.get("object") if isinstance(payload, dict) else None
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if payload.get("ref") != f"refs/heads/{branch}" or not isinstance(obj, dict) or obj.get("type") != "commit":
+              raise SystemExit("trusted default branch ref is not an immutable commit")
+          if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("trusted default branch SHA is malformed")
+          with Path(sys.argv[2]).open("a", encoding="ascii") as output:
+              output.write(f"sha={sha}\n")
+          PY
+          rm -f -- "$ref_json"
+
+      - name: Checkout trusted default-branch builder and validators T
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: StrayForest/old_sparky
+          ref: ${{ steps.trusted.outputs.sha }}
+          fetch-depth: 1
+          path: trusted-dev
+          persist-credentials: false
+
+      - name: Inspect the completed security workflow_run envelope
+        id: event
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            inspect-event --event "$GITHUB_EVENT_PATH" --github-output "$GITHUB_OUTPUT"
+
+      - name: Fetch canonical security run and same-repository PR data
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SECURITY_RUN_ID: ${{ steps.event.outputs.security_run_id }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "$REPOSITORY"
+          [[ "$SECURITY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/runs/$SECURITY_RUN_ID" \
+            --output "$RUNNER_TEMP/platform-host-tools-security-run.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/runs/$SECURITY_RUN_ID/pull_requests?per_page=100" \
+            --output "$RUNNER_TEMP/platform-host-tools-security-run-prs.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/pulls/${{ steps.event.outputs.pull_request }}" \
+            --output "$RUNNER_TEMP/platform-host-tools-pr.json"
+
+      - name: Validate exact workflow, run, PR, ref, and ancestry inputs
+        id: context
+        shell: bash
+        env:
+          SECURITY_RUN_ID: ${{ steps.event.outputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ steps.event.outputs.security_run_attempt }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            validate-context \
+            --event "$GITHUB_EVENT_PATH" \
+            --run "$RUNNER_TEMP/platform-host-tools-security-run.json" \
+            --pull-requests "$RUNNER_TEMP/platform-host-tools-security-run-prs.json" \
+            --pr "$RUNNER_TEMP/platform-host-tools-pr.json" \
+            --output "$RUNNER_TEMP/platform-host-tools-context.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Fetch the exact security jobs and final summary artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SECURITY_RUN_ID: ${{ steps.context.outputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ steps.context.outputs.security_run_attempt }}
+        run: |
+          set -euo pipefail
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          summary_name="platform-ci-summary-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/artifacts?name=$summary_name&per_page=100" \
+            --output "$RUNNER_TEMP/platform-host-tools-summary-artifacts.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/runs/$SECURITY_RUN_ID/jobs?filter=latest&per_page=100" \
+            --output "$RUNNER_TEMP/platform-host-tools-security-jobs.json"
+          summary_id="$(/usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            select-artifact-id --metadata "$RUNNER_TEMP/platform-host-tools-summary-artifacts.json" \
+            --name "$summary_name" --run-id "$SECURITY_RUN_ID" \
+            --run-attempt "$SECURITY_RUN_ATTEMPT")"
+          [[ "$summary_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          printf '%s\n' "$summary_id" > "$RUNNER_TEMP/platform-host-tools-summary-id"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/artifacts/$summary_id" \
+            --output "$RUNNER_TEMP/platform-host-tools-summary-metadata.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 8388608 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/zip" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/artifacts/$summary_id/zip" \
+            --output "$RUNNER_TEMP/platform-host-tools-summary.zip"
+
+      - name: Verify allowlisted completed-success jobs and closed final summary
+        id: security
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            verify-security \
+            --context "$RUNNER_TEMP/platform-host-tools-context.json" \
+            --jobs "$RUNNER_TEMP/platform-host-tools-security-jobs.json" \
+            --summary-metadata "$RUNNER_TEMP/platform-host-tools-summary-metadata.json" \
+            --summary-archive "$RUNNER_TEMP/platform-host-tools-summary.zip" \
+            --summary-artifact-id "$(cat "$RUNNER_TEMP/platform-host-tools-summary-id")" \
+            --output "$RUNNER_TEMP/platform-host-tools-security-evidence.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact PR head E as data only
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: StrayForest/old_sparky
+          ref: ${{ steps.context.outputs.candidate_sha }}
+          fetch-depth: 0
+          path: candidate-data
+          persist-credentials: false
+
+      - name: Resolve C from E host_tools_pin with the trusted parser
+        id: host-tools
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ steps.context.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate-data rev-parse --verify HEAD^{commit})" = "$CANDIDATE_SHA"
+          test -z "$(git -C candidate-data status --porcelain=v1 --untracked-files=all)"
+          pin_output="$RUNNER_TEMP/platform-host-tools-pin"
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_pin.py resolve \
+            --source-root "$GITHUB_WORKSPACE/candidate-data" \
+            --target-sha "$CANDIDATE_SHA" \
+            --expected-repository "$REPOSITORY" > "$pin_output"
+          IFS= read -r host_tools_sha < "$pin_output"
+          [[ "$host_tools_sha" =~ ^[0-9a-f]{40}$ ]]
+          test "$(wc -l < "$pin_output" | tr -d ' ')" = 1
+          printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Require base ancestor C strict ancestor E
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.context.outputs.base_sha }}
+          CANDIDATE_SHA: ${{ steps.context.outputs.candidate_sha }}
+          HOST_TOOLS_SHA: ${{ steps.host-tools.outputs.host_tools_sha }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            verify-ancestry --source-root "$GITHUB_WORKSPACE/candidate-data" \
+            --base-sha "$BASE_SHA" --host-tools-sha "$HOST_TOOLS_SHA" --candidate-sha "$CANDIDATE_SHA"
+
+      - name: Build and verify deterministic existing host-tools bundle from T
+        shell: bash
+        env:
+          HOST_TOOLS_SHA: ${{ steps.host-tools.outputs.host_tools_sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          output_dir="$RUNNER_TEMP/platform-host-tools-candidate"
+          mkdir -p "$output_dir"
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_bundle.py build \
+            --source-root "$GITHUB_WORKSPACE/candidate-data" \
+            --source-sha "$HOST_TOOLS_SHA" \
+            --output "$output_dir/platform-host-tools-bundle.zip"
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_bundle.py verify \
+            --bundle "$output_dir/platform-host-tools-bundle.zip" \
+            --expected-source-sha "$HOST_TOOLS_SHA" \
+            --contract-dir "$output_dir/contract"
+          test -f "$output_dir/platform-host-tools-bundle.zip"
+          test ! -L "$output_dir/platform-host-tools-bundle.zip"
+          test "$(stat -c '%F:%a:%h' "$output_dir/platform-host-tools-bundle.zip")" = "regular file:600:1"
+          test "$(stat -c '%s' "$output_dir/platform-host-tools-bundle.zip")" -le 4194304
+
+      - name: Recheck PR, security run, attempt, and head before attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SECURITY_RUN_ID: ${{ steps.context.outputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ steps.context.outputs.security_run_attempt }}
+        run: |
+          set -euo pipefail
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-run.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/runs/$SECURITY_RUN_ID/pull_requests?per_page=100" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-prs.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/pulls/${{ steps.context.outputs.pull_request }}" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-pr.json"
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            validate-context --event "$GITHUB_EVENT_PATH" \
+            --run "$RUNNER_TEMP/platform-host-tools-recheck-run.json" \
+            --pull-requests "$RUNNER_TEMP/platform-host-tools-recheck-prs.json" \
+            --pr "$RUNNER_TEMP/platform-host-tools-recheck-pr.json" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-context.json"
+          cmp -s "$RUNNER_TEMP/platform-host-tools-context.json" "$RUNNER_TEMP/platform-host-tools-recheck-context.json"
+
+      - name: Attest exact inner host-tools ZIP
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ runner.temp }}/platform-host-tools-candidate/platform-host-tools-bundle.zip
+
+      - name: Recheck PR, security run, attempt, and head before upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SECURITY_RUN_ID: ${{ steps.context.outputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ steps.context.outputs.security_run_attempt }}
+        run: |
+          set -euo pipefail
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-run-2.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/runs/$SECURITY_RUN_ID/pull_requests?per_page=100" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-prs-2.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/pulls/${{ steps.context.outputs.pull_request }}" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-pr-2.json"
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            validate-context --event "$GITHUB_EVENT_PATH" \
+            --run "$RUNNER_TEMP/platform-host-tools-recheck-run-2.json" \
+            --pull-requests "$RUNNER_TEMP/platform-host-tools-recheck-prs-2.json" \
+            --pr "$RUNNER_TEMP/platform-host-tools-recheck-pr-2.json" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-context-2.json"
+          cmp -s "$RUNNER_TEMP/platform-host-tools-context.json" "$RUNNER_TEMP/platform-host-tools-recheck-context-2.json"
+
+      - name: Upload exact candidate inner ZIP without overwrite
+        id: upload-candidate
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-host-tools-candidate-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          path: ${{ runner.temp }}/platform-host-tools-candidate/platform-host-tools-bundle.zip
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+      - name: Verify uploaded candidate artifact outer digest and metadata
+        id: candidate-artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload-candidate.outputs.artifact-id }}
+          ACTION_ARTIFACT_DIGEST: ${{ steps.upload-candidate.outputs.artifact-digest }}
+          ARTIFACT_NAME: platform-host-tools-candidate-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          action_digest="${ACTION_ARTIFACT_DIGEST#sha256:}"
+          [[ "$action_digest" =~ ^[0-9a-f]{64}$ ]]
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/artifacts/$ARTIFACT_ID" \
+            --output "$RUNNER_TEMP/platform-host-tools-candidate-metadata.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 8388608 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/zip" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/artifacts/$ARTIFACT_ID/zip" \
+            --output "$RUNNER_TEMP/platform-host-tools-candidate-outer.zip"
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            write-evidence --trusted-root "$GITHUB_WORKSPACE/trusted-dev" \
+            --candidate-root "$GITHUB_WORKSPACE/candidate-data" \
+            --context "$RUNNER_TEMP/platform-host-tools-context.json" \
+            --security-evidence "$RUNNER_TEMP/platform-host-tools-security-evidence.json" \
+            --bundle "$RUNNER_TEMP/platform-host-tools-candidate/platform-host-tools-bundle.zip" \
+            --artifact-metadata "$RUNNER_TEMP/platform-host-tools-candidate-metadata.json" \
+            --artifact-archive "$RUNNER_TEMP/platform-host-tools-candidate-outer.zip" \
+            --candidate-artifact-id "$ARTIFACT_ID" \
+            --host-tools-sha "${{ steps.host-tools.outputs.host_tools_sha }}" \
+            --trusted-sha "${{ steps.trusted.outputs.sha }}" \
+            --packaging-run-id "$GITHUB_RUN_ID" \
+            --packaging-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/platform-host-tools-candidate-evidence.json"
+          printf 'outer_digest=%s\n' "sha256:$(sha256sum "$RUNNER_TEMP/platform-host-tools-candidate-outer.zip" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          printf 'artifact_size=%s\n' "$(stat -c '%s' "$RUNNER_TEMP/platform-host-tools-candidate-outer.zip")" >> "$GITHUB_OUTPUT"
+          test "$action_digest" = "$(sha256sum "$RUNNER_TEMP/platform-host-tools-candidate-outer.zip" | awk '{print $1}')"
+          test ! -L "$RUNNER_TEMP/platform-host-tools-candidate-evidence.json"
+          test "$(stat -c '%F:%a:%h' "$RUNNER_TEMP/platform-host-tools-candidate-evidence.json")" = "regular file:600:1"
+          test "$(stat -c '%s' "$RUNNER_TEMP/platform-host-tools-candidate-evidence.json")" -le 524288
+
+      - name: Upload closed candidate evidence without overwrite
+        id: upload-evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: platform-host-tools-candidate-evidence-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          path: ${{ runner.temp }}/platform-host-tools-candidate-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+      - name: Verify uploaded evidence artifact envelope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_ARTIFACT_ID: ${{ steps.upload-evidence.outputs.artifact-id }}
+          EVIDENCE_ARTIFACT_NAME: platform-host-tools-candidate-evidence-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          PACKAGING_RUN_ATTEMPT: ${{ github.run_attempt }}
+          TRUSTED_SHA: ${{ steps.trusted.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EVIDENCE_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/artifacts/$EVIDENCE_ARTIFACT_ID" \
+            --output "$RUNNER_TEMP/platform-host-tools-evidence-metadata.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 8388608 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/zip" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/artifacts/$EVIDENCE_ARTIFACT_ID/zip" \
+            --output "$RUNNER_TEMP/platform-host-tools-evidence-outer.zip"
+          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            verify-evidence-upload \
+            --metadata "$RUNNER_TEMP/platform-host-tools-evidence-metadata.json" \
+            --archive "$RUNNER_TEMP/platform-host-tools-evidence-outer.zip" \
+            --artifact-id "$EVIDENCE_ARTIFACT_ID" \
+            --artifact-name "$EVIDENCE_ARTIFACT_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$PACKAGING_RUN_ATTEMPT" \
+            --trusted-sha "$TRUSTED_SHA"
+
+      - name: Publish exact candidate and evidence receipt
+        shell: bash
+        env:
+          CANDIDATE_ARTIFACT_ID: ${{ steps.upload-candidate.outputs.artifact-id }}
+          EVIDENCE_ARTIFACT_ID: ${{ steps.upload-evidence.outputs.artifact-id }}
+          CANDIDATE_ARTIFACT_NAME: platform-host-tools-candidate-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          EVIDENCE_ARTIFACT_NAME: platform-host-tools-candidate-evidence-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          OUTER_DIGEST: ${{ steps.candidate-artifact.outputs.outer_digest }}
+          ARTIFACT_SIZE: ${{ steps.candidate-artifact.outputs.artifact_size }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$EVIDENCE_ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$OUTER_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$ARTIFACT_SIZE" =~ ^[1-9][0-9]{0,15}$ ]]
+          {
+            echo "### Non-deployable host-tools candidate"
+            echo
+            echo "- Candidate artifact: `$CANDIDATE_ARTIFACT_NAME` (id=$CANDIDATE_ARTIFACT_ID, size=$ARTIFACT_SIZE, outer=$OUTER_DIGEST)"
+            echo "- Evidence artifact: `$EVIDENCE_ARTIFACT_NAME` (id=$EVIDENCE_ARTIFACT_ID)"
+            echo "- Candidate workflow never dispatches production, provisions a host, or grants deploy authority."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove candidate data and bounded handoff files
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- "$GITHUB_WORKSPACE/candidate-data" "$GITHUB_WORKSPACE/trusted-dev"
+          rm -rf -- "$RUNNER_TEMP/platform-host-tools-candidate"
+          rm -f -- "$RUNNER_TEMP/platform-host-tools-candidate-evidence.json" \
+            "$RUNNER_TEMP/platform-host-tools-candidate-metadata.json" \
+            "$RUNNER_TEMP/platform-host-tools-candidate-outer.zip" \
+            "$RUNNER_TEMP/platform-host-tools-summary.zip" \
+            "$RUNNER_TEMP/platform-host-tools-summary-metadata.json" \
+            "$RUNNER_TEMP/platform-host-tools-summary-artifacts.json" \
+            "$RUNNER_TEMP/platform-host-tools-security-jobs.json" \
+            "$RUNNER_TEMP/platform-host-tools-security-run.json" \
+            "$RUNNER_TEMP/platform-host-tools-security-run-prs.json" \
+            "$RUNNER_TEMP/platform-host-tools-pr.json" \
+            "$RUNNER_TEMP/platform-host-tools-evidence-metadata.json" \
+            "$RUNNER_TEMP/platform-host-tools-evidence-outer.zip"

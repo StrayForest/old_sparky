@@ -2,7 +2,7 @@
 
 - Status: Active how-to
 - Owner: Production operator
-- Last reviewed: 2026-09-24
+- Last reviewed: 2026-09-27
 
 Use this document for the normal immutable release path. CSP mode changes and production browser/live-user evidence are intentionally isolated in [`csp-live-qa-runbook.md`](csp-live-qa-runbook.md); do not load that document for routine releases.
 
@@ -90,6 +90,26 @@ to `dev`. The chain is:
    `size_in_bytes` to the downloaded archive byte size.
    The one-time out-of-band provisioning and rollback procedure is the owner of
    [`production-host-tools-provisioning.md`](adr/production-host-tools-provisioning.md).
+
+### Non-deployable pull-request host-tools candidate
+
+The default-branch `Platform host-tools candidate` workflow is evidence-only.
+It starts from a completed successful `Platform security and build`
+`workflow_run` for one open, non-draft same-repository pull request targeting
+`dev`; it is not a manual install or deployment entrypoint.  The workflow
+checks out validators from an immutable trusted `dev` commit **T**, reads the
+pull-request head **E** only as data, resolves the pinned host-tools
+generation **C** from **E**, and requires `base <= C < E` plus the exact pinned
+closure.  Candidate source is never executed, imported or compiled.
+
+Before attestation and again before upload it revalidates the exact security
+run/attempt, PR number, head SHA/ref, base SHA/ref and canonical repository.
+It attests only the deterministic inner bundle and read-backs both the
+candidate and evidence artifact envelopes with bounded digest, size and
+closed-member checks.  The evidence receipt is explicitly non-deployable;
+production workflows do not consume either `platform-host-tools-candidate-*`
+artifact prefix.  If this workflow fails, do not retry with a manual dispatch,
+host access or production release; investigate the exact run and PR state.
 
 The security workflow also has a separate `workflow_run` status finalizer. It
 uses only `statuses: write`, no checkout or secrets, and always overwrites the

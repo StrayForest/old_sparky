@@ -84,6 +84,33 @@ fail-closed on their existing trusted boundaries until they receive an
 equivalent reviewed generation capability; this ADR does not silently broaden
 those workflows.
 
+## Trusted pull-request candidate handoff
+
+The default-branch [`platform-host-tools-candidate.yml`](../../../.github/workflows/platform-host-tools-candidate.yml)
+workflow is a non-deployable `workflow_run` consumer of a successful canonical
+`Platform security and build` pull-request run.  Its job runs only from the
+trusted `dev` workflow context, has read-only repository/action/pull-request
+permissions plus the narrowly scoped provenance-attestation permissions, and
+receives no secrets, status/deployment write permission or production
+environment approval.
+
+The workflow resolves an immutable trusted default-branch commit **T** and
+executes only validators and the deterministic bundle builder from **T**.  It
+checks the exact workflow ID/name/path, run ID/attempt/conclusion/head and
+canonical repository, then re-reads the same run attempt and pull request
+before attestation and again before artifact upload.  The pull request checkout
+**E** is data only: it is never imported, compiled, interpreted or executed.
+The trusted pin parser resolves host-tools generation **C** from **E**, and
+the handoff requires `base <= C < E`, the exact fixed closure and its digests.
+
+The inner deterministic bundle is attested before upload.  Candidate and
+evidence artifact names bind the pull request, **C**, **E**, security run and
+attempt; each uploaded ZIP is read back through bounded metadata/digest checks
+and a closed one-member archive check.  The resulting evidence JSON is
+mode-0600, size-bounded and explicitly `deployable: false`.  Production
+workflows do not consume either candidate prefix, so this handoff can only
+produce review evidence; it cannot dispatch, provision, install or deploy.
+
 ## One-time operator provisioning (out of band)
 
 This repository change prepares and verifies the handoff only. An operator or

@@ -94,6 +94,7 @@ EXTERNAL_LOAD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-product
 CLASSIFIER_TOOL = PLATFORM_ROOT / "tools" / "platform_ci_classifier.py"
 AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-autodeploy.yml"
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-deploy.yml"
+CANDIDATE_HOST_TOOLS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-host-tools-candidate.yml"
 
 DIRECT_CANONICAL_COMMANDS = (
     "platform_run_tests.sh",
@@ -1469,6 +1470,73 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
     return issues
 
 
+def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> list[str]:
+    """Guard the default-branch-only, non-deployable host-tools handoff."""
+
+    if workflow_text is None:
+        try:
+            workflow_text = CANDIDATE_HOST_TOOLS_WORKFLOW.read_text(encoding="utf-8")
+        except OSError as exc:
+            return [f"host-tools candidate workflow is unreadable: {exc}"]
+    issues: list[str] = []
+    if not re.search(r"^  workflow_run:\n", workflow_text, re.MULTILINE):
+        issues.append("host-tools candidate workflow must use workflow_run")
+    if re.search(r"^  (?:pull_request|pull_request_target|workflow_dispatch):", workflow_text, re.MULTILINE):
+        issues.append("host-tools candidate workflow must not add a direct or target PR/manual trigger")
+    for marker in (
+        "workflows: [Platform security and build]",
+        "types: [completed]",
+        "cancel-in-progress: true",
+        "github.ref == 'refs/heads/dev'",
+        "github.event.workflow_run.event == 'pull_request'",
+        "github.event.workflow_run.head_repository.full_name == 'StrayForest/old_sparky'",
+        "github.event.workflow_run.workflow_id == 339062797",
+        "github.event.workflow_run.path == '.github/workflows/platform-security.yml'",
+        "github.event.workflow_run.name == 'Platform security and build'",
+        "platform_host_tools_candidate.py",
+        "platform_host_tools_pin.py resolve",
+        "--source-root \"$GITHUB_WORKSPACE/candidate-data\"",
+        "--summary-artifact-id",
+        "--candidate-artifact-id",
+        "verify-ancestry",
+        "Recheck PR, security run, attempt, and head before attestation",
+        "Recheck PR, security run, attempt, and head before upload",
+        "actions/attest-build-provenance@",
+        "actions/upload-artifact@",
+        "verify-evidence-upload",
+        "overwrite: false",
+        "retention-days: 30",
+    ):
+        if marker not in workflow_text:
+            issues.append(f"host-tools candidate workflow is missing marker: {marker}")
+    for forbidden in (
+        "pull_request_target",
+        "environment:",
+        "secrets.",
+        "actions: write",
+        "contents: write",
+        "statuses: write",
+        "actions/setup-python@",
+        "actions/cache@",
+        "actions/download-artifact@",
+        "python3 -I candidate-data/",
+    ):
+        if forbidden in workflow_text:
+            issues.append(f"host-tools candidate workflow contains forbidden marker: {forbidden}")
+    if "id-token: write" not in workflow_text or "attestations: write" not in workflow_text:
+        issues.append("host-tools candidate attestation permissions are missing")
+    if "permissions:\n  contents: read\n  actions: read\n  pull-requests: read" not in workflow_text:
+        issues.append("host-tools candidate workflow must have minimal read-only defaults")
+    production_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in WORKFLOW_ROOT.glob("platform-production-*.y*ml")
+    )
+    for prefix in ("platform-host-tools-candidate-", "platform-host-tools-candidate-evidence-"):
+        if prefix in production_text:
+            issues.append(f"production workflows must not consume candidate artifact prefix: {prefix}")
+    return issues
+
+
 def collect_issues() -> list[str]:
     issues: list[str] = []
 
@@ -1484,6 +1552,7 @@ def collect_issues() -> list[str]:
                     workflow_text,
                 )
             )
+    issues.extend(host_tools_candidate_workflow_issues())
 
     if not SECURITY_WORKFLOW.is_file():
         issues.append("platform-security.yml is missing")
