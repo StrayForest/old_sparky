@@ -248,7 +248,7 @@ jobs:
           # default-branch builder; no host side trust is inferred from it.
           gh attestation verify "$RUNNER_TEMP/platform-recovery-bootstrap-artifacts/${{ steps.evidence.outputs.bundle_name }}" \
             --repo "$REPOSITORY" \
-            --signer-workflow .github/workflows/platform-production-recovery-bootstrap-build.yml
+            --signer-workflow StrayForest/old_sparky/.github/workflows/platform-production-recovery-bootstrap-build.yml
 
       - name: Validate production SSH inputs
         shell: bash

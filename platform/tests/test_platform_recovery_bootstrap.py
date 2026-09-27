@@ -306,6 +306,24 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         secrets = workflow.index("secrets.PROD_SSH_HOST")
         self.assertLess(evidence, secrets)
         self.assertIn("gh attestation verify", workflow)
+        signer_identity = (
+            "StrayForest/old_sparky/"
+            ".github/workflows/platform-production-recovery-bootstrap-build.yml"
+        )
+        signer_lines = [
+            line.strip()
+            for line in workflow.splitlines()
+            if "--signer-workflow" in line
+        ]
+        self.assertEqual(signer_lines, [f"--signer-workflow {signer_identity}"])
+        self.assertNotIn(
+            "--signer-workflow .github/workflows/platform-production-recovery-bootstrap-build.yml",
+            workflow,
+        )
+        self.assertNotIn(
+            "--signer-workflow wrong-owner/wrong-repo/.github/workflows/platform-production-recovery-bootstrap-build.yml",
+            workflow,
+        )
         self.assertIn("actions: read", workflow)
         self.assertIn("attestations: read", workflow)
         self.assertIn("ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY", workflow)
