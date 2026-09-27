@@ -2346,7 +2346,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                     "/usr/bin/python3",
                     "-I",
                     "-B",
-                    str(trusted_tools / "platform_host_tools_candidate.py"),
+                    "trusted-dev/platform/tools/platform_host_tools_candidate.py",
                     "inspect-event",
                     "--event",
                     str(event),
@@ -2354,6 +2354,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 capture_output=True,
                 text=True,
                 env={**os.environ, "PYTHONPATH": str(candidate_tools)},
+                cwd=root,
                 check=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
