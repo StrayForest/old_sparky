@@ -124,14 +124,13 @@ produce review evidence; it cannot dispatch, provision, install or deploy.
 
 ### Closed source-versus-tested merge identity
 
-The handoff does not treat the PR source head **E** as the tested target.  The
-triggering `workflow_run` snapshot records the exact canonical workflow, run
-ID, run attempt, PR number, base ref/SHA and source head/ref; its
-`workflow_run.head_sha` is the tested synthetic merge **M** for a
-`pull_request` run.  The exact-attempt run API response and its embedded PR
-snapshot must agree with that event and with the current PR response.  The
-current PR's non-null `merge_commit_sha` must equal that original **M** only
-after the singular
+The handoff keeps the PR source head **E** separate from the tested synthetic
+merge **M**.  The triggering `workflow_run` snapshot records the exact
+canonical workflow, run ID, run attempt, PR number, base ref/SHA and source
+head/ref; for a `pull_request` run, `workflow_run.head_sha` is the source head
+**E**.  The exact-attempt run API response and its embedded PR snapshot must
+agree with that event and with the current PR response.  The current PR's
+non-null `merge_commit_sha` establishes **M** only after the singular
 `GET /git/matching-refs/pull/<N>/merge` response and `GET /commits/<M>` response
 confirm the same merge ref, a valid tree and exactly two ordered parents
 `[base, E]`.  Missing, null, stale, substituted or raced values are closed
@@ -144,9 +143,10 @@ provenance, the consumer accepts only one documented closed shape and compares
 every field exactly.  The classifier route artifact is an additional
 defense-in-depth check: its target must be **M**, its manifest must be closed,
 and its digest must equal the summary's manifest digest.  The exact-attempt
-jobs response must bind every supplied row identity (`run_id`, `run_attempt`,
-tested merge SHA, source head ref and workflow name) to the same run;
-commit-status metadata is advisory and is not treated as producer authority.
+jobs response and artifact metadata must bind every supplied row identity
+(`run_id`, `run_attempt`, source head **E**, source head ref and workflow name)
+to the same run; commit-status metadata is advisory and is not treated as
+producer authority.
 
 Before either attestation or upload, the workflow fetches the exact run and
 latest run snapshot, PR, merge ref and commit again and compares the complete

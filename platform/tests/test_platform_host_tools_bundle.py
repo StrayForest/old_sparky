@@ -2012,9 +2012,10 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             "event": "pull_request",
             "status": "completed",
             "conclusion": "success",
-            # A pull_request workflow's run head is the synthetic merge M;
-            # the embedded PR association carries the source head E.
-            "head_sha": merge_sha,
+            # GitHub's workflow_run and exact-attempt job/artifact identities
+            # carry the source head E. The current PR merge ref/commit below
+            # establishes the separately tested synthetic merge M.
+            "head_sha": candidate_sha,
             "head_branch": "codex/host-tools-bump",
             "repository": {"full_name": candidate.REPOSITORY},
             "head_repository": {"full_name": candidate.REPOSITORY},
@@ -2103,10 +2104,14 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             )
             self.assertEqual(context.run_id, "9001")
             self.assertEqual(context.run_attempt, "2")
+            self.assertEqual(context.original_source_head_sha, "2" * 40)
             self.assertEqual(context.original_base_sha, "1" * 40)
             self.assertEqual(context.tested_merge_sha, "3" * 40)
             self.assertEqual(context.tested_parents, ("1" * 40, "2" * 40))
-            self.assertEqual(json.loads(paths["context"].read_text())["pull_request"]["number"], 115)
+            payload = json.loads(paths["context"].read_text())
+            self.assertEqual(payload["pull_request"]["number"], 115)
+            self.assertEqual(payload["security_run"]["head_sha"], "2" * 40)
+            self.assertEqual(payload["tested_merge"]["sha"], "3" * 40)
 
     def test_candidate_context_rejects_empty_multiple_and_wrong_pr_associations(self) -> None:
         event, run, pr = self._candidate_event_fixture()
@@ -2133,7 +2138,8 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             ("wrong-workflow", lambda value: {**value, "workflow_id": candidate.SECURITY_WORKFLOW_ID + 1}),
             ("wrong-conclusion", lambda value: {**value, "conclusion": "failure"}),
             ("wrong-event", lambda value: {**value, "event": "push"}),
-            ("wrong-tested-merge", lambda value: {**value, "head_sha": "4" * 40}),
+            ("wrong-source-head", lambda value: {**value, "head_sha": "4" * 40}),
+            ("merge-as-source-head", lambda value: {**value, "head_sha": "3" * 40}),
             ("fork-run", lambda value: {**value, "head_repository": {"full_name": "attacker/old_sparky"}}),
             ("missing-head-repository", lambda value: {key: item for key, item in value.items() if key != "head_repository"}),
         )
@@ -2266,6 +2272,18 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 latest_run_path=paths["latest"],
                 output=paths["context"],
             )
+            partial_latest = {**run, "pull_requests": [{"number": 115}]}
+            paths["latest"].write_text(json.dumps(partial_latest), encoding="utf-8")
+            candidate.validate_context(
+                paths["event"],
+                paths["run"],
+                paths["pr"],
+                paths["merge_ref"],
+                paths["commit"],
+                latest_run_path=paths["latest"],
+                expected_context_path=paths["context"],
+                output=paths["output"],
+            )
             for label, path_key, mutate in (
                 (
                     "rerun-attempt",
@@ -2364,7 +2382,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 "name": name,
                 "run_id": 9001,
                 "run_attempt": 2,
-                "head_sha": context.tested_merge_sha,
+                "head_sha": context.original_source_head_sha,
                 "head_branch": context.original_head_ref,
                 "workflow_name": candidate.SECURITY_WORKFLOW_NAME,
                 "check_run_url": f"https://api.github.com/repos/StrayForest/old_sparky/check-runs/{index + 100}",
@@ -2404,6 +2422,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 ("cross-run", "run_id", 9002),
                 ("cross-attempt", "run_attempt", 3),
                 ("source-head", "head_sha", "5" * 40),
+                ("merge-as-head", "head_sha", context.tested_merge_sha),
                 ("source-branch", "head_branch", "other-branch"),
                 ("workflow", "workflow_name", "Other workflow"),
                 ("check-run-url", "check_run_url", "https://evil.example/check-runs/1"),
@@ -2433,6 +2452,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             candidate._validate_summary(alias_split_summary, context)
             for label, changed in (
                 ("arbitrary-tested-sha", {**summary, "tested_sha": "9" * 40}),
+                ("source-as-tested-sha", {**summary, "tested_sha": context.original_source_head_sha}),
                 ("malicious-extra", {**summary, "untrusted": "accepted"}),
                 ("schema", {**summary, "schema": 2}),
                 (
@@ -2488,7 +2508,13 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             "files": ["platform-ci-route.json"],
         }
 
-        def write_route_fixture(root: Path, manifest: dict[str, object], *, attempt: int = 2) -> tuple[Path, Path]:
+        def write_route_fixture(
+            root: Path,
+            manifest: dict[str, object],
+            *,
+            attempt: int = 2,
+            artifact_head_sha: str | None = None,
+        ) -> tuple[Path, Path]:
             manifest = {**manifest}
             manifest["digest"] = candidate._route_manifest_digest(manifest)
             archive = root / f"route-{attempt}.zip"
@@ -2508,7 +2534,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                         "workflow_run": {
                             "id": 9001,
                             "run_attempt": attempt,
-                            "head_sha": context.tested_merge_sha,
+                            "head_sha": artifact_head_sha or context.original_source_head_sha,
                             "head_branch": context.original_head_ref,
                         },
                     }
@@ -2555,6 +2581,19 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 expected_manifest_digest=candidate._route_manifest_digest(manifest_base),
             )
             self.assertEqual(result["manifest"]["target_sha"], context.tested_merge_sha)
+            bad_metadata, bad_archive = write_route_fixture(
+                root,
+                manifest_base,
+                artifact_head_sha=context.tested_merge_sha,
+            )
+            with self.assertRaises(candidate.CandidateError):
+                candidate.verify_route_artifact(
+                    context_path,
+                    bad_metadata,
+                    bad_archive,
+                    expected_artifact_id="123",
+                    expected_manifest_digest=candidate._route_manifest_digest(manifest_base),
+                )
             for label, manifest, expected_digest, attempt in (
                 (
                     "source-head-target",
@@ -2802,6 +2841,37 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         self.assertNotIn(candidate.CANDIDATE_ARTIFACT_PREFIX, production_text)
         self.assertNotIn(candidate.EVIDENCE_ARTIFACT_PREFIX, production_text)
         self.assertEqual(host_tools_candidate_workflow_issues(), [])
+        candidate_job = re.search(
+            r"^  build-candidate:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(candidate_job)
+        assert candidate_job is not None
+        blocks = list(_workflow_step_blocks(candidate_job.group("body")))
+        names = [
+            re.match(r"^      - name: (?P<name>[^\n]+)", block, re.MULTILINE).group("name")
+            for block in blocks
+        ]
+        attestation_index = names.index("Attest exact inner host-tools ZIP")
+        attestation_recheck_index = names.index(
+            "Recheck PR, security run, attempt, and head before attestation"
+        )
+        blocks[attestation_index], blocks[attestation_recheck_index] = (
+            blocks[attestation_recheck_index],
+            blocks[attestation_index],
+        )
+        broken_order = (
+            workflow[: candidate_job.start("body")]
+            + "".join(blocks)
+            + workflow[candidate_job.end("body") :]
+        )
+        self.assertTrue(
+            any(
+                "must recheck before Attest exact inner host-tools ZIP" in issue
+                for issue in host_tools_candidate_workflow_issues(broken_order)
+            )
+        )
         artifact_zip_blocks = host_tools_candidate_artifact_zip_curl_blocks(workflow)
         self.assertEqual(len(artifact_zip_blocks), 4)
         for block in artifact_zip_blocks:
@@ -2848,7 +2918,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                             "conclusion": "success",
                             "id": 36289064582,
                             "run_attempt": 1,
-                            "head_sha": "c" * 40,
+                            "head_sha": "a" * 40,
                             "head_branch": "feature/candidate",
                             "head_repository": {"full_name": "StrayForest/old_sparky"},
                             "pull_requests": [

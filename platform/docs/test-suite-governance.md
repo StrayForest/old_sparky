@@ -251,8 +251,9 @@ must target **M**; any optional split provenance fields are a closed,
 type-checked exact comparison.  The route artifact is checked independently
 for `target_sha == M` and for the classifier digest shared with the summary.
 Jobs are read from the exact-attempt API and every row identity supplied by
-GitHub (`run_id`, `run_attempt`, tested-merge `head_sha`, source `head_branch`,
-`workflow_name`) is bound to the same run.  The complete immutable context is fetched and
+GitHub (`run_id`, `run_attempt`, source-head `head_sha`, source `head_branch`,
+`workflow_name`) is bound to the same run.  Artifact metadata uses the same
+source-head identity.  The complete immutable context is fetched and
 compared again immediately before attestation and upload, so PR synchronize,
 base/head/merge-ref/tree changes and reruns fail closed.  The candidate
 checkout remains data-only, while all validator code is checked out from

@@ -401,7 +401,6 @@ class TriggerSnapshot:
     run_id: str
     run_attempt: str
     source_head_sha: str
-    tested_merge_sha: str
     head_ref: str
     pull_request: str
     # GitHub includes these fields in the workflow_run pull_requests entry.
@@ -462,7 +461,7 @@ class RunContext:
                 "event": SECURITY_EVENT,
                 "status": "completed",
                 "conclusion": "success",
-                "head_sha": self.tested_merge_sha,
+                "head_sha": self.original_source_head_sha,
                 "source_head_sha": self.original_source_head_sha,
                 "head_ref": self.original_head_ref,
                 "head_repository": self.original_head_repository,
@@ -561,8 +560,8 @@ def _workflow_run_fields(
         raise CandidateError("security run identity changed")
     if run.get("event") != SECURITY_EVENT or run.get("status") != "completed" or run.get("conclusion") != "success":
         raise CandidateError("security run is not completed successfully")
-    if _sha(run.get("head_sha"), "security run tested merge SHA") != expected.tested_merge_sha:
-        raise CandidateError("security run tested merge SHA changed")
+    if _sha(run.get("head_sha"), "security run source head SHA") != expected.source_head_sha:
+        raise CandidateError("security run source head SHA changed")
     if _safe_branch(run.get("head_branch")) != expected.head_ref:
         raise CandidateError("security run head ref changed")
     head_repository = _object(run.get("head_repository"), "security run head repository")
@@ -581,7 +580,7 @@ def _workflow_run_fields(
         ("head_ref", expected.association_head_ref),
     ):
         actual = association[key]
-        if expected_value is not None and actual != expected_value:
+        if expected_value is not None and actual is not None and actual != expected_value:
             raise CandidateError("security run pull request snapshot changed")
 
 
@@ -624,8 +623,6 @@ def _validate_pr(
     merge_sha = _sha(merge_sha, "pull request merge commit SHA")
     if merge_sha == head_sha:
         raise CandidateError("synthetic merge SHA was presented as the PR head")
-    if merge_sha != expected.tested_merge_sha:
-        raise CandidateError("pull request merge SHA does not match security run")
     label = head.get("label")
     if label is not None and label != f"StrayForest:{head_ref}":
         raise CandidateError("pull request head label is not canonical")
@@ -710,7 +707,7 @@ def _validate_merge_commit(
     *,
     expected_merge_sha: str,
     expected_base_sha: str,
-    expected_head_sha: str,
+    expected_source_head_sha: str,
 ) -> tuple[str, tuple[str, str]]:
     """Validate GET /commits/<merge> tree and ordered two-parent ancestry."""
 
@@ -723,7 +720,7 @@ def _validate_merge_commit(
     if not isinstance(parents, list) or len(parents) != 2:
         raise CandidateError("tested merge commit must have exactly two parents")
     parent_shas = tuple(_sha(_object(parent, "tested merge parent").get("sha"), "tested merge parent SHA") for parent in parents)
-    if parent_shas != (expected_base_sha, expected_head_sha):
+    if parent_shas != (expected_base_sha, expected_source_head_sha):
         raise CandidateError("tested merge commit parents are not [base, head]")
     return tree_sha, (parent_shas[0], parent_shas[1])
 
@@ -742,7 +739,7 @@ def inspect_event(path: Path) -> TriggerSnapshot:
         raise CandidateError("workflow_run is not the successful pull_request security run")
     run_id = _id(workflow_run.get("id"), "workflow_run id")
     run_attempt = _id(workflow_run.get("run_attempt"), "workflow_run attempt")
-    tested_merge_sha = _sha(workflow_run.get("head_sha"), "workflow_run tested merge SHA")
+    source_head_sha = _sha(workflow_run.get("head_sha"), "workflow_run source head SHA")
     head_ref = _safe_branch(workflow_run.get("head_branch"))
     head_repository = _object(workflow_run.get("head_repository"), "workflow_run head repository")
     if _repository(head_repository.get("full_name"), "workflow_run head repository") != REPOSITORY:
@@ -751,7 +748,9 @@ def inspect_event(path: Path) -> TriggerSnapshot:
         workflow_run,
         require_fields=True,
     )
-    source_head_sha = _sha(association["head_sha"], "workflow_run source head SHA")
+    association_head_sha = _sha(association["head_sha"], "workflow_run pull request source head SHA")
+    if association_head_sha != source_head_sha:
+        raise CandidateError("workflow_run source head snapshot does not match run")
     if association["head_ref"] != head_ref:
         raise CandidateError("workflow_run pull request head snapshot does not match run")
     if association["base_ref"] != DEFAULT_BRANCH:
@@ -766,7 +765,6 @@ def inspect_event(path: Path) -> TriggerSnapshot:
         run_id=run_id,
         run_attempt=run_attempt,
         source_head_sha=source_head_sha,
-        tested_merge_sha=tested_merge_sha,
         head_ref=head_ref,
         pull_request=pull_request,
         association_base_sha=association["base_sha"],
@@ -793,7 +791,11 @@ def validate_context(
     _workflow_run_fields(run, expected=trigger)
     if latest_run_path is not None:
         latest = _object(_read_json(latest_run_path, description="latest security run"), "latest security run")
-        _workflow_run_fields(latest, expected=trigger)
+        # The exact-attempt endpoint includes the embedded base/head snapshot;
+        # the ordinary run endpoint may expose only the PR number.  Bind any
+        # fields the latest response supplies, while the exact attempt and
+        # current PR remain the authoritative complete snapshot.
+        _workflow_run_fields(latest, expected=trigger, require_association=False)
     pr = _object(_read_json(pr_path, description="pull request"), "pull request")
     expected_context = load_context(expected_context_path) if expected_context_path is not None else None
     pr_snapshot = _validate_pr(pr, expected=trigger, expected_context=expected_context)
@@ -805,7 +807,7 @@ def validate_context(
         commit,
         expected_merge_sha=pr_snapshot.merge_sha,
         expected_base_sha=pr_snapshot.base_sha,
-        expected_head_sha=pr_snapshot.head_sha,
+        expected_source_head_sha=pr_snapshot.head_sha,
     )
     if merge_ref_sha != pr_snapshot.merge_sha:
         raise CandidateError("pull request merge ref does not match merge commit")
@@ -907,7 +909,7 @@ def load_context(path: Path) -> RunContext:
         run.get("event") != SECURITY_EVENT
         or run.get("status") != "completed"
         or run.get("conclusion") != "success"
-        or run.get("head_sha") != context.tested_merge_sha
+        or run.get("head_sha") != original_source_head_sha
         or run.get("source_head_sha") != original_source_head_sha
         or run.get("head_ref") != original_head_ref
         or run.get("head_repository") != REPOSITORY
@@ -1000,16 +1002,19 @@ def _verify_artifact_metadata(
     expected_run_attempt: str,
     expected_head_sha: str,
     expected_head_ref: str,
+    maximum: int = MAX_ARTIFACT_BYTES,
 ) -> str:
     if _id(payload.get("id"), "artifact id") != expected_id or payload.get("name") != expected_name:
         raise CandidateError("artifact identity is invalid")
     if payload.get("expired") is not False:
         raise CandidateError("artifact is expired")
     size = payload.get("size_in_bytes")
-    if type(size) is not int or size <= 0 or size > MAX_ARTIFACT_BYTES:
+    if type(maximum) is not int or maximum <= 0 or maximum > MAX_ARTIFACT_BYTES:
+        raise CandidateError("artifact size bound is invalid")
+    if type(size) is not int or size <= 0 or size > maximum:
         raise CandidateError("artifact size is invalid")
     digest = _canonical_sha256(payload.get("digest"), "artifact digest")
-    archive_data = _read_bytes(archive, maximum=MAX_ARTIFACT_BYTES, description="artifact archive")
+    archive_data = _read_bytes(archive, maximum=maximum, description="artifact archive")
     if len(archive_data) != size or hashlib.sha256(archive_data).hexdigest() != digest.removeprefix("sha256:"):
         raise CandidateError("artifact archive digest or size does not match metadata")
     workflow_run = _object(payload.get("workflow_run"), "artifact workflow binding")
@@ -1105,8 +1110,9 @@ def verify_summary_artifact(
         expected_name=f"{SUMMARY_ARTIFACT_PREFIX}{context.run_id}-{context.run_attempt}",
         expected_run_id=context.run_id,
         expected_run_attempt=context.run_attempt,
-        expected_head_sha=context.tested_merge_sha,
+        expected_head_sha=context.original_source_head_sha,
         expected_head_ref=context.original_head_ref,
+        maximum=MAX_SUMMARY_ARCHIVE_BYTES,
     )
     try:
         with zipfile.ZipFile(archive_path, "r", allowZip64=False) as opened:
@@ -1131,7 +1137,7 @@ def verify_summary_artifact(
         "artifact_name": metadata["name"],
         "artifact_size": metadata["size_in_bytes"],
         "artifact_digest": digest,
-        "archive_sha256": hashlib.sha256(_read_bytes(archive_path, maximum=MAX_ARTIFACT_BYTES, description="summary archive")).hexdigest(),
+        "archive_sha256": hashlib.sha256(_read_bytes(archive_path, maximum=MAX_SUMMARY_ARCHIVE_BYTES, description="summary archive")).hexdigest(),
         "summary": summary,
     }
     if output is not None:
@@ -1223,7 +1229,7 @@ def verify_route_artifact(
         expected_name=artifact_name,
         expected_run_id=context.run_id,
         expected_run_attempt=context.run_attempt,
-        expected_head_sha=context.tested_merge_sha,
+        expected_head_sha=context.original_source_head_sha,
         expected_head_ref=context.original_head_ref,
     )
     member = _verify_closed_archive(
@@ -1354,8 +1360,8 @@ def verify_jobs(jobs_path: Path, context: RunContext, summary: Mapping[str, obje
             raise CandidateError("security job run identity is invalid")
         if type(job.get("run_attempt")) is not int or job.get("run_attempt") != int(context.run_attempt):
             raise CandidateError("security job attempt identity is invalid")
-        if _sha(job.get("head_sha"), "security job tested merge SHA") != context.tested_merge_sha:
-            raise CandidateError("security job tested merge SHA identity is invalid")
+        if _sha(job.get("head_sha"), "security job source head SHA") != context.original_source_head_sha:
+            raise CandidateError("security job source head SHA identity is invalid")
         if job.get("head_branch") != context.original_head_ref:
             raise CandidateError("security job head ref identity is invalid")
         if job.get("workflow_name") != SECURITY_WORKFLOW_NAME:
