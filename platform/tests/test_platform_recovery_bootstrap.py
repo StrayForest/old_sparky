@@ -32,13 +32,16 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         ".github/workflows/platform-production-autodeploy.yml",
         ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
         ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+        ".github/workflows/platform-production-release-recover.yml",
         "platform/docs/README.md",
         "platform/docs/adr/recovery-bootstrap-retained-abort.md",
         "platform/docs/deployment-runbook.md",
+        "platform/docs/release-state-machine.md",
         "platform/docs/test-suite-governance.md",
         "platform/tests/test_platform_live_qa_runtime_install.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
         "platform/tests/test_platform_release_build_diagnostics.py",
+        "platform/tests/test_platform_release_systemd_state.py",
         "platform/tests/test_platform_ssh_host_key_scan.py",
         "platform/tools/platform_abort_retained_only.sh",
         "platform/tools/platform_build_live_qa_runtime.py",
@@ -48,6 +51,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_production_classifier_artifact.py",
         "platform/tools/platform_recovery_bootstrap.py",
         "platform/tools/platform_release_restore_runtime.sh",
+        "platform/tools/platform_release_rollback.sh",
         "platform/tools/platform_release_transaction.py",
         "platform/tools/platform_test_catalog.py",
     }
@@ -296,6 +300,14 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             'evidence_name="platform-recovery-bootstrap-evidence-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}.json"',
             workflow,
         )
+        self.assertIn(
+            'evidence="$RUNNER_TEMP/$evidence_name"',
+            workflow,
+        )
+        self.assertIn(
+            'path: ${{ runner.temp }}/${{ steps.bundle.outputs.evidence_name }}',
+            workflow,
+        )
         self.assertIn("actions: read", workflow)
         self.assertNotIn("PROD_SSH_KEY", workflow)
         self.assertNotIn("secrets.", workflow)
@@ -354,8 +366,17 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("stat.S_ISLNK", workflow)
         self.assertIn("metadata.st_uid != 0", workflow)
         self.assertIn("metadata.st_nlink != 1", workflow)
+        self.assertGreaterEqual(workflow.count("metadata.st_nlink < 2"), 4)
         self.assertIn("os.O_EXCL", workflow)
         self.assertIn("os.O_NOFOLLOW", workflow)
+        self.assertIn("source.infolist()", workflow)
+        self.assertIn("info.create_system != 3", workflow)
+        self.assertIn("len(set(names)) != len(names)", workflow)
+        self.assertIn("MAX_COMPRESSION_RATIO", workflow)
+        self.assertIn("MAX_TOTAL_MEMBER_BYTES", workflow)
+        self.assertIn("evidence_name", workflow)
+        self.assertIn("bundle_name", workflow)
+        self.assertIn("primary_status=%s cleanup_status=%s", workflow)
         self.assertNotIn(
             'stage="/tmp/oldsparky-recovery-bootstrap-stage-${expected_sha}"',
             workflow,
@@ -483,6 +504,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     state.write_text("{}", encoding="ascii")
                     systemd_state.write_text("{}", encoding="ascii")
                     receipt = {
+                        "operation_id": "a" * 32,
                         "previous_before": None,
                         "candidate_release": str(candidate),
                         "peer": str(peer),
@@ -536,6 +558,131 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                     self.assertFalse(state.exists())
                     self.assertFalse(systemd_state.exists())
                     self.assertGreaterEqual(len(calls), 4)
+
+    def test_legacy_v2_bridge_cleans_only_with_exact_no_systemd_state(self) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("legacy recovery bridge contract requires root")
+
+        def make_case() -> tuple[Path, Path, Path, Path, dict[str, object]]:
+            temporary = tempfile.TemporaryDirectory()
+            root = Path(temporary.name)
+            self.addCleanup(temporary.cleanup)
+            app = root / "app"
+            releases = app / "releases"
+            shared = app / "shared"
+            current = releases / "current-release"
+            previous = releases / "previous-release"
+            candidate = releases / "candidate-release"
+            releases.mkdir(parents=True)
+            shared.mkdir()
+            current.mkdir()
+            previous.mkdir()
+            candidate.mkdir()
+            (app / "current").symlink_to(current)
+            (app / "previous").symlink_to(previous)
+            shared_venv = shared / "venv"
+            shared_venv.mkdir()
+            peer = shared / ".venv-install-candidate-release.none"
+
+            def identity(path: Path) -> dict[str, int]:
+                metadata = path.lstat()
+                return {"dev": metadata.st_dev, "ino": metadata.st_ino}
+
+            receipt: dict[str, object] = {
+                "version": 2,
+                "operation": "install",
+                "phase": "recovery-restored",
+                "app_dir": str(app),
+                "current_before": str(current),
+                "previous_before": str(previous),
+                "candidate_release": str(candidate),
+                "shared_venv": str(shared_venv),
+                "peer": str(peer),
+                "snapshot": str(candidate / ".rollback/shared-venv-before-install"),
+                "transition": "none",
+                "shared_before": identity(shared_venv),
+                "peer_before": None,
+                "current_before_identity": identity(current),
+                "previous_before_identity": identity(previous),
+                "candidate_identity": identity(candidate),
+                "remove_env_on_recovery": False,
+                "service_state_before": {
+                    "deadlock-api": "active",
+                    "deadlock-worker": "inactive",
+                    "deadlock-web": "active",
+                },
+                "quiesced_services": [
+                    "deadlock-api",
+                    "deadlock-worker",
+                    "deadlock-web",
+                ],
+                "timer_active_before": False,
+            }
+            state = shared / ".release-operation.json"
+            state.write_text("legacy receipt\n", encoding="ascii")
+            state.chmod(0o600)
+            return app, current, previous, candidate, receipt
+
+        app, current, previous, candidate, receipt = make_case()
+        state = app / "shared/.release-operation.json"
+        calls: list[list[str]] = []
+
+        def cleanup_run(command: list[str], **_kwargs: object) -> None:
+            calls.append(command)
+            if "--retain-receipt" in command:
+                candidate.rmdir()
+            else:
+                state.unlink()
+
+        with (
+            mock.patch.object(recovery.os, "geteuid", return_value=0),
+            mock.patch.object(recovery, "_validate_generation_tree"),
+            mock.patch.object(recovery, "_receipt_json", return_value=receipt),
+            mock.patch.object(recovery.subprocess, "run", side_effect=cleanup_run),
+        ):
+            recovery.abort_retained_only(
+                app_dir=app,
+                generation=app / ("a" * 64),
+            )
+
+        self.assertFalse(state.exists())
+        self.assertFalse(candidate.exists())
+        self.assertEqual((app / "current").resolve(), current)
+        self.assertEqual((app / "previous").resolve(), previous)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all("complete-recovery" in command for command in calls))
+        self.assertTrue(all("systemctl" not in command for command in calls))
+        self.assertTrue(all("platform_release_restore_runtime.sh" not in command for command in calls))
+
+        for label in ("systemd", "candidate-active", "peer", "malformed"):
+            with self.subTest(label=label):
+                app, current, _previous, candidate, receipt = make_case()
+                state = app / "shared/.release-operation.json"
+                systemd_state = app / "shared/.release-systemd-state.json"
+                if label == "systemd":
+                    systemd_state.write_text("{}\n", encoding="ascii")
+                    systemd_state.chmod(0o600)
+                elif label == "candidate-active":
+                    (app / "current").unlink()
+                    (app / "current").symlink_to(candidate)
+                elif label == "peer":
+                    Path(str(receipt["peer"])).mkdir()
+                elif label == "malformed":
+                    receipt["phase"] = "prepared"
+                with (
+                    mock.patch.object(recovery.os, "geteuid", return_value=0),
+                    mock.patch.object(recovery, "_validate_generation_tree"),
+                    mock.patch.object(recovery, "_receipt_json", return_value=receipt),
+                    mock.patch.object(recovery.subprocess, "run") as run,
+                ):
+                    with self.assertRaises(recovery.RecoveryBootstrapError):
+                        recovery.abort_retained_only(
+                            app_dir=app,
+                            generation=app / ("b" * 64),
+                        )
+                self.assertTrue(state.exists())
+                self.assertTrue(candidate.exists())
+                run.assert_not_called()
 
     def test_recovery_bootstrap_route_is_non_deployable_and_mixed_runtime_is_deployable(self) -> None:
         sys.path.insert(0, str(TOOLS))

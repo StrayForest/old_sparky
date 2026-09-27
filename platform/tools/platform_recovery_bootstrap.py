@@ -35,6 +35,7 @@ ENTRYPOINT = "platform_abort_retained_only.sh"
 MEMBER_ROOT = "platform-recovery-bootstrap"
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+OPERATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,31}$")
 ATTEMPT_RE = RUN_ID_RE
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -772,18 +773,26 @@ def _validate_receipt_directory(path: Path, identity: dict[str, int], *, label: 
 
 def _validate_receipt_identity(receipt: dict[str, object], app_dir: Path) -> Path:
     expected = {
+        "operation_id",
         "version", "operation", "phase", "app_dir", "current_before", "previous_before", "candidate_release",
         "shared_venv", "peer", "snapshot", "transition", "shared_before", "peer_before", "current_before_identity",
         "previous_before_identity", "candidate_identity", "remove_env_on_recovery", "service_state_before",
         "quiesced_services", "timer_active_before",
     }
+    legacy_expected = expected - {"operation_id"}
+    legacy = set(receipt) == legacy_expected
     if (
-        set(receipt) != expected
+        (set(receipt) != expected and not legacy)
         or type(receipt.get("version")) is not int
         or receipt.get("version") != 2
         or receipt.get("operation") != "install"
     ):
         raise RecoveryBootstrapError("release receipt schema is invalid")
+    if not legacy and (
+        not isinstance(receipt.get("operation_id"), str)
+        or OPERATION_ID_RE.fullmatch(receipt["operation_id"]) is None
+    ):
+        raise RecoveryBootstrapError("release receipt operation identity is invalid")
     phase = receipt.get("phase")
     if phase in {"migration-pending", "migration-failed", "migration-applied", "activation-pending", "services-restarted", "nginx-pending", "nginx-applied", "smoke-passed", "activation-committed"}:
         raise RecoveryBootstrapError("migration outcome is uncertain")
@@ -895,13 +904,59 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
     runtime = generation / "platform_release_restore_runtime.sh"
     systemd = generation / "platform_release_systemd_state.py"
     liveqa = generation / "platform_live_qa_runtime_install.py"
+    if "operation_id" not in receipt:
+        # The deployed v2 receipt predates operation correlation.  It is a
+        # narrowly scoped, read-only compatibility bridge: with no systemd
+        # receipt present, prove the peer is already absent and let only the
+        # trusted transaction cleanup consume the inactive candidate.  Never
+        # synthesize an identity or execute retained runtime helpers for this
+        # legacy path.
+        if systemd_state_present:
+            raise RecoveryBootstrapError(
+                "legacy release receipt cannot authorize systemd recovery"
+            )
+        peer_value = receipt.get("peer")
+        if not isinstance(peer_value, str):
+            raise RecoveryBootstrapError("release receipt peer identity is invalid")
+        peer = Path(peer_value)
+        if os.path.lexists(peer):
+            raise RecoveryBootstrapError("legacy release receipt peer is present")
+        subprocess.run([
+            "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
+            "--state", str(state), "--retain-receipt",
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+        subprocess.run([
+            "/usr/bin/python3", "-I", str(transaction), "complete-recovery",
+            "--state", str(state),
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+        return
     if systemd_state_present:
+        if (
+            not isinstance(receipt.get("operation_id"), str)
+            or OPERATION_ID_RE.fullmatch(receipt["operation_id"]) is None
+        ):
+            raise RecoveryBootstrapError(
+                "legacy release receipt cannot authorize systemd recovery"
+            )
         _safe_receipt(systemd_state)
+        # Correlate both durable receipts before the runtime helper can touch
+        # unit files, Nginx, or the live-QA runtime.  A stale systemd receipt
+        # may be individually valid after a crash; it is not valid for a new
+        # transaction merely because the app directory still matches.
+        subprocess.run([
+            "/usr/bin/python3", "-I", str(systemd), "validate",
+            "--state", str(systemd_state),
+            "--app-dir", str(app_dir),
+            "--helper-release", str(release),
+            "--transaction", str(state),
+            "--systemctl", "/usr/bin/systemctl",
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
         command = [
             str(runtime),
             "--app-dir", str(app_dir),
             "--release", str(release),
             "--systemd-state", str(systemd_state),
+            "--transaction", str(state),
             "--systemctl", "/usr/bin/systemctl",
             "--live-qa-runtime-installer", str(liveqa),
         ]
@@ -912,7 +967,9 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
             raise RecoveryBootstrapError("previous release changed during retained recovery")
         subprocess.run([
             "/usr/bin/python3", "-I", str(systemd), "verify", "--state", str(systemd_state),
-            "--app-dir", str(app_dir), "--systemctl", "/usr/bin/systemctl",
+            "--app-dir", str(app_dir), "--helper-release", str(release),
+            "--transaction", str(state),
+            "--systemctl", "/usr/bin/systemctl",
         ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
         # Remove candidate/venv cleanup artifacts but retain the operation
         # receipt until the durable systemd receipt is also cleared.  A crash
@@ -923,7 +980,9 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
         ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
         subprocess.run([
             "/usr/bin/python3", "-I", str(systemd), "clear", "--state", str(systemd_state),
-            "--app-dir", str(app_dir), "--systemctl", "/usr/bin/systemctl",
+            "--app-dir", str(app_dir), "--helper-release", str(release),
+            "--transaction", str(state),
+            "--systemctl", "/usr/bin/systemctl",
         ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
     else:
         # The first attempt may have retained the operation receipt after

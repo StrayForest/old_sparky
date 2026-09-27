@@ -15,6 +15,7 @@ EDGE_ORIGIN="https://127.0.0.1"
 EDGE_HOST="old-sparky.com"
 PUBLIC_EDGE_ORIGIN="https://old-sparky.com"
 SYSTEMD_STATE=""
+TRANSACTION_STATE=""
 SYSTEMCTL_BIN="/usr/bin/systemctl"
 LIVE_QA_RUNTIME_INSTALLER=""
 PUBLIC_RELEASE_SLUG="unavailable"
@@ -85,6 +86,11 @@ while [[ $# -gt 0 ]]; do
     --systemd-state)
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       SYSTEMD_STATE="$2"
+      shift 2
+      ;;
+    --transaction)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      TRANSACTION_STATE="$2"
       shift 2
       ;;
     --systemctl)
@@ -219,6 +225,10 @@ if [[ -n "$SYSTEMD_STATE" ]]; then
     public_status failed systemd_state >&2
     exit 1
   fi
+  if [[ -z "$TRANSACTION_STATE" || ! -f "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
+    public_status failed transaction_state >&2
+    exit 1
+  fi
 fi
 if [[ "$RUN_SMOKE" -eq 1 && ! -f "$SMOKE_TOOL" ]]; then
   public_status failed tooling >&2
@@ -231,6 +241,17 @@ if [[ ! -f "$LIVE_QA_RUNTIME_INSTALLER" || -L "$LIVE_QA_RUNTIME_INSTALLER" \
   || "$LIVE_QA_RUNTIME_INSTALLER" != /* ]]; then
   public_status failed liveqa_runtime >&2
   exit 1
+fi
+if [[ -n "$SYSTEMD_STATE" ]]; then
+  # Correlate the durable systemd receipt, transaction operation and helper
+  # manifest before live-QA reconciliation or any release helper can mutate
+  # runtime files.  The bootstrap performs the same check, but rollback calls
+  # this script directly during retry recovery.
+  "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
+    validate --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+    --transaction "$TRANSACTION_STATE" --helper-release "$RELEASE" \
+    --systemctl "$SYSTEMCTL_BIN" \
+    >/dev/null 2>/dev/null
 fi
 # Rollback/recovery uses this same path, so reconcile the digest-bound
 # generation before units, Nginx, readiness or smoke can observe the restored
@@ -253,17 +274,25 @@ prepare_runtime_private() {
 
 restore_systemd_enabled_state() {
   [[ -n "$SYSTEMD_STATE" ]] || return 0
+  local transaction_args=()
+  [[ -n "$TRANSACTION_STATE" ]] && transaction_args=(--transaction "$TRANSACTION_STATE")
   "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
     restore-enabled --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+    --helper-release "$RELEASE" \
     --systemctl "$SYSTEMCTL_BIN" \
+    "${transaction_args[@]}" \
     >/dev/null 2>/dev/null
 }
 
 restore_systemd_state() {
   [[ -n "$SYSTEMD_STATE" ]] || return 0
+  local transaction_args=()
+  [[ -n "$TRANSACTION_STATE" ]] && transaction_args=(--transaction "$TRANSACTION_STATE")
   "$SHARED_VENV/bin/python" -I "$SYSTEMD_STATE_TOOL" \
     restore --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+    --helper-release "$RELEASE" \
     --systemctl "$SYSTEMCTL_BIN" \
+    "${transaction_args[@]}" \
     >/dev/null 2>/dev/null
 }
 

@@ -14,6 +14,7 @@ import zipfile
 
 from tests import platform_chromium_sandbox_fixture as chromium_sandbox_fixture
 from tests import platform_test_lock_support as lock_support
+from tools import platform_release_systemd_state
 from tools import platform_validate_release_artifact
 from tools import platform_validate_wheelhouse
 
@@ -26,10 +27,29 @@ RUNTIME_RESTORE_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_re
 RECOVERY_SHIM_SCRIPT = REPO_ROOT / "platform" / "tools" / "platform_release_recovery_shim.sh"
 TRANSACTION_STATE_NAME = ".release-operation.json"
 BUILT_AT = "20260811T120000Z"
+RELEASE_HELPER_NAMES = (
+    "platform_install_systemd_units.sh",
+    "platform_install_nginx.py",
+    "platform_deploy_smoke.py",
+    "platform_live_qa_runtime_install.py",
+    "platform_install_logging.sh",
+    "platform_prepare_service_user.sh",
+    "platform_render_service_envs.py",
+    "platform_deploy_smoke_impl.py",
+    "platform_safe_env_exec.py",
+    "platform_release_restore_runtime.sh",
+    "platform_release_systemd_state.py",
+    "platform_release_transaction.py",
+    "platform_release_lock.sh",
+)
 
 
 class PlatformReleaseVenvRollbackTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.assertEqual(
+            tuple(f"tools/{name}" for name in RELEASE_HELPER_NAMES),
+            platform_release_systemd_state.HELPER_RELATIVE_PATHS,
+        )
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self._release_lock = None
@@ -877,12 +897,7 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
         release.mkdir()
         tools = release / "tools"
         tools.mkdir()
-        for tool_name in (
-            "platform_install_systemd_units.sh",
-            "platform_install_nginx.py",
-            "platform_deploy_smoke.py",
-            "platform_live_qa_runtime_install.py",
-        ):
+        for tool_name in RELEASE_HELPER_NAMES:
             tool = tools / tool_name
             tool.write_text("#!/usr/bin/env sh\nexit 0\n")
             tool.chmod(0o755)
@@ -918,6 +933,11 @@ class PlatformReleaseVenvRollbackTests(unittest.TestCase):
             helper.parent.mkdir(parents=True, exist_ok=True)
             helper.write_text("# aggregate-only runtime helper fixture\n")
         self.add_liveqa_runtime(release)
+        for tool_name in RELEASE_HELPER_NAMES:
+            helper = release / "tools" / tool_name
+            helper.parent.mkdir(parents=True, exist_ok=True)
+            helper.write_text("#!/usr/bin/env sh\nexit 0\n")
+            helper.chmod(0o755)
         runtime_installer = release / "tools" / "platform_live_qa_runtime_install.py"
         runtime_installer.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n")
         runtime_installer.chmod(0o755)

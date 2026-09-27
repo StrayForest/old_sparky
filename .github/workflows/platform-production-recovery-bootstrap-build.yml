@@ -188,7 +188,8 @@ jobs:
           bundle_sha="$(/usr/bin/python3 -I -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["bundle_sha256"])' "$RUNNER_TEMP/recovery-build.json")"
           /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py validate \
             --bundle "$RUNNER_TEMP/$bundle_name" --source-sha "$SOURCE_SHA" --provenance "$provenance"
-          evidence="$RUNNER_TEMP/recovery-bootstrap-evidence.json"
+          evidence_name="platform-recovery-bootstrap-evidence-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}.json"
+          evidence="$RUNNER_TEMP/$evidence_name"
           /usr/bin/python3 -I -B - "$provenance" "$evidence" "$bundle_name" "$bundle_sha" <<'PY'
           import json,sys
           from pathlib import Path
@@ -199,7 +200,6 @@ jobs:
           PY
           echo "bundle_name=$bundle_name" >> "$GITHUB_OUTPUT"
           echo "bundle_sha=$bundle_sha" >> "$GITHUB_OUTPUT"
-          evidence_name="platform-recovery-bootstrap-evidence-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}.json"
           evidence_sha="$(sha256sum "$evidence" | awk '{print $1}')"
           echo "evidence_name=$evidence_name" >> "$GITHUB_OUTPUT"
           echo "evidence_sha=$evidence_sha" >> "$GITHUB_OUTPUT"
@@ -221,7 +221,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ steps.bundle.outputs.evidence_name }}
-          path: ${{ runner.temp }}/recovery-bootstrap-evidence.json
+          path: ${{ runner.temp }}/${{ steps.bundle.outputs.evidence_name }}
           if-no-files-found: error
           retention-days: 14
 

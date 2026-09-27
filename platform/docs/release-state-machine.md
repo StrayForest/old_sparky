@@ -92,11 +92,15 @@ starts a timer implicitly.
 Before the rollback pointer switch, the tool creates the separate root-owned
 `shared/.release-systemd-state.json` receipt. It contains the exact active and
 enablement state of the closed platform-owned service/timer set and the
-pre-rollback release identities. Recovery validates this receipt before any
-systemd action, restores enablement without `--now`, then restores active state
-only for the recorded units. Unsupported or malformed state is fail-closed;
-the receipt remains available when installation, restart, smoke or recovery is
-interrupted and is removed only after the rollback transaction completes.
+pre-rollback release identities. Both receipts carry one immutable operation ID;
+the systemd receipt also carries digest manifests for the helpers of both
+rollback targets, including the runtime installer and recovery orchestrator.
+Recovery validates IDs, paths, inode identities and the manifest for the
+explicit target before any helper or systemd action, restores enablement
+without `--now`, then restores active state only for the recorded units.
+Unsupported or malformed state is fail-closed. Completion is two-phase:
+`complete --retain-receipt`, systemd clear, then final `complete`; a crash
+after clear leaves a retryable transaction and no guessed service transition.
 
 Before a rollback pointer switch, the rollback tool refreshes the root-owned
 `shared/.release-recovery/` bundle and installs a small compatibility shim as
@@ -151,6 +155,12 @@ the recovery handoff needed for this cross-release boundary.
   durable. Recovery is invoked through the shared bundle, including when
   `current` already resolves to the previous release. A missing, stale or
   malformed systemd-state receipt never authorizes an enable/start operation.
+- A legacy v2 install receipt in `recovery-restored` has no operation ID and is
+  not upgraded in place. Only the immutable recovery-bootstrap bridge may
+  consume it, and only when the systemd receipt is absent, the candidate is
+  inactive and the peer is absent; that path performs transaction cleanup only
+  and never executes retained release helpers. The normal release-recover
+  workflow rejects it and directs the operator to that bridge.
 - `activation-committed` is resumable and idempotently calls final receipt
   completion. A crash after activation commit therefore cannot report success
   while leaving the receipt to block the next install.

@@ -154,6 +154,33 @@ jobs:
           print(value)
           PY
           } 2>/dev/null)"
+          transaction_context="$({
+            /usr/bin/python3 -I - "$state" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+          for key in ("operation_id", "phase", "current_before", "previous_before"):
+              value = record.get(key)
+              print("" if value is None else value)
+          PY
+          } 2>/dev/null)"
+          mapfile -t transaction_fields <<<"$transaction_context"
+          operation_id="${transaction_fields[0]:-}"
+          transaction_phase="${transaction_fields[1]:-}"
+          original_current="${transaction_fields[2]:-}"
+          original_previous="${transaction_fields[3]:-}"
+          if [[ "$pending_operation" == "install" && -z "$operation_id" ]]; then
+            if [[ "$transaction_phase" == "recovery-restored" \
+              && ! -e "$systemd_state" && ! -L "$systemd_state" ]]; then
+              echo "Legacy v2 recovery must use the immutable recovery-bootstrap bridge" >&2
+            else
+              echo "Legacy or malformed release receipt cannot enter this recovery path" >&2
+            fi
+            exit 1
+          fi
+          test -n "$original_current" && test -n "$original_previous" \
+            || { echo "Release transaction identities are incomplete" >&2; exit 1; }
           # This entrypoint recovers an interrupted install transaction. A
           # rollback transaction has its own state machine and receipt owner;
           # refusing it here prevents a second recovery path from guessing
@@ -163,6 +190,7 @@ jobs:
               if [[ -e "$systemd_state" ]]; then
                 /usr/bin/python3 -I "$systemd_state_tool" validate \
                   --state "$systemd_state" --app-dir "$runtime" \
+                  --transaction "$state" --helper-release "$original_current" \
                   --systemctl /usr/bin/systemctl >/dev/null 2>/dev/null
                 /usr/bin/python3 -I - "$state" "$systemd_state" <<'PY'
           import json
@@ -183,6 +211,8 @@ jobs:
                   --state "$systemd_state" \
                   --transaction "$state" \
                   --app-dir "$runtime" \
+                  --helper-release "$original_current" \
+                  --require-helper-manifest \
                   --systemctl /usr/bin/systemctl \
                   >/dev/null 2>/dev/null
               fi
@@ -273,6 +303,7 @@ jobs:
             --app-dir "$runtime" \
             --release "$current_release" \
             --systemd-state "$systemd_state" \
+            --transaction "$state" \
             --systemctl /usr/bin/systemctl \
             --expected-csp-mode enforce \
             --edge-origin https://127.0.0.1 \
@@ -284,6 +315,7 @@ jobs:
           # transaction; inactive services must remain inactive on recovery.
           /usr/bin/python3 -I "$current_release/tools/platform_release_systemd_state.py" \
             verify --state "$systemd_state" --app-dir "$runtime" \
+            --transaction "$state" --helper-release "$current_release" \
             --systemctl /usr/bin/systemctl >/dev/null 2>/dev/null
           nginx -t >/dev/null 2>/dev/null
           for service in deadlock-api.service deadlock-worker.service deadlock-web.service; do
@@ -334,6 +366,7 @@ jobs:
           fi
           /usr/bin/python3 -I "$current_release/tools/platform_release_systemd_state.py" \
             clear --state "$systemd_state" --app-dir "$runtime" \
+            --transaction "$state" --helper-release "$current_release" \
             --systemctl /usr/bin/systemctl >/dev/null 2>/dev/null
           test ! -e "$systemd_state" && test ! -L "$systemd_state" \
             || { echo "Systemd state receipt was not cleared" >&2; exit 1; }

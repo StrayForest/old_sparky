@@ -199,26 +199,73 @@ jobs:
               --header 'X-GitHub-Api-Version: 2022-11-28' \
               "$api/actions/artifacts/$id/zip" --output "$artifact_dir/$kind.zip"
           done
-          /usr/bin/python3 -I -B - "$artifact_dir" "$GITHUB_OUTPUT" <<'PY'
+          /usr/bin/python3 -I -B - "$artifact_dir" "$GITHUB_OUTPUT" "$EVIDENCE_NAME" "$BUNDLE_NAME" <<'PY'
           import hashlib
           import json
+          import os
           from pathlib import Path
           import re
+          import stat
           import sys
           import zipfile
           root = Path(sys.argv[1])
           output = Path(sys.argv[2])
-          def one(archive, prefix):
+          evidence_name = sys.argv[3]
+          bundle_name = sys.argv[4]
+          MAX_MEMBER_BYTES = 8 * 1024 * 1024
+          MAX_TOTAL_MEMBER_BYTES = 8 * 1024 * 1024
+          MAX_COMPRESSION_RATIO = 100
+          def write_exclusive(target, data):
+              descriptor = os.open(
+                  target,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                  0o600,
+              )
+              try:
+                  with os.fdopen(descriptor, "wb") as destination:
+                      destination.write(data)
+                      destination.flush()
+                      os.fsync(destination.fileno())
+                  os.chmod(target, 0o600, follow_symlinks=False)
+              except BaseException:
+                  try:
+                      os.unlink(target)
+                  except FileNotFoundError:
+                      pass
+                  raise
+          def one(archive, expected_name):
               with zipfile.ZipFile(archive) as source:
-                  names = [name for name in source.namelist() if name and not name.endswith("/")]
-                  if len(names) != 1 or not names[0].startswith(prefix):
+                  infos = source.infolist()
+                  if len(infos) != 1:
                       raise SystemExit("artifact archive is not a single closed file")
-                  target = root / Path(names[0]).name
-                  target.write_bytes(source.read(names[0]))
-                  target.chmod(0o600)
+                  info = infos[0]
+                  mode = (info.external_attr >> 16) & 0o177777
+                  if (
+                      info.filename != expected_name
+                      or info.create_system != 3
+                      or info.is_dir()
+                      or not stat.S_ISREG(mode)
+                      or stat.S_IMODE(mode) & 0o022
+                      or info.flag_bits & 0x1
+                      or info.file_size > MAX_MEMBER_BYTES
+                      or info.compress_size > MAX_MEMBER_BYTES
+                      or (
+                          info.file_size
+                          and (
+                              info.compress_size == 0
+                              or info.file_size > info.compress_size * MAX_COMPRESSION_RATIO
+                          )
+                      )
+                  ):
+                      raise SystemExit("artifact archive member is unsafe")
+                  data = source.read(info)
+                  if len(data) != info.file_size or len(data) > MAX_TOTAL_MEMBER_BYTES:
+                      raise SystemExit("artifact archive member size is unsafe")
+                  target = root / expected_name
+                  write_exclusive(target, data)
                   return target
-          evidence = one(root / "evidence.zip", "platform-recovery-bootstrap-evidence-")
-          bundle = one(root / "bundle.zip", "platform-recovery-bootstrap-")
+          evidence = one(root / "evidence.zip", evidence_name)
+          bundle = one(root / "bundle.zip", bundle_name)
           payload = json.loads(evidence.read_text(encoding="ascii"))
           if set(payload) != {"schema", "capability", "deployable", "bundle_name", "bundle_sha256", "provenance"} or payload.get("schema") != 1 or payload.get("capability") != "abort_retained_only" or payload.get("deployable") is not False:
               raise SystemExit("recovery evidence schema is not closed")
@@ -318,6 +365,7 @@ jobs:
               or stat.S_ISLNK(metadata.st_mode)
               or metadata.st_uid != 0
               or metadata.st_gid != 0
+              or metadata.st_nlink < 2
               or stat.S_IMODE(metadata.st_mode) != 0o700
           ):
               raise SystemExit("recovery staging directory is unsafe")
@@ -351,6 +399,7 @@ jobs:
               or stat.S_ISLNK(metadata.st_mode)
               or metadata.st_uid != 0
               or metadata.st_gid != 0
+              or metadata.st_nlink < 2
               or stat.S_IMODE(metadata.st_mode) != 0o700
           ):
               raise SystemExit("recovery staging directory is unsafe")
@@ -361,10 +410,14 @@ jobs:
           REMOTE
             local cleanup_status="$?"
             if (( status == 0 && cleanup_status != 0 )); then
-              printf '%s\n' 'Remote recovery staging cleanup failed' >&2
-              return "$cleanup_status"
+              printf 'Remote recovery staging cleanup failed primary_status=%s cleanup_status=%s\n' "$status" "$cleanup_status" >&2
+              exit "$cleanup_status"
             fi
-            return "$status"
+            if (( status != 0 && cleanup_status != 0 )); then
+              printf 'Remote recovery staging cleanup failed primary_status=%s cleanup_status=%s\n' "$status" "$cleanup_status" >&2
+              exit 1
+            fi
+            exit "$status"
           }
           trap cleanup_remote_stage EXIT
 
@@ -386,6 +439,7 @@ jobs:
               or stat.S_ISLNK(metadata.st_mode)
               or metadata.st_uid != 0
               or metadata.st_gid != 0
+              or metadata.st_nlink < 2
               or stat.S_IMODE(metadata.st_mode) != 0o700
           ):
               raise SystemExit("recovery staging directory is unsafe")
@@ -416,6 +470,7 @@ jobs:
               or stat.S_ISLNK(metadata.st_mode)
               or metadata.st_uid != 0
               or metadata.st_gid != 0
+              or metadata.st_nlink < 2
               or stat.S_IMODE(metadata.st_mode) != 0o700
           ):
               raise SystemExit("recovery staging directory is unsafe")
@@ -443,14 +498,27 @@ jobs:
           cleanup_stage() {
             local status="$?"
             trap - EXIT
+            set +e
+            local cleanup_status=0
             if [[ -L "$stage" ]]; then
-              rm -f -- "$stage"
+              rm -f -- "$stage" || cleanup_status="$?"
             elif [[ -e "$stage" ]]; then
-              validate_stage_dir "$stage"
-              rm -rf -- "$stage"
+              validate_stage_dir "$stage" || cleanup_status="$?"
+              if (( cleanup_status == 0 )); then
+                rm -rf -- "$stage" || cleanup_status="$?"
+              fi
             fi
-            test ! -e "$stage" && test ! -L "$stage"
-            return "$status"
+            if [[ -e "$stage" || -L "$stage" ]]; then
+              cleanup_status=1
+            fi
+            if (( cleanup_status != 0 )); then
+              printf 'Recovery staging cleanup failed primary_status=%s cleanup_status=%s\n' "$status" "$cleanup_status" >&2
+            fi
+            if (( status != 0 )); then
+              (( cleanup_status == 0 )) && exit "$status"
+              exit 1
+            fi
+            exit "$cleanup_status"
           }
           trap cleanup_stage EXIT
           validate_stage_dir "$stage"
@@ -460,10 +528,14 @@ jobs:
           validate_stage_dir "$payload"
           /usr/bin/python3 -I -B - "$bundle" "$payload" <<'PY'
           import os
+          import stat
           import sys
           import zipfile
           from pathlib import Path
           bundle, payload = map(Path, sys.argv[1:])
+          MAX_MEMBER_BYTES = 768 * 1024
+          MAX_TOTAL_MEMBER_BYTES = 8 * 1024 * 1024
+          MAX_COMPRESSION_RATIO = 100
           expected = {
               "platform-recovery-bootstrap/manifest.json",
               "platform-recovery-bootstrap/platform_abort_retained_only.sh",
@@ -476,16 +548,52 @@ jobs:
               "platform-recovery-bootstrap/platform_release_systemd_state.py",
           }
           with zipfile.ZipFile(bundle) as source:
-              names = [name for name in source.namelist() if name and not name.endswith('/')]
-              if set(names) != expected:
+              infos = source.infolist()
+              names = [info.filename for info in infos]
+              if (
+                  len(infos) != len(expected)
+                  or len(set(names)) != len(names)
+                  or set(names) != expected
+              ):
                   raise SystemExit('bootstrap bundle inventory is unsafe')
-              for name in names:
+              total = 0
+              for info in infos:
+                  name = info.filename
+                  mode = (info.external_attr >> 16) & 0o177777
+                  expected_mode = 0o555 if name.endswith('.sh') else 0o444
+                  if (
+                      not name.startswith('platform-recovery-bootstrap/')
+                      or '..' in Path(name).parts
+                      or info.create_system != 3
+                      or info.is_dir()
+                      or not stat.S_ISREG(mode)
+                      or stat.S_IMODE(mode) != expected_mode
+                      or info.flag_bits & 0x1
+                      or info.file_size > MAX_MEMBER_BYTES
+                      or info.compress_size > MAX_MEMBER_BYTES
+                      or (
+                          info.file_size
+                          and (
+                              info.compress_size == 0
+                              or info.file_size > info.compress_size * MAX_COMPRESSION_RATIO
+                          )
+                      )
+                  ):
+                      raise SystemExit('bootstrap bundle member is unsafe')
+                  total += info.file_size
+                  if total > MAX_TOTAL_MEMBER_BYTES:
+                      raise SystemExit('bootstrap bundle size is unsafe')
                   destination = payload / Path(name).name
                   mode = 0o555 if destination.name.endswith('.sh') else 0o444
                   descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
                   try:
                       with os.fdopen(descriptor, 'wb') as target:
-                          target.write(source.read(name))
+                          data = source.read(info)
+                          if len(data) != info.file_size:
+                              raise SystemExit('bootstrap bundle member is truncated')
+                          target.write(data)
+                          target.flush()
+                          os.fsync(target.fileno())
                           os.fchmod(target.fileno(), mode)
                   except BaseException:
                       try:

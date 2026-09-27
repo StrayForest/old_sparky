@@ -120,6 +120,7 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             str(systemd_receipt),
             "--transaction",
             str(state),
+            "--require-helper-manifest",
             "--app-dir",
             str(self.app_dir),
             "--systemctl",
@@ -295,6 +296,142 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertEqual((self.app_dir / "current").resolve(), previous)
         self.assertEqual((self.app_dir / "previous").resolve(), current)
         self.assertFalse((self.shared / STATE_NAME).exists())
+
+    def test_rollback_crash_after_systemd_clear_retries_transaction_completion(self) -> None:
+        current, previous = self.prepare_rollback_state()
+        units_state = self.root / "units.state"
+        nginx_state = self.root / "nginx.state"
+        units_state.write_text("current\n")
+        nginx_state.write_text("current\n")
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "active",
+                "deadlock-worker": "active",
+                "deadlock-web": "active",
+                "deadlock-cloudflare-ips.timer": "active",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        rollback = self.copy_rollback_with_systemctl(systemctl)
+        clear_block = (
+            "  clear_rollback_systemd_state\n"
+            "  /usr/bin/python3 -I \"$TRANSACTION_TOOL\" complete --state \"$TRANSACTION_STATE\"\n"
+        )
+        self.assertIn(clear_block, rollback.read_text(encoding="utf-8"))
+        interrupted = self.root / "rollback-after-systemd-clear.sh"
+        interrupted.write_text(
+            rollback.read_text(encoding="utf-8").replace(
+                clear_block,
+                "  clear_rollback_systemd_state\n"
+                "  /bin/kill -KILL \"$$\"\n"
+                "  /usr/bin/python3 -I \"$TRANSACTION_TOOL\" complete --state \"$TRANSACTION_STATE\"\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        interrupted.chmod(0o755)
+        result = self.run_script(
+            interrupted,
+            "--app-dir",
+            str(self.app_dir),
+            "--no-restart",
+            env=self.runtime_env(label="previous"),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertEqual(self.state_phase(), "rollback-runtime-applied")
+        self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+        self.assertEqual((self.app_dir / "current").resolve(), previous)
+        self.assertEqual((self.app_dir / "previous").resolve(), current)
+
+        retry = self.copy_rollback_with_systemctl(systemctl)
+        result = self.run_script(
+            retry,
+            "--recover-pending",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="previous"),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+
+    def test_rollback_recovery_receipt_retry_after_retained_cleanup_crash(self) -> None:
+        current, previous = self.prepare_rollback_state()
+        runtime = self.copy_runtime_with_fault(
+            "runtime-before-recovery-retry.sh",
+            '  PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"\n',
+            '  PLATFORM_APP_DIR="$APP_DIR" "$UNITS_TOOL"\n'
+            '  /bin/kill -KILL "$PPID"\n',
+        )
+        interrupted = self.copy_rollback_with_runtime(
+            "rollback-before-recovery-retry.sh", runtime
+        )
+        result = self.run_script(
+            interrupted,
+            "--app-dir",
+            str(self.app_dir),
+            "--no-restart",
+            env=self.runtime_env(label="previous"),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state_phase(), "rollback-runtime-pending")
+        systemd_receipt = self.shared / ".release-systemd-state.json"
+        self.assertTrue(systemd_receipt.is_file())
+
+        recovery_runtime = self.write_test_runtime_restore()
+        recovery = self.copy_rollback_with_runtime(
+            "rollback-retained-cleanup-kill.sh", recovery_runtime
+        )
+        retained_cleanup = (
+            "  /usr/bin/python3 -I \"$TRANSACTION_TOOL\" complete-recovery \\\n"
+            "    --retain-receipt \\\n"
+            "    --state \"$TRANSACTION_STATE\"\n"
+        )
+        recovery_text = recovery.read_text(encoding="utf-8")
+        self.assertIn(retained_cleanup, recovery_text)
+        recovery.write_text(
+            recovery_text.replace(
+                retained_cleanup,
+                retained_cleanup + '  /bin/kill -KILL "$$"\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        recovery.chmod(0o755)
+        result = self.run_script(
+            recovery,
+            "--recover-pending",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="current"),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state_phase(), "recovery-restored")
+        self.assertTrue(systemd_receipt.is_file())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+
+        retry = self.copy_rollback_with_runtime(
+            "rollback-retained-cleanup-retry.sh", recovery_runtime
+        )
+        result = self.run_script(
+            retry,
+            "--recover-pending",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="current"),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(systemd_receipt.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
 
     def test_deploy_faults_after_units_and_restart_resume_to_commit(self) -> None:
         for label, needle in (
@@ -1337,11 +1474,27 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             "printf '%s\\n' \"$PLATFORM_TEST_UNITS_LABEL\" > \"$PLATFORM_TEST_UNITS_STATE\"\n"
         )
         units.chmod(0o755)
-        (tools / "platform_install_nginx.py").write_text("# test stub\n")
-        (tools / "platform_deploy_smoke.py").write_text("# test stub\n")
+        for name in ("platform_install_nginx.py", "platform_deploy_smoke.py"):
+            helper = tools / name
+            helper.write_text("# test stub\n")
+            helper.chmod(0o755)
         runtime_installer = tools / "platform_live_qa_runtime_install.py"
         runtime_installer.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n")
         runtime_installer.chmod(0o755)
+        for name in (
+            "platform_install_logging.sh",
+            "platform_prepare_service_user.sh",
+            "platform_render_service_envs.py",
+            "platform_deploy_smoke_impl.py",
+            "platform_safe_env_exec.py",
+            "platform_release_restore_runtime.sh",
+            "platform_release_systemd_state.py",
+            "platform_release_transaction.py",
+            "platform_release_lock.sh",
+        ):
+            helper = tools / name
+            helper.write_text("#!/usr/bin/env bash\nexit 0\n" if name.endswith(".sh") else "# test stub\n")
+            helper.chmod(0o755)
     def add_release(self, name: str) -> Path:
         release = self.releases / name
         release.mkdir()

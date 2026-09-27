@@ -534,8 +534,13 @@ closed bundles, source/archive path and type rejection, exact manifest and
 provenance schemas, content-addressed atomic installation, receipt identity
 and migration-uncertainty guards, missing-candidate and generation-byte
 provenance boundaries, two-phase receipt cleanup retries, and the manual
-workflow's secret/SSH ordering. The workflow is evidence-only and
-non-deployable; live execution remains an explicit operator recovery action.
+workflow's secret/SSH ordering. `tests.test_platform_release_systemd_state`
+adds real subprocess coverage for operation-ID/path/inode mismatch,
+helper-manifest tamper-before-systemd, and rollback-target retry binding;
+`tests.test_platform_release_recovery_boundaries` covers rollback/recovery
+subprocess fault boundaries. The contract also covers the exact legacy-v2
+no-systemd cleanup bridge. The workflow is evidence-only and non-deployable;
+live execution remains an explicit operator recovery action.
 
 The `docs` gate checks document shape, repository-local links and project skill
 frontmatter/interface metadata. `verification-contract` checks registry/CI

@@ -25,6 +25,7 @@ QUIESCE_STATE_VERSION = 1
 RENAME_EXCHANGE = 2
 AT_FDCWD = -100
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+OPERATION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SERVICE_UNITS = ("deadlock-api", "deadlock-worker", "deadlock-web")
 PHASES = {
     "prepared",
@@ -82,7 +83,11 @@ PHASE_TRANSITIONS = {
     },
     "activation-committed": {"recovery-authorized"},
     "recovery-authorized": set(),
-    "restart-pending": {"services-restarted", "recovery-authorized"},
+    "restart-pending": {
+        "services-restarted",
+        "rollback-runtime-applied",
+        "recovery-authorized",
+    },
     "rollback-runtime-pending": {
         "restart-pending",
         "rollback-runtime-applied",
@@ -104,6 +109,7 @@ MIGRATION_OUTCOME_UNCERTAIN_PHASES = {
 }
 RECOVERY_CONFIRMATION = "MIGRATION_NOT_REVERSED"
 RECORD_KEYS = {
+    "operation_id",
     "version",
     "operation",
     "phase",
@@ -125,6 +131,7 @@ RECORD_KEYS = {
     "quiesced_services",
     "timer_active_before",
 }
+LEGACY_RECORD_KEYS = RECORD_KEYS - {"operation_id"}
 QUIESCE_RECORD_KEYS = {
     "version",
     "operation",
@@ -450,8 +457,23 @@ def _validate_record(
     state: Path,
     record: dict[str, object],
 ) -> dict[str, object]:
-    if set(record) != RECORD_KEYS or record.get("version") != STATE_VERSION:
+    legacy_recovery = (
+        set(record) == LEGACY_RECORD_KEYS
+        and record.get("phase") == "recovery-restored"
+    )
+    if (set(record) != RECORD_KEYS and not legacy_recovery) or record.get("version") != STATE_VERSION:
         raise TransactionError("release operation record schema is invalid")
+    if not legacy_recovery and (
+        not isinstance(record.get("operation_id"), str)
+        or OPERATION_ID_PATTERN.fullmatch(record["operation_id"]) is None
+    ):
+        raise TransactionError("release operation identity is invalid")
+    if legacy_recovery:
+        # Legacy receipts are read-only recovery inputs. They may be cleaned
+        # up when no systemd receipt exists, but cannot authorize a new
+        # systemd capture/restore because no durable operation correlation is
+        # available. Never synthesize or persist an identity for them.
+        record = {**record, "operation_id": None}
     operation = record.get("operation")
     phase = record.get("phase")
     transition = record.get("transition")
@@ -727,6 +749,7 @@ def create_record(
             transition=transition,
         )
     record: dict[str, object] = {
+        "operation_id": uuid4().hex,
         "version": STATE_VERSION,
         "operation": operation,
         "phase": "prepared",
@@ -952,6 +975,7 @@ def promote_quiesce(
             transition=transition,
         )
     record: dict[str, object] = {
+        "operation_id": uuid4().hex,
         "version": STATE_VERSION,
         "operation": "install",
         "phase": "prepared",
@@ -1502,7 +1526,7 @@ def _validate_success(record: dict[str, object]) -> None:
             raise TransactionError("shared venv appeared during pointer-only rollback")
 
 
-def complete(state: Path) -> None:
+def complete(state: Path, *, retain_receipt: bool = False) -> None:
     record = _load_record(state)
     if record["phase"] not in {
         "pointers-switched",
@@ -1512,8 +1536,9 @@ def complete(state: Path) -> None:
     }:
         raise TransactionError("release operation pointers are not durably switched")
     _validate_success(record)
-    state.unlink()
-    _fsync_directory(state.parent)
+    if not retain_receipt:
+        state.unlink()
+        _fsync_directory(state.parent)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1610,6 +1635,7 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_original_parser.add_argument("--state", required=True, type=Path)
     complete_parser = commands.add_parser("complete")
     complete_parser.add_argument("--state", required=True, type=Path)
+    complete_parser.add_argument("--retain-receipt", action="store_true")
     complete_recovery_parser = commands.add_parser("complete-recovery")
     complete_recovery_parser.add_argument("--state", required=True, type=Path)
     complete_recovery_parser.add_argument("--retain-receipt", action="store_true")
@@ -1706,7 +1732,7 @@ def main() -> int:
             record = _load_record(args.state)
             _verify_original_pointers(record)
         elif args.command == "complete":
-            complete(args.state)
+            complete(args.state, retain_receipt=args.retain_receipt)
         elif args.command == "complete-recovery":
             complete_recovery(args.state, retain_receipt=args.retain_receipt)
         elif args.command == "status":

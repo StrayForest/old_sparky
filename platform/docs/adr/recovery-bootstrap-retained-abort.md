@@ -32,6 +32,23 @@ durable cleanup side effect is idempotent and fails closed if the receipt pair
 or cleanup identities are inconsistent. It never checks out source, runs
 Alembic, downgrades a migration or selects a normal deploy entrypoint.
 
+New transaction receipts carry one immutable 32-hex `operation_id`; the
+systemd receipt must carry the same ID and the canonical current/previous
+release paths and inode identities before any runtime helper, `systemctl`, or
+receipt unlink. Its helper manifest covers both rollback targets, including
+the live-QA runtime installer, and is checked against the release actually
+passed to runtime restoration. The only compatibility bridge is the exact
+legacy v2 `install`/`recovery-restored` receipt with no systemd receipt: it
+performs receipt-owned candidate cleanup only, never synthesizes an ID or
+executes a retained release helper. Missing, mismatched, or present systemd
+state fails closed.
+
+The trusted workflow also rejects duplicate or unsafe outer/inner ZIP members,
+bounded-size/compression violations, symlink/special/non-regular entries, and
+unsafe staging directories. Recovery staging cleanup reports both the primary
+operation and cleanup result; a cleanup failure cannot turn a failed recovery
+into success.
+
 ## Consequences
 
 - Bootstrap changes receive full deterministic CI but are always

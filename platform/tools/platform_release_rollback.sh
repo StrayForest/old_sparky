@@ -183,6 +183,7 @@ restore_release_runtime() {
       --app-dir "$APP_DIR" \
       --release "$release" \
       --systemd-state "$SYSTEMD_STATE_RECEIPT" \
+      --transaction "$TRANSACTION_STATE" \
       --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
   else
     "$RUNTIME_RESTORE_TOOL" \
@@ -190,12 +191,14 @@ restore_release_runtime() {
       --release "$release" \
       --no-restart \
       --systemd-state "$SYSTEMD_STATE_RECEIPT" \
+      --transaction "$TRANSACTION_STATE" \
       --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
   fi
 }
 
 restore_rollback_systemd_state() {
   local active="$1"
+  local helper_release="${2:-${PREVIOUS_TARGET:-}}"
   local command=(restore-enabled)
   if [[ "$active" == "1" ]]; then
     command=(restore)
@@ -206,30 +209,39 @@ restore_rollback_systemd_state() {
   /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" \
     "${command[@]}" \
     --state "$SYSTEMD_STATE_RECEIPT" \
+    --transaction "$TRANSACTION_STATE" \
+    --helper-release "$helper_release" \
     --app-dir "$APP_DIR" \
     --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
 }
 
 verify_rollback_systemd_state() {
+  local helper_release="${1:-${PREVIOUS_TARGET:-}}"
   /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" \
     verify --state "$SYSTEMD_STATE_RECEIPT" \
+    --transaction "$TRANSACTION_STATE" \
+    --helper-release "$helper_release" \
     --app-dir "$APP_DIR" \
     --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
 }
 
 clear_rollback_systemd_state() {
+  local helper_release="${1:-${PREVIOUS_TARGET:-}}"
   /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" \
     clear --state "$SYSTEMD_STATE_RECEIPT" \
+    --transaction "$TRANSACTION_STATE" \
+    --helper-release "$helper_release" \
     --app-dir "$APP_DIR" \
     --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
 }
 
 capture_rollback_systemd_state() {
   /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" \
-    capture --state "$SYSTEMD_STATE_RECEIPT" \
+    capture-transaction --state "$SYSTEMD_STATE_RECEIPT" \
+    --transaction "$TRANSACTION_STATE" \
+    --helper-release "$PREVIOUS_TARGET" \
     --app-dir "$APP_DIR" \
-    --current-before "$CURRENT_TARGET" \
-    --previous-before "$PREVIOUS_TARGET" \
+    --require-helper-manifest \
     --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
 }
 
@@ -243,11 +255,51 @@ recover_rollback_to_original() {
     --retain \
     --state "$TRANSACTION_STATE"
   restore_release_runtime "$original_current" 1
-  restore_rollback_systemd_state 1
+  restore_rollback_systemd_state 1 "$original_current"
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+    --retain-receipt \
+    --state "$TRANSACTION_STATE"
+  if [[ -e "$SYSTEMD_STATE_RECEIPT" || -L "$SYSTEMD_STATE_RECEIPT" ]]; then
+    clear_rollback_systemd_state "$original_current"
+  fi
   /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
     --state "$TRANSACTION_STATE"
-  clear_rollback_systemd_state
-  public_status passed recovery >&2
+}
+
+recover_rollback_before_runtime() {
+  # A rollback receipt is captured before the venv/pointer transition.  If an
+  # interruption happens before rollback-runtime-pending, restore the
+  # filesystem with the transaction retained, clear the correlated systemd
+  # receipt while that operation identity still exists, then remove the
+  # transaction receipt.  Deleting either receipt first would leave a stale
+  # systemd snapshot that cannot be safely correlated on the next attempt.
+  local original_current
+  original_current="$(transaction_json | json_field current_before)"
+  [[ -n "$original_current" ]] || return 1
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+    --retain --state "$TRANSACTION_STATE"
+  if [[ -e "$SYSTEMD_STATE_RECEIPT" || -L "$SYSTEMD_STATE_RECEIPT" ]]; then
+    clear_rollback_systemd_state "$original_current"
+  fi
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+    --state "$TRANSACTION_STATE"
+}
+
+resume_rollback_recovery_restored() {
+  # recover_rollback_to_original retains the transaction before clearing the
+  # systemd receipt.  If the process dies in that gap, validate and verify the
+  # same operation pair before clearing it; do not rerun runtime restoration.
+  local original_current
+  original_current="$(transaction_json | json_field current_before)"
+  [[ -n "$original_current" ]] || return 1
+  if [[ -e "$SYSTEMD_STATE_RECEIPT" || -L "$SYSTEMD_STATE_RECEIPT" ]]; then
+    verify_rollback_systemd_state "$original_current"
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+      --retain-receipt --state "$TRANSACTION_STATE"
+    clear_rollback_systemd_state "$original_current"
+  fi
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+    --state "$TRANSACTION_STATE"
 }
 
 if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
@@ -260,7 +312,21 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
   )"
   PENDING_OPERATION="${TRANSACTION_STATUS%% *}"
   PENDING_PHASE="${TRANSACTION_STATUS#* }"
+  if [[ "$PENDING_OPERATION" == "rollback" ]]; then
+    CURRENT_TARGET="$(transaction_json | json_field current_before)"
+    PREVIOUS_TARGET="$(transaction_json | json_field previous_before)"
+    if [[ -z "$CURRENT_TARGET" || -z "$PREVIOUS_TARGET" ]]; then
+      public_status failed transaction >&2
+      exit 1
+    fi
+  fi
   if [[ "$PENDING_OPERATION" == "rollback" \
+    && "$PENDING_PHASE" == "recovery-restored" ]]; then
+    trap '' HUP INT TERM
+    resume_rollback_recovery_restored
+    trap - HUP INT TERM
+    public_status passed recovery
+  elif [[ "$PENDING_OPERATION" == "rollback" \
     && "$PENDING_PHASE" == "restart-pending" ]]; then
     trap '' HUP INT TERM
     PENDING_RELEASE="$(readlink -f "$APP_DIR/current")"
@@ -269,10 +335,22 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
       --release "$PENDING_RELEASE" \
       --no-restart \
       --systemd-state "$SYSTEMD_STATE_RECEIPT" \
+      --transaction "$TRANSACTION_STATE" \
       --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
     restore_rollback_systemd_state 1
-    /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
+    verify_rollback_systemd_state
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" complete \
+      --retain-receipt --state "$TRANSACTION_STATE"
+    # Persist that runtime and service verification completed before removing
+    # the systemd receipt.  A crash after clear can then finish from this
+    # phase using pointer/venv validation without trying to restore a missing
+    # receipt or invoking runtime helpers blindly.
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+      --state "$TRANSACTION_STATE" \
+      --expected restart-pending \
+      --phase rollback-runtime-applied
     clear_rollback_systemd_state
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
     trap - HUP INT TERM
     public_status passed recovery
   elif [[ "$PENDING_OPERATION" == "rollback" \
@@ -283,8 +361,13 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
   elif [[ "$PENDING_OPERATION" == "rollback" \
     && "$PENDING_PHASE" == "rollback-runtime-applied" ]]; then
     trap '' HUP INT TERM
+    if [[ -e "$SYSTEMD_STATE_RECEIPT" || -L "$SYSTEMD_STATE_RECEIPT" ]]; then
+      verify_rollback_systemd_state
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete \
+        --retain-receipt --state "$TRANSACTION_STATE"
+      clear_rollback_systemd_state
+    fi
     /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
-    clear_rollback_systemd_state
     trap - HUP INT TERM
     public_status passed recovery
   elif [[ "$PENDING_OPERATION" == "rollback" \
@@ -294,8 +377,7 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
     recover_rollback_to_original
     trap - HUP INT TERM
   else
-    /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
-      --state "$TRANSACTION_STATE"
+    recover_rollback_before_runtime
     public_status passed recovery
   fi
   exit 0
@@ -556,11 +638,11 @@ install_recovery_shim "$PREVIOUS_TARGET"
 
 ROLLBACK_COMPLETE=0
 cleanup_failed_rollback() {
-  if [[ "$ROLLBACK_COMPLETE" -eq 1 ]]; then
-    platform_release_lock_close
-    return
-  fi
-  if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
+  local primary_rc=$?
+  local cleanup_rc=0
+  trap - EXIT
+  if [[ "$ROLLBACK_COMPLETE" -ne 1 \
+    && ( -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ) ]]; then
     local pending_status pending_operation pending_phase
     pending_status="$(
       /usr/bin/python3 -I "$TRANSACTION_TOOL" status --state "$TRANSACTION_STATE" \
@@ -575,14 +657,27 @@ cleanup_failed_rollback() {
       "$pending_phase" == "smoke-passed" || \
       "$pending_phase" == "rollback-runtime-applied" ) ]]; then
       if ! recover_rollback_to_original; then
-        public_status failed recovery >&2
+        cleanup_rc=1
+      fi
+    elif [[ "$pending_operation" == "rollback" ]]; then
+      if ! recover_rollback_before_runtime >/dev/null 2>/dev/null; then
+        cleanup_rc=1
       fi
     elif ! /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
       --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null; then
-      public_status failed recovery >&2
+      cleanup_rc=1
     fi
   fi
-  platform_release_lock_close
+  if ! platform_release_lock_close; then
+    cleanup_rc=1
+  fi
+  if [[ "$cleanup_rc" -ne 0 ]]; then
+    public_status failed recovery >&2
+  fi
+  if [[ "$primary_rc" -ne 0 ]]; then
+    exit "$primary_rc"
+  fi
+  exit "$cleanup_rc"
 }
 trap cleanup_failed_rollback EXIT
 
@@ -590,7 +685,7 @@ TRANSACTION_TRANSITION="none"
 if [[ "$RESTORE_VENV" -eq 1 ]]; then
   TRANSACTION_TRANSITION="exchange"
 fi
-  /usr/bin/python3 -I "$TRANSACTION_TOOL" create \
+/usr/bin/python3 -I "$TRANSACTION_TOOL" create \
   --state "$TRANSACTION_STATE" \
   --operation rollback \
   --app-dir "$APP_DIR" \
@@ -651,6 +746,7 @@ trap '' HUP INT TERM
   --release "$PREVIOUS_TARGET" \
   --prepare-only \
   --systemd-state "$SYSTEMD_STATE_RECEIPT" \
+  --transaction "$TRANSACTION_STATE" \
   --systemctl "$SYSTEMCTL_BIN"
 
 if [[ "$RESTART_AFTER" -eq 1 ]]; then
@@ -663,6 +759,7 @@ if [[ "$RESTART_AFTER" -eq 1 ]]; then
     --release "$PREVIOUS_TARGET" \
     --restart-only \
     --systemd-state "$SYSTEMD_STATE_RECEIPT" \
+    --transaction "$TRANSACTION_STATE" \
     --systemctl "$SYSTEMCTL_BIN"
   /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
     --state "$TRANSACTION_STATE" \
@@ -672,6 +769,7 @@ if [[ "$RESTART_AFTER" -eq 1 ]]; then
     --app-dir "$APP_DIR" \
     --release "$PREVIOUS_TARGET" \
     --smoke-only
+  verify_rollback_systemd_state
   /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
     --state "$TRANSACTION_STATE" \
     --expected services-restarted \
@@ -691,9 +789,11 @@ else
     --expected rollback-runtime-pending \
     --phase rollback-runtime-applied
 fi
-/usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
-ROLLBACK_COMPLETE=1
-clear_rollback_systemd_state
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" complete \
+    --retain-receipt --state "$TRANSACTION_STATE"
+  clear_rollback_systemd_state
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$TRANSACTION_STATE"
+  ROLLBACK_COMPLETE=1
 platform_release_lock_close
 trap - HUP INT TERM
 trap - EXIT

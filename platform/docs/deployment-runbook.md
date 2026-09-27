@@ -342,13 +342,21 @@ Rollback has a separate root-owned
 `shared/.release-systemd-state.json` receipt. Before switching pointers it
 records the exact active (`active|inactive`) and enablement
 (`enabled|disabled|static`) state of every unit owned by the platform unit
-installer. The receipt is validated against the original release identities
-and is retained on an installer, restart, smoke or interruption failure.
+installer. The transaction and systemd receipts share one immutable
+`operation_id` and are validated together against both canonical release
+paths/inode identities before any runtime helper, systemd operation or receipt
+clear. The receipt also carries digest manifests for both rollback targets,
+including the live-QA runtime installer; runtime restoration must name the
+target whose manifest is being executed. It is retained on an installer,
+restart, smoke or interruption failure.
 Recovery restores only that closed owned set, first without `--now` enablement
 and then to the recorded active state; an unsupported or malformed state fails
 closed. `--no-restart` installs the files with activation disabled and verifies
 the recorded active state without starting units. The receipt is removed only
-after the rollback transaction has completed successfully.
+after the rollback transaction has completed successfully. A legacy v2
+`install`/`recovery-restored` receipt with no operation ID is recoverable only
+when the systemd receipt is absent and the candidate is inactive; that bridge
+performs receipt cleanup only and never executes retained release helpers.
 
 The production abort workflow applies the same receipt authority: it accepts
 only a validated v2 transaction (or the exact pre-quiesce receipt), selects a
