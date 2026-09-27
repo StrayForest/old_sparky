@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-24
+- Last reviewed: 2026-09-27
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
@@ -190,18 +190,26 @@ digest are validated by the downstream release workflows.
 
 The route class and fallback bit are both part of the exact classifier
 manifest. Known, complete repository state and a recognized event can produce
-`class=full`, `fallback=false`; a successful known full route is still only
-deployable when its source is the current `dev` push. The routes are:
+`class=full`, `fallback=false`; deployability is a separate authority bit. The
+trusted host-tools candidate packaging paths are deliberately full-coverage
+but CI-only, while application/runtime/migration/release paths retain normal
+trusted-push authority. The exact candidate allowlist is owned by the
+[classifier source](../tools/platform_ci_classifier.py). The routes are:
 
 | Route/provenance | Expected gates | `fallback` | Production authority |
 | --- | --- | --- | --- |
 | known `docs-only` | `docs`, `verification-contract` | `false` | never deployable; auto-deploy is a successful no-op |
 | known `out-of-scope` | `verification-contract` | `false` | never deployable; auto-deploy is a successful no-op |
-| known `full` platform/workflow path | all first eight gates | `false` | deployable only for a non-fallback push to current `dev` |
+| known full candidate-packaging-only path set (candidate workflow/helper, contract test/catalog/verification updates and platform docs) | all first eight gates | `false` | never deployable; trusted pushes are successful CI-only no-ops |
+| known `full` application/runtime/migration/release path | all first eight gates | `false` | deployable only for a non-fallback push to current `dev` |
 | unknown or malformed full fallback | all first eight gates | `true` | never deployable; fail-closed verification only |
 
 Host-tools lifecycle files are full-route platform/workflow paths, never a
-docs-only or reduced route. `platform/contracts/host_tools_pin.json` is the
+docs-only or reduced route. The trusted candidate-packaging-only set remains a
+full route for test coverage but has `deployable=false` on both pull-request
+and trusted push events. A mixed candidate-packaging/application change is
+classified by its application path and remains deployable on a trusted push.
+`platform/contracts/host_tools_pin.json` is the
 single bounded pin contract: application-only changes keep the reviewed
 `HOST_TOOLS_SHA`, while a host-control closure edit must update the pin and its
 closure baseline. The practical bump is commit A (closure change), out-of-band
@@ -218,6 +226,21 @@ resolver against the repository and target SHA. The fast DB-free backend
 contour stays shallow and proves the static contract plus the synthetic A/B
 pin-bump lifecycle; it does not silently skip historical ancestry proof.
 
+The `platform-host-tools-candidate.yml` workflow is a separate trusted
+`workflow_run` contract, not a production gate.  Its validator and bundle
+tests remain owned by the `backend-tool-contract` contour through
+`test_platform_host_tools_bundle`; the executable catalog snapshot must be
+updated whenever those tests change.  The verification-contract gate also
+invokes `host_tools_candidate_workflow_issues()` so a missing default-branch
+guard, broadened permission, unpinned action, direct candidate execution,
+unsafe isolated-Python invocation, missing TOCTOU recheck or production
+artifact consumer fails closed.  The workflow first validates whether the
+resolved pin is a novel generation: an existing base-reachable pin completes
+as a successful no-op, while only an eligible novel pin reaches build,
+attestation and upload.  Its successful output is bounded review evidence
+only: it never grants deploy/provision authority and production workflows must
+not consume its artifact prefixes.
+
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route
 with `fallback=true` and `deployable=false`; these routes also run the
@@ -226,8 +249,10 @@ canonical `dev` branch also runs the separate `release-runtime-real` builder.
 Known `.github/**` and
 `platform/**` dependency, configuration, migration, workflow and registry
 paths are recognized full routes with `fallback=false`; they are not fallback
-cases merely because they require the full gate set. A known full path with
-valid exact-SHA provenance is the distinct `fallback=false` case. A successful
+cases merely because they require the full gate set. The explicit candidate
+packaging-only allowlist is the exception to production authority: it remains
+full verification but sets `deployable=false`. A known full path with valid
+exact-SHA provenance is the distinct `fallback=false` case. A successful
 `platform-security-build` status
 therefore remains the exact-SHA CI result, not permission to deploy by itself:
 auto-deploy must download and validate the matching classifier artifact, and

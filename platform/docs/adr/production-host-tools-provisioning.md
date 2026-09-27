@@ -12,8 +12,8 @@ generation.  The immutable path is:
 The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
-is the only source for `HOST_TOOLS_SHA`; it currently pins the installed
-generation `4233e3ce3395da6948192f14e50af2033774f4f0`. The pin records the
+is the only source for `HOST_TOOLS_SHA`; it currently pins the reviewed
+generation `25c67089fdfca99f58d801cc529bb0e987f5ecf8`. The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
 ancestor of the reviewed application target. There is no `current` or
@@ -83,6 +83,44 @@ secret-bearing job.  External-load and retained-cleanup workflows remain
 fail-closed on their existing trusted boundaries until they receive an
 equivalent reviewed generation capability; this ADR does not silently broaden
 those workflows.
+
+## Trusted pull-request candidate handoff
+
+The default-branch [`platform-host-tools-candidate.yml`](../../../.github/workflows/platform-host-tools-candidate.yml)
+workflow is a non-deployable `workflow_run` consumer of a successful canonical
+`Platform security and build` pull-request run.  Its job runs only from the
+trusted `dev` workflow context, has read-only repository/action/pull-request
+permissions plus the narrowly scoped provenance-attestation permissions, and
+receives no secrets, status/deployment write permission or production
+environment approval.
+
+The workflow resolves an immutable trusted default-branch commit **T** and
+executes only validators and the deterministic bundle builder from **T**. Its
+isolated `python -I -B` invocations load the candidate validator's sibling
+bundle helper by the validator's trusted `__file__` path; they never add the
+candidate checkout to `sys.path` or import candidate code. It checks the exact
+workflow ID/name/path, run ID/attempt/conclusion/head and canonical repository,
+then re-reads the same run attempt (including its canonical `pull_requests`
+payload) and pull request before attestation and again before artifact upload.
+The pull request checkout **E** is data only: it is never imported, compiled,
+interpreted or executed. The trusted pin parser resolves host-tools generation
+**C** from **E**. A strict-ancestor **C** that is already reachable from the
+current PR base is a valid existing generation and completes as `eligible=false`
+without building, attesting or uploading an artifact. A novel
+`C ∈ reachable(E) \ reachable(base)` is `eligible=true` and may produce the
+review artifact. This deliberately accepts a PR branch that merge-syncs
+current `dev` before introducing **C**; the merge-sync makes the base reachable
+from **E**, while **C** remains reachable only from the PR head. Malformed,
+unrelated or otherwise ambiguous pin history fails closed. The exact fixed
+closure and its digests remain required.
+
+The inner deterministic bundle is attested before upload.  Candidate and
+evidence artifact names bind the pull request, **C**, **E**, security run and
+attempt; each uploaded ZIP is read back through bounded metadata/digest checks
+and a closed one-member archive check.  The resulting evidence JSON is
+mode-0600, size-bounded and explicitly `deployable: false`.  Production
+workflows do not consume either candidate prefix, so this handoff can only
+produce review evidence; it cannot dispatch, provision, install or deploy.
 
 ## One-time operator provisioning (out of band)
 

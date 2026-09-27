@@ -94,6 +94,7 @@ EXTERNAL_LOAD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-product
 CLASSIFIER_TOOL = PLATFORM_ROOT / "tools" / "platform_ci_classifier.py"
 AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-autodeploy.yml"
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-production-deploy.yml"
+CANDIDATE_HOST_TOOLS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "platform-host-tools-candidate.yml"
 
 DIRECT_CANONICAL_COMMANDS = (
     "platform_run_tests.sh",
@@ -346,6 +347,34 @@ def _workflow_step_blocks(job_block: str) -> tuple[str, ...]:
         "".join(lines[start:end])
         for start, end in zip(starts, (*starts[1:], len(lines)))
     )
+
+
+def host_tools_candidate_artifact_zip_curl_blocks(workflow_text: str) -> tuple[str, ...]:
+    """Find every artifact ZIP download curl command in the candidate workflow.
+
+    The workflow uses one shell command per download, with backslash-continued
+    options. Joining only those continuations keeps this contract independent
+    of surrounding YAML step names and catches a newly added artifact download
+    automatically.
+    """
+
+    lines = workflow_text.splitlines(keepends=True)
+    commands: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not re.match(r"^\s*curl(?:\s|$)", line):
+            index += 1
+            continue
+        command = line
+        while line.rstrip().endswith("\\") and index + 1 < len(lines):
+            index += 1
+            line = lines[index]
+            command += line
+        if re.search(r"/actions/artifacts/[^\s\"']+/zip(?:[^A-Za-z0-9_]|$)", command):
+            commands.append(command)
+        index += 1
+    return tuple(commands)
 
 
 def _checkout_credential_issues(workflow_name: str, workflow_text: str) -> list[str]:
@@ -1469,6 +1498,145 @@ def release_runtime_workflow_issues(security_text: str) -> list[str]:
     return issues
 
 
+def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> list[str]:
+    """Guard the default-branch-only, non-deployable host-tools handoff."""
+
+    if workflow_text is None:
+        try:
+            workflow_text = CANDIDATE_HOST_TOOLS_WORKFLOW.read_text(encoding="utf-8")
+        except OSError as exc:
+            return [f"host-tools candidate workflow is unreadable: {exc}"]
+    issues: list[str] = []
+    if not re.search(r"^  workflow_run:\n", workflow_text, re.MULTILINE):
+        issues.append("host-tools candidate workflow must use workflow_run")
+    if re.search(r"^  (?:pull_request|pull_request_target|workflow_dispatch):", workflow_text, re.MULTILINE):
+        issues.append("host-tools candidate workflow must not add a direct or target PR/manual trigger")
+    for marker in (
+        "workflows: [Platform security and build]",
+        "types: [completed]",
+        "cancel-in-progress: true",
+        "github.ref == 'refs/heads/dev'",
+        "github.event.workflow_run.event == 'pull_request'",
+        "github.event.workflow_run.head_repository.full_name == 'StrayForest/old_sparky'",
+        "github.event.workflow_run.workflow_id == 339062797",
+        "github.event.workflow_run.path == '.github/workflows/platform-security.yml'",
+        "github.event.workflow_run.name == 'Platform security and build'",
+        "platform_host_tools_candidate.py",
+        "platform_host_tools_pin.py resolve",
+        "python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py",
+        "python3 -I -B trusted-dev/platform/tools/platform_host_tools_pin.py",
+        "python3 -I -B trusted-dev/platform/tools/platform_host_tools_bundle.py",
+        "--source-root \"$GITHUB_WORKSPACE/candidate-data\"",
+        "--summary-artifact-id",
+        "--candidate-artifact-id",
+        "verify-ancestry",
+        "--github-output \"$GITHUB_OUTPUT\"",
+        "steps.eligibility.outputs.eligible == 'false'",
+        "steps.eligibility.outputs.eligible == 'true'",
+        "/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1",
+        "Recheck PR, security run, attempt, and head before attestation",
+        "Recheck PR, security run, attempt, and head before upload",
+        "actions/attest-build-provenance@",
+        "actions/upload-artifact@",
+        "verify-evidence-upload",
+        "overwrite: false",
+        "retention-days: 30",
+    ):
+        if marker not in workflow_text:
+            issues.append(f"host-tools candidate workflow is missing marker: {marker}")
+    for forbidden in (
+        "pull_request_target",
+        "environment:",
+        "secrets.",
+        "actions: write",
+        "contents: write",
+        "statuses: write",
+        "actions/setup-python@",
+        "actions/cache@",
+        "actions/download-artifact@",
+        "python3 -I candidate-data/",
+        "actions/runs/$SECURITY_RUN_ID/pull_requests",
+        "actions/runs/$SECURITY_RUN_ID/jobs?filter=latest",
+        "--pull-requests",
+    ):
+        if forbidden in workflow_text:
+            issues.append(f"host-tools candidate workflow contains forbidden marker: {forbidden}")
+    if re.search(
+        r"python3\s+-I(?!\s+-B\b)[^\n]*trusted-dev/platform/tools/",
+        workflow_text,
+    ):
+        issues.append("trusted host-tools candidate invocations must preserve isolated bytecode-free Python")
+    artifact_zip_commands = host_tools_candidate_artifact_zip_curl_blocks(workflow_text)
+    if len(artifact_zip_commands) != 3:
+        issues.append(
+            "host-tools candidate workflow must contain exactly three artifact ZIP download curl blocks"
+        )
+    for index, command in enumerate(artifact_zip_commands, start=1):
+        for marker, description in (
+            ("--location", "redirect following"),
+            ("--fail-with-body", "HTTP failure handling"),
+            ("--max-filesize", "bounded response size"),
+            ("Authorization: Bearer $GH_TOKEN", "authorization"),
+            ("X-GitHub-Api-Version: 2022-11-28", "API version"),
+            ("--output", "output path"),
+        ):
+            if marker not in command:
+                issues.append(
+                    f"host-tools candidate artifact ZIP curl block {index} is missing {description}"
+                )
+        if "Accept: application/vnd.github+json" not in command:
+            issues.append(
+                f"host-tools candidate artifact ZIP curl block {index} must request application/vnd.github+json"
+            )
+        if "application/zip" in command:
+            issues.append(
+                f"host-tools candidate artifact ZIP curl block {index} must not request application/zip"
+            )
+    eligible_true = "if: ${{ steps.eligibility.outputs.eligible == 'true' }}"
+    candidate_job = re.search(
+        r"^  build-candidate:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        workflow_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    candidate_steps = {
+        match.group("name"): match.group(0)
+        for match in (
+            re.match(
+                r"^      - name: (?P<name>[^\n]+)\n(?P<body>.*)",
+                block,
+                re.MULTILINE | re.DOTALL,
+            )
+            for block in _workflow_step_blocks(candidate_job.group("body"))
+        )
+        if match is not None
+    } if candidate_job is not None else {}
+    for step_name in (
+        "Build and verify deterministic existing host-tools bundle from T",
+        "Recheck PR, security run, attempt, and head before attestation",
+        "Attest exact inner host-tools ZIP",
+        "Recheck PR, security run, attempt, and head before upload",
+        "Upload exact candidate inner ZIP without overwrite",
+        "Verify uploaded candidate artifact outer digest and metadata",
+        "Upload closed candidate evidence without overwrite",
+        "Verify uploaded evidence artifact envelope",
+        "Publish exact candidate and evidence receipt",
+    ):
+        if eligible_true not in candidate_steps.get(step_name, ""):
+            issues.append(f"host-tools candidate artifact step is not gated by eligibility: {step_name}")
+    if "id-token: write" not in workflow_text or "attestations: write" not in workflow_text:
+        issues.append("host-tools candidate attestation permissions are missing")
+    if "permissions:\n  contents: read\n  actions: read\n  pull-requests: read" not in workflow_text:
+        issues.append("host-tools candidate workflow must have minimal read-only defaults")
+    production_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in WORKFLOW_ROOT.glob("platform-production-*.y*ml")
+    )
+    for prefix in ("platform-host-tools-candidate-", "platform-host-tools-candidate-evidence-"):
+        if prefix in production_text:
+            issues.append(f"production workflows must not consume candidate artifact prefix: {prefix}")
+    return issues
+
+
 def collect_issues() -> list[str]:
     issues: list[str] = []
 
@@ -1484,6 +1652,7 @@ def collect_issues() -> list[str]:
                     workflow_text,
                 )
             )
+    issues.extend(host_tools_candidate_workflow_issues())
 
     if not SECURITY_WORKFLOW.is_file():
         issues.append("platform-security.yml is missing")

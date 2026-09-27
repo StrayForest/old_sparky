@@ -98,6 +98,29 @@ OUT_OF_SCOPE_PREFIXES = (
 FULL_PREFIXES = (".github/", "platform/")
 DOCS_PREFIX = "platform/docs/"
 
+# The host-tools candidate is a trusted ``workflow_run`` evidence package.  A
+# change limited to this package can require the complete deterministic CI
+# suite, but must not turn a successful ``dev`` push into a production
+# release.  Keep the non-doc paths explicit: adding a new candidate helper or
+# workflow without deliberately reviewing its production authority should fail
+# into the ordinary deployable full route until this allowlist is updated.
+CANDIDATE_PACKAGING_FILES = frozenset(
+    {
+        ".github/workflows/platform-host-tools-candidate.yml",
+        ".github/workflows/platform-production-autodeploy.yml",
+        ".github/workflows/platform-security.yml",
+        "platform/tests/test_platform_ci_classifier.py",
+        "platform/tools/platform_host_tools_candidate.py",
+        "platform/tools/platform_ci_classifier.py",
+        "platform/tests/test_platform_host_tools_bundle.py",
+        "platform/tools/platform_test_catalog.py",
+        "platform/tools/platform_verify_contract.py",
+    }
+)
+CANDIDATE_PACKAGING_REASON = (
+    "trusted candidate-packaging change requires full verification and is non-deployable"
+)
+
 _DIGEST_FIELDS = (
     "schema",
     "version",
@@ -218,6 +241,18 @@ def _is_out_of_scope(path: str) -> bool:
     return path in OUT_OF_SCOPE_EXACT or path.startswith(OUT_OF_SCOPE_PREFIXES)
 
 
+def _is_candidate_packaging_only(files: Sequence[str]) -> bool:
+    """Return whether a path set is limited to candidate packaging/CI docs."""
+
+    return bool(
+        any(path in CANDIDATE_PACKAGING_FILES for path in files)
+        and all(
+            path in CANDIDATE_PACKAGING_FILES or path.startswith(DOCS_PREFIX)
+            for path in files
+        )
+    )
+
+
 def _route_for_files(files: Sequence[str]) -> tuple[str, tuple[str, ...], str, bool]:
     """Return class, gates, reason and whether the path set is a fallback."""
 
@@ -261,11 +296,13 @@ def _build_manifest(
     route_class: str,
     expected_gates: Sequence[str],
     runtime_sensitive: bool = False,
+    non_deployable: bool = False,
 ) -> dict[str, object]:
     reason = _single_line_output(reason, field="reason")
     deployable = (
         route_class == "full"
         and not fallback
+        and not non_deployable
         and event == "push"
         and branch == "dev"
         and bool(SHA_RE.fullmatch(target_sha))
@@ -397,6 +434,9 @@ def classify(
 
     route_class, expected_gates, reason, fallback = _route_for_files(normalised)
     runtime_sensitive = runtime_sensitive or fallback
+    candidate_packaging_only = _is_candidate_packaging_only(normalised)
+    if candidate_packaging_only:
+        reason = CANDIDATE_PACKAGING_REASON
     return _build_manifest(
         target_sha=target_sha,
         event=event,
@@ -407,6 +447,7 @@ def classify(
         route_class=route_class,
         expected_gates=expected_gates,
         runtime_sensitive=runtime_sensitive,
+        non_deployable=candidate_packaging_only,
     )
 
 
@@ -472,6 +513,13 @@ def validate_manifest(
         raise ClassifierError("fallback classifier route cannot be deployable")
     if route_class != "full" and manifest["deployable"]:
         raise ClassifierError("only the full route can be deployable")
+    if (
+        route_class == "full"
+        and not manifest["fallback"]
+        and _is_candidate_packaging_only(files)
+        and manifest["deployable"]
+    ):
+        raise ClassifierError("candidate packaging route cannot be deployable")
     if expected_target_sha is not None and target_sha != expected_target_sha:
         raise ClassifierError("classifier target_sha does not match the release SHA")
     if require_deployable:

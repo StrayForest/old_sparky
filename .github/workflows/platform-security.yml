@@ -1149,6 +1149,9 @@ jobs:
                   "web-quality", "web-hermetic", "verification-contract",
               ],
           }
+          # A full route can be CI-only. Keep the deployable authority bit
+          # independent from gate coverage so candidate packaging can pass
+          # every required check without authorizing production.
           route_class = os.environ.get("ROUTE_CLASS", "")
           route_event = os.environ.get("ROUTE_EVENT", "")
           event_name = os.environ.get("EVENT_NAME", "")

@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -13,6 +14,8 @@ import warnings
 import zipfile
 
 from tools.platform_ci_classifier import (
+    CANDIDATE_PACKAGING_FILES,
+    CANDIDATE_PACKAGING_REASON,
     DOCS_ONLY_GATE_IDS,
     FULL_GATE_IDS,
     OUT_OF_SCOPE_GATE_IDS,
@@ -36,9 +39,113 @@ AUTO_DEPLOY_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-autode
 PRODUCTION_WORKFLOW = REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
 STATUS_FINALIZER_WORKFLOW = REPO_ROOT / ".github/workflows/platform-security-status-finalizer.yml"
 
+# PR117 was merged as a real merge commit.  The push range is the first
+# parent (the branch before the merge) to that merge commit; the PR range is
+# the same base to the source head.  In particular, the PR fixture must not
+# use the second parent -> merge range, which is empty for a clean GitHub
+# merge and would hide the changed-file classifier regression.
+PR117_BASE_SHA = "adb9b56384db7f444596e752088990a39555de1b"
+PR117_HEAD_SHA = "7a20f9718c9debcd20d7dc0ac338218576b318a4"
+PR117_MERGE_SHA = "d6c4c0922289234735c62728991dffc0db410726"
+PR117_CHANGED_FILES = frozenset(
+    {
+        ".github/workflows/platform-host-tools-candidate.yml",
+        ".github/workflows/platform-production-autodeploy.yml",
+        ".github/workflows/platform-security.yml",
+        "platform/docs/CURRENT.md",
+        "platform/docs/adr/production-host-tools-provisioning.md",
+        "platform/docs/deployment-runbook.md",
+        "platform/docs/development-guide.md",
+        "platform/docs/test-suite-governance.md",
+        "platform/tests/test_platform_ci_classifier.py",
+        "platform/tests/test_platform_host_tools_bundle.py",
+        "platform/tools/platform_ci_classifier.py",
+        "platform/tools/platform_host_tools_candidate.py",
+        "platform/tools/platform_test_catalog.py",
+        "platform/tools/platform_verify_contract.py",
+    }
+)
+
 
 class PlatformCiClassifierTests(unittest.TestCase):
     TARGET_SHA = "a" * 40
+
+    def _run_classifier_fixture(
+        self,
+        *,
+        event: str,
+        payload: dict[str, object],
+        target_sha: str,
+        branch: str,
+    ) -> dict[str, object]:
+        """Generate one artifact through the production classifier CLI."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "event.json"
+            output_path = root / "classifier-manifest.json"
+            event_path.write_text(json.dumps(payload), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "platform/tools/platform_ci_classifier.py"),
+                    "--event",
+                    event,
+                    "--target-sha",
+                    target_sha,
+                    "--branch",
+                    branch,
+                    "--event-file",
+                    str(event_path),
+                    "--repo-root",
+                    str(REPO_ROOT),
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return json.loads(output_path.read_text(encoding="utf-8"))
+
+    def _run_auto_deploy_manifest_contract(
+        self, manifest: dict[str, object]
+    ) -> dict[str, str]:
+        """Pass a generated manifest through auto-deploy's no-op boundary."""
+
+        workflow = AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+        marker = (
+            '          /usr/bin/python3 - "$manifest_path" "$TARGET_SHA" '
+            '"$GITHUB_OUTPUT" <<\'PY\'\n'
+        )
+        start = workflow.index(marker) + len(marker)
+        end = workflow.index("          PY\n", start)
+        contract = textwrap.dedent(workflow[start:end])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = root / "classifier-manifest.json"
+            output_path = root / "github-output"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-",
+                    str(manifest_path),
+                    str(manifest["target_sha"]),
+                    str(output_path),
+                ],
+                input=contract,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            output: dict[str, str] = {}
+            for line in output_path.read_text(encoding="utf-8").splitlines():
+                key, value = line.split("=", 1)
+                output[key] = value
+            return output
 
     def test_docs_only_route_is_nondeployable_and_digest_bound(self) -> None:
         manifest = classify(
@@ -72,6 +179,245 @@ class PlatformCiClassifierTests(unittest.TestCase):
             expected_target_sha=self.TARGET_SHA,
             require_deployable=True,
         )
+
+    def test_candidate_packaging_is_full_ci_but_non_deployable_for_pr_and_push(self) -> None:
+        candidate_files = {
+            ".github/workflows/platform-host-tools-candidate.yml",
+            ".github/workflows/platform-production-autodeploy.yml",
+            ".github/workflows/platform-security.yml",
+            "platform/tests/test_platform_ci_classifier.py",
+            "platform/tools/platform_host_tools_candidate.py",
+            "platform/tools/platform_ci_classifier.py",
+            "platform/tests/test_platform_host_tools_bundle.py",
+            "platform/tools/platform_test_catalog.py",
+            "platform/tools/platform_verify_contract.py",
+        }
+        self.assertEqual(CANDIDATE_PACKAGING_FILES, candidate_files)
+        files = sorted(
+            candidate_files
+            | {
+                "platform/docs/CURRENT.md",
+                "platform/docs/README.md",
+                "platform/docs/adr/production-host-tools-provisioning.md",
+                "platform/docs/deployment-runbook.md",
+                "platform/docs/test-suite-governance.md",
+            }
+        )
+        manifests = {
+            event: classify(
+                files,
+                event=event,
+                target_sha=self.TARGET_SHA,
+                branch="dev" if event == "push" else "feature/candidate",
+            )
+            for event in ("pull_request", "push")
+        }
+
+        for event, manifest in manifests.items():
+            with self.subTest(event=event):
+                self.assertEqual(manifest["class"], "full")
+                self.assertEqual(manifest["expected_gates"], list(FULL_GATE_IDS))
+                self.assertFalse(manifest["fallback"])
+                self.assertFalse(manifest["deployable"])
+                self.assertFalse(manifest["runtime_sensitive"])
+                self.assertEqual(manifest["reason"], CANDIDATE_PACKAGING_REASON)
+                validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+        tampered = dict(manifests["push"])
+        tampered["deployable"] = True
+        tampered["digest"] = manifest_digest(tampered)
+        with self.assertRaises(ClassifierError):
+            validate_manifest(tampered)
+
+    def test_pr117_first_parent_push_and_pr_ranges_generate_non_deployable_manifest(self) -> None:
+        self.assertNotEqual(PR117_HEAD_SHA, PR117_MERGE_SHA)
+        merge_parents = subprocess.check_output(
+            ["git", "rev-list", "--parents", "-n", "1", PR117_MERGE_SHA],
+            cwd=REPO_ROOT,
+            text=True,
+        ).split()
+        self.assertEqual(merge_parents[1:], [PR117_BASE_SHA, PR117_HEAD_SHA])
+        self.assertEqual(
+            set(
+                subprocess.check_output(
+                    ["git", "diff", "--name-only", PR117_BASE_SHA, PR117_HEAD_SHA, "--"],
+                    cwd=REPO_ROOT,
+                    text=True,
+                ).splitlines()
+            ),
+            PR117_CHANGED_FILES,
+        )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "diff", "--name-only", PR117_HEAD_SHA, PR117_MERGE_SHA, "--"],
+                cwd=REPO_ROOT,
+                text=True,
+            ),
+            "",
+        )
+
+        push_manifest = self._run_classifier_fixture(
+            event="push",
+            payload={"before": PR117_BASE_SHA, "after": PR117_MERGE_SHA},
+            target_sha=PR117_MERGE_SHA,
+            branch="dev",
+        )
+        pr_manifest = self._run_classifier_fixture(
+            event="pull_request",
+            payload={
+                "pull_request": {
+                    "base": {"sha": PR117_BASE_SHA},
+                    "head": {"sha": PR117_HEAD_SHA},
+                }
+            },
+            target_sha=PR117_MERGE_SHA,
+            branch="classifier-push-parity",
+        )
+
+        for label, manifest in (("push", push_manifest), ("pull request", pr_manifest)):
+            with self.subTest(event=label):
+                self.assertEqual(set(manifest["files"]), PR117_CHANGED_FILES)
+                self.assertEqual(manifest["class"], "full")
+                self.assertFalse(manifest["fallback"])
+                self.assertFalse(manifest["runtime_sensitive"])
+                self.assertFalse(manifest["deployable"])
+                self.assertEqual(manifest["reason"], CANDIDATE_PACKAGING_REASON)
+                validate_manifest(manifest, expected_target_sha=PR117_MERGE_SHA)
+
+        # Auto-deploy consumes the generated artifact's authority bit.  This
+        # exercises the same inline manifest contract that emits route_*
+        # outputs for the no-op branch; the test never substitutes a literal
+        # deployable=false input.
+        route = self._run_auto_deploy_manifest_contract(push_manifest)
+        self.assertEqual(route["route_class"], push_manifest["class"])
+        self.assertEqual(route["route_deployable"], str(push_manifest["deployable"]).lower())
+        self.assertEqual(route["route_fallback"], str(push_manifest["fallback"]).lower())
+        self.assertEqual(route["route_digest"], push_manifest["digest"])
+        self.assertIn(
+            'if [[ "$ROUTE_DEPLOYABLE" != "true" ]]',
+            AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            'echo "deploy=false" >> "$GITHUB_OUTPUT"',
+            AUTO_DEPLOY_WORKFLOW.read_text(encoding="utf-8"),
+        )
+
+    def test_deployable_push_matrix_keeps_application_runtime_migration_and_release_paths(self) -> None:
+        paths = (
+            "platform/apps/platform_api/app/main.py",
+            "platform/tools/platform_build_release.sh",
+            "platform/alembic/versions/20260927_candidate.py",
+            ".github/workflows/platform-production-deploy.yml",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                pull_request = classify(
+                    [path],
+                    event="pull_request",
+                    target_sha=self.TARGET_SHA,
+                    branch="feature/candidate",
+                )
+                push = classify(
+                    [path],
+                    event="push",
+                    target_sha=self.TARGET_SHA,
+                    branch="dev",
+                )
+                self.assertEqual(pull_request["class"], "full")
+                self.assertFalse(pull_request["deployable"])
+                self.assertFalse(pull_request["fallback"])
+                self.assertEqual(push["class"], "full")
+                self.assertTrue(push["deployable"])
+                self.assertFalse(push["fallback"])
+                validate_manifest(push, expected_target_sha=self.TARGET_SHA, require_deployable=True)
+
+        mixed = classify(
+            [
+                ".github/workflows/platform-host-tools-candidate.yml",
+                "platform/apps/platform_api/app/main.py",
+            ],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(mixed["class"], "full")
+        self.assertTrue(mixed["deployable"])
+        validate_manifest(mixed, expected_target_sha=self.TARGET_SHA, require_deployable=True)
+
+        for application_path in (
+            "platform/apps/platform_api/app/main.py",
+            "platform/tools/platform_build_live_qa_runtime.py",
+        ):
+            with self.subTest(mixed_application_path=application_path):
+                mixed_control = classify(
+                    [
+                        ".github/workflows/platform-production-autodeploy.yml",
+                        ".github/workflows/platform-security.yml",
+                        "platform/tests/test_platform_ci_classifier.py",
+                        "platform/tools/platform_ci_classifier.py",
+                        application_path,
+                    ],
+                    event="push",
+                    target_sha=self.TARGET_SHA,
+                    branch="dev",
+                )
+                self.assertEqual(mixed_control["class"], "full")
+                self.assertFalse(mixed_control["fallback"])
+                self.assertTrue(mixed_control["deployable"])
+                if application_path in RUNTIME_SENSITIVE_FILES:
+                    self.assertTrue(mixed_control["runtime_sensitive"])
+                validate_manifest(
+                    mixed_control,
+                    expected_target_sha=self.TARGET_SHA,
+                    require_deployable=True,
+                )
+
+        unknown_mixed = classify(
+            [
+                ".github/workflows/platform-security.yml",
+                "platform/tools/platform_ci_classifier.py",
+                "unknown-root-config.toml",
+            ],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(unknown_mixed["class"], "full")
+        self.assertTrue(unknown_mixed["fallback"])
+        self.assertTrue(unknown_mixed["runtime_sensitive"])
+        self.assertFalse(unknown_mixed["deployable"])
+        validate_manifest(unknown_mixed, expected_target_sha=self.TARGET_SHA)
+
+        for path, expected_class, expected_fallback, expected_gates in (
+            (
+                "platform/docs/deployment-runbook.md",
+                "docs-only",
+                False,
+                DOCS_ONLY_GATE_IDS,
+            ),
+            (
+                "unknown-root-config.toml",
+                "full",
+                True,
+                FULL_GATE_IDS,
+            ),
+        ):
+            for event, branch in (
+                ("pull_request", "feature/candidate"),
+                ("push", "dev"),
+            ):
+                with self.subTest(path=path, event=event):
+                    manifest = classify(
+                        [path],
+                        event=event,
+                        target_sha=self.TARGET_SHA,
+                        branch=branch,
+                    )
+                    self.assertEqual(manifest["class"], expected_class)
+                    self.assertEqual(manifest["fallback"], expected_fallback)
+                    self.assertEqual(manifest["expected_gates"], list(expected_gates))
+                    self.assertFalse(manifest["deployable"])
+                    validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
 
     def test_release_runtime_sensitivity_is_exact_and_digest_bound(self) -> None:
         runtime_path = "platform/tools/platform_build_live_qa_runtime.py"
@@ -260,6 +606,11 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn('echo "deploy=false" >> "$GITHUB_OUTPUT"', auto)
         self.assertIn("Dispatch production deployment", auto)
         self.assertIn("steps.gate.outputs.deploy == 'true'", auto)
+        self.assertIn(
+            'type(manifest.get("deployable")) is not bool',
+            auto,
+        )
+        self.assertIn("full route may be non-deployable", auto)
 
         for files in (
             ["platform/docs/deployment-runbook.md"],
@@ -621,6 +972,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("STATUS_START_RESULT", workflow)
         self.assertIn("published_event", workflow)
         self.assertIn("expected_by_class", workflow)
+        self.assertIn("A full route can be CI-only", workflow)
         self.assertIn("ROUTE_EVENT", workflow)
         self.assertIn("classifier event does not match the workflow event", workflow)
         self.assertIn("classifier expected gates do not match its class", workflow)
@@ -804,6 +1156,19 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 ),
                 (
                     "ordinary dev both skipped",
+                    "push",
+                    "refs/heads/dev",
+                    "false",
+                    "false",
+                    "skipped",
+                    "skipped",
+                    True,
+                    False,
+                ),
+                # Candidate packaging keeps the full gate class but is a
+                # successful CI-only push when deployable=false.
+                (
+                    "candidate packaging dev no-op",
                     "push",
                     "refs/heads/dev",
                     "false",
