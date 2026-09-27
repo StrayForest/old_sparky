@@ -27,7 +27,7 @@ from tools.platform_verify_contract import _workflow_step_blocks
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOLS_ROOT = REPO_ROOT / "platform" / "tools"
 SOURCE_SHA = "d974c8b0536683d0ca8d6f1aca8331a215023fd4"
-PIN_SHA = "92b144e0c9b106ffdfaa7a53667c585275b05f35"
+PIN_SHA = "25c67089fdfca99f58d801cc529bb0e987f5ecf8"
 ARTIFACT_DIGEST = "sha256:" + "e" * 64
 
 
