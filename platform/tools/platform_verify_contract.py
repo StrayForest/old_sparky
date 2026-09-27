@@ -1528,8 +1528,16 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
         "python3 -I -B trusted-dev/platform/tools/platform_host_tools_bundle.py",
         "--source-root \"$GITHUB_WORKSPACE/candidate-data\"",
         "--summary-artifact-id",
+        "--run-latest",
+        "--merge-ref",
+        "--commit",
+        "--route-metadata",
+        "--route-archive",
+        "--route-artifact-id",
+        "--expected-context",
         "--candidate-artifact-id",
         "verify-ancestry",
+        "--source-head-sha",
         "--github-output \"$GITHUB_OUTPUT\"",
         "steps.eligibility.outputs.eligible == 'false'",
         "steps.eligibility.outputs.eligible == 'true'",
@@ -1567,9 +1575,9 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
     ):
         issues.append("trusted host-tools candidate invocations must preserve isolated bytecode-free Python")
     artifact_zip_commands = host_tools_candidate_artifact_zip_curl_blocks(workflow_text)
-    if len(artifact_zip_commands) != 3:
+    if len(artifact_zip_commands) != 4:
         issues.append(
-            "host-tools candidate workflow must contain exactly three artifact ZIP download curl blocks"
+            "host-tools candidate workflow must contain exactly four artifact ZIP download curl blocks"
         )
     for index, command in enumerate(artifact_zip_commands, start=1):
         for marker, description in (
