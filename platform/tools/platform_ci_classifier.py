@@ -107,7 +107,11 @@ DOCS_PREFIX = "platform/docs/"
 CANDIDATE_PACKAGING_FILES = frozenset(
     {
         ".github/workflows/platform-host-tools-candidate.yml",
+        ".github/workflows/platform-production-autodeploy.yml",
+        ".github/workflows/platform-security.yml",
+        "platform/tests/test_platform_ci_classifier.py",
         "platform/tools/platform_host_tools_candidate.py",
+        "platform/tools/platform_ci_classifier.py",
         "platform/tests/test_platform_host_tools_bundle.py",
         "platform/tools/platform_test_catalog.py",
         "platform/tools/platform_verify_contract.py",
