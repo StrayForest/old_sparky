@@ -349,6 +349,34 @@ def _workflow_step_blocks(job_block: str) -> tuple[str, ...]:
     )
 
 
+def host_tools_candidate_artifact_zip_curl_blocks(workflow_text: str) -> tuple[str, ...]:
+    """Find every artifact ZIP download curl command in the candidate workflow.
+
+    The workflow uses one shell command per download, with backslash-continued
+    options. Joining only those continuations keeps this contract independent
+    of surrounding YAML step names and catches a newly added artifact download
+    automatically.
+    """
+
+    lines = workflow_text.splitlines(keepends=True)
+    commands: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not re.match(r"^\s*curl(?:\s|$)", line):
+            index += 1
+            continue
+        command = line
+        while line.rstrip().endswith("\\") and index + 1 < len(lines):
+            index += 1
+            line = lines[index]
+            command += line
+        if re.search(r"/actions/artifacts/[^\s\"']+/zip(?:[^A-Za-z0-9_]|$)", command):
+            commands.append(command)
+        index += 1
+    return tuple(commands)
+
+
 def _checkout_credential_issues(workflow_name: str, workflow_text: str) -> list[str]:
     """Ensure every checkout step disables the persistent git credential."""
 
@@ -1538,6 +1566,32 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
         workflow_text,
     ):
         issues.append("trusted host-tools candidate invocations must preserve isolated bytecode-free Python")
+    artifact_zip_commands = host_tools_candidate_artifact_zip_curl_blocks(workflow_text)
+    if len(artifact_zip_commands) != 3:
+        issues.append(
+            "host-tools candidate workflow must contain exactly three artifact ZIP download curl blocks"
+        )
+    for index, command in enumerate(artifact_zip_commands, start=1):
+        for marker, description in (
+            ("--location", "redirect following"),
+            ("--fail-with-body", "HTTP failure handling"),
+            ("--max-filesize", "bounded response size"),
+            ("Authorization: Bearer $GH_TOKEN", "authorization"),
+            ("X-GitHub-Api-Version: 2022-11-28", "API version"),
+            ("--output", "output path"),
+        ):
+            if marker not in command:
+                issues.append(
+                    f"host-tools candidate artifact ZIP curl block {index} is missing {description}"
+                )
+        if "Accept: application/vnd.github+json" not in command:
+            issues.append(
+                f"host-tools candidate artifact ZIP curl block {index} must request application/vnd.github+json"
+            )
+        if "application/zip" in command:
+            issues.append(
+                f"host-tools candidate artifact ZIP curl block {index} must not request application/zip"
+            )
     eligible_true = "if: ${{ steps.eligibility.outputs.eligible == 'true' }}"
     candidate_job = re.search(
         r"^  build-candidate:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
