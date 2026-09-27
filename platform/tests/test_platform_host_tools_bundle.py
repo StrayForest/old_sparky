@@ -2046,7 +2046,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             "event": "pull_request",
             "route_event": "pull_request",
             "class": "full",
-            "reason": "platform or workflow change requires the full deterministic suite",
+            "reason": "trusted candidate-packaging change requires full verification and is non-deployable",
             "deployable": False,
             "fallback": False,
             "manifest_digest": "a" * 64,

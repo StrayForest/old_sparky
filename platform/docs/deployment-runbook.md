@@ -11,10 +11,11 @@ Use this document for the normal immutable release path. CSP mode changes and pr
 1. Work from a clean, reviewed commit; release metadata records the exact
    GitHub target SHA.
 2. Push the reviewed commit to `dev` and wait for the GitHub Actions
-   `Platform security and build` gate. A successful full-route push run for the
-   current `dev` HEAD is the normal production release signal and is consumed
-   by the automatic deployment workflow; a docs-only or out-of-scope run is a
-   successful non-deployable no-op. Do not substitute a manually run local test.
+   `Platform security and build` gate. A successful deployable full-route push
+   run for the current `dev` HEAD is the normal production release signal and
+   is consumed by the automatic deployment workflow; a docs-only,
+   out-of-scope or candidate-packaging-only full-route run is a successful
+   non-deployable no-op. Do not substitute a manually run local test.
 3. Confirm migration expand/rollback compatibility.
 4. Confirm services are healthy, disk has at least 5 GiB available and is at
    most 85% conservative use, and `current`/`previous` releases are protected.
@@ -37,8 +38,10 @@ to `dev`. The chain is:
    for a push to `dev`.
 3. The auto-deploy gate downloads the classifier artifact from that exact
    security run, validates its schema, digest, target SHA and non-fallback
-   deployable `full` route, then re-reads the current `dev` HEAD and refuses a
-   stale successful CI result. The source run and both status snapshots are
+   route, then consumes its `deployable` bit: a deployable `full` route
+   proceeds while a valid full CI-only route completes as a no-op. It then
+   re-reads the current `dev` HEAD and refuses a stale successful CI result.
+   The source run and both status snapshots are
    checked by the shared dependency-free
    [`platform_workflow_provenance.py`](../tools/platform_workflow_provenance.py)
    validator, including the exact repository/workflow/run attempt, SHA, event,
