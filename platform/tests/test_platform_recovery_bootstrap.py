@@ -27,6 +27,9 @@ SOURCE_SHA = "a" * 40
 # the merge base.  Keep the real set here so the route test exercises the
 # exact pull-request and trusted-dev-push inputs, including the host-key scan
 # contract that is easy to omit from one of the independent consumers.
+# The digest assertion below makes this a static merge-base contract: a
+# missing owner/test path cannot be hidden by changing the fixture's count or
+# by consulting the mutable checkout's git state at test time.
 RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
     {
         ".github/workflows/platform-production-autodeploy.yml",
@@ -41,6 +44,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tests/test_platform_live_qa_runtime_install.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
         "platform/tests/test_platform_release_build_diagnostics.py",
+        "platform/tests/test_platform_release_recovery_boundaries.py",
         "platform/tests/test_platform_release_systemd_state.py",
         "platform/tests/test_platform_release_venv_rollback.py",
         "platform/tests/test_platform_ssh_host_key_scan.py",
@@ -53,9 +57,14 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_recovery_bootstrap.py",
         "platform/tools/platform_release_restore_runtime.sh",
         "platform/tools/platform_release_rollback.sh",
+        "platform/tools/platform_release_systemd_state.py",
         "platform/tools/platform_release_transaction.py",
         "platform/tools/platform_test_catalog.py",
     }
+)
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 28
+RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
+    "f0dda0b08c8efc665b5f100d1fff4f4595a43d5363babd9352495cb726713410"
 )
 
 
@@ -689,6 +698,14 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         sys.path.insert(0, str(TOOLS))
         from tools import platform_ci_classifier as classifier
 
+        patch_file_digest = hashlib.sha256(
+            "\n".join(sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)).encode()
+        ).hexdigest()
+        self.assertEqual(
+            len(RECOVERY_BOOTSTRAP_PATCH_FILES),
+            RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT,
+        )
+        self.assertEqual(patch_file_digest, RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST)
         paths = sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)
         for event, branch in (
             ("pull_request", "feature/recovery-bootstrap"),
