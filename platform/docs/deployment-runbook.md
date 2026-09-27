@@ -108,7 +108,11 @@ context=platform-security-build`; never post success manually.
 
 The dispatch `mode`, runtime profile, release slug, target SHA and artifact
 directory are checked by the bounded ASCII input guard before production host
-access or secret-file setup. They cross SSH only as a mode-600 JSON handoff to
+access or secret-file setup. A deployment release slug is exactly
+`gha-<run_id>-<run_attempt>-<first 12 lowercase characters of target SHA>`;
+the CI builder receives that slug explicitly and does not append a build-time
+timestamp. The artifact filename, archive metadata and host supervisor must
+all retain that same slug. They cross SSH only as a mode-600 JSON handoff to
 the fixed remote dispatcher; the host revalidates them before invoking the
 deployment supervisor. Deploy handoffs also require canonical positive decimal
 `classifier_run_id`/`classifier_run_attempt` values and the exact

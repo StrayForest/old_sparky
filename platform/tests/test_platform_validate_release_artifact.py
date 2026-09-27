@@ -702,6 +702,38 @@ class PlatformReleaseArtifactValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(validator.ArtifactError, "duplicate keys"):
             validator.validate_archive(duplicate_keys, release_slug=RELEASE_SLUG)
 
+    def test_canonical_dispatch_slug_is_source_bound_without_timestamp_suffix(self) -> None:
+        canonical_slug = "gha-123456-2-aaaaaaaaaaaa"
+        artifact = self.root / "canonical-dispatch.tar.gz"
+        payload = release_payload(
+            release_slug=canonical_slug,
+            release_ref=canonical_slug,
+        )
+        builder = ArchiveBuilder(artifact, payload)
+        old_prefix = f"{RELEASE_SLUG}/"
+        builder.write()
+        for member, _content in builder.entries:
+            if member.name == RELEASE_SLUG:
+                member.name = canonical_slug
+            elif member.name.startswith(old_prefix):
+                member.name = canonical_slug + member.name.removeprefix(RELEASE_SLUG)
+        builder.write(regenerate_runtime_manifest=False)
+        accepted = validator.validate_archive(artifact, release_slug=canonical_slug)
+        self.assertEqual(accepted["release_slug"], canonical_slug)
+
+        invalid_payload = {**payload, "release_ref": canonical_slug[:-1] + "b"}
+        invalid_artifact = self.root / "canonical-dispatch-invalid.tar.gz"
+        invalid_builder = ArchiveBuilder(invalid_artifact, invalid_payload)
+        invalid_builder.write()
+        for member, _content in invalid_builder.entries:
+            if member.name == RELEASE_SLUG:
+                member.name = canonical_slug
+            elif member.name.startswith(old_prefix):
+                member.name = canonical_slug + member.name.removeprefix(RELEASE_SLUG)
+        invalid_builder.write(regenerate_runtime_manifest=False)
+        with self.assertRaisesRegex(validator.ArtifactError, "identity|source-bound"):
+            validator.validate_archive(invalid_artifact, release_slug=canonical_slug)
+
     def test_standalone_runtime_cache_is_not_allowed_in_immutable_artifact(self) -> None:
         artifact = self.root / "runtime-cache.tar.gz"
         builder = ArchiveBuilder(artifact)

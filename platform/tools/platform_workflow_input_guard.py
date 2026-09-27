@@ -85,7 +85,9 @@ POSITIVE_INTEGER_RE = re.compile(r"^[1-9][0-9]*$")
 UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
-RELEASE_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+DEPLOY_RELEASE_SLUG_RE = re.compile(
+    r"^gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$"
+)
 ARTIFACT_REMOTE_DIR_RE = re.compile(
     r"^/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$"
 )
@@ -411,11 +413,15 @@ def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, str]:
     runtime_profile = _require_string(payload, "runtime_profile")
     if runtime_profile not in DEPLOY_RUNTIME_PROFILES:
         raise _invalid()
-    release_slug = _require_string(payload, "release_slug")
-    if not release_slug.isascii() or RELEASE_SLUG_RE.fullmatch(release_slug) is None:
-        raise _invalid()
     target_sha = _require_string(payload, "target_sha")
     if SHA_RE.fullmatch(target_sha) is None:
+        raise _invalid()
+    release_slug = _require_string(payload, "release_slug")
+    if (
+        not release_slug.isascii()
+        or DEPLOY_RELEASE_SLUG_RE.fullmatch(release_slug) is None
+        or not release_slug.endswith(f"-{target_sha[:12]}")
+    ):
         raise _invalid()
     artifact_remote_dir = _require_string(payload, "artifact_remote_dir")
     if (

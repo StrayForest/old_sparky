@@ -9,6 +9,7 @@ WEB_NEXT_COMPRESSION="${PLATFORM_WEB_NEXT_COMPRESSION:-true}"
 DEPENDENCY_BASELINE=""
 RELEASE_REF_RAW="workspace"
 RELEASE_REF_SET=0
+RELEASE_SLUG_OVERRIDE=""
 CURRENT_PHASE="canonical-preflight"
 FAILURE_REASON="build_failed"
 ORIGINAL_RC=0
@@ -186,14 +187,24 @@ while [[ $# -gt 0 ]]; do
       DEPENDENCY_BASELINE="$2"
       shift 2
       ;;
+    --release-slug)
+      if [[ $# -lt 2 || -n "$RELEASE_SLUG_OVERRIDE" ]]; then
+        echo "--release-slug requires exactly one canonical dispatch slug." >&2
+        exit 1
+      fi
+      RELEASE_SLUG_OVERRIDE="$2"
+      shift 2
+      ;;
     --help|-h)
       TELEMETRY_ENABLED=0
       cat <<'EOF'
-Usage: platform_build_release.sh [--dependency-baseline <absolute candidate-release-dir>] [release-ref]
+Usage: platform_build_release.sh [--dependency-baseline <absolute candidate-release-dir>] [--release-slug <gha-run-attempt-shortsha>] [release-ref]
 
 Candidate builds omit --dependency-baseline. Enforcement builds must name the
 candidate release directory in the same output root; all Python requirements,
 resolved freeze, wheelhouse manifest, and web package lock bytes must match.
+Production dispatch builds pass the exact validated ``gha-<run>-<attempt>-<shortsha>``
+slug with --release-slug; the builder never appends a timestamp to that slug.
 EOF
       exit 0
       ;;
@@ -212,7 +223,16 @@ EOF
       ;;
   esac
 done
-if [[ ! "$RELEASE_REF_RAW" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]; then
+if [[ -n "$RELEASE_SLUG_OVERRIDE" ]]; then
+  if [[ "$RELEASE_REF_SET" -eq 1 ]]; then
+    echo "--release-slug cannot be combined with a release ref." >&2
+    exit 1
+  fi
+  if [[ ! "$RELEASE_SLUG_OVERRIDE" =~ ^gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$ ]]; then
+    echo "Release slug must be gha-<run>-<attempt>-<12-char lowercase source SHA>." >&2
+    exit 1
+  fi
+elif [[ ! "$RELEASE_REF_RAW" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]; then
   echo "Release ref must be 1-100 safe slug characters and start with an alphanumeric." >&2
   exit 1
 fi
@@ -241,9 +261,17 @@ if [[ ! -x "$ROOT_DIR/.venv_platform/bin/python" ]]; then
   echo "Missing platform/.venv_platform. Run platform/tools/platform_bootstrap.sh first." >&2
   exit 1
 fi
-RELEASE_REF="$RELEASE_REF_RAW"
 BUILD_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-RELEASE_SLUG="${RELEASE_REF}-${BUILD_TIMESTAMP}"
+if [[ -n "$RELEASE_SLUG_OVERRIDE" ]]; then
+  RELEASE_SLUG="$RELEASE_SLUG_OVERRIDE"
+  # Keep the metadata ref closed and deterministic for the explicit CI slug.
+  # The validator recognizes this canonical form and binds its short SHA to
+  # source_git_commit rather than treating it as a timestamped local build.
+  RELEASE_REF="$RELEASE_SLUG_OVERRIDE"
+else
+  RELEASE_REF="$RELEASE_REF_RAW"
+  RELEASE_SLUG="${RELEASE_REF}-${BUILD_TIMESTAMP}"
+fi
 RELEASE_DIR="$OUTPUT_DIR/$RELEASE_SLUG"
 ARTIFACT_PATH="$OUTPUT_DIR/$RELEASE_SLUG.tar.gz"
 ARTIFACT_SHA_PATH="$ARTIFACT_PATH.sha256"
@@ -375,6 +403,11 @@ fi
 SOURCE_GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse --verify HEAD)"
 if [[ ! "$SOURCE_GIT_COMMIT" =~ ^[0-9a-f]{40,64}$ ]]; then
   echo "Release build refused: source HEAD is invalid." >&2
+  exit 1
+fi
+if [[ -n "$RELEASE_SLUG_OVERRIDE" \
+  && "$RELEASE_SLUG_OVERRIDE" != *"-${SOURCE_GIT_COMMIT:0:12}" ]]; then
+  echo "Release slug is not bound to the exact source HEAD." >&2
   exit 1
 fi
 mark_phase_passed

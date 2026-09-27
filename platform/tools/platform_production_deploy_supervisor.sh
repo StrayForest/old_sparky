@@ -25,18 +25,6 @@ deploy_mode="$3"
 artifact_dir="$4"
 runtime_profile="$5"
 
-[[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || invalid_input
-[[ "$release_slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] || invalid_input
-[[ "$artifact_dir" =~ ^/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$ ]] || invalid_input
-case "$deploy_mode" in
-  preflight|deploy) ;;
-  *) invalid_input ;;
-esac
-case "$runtime_profile" in
-  baseline|ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-cprofile|ready-vote-static-12|ready-vote-static-16|ready-vote-adaptive-v2|api-3x16|api-1x48|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|web-ssr-diagnostics|web-ssr-native-transport|web-ssr-workers-2|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24) ;;
-  *) invalid_input ;;
-esac
-
 runtime=/opt/oldsparky/platform
 current="$runtime/current"
 host_tools_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -63,6 +51,40 @@ fail() {
     "$failure_class" "$failure_phase" "$failure_reason" "$release_slug" "$target_sha"
   exit 1
 }
+
+cleanup() {
+  local cleanup_rc=$?
+  trap - EXIT
+  set +e
+  if [[ "$artifact_dir" =~ ^/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$ \
+    && -d "$artifact_dir" && ! -L "$artifact_dir" ]]; then
+    rm -rf -- "$artifact_dir" || cleanup_rc=1
+  fi
+  if [[ -n "$bootstrap_dir" && -d "$bootstrap_dir" && ! -L "$bootstrap_dir" ]]; then
+    rm -rf -- "$bootstrap_dir" || cleanup_rc=1
+  fi
+  if declare -F platform_retained_load_lock_close >/dev/null 2>&1; then
+    platform_retained_load_lock_close
+  fi
+  if declare -F platform_release_lock_close >/dev/null 2>&1; then
+    platform_release_lock_close
+  fi
+  exit "$cleanup_rc"
+}
+trap cleanup EXIT
+
+[[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || invalid_input
+[[ "$release_slug" =~ ^gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$ ]] || invalid_input
+[[ "$release_slug" == *"-${target_sha:0:12}" ]] || invalid_input
+[[ "$artifact_dir" =~ ^/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$ ]] || invalid_input
+case "$deploy_mode" in
+  preflight|deploy) ;;
+  *) invalid_input ;;
+esac
+case "$runtime_profile" in
+  baseline|ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-cprofile|ready-vote-static-12|ready-vote-static-16|ready-vote-adaptive-v2|api-3x16|api-1x48|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|web-ssr-diagnostics|web-ssr-native-transport|web-ssr-workers-2|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24) ;;
+  *) invalid_input ;;
+esac
 
 restart_web_and_wait() {
   systemctl restart deadlock-web
@@ -154,17 +176,6 @@ if [[ "${PLATFORM_RETAINED_LOAD_LOCK_SUPERVISED:-}" != "1" ]]; then
 fi
 platform_retained_load_lock_open \
   || fail "the retained-load lock could not be opened or is already held"
-trap 'platform_retained_load_lock_close; platform_release_lock_close' EXIT
-
-cleanup() {
-  if [[ -n "$artifact_dir" && -d "$artifact_dir" && ! -L "$artifact_dir" ]]; then
-    rm -rf -- "$artifact_dir"
-  fi
-  if [[ -n "$bootstrap_dir" && -d "$bootstrap_dir" && ! -L "$bootstrap_dir" ]]; then
-    rm -rf -- "$bootstrap_dir"
-  fi
-}
-trap cleanup EXIT
 
 set_failure_context preflight preflight environment
 test "$(id -u)" -eq 0 || fail "deployment user must be root"

@@ -1311,6 +1311,18 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         ):
             self.assertNotIn(ssh_secret_name, build_step)
         self.assertIn('sudo find "$ci_build_root/platform/dist/releases"', workflow)
+        self.assertIn(
+            'platform_build_release.sh" --release-slug "$release_slug"',
+            workflow,
+        )
+        self.assertIn(
+            '-type f -name "${release_slug}.tar.gz"',
+            workflow,
+        )
+        self.assertIn(
+            'candidate_release_slug="${RELEASE_SLUG_BASE}-${short_sha}"',
+            workflow,
+        )
         self.assertIn('sudo chown "$(id -u):$(id -g)"', workflow)
         self.assertIn(
             '(cd "$release_output" && sha256sum -c "$(basename "$release_checksum")")',
@@ -1409,7 +1421,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
             workflow, "Build immutable release artifact in CI"
         )
         producer_match = re.search(
-            r"""/usr/bin/python3 - .*? <<'PY'\n"""
+            r"""/usr/bin/python3 - "\$release_output/\$\(basename "\$release_archive"\)" "\$TARGET_SHA" <<'PY'\n"""
             r"(?P<script>.*?)\nPY(?:\n|$)",
             build_step,
             re.DOTALL,
@@ -1434,7 +1446,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         consumer = textwrap.dedent(consumer_match.group("script"))
 
         target_sha = "a" * 40
-        release_slug = "gha-10917370996-1"
+        release_slug = "gha-10917370996-1-aaaaaaaaaaaa"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             artifact = root / f"{release_slug}.tar.gz"
@@ -1510,6 +1522,7 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 "additional-field",
                 "schema-type",
                 "slug-invalid",
+                "slug-mismatch",
                 "target-sha-invalid",
             ):
                 candidate = dict(canonical)
@@ -1545,6 +1558,10 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
                 with self.subTest(mutation=mutation):
                     if mutation == "slug-invalid":
                         rejected = consume(slug="bad/slug")
+                    elif mutation == "slug-mismatch":
+                        rejected = consume(
+                            slug="gha-10917370996-1-bbbbbbbbbbbb"
+                        )
                     elif mutation == "target-sha-invalid":
                         rejected = consume(source_sha="a" * 39)
                     else:
@@ -1555,11 +1572,11 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
     def test_supervisor_failure_marker_is_stable_and_sanitized(self) -> None:
         supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
         marker_start = supervisor.index("failure_class=")
-        marker_end = supervisor.index("\nrestart_web_and_wait()", marker_start)
+        marker_end = supervisor.index("\ncleanup() {", marker_start)
         marker_functions = supervisor[marker_start:marker_end]
         fixture = f"""set -u
 target_sha={'a' * 40}
-release_slug=gha-10917370996-1
+release_slug=gha-10917370996-1-aaaaaaaaaaaa
 {marker_functions}
 set +e
 set_failure_context artifact provenance provenance_invalid
@@ -1578,7 +1595,7 @@ fail 'private stderr must not cross the public channel'
             completed.stdout,
             "RELEASE_DEPLOY schema=1 status=failed class=artifact "
             "phase=provenance reason=provenance_invalid "
-            f"release_slug=gha-10917370996-1 source_sha={'a' * 40}\n",
+            f"release_slug=gha-10917370996-1-aaaaaaaaaaaa source_sha={'a' * 40}\n",
         )
         self.assertEqual(completed.stderr, "ERROR: deployment failed\n")
         self.assertNotIn("private stderr", completed.stdout + completed.stderr)
@@ -1588,6 +1605,24 @@ fail 'private stderr must not cross the public channel'
         ).read_text(encoding="utf-8")
         self.assertIn("phase=(artifact|provenance|preflight|candidate|readiness)", workflow)
         self.assertIn("reason=(internal|host_tools_invalid|lock|environment", workflow)
+
+    def test_supervisor_cleanup_covers_upload_failures_and_closes_locks(self) -> None:
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        cleanup_start = supervisor.index("cleanup() {")
+        cleanup_end = supervisor.index("\ntrap cleanup EXIT", cleanup_start)
+        cleanup_body = supervisor[cleanup_start:cleanup_end]
+        self.assertLess(
+            supervisor.index("trap cleanup EXIT"),
+            supervisor.index("\nplatform_release_lock_supervise"),
+        )
+        self.assertIn('rm -rf -- "$artifact_dir"', cleanup_body)
+        self.assertIn("platform_retained_load_lock_close", cleanup_body)
+        self.assertIn("platform_release_lock_close", cleanup_body)
+        self.assertIn("trap - EXIT", cleanup_body)
+        self.assertNotIn(
+            "trap 'platform_retained_load_lock_close; platform_release_lock_close' EXIT",
+            supervisor,
+        )
 
     def test_production_env_contract_matches_runtime_policy(self) -> None:
         example = (REPO_ROOT / "platform/.env.platform.example").read_text()
@@ -1950,7 +1985,10 @@ cleanup
         self.assertIn('case "$deploy_mode" in', deploy_supervisor)
         self.assertIn('case "$runtime_profile" in', deploy_supervisor)
         self.assertIn('[[ "$target_sha" =~ ^[0-9a-f]{40}$ ]]', deploy_supervisor)
-        self.assertIn('[[ "$release_slug" =~ ^[A-Za-z0-9]', deploy_supervisor)
+        self.assertIn(
+            '[[ "$release_slug" =~ ^gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$ ]]',
+            deploy_supervisor,
+        )
         self.assertNotIn('echo \'{"ok":true,"fixture_absent":true}\'', workflow)
         cleanup_supervisor = (
             REPO_ROOT
@@ -2270,6 +2308,43 @@ cleanup
                     )
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("Release ref", result.stderr)
+            self.assertFalse((Path(temp_dir) / "releases").exists())
+
+    def test_dispatch_release_slug_is_exact_and_source_bound(self) -> None:
+        script = BUILD_SCRIPT.read_text()
+        self.assertIn("--release-slug", script)
+        self.assertIn("RELEASE_SLUG_OVERRIDE", script)
+        self.assertIn(
+            '"$RELEASE_SLUG_OVERRIDE" != *"-${SOURCE_GIT_COMMIT:0:12}"',
+            script,
+        )
+        unsafe_slugs = (
+            "gha-123456-2",
+            "gha-123456-2-aaaaaaaaaaa",
+            "gha-123456-2-AAAAAAAAAAAA",
+            "gha-0-2-aaaaaaaaaaaa",
+            "gha-123456-0-aaaaaaaaaaaa",
+            "gha-123456-2-aaaaaaaaaaaa/escape",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for release_slug in unsafe_slugs:
+                with self.subTest(release_slug=release_slug):
+                    result = subprocess.run(
+                        [str(BUILD_SCRIPT), "--release-slug", release_slug],
+                        cwd=REPO_ROOT,
+                        env={
+                            **os.environ,
+                            "PLATFORM_RELEASE_OUTPUT_DIR": str(
+                                Path(temp_dir) / "releases"
+                            ),
+                        },
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Release slug", result.stderr)
             self.assertFalse((Path(temp_dir) / "releases").exists())
 
     def test_build_uses_only_tracked_source_and_lock_driven_node_install(self) -> None:
