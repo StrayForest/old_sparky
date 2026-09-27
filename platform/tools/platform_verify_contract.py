@@ -1499,7 +1499,7 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
         "--summary-artifact-id",
         "--candidate-artifact-id",
         "verify-ancestry",
-        "/attempts/$SECURITY_RUN_ATTEMPT",
+        "/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1",
         "Recheck PR, security run, attempt, and head before attestation",
         "Recheck PR, security run, attempt, and head before upload",
         "actions/attest-build-provenance@",
@@ -1522,6 +1522,7 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
         "actions/download-artifact@",
         "python3 -I candidate-data/",
         "actions/runs/$SECURITY_RUN_ID/pull_requests",
+        "actions/runs/$SECURITY_RUN_ID/jobs?filter=latest",
         "--pull-requests",
     ):
         if forbidden in workflow_text:

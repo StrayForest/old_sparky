@@ -2256,7 +2256,9 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         self.assertIn("cancel-in-progress: true", workflow)
         self.assertIn("github.event.workflow_run.head_sha", workflow)
         self.assertIn("github.event.workflow_run.pull_requests[0].number", workflow)
-        self.assertIn("/attempts/$SECURITY_RUN_ATTEMPT", workflow)
+        exact_jobs_endpoint = "/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1"
+        self.assertIn(exact_jobs_endpoint, workflow)
+        self.assertNotIn("actions/runs/$SECURITY_RUN_ID/jobs?filter=latest", workflow)
         self.assertNotIn("actions/runs/$SECURITY_RUN_ID/pull_requests", workflow)
         self.assertIn("actions: read", workflow)
         self.assertIn("pull-requests: read", workflow)
@@ -2276,6 +2278,12 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         self.assertIn("Recheck PR, security run, attempt, and head before attestation", workflow)
         self.assertIn("Recheck PR, security run, attempt, and head before upload", workflow)
         self.assertNotRegex(workflow, r"python3[^\n]*candidate-data/platform/")
+        latest_jobs_workflow = workflow.replace(
+            "$api/actions/runs/$SECURITY_RUN_ID" + exact_jobs_endpoint,
+            "$api/actions/runs/$SECURITY_RUN_ID/jobs?filter=latest&per_page=100",
+        )
+        self.assertNotEqual(latest_jobs_workflow, workflow)
+        self.assertTrue(host_tools_candidate_workflow_issues(latest_jobs_workflow))
         production_text = "\n".join(
             path.read_text(encoding="utf-8")
             for path in (REPO_ROOT / ".github/workflows").glob("platform-production-*.yml")

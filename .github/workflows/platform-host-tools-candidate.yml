@@ -158,7 +158,7 @@ jobs:
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "$api/actions/runs/$SECURITY_RUN_ID/jobs?filter=latest&per_page=100" \
+            "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1" \
             --output "$RUNNER_TEMP/platform-host-tools-security-jobs.json"
           summary_id="$(/usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
             select-artifact-id --metadata "$RUNNER_TEMP/platform-host-tools-summary-artifacts.json" \
