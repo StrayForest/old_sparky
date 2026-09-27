@@ -205,6 +205,26 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertNotIn("git checkout", workflow)
         self.assertNotIn("platform_release_deploy", workflow)
         self.assertNotIn("downgrade", workflow)
+        self.assertIn("for ssh_attempt in 1 2; do", workflow)
+        self.assertIn('known_hosts.scan.1', workflow)
+        self.assertIn('known_hosts.scan.2', workflow)
+        self.assertIn('NF == 3 && $1 == host && $2 == "ssh-ed25519"', workflow)
+        self.assertIn("ssh-keygen -lf \"$ssh_scan_attempt\" -E sha256", workflow)
+        self.assertIn("mktemp -d --tmpdir=/tmp oldsparky-recovery-bootstrap.XXXXXX", workflow)
+        self.assertIn("trap cleanup_remote_stage EXIT", workflow)
+        self.assertIn("trap cleanup_stage EXIT", workflow)
+        self.assertIn("os.lstat", workflow)
+        self.assertIn("stat.S_ISREG", workflow)
+        self.assertIn("stat.S_ISLNK", workflow)
+        self.assertIn("metadata.st_uid != 0", workflow)
+        self.assertIn("metadata.st_nlink != 1", workflow)
+        self.assertIn("os.O_EXCL", workflow)
+        self.assertIn("os.O_NOFOLLOW", workflow)
+        self.assertNotIn(
+            'stage="/tmp/oldsparky-recovery-bootstrap-stage-${expected_sha}"',
+            workflow,
+        )
+        self.assertNotIn("destination.write_bytes", workflow)
 
     def test_recovery_bootstrap_route_is_non_deployable_and_mixed_runtime_is_deployable(self) -> None:
         sys.path.insert(0, str(TOOLS))

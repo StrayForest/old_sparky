@@ -267,12 +267,27 @@ jobs:
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
         run: |
           set -euo pipefail
+          umask 077
           ssh_dir="$RUNNER_TEMP/platform-recovery-bootstrap-ssh"
+          test "$ssh_dir" = "$RUNNER_TEMP/platform-recovery-bootstrap-ssh"
+          if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
+            test -d "$ssh_dir" && test ! -L "$ssh_dir"
+          fi
           install -d -m 700 "$ssh_dir"
           printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
           chmod 600 "$ssh_dir/id_ed25519"
-          timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" > "$ssh_dir/known_hosts"
-          test "$(ssh-keygen -lf "$ssh_dir/known_hosts" -E sha256 | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"
+          ssh_scan="$ssh_dir/known_hosts.scan"; rm -f -- "$ssh_scan"; ssh_scan_ok=0
+          for ssh_attempt in 1 2; do
+            ssh_scan_attempt="$ssh_scan.$ssh_attempt"; rm -f -- "$ssh_scan_attempt"; install -m 600 /dev/null "$ssh_scan_attempt"
+            if timeout --foreground 4s ssh-keyscan -T 3 -t ed25519 "$PROD_SSH_HOST" >"$ssh_scan_attempt" 2>/dev/null \
+              && awk -v host="$PROD_SSH_HOST" 'NR == 1 && NF == 3 && $1 == host && $2 == "ssh-ed25519" { valid=1; next } { invalid=1 } END { exit !(NR == 1 && valid == 1 && !invalid) }' "$ssh_scan_attempt" \
+              && test "$(ssh-keygen -lf "$ssh_scan_attempt" -E sha256 2>/dev/null | awk 'NR == 1 {print $2}')" = "SHA256:1SvoVPU2QXAxj3TlwX3DO/7wGPdl3WcKXPIM87xSQ+Y"; then
+              mv -- "$ssh_scan_attempt" "$ssh_scan"; ssh_scan_ok=1; printf 'Production SSH host-key acquisition attempt %s/2 succeeded\n' "$ssh_attempt"; break
+            fi
+            rm -f -- "$ssh_scan_attempt"; printf 'Production SSH host-key acquisition attempt %s/2 failed\n' "$ssh_attempt" >&2; (( ssh_attempt == 2 )) || sleep 0.5
+          done
+          test "$ssh_scan_ok" = 1 || { echo "Production SSH host-key acquisition failed after 2 bounded attempts" >&2; exit 1; }
+          install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
           chmod 600 "$ssh_dir/known_hosts"
           echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
@@ -285,29 +300,208 @@ jobs:
           BUNDLE_SHA: ${{ steps.bundle.outputs.bundle_sha }}
         run: |
           set -euo pipefail
-          remote_bundle="/tmp/oldsparky-recovery-bootstrap-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}.zip"
-          scp -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$BUNDLE" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_bundle"
-          ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_bundle' '$BUNDLE_SHA'" <<'REMOTE'
+          remote_stage="$(
+            ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s" <<'REMOTE'
           set -Eeuo pipefail
-          bundle="$1"; expected_sha="$2"; app_dir=/opt/oldsparky/platform
+          umask 077
           test "$(id -u)" -eq 0
+          stage="$(mktemp -d --tmpdir=/tmp oldsparky-recovery-bootstrap.XXXXXX)"
+          [[ "$stage" =~ ^/tmp/oldsparky-recovery-bootstrap\.[A-Za-z0-9]{6}$ ]]
+          /usr/bin/python3 -I -B - "$stage" <<'PY'
+          import os
+          import stat
+          import sys
+
+          metadata = os.lstat(sys.argv[1])
+          if (
+              not stat.S_ISDIR(metadata.st_mode)
+              or stat.S_ISLNK(metadata.st_mode)
+              or metadata.st_uid != 0
+              or metadata.st_gid != 0
+              or stat.S_IMODE(metadata.st_mode) != 0o700
+          ):
+              raise SystemExit("recovery staging directory is unsafe")
+          PY
+          printf '%s\n' "$stage"
+          REMOTE
+          )"
+          [[ "$remote_stage" =~ ^/tmp/oldsparky-recovery-bootstrap\.[A-Za-z0-9]{6}$ ]]
+          remote_bundle="$remote_stage/bundle.zip"
+
+          cleanup_remote_stage() {
+            local status="$?"
+            trap - EXIT
+            set +e
+            ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage'" >/dev/null 2>&1 <<'REMOTE'
+          set -Eeuo pipefail
+          umask 077
+          stage="$1"
+          [[ "$stage" =~ ^/tmp/oldsparky-recovery-bootstrap\.[A-Za-z0-9]{6}$ ]]
+          if [[ -L "$stage" ]]; then
+            rm -f -- "$stage"
+          elif [[ -e "$stage" ]]; then
+            /usr/bin/python3 -I -B - "$stage" <<'PY'
+          import os
+          import stat
+          import sys
+
+          metadata = os.lstat(sys.argv[1])
+          if (
+              not stat.S_ISDIR(metadata.st_mode)
+              or stat.S_ISLNK(metadata.st_mode)
+              or metadata.st_uid != 0
+              or metadata.st_gid != 0
+              or stat.S_IMODE(metadata.st_mode) != 0o700
+          ):
+              raise SystemExit("recovery staging directory is unsafe")
+          PY
+            rm -rf -- "$stage"
+          fi
+          test ! -e "$stage" && test ! -L "$stage"
+          REMOTE
+            local cleanup_status="$?"
+            if (( status == 0 && cleanup_status != 0 )); then
+              printf '%s\n' 'Remote recovery staging cleanup failed' >&2
+              return "$cleanup_status"
+            fi
+            return "$status"
+          }
+          trap cleanup_remote_stage EXIT
+
+          ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage'" <<'REMOTE'
+          set -Eeuo pipefail
+          umask 077
+          stage="$1"
+          [[ "$stage" =~ ^/tmp/oldsparky-recovery-bootstrap\.[A-Za-z0-9]{6}$ ]]
+          bundle="$stage/bundle.zip"
+          /usr/bin/python3 -I -B - "$stage" <<'PY'
+          import os
+          import stat
+          import sys
+
+          stage = sys.argv[1]
+          metadata = os.lstat(stage)
+          if (
+              not stat.S_ISDIR(metadata.st_mode)
+              or stat.S_ISLNK(metadata.st_mode)
+              or metadata.st_uid != 0
+              or metadata.st_gid != 0
+              or stat.S_IMODE(metadata.st_mode) != 0o700
+          ):
+              raise SystemExit("recovery staging directory is unsafe")
+          bundle = os.path.join(stage, "bundle.zip")
+          if os.path.lexists(bundle):
+              raise SystemExit("recovery bundle destination already exists")
+          fd = os.open(bundle, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          os.close(fd)
+          PY
+          REMOTE
+          scp -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$BUNDLE" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_bundle"
+          ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$SSH_DIR/known_hosts" -i "$SSH_DIR/id_ed25519" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA'" <<'REMOTE'
+          set -Eeuo pipefail
+          umask 077
+          stage="$1"; expected_sha="$2"; bundle="$stage/bundle.zip"; app_dir=/opt/oldsparky/platform
+          [[ "$stage" =~ ^/tmp/oldsparky-recovery-bootstrap\.[A-Za-z0-9]{6}$ ]]
+          [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]]
+          test "$(id -u)" -eq 0
+          validate_stage_dir() {
+            /usr/bin/python3 -I -B - "$1" <<'PY'
+          import os
+          import stat
+          import sys
+
+          metadata = os.lstat(sys.argv[1])
+          if (
+              not stat.S_ISDIR(metadata.st_mode)
+              or stat.S_ISLNK(metadata.st_mode)
+              or metadata.st_uid != 0
+              or metadata.st_gid != 0
+              or stat.S_IMODE(metadata.st_mode) != 0o700
+          ):
+              raise SystemExit("recovery staging directory is unsafe")
+          PY
+          }
+          validate_stage_file() {
+            /usr/bin/python3 -I -B - "$1" "$2" <<'PY'
+          import os
+          import stat
+          import sys
+
+          metadata = os.lstat(sys.argv[1])
+          expected_mode = int(sys.argv[2], 8)
+          if (
+              not stat.S_ISREG(metadata.st_mode)
+              or stat.S_ISLNK(metadata.st_mode)
+              or metadata.st_uid != 0
+              or metadata.st_gid != 0
+              or metadata.st_nlink != 1
+              or stat.S_IMODE(metadata.st_mode) != expected_mode
+          ):
+              raise SystemExit("recovery staging file is unsafe")
+          PY
+          }
+          cleanup_stage() {
+            local status="$?"
+            trap - EXIT
+            if [[ -L "$stage" ]]; then
+              rm -f -- "$stage"
+            elif [[ -e "$stage" ]]; then
+              validate_stage_dir "$stage"
+              rm -rf -- "$stage"
+            fi
+            test ! -e "$stage" && test ! -L "$stage"
+            return "$status"
+          }
+          trap cleanup_stage EXIT
+          validate_stage_dir "$stage"
+          validate_stage_file "$bundle" 600
           test "$(sha256sum "$bundle" | awk '{print $1}')" = "$expected_sha"
-          stage="/tmp/oldsparky-recovery-bootstrap-stage-${expected_sha}"
-          install -d -m 700 "$stage"
-          /usr/bin/python3 -I -B - "$bundle" "$stage" <<'PY'
-          import os, shutil, sys, zipfile
+          payload="$(mktemp -d "$stage/payload.XXXXXX")"
+          validate_stage_dir "$payload"
+          /usr/bin/python3 -I -B - "$bundle" "$payload" <<'PY'
+          import os
+          import sys
+          import zipfile
           from pathlib import Path
-          bundle, stage = map(Path, sys.argv[1:])
+          bundle, payload = map(Path, sys.argv[1:])
+          expected = {
+              "platform-recovery-bootstrap/manifest.json",
+              "platform-recovery-bootstrap/platform_abort_retained_only.sh",
+              "platform-recovery-bootstrap/platform_build_live_qa_runtime.py",
+              "platform-recovery-bootstrap/platform_live_qa_guard.py",
+              "platform-recovery-bootstrap/platform_live_qa_runtime_install.py",
+              "platform-recovery-bootstrap/platform_recovery_bootstrap.py",
+              "platform-recovery-bootstrap/platform_release_lock.sh",
+              "platform-recovery-bootstrap/platform_release_restore_runtime.sh",
+              "platform-recovery-bootstrap/platform_release_transaction.py",
+          }
           with zipfile.ZipFile(bundle) as source:
               names = [name for name in source.namelist() if name and not name.endswith('/')]
-              if len(names) != 9 or any(not name.startswith('platform-recovery-bootstrap/') or name.count('/') != 1 for name in names):
+              if set(names) != expected:
                   raise SystemExit('bootstrap bundle inventory is unsafe')
               for name in names:
-                  destination = stage / Path(name).name
-                  destination.write_bytes(source.read(name))
-                  os.chmod(destination, 0o555 if destination.name.endswith('.sh') else 0o444)
+                  destination = payload / Path(name).name
+                  mode = 0o555 if destination.name.endswith('.sh') else 0o444
+                  descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+                  try:
+                      with os.fdopen(descriptor, 'wb') as target:
+                          target.write(source.read(name))
+                          os.fchmod(target.fileno(), mode)
+                  except BaseException:
+                      try:
+                          os.unlink(destination)
+                      except FileNotFoundError:
+                          pass
+                      raise
           PY
-          "$stage/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$stage/platform_recovery_bootstrap.py" install --bundle "$bundle" --app-dir "$app_dir" --expected-bundle-sha "$expected_sha"
+          for name in manifest.json platform_abort_retained_only.sh platform_build_live_qa_runtime.py platform_live_qa_guard.py platform_live_qa_runtime_install.py platform_recovery_bootstrap.py platform_release_lock.sh platform_release_restore_runtime.sh platform_release_transaction.py; do
+            if [[ "$name" == *.sh ]]; then
+              validate_stage_file "$payload/$name" 555
+            else
+              validate_stage_file "$payload/$name" 444
+            fi
+          done
+          "$payload/platform_release_lock.sh" --run /usr/bin/python3 -I -B "$payload/platform_recovery_bootstrap.py" install --bundle "$bundle" --app-dir "$app_dir" --expected-bundle-sha "$expected_sha"
           generation="$app_dir/shared/.release-recovery/generations/$expected_sha"
           test -x "$generation/platform_abort_retained_only.sh"
           exec "$generation/platform_abort_retained_only.sh" --app-dir "$app_dir"
@@ -321,7 +515,7 @@ jobs:
           ssh_dir="${SSH_DIR:-$RUNNER_TEMP/platform-recovery-bootstrap-ssh}"
           if [[ -e "$ssh_dir" || -L "$ssh_dir" ]]; then
             test -d "$ssh_dir" && test ! -L "$ssh_dir"
-            rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts"
+            rm -f -- "$ssh_dir/id_ed25519" "$ssh_dir/known_hosts" "$ssh_dir/known_hosts.scan" "$ssh_dir/known_hosts.scan.1" "$ssh_dir/known_hosts.scan.2"
             rmdir -- "$ssh_dir"
           fi
           test ! -e "$ssh_dir" && test ! -L "$ssh_dir"
