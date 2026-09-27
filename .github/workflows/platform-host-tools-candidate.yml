@@ -119,8 +119,42 @@ jobs:
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/runs/$SECURITY_RUN_ID" \
+            --output "$RUNNER_TEMP/platform-host-tools-security-run-latest.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/pulls/${{ steps.event.outputs.pull_request }}" \
             --output "$RUNNER_TEMP/platform-host-tools-pr.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/git/matching-refs/pull/${{ steps.event.outputs.pull_request }}/merge" \
+            --output "$RUNNER_TEMP/platform-host-tools-merge-ref.json"
+          merge_sha="$(/usr/bin/python3 -I -B - "$RUNNER_TEMP/platform-host-tools-merge-ref.json" <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          import sys
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+              raise SystemExit("merge ref result is not singular")
+          row = payload[0]
+          obj = row.get("object")
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if row.get("ref") != f"refs/pull/${{ steps.event.outputs.pull_request }}/merge" or not isinstance(obj, dict) or obj.get("type") != "commit" or not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("merge ref is not a canonical commit")
+          print(sha)
+          PY
+          )"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/commits/$merge_sha" \
+            --output "$RUNNER_TEMP/platform-host-tools-merge-commit.json"
 
       - name: Validate exact workflow, run, PR, ref, and ancestry inputs
         id: context
@@ -134,7 +168,10 @@ jobs:
             validate-context \
             --event "$GITHUB_EVENT_PATH" \
             --run "$RUNNER_TEMP/platform-host-tools-security-run.json" \
+            --run-latest "$RUNNER_TEMP/platform-host-tools-security-run-latest.json" \
             --pr "$RUNNER_TEMP/platform-host-tools-pr.json" \
+            --merge-ref "$RUNNER_TEMP/platform-host-tools-merge-ref.json" \
+            --commit "$RUNNER_TEMP/platform-host-tools-merge-commit.json" \
             --output "$RUNNER_TEMP/platform-host-tools-context.json" \
             --github-output "$GITHUB_OUTPUT"
 
@@ -148,12 +185,19 @@ jobs:
           set -euo pipefail
           api="$GITHUB_API_URL/repos/$REPOSITORY"
           summary_name="platform-ci-summary-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}"
+          route_name="platform-ci-route-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}"
           curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/actions/artifacts?name=$summary_name&per_page=100" \
             --output "$RUNNER_TEMP/platform-host-tools-summary-artifacts.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/artifacts?name=$route_name&per_page=100" \
+            --output "$RUNNER_TEMP/platform-host-tools-route-artifacts.json"
           curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
@@ -166,6 +210,12 @@ jobs:
             --run-attempt "$SECURITY_RUN_ATTEMPT")"
           [[ "$summary_id" =~ ^[1-9][0-9]{0,31}$ ]]
           printf '%s\n' "$summary_id" > "$RUNNER_TEMP/platform-host-tools-summary-id"
+          route_id="$(/usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
+            select-artifact-id --metadata "$RUNNER_TEMP/platform-host-tools-route-artifacts.json" \
+            --name "$route_name" --run-id "$SECURITY_RUN_ID" \
+            --run-attempt "$SECURITY_RUN_ATTEMPT")"
+          [[ "$route_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          printf '%s\n' "$route_id" > "$RUNNER_TEMP/platform-host-tools-route-id"
           curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
@@ -178,6 +228,18 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/actions/artifacts/$summary_id/zip" \
             --output "$RUNNER_TEMP/platform-host-tools-summary.zip"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/artifacts/$route_id" \
+            --output "$RUNNER_TEMP/platform-host-tools-route-metadata.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 8388608 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/artifacts/$route_id/zip" \
+            --output "$RUNNER_TEMP/platform-host-tools-route.zip"
 
       - name: Verify allowlisted completed-success jobs and closed final summary
         id: security
@@ -191,6 +253,9 @@ jobs:
             --summary-metadata "$RUNNER_TEMP/platform-host-tools-summary-metadata.json" \
             --summary-archive "$RUNNER_TEMP/platform-host-tools-summary.zip" \
             --summary-artifact-id "$(cat "$RUNNER_TEMP/platform-host-tools-summary-id")" \
+            --route-metadata "$RUNNER_TEMP/platform-host-tools-route-metadata.json" \
+            --route-archive "$RUNNER_TEMP/platform-host-tools-route.zip" \
+            --route-artifact-id "$(cat "$RUNNER_TEMP/platform-host-tools-route-id")" \
             --output "$RUNNER_TEMP/platform-host-tools-security-evidence.json" \
             --github-output "$GITHUB_OUTPUT"
 
@@ -198,7 +263,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: StrayForest/old_sparky
-          ref: ${{ steps.context.outputs.candidate_sha }}
+          ref: ${{ steps.context.outputs.source_head_sha }}
           fetch-depth: 0
           path: candidate-data
           persist-credentials: false
@@ -207,7 +272,7 @@ jobs:
         id: host-tools
         shell: bash
         env:
-          CANDIDATE_SHA: ${{ steps.context.outputs.candidate_sha }}
+          CANDIDATE_SHA: ${{ steps.context.outputs.source_head_sha }}
         run: |
           set -euo pipefail
           test "$(git -C candidate-data rev-parse --verify HEAD^{commit})" = "$CANDIDATE_SHA"
@@ -227,13 +292,13 @@ jobs:
         shell: bash
         env:
           BASE_SHA: ${{ steps.context.outputs.base_sha }}
-          CANDIDATE_SHA: ${{ steps.context.outputs.candidate_sha }}
+          CANDIDATE_SHA: ${{ steps.context.outputs.source_head_sha }}
           HOST_TOOLS_SHA: ${{ steps.host-tools.outputs.host_tools_sha }}
         run: |
           set -euo pipefail
           /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             verify-ancestry --source-root "$GITHUB_WORKSPACE/candidate-data" \
-            --base-sha "$BASE_SHA" --host-tools-sha "$HOST_TOOLS_SHA" --candidate-sha "$CANDIDATE_SHA" \
+            --base-sha "$BASE_SHA" --host-tools-sha "$HOST_TOOLS_SHA" --source-head-sha "$CANDIDATE_SHA" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Finish successfully without an artifact for an existing generation
@@ -288,12 +353,49 @@ jobs:
           curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
             --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/runs/$SECURITY_RUN_ID" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-run-latest.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/pulls/${{ steps.context.outputs.pull_request }}" \
             --output "$RUNNER_TEMP/platform-host-tools-recheck-pr.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/git/matching-refs/pull/${{ steps.context.outputs.pull_request }}/merge" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-merge-ref.json"
+          merge_sha="$(/usr/bin/python3 -I -B - "$RUNNER_TEMP/platform-host-tools-recheck-merge-ref.json" <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          import sys
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+              raise SystemExit("recheck merge ref result is not singular")
+          row = payload[0]
+          if row.get("ref") != f"refs/pull/${{ steps.context.outputs.pull_request }}/merge":
+              raise SystemExit("recheck merge ref name is not canonical")
+          obj = row.get("object")
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if not isinstance(obj, dict) or obj.get("type") != "commit" or not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("recheck merge ref is not a canonical commit")
+          print(sha)
+          PY
+          )"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/commits/$merge_sha" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-merge-commit.json"
           /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             validate-context --event "$GITHUB_EVENT_PATH" \
             --run "$RUNNER_TEMP/platform-host-tools-recheck-run.json" \
+            --run-latest "$RUNNER_TEMP/platform-host-tools-recheck-run-latest.json" \
             --pr "$RUNNER_TEMP/platform-host-tools-recheck-pr.json" \
+            --merge-ref "$RUNNER_TEMP/platform-host-tools-recheck-merge-ref.json" \
+            --commit "$RUNNER_TEMP/platform-host-tools-recheck-merge-commit.json" \
+            --expected-context "$RUNNER_TEMP/platform-host-tools-context.json" \
             --output "$RUNNER_TEMP/platform-host-tools-recheck-context.json"
           cmp -s "$RUNNER_TEMP/platform-host-tools-context.json" "$RUNNER_TEMP/platform-host-tools-recheck-context.json"
 
@@ -321,12 +423,49 @@ jobs:
           curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
             --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/actions/runs/$SECURITY_RUN_ID" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-run-latest-2.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/pulls/${{ steps.context.outputs.pull_request }}" \
             --output "$RUNNER_TEMP/platform-host-tools-recheck-pr-2.json"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/git/matching-refs/pull/${{ steps.context.outputs.pull_request }}/merge" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-merge-ref-2.json"
+          merge_sha="$(/usr/bin/python3 -I -B - "$RUNNER_TEMP/platform-host-tools-recheck-merge-ref-2.json" <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          import sys
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+              raise SystemExit("second recheck merge ref result is not singular")
+          row = payload[0]
+          if row.get("ref") != f"refs/pull/${{ steps.context.outputs.pull_request }}/merge":
+              raise SystemExit("second recheck merge ref name is not canonical")
+          obj = row.get("object")
+          sha = obj.get("sha") if isinstance(obj, dict) else None
+          if not isinstance(obj, dict) or obj.get("type") != "commit" or not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+              raise SystemExit("second recheck merge ref is not a canonical commit")
+          print(sha)
+          PY
+          )"
+          curl --fail-with-body --silent --show-error --location --max-time 30 --max-filesize 1048576 \
+            --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/commits/$merge_sha" \
+            --output "$RUNNER_TEMP/platform-host-tools-recheck-merge-commit-2.json"
           /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             validate-context --event "$GITHUB_EVENT_PATH" \
             --run "$RUNNER_TEMP/platform-host-tools-recheck-run-2.json" \
+            --run-latest "$RUNNER_TEMP/platform-host-tools-recheck-run-latest-2.json" \
             --pr "$RUNNER_TEMP/platform-host-tools-recheck-pr-2.json" \
+            --merge-ref "$RUNNER_TEMP/platform-host-tools-recheck-merge-ref-2.json" \
+            --commit "$RUNNER_TEMP/platform-host-tools-recheck-merge-commit-2.json" \
+            --expected-context "$RUNNER_TEMP/platform-host-tools-context.json" \
             --output "$RUNNER_TEMP/platform-host-tools-recheck-context-2.json"
           cmp -s "$RUNNER_TEMP/platform-host-tools-context.json" "$RUNNER_TEMP/platform-host-tools-recheck-context-2.json"
 
@@ -335,7 +474,7 @@ jobs:
         if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-host-tools-candidate-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          name: platform-host-tools-candidate-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.source_head_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
           path: ${{ runner.temp }}/platform-host-tools-candidate/platform-host-tools-bundle.zip
           if-no-files-found: error
           retention-days: 30
@@ -349,7 +488,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_ID: ${{ steps.upload-candidate.outputs.artifact-id }}
           ACTION_ARTIFACT_DIGEST: ${{ steps.upload-candidate.outputs.artifact-digest }}
-          ARTIFACT_NAME: platform-host-tools-candidate-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          ARTIFACT_NAME: platform-host-tools-candidate-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.source_head_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
         run: |
           set -euo pipefail
           [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,31}$ ]]
@@ -392,7 +531,7 @@ jobs:
         if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: platform-host-tools-candidate-evidence-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          name: platform-host-tools-candidate-evidence-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.source_head_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
           path: ${{ runner.temp }}/platform-host-tools-candidate-evidence.json
           if-no-files-found: error
           retention-days: 30
@@ -404,7 +543,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVIDENCE_ARTIFACT_ID: ${{ steps.upload-evidence.outputs.artifact-id }}
-          EVIDENCE_ARTIFACT_NAME: platform-host-tools-candidate-evidence-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          EVIDENCE_ARTIFACT_NAME: platform-host-tools-candidate-evidence-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.source_head_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
           PACKAGING_RUN_ATTEMPT: ${{ github.run_attempt }}
           TRUSTED_SHA: ${{ steps.trusted.outputs.sha }}
         run: |
@@ -437,8 +576,8 @@ jobs:
         env:
           CANDIDATE_ARTIFACT_ID: ${{ steps.upload-candidate.outputs.artifact-id }}
           EVIDENCE_ARTIFACT_ID: ${{ steps.upload-evidence.outputs.artifact-id }}
-          CANDIDATE_ARTIFACT_NAME: platform-host-tools-candidate-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
-          EVIDENCE_ARTIFACT_NAME: platform-host-tools-candidate-evidence-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          CANDIDATE_ARTIFACT_NAME: platform-host-tools-candidate-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.source_head_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
+          EVIDENCE_ARTIFACT_NAME: platform-host-tools-candidate-evidence-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.source_head_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
           OUTER_DIGEST: ${{ steps.candidate-artifact.outputs.outer_digest }}
           ARTIFACT_SIZE: ${{ steps.candidate-artifact.outputs.artifact_size }}
         run: |
@@ -468,8 +607,28 @@ jobs:
             "$RUNNER_TEMP/platform-host-tools-summary.zip" \
             "$RUNNER_TEMP/platform-host-tools-summary-metadata.json" \
             "$RUNNER_TEMP/platform-host-tools-summary-artifacts.json" \
+            "$RUNNER_TEMP/platform-host-tools-route.zip" \
+            "$RUNNER_TEMP/platform-host-tools-route-metadata.json" \
+            "$RUNNER_TEMP/platform-host-tools-route-artifacts.json" \
+            "$RUNNER_TEMP/platform-host-tools-route-id" \
             "$RUNNER_TEMP/platform-host-tools-security-jobs.json" \
             "$RUNNER_TEMP/platform-host-tools-security-run.json" \
+            "$RUNNER_TEMP/platform-host-tools-security-run-latest.json" \
             "$RUNNER_TEMP/platform-host-tools-pr.json" \
+            "$RUNNER_TEMP/platform-host-tools-merge-ref.json" \
+            "$RUNNER_TEMP/platform-host-tools-merge-commit.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-run.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-run-latest.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-pr.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-merge-ref.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-merge-commit.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-context.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-run-2.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-run-latest-2.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-pr-2.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-merge-ref-2.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-merge-commit-2.json" \
+            "$RUNNER_TEMP/platform-host-tools-recheck-context-2.json" \
             "$RUNNER_TEMP/platform-host-tools-evidence-metadata.json" \
-            "$RUNNER_TEMP/platform-host-tools-evidence-outer.zip"
+            "$RUNNER_TEMP/platform-host-tools-evidence-outer.zip" \
+            "$RUNNER_TEMP/platform-host-tools-summary-id"

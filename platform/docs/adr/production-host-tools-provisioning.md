@@ -122,6 +122,39 @@ mode-0600, size-bounded and explicitly `deployable: false`.  Production
 workflows do not consume either candidate prefix, so this handoff can only
 produce review evidence; it cannot dispatch, provision, install or deploy.
 
+### Closed source-versus-tested merge identity
+
+The handoff keeps the PR source head **E** separate from the tested synthetic
+merge **M**.  The triggering `workflow_run` snapshot records the exact
+canonical workflow, run ID, run attempt, PR number, base ref/SHA and source
+head/ref; for a `pull_request` run, `workflow_run.head_sha` is the source head
+**E**.  The exact-attempt run API response and its embedded PR snapshot must
+agree with that event and with the current PR response.  The current PR's
+non-null `merge_commit_sha` establishes **M** only after the singular
+`GET /git/matching-refs/pull/<N>/merge` response and `GET /commits/<M>` response
+confirm the same merge ref, a valid tree and exactly two ordered parents
+`[base, E]`.  Missing, null, stale, substituted or raced values are closed
+failures; no source-head fallback is permitted.
+
+The serialized context includes the source/base repositories and refs, **E**,
+**M**, merge ref, tree and ordered parents.  The security summary's
+`tested_sha` must equal **M**.  If a producer adds split source/base/tree/parent
+provenance, the consumer accepts only one documented closed shape and compares
+every field exactly.  The classifier route artifact is an additional
+defense-in-depth check: its target must be **M**, its manifest must be closed,
+and its digest must equal the summary's manifest digest.  The exact-attempt
+jobs response and artifact metadata must bind every supplied row identity
+(`run_id`, `run_attempt`, source head **E**, source head ref and workflow name)
+to the same run; commit-status metadata is advisory and is not treated as
+producer authority.
+
+Before either attestation or upload, the workflow fetches the exact run and
+latest run snapshot, PR, merge ref and commit again and compares the complete
+immutable context.  This catches synchronize, base/head/merge-ref/tree and
+rerun races.  These checks apply to the candidate `pull_request`/
+`deployable=false` path only; production push/deploy authority remains the
+separate classifier and release contract.
+
 ## One-time operator provisioning (out of band)
 
 This repository change prepares and verifies the handoff only. An operator or

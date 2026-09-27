@@ -1528,8 +1528,16 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
         "python3 -I -B trusted-dev/platform/tools/platform_host_tools_bundle.py",
         "--source-root \"$GITHUB_WORKSPACE/candidate-data\"",
         "--summary-artifact-id",
+        "--run-latest",
+        "--merge-ref",
+        "--commit",
+        "--route-metadata",
+        "--route-archive",
+        "--route-artifact-id",
+        "--expected-context",
         "--candidate-artifact-id",
         "verify-ancestry",
+        "--source-head-sha",
         "--github-output \"$GITHUB_OUTPUT\"",
         "steps.eligibility.outputs.eligible == 'false'",
         "steps.eligibility.outputs.eligible == 'true'",
@@ -1567,9 +1575,9 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
     ):
         issues.append("trusted host-tools candidate invocations must preserve isolated bytecode-free Python")
     artifact_zip_commands = host_tools_candidate_artifact_zip_curl_blocks(workflow_text)
-    if len(artifact_zip_commands) != 3:
+    if len(artifact_zip_commands) != 4:
         issues.append(
-            "host-tools candidate workflow must contain exactly three artifact ZIP download curl blocks"
+            "host-tools candidate workflow must contain exactly four artifact ZIP download curl blocks"
         )
     for index, command in enumerate(artifact_zip_commands, start=1):
         for marker, description in (
@@ -1610,6 +1618,11 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
         )
         if match is not None
     } if candidate_job is not None else {}
+    candidate_step_names = (
+        re.findall(r"^      - name: (?P<name>[^\n]+)$", candidate_job.group("body"), re.MULTILINE)
+        if candidate_job is not None
+        else []
+    )
     for step_name in (
         "Build and verify deterministic existing host-tools bundle from T",
         "Recheck PR, security run, attempt, and head before attestation",
@@ -1623,6 +1636,19 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
     ):
         if eligible_true not in candidate_steps.get(step_name, ""):
             issues.append(f"host-tools candidate artifact step is not gated by eligibility: {step_name}")
+    step_positions = {name: index for index, name in enumerate(candidate_step_names)}
+    for before, after in (
+        (
+            "Recheck PR, security run, attempt, and head before attestation",
+            "Attest exact inner host-tools ZIP",
+        ),
+        (
+            "Recheck PR, security run, attempt, and head before upload",
+            "Upload exact candidate inner ZIP without overwrite",
+        ),
+    ):
+        if before in step_positions and after in step_positions and step_positions[before] >= step_positions[after]:
+            issues.append(f"host-tools candidate workflow must recheck before {after}")
     if "id-token: write" not in workflow_text or "attestations: write" not in workflow_text:
         issues.append("host-tools candidate attestation permissions are missing")
     if "permissions:\n  contents: read\n  actions: read\n  pull-requests: read" not in workflow_text:
