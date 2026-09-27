@@ -13,6 +13,8 @@ import warnings
 import zipfile
 
 from tools.platform_ci_classifier import (
+    CANDIDATE_PACKAGING_FILES,
+    CANDIDATE_PACKAGING_REASON,
     DOCS_ONLY_GATE_IDS,
     FULL_GATE_IDS,
     OUT_OF_SCOPE_GATE_IDS,
@@ -72,6 +74,124 @@ class PlatformCiClassifierTests(unittest.TestCase):
             expected_target_sha=self.TARGET_SHA,
             require_deployable=True,
         )
+
+    def test_candidate_packaging_is_full_ci_but_non_deployable_for_pr_and_push(self) -> None:
+        candidate_files = {
+            ".github/workflows/platform-host-tools-candidate.yml",
+            "platform/tools/platform_host_tools_candidate.py",
+            "platform/tests/test_platform_host_tools_bundle.py",
+            "platform/tools/platform_test_catalog.py",
+            "platform/tools/platform_verify_contract.py",
+        }
+        self.assertEqual(CANDIDATE_PACKAGING_FILES, candidate_files)
+        files = sorted(
+            candidate_files
+            | {
+                "platform/docs/CURRENT.md",
+                "platform/docs/README.md",
+                "platform/docs/adr/production-host-tools-provisioning.md",
+                "platform/docs/deployment-runbook.md",
+                "platform/docs/test-suite-governance.md",
+            }
+        )
+        manifests = {
+            event: classify(
+                files,
+                event=event,
+                target_sha=self.TARGET_SHA,
+                branch="dev" if event == "push" else "feature/candidate",
+            )
+            for event in ("pull_request", "push")
+        }
+
+        for event, manifest in manifests.items():
+            with self.subTest(event=event):
+                self.assertEqual(manifest["class"], "full")
+                self.assertEqual(manifest["expected_gates"], list(FULL_GATE_IDS))
+                self.assertFalse(manifest["fallback"])
+                self.assertFalse(manifest["deployable"])
+                self.assertFalse(manifest["runtime_sensitive"])
+                self.assertEqual(manifest["reason"], CANDIDATE_PACKAGING_REASON)
+                validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
+
+        tampered = dict(manifests["push"])
+        tampered["deployable"] = True
+        tampered["digest"] = manifest_digest(tampered)
+        with self.assertRaises(ClassifierError):
+            validate_manifest(tampered)
+
+    def test_deployable_push_matrix_keeps_application_runtime_migration_and_release_paths(self) -> None:
+        paths = (
+            "platform/apps/platform_api/app/main.py",
+            "platform/tools/platform_build_release.sh",
+            "platform/alembic/versions/20260927_candidate.py",
+            ".github/workflows/platform-production-deploy.yml",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                pull_request = classify(
+                    [path],
+                    event="pull_request",
+                    target_sha=self.TARGET_SHA,
+                    branch="feature/candidate",
+                )
+                push = classify(
+                    [path],
+                    event="push",
+                    target_sha=self.TARGET_SHA,
+                    branch="dev",
+                )
+                self.assertEqual(pull_request["class"], "full")
+                self.assertFalse(pull_request["deployable"])
+                self.assertFalse(pull_request["fallback"])
+                self.assertEqual(push["class"], "full")
+                self.assertTrue(push["deployable"])
+                self.assertFalse(push["fallback"])
+                validate_manifest(push, expected_target_sha=self.TARGET_SHA, require_deployable=True)
+
+        mixed = classify(
+            [
+                ".github/workflows/platform-host-tools-candidate.yml",
+                "platform/apps/platform_api/app/main.py",
+            ],
+            event="push",
+            target_sha=self.TARGET_SHA,
+            branch="dev",
+        )
+        self.assertEqual(mixed["class"], "full")
+        self.assertTrue(mixed["deployable"])
+        validate_manifest(mixed, expected_target_sha=self.TARGET_SHA, require_deployable=True)
+
+        for path, expected_class, expected_fallback, expected_gates in (
+            (
+                "platform/docs/deployment-runbook.md",
+                "docs-only",
+                False,
+                DOCS_ONLY_GATE_IDS,
+            ),
+            (
+                "unknown-root-config.toml",
+                "full",
+                True,
+                FULL_GATE_IDS,
+            ),
+        ):
+            for event, branch in (
+                ("pull_request", "feature/candidate"),
+                ("push", "dev"),
+            ):
+                with self.subTest(path=path, event=event):
+                    manifest = classify(
+                        [path],
+                        event=event,
+                        target_sha=self.TARGET_SHA,
+                        branch=branch,
+                    )
+                    self.assertEqual(manifest["class"], expected_class)
+                    self.assertEqual(manifest["fallback"], expected_fallback)
+                    self.assertEqual(manifest["expected_gates"], list(expected_gates))
+                    self.assertFalse(manifest["deployable"])
+                    validate_manifest(manifest, expected_target_sha=self.TARGET_SHA)
 
     def test_release_runtime_sensitivity_is_exact_and_digest_bound(self) -> None:
         runtime_path = "platform/tools/platform_build_live_qa_runtime.py"
@@ -260,6 +380,11 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn('echo "deploy=false" >> "$GITHUB_OUTPUT"', auto)
         self.assertIn("Dispatch production deployment", auto)
         self.assertIn("steps.gate.outputs.deploy == 'true'", auto)
+        self.assertIn(
+            'type(manifest.get("deployable")) is not bool',
+            auto,
+        )
+        self.assertIn("full route may be non-deployable", auto)
 
         for files in (
             ["platform/docs/deployment-runbook.md"],
@@ -621,6 +746,7 @@ class PlatformCiClassifierTests(unittest.TestCase):
         self.assertIn("STATUS_START_RESULT", workflow)
         self.assertIn("published_event", workflow)
         self.assertIn("expected_by_class", workflow)
+        self.assertIn("A full route can be CI-only", workflow)
         self.assertIn("ROUTE_EVENT", workflow)
         self.assertIn("classifier event does not match the workflow event", workflow)
         self.assertIn("classifier expected gates do not match its class", workflow)
@@ -804,6 +930,19 @@ class PlatformCiClassifierTests(unittest.TestCase):
                 ),
                 (
                     "ordinary dev both skipped",
+                    "push",
+                    "refs/heads/dev",
+                    "false",
+                    "false",
+                    "skipped",
+                    "skipped",
+                    True,
+                    False,
+                ),
+                # Candidate packaging keeps the full gate class but is a
+                # successful CI-only push when deployable=false.
+                (
+                    "candidate packaging dev no-op",
                     "push",
                     "refs/heads/dev",
                     "false",

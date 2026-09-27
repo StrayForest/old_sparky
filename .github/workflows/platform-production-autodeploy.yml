@@ -314,8 +314,11 @@ jobs:
           ).hexdigest()
           if manifest.get("digest") != digest:
               raise SystemExit("classifier digest does not match manifest")
-          if route_class == "full" and manifest.get("deployable") is not True:
-              raise SystemExit("full dev push classifier route is not deployable")
+          # A full route can intentionally be CI-only (for example, the
+          # trusted host-tools candidate packaging).  The classifier's
+          # deployable bit, not the route class alone, controls dispatch.
+          if type(manifest.get("deployable")) is not bool:
+              raise SystemExit("full route may be non-deployable, but its flag must be boolean")
           if route_class != "full" and manifest.get("deployable") is not False:
               raise SystemExit("reduced classifier route must be non-deployable")
           with Path(output_path).open("a", encoding="utf-8") as output:

@@ -61,7 +61,7 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$GITHUB_API_URL/repos/$REPOSITORY/git/ref/heads/$DEFAULT_BRANCH" \
             --output "$ref_json"
-          /usr/bin/python3 - "$ref_json" "$GITHUB_OUTPUT" "$DEFAULT_BRANCH" <<'PY'
+          /usr/bin/python3 -I -B - "$ref_json" "$GITHUB_OUTPUT" "$DEFAULT_BRANCH" <<'PY'
           import json
           from pathlib import Path
           import re
@@ -94,7 +94,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             inspect-event --event "$GITHUB_EVENT_PATH" --github-output "$GITHUB_OUTPUT"
 
       - name: Fetch canonical security run attempt and same-repository PR data
@@ -130,7 +130,7 @@ jobs:
           SECURITY_RUN_ATTEMPT: ${{ steps.event.outputs.security_run_attempt }}
         run: |
           set -euo pipefail
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             validate-context \
             --event "$GITHUB_EVENT_PATH" \
             --run "$RUNNER_TEMP/platform-host-tools-security-run.json" \
@@ -160,7 +160,7 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1" \
             --output "$RUNNER_TEMP/platform-host-tools-security-jobs.json"
-          summary_id="$(/usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+          summary_id="$(/usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             select-artifact-id --metadata "$RUNNER_TEMP/platform-host-tools-summary-artifacts.json" \
             --name "$summary_name" --run-id "$SECURITY_RUN_ID" \
             --run-attempt "$SECURITY_RUN_ATTEMPT")"
@@ -184,7 +184,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             verify-security \
             --context "$RUNNER_TEMP/platform-host-tools-context.json" \
             --jobs "$RUNNER_TEMP/platform-host-tools-security-jobs.json" \
@@ -213,7 +213,7 @@ jobs:
           test "$(git -C candidate-data rev-parse --verify HEAD^{commit})" = "$CANDIDATE_SHA"
           test -z "$(git -C candidate-data status --porcelain=v1 --untracked-files=all)"
           pin_output="$RUNNER_TEMP/platform-host-tools-pin"
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_pin.py resolve \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_pin.py resolve \
             --source-root "$GITHUB_WORKSPACE/candidate-data" \
             --target-sha "$CANDIDATE_SHA" \
             --expected-repository "$REPOSITORY" > "$pin_output"
@@ -222,7 +222,8 @@ jobs:
           test "$(wc -l < "$pin_output" | tr -d ' ')" = 1
           printf 'host_tools_sha=%s\n' "$host_tools_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Require PR-introduced C strict ancestor E and outside base
+      - name: Determine PR-introduced C eligibility
+        id: eligibility
         shell: bash
         env:
           BASE_SHA: ${{ steps.context.outputs.base_sha }}
@@ -230,11 +231,24 @@ jobs:
           HOST_TOOLS_SHA: ${{ steps.host-tools.outputs.host_tools_sha }}
         run: |
           set -euo pipefail
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             verify-ancestry --source-root "$GITHUB_WORKSPACE/candidate-data" \
-            --base-sha "$BASE_SHA" --host-tools-sha "$HOST_TOOLS_SHA" --candidate-sha "$CANDIDATE_SHA"
+            --base-sha "$BASE_SHA" --host-tools-sha "$HOST_TOOLS_SHA" --candidate-sha "$CANDIDATE_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Finish successfully without an artifact for an existing generation
+        if: ${{ steps.eligibility.outputs.eligible == 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Host-tools candidate no-op"
+            echo
+            echo "The resolved host-tools generation is already reachable from the current PR base; no candidate artifact was built, uploaded, or attested."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build and verify deterministic existing host-tools bundle from T
+        if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         shell: bash
         env:
           HOST_TOOLS_SHA: ${{ steps.host-tools.outputs.host_tools_sha }}
@@ -243,11 +257,11 @@ jobs:
           umask 077
           output_dir="$RUNNER_TEMP/platform-host-tools-candidate"
           mkdir -p "$output_dir"
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_bundle.py build \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_bundle.py build \
             --source-root "$GITHUB_WORKSPACE/candidate-data" \
             --source-sha "$HOST_TOOLS_SHA" \
             --output "$output_dir/platform-host-tools-bundle.zip"
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_bundle.py verify \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_bundle.py verify \
             --bundle "$output_dir/platform-host-tools-bundle.zip" \
             --expected-source-sha "$HOST_TOOLS_SHA" \
             --contract-dir "$output_dir/contract"
@@ -257,6 +271,7 @@ jobs:
           test "$(stat -c '%s' "$output_dir/platform-host-tools-bundle.zip")" -le 4194304
 
       - name: Recheck PR, security run, attempt, and head before attestation
+        if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -275,7 +290,7 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/pulls/${{ steps.context.outputs.pull_request }}" \
             --output "$RUNNER_TEMP/platform-host-tools-recheck-pr.json"
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             validate-context --event "$GITHUB_EVENT_PATH" \
             --run "$RUNNER_TEMP/platform-host-tools-recheck-run.json" \
             --pr "$RUNNER_TEMP/platform-host-tools-recheck-pr.json" \
@@ -283,11 +298,13 @@ jobs:
           cmp -s "$RUNNER_TEMP/platform-host-tools-context.json" "$RUNNER_TEMP/platform-host-tools-recheck-context.json"
 
       - name: Attest exact inner host-tools ZIP
+        if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: ${{ runner.temp }}/platform-host-tools-candidate/platform-host-tools-bundle.zip
 
       - name: Recheck PR, security run, attempt, and head before upload
+        if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -306,7 +323,7 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/pulls/${{ steps.context.outputs.pull_request }}" \
             --output "$RUNNER_TEMP/platform-host-tools-recheck-pr-2.json"
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             validate-context --event "$GITHUB_EVENT_PATH" \
             --run "$RUNNER_TEMP/platform-host-tools-recheck-run-2.json" \
             --pr "$RUNNER_TEMP/platform-host-tools-recheck-pr-2.json" \
@@ -315,6 +332,7 @@ jobs:
 
       - name: Upload exact candidate inner ZIP without overwrite
         id: upload-candidate
+        if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-host-tools-candidate-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
@@ -325,6 +343,7 @@ jobs:
 
       - name: Verify uploaded candidate artifact outer digest and metadata
         id: candidate-artifact
+        if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -347,7 +366,7 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/actions/artifacts/$ARTIFACT_ID/zip" \
             --output "$RUNNER_TEMP/platform-host-tools-candidate-outer.zip"
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             write-evidence --trusted-root "$GITHUB_WORKSPACE/trusted-dev" \
             --candidate-root "$GITHUB_WORKSPACE/candidate-data" \
             --context "$RUNNER_TEMP/platform-host-tools-context.json" \
@@ -370,6 +389,7 @@ jobs:
 
       - name: Upload closed candidate evidence without overwrite
         id: upload-evidence
+        if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: platform-host-tools-candidate-evidence-pr${{ steps.context.outputs.pull_request }}-c${{ steps.host-tools.outputs.host_tools_sha }}-e${{ steps.context.outputs.candidate_sha }}-run${{ steps.context.outputs.security_run_id }}-attempt${{ steps.context.outputs.security_run_attempt }}
@@ -379,6 +399,7 @@ jobs:
           overwrite: false
 
       - name: Verify uploaded evidence artifact envelope
+        if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -400,7 +421,7 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "$api/actions/artifacts/$EVIDENCE_ARTIFACT_ID/zip" \
             --output "$RUNNER_TEMP/platform-host-tools-evidence-outer.zip"
-          /usr/bin/python3 -I trusted-dev/platform/tools/platform_host_tools_candidate.py \
+          /usr/bin/python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py \
             verify-evidence-upload \
             --metadata "$RUNNER_TEMP/platform-host-tools-evidence-metadata.json" \
             --archive "$RUNNER_TEMP/platform-host-tools-evidence-outer.zip" \
@@ -411,6 +432,7 @@ jobs:
             --trusted-sha "$TRUSTED_SHA"
 
       - name: Publish exact candidate and evidence receipt
+        if: ${{ steps.eligibility.outputs.eligible == 'true' }}
         shell: bash
         env:
           CANDIDATE_ARTIFACT_ID: ${{ steps.upload-candidate.outputs.artifact-id }}

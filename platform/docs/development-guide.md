@@ -115,8 +115,8 @@ is not the CI or release reproducibility contract.
 5. Add regression coverage before broad gates. For async UI mutations, cover duplicate-submit, stale-response and editable-draft races when applicable; permission-sensitive UI must consume backend capabilities rather than infer access from visibility or presentation state.
 6. Remove replaced imports, CSS, mocks, routes and stale documentation.
 7. Push the coherent reviewed package and use GitHub Actions as the release verification authority. Local checks may help diagnose a failure but are not the normal production gate.
-8. `Platform security and build` always runs its fail-closed classifier. A strict `platform/docs/**` change runs only `docs` and `verification-contract`; an out-of-scope change runs the contract check; unknown/global/dependency/config/migration/workflow/registry changes use all deterministic gates. Reduced routes never authorize production deployment.
-9. For production-bound work merged or pushed to `dev`, wait for the exact-SHA `Platform security and build` push run. When it succeeds for the current `dev` HEAD, `Platform production auto-deploy` downloads and validates the exact classifier artifact before dispatching the immutable `Platform production deploy` workflow automatically.
+8. `Platform security and build` always runs its fail-closed classifier. A strict `platform/docs/**` change runs only `docs` and `verification-contract`; an out-of-scope change runs the contract check; unknown/global/dependency/config/migration/workflow/registry changes use all deterministic gates. Trusted candidate-packaging-only changes also use all deterministic gates but set `deployable=false`; reduced and candidate CI-only routes never authorize production deployment.
+9. For production-bound work merged or pushed to `dev`, wait for the exact-SHA `Platform security and build` push run. When it succeeds for the current `dev` HEAD with `deployable=true`, `Platform production auto-deploy` downloads and validates the exact classifier artifact before dispatching the immutable `Platform production deploy` workflow automatically; valid CI-only full routes finish as no-ops.
 10. Follow the deployment runbook and the [release state machine](release-state-machine.md) through live validation. Do not manually dispatch production for the normal `dev` path and do not call the low-level release installer directly.
 11. Commit each coherent verified change/package and push it to the matching GitHub branch before handoff unless explicitly requested otherwise.
 
@@ -133,8 +133,11 @@ complete repository state, a recognized event, a non-empty normalized file
 list and a valid target SHA, a known platform/workflow path is exactly
 `class=full`, `fallback=false`; a strict `platform/docs/**` path is `docs-only` with
 `fallback=false`, and an out-of-scope path is `out-of-scope` with
-`fallback=false`. A known full route is deployable only when it is the current
-`push` to `dev` and passes the exact release guard.
+`fallback=false`. Candidate-packaging-only paths remain `class=full` with
+`fallback=false` and all full gates, but set `deployable=false` for both PR and
+trusted push events. Application/runtime/migration/release paths are
+deployable only when they are the current `push` to `dev` and pass the exact
+release guard.
 
 Unknown or global paths, malformed paths or provenance, shallow/unavailable
 repository state, an unknown event and every `merge_group` event are
@@ -201,7 +204,7 @@ not run production smoke, live QA or load testing.
 For a production-bound `dev` change, final verification is the GitHub chain for the same tested execution SHA:
 
 1. `Platform security and build` succeeds and publishes `platform-security-build=success` plus a classifier artifact whose `target_sha` matches the tested execution SHA; the exact `TESTED_SHA` and pull-request source-head boundary are defined in [test-suite governance](test-suite-governance.md).
-2. `Platform production auto-deploy` accepts that SHA and a deployable `full` route rather than skipping it as stale/already deployed; docs-only and out-of-scope routes are successful no-ops.
+2. `Platform production auto-deploy` accepts that SHA and dispatches only for a deployable `full` route rather than skipping it as stale/already deployed; docs-only, out-of-scope and candidate-packaging-only full routes are successful no-ops.
 3. `Platform production deploy` succeeds, including immutable-artifact validation and live smoke.
 
 Manual `Platform production deploy` remains an operator fallback/read-only preflight tool, not the routine continuation of a successful `dev` push.
