@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 from pathlib import Path
 import shutil
 import stat
 import sys
 import tempfile
+import textwrap
 import unittest
 import zipfile
 
@@ -16,6 +18,35 @@ PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PLATFORM_ROOT.parent
 TOOLS = PLATFORM_ROOT / "tools"
 SOURCE_SHA = "a" * 40
+
+# This is the complete changed-file set of the recovery-bootstrap patch at
+# the merge base.  Keep the real set here so the route test exercises the
+# exact pull-request and trusted-dev-push inputs, including the host-key scan
+# contract that is easy to omit from one of the independent consumers.
+RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
+    {
+        ".github/workflows/platform-production-autodeploy.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+        "platform/docs/README.md",
+        "platform/docs/adr/recovery-bootstrap-retained-abort.md",
+        "platform/docs/deployment-runbook.md",
+        "platform/docs/test-suite-governance.md",
+        "platform/tests/test_platform_live_qa_runtime_install.py",
+        "platform/tests/test_platform_recovery_bootstrap.py",
+        "platform/tests/test_platform_ssh_host_key_scan.py",
+        "platform/tools/platform_abort_retained_only.sh",
+        "platform/tools/platform_build_live_qa_runtime.py",
+        "platform/tools/platform_ci_classifier.py",
+        "platform/tools/platform_live_qa_guard.py",
+        "platform/tools/platform_live_qa_runtime_install.py",
+        "platform/tools/platform_production_classifier_artifact.py",
+        "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_release_restore_runtime.sh",
+        "platform/tools/platform_release_transaction.py",
+        "platform/tools/platform_test_catalog.py",
+    }
+)
 
 
 def provenance() -> dict[str, object]:
@@ -173,6 +204,40 @@ class RecoveryBootstrapInstallTests(unittest.TestCase):
 
 
 class RecoveryBootstrapContractTests(unittest.TestCase):
+    @staticmethod
+    def _set_assignment(source: str, name: str) -> frozenset[str]:
+        tree = ast.parse(source)
+        assignments = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+        ]
+        if len(assignments) != 1:
+            raise AssertionError(f"expected one {name} assignment")
+        value = assignments[0].value
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "frozenset"
+        ):
+            if len(value.args) != 1 or value.keywords:
+                raise AssertionError(f"{name} frozenset expression is malformed")
+            value = value.args[0]
+        parsed = ast.literal_eval(value)
+        if not isinstance(parsed, (set, frozenset, list, tuple)):
+            raise AssertionError(f"{name} is not a literal set")
+        if not all(isinstance(item, str) for item in parsed):
+            raise AssertionError(f"{name} contains a non-string path")
+        return frozenset(parsed)
+
+    @classmethod
+    def _workflow_recovery_set(cls, source: str) -> frozenset[str]:
+        marker = "          recovery_bootstrap_files = {\n"
+        start = source.index(marker)
+        end = source.index("          }\n", start) + len("          }\n")
+        return cls._set_assignment(textwrap.dedent(source[start:end]), "recovery_bootstrap_files")
+
     def test_fixed_entrypoint_has_only_abort_retained_capability(self) -> None:
         script = (TOOLS / "platform_abort_retained_only.sh").read_text(encoding="utf-8")
         self.assertIn("abort_retained_only", script)
@@ -230,12 +295,54 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         sys.path.insert(0, str(TOOLS))
         from tools import platform_ci_classifier as classifier
 
-        paths = ["platform/tools/platform_recovery_bootstrap.py"]
-        manifest = classifier.classify(paths, event="push", target_sha="a" * 40, branch="dev")
-        self.assertFalse(manifest["deployable"])
-        self.assertFalse(manifest["fallback"])
-        mixed = classifier.classify(paths + ["platform/apps/platform_api/app/main.py"], event="push", target_sha="a" * 40, branch="dev")
+        paths = sorted(RECOVERY_BOOTSTRAP_PATCH_FILES)
+        for event, branch in (
+            ("pull_request", "feature/recovery-bootstrap"),
+            ("push", "dev"),
+        ):
+            with self.subTest(event=event):
+                manifest = classifier.classify(
+                    paths,
+                    event=event,
+                    target_sha="a" * 40,
+                    branch=branch,
+                )
+                self.assertEqual(set(manifest["files"]), RECOVERY_BOOTSTRAP_PATCH_FILES)
+                self.assertEqual(manifest["class"], "full")
+                self.assertFalse(manifest["deployable"])
+                self.assertFalse(manifest["fallback"])
+                classifier.validate_manifest(manifest, expected_target_sha="a" * 40)
+
+        mixed = classifier.classify(
+            paths + ["platform/apps/platform_api/app/main.py"],
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        self.assertEqual(mixed["class"], "full")
         self.assertTrue(mixed["deployable"])
+        self.assertFalse(mixed["fallback"])
+        unknown = classifier.classify(
+            paths + ["unknown-root-config.toml"],
+            event="push",
+            target_sha="a" * 40,
+            branch="dev",
+        )
+        self.assertEqual(unknown["class"], "full")
+        self.assertFalse(unknown["deployable"])
+        self.assertTrue(unknown["fallback"])
+
+        classifier_source = (TOOLS / "platform_ci_classifier.py").read_text(encoding="utf-8")
+        artifact_source = (
+            TOOLS / "platform_production_classifier_artifact.py"
+        ).read_text(encoding="utf-8")
+        auto_deploy_source = (
+            REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
+        ).read_text(encoding="utf-8")
+        canonical = frozenset(classifier.RECOVERY_BOOTSTRAP_FILES)
+        self.assertEqual(canonical, self._set_assignment(classifier_source, "RECOVERY_BOOTSTRAP_FILES"))
+        self.assertEqual(canonical, self._set_assignment(artifact_source, "RECOVERY_BOOTSTRAP_FILES"))
+        self.assertEqual(canonical, self._workflow_recovery_set(auto_deploy_source))
 
 
 if __name__ == "__main__":

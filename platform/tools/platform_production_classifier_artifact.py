@@ -76,6 +76,8 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tests/test_platform_release_recovery_boundaries.py",
         "platform/tests/test_platform_live_qa_guard.py",
         "platform/tests/test_platform_live_qa_runtime_install.py",
+        "platform/tests/test_platform_ssh_host_key_scan.py",
+        "platform/tests/test_platform_release_build_diagnostics.py",
         "platform/tests/test_platform_ci_classifier.py",
         "platform/tools/platform_ci_classifier.py",
         "platform/tools/platform_production_classifier_artifact.py",

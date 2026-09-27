@@ -542,6 +542,12 @@ class PlatformReleaseBuildDiagnosticsTests(unittest.TestCase):
                 phase_writer,
             )
             os.chmod(phase_writer, 0o755)
+            guard = tools / "platform_live_qa_guard.py"
+            shutil.copyfile(
+                REPO_ROOT / "platform/tools/platform_live_qa_guard.py",
+                guard,
+            )
+            os.chmod(guard, 0o755)
             bootstrap = tools / "platform_bootstrap.sh"
             bootstrap.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="ascii")
             os.chmod(bootstrap, 0o755)
