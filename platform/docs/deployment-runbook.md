@@ -372,7 +372,11 @@ The host installs the verified bundle as one immutable generation and invokes
 only its fixed `platform_abort_retained_only.sh` entrypoint. The entrypoint
 accepts only an install receipt in `phase=recovery-restored`; uncertain
 migration phases, missing identities, lock contention and any runtime,
-systemd, pointer or completion failure remain retained. This workflow is
+systemd, pointer or completion failure remain retained. It first keeps the
+operation receipt while cleaning candidate/venv artifacts, then clears the
+systemd receipt, and removes the operation receipt only after both durable
+states are clean. A retry after one of those side effects resumes from the
+remaining receipt and never repeats an unproven runtime transition. This workflow is
 non-deployable recovery authority: it does not run normal deploy, Alembic
 downgrade or a manually selected `systemctl` command.
 

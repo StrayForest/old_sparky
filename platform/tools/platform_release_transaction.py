@@ -1340,7 +1340,9 @@ def _mark_recovery_restored(
     return _load_record(state)
 
 
-def _cleanup_recovered_install(state: Path, record: dict[str, object]) -> None:
+def _cleanup_recovered_install(
+    state: Path, record: dict[str, object], *, remove_receipt: bool = True
+) -> None:
     shared = cast(Path, record["shared"])
     peer = cast(Path, record["peer_path"])
     candidate = cast(Path, record["candidate_path"])
@@ -1381,7 +1383,7 @@ def _cleanup_recovered_install(state: Path, record: dict[str, object]) -> None:
         _optional_safe_private_file(path, label="install freeze-check temporary file")
         path.unlink()
         _fsync_directory(shared)
-    if _lexists(state):
+    if remove_receipt and _lexists(state):
         state.unlink()
         _fsync_directory(state.parent)
 
@@ -1421,17 +1423,22 @@ def recover(state: Path, *, retain: bool = False) -> None:
         _fsync_directory(state.parent)
 
 
-def complete_recovery(state: Path) -> None:
+def complete_recovery(state: Path, *, retain_receipt: bool = False) -> None:
     record = _load_record(state)
     if record["phase"] != "recovery-restored":
         raise TransactionError("release operation recovery is not durably restored")
     _verify_original_pointers(record)
     _restore_venv(record)
     if record["operation"] == "install":
-        _cleanup_recovered_install(state, record)
+        _cleanup_recovered_install(
+            state,
+            record,
+            remove_receipt=not retain_receipt,
+        )
     else:
-        state.unlink()
-        _fsync_directory(state.parent)
+        if not retain_receipt:
+            state.unlink()
+            _fsync_directory(state.parent)
 
 
 def _validate_success(record: dict[str, object]) -> None:
@@ -1605,6 +1612,7 @@ def _build_parser() -> argparse.ArgumentParser:
     complete_parser.add_argument("--state", required=True, type=Path)
     complete_recovery_parser = commands.add_parser("complete-recovery")
     complete_recovery_parser.add_argument("--state", required=True, type=Path)
+    complete_recovery_parser.add_argument("--retain-receipt", action="store_true")
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--state", required=True, type=Path)
     status_parser.add_argument("--json", action="store_true", dest="as_json")
@@ -1700,7 +1708,7 @@ def main() -> int:
         elif args.command == "complete":
             complete(args.state)
         elif args.command == "complete-recovery":
-            complete_recovery(args.state)
+            complete_recovery(args.state, retain_receipt=args.retain_receipt)
         elif args.command == "status":
             try:
                 record = _load_record(args.state)

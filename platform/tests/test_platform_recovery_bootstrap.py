@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
+import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
 import zipfile
+from unittest import mock
 
 from tools import platform_recovery_bootstrap as recovery
 
@@ -34,6 +38,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/docs/test-suite-governance.md",
         "platform/tests/test_platform_live_qa_runtime_install.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
+        "platform/tests/test_platform_release_build_diagnostics.py",
         "platform/tests/test_platform_ssh_host_key_scan.py",
         "platform/tools/platform_abort_retained_only.sh",
         "platform/tools/platform_build_live_qa_runtime.py",
@@ -162,6 +167,19 @@ class RecoveryBootstrapBundleTests(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryBootstrapError):
             recovery.verify_bundle(wrong_mode_archive)
 
+        aggregate_archive = self.root / "aggregate-limit.zip"
+        with zipfile.ZipFile(self.bundle) as source, zipfile.ZipFile(aggregate_archive, "w") as output:
+            for info in source.infolist():
+                data = source.read(info)
+                if info.filename.endswith("/manifest.json"):
+                    manifest = json.loads(data.decode("ascii"))
+                    manifest["limits"]["max_total_member_bytes"] = 1
+                    data = recovery._canonical_json(manifest)
+                output.writestr(info, data)
+        with mock.patch.object(recovery, "MAX_TOTAL_MEMBER_BYTES", 1):
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.verify_bundle(aggregate_archive)
+
     def test_manifest_duplicate_keys_and_provenance_schema_are_rejected(self) -> None:
         self.build()
         altered = self.root / "manifest-duplicate.zip"
@@ -200,6 +218,22 @@ class RecoveryBootstrapInstallTests(unittest.TestCase):
             self.assertEqual(installed.name, result["bundle_sha256"])
             self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o555)
             self.assertEqual(recovery.install_bundle(bundle, app_dir=app), installed)
+            member = installed / "platform_recovery_bootstrap.py"
+            member.chmod(0o644)
+            tampered = member.read_bytes() + b"\n# tampered generation\n"
+            member.write_bytes(tampered)
+            member.chmod(0o444)
+            manifest_path = installed / "manifest.json"
+            manifest_path.chmod(0o644)
+            manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+            for record in manifest["files"]:
+                if record["path"] == member.name:
+                    record["sha256"] = hashlib.sha256(tampered).hexdigest()
+                    break
+            manifest_path.write_bytes(recovery._canonical_json(manifest))
+            manifest_path.chmod(0o444)
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.install_bundle(bundle, app_dir=app)
             self.assertFalse(any(path.name.startswith(".") for path in (app / "shared" / ".release-recovery" / "generations").iterdir()))
 
 
@@ -238,6 +272,13 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         end = source.index("          }\n", start) + len("          }\n")
         return cls._set_assignment(textwrap.dedent(source[start:end]), "recovery_bootstrap_files")
 
+    @classmethod
+    def _workflow_bundle_set(cls, source: str) -> frozenset[str]:
+        marker = "          expected = {\n"
+        start = source.index(marker)
+        end = source.index("          }\n", start) + len("          }\n")
+        return cls._set_assignment(textwrap.dedent(source[start:end]), "expected")
+
     def test_fixed_entrypoint_has_only_abort_retained_capability(self) -> None:
         script = (TOOLS / "platform_abort_retained_only.sh").read_text(encoding="utf-8")
         self.assertIn("abort_retained_only", script)
@@ -251,6 +292,10 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("github.event.workflow_run.head_branch == 'dev'", workflow)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
         self.assertIn('"deployable":False', workflow)
+        self.assertIn(
+            'evidence_name="platform-recovery-bootstrap-evidence-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}.json"',
+            workflow,
+        )
         self.assertIn("actions: read", workflow)
         self.assertNotIn("PROD_SSH_KEY", workflow)
         self.assertNotIn("secrets.", workflow)
@@ -264,6 +309,14 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("actions: read", workflow)
         self.assertIn("attestations: read", workflow)
         self.assertIn("ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY", workflow)
+        self.assertIn(
+            "evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{run_id}-{attempt}.json\\n",
+            workflow,
+        )
+        self.assertNotIn(
+            "evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{run_id}-{attempt}\\n",
+            workflow,
+        )
         self.assertIn("platform_recovery_bootstrap.py\" install", workflow)
         self.assertIn("platform_abort_retained_only.sh", workflow)
         self.assertIn("platform_release_lock.sh\" --run", workflow)
@@ -290,6 +343,181 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             workflow,
         )
         self.assertNotIn("destination.write_bytes", workflow)
+        expected = frozenset(
+            f"{recovery.MEMBER_ROOT}/{name}"
+            for name in ("manifest.json", *recovery.RECOVERY_FILES)
+        )
+        self.assertEqual(expected, self._workflow_bundle_set(workflow))
+        loop = next(
+            line.strip()
+            for line in workflow.splitlines()
+            if line.strip().startswith("for name in manifest.json ")
+        )
+        loop_names = frozenset(
+            loop.removeprefix("for name in ").split("; do", 1)[0].split()
+        )
+        self.assertEqual(
+            loop_names,
+            frozenset(("manifest.json", *recovery.RECOVERY_FILES)),
+        )
+        self.assertNotIn("platform_build_live_qa_runtime.py", workflow)
+
+        transaction_source = (
+            TOOLS / "platform_release_transaction.py"
+        ).read_text(encoding="utf-8")
+        bootstrap_source = (
+            TOOLS / "platform_recovery_bootstrap.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--retain-receipt", transaction_source)
+        retained_cleanup = bootstrap_source.index('"--retain-receipt"')
+        systemd_clear = bootstrap_source.index('"clear", "--state"')
+        final_cleanup = bootstrap_source.rindex('"complete-recovery"')
+        self.assertLess(retained_cleanup, systemd_clear)
+        self.assertLess(systemd_clear, final_cleanup)
+
+        if os.geteuid() == 0:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                app = root / "app"
+                releases = app / "releases"
+                shared = app / "shared"
+                current = releases / "current-release"
+                previous = releases / "previous-release"
+                candidate = releases / "candidate-release"
+                releases.mkdir(parents=True)
+                shared.mkdir()
+                current.mkdir()
+                previous.mkdir()
+                candidate.mkdir()
+                (app / "current").symlink_to(current)
+                (app / "previous").symlink_to(previous)
+                shared_venv = shared / "venv"
+                shared_venv.mkdir()
+
+                def identity(path: Path) -> dict[str, int]:
+                    metadata = path.lstat()
+                    return {"dev": metadata.st_dev, "ino": metadata.st_ino}
+
+                receipt = {
+                    "version": 2,
+                    "operation": "install",
+                    "phase": "recovery-restored",
+                    "app_dir": str(app),
+                    "current_before": str(current),
+                    "previous_before": str(previous),
+                    "candidate_release": str(candidate),
+                    "shared_venv": str(shared_venv),
+                    "peer": str(shared / ".venv-install-candidate-release.none"),
+                    "snapshot": str(candidate / ".rollback/shared-venv-before-install"),
+                    "transition": "none",
+                    "shared_before": identity(shared_venv),
+                    "peer_before": None,
+                    "current_before_identity": identity(current),
+                    "previous_before_identity": identity(previous),
+                    "candidate_identity": identity(candidate),
+                    "remove_env_on_recovery": False,
+                    "service_state_before": {
+                        "deadlock-api": "active",
+                        "deadlock-worker": "inactive",
+                        "deadlock-web": "active",
+                    },
+                    "quiesced_services": [
+                        "deadlock-api",
+                        "deadlock-worker",
+                        "deadlock-web",
+                    ],
+                    "timer_active_before": False,
+                }
+                self.assertEqual(
+                    recovery._validate_receipt_identity(receipt, app), current
+                )
+
+                candidate.rmdir()
+                candidate.symlink_to(current)
+                with self.assertRaises(recovery.RecoveryBootstrapError):
+                    recovery._validate_receipt_identity(receipt, app)
+                candidate.unlink()
+                candidate.write_text("wrong object", encoding="ascii")
+                with self.assertRaises(recovery.RecoveryBootstrapError):
+                    recovery._validate_receipt_identity(receipt, app)
+                candidate.unlink()
+                receipt["phase"] = "prepared"
+                with self.assertRaises(recovery.RecoveryBootstrapError):
+                    recovery._validate_receipt_identity(receipt, app)
+
+            # Exercise both durable cleanup boundaries with a one-shot fault
+            # after the side effect. Each retry must skip already-cleared
+            # state and remove only the final operation receipt.
+            for failure_point in ("retain", "clear"):
+                with self.subTest(failure_point=failure_point), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    app = root / "app"
+                    releases = app / "releases"
+                    shared = app / "shared"
+                    candidate = releases / "candidate-release"
+                    peer = shared / ".venv-install-candidate-release.none"
+                    releases.mkdir(parents=True)
+                    shared.mkdir()
+                    candidate.mkdir()
+                    peer.mkdir()
+                    state = shared / ".release-operation.json"
+                    systemd_state = shared / ".release-systemd-state.json"
+                    state.write_text("{}", encoding="ascii")
+                    systemd_state.write_text("{}", encoding="ascii")
+                    receipt = {
+                        "previous_before": None,
+                        "candidate_release": str(candidate),
+                        "peer": str(peer),
+                    }
+                    calls: list[list[str]] = []
+                    failed = False
+
+                    def fake_run(command: list[str], **_kwargs: object) -> None:
+                        nonlocal failed
+                        calls.append(command)
+                        if "complete-recovery" in command:
+                            if "--retain-receipt" in command:
+                                if candidate.exists():
+                                    candidate.rmdir()
+                                if peer.exists():
+                                    peer.rmdir()
+                                if failure_point == "retain" and not failed:
+                                    failed = True
+                                    raise subprocess.CalledProcessError(1, command)
+                            else:
+                                state.unlink()
+                        elif "clear" in command:
+                            systemd_state.unlink()
+                            if failure_point == "clear" and not failed:
+                                failed = True
+                                raise subprocess.CalledProcessError(1, command)
+
+                    with (
+                        mock.patch.object(recovery.os, "geteuid", return_value=0),
+                        mock.patch.object(recovery, "_validate_generation_tree"),
+                        mock.patch.object(recovery, "_receipt_json", return_value=receipt),
+                        mock.patch.object(recovery, "_validate_receipt_identity", return_value=app / "releases" / "current-release"),
+                        mock.patch.object(recovery, "_safe_receipt"),
+                        mock.patch.object(recovery, "_release_pointer", return_value=app / "releases" / "current-release"),
+                        mock.patch.object(recovery.subprocess, "run", side_effect=fake_run),
+                    ):
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            recovery.abort_retained_only(
+                                app_dir=app,
+                                generation=root / ("a" * 64),
+                            )
+                        self.assertTrue(state.exists())
+                        if failure_point == "retain":
+                            self.assertTrue(systemd_state.exists())
+                        else:
+                            self.assertFalse(systemd_state.exists())
+                        recovery.abort_retained_only(
+                            app_dir=app,
+                            generation=root / ("a" * 64),
+                        )
+                    self.assertFalse(state.exists())
+                    self.assertFalse(systemd_state.exists())
+                    self.assertGreaterEqual(len(calls), 4)
 
     def test_recovery_bootstrap_route_is_non_deployable_and_mixed_runtime_is_deployable(self) -> None:
         sys.path.insert(0, str(TOOLS))

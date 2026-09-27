@@ -146,7 +146,7 @@ jobs:
               stream.write(f"recovery_run_id={recovery_run.get('id')}\n")
               stream.write(f"route_digest={route['digest'].removeprefix('sha256:')}\n")
               stream.write(f"bundle_name=platform-recovery-bootstrap-{source_sha}-{run_id}-{attempt}.zip\n")
-              stream.write(f"evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{run_id}-{attempt}\n")
+              stream.write(f"evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{run_id}-{attempt}.json\n")
           # Evidence and bundle are downloaded by the next step; the host is
           # not contacted and no production secret has been read yet.
           _ = route
@@ -467,13 +467,13 @@ jobs:
           expected = {
               "platform-recovery-bootstrap/manifest.json",
               "platform-recovery-bootstrap/platform_abort_retained_only.sh",
-              "platform-recovery-bootstrap/platform_build_live_qa_runtime.py",
               "platform-recovery-bootstrap/platform_live_qa_guard.py",
               "platform-recovery-bootstrap/platform_live_qa_runtime_install.py",
               "platform-recovery-bootstrap/platform_recovery_bootstrap.py",
               "platform-recovery-bootstrap/platform_release_lock.sh",
               "platform-recovery-bootstrap/platform_release_restore_runtime.sh",
               "platform-recovery-bootstrap/platform_release_transaction.py",
+              "platform-recovery-bootstrap/platform_release_systemd_state.py",
           }
           with zipfile.ZipFile(bundle) as source:
               names = [name for name in source.namelist() if name and not name.endswith('/')]
@@ -494,7 +494,7 @@ jobs:
                           pass
                       raise
           PY
-          for name in manifest.json platform_abort_retained_only.sh platform_build_live_qa_runtime.py platform_live_qa_guard.py platform_live_qa_runtime_install.py platform_recovery_bootstrap.py platform_release_lock.sh platform_release_restore_runtime.sh platform_release_transaction.py; do
+          for name in manifest.json platform_abort_retained_only.sh platform_live_qa_guard.py platform_live_qa_runtime_install.py platform_recovery_bootstrap.py platform_release_lock.sh platform_release_restore_runtime.sh platform_release_systemd_state.py platform_release_transaction.py; do
             if [[ "$name" == *.sh ]]; then
               validate_stage_file "$payload/$name" 555
             else

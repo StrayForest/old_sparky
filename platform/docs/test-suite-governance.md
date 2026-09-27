@@ -532,9 +532,10 @@ The immutable recovery-bootstrap contract is owned by the privileged contour
 (`tests.test_platform_recovery_bootstrap`). Its tests cover deterministic
 closed bundles, source/archive path and type rejection, exact manifest and
 provenance schemas, content-addressed atomic installation, receipt identity
-and migration-uncertainty guards, and the manual workflow's secret/SSH
-ordering. The workflow is evidence-only and non-deployable; live execution
-remains an explicit operator recovery action.
+and migration-uncertainty guards, missing-candidate and generation-byte
+provenance boundaries, two-phase receipt cleanup retries, and the manual
+workflow's secret/SSH ordering. The workflow is evidence-only and
+non-deployable; live execution remains an explicit operator recovery action.
 
 The `docs` gate checks document shape, repository-local links and project skill
 frontmatter/interface metadata. `verification-contract` checks registry/CI

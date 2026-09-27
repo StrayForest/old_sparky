@@ -24,9 +24,13 @@ The host installs one root-owned, immutable, content-addressed generation
 under `shared/.release-recovery/generations/<bundle-sha256>`. Its fixed
 entrypoint executes only `abort_retained_only`, accepts a v2
 `recovery-restored` install receipt, restores the recorded runtime, verifies
-the retained systemd receipt and calls `complete-recovery`. It never checks
-out source, runs Alembic, downgrades a migration or selects a normal deploy
-entrypoint.
+the retained systemd receipt, and performs two-phase completion: it removes
+the candidate/venv cleanup artifacts with `complete-recovery
+--retain-receipt`, clears the systemd receipt, and only then removes the
+operation receipt with a final `complete-recovery`. A retry after either
+durable cleanup side effect is idempotent and fails closed if the receipt pair
+or cleanup identities are inconsistent. It never checks out source, runs
+Alembic, downgrades a migration or selects a normal deploy entrypoint.
 
 ## Consequences
 

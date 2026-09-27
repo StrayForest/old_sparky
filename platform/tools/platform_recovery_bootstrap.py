@@ -42,6 +42,7 @@ WORKFLOW_RE = re.compile(r"^[A-Za-z0-9_. -]{1,128}$")
 JOB_RE = re.compile(r"^[A-Za-z0-9_. -]{1,128}$")
 MAX_FILE_BYTES = 768 * 1024
 MAX_ARCHIVE_BYTES = 8 * 1024 * 1024
+MAX_TOTAL_MEMBER_BYTES = 8 * 1024 * 1024
 MAX_FILES = 32
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_PROVENANCE_BYTES = 64 * 1024
@@ -276,6 +277,7 @@ def _manifest(
         "limits": {
             "max_archive_bytes": MAX_ARCHIVE_BYTES,
             "max_file_bytes": MAX_FILE_BYTES,
+            "max_total_member_bytes": MAX_TOTAL_MEMBER_BYTES,
             "max_files": MAX_FILES,
         },
         "files": records,
@@ -411,6 +413,7 @@ def _validate_manifest(
     if limits != {
         "max_archive_bytes": MAX_ARCHIVE_BYTES,
         "max_file_bytes": MAX_FILE_BYTES,
+        "max_total_member_bytes": MAX_TOTAL_MEMBER_BYTES,
         "max_files": MAX_FILES,
     }:
         raise RecoveryBootstrapError("recovery manifest limits are invalid")
@@ -465,15 +468,21 @@ def verify_bundle(
                 raise RecoveryBootstrapError("recovery archive member count is invalid")
             members: dict[str, bytes] = {}
             modes: dict[str, int] = {}
+            total_member_bytes = 0
             for info in infos:
                 name = _safe_member(info)
-                if name in members or info.file_size > MAX_FILE_BYTES:
+                if (
+                    name in members
+                    or info.file_size > MAX_FILE_BYTES
+                    or total_member_bytes > MAX_TOTAL_MEMBER_BYTES - info.file_size
+                ):
                     raise RecoveryBootstrapError("recovery archive member is invalid")
                 data = archive.read(info)
                 if len(data) != info.file_size or len(data) > MAX_FILE_BYTES:
                     raise RecoveryBootstrapError("recovery archive member size is invalid")
                 members[name] = data
                 modes[name] = (info.external_attr >> 16) & 0o7777
+                total_member_bytes += len(data)
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
         if isinstance(exc, RecoveryBootstrapError):
             raise
@@ -548,7 +557,11 @@ def _safe_generation_file(path: Path, *, mode: int, maximum: int = MAX_FILE_BYTE
 
 
 def _validate_generation_tree(
-    generation: Path, *, bundle_sha: str, require_generation_name: bool = True
+    generation: Path,
+    *,
+    bundle_sha: str,
+    require_generation_name: bool = True,
+    expected_members: dict[str, bytes] | None = None,
 ) -> None:
     if not HEX64_RE.fullmatch(bundle_sha) or (
         require_generation_name and generation.name != bundle_sha
@@ -580,6 +593,12 @@ def _validate_generation_tree(
         data = (generation / name).read_bytes()
         if _sha256(data) != record["sha256"]:
             raise RecoveryBootstrapError("recovery generation member digest is invalid")
+    if expected_members is not None:
+        if set(expected_members) != set(records) | {"manifest.json"}:
+            raise RecoveryBootstrapError("recovery generation does not match the bundle")
+        for name, expected in expected_members.items():
+            if (generation / name).read_bytes() != expected:
+                raise RecoveryBootstrapError("recovery generation does not match the bundle")
 
 
 def install_bundle(
@@ -623,7 +642,11 @@ def install_bundle(
     _safe_host_directory(generations, mode=0o755)
     target = generations / bundle_sha
     if os.path.lexists(target):
-        _validate_generation_tree(target, bundle_sha=bundle_sha)
+        _validate_generation_tree(
+            target,
+            bundle_sha=bundle_sha,
+            expected_members=verified["members"],
+        )
         return target
     temporary = generations / f".{bundle_sha}.install-{os.getpid()}"
     if os.path.lexists(temporary):
@@ -841,7 +864,10 @@ def _validate_receipt_identity(receipt: dict[str, object], app_dir: Path) -> Pat
         raise RecoveryBootstrapError("unexpected previous release pointer")
     if candidate_identity is None:
         raise RecoveryBootstrapError("release receipt candidate identity is invalid")
-    _validate_receipt_directory(candidate, candidate_identity, label="candidate release")
+    if os.path.lexists(candidate):
+        _validate_receipt_directory(candidate, candidate_identity, label="candidate release")
+    elif receipt["phase"] != "recovery-restored":
+        raise RecoveryBootstrapError("release receipt candidate release is unavailable")
     return current
 
 
@@ -854,38 +880,68 @@ def abort_retained_only(*, app_dir: Path, generation: Path) -> None:
     shared = app_dir / "shared"
     state = shared / ".release-operation.json"
     systemd_state = shared / ".release-systemd-state.json"
+    state_present = os.path.lexists(state)
+    systemd_state_present = os.path.lexists(systemd_state)
+    # A retry after the final transaction receipt was removed is a safe
+    # idempotent no-op.  A half-pair is never treated as completed: it could
+    # represent an interrupted cleanup or an unrelated host mutation.
+    if not state_present:
+        if systemd_state_present:
+            raise RecoveryBootstrapError("retained recovery receipts are incomplete")
+        return
     receipt = _receipt_json(state)
     release = _validate_receipt_identity(receipt, app_dir)
-    if not systemd_state.exists() or systemd_state.is_symlink():
-        raise RecoveryBootstrapError("retained systemd state receipt is missing")
-    _safe_receipt(systemd_state)
     transaction = generation / "platform_release_transaction.py"
     runtime = generation / "platform_release_restore_runtime.sh"
     systemd = generation / "platform_release_systemd_state.py"
     liveqa = generation / "platform_live_qa_runtime_install.py"
-    command = [
-        str(runtime),
-        "--app-dir", str(app_dir),
-        "--release", str(release),
-        "--systemd-state", str(systemd_state),
-        "--systemctl", "/usr/bin/systemctl",
-        "--live-qa-runtime-installer", str(liveqa),
-    ]
-    subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
-    if _release_pointer(app_dir, "current") != release:
-        raise RecoveryBootstrapError("current release changed during retained recovery")
-    if receipt.get("previous_before") is not None and _release_pointer(app_dir, "previous") != Path(str(receipt["previous_before"])):
-        raise RecoveryBootstrapError("previous release changed during retained recovery")
-    subprocess.run([
-        "/usr/bin/python3", "-I", str(systemd), "verify", "--state", str(systemd_state),
-        "--app-dir", str(app_dir), "--systemctl", "/usr/bin/systemctl",
-    ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+    if systemd_state_present:
+        _safe_receipt(systemd_state)
+        command = [
+            str(runtime),
+            "--app-dir", str(app_dir),
+            "--release", str(release),
+            "--systemd-state", str(systemd_state),
+            "--systemctl", "/usr/bin/systemctl",
+            "--live-qa-runtime-installer", str(liveqa),
+        ]
+        subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+        if _release_pointer(app_dir, "current") != release:
+            raise RecoveryBootstrapError("current release changed during retained recovery")
+        if receipt.get("previous_before") is not None and _release_pointer(app_dir, "previous") != Path(str(receipt["previous_before"])):
+            raise RecoveryBootstrapError("previous release changed during retained recovery")
+        subprocess.run([
+            "/usr/bin/python3", "-I", str(systemd), "verify", "--state", str(systemd_state),
+            "--app-dir", str(app_dir), "--systemctl", "/usr/bin/systemctl",
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+        # Remove candidate/venv cleanup artifacts but retain the operation
+        # receipt until the durable systemd receipt is also cleared.  A crash
+        # after either side effect can therefore resume without guessing.
+        subprocess.run([
+            "/usr/bin/python3", "-I", str(transaction), "complete-recovery", "--state", str(state),
+            "--retain-receipt",
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+        subprocess.run([
+            "/usr/bin/python3", "-I", str(systemd), "clear", "--state", str(systemd_state),
+            "--app-dir", str(app_dir), "--systemctl", "/usr/bin/systemctl",
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
+    else:
+        # The first attempt may have retained the operation receipt after
+        # completing its filesystem cleanup, then removed the systemd receipt
+        # before a process failure.  Do not rerun runtime/systemd side effects;
+        # prove the cleanup half is complete and finish the receipt deletion.
+        candidate = _receipt_release_path(
+            receipt.get("candidate_release"), app_dir=app_dir, label="candidate identity"
+        )
+        peer = Path(str(receipt.get("peer")))
+        if os.path.lexists(candidate) or os.path.lexists(peer):
+            raise RecoveryBootstrapError("systemd receipt is missing before transaction cleanup")
+
+    # This is the only operation that removes the release receipt.  It is
+    # deliberately after successful systemd clear, and is safe to retry after
+    # a failure in either prior subprocess.
     subprocess.run([
         "/usr/bin/python3", "-I", str(transaction), "complete-recovery", "--state", str(state),
-    ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
-    subprocess.run([
-        "/usr/bin/python3", "-I", str(systemd), "clear", "--state", str(systemd_state),
-        "--app-dir", str(app_dir), "--systemctl", "/usr/bin/systemctl",
     ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, close_fds=True)
 
 
