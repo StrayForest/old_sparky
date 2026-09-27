@@ -316,6 +316,8 @@ class HostToolsBundleTests(unittest.TestCase):
             manifest = first_summary["manifest"]
             self.assertIsInstance(manifest, dict)
             self.assertEqual(manifest["source_sha"], SOURCE_SHA)
+            self.assertEqual(candidate.MAX_BUNDLE_BYTES, bundle.MAX_BUNDLE_BYTES)
+            self.assertEqual(manifest["limits"]["max_bundle_bytes"], bundle.MAX_BUNDLE_BYTES)
             self.assertEqual(
                 manifest["components"],
                 {key: list(value) for key, value in bundle.COMPONENT_FILES.items()},
@@ -347,6 +349,12 @@ class HostToolsBundleTests(unittest.TestCase):
                 self.assertEqual(metadata.st_nlink, 1)
                 self.assertEqual(metadata.st_mode & 0o777, 0o600)
             self.assertFalse(any(contract.glob(".*.tmp")))
+
+            oversized = root / "oversized.zip"
+            with oversized.open("wb") as stream:
+                stream.truncate(bundle.MAX_BUNDLE_BYTES + 1)
+            with self.assertRaises(bundle.HostToolsBundleError):
+                bundle.verify_bundle(oversized, expected_source_sha=SOURCE_SHA)
 
     def test_generated_mode_contract_passes_workflow_consumer(self) -> None:
         """Keep files.modes aligned with the production shell consumer.
@@ -1874,7 +1882,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 patch.object(dispatcher, "__file__", str(generation / bundle.HOST_TOOL_FILES[0])):
                 self.assertEqual(dispatcher._host_capabilities(), 2)
 
-    def _candidate_event_fixture(self) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]], dict[str, object]]:
+    def _candidate_event_fixture(self) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
         base_sha = "1" * 40
         candidate_sha = "2" * 40
         run = {
@@ -1890,9 +1898,9 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             "head_branch": "codex/host-tools-bump",
             "repository": {"full_name": candidate.REPOSITORY},
             "head_repository": {"full_name": candidate.REPOSITORY},
+            "pull_requests": [{"number": 115}],
         }
         event = {"workflow_run": {**run, "pull_requests": [{"number": 115}]}}
-        pull_requests = [{"number": 115}]
         repository = {
             "full_name": candidate.REPOSITORY,
             "owner": {"login": "StrayForest"},
@@ -1910,28 +1918,25 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             },
             "merge_commit_sha": "3" * 40,
         }
-        return event, run, pull_requests, pr
+        return event, run, pr
 
     def test_candidate_event_context_binds_canonical_run_pr_and_base(self) -> None:
-        event, run, pull_requests, pr = self._candidate_event_fixture()
+        event, run, pr = self._candidate_event_fixture()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = {
                 "event": root / "event.json",
                 "run": root / "run.json",
-                "pull_requests": root / "pull_requests.json",
                 "pr": root / "pr.json",
                 "context": root / "context.json",
                 "output": root / "output",
             }
             paths["event"].write_text(json.dumps(event), encoding="utf-8")
             paths["run"].write_text(json.dumps(run), encoding="utf-8")
-            paths["pull_requests"].write_text(json.dumps(pull_requests), encoding="utf-8")
             paths["pr"].write_text(json.dumps(pr), encoding="utf-8")
             context = candidate.validate_context(
                 paths["event"],
                 paths["run"],
-                paths["pull_requests"],
                 paths["pr"],
                 output=paths["context"],
             )
@@ -1940,8 +1945,32 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             self.assertEqual(context.base_sha, "1" * 40)
             self.assertEqual(json.loads(paths["context"].read_text())["pull_request"]["number"], 115)
 
+    def test_candidate_context_rejects_empty_multiple_and_wrong_pr_associations(self) -> None:
+        event, run, pr = self._candidate_event_fixture()
+        payload_mutations = (
+            ("event-empty", [], run["pull_requests"]),
+            ("event-multiple", [{"number": 115}, {"number": 115}], run["pull_requests"]),
+            ("run-empty", event["workflow_run"]["pull_requests"], []),
+            ("run-multiple", event["workflow_run"]["pull_requests"], [{"number": 115}, {"number": 115}]),
+            ("event-wrong-association", [{"number": 116}], run["pull_requests"]),
+            ("run-wrong-association", event["workflow_run"]["pull_requests"], [{"number": 116}]),
+        )
+        for label, event_rows, run_rows in payload_mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                event_path = root / "event.json"
+                run_path = root / "run.json"
+                pr_path = root / "pr.json"
+                mutated_event = {"workflow_run": {**event["workflow_run"], "pull_requests": event_rows}}
+                mutated_run = {**run, "pull_requests": run_rows}
+                event_path.write_text(json.dumps(mutated_event), encoding="utf-8")
+                run_path.write_text(json.dumps(mutated_run), encoding="utf-8")
+                pr_path.write_text(json.dumps(pr), encoding="utf-8")
+                with self.assertRaises(candidate.CandidateError):
+                    candidate.validate_context(event_path, run_path, pr_path, output=root / "context.json")
+
     def test_candidate_context_rejects_stale_fork_ref_tag_merge_and_pr_state(self) -> None:
-        event, run, pull_requests, pr = self._candidate_event_fixture()
+        event, run, pr = self._candidate_event_fixture()
         mutations = (
             ("wrong-workflow", lambda value: {**value, "workflow_id": candidate.SECURITY_WORKFLOW_ID + 1}),
             ("wrong-conclusion", lambda value: {**value, "conclusion": "failure"}),
@@ -1952,22 +1981,19 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         for label, mutation in mutations:
             with self.subTest(label=label):
                 mutated_run = mutation(run)
-                mutated_event = {"workflow_run": {**mutated_run, "pull_requests": [{"number": 115}]}}
+                mutated_event = {"workflow_run": {**mutated_run}}
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
                     event_path = root / "event.json"
                     run_path = root / "run.json"
-                    prs_path = root / "prs.json"
                     pr_path = root / "pr.json"
                     event_path.write_text(json.dumps(mutated_event), encoding="utf-8")
                     run_path.write_text(json.dumps(mutated_run), encoding="utf-8")
-                    prs_path.write_text(json.dumps(pull_requests), encoding="utf-8")
                     pr_path.write_text(json.dumps(pr), encoding="utf-8")
                     with self.assertRaises(candidate.CandidateError):
                         candidate.validate_context(
                             event_path,
                             run_path,
-                            prs_path,
                             pr_path,
                             output=root / "context.json",
                         )
@@ -1979,6 +2005,9 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             ("draft", lambda value: {**value, "draft": True}),
             ("closed", lambda value: {**value, "state": "closed"}),
             ("wrong-base", lambda value: {**value, "base": {**value["base"], "ref": "main"}}),
+            ("wrong-pr-number", lambda value: {**value, "number": 116}),
+            ("stale-direct-head", lambda value: {**value, "head": {**value["head"], "sha": "3" * 40}}),
+            ("stale-direct-ref", lambda value: {**value, "head": {**value["head"], "ref": "old-host-tools"}}),
         ):
             with self.subTest(label=label):
                 mutated_pr = mutation(pr)
@@ -1986,17 +2015,14 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                     root = Path(temporary)
                     event_path = root / "event.json"
                     run_path = root / "run.json"
-                    prs_path = root / "prs.json"
                     pr_path = root / "pr.json"
                     event_path.write_text(json.dumps(event), encoding="utf-8")
                     run_path.write_text(json.dumps(run), encoding="utf-8")
-                    prs_path.write_text(json.dumps(pull_requests), encoding="utf-8")
                     pr_path.write_text(json.dumps(mutated_pr), encoding="utf-8")
                     with self.assertRaises(candidate.CandidateError):
                         candidate.validate_context(
                             event_path,
                             run_path,
-                            prs_path,
                             pr_path,
                             output=root / "context.json",
                         )
@@ -2135,15 +2161,92 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                             expected_head_ref="dev",
                         )
 
-    def test_candidate_ancestry_requires_base_ancestor_and_strict_pin(self) -> None:
-        head = subprocess.check_output(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], text=True).strip()
-        host = subprocess.check_output(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD^"], text=True).strip()
-        base = subprocess.check_output(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD^^"], text=True).strip()
-        candidate.verify_ancestry(REPO_ROOT, base_sha=base, host_tools_sha=host, candidate_sha=head)
-        with self.assertRaises(candidate.CandidateError):
-            candidate.verify_ancestry(REPO_ROOT, base_sha=head, host_tools_sha=host, candidate_sha=head)
-        with self.assertRaises(candidate.CandidateError):
-            candidate.verify_ancestry(REPO_ROOT, base_sha=base, host_tools_sha=head, candidate_sha=head)
+    def test_candidate_ancestry_accepts_pr_introduced_pin_after_merge_sync(self) -> None:
+        """Model PR115's post-dev-merge pin and reject PR116's old pin."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary) / "synthetic-repository"
+
+            def git(*arguments: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(repository), *arguments],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            def commit(name: str, filename: str, contents: str) -> str:
+                (repository / filename).write_text(contents, encoding="ascii")
+                git("add", filename)
+                git("commit", "-m", name)
+                return git("rev-parse", "HEAD")
+
+            repository.mkdir()
+            git("init", "--initial-branch=dev")
+            git("config", "user.email", "candidate-tests@example.invalid")
+            git("config", "user.name", "Candidate tests")
+            root_commit = commit("synthetic root", "root.txt", "root\n")
+            old_pin = commit("PR116 old pinned generation 4233", "old.txt", "old\n")
+            base_before_sync = commit("base before PR branch", "base.txt", "base\n")
+
+            git("switch", "-c", "pr115")
+            introduced_pin = commit("PR115 introduces host-tools generation C", "introduced.txt", "C\n")
+            git("switch", "dev")
+            current_base = commit("current dev advances", "dev.txt", "dev\n")
+            git("switch", "pr115")
+            git("merge", "--no-ff", "dev", "-m", "PR115 merge-syncs current dev")
+            candidate_head = git("rev-parse", "HEAD")
+
+            # Merge-syncing current dev leaves base reachable from E, while
+            # the newly introduced C remains outside base's reachable set.
+            candidate.verify_ancestry(
+                repository,
+                base_sha=current_base,
+                host_tools_sha=introduced_pin,
+                candidate_sha=candidate_head,
+            )
+
+            # PR116's old 4233 pin is still an ancestor of E, but current dev
+            # already reaches it; it is not a PR-introduced generation.
+            with self.assertRaises(candidate.CandidateError):
+                candidate.verify_ancestry(
+                    repository,
+                    base_sha=current_base,
+                    host_tools_sha=old_pin,
+                    candidate_sha=candidate_head,
+                )
+
+            with self.assertRaises(candidate.CandidateError):
+                candidate.verify_ancestry(
+                    repository,
+                    base_sha=current_base,
+                    host_tools_sha=candidate_head,
+                    candidate_sha=candidate_head,
+                )
+
+            git("switch", "-c", "unrelated", root_commit)
+            unrelated_pin = commit("unrelated host-tools generation", "unrelated.txt", "unrelated\n")
+            unrelated_base = commit("unrelated current base", "other-base.txt", "other\n")
+            git("switch", "pr115")
+            with self.assertRaises(candidate.CandidateError):
+                candidate.verify_ancestry(
+                    repository,
+                    base_sha=current_base,
+                    host_tools_sha=unrelated_pin,
+                    candidate_sha=candidate_head,
+                )
+            with self.assertRaises(candidate.CandidateError):
+                candidate.verify_ancestry(
+                    repository,
+                    base_sha=unrelated_base,
+                    host_tools_sha=introduced_pin,
+                    candidate_sha=candidate_head,
+                )
+
+            # Every SHA is explicit; this test never depends on the checkout's
+            # own history or on symbolic parent expressions.
+            self.assertNotEqual(base_before_sync, current_base)
 
     def test_candidate_workflow_is_workflow_run_only_trusted_and_non_deployable(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/platform-host-tools-candidate.yml").read_text(encoding="utf-8")
@@ -2153,6 +2256,8 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         self.assertIn("cancel-in-progress: true", workflow)
         self.assertIn("github.event.workflow_run.head_sha", workflow)
         self.assertIn("github.event.workflow_run.pull_requests[0].number", workflow)
+        self.assertIn("/attempts/$SECURITY_RUN_ATTEMPT", workflow)
+        self.assertNotIn("actions/runs/$SECURITY_RUN_ID/pull_requests", workflow)
         self.assertIn("actions: read", workflow)
         self.assertIn("pull-requests: read", workflow)
         self.assertIn("id-token: write", workflow)

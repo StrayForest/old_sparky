@@ -1499,6 +1499,7 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
         "--summary-artifact-id",
         "--candidate-artifact-id",
         "verify-ancestry",
+        "/attempts/$SECURITY_RUN_ATTEMPT",
         "Recheck PR, security run, attempt, and head before attestation",
         "Recheck PR, security run, attempt, and head before upload",
         "actions/attest-build-provenance@",
@@ -1520,6 +1521,8 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
         "actions/cache@",
         "actions/download-artifact@",
         "python3 -I candidate-data/",
+        "actions/runs/$SECURITY_RUN_ID/pull_requests",
+        "--pull-requests",
     ):
         if forbidden in workflow_text:
             issues.append(f"host-tools candidate workflow contains forbidden marker: {forbidden}")

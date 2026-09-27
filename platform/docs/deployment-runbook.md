@@ -99,8 +99,11 @@ It starts from a completed successful `Platform security and build`
 `dev`; it is not a manual install or deployment entrypoint.  The workflow
 checks out validators from an immutable trusted `dev` commit **T**, reads the
 pull-request head **E** only as data, resolves the pinned host-tools
-generation **C** from **E**, and requires `base <= C < E` plus the exact pinned
-closure.  Candidate source is never executed, imported or compiled.
+generation **C** from **E**, and requires the current base to be a strict
+ancestor of **E** while `C ∈ reachable(E) \ reachable(base)`. This accepts a
+merge-sync of current `dev` before a PR introduces **C**, but rejects a
+generation already reachable from current `dev`; the exact pinned closure is
+also required. Candidate source is never executed, imported or compiled.
 
 Before attestation and again before upload it revalidates the exact security
 run/attempt, PR number, head SHA/ref, base SHA/ref and canonical repository.

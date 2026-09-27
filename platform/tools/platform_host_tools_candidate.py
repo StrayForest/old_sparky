@@ -23,7 +23,7 @@ import stat
 import subprocess
 import sys
 import zipfile
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
 try:
     from . import platform_host_tools_bundle as bundle
@@ -46,6 +46,10 @@ MAX_SUMMARY_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_SUMMARY_BYTES = 512 * 1024
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 512 * 1024
+# The inner bundle and the manifest's max_bundle_bytes contract share one
+# owner.  The candidate validator must not widen that existing bound while
+# checking the upload-artifact envelope.
+MAX_BUNDLE_BYTES = bundle.MAX_BUNDLE_BYTES
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -288,11 +292,6 @@ def _strict_ancestor(root: Path, ancestor: str, descendant: str, description: st
         raise CandidateError(f"{description} is not a strict ancestor")
 
 
-def _ancestor(root: Path, ancestor: str, descendant: str, description: str) -> None:
-    if _git(root, "merge-base", "--is-ancestor", ancestor, descendant, check=False) != "0":
-        raise CandidateError(f"{description} is not an ancestor")
-
-
 @dataclass(frozen=True, slots=True)
 class RunContext:
     repository: str
@@ -348,6 +347,8 @@ def _workflow_run_fields(run: Mapping[str, object], *, expected: RunContext) -> 
     head_repository = _object(run.get("head_repository"), "security run head repository")
     if _repository(head_repository.get("full_name"), "security run head repository") != REPOSITORY:
         raise CandidateError("security run head repository is not canonical")
+    if _workflow_run_pull_request_number(run) != expected.pull_request:
+        raise CandidateError("security run pull request identity changed")
 
 
 def _pr_repository(value: object, description: str) -> None:
@@ -386,17 +387,14 @@ def _validate_pr(pr: Mapping[str, object], *, expected: RunContext) -> tuple[str
     return base_sha, head_ref
 
 
-def _pull_request_numbers(payload: object, expected: RunContext) -> None:
-    if isinstance(payload, list):
-        rows = payload
-    else:
-        root = _object(payload, "security run pull-request list")
-        rows = root.get("pull_requests")
+def _workflow_run_pull_request_number(payload: Mapping[str, object]) -> str:
+    """Read the one PR association carried by the canonical run payload."""
+
+    rows = payload.get("pull_requests")
     if not isinstance(rows, list) or len(rows) != 1:
         raise CandidateError("security run must have exactly one pull request")
     row = _object(rows[0], "security run pull request")
-    if _id(row.get("number"), "security run pull request number") != expected.pull_request:
-        raise CandidateError("security run pull request identity changed")
+    return _id(row.get("number"), "security run pull request number")
 
 
 def inspect_event(path: Path) -> RunContext:
@@ -418,11 +416,7 @@ def inspect_event(path: Path) -> RunContext:
     head_repository = _object(workflow_run.get("head_repository"), "workflow_run head repository")
     if _repository(head_repository.get("full_name"), "workflow_run head repository") != REPOSITORY:
         raise CandidateError("workflow_run head repository is not canonical")
-    pull_requests = workflow_run.get("pull_requests")
-    if not isinstance(pull_requests, list) or len(pull_requests) != 1:
-        raise CandidateError("workflow_run must identify exactly one pull request")
-    row = _object(pull_requests[0], "workflow_run pull request")
-    pull_request = _id(row.get("number"), "workflow_run pull request number")
+    pull_request = _workflow_run_pull_request_number(workflow_run)
     return RunContext(
         repository=REPOSITORY,
         workflow_id=SECURITY_WORKFLOW_ID,
@@ -440,7 +434,6 @@ def inspect_event(path: Path) -> RunContext:
 def validate_context(
     event_path: Path,
     run_path: Path,
-    pull_requests_path: Path,
     pr_path: Path,
     *,
     output: Path,
@@ -449,7 +442,6 @@ def validate_context(
     initial = inspect_event(event_path)
     run = _object(_read_json(run_path, description="security run"), "security run")
     _workflow_run_fields(run, expected=initial)
-    _pull_request_numbers(_read_json(pull_requests_path, description="security run pull requests"), initial)
     pr = _object(_read_json(pr_path, description="pull request"), "pull request")
     base_sha, head_ref = _validate_pr(pr, expected=initial)
     context = RunContext(
@@ -811,8 +803,17 @@ def verify_ancestry(source_root: Path, *, base_sha: str, host_tools_sha: str, ca
         raise CandidateError("candidate checkout is not the exact PR head")
     if _git(root, "cat-file", "-t", base) != "commit" or _git(root, "cat-file", "-t", host) != "commit":
         raise CandidateError("ancestry commit object is unavailable")
-    _ancestor(root, base, host, "base SHA")
+    # The current PR base must be present in E.  This allows a branch to
+    # merge-sync current dev before its host-tools pin C, while still binding
+    # C to commits introduced by the PR rather than an older generation that
+    # current dev already contains.
+    _strict_ancestor(root, base, candidate, "base SHA")
     _strict_ancestor(root, host, candidate, "host-tools SHA")
+    host_in_base = _git(root, "merge-base", "--is-ancestor", host, base, check=False)
+    if host_in_base == "0":
+        raise CandidateError("host-tools SHA is already reachable from the current base")
+    if host_in_base != "1":
+        raise CandidateError("host-tools/base reachability could not be determined")
 
 
 def _pin_payload(candidate_root: Path) -> Mapping[str, object]:
@@ -1087,7 +1088,6 @@ def _parser() -> argparse.ArgumentParser:
     context = sub.add_parser("validate-context")
     context.add_argument("--event", required=True, type=Path)
     context.add_argument("--run", required=True, type=Path)
-    context.add_argument("--pull-requests", required=True, type=Path)
     context.add_argument("--pr", required=True, type=Path)
     context.add_argument("--output", required=True, type=Path)
     context.add_argument("--github-output", type=Path)
@@ -1160,7 +1160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(json.dumps(context.as_payload(), sort_keys=True, separators=(",", ":")))
         elif args.command == "validate-context":
-            validate_context(args.event, args.run, args.pull_requests, args.pr, output=args.output, github_output=args.github_output)
+            validate_context(args.event, args.run, args.pr, output=args.output, github_output=args.github_output)
         elif args.command == "select-artifact-id":
             print(
                 select_artifact_id(

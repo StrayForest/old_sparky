@@ -97,11 +97,19 @@ environment approval.
 The workflow resolves an immutable trusted default-branch commit **T** and
 executes only validators and the deterministic bundle builder from **T**.  It
 checks the exact workflow ID/name/path, run ID/attempt/conclusion/head and
-canonical repository, then re-reads the same run attempt and pull request
-before attestation and again before artifact upload.  The pull request checkout
+canonical repository, then re-reads the same run attempt (including its
+canonical `pull_requests` payload) and pull request before attestation and
+again before artifact upload.  The pull request checkout
 **E** is data only: it is never imported, compiled, interpreted or executed.
 The trusted pin parser resolves host-tools generation **C** from **E**, and
-the handoff requires `base <= C < E`, the exact fixed closure and its digests.
+the handoff requires the current PR base to be a strict ancestor of **E** and
+`C ∈ reachable(E) \ reachable(base)`: **C** is a strict ancestor of **E** but
+is not already reachable from the current base. This deliberately accepts a
+PR branch that merge-syncs current `dev` before introducing **C**; the
+merge-sync makes the base reachable from **E**, while **C** remains reachable
+only from the PR head. An older pin already present in `dev` is rejected even
+though it is also an ancestor of **E**. The exact fixed closure and its
+digests remain required.
 
 The inner deterministic bundle is attested before upload.  Candidate and
 evidence artifact names bind the pull request, **C**, **E**, security run and
