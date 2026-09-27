@@ -241,6 +241,24 @@ attestation and upload.  Its successful output is bounded review evidence
 only: it never grants deploy/provision authority and production workflows must
 not consume its artifact prefixes.
 
+The handoff context keeps the triggering PR source head **E** separate from
+the synthetic merge SHA **M** that the security workflow tested.  The trusted
+validator binds the exact workflow/run/attempt and its embedded PR snapshot,
+then requires the current PR, the singular
+`refs/pull/<N>/merge` matching-ref response, and the commit API to agree on
+`[base, E]`, exactly two ordered parents and a valid tree.  The final summary
+must target **M**; any optional split provenance fields are a closed,
+type-checked exact comparison.  The route artifact is checked independently
+for `target_sha == M` and for the classifier digest shared with the summary.
+Jobs are read from the exact-attempt API and every row identity supplied by
+GitHub (`run_id`, `run_attempt`, source-head `head_sha`, source `head_branch`,
+`workflow_name`) is bound to the same run.  Artifact metadata uses the same
+source-head identity.  The complete immutable context is fetched and
+compared again immediately before attestation and upload, so PR synchronize,
+base/head/merge-ref/tree changes and reruns fail closed.  The candidate
+checkout remains data-only, while all validator code is checked out from
+trusted `dev` and invoked with `python -I -B`.
+
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route
 with `fallback=true` and `deployable=false`; these routes also run the

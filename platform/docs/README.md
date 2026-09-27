@@ -35,6 +35,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Security findings and evidence | [Application security audit](application-security-audit.md) |
 | Secret-bearing workflow artifact boundary | [Secret-job artifact boundary ADR](adr/secret-job-artifact-boundary.md) |
 | Release-independent host-tools generations / trusted PR handoff | [Production host-tools provisioning ADR](adr/production-host-tools-provisioning.md) |
+| Trusted CI-handoff source/merge identity | [Closed source-versus-tested merge identity](adr/production-host-tools-provisioning.md#closed-source-versus-tested-merge-identity) |
 | Historical implementation context | [`archive/`](archive/) |
 | Accepted architectural decisions | [`adr/`](adr/) |
 | Private tournament bearer reads | [Private bearer read boundary](adr/private-tournament-bearer-read-boundary.md) |

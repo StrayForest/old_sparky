@@ -1996,6 +1996,13 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
     def _candidate_event_fixture(self) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
         base_sha = "1" * 40
         candidate_sha = "2" * 40
+        merge_sha = "3" * 40
+        repository_snapshot = {"name": "old_sparky"}
+        pull_snapshot = {
+            "number": 115,
+            "head": {"ref": "codex/host-tools-bump", "sha": candidate_sha, "repo": repository_snapshot},
+            "base": {"ref": "dev", "sha": base_sha, "repo": repository_snapshot},
+        }
         run = {
             "id": 9001,
             "run_attempt": 2,
@@ -2005,13 +2012,16 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             "event": "pull_request",
             "status": "completed",
             "conclusion": "success",
+            # GitHub's workflow_run and exact-attempt job/artifact identities
+            # carry the source head E. The current PR merge ref/commit below
+            # establishes the separately tested synthetic merge M.
             "head_sha": candidate_sha,
             "head_branch": "codex/host-tools-bump",
             "repository": {"full_name": candidate.REPOSITORY},
             "head_repository": {"full_name": candidate.REPOSITORY},
-            "pull_requests": [{"number": 115}],
+            "pull_requests": [pull_snapshot],
         }
-        event = {"workflow_run": {**run, "pull_requests": [{"number": 115}]}}
+        event = {"workflow_run": {**run, "pull_requests": [pull_snapshot]}}
         repository = {
             "full_name": candidate.REPOSITORY,
             "owner": {"login": "StrayForest"},
@@ -2027,34 +2037,81 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 "label": "StrayForest:codex/host-tools-bump",
                 "repo": repository,
             },
-            "merge_commit_sha": "3" * 40,
+            "merge_commit_sha": merge_sha,
         }
         return event, run, pr
+
+    def _candidate_context_files(
+        self,
+        root: Path,
+        event: dict[str, object],
+        run: dict[str, object],
+        pr: dict[str, object],
+    ) -> dict[str, Path]:
+        merge_sha = str(pr["merge_commit_sha"])
+        base_sha = str(pr["base"]["sha"])
+        head_sha = str(pr["head"]["sha"])
+        files = {
+            "event": root / "event.json",
+            "run": root / "run.json",
+            "latest": root / "latest.json",
+            "pr": root / "pr.json",
+            "merge_ref": root / "merge-ref.json",
+            "commit": root / "commit.json",
+            "context": root / "context.json",
+            "output": root / "output",
+        }
+        files["event"].write_text(json.dumps(event), encoding="utf-8")
+        files["run"].write_text(json.dumps(run), encoding="utf-8")
+        files["latest"].write_text(json.dumps(run), encoding="utf-8")
+        files["pr"].write_text(json.dumps(pr), encoding="utf-8")
+        files["merge_ref"].write_text(
+            json.dumps(
+                [
+                    {
+                        "ref": "refs/pull/115/merge",
+                        "object": {"type": "commit", "sha": merge_sha},
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        files["commit"].write_text(
+            json.dumps(
+                {
+                    "sha": merge_sha,
+                    "commit": {"tree": {"sha": "4" * 40}},
+                    "parents": [{"sha": base_sha}, {"sha": head_sha}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return files
 
     def test_candidate_event_context_binds_canonical_run_pr_and_base(self) -> None:
         event, run, pr = self._candidate_event_fixture()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            paths = {
-                "event": root / "event.json",
-                "run": root / "run.json",
-                "pr": root / "pr.json",
-                "context": root / "context.json",
-                "output": root / "output",
-            }
-            paths["event"].write_text(json.dumps(event), encoding="utf-8")
-            paths["run"].write_text(json.dumps(run), encoding="utf-8")
-            paths["pr"].write_text(json.dumps(pr), encoding="utf-8")
+            paths = self._candidate_context_files(root, event, run, pr)
             context = candidate.validate_context(
                 paths["event"],
                 paths["run"],
                 paths["pr"],
+                paths["merge_ref"],
+                paths["commit"],
                 output=paths["context"],
+                latest_run_path=paths["latest"],
             )
             self.assertEqual(context.run_id, "9001")
             self.assertEqual(context.run_attempt, "2")
-            self.assertEqual(context.base_sha, "1" * 40)
-            self.assertEqual(json.loads(paths["context"].read_text())["pull_request"]["number"], 115)
+            self.assertEqual(context.original_source_head_sha, "2" * 40)
+            self.assertEqual(context.original_base_sha, "1" * 40)
+            self.assertEqual(context.tested_merge_sha, "3" * 40)
+            self.assertEqual(context.tested_parents, ("1" * 40, "2" * 40))
+            payload = json.loads(paths["context"].read_text())
+            self.assertEqual(payload["pull_request"]["number"], 115)
+            self.assertEqual(payload["security_run"]["head_sha"], "2" * 40)
+            self.assertEqual(payload["tested_merge"]["sha"], "3" * 40)
 
     def test_candidate_context_rejects_empty_multiple_and_wrong_pr_associations(self) -> None:
         event, run, pr = self._candidate_event_fixture()
@@ -2069,16 +2126,11 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         for label, event_rows, run_rows in payload_mutations:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                event_path = root / "event.json"
-                run_path = root / "run.json"
-                pr_path = root / "pr.json"
                 mutated_event = {"workflow_run": {**event["workflow_run"], "pull_requests": event_rows}}
                 mutated_run = {**run, "pull_requests": run_rows}
-                event_path.write_text(json.dumps(mutated_event), encoding="utf-8")
-                run_path.write_text(json.dumps(mutated_run), encoding="utf-8")
-                pr_path.write_text(json.dumps(pr), encoding="utf-8")
+                paths = self._candidate_context_files(root, mutated_event, mutated_run, pr)
                 with self.assertRaises(candidate.CandidateError):
-                    candidate.validate_context(event_path, run_path, pr_path, output=root / "context.json")
+                    candidate.validate_context(paths["event"], paths["run"], paths["pr"], paths["merge_ref"], paths["commit"], latest_run_path=paths["latest"], output=root / "context.json")
 
     def test_candidate_context_rejects_stale_fork_ref_tag_merge_and_pr_state(self) -> None:
         event, run, pr = self._candidate_event_fixture()
@@ -2086,6 +2138,8 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             ("wrong-workflow", lambda value: {**value, "workflow_id": candidate.SECURITY_WORKFLOW_ID + 1}),
             ("wrong-conclusion", lambda value: {**value, "conclusion": "failure"}),
             ("wrong-event", lambda value: {**value, "event": "push"}),
+            ("wrong-source-head", lambda value: {**value, "head_sha": "4" * 40}),
+            ("merge-as-source-head", lambda value: {**value, "head_sha": "3" * 40}),
             ("fork-run", lambda value: {**value, "head_repository": {"full_name": "attacker/old_sparky"}}),
             ("missing-head-repository", lambda value: {key: item for key, item in value.items() if key != "head_repository"}),
         )
@@ -2095,17 +2149,15 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 mutated_event = {"workflow_run": {**mutated_run}}
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
-                    event_path = root / "event.json"
-                    run_path = root / "run.json"
-                    pr_path = root / "pr.json"
-                    event_path.write_text(json.dumps(mutated_event), encoding="utf-8")
-                    run_path.write_text(json.dumps(mutated_run), encoding="utf-8")
-                    pr_path.write_text(json.dumps(pr), encoding="utf-8")
+                    paths = self._candidate_context_files(root, mutated_event, mutated_run, pr)
                     with self.assertRaises(candidate.CandidateError):
                         candidate.validate_context(
-                            event_path,
-                            run_path,
-                            pr_path,
+                            paths["event"],
+                            paths["run"],
+                            paths["pr"],
+                            paths["merge_ref"],
+                            paths["commit"],
+                            latest_run_path=paths["latest"],
                             output=root / "context.json",
                         )
 
@@ -2113,6 +2165,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             ("fork-pr", lambda value: {**value, "head": {**value["head"], "repo": {"full_name": "attacker/old_sparky", "owner": {"login": "attacker"}}}}),
             ("tag-ref", lambda value: {**value, "head": {**value["head"], "ref": "refs/tags/v1"}}),
             ("synthetic-merge", lambda value: {**value, "merge_commit_sha": value["head"]["sha"]}),
+            ("missing-merge", lambda value: {**value, "merge_commit_sha": None}),
             ("draft", lambda value: {**value, "draft": True}),
             ("closed", lambda value: {**value, "state": "closed"}),
             ("wrong-base", lambda value: {**value, "base": {**value["base"], "ref": "main"}}),
@@ -2124,18 +2177,162 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 mutated_pr = mutation(pr)
                 with tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary)
-                    event_path = root / "event.json"
-                    run_path = root / "run.json"
-                    pr_path = root / "pr.json"
-                    event_path.write_text(json.dumps(event), encoding="utf-8")
-                    run_path.write_text(json.dumps(run), encoding="utf-8")
-                    pr_path.write_text(json.dumps(mutated_pr), encoding="utf-8")
+                    paths = self._candidate_context_files(root, event, run, mutated_pr)
                     with self.assertRaises(candidate.CandidateError):
                         candidate.validate_context(
-                            event_path,
-                            run_path,
-                            pr_path,
+                            paths["event"],
+                            paths["run"],
+                            paths["pr"],
+                            paths["merge_ref"],
+                            paths["commit"],
+                            latest_run_path=paths["latest"],
                             output=root / "context.json",
+                        )
+
+    def test_candidate_context_rejects_merge_ref_parent_tree_and_source_substitution(self) -> None:
+        """The source head and tested synthetic merge are distinct authorities."""
+
+        event, run, pr = self._candidate_event_fixture()
+        for label, mutate in (
+            (
+                "head-substitution",
+                lambda files, payload: payload["workflow_run"]["pull_requests"][0]["head"].update(
+                    {"sha": "5" * 40}
+                ),
+            ),
+            (
+                "base-substitution",
+                lambda files, payload: payload["workflow_run"]["pull_requests"][0]["base"].update(
+                    {"sha": "6" * 40}
+                ),
+            ),
+            (
+                "merge-ref-mismatch",
+                lambda files, payload: payload[0]["object"].update({"sha": "7" * 40}),
+            ),
+            ("empty-merge-ref", lambda files, payload: payload.clear()),
+            (
+                "multiple-merge-refs",
+                lambda files, payload: payload.append(payload[0]),
+            ),
+            (
+                "commit-sha-mismatch",
+                lambda files, payload: payload.update({"sha": "8" * 40}),
+            ),
+            (
+                "wrong-parent-order",
+                lambda files, payload: payload["parents"].reverse(),
+            ),
+            (
+                "wrong-parent-count",
+                lambda files, payload: payload["parents"].append({"sha": "8" * 40}),
+            ),
+            (
+                "invalid-tree",
+                lambda files, payload: payload["commit"]["tree"].update({"sha": "not-a-sha"}),
+            ),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                paths = self._candidate_context_files(root, event, run, pr)
+                target = (
+                    paths["event"]
+                    if label in {"head-substitution", "base-substitution"}
+                    else paths["merge_ref"]
+                    if label in {"merge-ref-mismatch", "empty-merge-ref", "multiple-merge-refs"}
+                    else paths["commit"]
+                )
+                payload = json.loads(target.read_text(encoding="utf-8"))
+                mutate(paths, payload)
+                target.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(candidate.CandidateError):
+                    candidate.validate_context(
+                        paths["event"],
+                        paths["run"],
+                        paths["pr"],
+                        paths["merge_ref"],
+                        paths["commit"],
+                        latest_run_path=paths["latest"],
+                        output=paths["output"],
+                    )
+
+    def test_candidate_context_recheck_rejects_pr_merge_tree_and_rerun_races(self) -> None:
+        """A second API snapshot must remain byte-for-byte the same context."""
+
+        event, run, pr = self._candidate_event_fixture()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self._candidate_context_files(root, event, run, pr)
+            candidate.validate_context(
+                paths["event"],
+                paths["run"],
+                paths["pr"],
+                paths["merge_ref"],
+                paths["commit"],
+                latest_run_path=paths["latest"],
+                output=paths["context"],
+            )
+            partial_latest = {**run, "pull_requests": [{"number": 115}]}
+            paths["latest"].write_text(json.dumps(partial_latest), encoding="utf-8")
+            candidate.validate_context(
+                paths["event"],
+                paths["run"],
+                paths["pr"],
+                paths["merge_ref"],
+                paths["commit"],
+                latest_run_path=paths["latest"],
+                expected_context_path=paths["context"],
+                output=paths["output"],
+            )
+            for label, path_key, mutate in (
+                (
+                    "rerun-attempt",
+                    "latest",
+                    lambda payload: payload.update({"run_attempt": 3}),
+                ),
+                (
+                    "base-race",
+                    "pr",
+                    lambda payload: payload["base"].update({"sha": "5" * 40}),
+                ),
+                (
+                    "head-race",
+                    "pr",
+                    lambda payload: payload["head"].update({"sha": "6" * 40}),
+                ),
+                (
+                    "merge-race",
+                    "pr",
+                    lambda payload: payload.update({"merge_commit_sha": "7" * 40}),
+                ),
+                (
+                    "merge-ref-race",
+                    "merge_ref",
+                    lambda payload: payload[0]["object"].update({"sha": "8" * 40}),
+                ),
+                (
+                    "tree-race",
+                    "commit",
+                    lambda payload: payload["commit"]["tree"].update({"sha": "9" * 40}),
+                ),
+            ):
+                with self.subTest(label=label):
+                    # Restore every input to the original snapshot before
+                    # introducing one race at a time.
+                    fresh = self._candidate_context_files(root, event, run, pr)
+                    payload = json.loads(fresh[path_key].read_text(encoding="utf-8"))
+                    mutate(payload)
+                    fresh[path_key].write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.validate_context(
+                            fresh["event"],
+                            fresh["run"],
+                            fresh["pr"],
+                            fresh["merge_ref"],
+                            fresh["commit"],
+                            latest_run_path=fresh["latest"],
+                            expected_context_path=paths["context"],
+                            output=fresh["output"],
                         )
 
     def test_candidate_jobs_and_final_summary_are_closed_and_successful(self) -> None:
@@ -2146,14 +2343,21 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             workflow_path=candidate.SECURITY_WORKFLOW_PATH,
             run_id="9001",
             run_attempt="2",
-            candidate_sha="2" * 40,
-            head_ref="codex/host-tools-bump",
-            base_sha="1" * 40,
             pull_request="115",
+            original_source_head_sha="2" * 40,
+            original_base_sha="1" * 40,
+            original_base_ref="dev",
+            original_head_ref="codex/host-tools-bump",
+            original_base_repository=candidate.REPOSITORY,
+            original_head_repository=candidate.REPOSITORY,
+            tested_merge_ref="refs/pull/115/merge",
+            tested_merge_sha="3" * 40,
+            tested_tree_sha="4" * 40,
+            tested_parents=("1" * 40, "2" * 40),
         )
         summary = {
             "schema": 1,
-            "tested_sha": context.candidate_sha,
+            "tested_sha": context.tested_merge_sha,
             "event": "pull_request",
             "route_event": "pull_request",
             "class": "full",
@@ -2176,6 +2380,12 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             {
                 "id": index + 1,
                 "name": name,
+                "run_id": 9001,
+                "run_attempt": 2,
+                "head_sha": context.original_source_head_sha,
+                "head_branch": context.original_head_ref,
+                "workflow_name": candidate.SECURITY_WORKFLOW_NAME,
+                "check_run_url": f"https://api.github.com/repos/StrayForest/old_sparky/check-runs/{index + 100}",
                 "status": "completed",
                 "conclusion": "skipped" if name in candidate.CONDITIONAL_JOB_NAMES else "success",
             }
@@ -2204,6 +2414,224 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 with self.subTest(label=label):
                     with self.assertRaises(candidate.CandidateError):
                         candidate._validate_summary(bad_summary, context)
+
+            # The exact-attempt jobs endpoint is the authority for each row's
+            # identity.  A successful row from another run/attempt, source,
+            # branch, or workflow is not interchangeable with this run.
+            for label, field, value in (
+                ("cross-run", "run_id", 9002),
+                ("cross-attempt", "run_attempt", 3),
+                ("source-head", "head_sha", "5" * 40),
+                ("merge-as-head", "head_sha", context.tested_merge_sha),
+                ("source-branch", "head_branch", "other-branch"),
+                ("workflow", "workflow_name", "Other workflow"),
+                ("check-run-url", "check_run_url", "https://evil.example/check-runs/1"),
+            ):
+                bad_jobs = list(jobs)
+                bad_jobs[0] = {**bad_jobs[0], field: value}
+                path.write_text(json.dumps({"total_count": len(bad_jobs), "jobs": bad_jobs}), encoding="utf-8")
+                with self.subTest(job_identity=label):
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.verify_jobs(path, context, summary)
+
+            split_summary = {
+                **summary,
+                "source_head_sha": context.original_source_head_sha,
+                "base_sha": context.original_base_sha,
+                "tested_tree_sha": context.tested_tree_sha,
+                "tested_parents": list(context.tested_parents),
+            }
+            candidate._validate_summary(split_summary, context)
+            alias_split_summary = {
+                **summary,
+                "source_sha": context.original_source_head_sha,
+                "base_sha": context.original_base_sha,
+                "tree_sha": context.tested_tree_sha,
+                "parents": list(context.tested_parents),
+            }
+            candidate._validate_summary(alias_split_summary, context)
+            for label, changed in (
+                ("arbitrary-tested-sha", {**summary, "tested_sha": "9" * 40}),
+                ("source-as-tested-sha", {**summary, "tested_sha": context.original_source_head_sha}),
+                ("malicious-extra", {**summary, "untrusted": "accepted"}),
+                ("schema", {**summary, "schema": 2}),
+                (
+                    "split-source-mismatch",
+                    {**split_summary, "source_head_sha": "5" * 40},
+                ),
+                (
+                    "split-parent-order",
+                    {**split_summary, "tested_parents": list(reversed(context.tested_parents))},
+                ),
+                (
+                    "split-extra-key",
+                    {**split_summary, "unexpected": True},
+                ),
+            ):
+                with self.subTest(summary_identity=label):
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate._validate_summary(changed, context)
+
+    def test_candidate_artifacts_bind_route_target_digest_and_attempt(self) -> None:
+        """Classifier output is data-only and must target the tested merge."""
+
+        context = candidate.RunContext(
+            repository=candidate.REPOSITORY,
+            workflow_id=candidate.SECURITY_WORKFLOW_ID,
+            workflow_name=candidate.SECURITY_WORKFLOW_NAME,
+            workflow_path=candidate.SECURITY_WORKFLOW_PATH,
+            run_id="9001",
+            run_attempt="2",
+            pull_request="115",
+            original_source_head_sha="2" * 40,
+            original_base_sha="1" * 40,
+            original_base_ref="dev",
+            original_head_ref="codex/host-tools-bump",
+            original_base_repository=candidate.REPOSITORY,
+            original_head_repository=candidate.REPOSITORY,
+            tested_merge_ref="refs/pull/115/merge",
+            tested_merge_sha="3" * 40,
+            tested_tree_sha="4" * 40,
+            tested_parents=("1" * 40, "2" * 40),
+        )
+        manifest_base = {
+            "schema": 1,
+            "version": 1,
+            "target_sha": context.tested_merge_sha,
+            "event": "pull_request",
+            "class": "full",
+            "expected_gates": list(candidate.FULL_GATE_IDS),
+            "runtime_sensitive": False,
+            "deployable": False,
+            "fallback": False,
+            "reason": "candidate requires full verification",
+            "files": ["platform-ci-route.json"],
+        }
+
+        def write_route_fixture(
+            root: Path,
+            manifest: dict[str, object],
+            *,
+            attempt: int = 2,
+            artifact_head_sha: str | None = None,
+        ) -> tuple[Path, Path]:
+            manifest = {**manifest}
+            manifest["digest"] = candidate._route_manifest_digest(manifest)
+            archive = root / f"route-{attempt}.zip"
+            member = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as opened:
+                opened.writestr(candidate.ROUTE_MANIFEST_MEMBER, member)
+            archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            metadata = root / f"route-{attempt}.json"
+            metadata.write_text(
+                json.dumps(
+                    {
+                        "id": 123,
+                        "name": "platform-ci-route-9001-2",
+                        "expired": False,
+                        "size_in_bytes": archive.stat().st_size,
+                        "digest": f"sha256:{archive_digest}",
+                        "workflow_run": {
+                            "id": 9001,
+                            "run_attempt": attempt,
+                            "head_sha": artifact_head_sha or context.original_source_head_sha,
+                            "head_branch": context.original_head_ref,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return metadata, archive
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            context_path = root / "context.json"
+            context_path.write_text(json.dumps(context.as_payload()), encoding="utf-8")
+            metadata, archive = write_route_fixture(root, manifest_base)
+            listing = root / "route-list.json"
+            listing.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "id": 123,
+                                "name": "platform-ci-route-9001-2",
+                                "expired": False,
+                                "workflow_run": {"id": 9001, "run_attempt": 2},
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                candidate.select_artifact_id(
+                    listing,
+                    name="platform-ci-route-9001-2",
+                    run_id="9001",
+                    run_attempt="2",
+                ),
+                "123",
+            )
+            result = candidate.verify_route_artifact(
+                context_path,
+                metadata,
+                archive,
+                expected_artifact_id="123",
+                expected_manifest_digest=candidate._route_manifest_digest(manifest_base),
+            )
+            self.assertEqual(result["manifest"]["target_sha"], context.tested_merge_sha)
+            bad_metadata, bad_archive = write_route_fixture(
+                root,
+                manifest_base,
+                artifact_head_sha=context.tested_merge_sha,
+            )
+            with self.assertRaises(candidate.CandidateError):
+                candidate.verify_route_artifact(
+                    context_path,
+                    bad_metadata,
+                    bad_archive,
+                    expected_artifact_id="123",
+                    expected_manifest_digest=candidate._route_manifest_digest(manifest_base),
+                )
+            for label, manifest, expected_digest, attempt in (
+                (
+                    "source-head-target",
+                    {**manifest_base, "target_sha": context.original_source_head_sha},
+                    candidate._route_manifest_digest(
+                        {**manifest_base, "target_sha": context.original_source_head_sha}
+                    ),
+                    2,
+                ),
+                (
+                    "summary-digest-mismatch",
+                    manifest_base,
+                    "f" * 64,
+                    2,
+                ),
+                (
+                    "cross-attempt-artifact",
+                    manifest_base,
+                    candidate._route_manifest_digest(manifest_base),
+                    3,
+                ),
+                (
+                    "extra-manifest-key",
+                    {**manifest_base, "unexpected": True},
+                    candidate._route_manifest_digest({**manifest_base, "unexpected": True}),
+                    2,
+                ),
+            ):
+                with self.subTest(route_identity=label):
+                    bad_metadata, bad_archive = write_route_fixture(root, manifest, attempt=attempt)
+                    with self.assertRaises(candidate.CandidateError):
+                        candidate.verify_route_artifact(
+                            context_path,
+                            bad_metadata,
+                            bad_archive,
+                            expected_artifact_id="123",
+                            expected_manifest_digest=expected_digest,
+                        )
 
     def test_candidate_artifact_metadata_binds_outer_digest_size_and_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2312,39 +2740,39 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             # Merge-syncing current dev leaves base reachable from E, while
             # the newly introduced C remains outside base's reachable set.
             self.assertTrue(
-                candidate.verify_ancestry(
-                    repository,
-                    base_sha=current_base,
-                    host_tools_sha=introduced_pin,
-                    candidate_sha=candidate_head,
+                    candidate.verify_ancestry(
+                        repository,
+                        base_sha=current_base,
+                        host_tools_sha=introduced_pin,
+                        source_head_sha=candidate_head,
                 )
             )
 
             # PR116's old 4233 pin is still an ancestor of E, but current dev
             # already reaches it; it is not a PR-introduced generation.
             self.assertFalse(
-                candidate.verify_ancestry(
-                    repository,
-                    base_sha=current_base,
-                    host_tools_sha=old_pin,
-                    candidate_sha=candidate_head,
+                    candidate.verify_ancestry(
+                        repository,
+                        base_sha=current_base,
+                        host_tools_sha=old_pin,
+                        source_head_sha=candidate_head,
                 )
             )
 
             with self.assertRaises(candidate.CandidateError):
-                candidate.verify_ancestry(
-                    repository,
-                    base_sha=current_base,
-                    host_tools_sha="malformed-host-tools-pin",
-                    candidate_sha=candidate_head,
+                    candidate.verify_ancestry(
+                        repository,
+                        base_sha=current_base,
+                        host_tools_sha="malformed-host-tools-pin",
+                        source_head_sha=candidate_head,
                 )
 
             with self.assertRaises(candidate.CandidateError):
-                candidate.verify_ancestry(
-                    repository,
-                    base_sha=current_base,
-                    host_tools_sha=candidate_head,
-                    candidate_sha=candidate_head,
+                    candidate.verify_ancestry(
+                        repository,
+                        base_sha=current_base,
+                        host_tools_sha=candidate_head,
+                        source_head_sha=candidate_head,
                 )
 
             git("switch", "-c", "unrelated", root_commit)
@@ -2352,18 +2780,18 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
             unrelated_base = commit("unrelated current base", "other-base.txt", "other\n")
             git("switch", "pr115")
             with self.assertRaises(candidate.CandidateError):
-                candidate.verify_ancestry(
-                    repository,
-                    base_sha=current_base,
-                    host_tools_sha=unrelated_pin,
-                    candidate_sha=candidate_head,
+                    candidate.verify_ancestry(
+                        repository,
+                        base_sha=current_base,
+                        host_tools_sha=unrelated_pin,
+                        source_head_sha=candidate_head,
                 )
             with self.assertRaises(candidate.CandidateError):
-                candidate.verify_ancestry(
-                    repository,
-                    base_sha=unrelated_base,
-                    host_tools_sha=introduced_pin,
-                    candidate_sha=candidate_head,
+                    candidate.verify_ancestry(
+                        repository,
+                        base_sha=unrelated_base,
+                        host_tools_sha=introduced_pin,
+                        source_head_sha=candidate_head,
                 )
 
             # Every SHA is explicit; this test never depends on the checkout's
@@ -2413,8 +2841,39 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         self.assertNotIn(candidate.CANDIDATE_ARTIFACT_PREFIX, production_text)
         self.assertNotIn(candidate.EVIDENCE_ARTIFACT_PREFIX, production_text)
         self.assertEqual(host_tools_candidate_workflow_issues(), [])
+        candidate_job = re.search(
+            r"^  build-candidate:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(candidate_job)
+        assert candidate_job is not None
+        blocks = list(_workflow_step_blocks(candidate_job.group("body")))
+        names = [
+            re.match(r"^      - name: (?P<name>[^\n]+)", block, re.MULTILINE).group("name")
+            for block in blocks
+        ]
+        attestation_index = names.index("Attest exact inner host-tools ZIP")
+        attestation_recheck_index = names.index(
+            "Recheck PR, security run, attempt, and head before attestation"
+        )
+        blocks[attestation_index], blocks[attestation_recheck_index] = (
+            blocks[attestation_recheck_index],
+            blocks[attestation_index],
+        )
+        broken_order = (
+            workflow[: candidate_job.start("body")]
+            + "".join(blocks)
+            + workflow[candidate_job.end("body") :]
+        )
+        self.assertTrue(
+            any(
+                "must recheck before Attest exact inner host-tools ZIP" in issue
+                for issue in host_tools_candidate_workflow_issues(broken_order)
+            )
+        )
         artifact_zip_blocks = host_tools_candidate_artifact_zip_curl_blocks(workflow)
-        self.assertEqual(len(artifact_zip_blocks), 3)
+        self.assertEqual(len(artifact_zip_blocks), 4)
         for block in artifact_zip_blocks:
             broken_workflow = workflow.replace(
                 block,
@@ -2462,7 +2921,21 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                             "head_sha": "a" * 40,
                             "head_branch": "feature/candidate",
                             "head_repository": {"full_name": "StrayForest/old_sparky"},
-                            "pull_requests": [{"number": 117}],
+                            "pull_requests": [
+                                {
+                                    "number": 117,
+                                    "base": {
+                                        "ref": "dev",
+                                        "sha": "b" * 40,
+                                        "repo": {"name": "old_sparky"},
+                                    },
+                                    "head": {
+                                        "ref": "feature/candidate",
+                                        "sha": "a" * 40,
+                                        "repo": {"name": "old_sparky"},
+                                    },
+                                }
+                            ],
                         }
                     }
                 ),
@@ -2485,7 +2958,7 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
                 check=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertIn('"head_sha":"' + "a" * 40 + '"', completed.stdout)
+            self.assertIn('"source_head_sha":"' + "a" * 40 + '"', completed.stdout)
             self.assertFalse((trusted_tools / "__pycache__").exists())
 
 
