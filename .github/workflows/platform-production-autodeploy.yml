@@ -283,6 +283,29 @@ jobs:
                   "web-quality", "web-hermetic", "verification-contract",
               ],
           }
+          recovery_bootstrap_files = {
+              ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+              ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+              ".github/workflows/platform-production-release-abort.yml",
+              ".github/workflows/platform-production-release-recover.yml",
+              ".github/workflows/platform-production-autodeploy.yml",
+              "platform/tools/platform_recovery_bootstrap.py",
+              "platform/tools/platform_abort_retained_only.sh",
+              "platform/tools/platform_release_restore_runtime.sh",
+              "platform/tools/platform_release_transaction.py",
+              "platform/tools/platform_live_qa_guard.py",
+              "platform/tools/platform_live_qa_runtime_install.py",
+              "platform/tools/platform_build_live_qa_runtime.py",
+              "platform/tests/test_platform_recovery_bootstrap.py",
+              "platform/tests/test_platform_release_recovery_boundaries.py",
+              "platform/tests/test_platform_live_qa_guard.py",
+              "platform/tests/test_platform_live_qa_runtime_install.py",
+              "platform/tests/test_platform_ci_classifier.py",
+              "platform/tools/platform_ci_classifier.py",
+              "platform/tools/platform_production_classifier_artifact.py",
+              "platform/tools/platform_verify_contract.py",
+              "platform/tools/platform_test_catalog.py",
+          }
           if manifest.get("schema") != 1 or manifest.get("version") != 1:
               raise SystemExit("classifier manifest schema/version is invalid")
           route_class = manifest.get("class")
@@ -306,6 +329,15 @@ jobs:
               raise SystemExit("classifier reason is missing")
           if not isinstance(manifest.get("files"), list):
               raise SystemExit("classifier files are malformed")
+          files = manifest["files"]
+          recovery_bootstrap_only = bool(
+              any(path in recovery_bootstrap_files for path in files)
+              and all(
+                  path in recovery_bootstrap_files
+                  or (isinstance(path, str) and path.startswith("platform/docs/"))
+                  for path in files
+              )
+          )
           if not isinstance(manifest.get("runtime_sensitive"), bool):
               raise SystemExit("classifier runtime-sensitive field is malformed")
           payload = {field: manifest[field] for field in fields}
@@ -319,6 +351,8 @@ jobs:
           # deployable bit, not the route class alone, controls dispatch.
           if type(manifest.get("deployable")) is not bool:
               raise SystemExit("full route may be non-deployable, but its flag must be boolean")
+          if recovery_bootstrap_only and manifest["deployable"]:
+              raise SystemExit("recovery-bootstrap route cannot be deployable")
           if route_class != "full" and manifest.get("deployable") is not False:
               raise SystemExit("reduced classifier route must be non-deployable")
           with Path(output_path).open("a", encoding="utf-8") as output:

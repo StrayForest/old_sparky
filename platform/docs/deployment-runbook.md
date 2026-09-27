@@ -358,6 +358,24 @@ pre-quiesce snapshot. It does not require intentionally inactive units to be
 active, and it fails closed while retaining the receipt if recovery, pointer,
 identity, or readiness evidence is incomplete.
 
+## Immutable recovery bootstrap
+
+Use the manual **Platform production recovery bootstrap abort** workflow only
+after reviewing the retained receipt and confirming that the migration was
+not reversed. Supply the exact successful `Platform security and build` run
+ID and attempt, then type `ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY`. The
+workflow validates the default-branch run, route artifact, closed evidence,
+bundle digest and build attestation before it reads `PROD_SSH_*` secrets or
+opens SSH. It transfers no source checkout to the host.
+
+The host installs the verified bundle as one immutable generation and invokes
+only its fixed `platform_abort_retained_only.sh` entrypoint. The entrypoint
+accepts only an install receipt in `phase=recovery-restored`; uncertain
+migration phases, missing identities, lock contention and any runtime,
+systemd, pointer or completion failure remain retained. This workflow is
+non-deployable recovery authority: it does not run normal deploy, Alembic
+downgrade or a manually selected `systemctl` command.
+
 ## Smoke
 
 ```bash

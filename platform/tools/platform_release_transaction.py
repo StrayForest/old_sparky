@@ -208,6 +208,7 @@ def _safe_directory(path: Path, *, label: str) -> os.stat_result:
     if (
         stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_nlink < 2
         or metadata.st_uid != 0
         or stat.S_IMODE(metadata.st_mode) & 0o022
         or resolved != path

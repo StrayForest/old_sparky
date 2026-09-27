@@ -349,6 +349,7 @@ def _directory(path: Path, *, mode: int | None = None) -> os.stat_result:
         or not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != 0
         or metadata.st_gid != 0
+        or metadata.st_nlink < 2
         or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
         or stat.S_IMODE(metadata.st_mode) & 0o022
         or (mode is not None and stat.S_IMODE(metadata.st_mode) != mode)
@@ -535,7 +536,7 @@ def _validate_source_tree(source: Path, relative: str) -> None:
         if stat.S_ISLNK(metadata.st_mode):
             raise InstallerError("trusted live-QA source tree contains a symlink")
         if stat.S_ISDIR(metadata.st_mode):
-            if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+            if metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_nlink < 2 or stat.S_IMODE(metadata.st_mode) & 0o022:
                 raise InstallerError("trusted live-QA source directory metadata is unsafe")
             continue
         relative_name = PurePosixPath(rel).as_posix()
@@ -620,7 +621,7 @@ def _tree_digest(
             raise InstallerError("trusted live-QA payload contains a symlink")
         digest.update(relative.encode("utf-8") + b"\0")
         if stat.S_ISDIR(metadata.st_mode):
-            if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+            if metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_nlink < 2 or stat.S_IMODE(metadata.st_mode) & 0o022:
                 raise InstallerError("trusted live-QA payload directory metadata is unsafe")
             digest.update(b"d\0")
             continue
@@ -966,13 +967,18 @@ def _cleanup_staging(*, apply: bool) -> int:
                 stat.S_ISLNK(metadata.st_mode)
                 or metadata.st_uid != 0
                 or metadata.st_gid != 0
-                or metadata.st_nlink != 1
             ):
                 raise InstallerError("interrupted trusted live-QA install is unsafe")
             if stat.S_ISDIR(metadata.st_mode):
+                if metadata.st_nlink < 2:
+                    raise InstallerError("interrupted trusted live-QA directory link count is unsafe")
                 os.chmod(path, 0o700)
             elif stat.S_ISREG(metadata.st_mode):
+                if metadata.st_nlink != 1:
+                    raise InstallerError("interrupted trusted live-QA file link count is unsafe")
                 os.chmod(path, 0o600)
+            else:
+                raise InstallerError("interrupted trusted live-QA install contains a special file")
         shutil.rmtree(stage)
     _fsync_directory(PAYLOAD_ROOT)
     return len(stages)
@@ -1034,12 +1040,18 @@ def _retention(app_dir: Path, *, apply: bool) -> int:
         _directory(entry, mode=0o555)
         for path in [entry, *entry.rglob("*")]:
             metadata = _metadata(path)
-            if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_nlink != 1:
+            if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
                 raise InstallerError("trusted live-QA retention target is unsafe")
             if stat.S_ISDIR(metadata.st_mode):
+                if metadata.st_nlink < 2:
+                    raise InstallerError("trusted live-QA retention directory link count is unsafe")
                 os.chmod(path, 0o700)
             elif stat.S_ISREG(metadata.st_mode):
+                if metadata.st_nlink != 1:
+                    raise InstallerError("trusted live-QA retention file link count is unsafe")
                 os.chmod(path, 0o600)
+            else:
+                raise InstallerError("trusted live-QA retention target contains a special file")
         shutil.rmtree(entry)
     _fsync_directory(PAYLOAD_ROOT)
     return len(candidates)

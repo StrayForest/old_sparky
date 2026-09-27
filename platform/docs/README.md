@@ -22,6 +22,7 @@ Start with [`CURRENT.md`](CURRENT.md). It is the compact source of current produ
 | Admin console structure and metric definitions | [Admin console IA](admin-console-information-architecture.md) |
 | Normal release or rollback | [Deployment runbook](deployment-runbook.md) |
 | Release transaction and recovery | [Release state machine](release-state-machine.md) |
+| Immutable retained-release recovery bootstrap | [Recovery bootstrap ADR](adr/recovery-bootstrap-retained-abort.md) and [deployment runbook](deployment-runbook.md#immutable-recovery-bootstrap) |
 | Test-suite ownership and CI/live runners | [Test-suite governance](test-suite-governance.md) |
 | CSP rollout / production browser and live-user QA | [CSP and live QA runbook](csp-live-qa-runbook.md) |
 | Backup or restore | [Backup and restore](backup-restore-runbook.md) |

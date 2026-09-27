@@ -16,6 +16,7 @@ EDGE_HOST="old-sparky.com"
 PUBLIC_EDGE_ORIGIN="https://old-sparky.com"
 SYSTEMD_STATE=""
 SYSTEMCTL_BIN="/usr/bin/systemctl"
+LIVE_QA_RUNTIME_INSTALLER=""
 PUBLIC_RELEASE_SLUG="unavailable"
 PUBLIC_SOURCE_SHA="unavailable"
 
@@ -89,6 +90,11 @@ while [[ $# -gt 0 ]]; do
     --systemctl)
       [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
       SYSTEMCTL_BIN="$2"
+      shift 2
+      ;;
+    --live-qa-runtime-installer)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      LIVE_QA_RUNTIME_INSTALLER="$2"
       shift 2
       ;;
     --skip-smoke)
@@ -218,8 +224,11 @@ if [[ "$RUN_SMOKE" -eq 1 && ! -f "$SMOKE_TOOL" ]]; then
   public_status failed tooling >&2
   exit 1
 fi
-LIVE_QA_RUNTIME_INSTALLER="$RELEASE/tools/platform_live_qa_runtime_install.py"
-if [[ ! -f "$LIVE_QA_RUNTIME_INSTALLER" || -L "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
+if [[ -z "$LIVE_QA_RUNTIME_INSTALLER" ]]; then
+  LIVE_QA_RUNTIME_INSTALLER="$RELEASE/tools/platform_live_qa_runtime_install.py"
+fi
+if [[ ! -f "$LIVE_QA_RUNTIME_INSTALLER" || -L "$LIVE_QA_RUNTIME_INSTALLER" \
+  || "$LIVE_QA_RUNTIME_INSTALLER" != /* ]]; then
   public_status failed liveqa_runtime >&2
   exit 1
 fi

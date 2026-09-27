@@ -121,6 +121,40 @@ CANDIDATE_PACKAGING_REASON = (
     "trusted candidate-packaging change requires full verification and is non-deployable"
 )
 
+# Recovery-bootstrap changes are intentionally a full-CI route with no
+# production authority.  Keep this set closed: adding a new recovery helper,
+# workflow or contract file requires an explicit classifier review.  Docs may
+# accompany the set without changing the route.  An application/runtime path
+# mixed into the set remains an ordinary deployable full route.
+RECOVERY_BOOTSTRAP_FILES = frozenset(
+    {
+        ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+        ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+        ".github/workflows/platform-production-release-abort.yml",
+        ".github/workflows/platform-production-release-recover.yml",
+        ".github/workflows/platform-production-autodeploy.yml",
+        "platform/tools/platform_recovery_bootstrap.py",
+        "platform/tools/platform_abort_retained_only.sh",
+        "platform/tools/platform_release_restore_runtime.sh",
+        "platform/tools/platform_release_transaction.py",
+        "platform/tools/platform_live_qa_guard.py",
+        "platform/tools/platform_live_qa_runtime_install.py",
+        "platform/tools/platform_build_live_qa_runtime.py",
+        "platform/tests/test_platform_recovery_bootstrap.py",
+        "platform/tests/test_platform_release_recovery_boundaries.py",
+        "platform/tests/test_platform_live_qa_guard.py",
+        "platform/tests/test_platform_live_qa_runtime_install.py",
+        "platform/tests/test_platform_ci_classifier.py",
+        "platform/tools/platform_ci_classifier.py",
+        "platform/tools/platform_production_classifier_artifact.py",
+        "platform/tools/platform_verify_contract.py",
+        "platform/tools/platform_test_catalog.py",
+    }
+)
+RECOVERY_BOOTSTRAP_REASON = (
+    "retained-release recovery-bootstrap change requires full verification and is non-deployable"
+)
+
 _DIGEST_FIELDS = (
     "schema",
     "version",
@@ -248,6 +282,18 @@ def _is_candidate_packaging_only(files: Sequence[str]) -> bool:
         any(path in CANDIDATE_PACKAGING_FILES for path in files)
         and all(
             path in CANDIDATE_PACKAGING_FILES or path.startswith(DOCS_PREFIX)
+            for path in files
+        )
+    )
+
+
+def _is_recovery_bootstrap_only(files: Sequence[str]) -> bool:
+    """Return whether files are the closed recovery-bootstrap route plus docs."""
+
+    return bool(
+        any(path in RECOVERY_BOOTSTRAP_FILES for path in files)
+        and all(
+            path in RECOVERY_BOOTSTRAP_FILES or path.startswith(DOCS_PREFIX)
             for path in files
         )
     )
@@ -435,7 +481,10 @@ def classify(
     route_class, expected_gates, reason, fallback = _route_for_files(normalised)
     runtime_sensitive = runtime_sensitive or fallback
     candidate_packaging_only = _is_candidate_packaging_only(normalised)
-    if candidate_packaging_only:
+    recovery_bootstrap_only = _is_recovery_bootstrap_only(normalised)
+    if recovery_bootstrap_only:
+        reason = RECOVERY_BOOTSTRAP_REASON
+    elif candidate_packaging_only:
         reason = CANDIDATE_PACKAGING_REASON
     return _build_manifest(
         target_sha=target_sha,
@@ -447,7 +496,7 @@ def classify(
         route_class=route_class,
         expected_gates=expected_gates,
         runtime_sensitive=runtime_sensitive,
-        non_deployable=candidate_packaging_only,
+        non_deployable=candidate_packaging_only or recovery_bootstrap_only,
     )
 
 
@@ -497,6 +546,7 @@ def validate_manifest(
     files = manifest.get("files")
     if not isinstance(files, list) or any(not isinstance(path, str) for path in files):
         raise ClassifierError("classifier files must be a list of strings")
+    recovery_bootstrap_only = _is_recovery_bootstrap_only(files)
     expected_runtime_sensitive = (
         manifest["fallback"]
         or event not in {"pull_request", "push"}
@@ -516,10 +566,10 @@ def validate_manifest(
     if (
         route_class == "full"
         and not manifest["fallback"]
-        and _is_candidate_packaging_only(files)
+        and (_is_candidate_packaging_only(files) or recovery_bootstrap_only)
         and manifest["deployable"]
     ):
-        raise ClassifierError("candidate packaging route cannot be deployable")
+        raise ClassifierError("review-only packaging route cannot be deployable")
     if expected_target_sha is not None and target_sha != expected_target_sha:
         raise ClassifierError("classifier target_sha does not match the release SHA")
     if require_deployable:
