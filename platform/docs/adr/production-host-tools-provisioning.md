@@ -95,21 +95,24 @@ receives no secrets, status/deployment write permission or production
 environment approval.
 
 The workflow resolves an immutable trusted default-branch commit **T** and
-executes only validators and the deterministic bundle builder from **T**.  It
-checks the exact workflow ID/name/path, run ID/attempt/conclusion/head and
-canonical repository, then re-reads the same run attempt (including its
-canonical `pull_requests` payload) and pull request before attestation and
-again before artifact upload.  The pull request checkout
-**E** is data only: it is never imported, compiled, interpreted or executed.
-The trusted pin parser resolves host-tools generation **C** from **E**, and
-the handoff requires the current PR base to be a strict ancestor of **E** and
-`C ∈ reachable(E) \ reachable(base)`: **C** is a strict ancestor of **E** but
-is not already reachable from the current base. This deliberately accepts a
-PR branch that merge-syncs current `dev` before introducing **C**; the
-merge-sync makes the base reachable from **E**, while **C** remains reachable
-only from the PR head. An older pin already present in `dev` is rejected even
-though it is also an ancestor of **E**. The exact fixed closure and its
-digests remain required.
+executes only validators and the deterministic bundle builder from **T**. Its
+isolated `python -I -B` invocations load the candidate validator's sibling
+bundle helper by the validator's trusted `__file__` path; they never add the
+candidate checkout to `sys.path` or import candidate code. It checks the exact
+workflow ID/name/path, run ID/attempt/conclusion/head and canonical repository,
+then re-reads the same run attempt (including its canonical `pull_requests`
+payload) and pull request before attestation and again before artifact upload.
+The pull request checkout **E** is data only: it is never imported, compiled,
+interpreted or executed. The trusted pin parser resolves host-tools generation
+**C** from **E**. A strict-ancestor **C** that is already reachable from the
+current PR base is a valid existing generation and completes as `eligible=false`
+without building, attesting or uploading an artifact. A novel
+`C ∈ reachable(E) \ reachable(base)` is `eligible=true` and may produce the
+review artifact. This deliberately accepts a PR branch that merge-syncs
+current `dev` before introducing **C**; the merge-sync makes the base reachable
+from **E**, while **C** remains reachable only from the PR head. Malformed,
+unrelated or otherwise ambiguous pin history fails closed. The exact fixed
+closure and its digests remain required.
 
 The inner deterministic bundle is attested before upload.  Candidate and
 evidence artifact names bind the pull request, **C**, **E**, security run and

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 from io import BytesIO
 import json
 import os
@@ -22,13 +23,61 @@ import re
 import stat
 import subprocess
 import sys
+from types import ModuleType
 import zipfile
 from typing import Mapping, Sequence
 
-try:
-    from . import platform_host_tools_bundle as bundle
-except ImportError:  # pragma: no cover - direct runner invocation
-    import platform_host_tools_bundle as bundle  # type: ignore[no-redef]
+
+def _load_trusted_bundle() -> ModuleType:
+    """Load the sibling bundle helper from this trusted tools directory only.
+
+    The workflow deliberately invokes this file with ``python -I -B``.  In
+    isolated mode Python does not add the script directory to ``sys.path``,
+    so a normal relative/fallback import would fail.  Resolve the sibling
+    from ``__file__`` instead and load it under a private module name.  The
+    candidate checkout is never added to the import path and cannot satisfy
+    this dependency.
+    """
+
+    script = Path(__file__)
+    if script.is_symlink() or script.name != "platform_host_tools_candidate.py":
+        raise ImportError("trusted candidate validator path is unsafe")
+    try:
+        trusted_tools = script.resolve(strict=True).parent
+        if (
+            trusted_tools.name != "tools"
+            or trusted_tools.parent.name != "platform"
+            or trusted_tools.parent.is_symlink()
+            or trusted_tools.parent.parent.is_symlink()
+        ):
+            raise ImportError("trusted candidate validator directory is unsafe")
+        bundle_path = trusted_tools / "platform_host_tools_bundle.py"
+        metadata = bundle_path.lstat()
+    except OSError as exc:
+        raise ImportError("trusted bundle helper is unavailable") from exc
+    if (
+        bundle_path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+    ):
+        raise ImportError("trusted bundle helper metadata is unsafe")
+    spec = importlib.util.spec_from_file_location(
+        "_platform_host_tools_bundle_trusted", bundle_path
+    )
+    loader = spec.loader if spec is not None else None
+    if spec is None or loader is None or spec.origin is None:
+        raise ImportError("trusted bundle helper loader is unavailable")
+    try:
+        if Path(spec.origin).resolve(strict=True) != bundle_path.resolve(strict=True):
+            raise ImportError("trusted bundle helper origin changed")
+    except OSError as exc:
+        raise ImportError("trusted bundle helper origin is unavailable") from exc
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+bundle = _load_trusted_bundle()
 
 
 SCHEMA = 1
@@ -794,7 +843,22 @@ def verify_security_run(
     return result
 
 
-def verify_ancestry(source_root: Path, *, base_sha: str, host_tools_sha: str, candidate_sha: str) -> None:
+def verify_ancestry(
+    source_root: Path,
+    *,
+    base_sha: str,
+    host_tools_sha: str,
+    candidate_sha: str,
+) -> bool:
+    """Validate ancestry and return whether this pin needs a candidate.
+
+    A pin already reachable from the current PR base is a valid, existing
+    generation and therefore a successful no-op.  A strict-ancestor pin that
+    is reachable from the PR head but not the base is a novel generation and
+    is eligible for packaging.  Every malformed, unrelated or otherwise
+    ambiguous history remains a hard failure.
+    """
+
     root = _safe_root(source_root, "candidate")
     base = _sha(base_sha, "base SHA")
     host = _sha(host_tools_sha, "host-tools SHA")
@@ -811,9 +875,10 @@ def verify_ancestry(source_root: Path, *, base_sha: str, host_tools_sha: str, ca
     _strict_ancestor(root, host, candidate, "host-tools SHA")
     host_in_base = _git(root, "merge-base", "--is-ancestor", host, base, check=False)
     if host_in_base == "0":
-        raise CandidateError("host-tools SHA is already reachable from the current base")
+        return False
     if host_in_base != "1":
         raise CandidateError("host-tools/base reachability could not be determined")
+    return True
 
 
 def _pin_payload(candidate_root: Path) -> Mapping[str, object]:
@@ -888,7 +953,13 @@ def write_evidence(
     trusted_commit = _sha(trusted_sha, "trusted source SHA")
     if _git(trusted, "rev-parse", "--verify", "HEAD^{commit}") != trusted_commit:
         raise CandidateError("trusted checkout is not the requested default-branch commit")
-    verify_ancestry(candidate, base_sha=context.base_sha, host_tools_sha=host_tools_sha, candidate_sha=context.candidate_sha)
+    if not verify_ancestry(
+        candidate,
+        base_sha=context.base_sha,
+        host_tools_sha=host_tools_sha,
+        candidate_sha=context.candidate_sha,
+    ):
+        raise CandidateError("host-tools SHA is already reachable from the current base")
     host = _sha(host_tools_sha, "host-tools SHA")
     pin = _pin_payload(candidate)
     if pin.get("host_tools_sha") != host:
@@ -1116,6 +1187,7 @@ def _parser() -> argparse.ArgumentParser:
     ancestry.add_argument("--base-sha", required=True)
     ancestry.add_argument("--host-tools-sha", required=True)
     ancestry.add_argument("--candidate-sha", required=True)
+    ancestry.add_argument("--github-output", type=Path)
     evidence = sub.add_parser("write-evidence")
     evidence.add_argument("--trusted-root", required=True, type=Path)
     evidence.add_argument("--candidate-root", required=True, type=Path)
@@ -1190,8 +1262,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 github_output=args.github_output,
             )
         elif args.command == "verify-ancestry":
-            verify_ancestry(args.source_root, base_sha=args.base_sha, host_tools_sha=args.host_tools_sha, candidate_sha=args.candidate_sha)
-            print("HOST_TOOLS_CANDIDATE ancestry=verified")
+            eligible = verify_ancestry(
+                args.source_root,
+                base_sha=args.base_sha,
+                host_tools_sha=args.host_tools_sha,
+                candidate_sha=args.candidate_sha,
+            )
+            if args.github_output is not None:
+                with args.github_output.open("a", encoding="ascii") as stream:
+                    stream.write(f"eligible={'true' if eligible else 'false'}\n")
+            print(
+                "HOST_TOOLS_CANDIDATE "
+                f"ancestry=verified eligible={'true' if eligible else 'false'}"
+            )
         elif args.command == "write-evidence":
             write_evidence(
                 trusted_root=args.trusted_root,

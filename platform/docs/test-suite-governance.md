@@ -233,10 +233,13 @@ tests remain owned by the `backend-tool-contract` contour through
 updated whenever those tests change.  The verification-contract gate also
 invokes `host_tools_candidate_workflow_issues()` so a missing default-branch
 guard, broadened permission, unpinned action, direct candidate execution,
-missing TOCTOU recheck or production artifact consumer fails closed.  The
-workflow's successful output is bounded review evidence only: it never grants
-deploy/provision authority and production workflows must not consume its
-artifact prefixes.
+unsafe isolated-Python invocation, missing TOCTOU recheck or production
+artifact consumer fails closed.  The workflow first validates whether the
+resolved pin is a novel generation: an existing base-reachable pin completes
+as a successful no-op, while only an eligible novel pin reaches build,
+attestation and upload.  Its successful output is bounded review evidence
+only: it never grants deploy/provision authority and production workflows must
+not consume its artifact prefixes.
 
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route

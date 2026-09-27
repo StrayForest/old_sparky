@@ -2200,20 +2200,31 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
 
             # Merge-syncing current dev leaves base reachable from E, while
             # the newly introduced C remains outside base's reachable set.
-            candidate.verify_ancestry(
-                repository,
-                base_sha=current_base,
-                host_tools_sha=introduced_pin,
-                candidate_sha=candidate_head,
+            self.assertTrue(
+                candidate.verify_ancestry(
+                    repository,
+                    base_sha=current_base,
+                    host_tools_sha=introduced_pin,
+                    candidate_sha=candidate_head,
+                )
             )
 
             # PR116's old 4233 pin is still an ancestor of E, but current dev
             # already reaches it; it is not a PR-introduced generation.
-            with self.assertRaises(candidate.CandidateError):
+            self.assertFalse(
                 candidate.verify_ancestry(
                     repository,
                     base_sha=current_base,
                     host_tools_sha=old_pin,
+                    candidate_sha=candidate_head,
+                )
+            )
+
+            with self.assertRaises(candidate.CandidateError):
+                candidate.verify_ancestry(
+                    repository,
+                    base_sha=current_base,
+                    host_tools_sha="malformed-host-tools-pin",
                     candidate_sha=candidate_head,
                 )
 
@@ -2291,6 +2302,63 @@ raise SystemExit(int(os.environ.get("FAKE_SSH_RC", "0")))
         self.assertNotIn(candidate.CANDIDATE_ARTIFACT_PREFIX, production_text)
         self.assertNotIn(candidate.EVIDENCE_ARTIFACT_PREFIX, production_text)
         self.assertEqual(host_tools_candidate_workflow_issues(), [])
+
+        # Exercise the exact trusted workflow invocation in isolated,
+        # bytecode-free mode.  A candidate-side module with the same name is
+        # deliberately present and must never satisfy the trusted import.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trusted_tools = root / "trusted-dev/platform/tools"
+            trusted_tools.mkdir(parents=True)
+            shutil.copyfile(TOOLS_ROOT / "platform_host_tools_candidate.py", trusted_tools / "platform_host_tools_candidate.py")
+            shutil.copyfile(TOOLS_ROOT / "platform_host_tools_bundle.py", trusted_tools / "platform_host_tools_bundle.py")
+            candidate_tools = root / "candidate-data/platform/tools"
+            candidate_tools.mkdir(parents=True)
+            (candidate_tools / "platform_host_tools_bundle.py").write_text(
+                "raise RuntimeError('candidate code must never load')\n",
+                encoding="ascii",
+            )
+            event = root / "event.json"
+            event.write_text(
+                json.dumps(
+                    {
+                        "workflow_run": {
+                            "repository": {"full_name": "StrayForest/old_sparky"},
+                            "workflow_id": 339062797,
+                            "name": "Platform security and build",
+                            "path": ".github/workflows/platform-security.yml",
+                            "event": "pull_request",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "id": 36289064582,
+                            "run_attempt": 1,
+                            "head_sha": "a" * 40,
+                            "head_branch": "feature/candidate",
+                            "head_repository": {"full_name": "StrayForest/old_sparky"},
+                            "pull_requests": [{"number": 117}],
+                        }
+                    }
+                ),
+                encoding="ascii",
+            )
+            completed = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    "-B",
+                    str(trusted_tools / "platform_host_tools_candidate.py"),
+                    "inspect-event",
+                    "--event",
+                    str(event),
+                ],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(candidate_tools)},
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn('"head_sha":"' + "a" * 40 + '"', completed.stdout)
+            self.assertFalse((trusted_tools / "__pycache__").exists())
 
 
 if __name__ == "__main__":

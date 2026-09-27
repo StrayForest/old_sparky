@@ -1495,10 +1495,16 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
         "github.event.workflow_run.name == 'Platform security and build'",
         "platform_host_tools_candidate.py",
         "platform_host_tools_pin.py resolve",
+        "python3 -I -B trusted-dev/platform/tools/platform_host_tools_candidate.py",
+        "python3 -I -B trusted-dev/platform/tools/platform_host_tools_pin.py",
+        "python3 -I -B trusted-dev/platform/tools/platform_host_tools_bundle.py",
         "--source-root \"$GITHUB_WORKSPACE/candidate-data\"",
         "--summary-artifact-id",
         "--candidate-artifact-id",
         "verify-ancestry",
+        "--github-output \"$GITHUB_OUTPUT\"",
+        "steps.eligibility.outputs.eligible == 'false'",
+        "steps.eligibility.outputs.eligible == 'true'",
         "/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100&page=1",
         "Recheck PR, security run, attempt, and head before attestation",
         "Recheck PR, security run, attempt, and head before upload",
@@ -1527,6 +1533,42 @@ def host_tools_candidate_workflow_issues(workflow_text: str | None = None) -> li
     ):
         if forbidden in workflow_text:
             issues.append(f"host-tools candidate workflow contains forbidden marker: {forbidden}")
+    if re.search(
+        r"python3\s+-I(?!\s+-B\b)[^\n]*trusted-dev/platform/tools/",
+        workflow_text,
+    ):
+        issues.append("trusted host-tools candidate invocations must preserve isolated bytecode-free Python")
+    eligible_true = "if: ${{ steps.eligibility.outputs.eligible == 'true' }}"
+    candidate_job = re.search(
+        r"^  build-candidate:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        workflow_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    candidate_steps = {
+        match.group("name"): match.group(0)
+        for match in (
+            re.match(
+                r"^      - name: (?P<name>[^\n]+)\n(?P<body>.*)",
+                block,
+                re.MULTILINE | re.DOTALL,
+            )
+            for block in _workflow_step_blocks(candidate_job.group("body"))
+        )
+        if match is not None
+    } if candidate_job is not None else {}
+    for step_name in (
+        "Build and verify deterministic existing host-tools bundle from T",
+        "Recheck PR, security run, attempt, and head before attestation",
+        "Attest exact inner host-tools ZIP",
+        "Recheck PR, security run, attempt, and head before upload",
+        "Upload exact candidate inner ZIP without overwrite",
+        "Verify uploaded candidate artifact outer digest and metadata",
+        "Upload closed candidate evidence without overwrite",
+        "Verify uploaded evidence artifact envelope",
+        "Publish exact candidate and evidence receipt",
+    ):
+        if eligible_true not in candidate_steps.get(step_name, ""):
+            issues.append(f"host-tools candidate artifact step is not gated by eligibility: {step_name}")
     if "id-token: write" not in workflow_text or "attestations: write" not in workflow_text:
         issues.append("host-tools candidate attestation permissions are missing")
     if "permissions:\n  contents: read\n  actions: read\n  pull-requests: read" not in workflow_text:
