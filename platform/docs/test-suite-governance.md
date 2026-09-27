@@ -2,7 +2,7 @@
 
 - Status: Active reference
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-24
+- Last reviewed: 2026-09-27
 
 The executable registry at `platform/tools/platform_verify.py` is the single
 source of truth for verification ownership, commands, environment
@@ -217,6 +217,18 @@ checks out the exact target with `fetch-depth: 0` and runs the canonical
 resolver against the repository and target SHA. The fast DB-free backend
 contour stays shallow and proves the static contract plus the synthetic A/B
 pin-bump lifecycle; it does not silently skip historical ancestry proof.
+
+The `platform-host-tools-candidate.yml` workflow is a separate trusted
+`workflow_run` contract, not a production gate.  Its validator and bundle
+tests remain owned by the `backend-tool-contract` contour through
+`test_platform_host_tools_bundle`; the executable catalog snapshot must be
+updated whenever those tests change.  The verification-contract gate also
+invokes `host_tools_candidate_workflow_issues()` so a missing default-branch
+guard, broadened permission, unpinned action, direct candidate execution,
+missing TOCTOU recheck or production artifact consumer fails closed.  The
+workflow's successful output is bounded review evidence only: it never grants
+deploy/provision authority and production workflows must not consume its
+artifact prefixes.
 
 Unknown/global paths, malformed input or provenance, a shallow/unavailable
 repository, an unknown event and every `merge_group` event use the full route

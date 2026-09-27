@@ -2,7 +2,7 @@
 
 - Status: Active source of current production state
 - Owner: Platform maintainers
-- Last reviewed: 2026-09-13
+- Last reviewed: 2026-09-27
 
 Read this file for the current production baseline and next engineering priority. Use the documentation index for deeper task-specific context.
 
