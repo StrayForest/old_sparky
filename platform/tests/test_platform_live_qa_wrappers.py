@@ -592,6 +592,11 @@ class LiveQaWrapperContractTests(unittest.TestCase):
                 "release\x01",
                 "release\x00",
                 "r" * 181,
+                "gha-123456-2-bbbbbbbbbbbb",
+                "gha-123456-2-aaaaaaaaaaa",
+                "gha-123456-2-aaaaaaaaaaaaa",
+                "gha-123456-0-aaaaaaaaaaaa",
+                "gha-123456-2-AAAAAAAAAAAA",
             ),
             "target_sha": (
                 "x; touch /tmp/pwn #",

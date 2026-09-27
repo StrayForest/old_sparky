@@ -85,7 +85,7 @@ jobs:
       WEB_COMPRESSION: ${{ inputs.web_compression }}
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
-      RELEASE_SLUG: gha-${{ github.run_id }}-${{ github.run_attempt }}
+      RELEASE_SLUG_BASE: gha-${{ github.run_id }}-${{ github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Reject invalid dispatch values before mode branches
@@ -117,7 +117,11 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
-          candidate_release_slug="${RELEASE_SLUG:0:32}-${short_sha}"
+          candidate_release_slug="${RELEASE_SLUG_BASE}-${short_sha}"
+          [[ "$candidate_release_slug" =~ ^gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$ ]] || {
+            echo "Canonical deployment release slug is malformed." >&2
+            exit 1
+          }
           # The candidate parser is used only on this secret-free runner.  All
           # secret-bearing consumers independently validate the JSON schema.
           /usr/bin/python3 platform/tools/platform_workflow_input_guard.py deployment \
@@ -905,7 +909,6 @@ jobs:
       WEB_COMPRESSION: ${{ inputs.web_compression }}
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
-      RELEASE_SLUG: gha-${{ github.run_id }}-${{ github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
     outputs:
       artifact_id: ${{ steps.publish-release-artifact.outputs.artifact-id }}
@@ -951,8 +954,13 @@ jobs:
               raise SystemExit("deployment handoff classifier run mismatch")
           if re.fullmatch(r"[1-9][0-9]{0,31}", str(payload.get("classifier_run_attempt"))) is None or payload.get("classifier_run_attempt") != attempt:
               raise SystemExit("deployment handoff classifier attempt mismatch")
-          if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,179}", str(payload.get("release_slug"))) is None:
-              raise SystemExit("deployment handoff release slug is unsafe")
+          release_slug = payload.get("release_slug")
+          if (
+              not isinstance(release_slug, str)
+              or re.fullmatch(r"gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}", release_slug) is None
+              or not release_slug.endswith(f"-{target_sha[:12]}")
+          ):
+              raise SystemExit("deployment handoff release slug is not source-bound")
           if re.fullmatch(r"/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}", str(payload.get("artifact_remote_dir"))) is None:
               raise SystemExit("deployment handoff artifact path is unsafe")
           print("closed deployment handoff accepted for exact target SHA")
@@ -989,6 +997,24 @@ jobs:
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             /usr/bin/python3 -m venv "$ci_build_root/platform/.venv_platform"
           sudo install -d -o root -g root -m 0755 "$ci_build_root/platform/dist/releases"
+          release_slug="$(/usr/bin/python3 - "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          target_sha = sys.argv[2]
+          release_slug = payload.get("release_slug")
+          if (
+              not isinstance(release_slug, str)
+              or re.fullmatch(r"gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}", release_slug) is None
+              or not release_slug.endswith(f"-{target_sha[:12]}")
+          ):
+              raise SystemExit("deployment handoff release slug is not source-bound")
+          print(release_slug)
+          PY
+          )"
           sudo env -i \
             HOME=/root \
             LANG=C.UTF-8 \
@@ -996,8 +1022,8 @@ jobs:
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             PLATFORM_RELEASE_OUTPUT_DIR="$ci_build_root/platform/dist/releases" \
             PLATFORM_WEB_NEXT_COMPRESSION="$PLATFORM_WEB_NEXT_COMPRESSION" \
-            "$ci_build_root/platform/tools/platform_build_release.sh" "$RELEASE_SLUG"
-          release_archive="$(sudo find "$ci_build_root/platform/dist/releases" -maxdepth 1 -type f -name "${RELEASE_SLUG}-*.tar.gz" -print -quit)"
+            "$ci_build_root/platform/tools/platform_build_release.sh" --release-slug "$release_slug"
+          release_archive="$(sudo find "$ci_build_root/platform/dist/releases" -maxdepth 1 -type f -name "${release_slug}.tar.gz" -print -quit)"
           test -n "$release_archive" || { echo "CI release artifact was not produced" >&2; exit 1; }
           release_checksum="${release_archive}.sha256"
           sudo test -f "$release_checksum"
@@ -1413,7 +1439,6 @@ jobs:
       WEB_COMPRESSION: ${{ inputs.web_compression }}
       CLASSIFIER_RUN_ID: ${{ inputs.classifier_run_id || github.run_id }}
       CLASSIFIER_RUN_ATTEMPT: ${{ inputs.classifier_run_attempt || github.run_attempt }}
-      RELEASE_SLUG: gha-${{ github.run_id }}-${{ github.run_attempt }}
       ARTIFACT_REMOTE_DIR: /tmp/old-sparky-platform-artifact-${{ github.run_id }}-${{ github.run_attempt }}
       PUBLISHED_ARTIFACT_ID: ${{ needs.build-release.outputs.artifact_id }}
       PUBLISHED_ARTIFACT_DIGEST: ${{ needs.build-release.outputs.artifact_digest }}
@@ -1449,6 +1474,13 @@ jobs:
               raise SystemExit("deployment handoff values do not match dispatch")
           if payload.get("target_sha") != target_sha or re.fullmatch(r"[0-9a-f]{40}", target_sha) is None:
               raise SystemExit("deployment handoff exact target SHA mismatch")
+          release_slug = payload.get("release_slug")
+          if (
+              not isinstance(release_slug, str)
+              or re.fullmatch(r"gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}", release_slug) is None
+              or not release_slug.endswith(f"-{target_sha[:12]}")
+          ):
+              raise SystemExit("deployment handoff release slug is not source-bound")
           if payload.get("classifier_run_id") != run_id or payload.get("classifier_run_attempt") != attempt:
               raise SystemExit("deployment handoff classifier identity mismatch")
           if re.fullmatch(r"/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}", str(payload.get("artifact_remote_dir"))) is None:
@@ -1656,7 +1688,25 @@ jobs:
           curl --fail-with-body --silent --show-error --location --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${PUBLISHED_ARTIFACT_ID}/zip" --output "$artifact_zip"
           printf '%s  %s\n' "$PUBLISHED_ARTIFACT_DIGEST" "$artifact_zip" | sha256sum -c - >/dev/null 2>/dev/null || { echo "Published GitHub artifact digest verification failed" >&2; exit 1; }
-          release_archive="$(find "$RUNNER_TEMP/release" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          release_slug="$(/usr/bin/python3 - "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$TARGET_SHA" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          target_sha = sys.argv[2]
+          release_slug = payload.get("release_slug")
+          if (
+              not isinstance(release_slug, str)
+              or re.fullmatch(r"gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}", release_slug) is None
+              or not release_slug.endswith(f"-{target_sha[:12]}")
+          ):
+              raise SystemExit("deployment handoff release slug is not source-bound")
+          print(release_slug)
+          PY
+          )"
+          release_archive="$(find "$RUNNER_TEMP/release" -maxdepth 1 -type f -name "${release_slug}.tar.gz" -print -quit)"
           test -n "$release_archive" || { echo "Published release artifact is missing" >&2; exit 1; }
           release_checksum="${release_archive}.sha256"
           release_provenance="$RUNNER_TEMP/release/RELEASE.provenance.json"
@@ -1780,7 +1830,7 @@ jobs:
             /usr/bin/python3.12 -I -B "$HOST_TOOLS_DISPATCHER" production-deploy < "$input_path" > "$remote_log" 2> "$remote_error"
           remote_status="$?"
           set -e
-          public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport) release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"
+          public_line="$(grep -E '^RELEASE_DEPLOY schema=1 status=(passed|failed|review) class=(preflight|deployment|argument|privilege|policy|layout|service_state|readiness|lock|quiesce|recovery|artifact|pending_operation|transaction|abort|remote_or_transport)( phase=(artifact|provenance|preflight|candidate|readiness) reason=(internal|host_tools_invalid|lock|environment|service_state|nginx_config|preflight_failed|artifact_missing|artifact_count_invalid|checksum_missing|provenance_missing|artifact_name_invalid|release_slug_mismatch|checksum_mismatch|validation_failed|provenance_invalid|candidate_missing|activation_failed|lock_lost|runtime_profile_failed))? release_slug=(unavailable|[A-Za-z0-9][A-Za-z0-9._-]{0,179}) source_sha=(unavailable|[0-9a-f]{40,64})$' "$remote_log" | tail -n 1 || true)"
           [[ -n "$public_line" ]] || public_line='RELEASE_DEPLOY schema=1 status=failed class=remote_or_transport release_slug=unavailable source_sha=unavailable'
           printf '%s\n' "$public_line"
           exit "$remote_status"

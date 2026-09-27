@@ -44,6 +44,104 @@ def workflow_job(source: str, name: str) -> str:
 
 class PlatformReleaseBuildContractTests(unittest.TestCase):
     @staticmethod
+    def _install_supervisor_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
+        """Install an exact supervisor copy under the production path shape.
+
+        The real supervisor derives its trusted generation from ``BASH_SOURCE``
+        and uses absolute production lock paths.  Keep this subprocess fixture
+        isolated to one unique host-tools generation and two unique lock files;
+        no production helper or shared lock is replaced.
+        """
+
+        if os.geteuid() != 0:
+            raise AssertionError("supervisor ownership fixture requires root")
+        host_tools_root = Path("/opt/oldsparky/platform/shared/host-tools")
+        host_tools_root.mkdir(parents=True, exist_ok=True)
+        generation = hashlib.sha1(str(root).encode("utf-8")).hexdigest()
+        generation_dir = host_tools_root / generation
+        if generation_dir.exists() or generation_dir.is_symlink():
+            raise AssertionError("supervisor fixture generation unexpectedly exists")
+        generation_dir.mkdir(mode=0o555)
+        os.chown(generation_dir, 0, 0)
+        os.chmod(generation_dir, 0o555)
+
+        release_lock = Path(f"/run/lock/oldsparky-pr115-release-{generation[:16]}.lock")
+        retained_lock = Path(f"/run/lock/oldsparky-pr115-retained-{generation[:16]}.lock")
+        if (
+            release_lock.exists()
+            or release_lock.is_symlink()
+            or retained_lock.exists()
+            or retained_lock.is_symlink()
+        ):
+            raise AssertionError("supervisor fixture lock unexpectedly exists")
+
+        lock_source = (TOOLS_DIR / "platform_release_lock.sh").read_text(encoding="utf-8")
+        lock_source = lock_source.replace(
+            'PLATFORM_RELEASE_LOCK_CANONICAL_PATH="/run/lock/oldsparky-platform-release.lock"',
+            f'PLATFORM_RELEASE_LOCK_CANONICAL_PATH="{release_lock}"',
+            1,
+        )
+        lock_source = lock_source.replace(
+            (
+                'PLATFORM_RETAINED_LOAD_LOCK_CANONICAL_PATH='
+                '"/run/lock/oldsparky-retained-load-matrix.lock"'
+            ),
+            f'PLATFORM_RETAINED_LOAD_LOCK_CANONICAL_PATH="{retained_lock}"',
+            1,
+        )
+        lock_source = lock_source.replace(
+            "platform_release_lock_open() {",
+            "platform_release_lock_open_original() {",
+            1,
+        )
+        lock_source = lock_source.replace(
+            "platform_retained_load_lock_open() {",
+            "platform_retained_load_lock_open_original() {",
+            1,
+        )
+        lock_source += textwrap.dedent(
+            """
+
+            platform_release_lock_open() {
+              runtime="${PLATFORM_TEST_RUNTIME:-$runtime}"
+              platform_release_lock_open_original
+            }
+
+            platform_retained_load_lock_open() {
+              runtime="${PLATFORM_TEST_RUNTIME:-$runtime}"
+              platform_retained_load_lock_open_original
+            }
+            """
+        )
+
+        host_tool_files = (
+            "platform_workflow_remote_dispatch.py",
+            "platform_workflow_input_guard.py",
+            "platform_prepare_artifact_dir.py",
+            "platform_production_deploy_supervisor.sh",
+            "platform_release_lock.sh",
+            "platform_release_preflight.sh",
+            "platform_validate_release_artifact.py",
+            "platform_safe_env_exec.py",
+            "platform_render_service_envs.py",
+            "platform_validate_edge_policy.py",
+            "platform_configure_shared_env.py",
+            "platform_update_cloudflare_ips.py",
+            "platform_storage_evidence_summary.py",
+        )
+        for name in host_tool_files:
+            destination = generation_dir / name
+            if name == "platform_release_lock.sh":
+                destination.write_text(lock_source, encoding="utf-8")
+            else:
+                shutil.copyfile(TOOLS_DIR / name, destination)
+            os.chown(destination, 0, 0)
+            os.chmod(destination, 0o555)
+
+        supervisor = generation_dir / "platform_production_deploy_supervisor.sh"
+        return supervisor, release_lock, retained_lock, generation_dir
+
+    @staticmethod
     def _copy_staged_live_qa_builder(root: Path) -> tuple[Path, Path]:
         tools = root / "candidate" / "tools"
         tools.mkdir(parents=True, mode=0o755)
@@ -1311,6 +1409,18 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         ):
             self.assertNotIn(ssh_secret_name, build_step)
         self.assertIn('sudo find "$ci_build_root/platform/dist/releases"', workflow)
+        self.assertIn(
+            'platform_build_release.sh" --release-slug "$release_slug"',
+            workflow,
+        )
+        self.assertIn(
+            '-type f -name "${release_slug}.tar.gz"',
+            workflow,
+        )
+        self.assertIn(
+            'candidate_release_slug="${RELEASE_SLUG_BASE}-${short_sha}"',
+            workflow,
+        )
         self.assertIn('sudo chown "$(id -u):$(id -g)"', workflow)
         self.assertIn(
             '(cd "$release_output" && sha256sum -c "$(basename "$release_checksum")")',
@@ -1392,6 +1502,360 @@ class PlatformReleaseBuildContractTests(unittest.TestCase):
         self.assertIn("Recovered current release does not match retained receipt", recover)
         self.assertIn("Retained active state is invalid", recover)
         self.assertNotIn('for service in deadlock-api deadlock-worker deadlock-web; do', recover)
+
+    def test_supervisor_provenance_consumer_matches_canonical_ci_schema(self) -> None:
+        """Execute the supervisor consumer against the CI-produced provenance.
+
+        The supervisor is a root-side host helper, so this test extracts and
+        executes its actual isolated Python consumer rather than reproducing
+        the contract in a second test-only implementation.  The provenance
+        producer is likewise extracted from the canonical CI builder step.
+        """
+
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        build_step = self._workflow_step_run(
+            workflow, "Build immutable release artifact in CI"
+        )
+        producer_match = re.search(
+            r"""/usr/bin/python3 - "\$release_output/\$\(basename "\$release_archive"\)" "\$TARGET_SHA" <<'PY'\n"""
+            r"(?P<script>.*?)\nPY(?:\n|$)",
+            build_step,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(producer_match)
+        producer = textwrap.dedent(producer_match.group("script"))
+
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        consumer_match = re.search(
+            r"""if ! /usr/bin/python3 -I -B - "\$artifact_path" "\$artifact_slug" "\$target_sha" "\$provenance_path" <<'PY'\n"""
+            r"(?P<script>.*?)\nPY(?:\n|$)",
+            supervisor,
+            re.DOTALL,
+        )
+        if consumer_match is None:
+            consumer_match = re.search(
+                r"<<'PY'\n(?P<script>.*?)\nPY(?:\n|$)",
+                supervisor,
+                re.DOTALL,
+            )
+        self.assertIsNotNone(consumer_match)
+        consumer = textwrap.dedent(consumer_match.group("script"))
+
+        target_sha = "a" * 40
+        release_slug = "gha-10917370996-1-aaaaaaaaaaaa"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / f"{release_slug}.tar.gz"
+            release_payload = json.dumps(
+                {
+                    "release_slug": release_slug,
+                    "source_git_commit": target_sha,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            with tarfile.open(artifact, mode="w:gz") as archive:
+                member = tarfile.TarInfo(f"{release_slug}/RELEASE.json")
+                member.size = len(release_payload)
+                archive.addfile(member, io.BytesIO(release_payload))
+
+            provenance = root / "RELEASE.provenance.json"
+            produced = subprocess.run(
+                ["/usr/bin/python3", "-I", "-", str(artifact), target_sha],
+                input=producer,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(produced.returncode, 0, produced.stderr)
+            # The canonical builder writes next to the archive.  Keep the
+            # expected path explicit so this test cannot accidentally consume
+            # a hand-written fixture.
+            self.assertTrue(provenance.is_file())
+            canonical = json.loads(provenance.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(canonical),
+                {"schema", "artifact_file", "artifact_sha256", "source_git_commit"},
+            )
+
+            def consume(
+                *,
+                slug: str = release_slug,
+                source_sha: str = target_sha,
+            ) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        "/usr/bin/python3",
+                        "-I",
+                        "-B",
+                        "-",
+                        str(artifact),
+                        slug,
+                        source_sha,
+                        str(provenance),
+                    ],
+                    input=consumer,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+
+            accepted = consume()
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+            for mutation in (
+                "old-artifact-digest",
+                "missing-artifact-sha256",
+                "artifact-sha256-type",
+                "artifact-sha256-non-hex",
+                "wrong-artifact-sha256",
+                "artifact-file-mismatch",
+                "artifact-file-type",
+                "source-type",
+                "source-non-hex",
+                "source-mismatch",
+                "additional-field",
+                "schema-type",
+                "slug-invalid",
+                "slug-mismatch",
+                "target-sha-invalid",
+            ):
+                candidate = dict(canonical)
+                if mutation == "old-artifact-digest":
+                    candidate["artifact_digest"] = candidate.pop("artifact_sha256")
+                elif mutation == "missing-artifact-sha256":
+                    candidate.pop("artifact_sha256")
+                elif mutation == "artifact-sha256-type":
+                    candidate["artifact_sha256"] = 123
+                elif mutation == "artifact-sha256-non-hex":
+                    candidate["artifact_sha256"] = "g" * 64
+                elif mutation == "wrong-artifact-sha256":
+                    candidate["artifact_sha256"] = "0" * 64
+                elif mutation == "artifact-file-mismatch":
+                    candidate["artifact_file"] = "other.tar.gz"
+                elif mutation == "artifact-file-type":
+                    candidate["artifact_file"] = 123
+                elif mutation == "source-type":
+                    candidate["source_git_commit"] = 123
+                elif mutation == "source-non-hex":
+                    candidate["source_git_commit"] = "g" * 40
+                elif mutation == "source-mismatch":
+                    candidate["source_git_commit"] = "b" * 40
+                else:
+                    if mutation == "additional-field":
+                        candidate["unexpected"] = "rejected"
+                    elif mutation == "schema-type":
+                        candidate["schema"] = "1"
+                provenance.write_text(
+                    json.dumps(candidate, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(mutation=mutation):
+                    if mutation == "slug-invalid":
+                        rejected = consume(slug="bad/slug")
+                    elif mutation == "slug-mismatch":
+                        rejected = consume(
+                            slug="gha-10917370996-1-bbbbbbbbbbbb"
+                        )
+                    elif mutation == "target-sha-invalid":
+                        rejected = consume(source_sha="a" * 39)
+                    else:
+                        rejected = consume()
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertNotIn("Traceback", rejected.stderr)
+
+    def test_supervisor_failure_marker_is_stable_and_sanitized(self) -> None:
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        marker_start = supervisor.index("failure_class=")
+        marker_end = supervisor.index("\ncleanup() {", marker_start)
+        marker_functions = supervisor[marker_start:marker_end]
+        fixture = f"""set -u
+target_sha={'a' * 40}
+release_slug=gha-10917370996-1-aaaaaaaaaaaa
+{marker_functions}
+set +e
+set_failure_context artifact provenance provenance_invalid
+fail 'private stderr must not cross the public channel'
+"""
+        completed = subprocess.run(
+            ["/bin/bash"],
+            input=fixture,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(
+            completed.stdout,
+            "RELEASE_DEPLOY schema=1 status=failed class=artifact "
+            "phase=provenance reason=provenance_invalid "
+            f"release_slug=gha-10917370996-1-aaaaaaaaaaaa source_sha={'a' * 40}\n",
+        )
+        self.assertEqual(completed.stderr, "ERROR: deployment failed\n")
+        self.assertNotIn("private stderr", completed.stdout + completed.stderr)
+
+        workflow = (
+            REPO_ROOT / ".github/workflows/platform-production-deploy.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("phase=(artifact|provenance|preflight|candidate|readiness)", workflow)
+        self.assertIn("reason=(internal|host_tools_invalid|lock|environment", workflow)
+
+    def test_supervisor_cleanup_covers_upload_failures_and_closes_locks(self) -> None:
+        supervisor = DEPLOY_SUPERVISOR.read_text(encoding="utf-8")
+        cleanup_start = supervisor.index("cleanup() {")
+        cleanup_end = supervisor.index("\ntrap cleanup EXIT", cleanup_start)
+        cleanup_body = supervisor[cleanup_start:cleanup_end]
+        self.assertLess(
+            supervisor.index("platform_release_lock_supervise"),
+            supervisor.index("trap cleanup EXIT"),
+        )
+        self.assertLess(
+            supervisor.index("\nplatform_retained_load_lock_open"),
+            supervisor.index("trap cleanup EXIT"),
+        )
+        self.assertIn('rm -rf -- "$artifact_dir"', cleanup_body)
+        self.assertIn("artifact_cleanup_owned", cleanup_body)
+        self.assertIn("artifact_identity_snapshot", cleanup_body)
+        self.assertIn(".old-sparky-platform-artifact-owner", supervisor)
+        self.assertIn("platform_retained_load_lock_close", cleanup_body)
+        self.assertIn("platform_release_lock_close", cleanup_body)
+        self.assertIn("trap - EXIT", cleanup_body)
+        self.assertNotIn(
+            "trap 'platform_retained_load_lock_close; platform_release_lock_close' EXIT",
+            supervisor,
+        )
+
+        # Exercise the actual supervisor in a root-owned immutable-generation
+        # fixture.  Invalid input must return before ownership/trap setup and
+        # preserve the pre-existing matching directory byte-for-byte.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            fixture, release_lock, retained_lock, generation_dir = self._install_supervisor_fixture(
+                fixture_root
+            )
+
+            def cleanup_fixture() -> None:
+                for path in (release_lock, retained_lock):
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
+                if generation_dir.exists() or generation_dir.is_symlink():
+                    shutil.rmtree(generation_dir)
+
+            self.addCleanup(cleanup_fixture)
+            target_sha = "a" * 40
+            release_slug = "gha-123456-1-aaaaaaaaaaaa"
+            run_id = str(os.getpid())
+            artifact = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            if artifact.exists() or artifact.is_symlink():
+                run_id = str(int(run_id) + 1)
+                artifact = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            artifact.mkdir(mode=0o700)
+            os.chown(artifact, 0, 0)
+            os.chmod(artifact, 0o700)
+            marker = artifact / ".old-sparky-platform-artifact-owner"
+            marker.write_text(
+                f"platform_prepare_artifact_dir schema=1 "
+                f"dev={artifact.stat().st_dev} ino={artifact.stat().st_ino}\n",
+                encoding="ascii",
+            )
+            os.chown(marker, 0, 0)
+            os.chmod(marker, 0o600)
+            sentinel = artifact / "preexisting-sentinel"
+            sentinel.write_bytes(b"must-survive-early-failure\n")
+            os.chown(sentinel, 0, 0)
+            os.chmod(sentinel, 0o600)
+
+            def cleanup_artifact() -> None:
+                if artifact.is_dir() and not artifact.is_symlink():
+                    shutil.rmtree(artifact)
+
+            self.addCleanup(cleanup_artifact)
+
+            def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        str(fixture),
+                        target_sha,
+                        *arguments,
+                        str(artifact),
+                        "baseline",
+                    ],
+                    env={
+                        **os.environ,
+                        "PLATFORM_TEST_RUNTIME": str(fixture_root / "runtime"),
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=20,
+                )
+
+            for invalid in (
+                ("bad-release-slug", "deploy"),
+                (release_slug, "invalid-mode"),
+            ):
+                rejected = run(invalid[0], invalid[1])
+                self.assertEqual(rejected.returncode, 2, rejected.stderr)
+                self.assertTrue(artifact.is_dir())
+                self.assertEqual(sentinel.read_bytes(), b"must-survive-early-failure\n")
+
+            rejected_profile = subprocess.run(
+                [
+                    str(fixture),
+                    target_sha,
+                    release_slug,
+                    "deploy",
+                    str(artifact),
+                    "invalid-profile",
+                ],
+                env={
+                    **os.environ,
+                    "PLATFORM_TEST_RUNTIME": str(fixture_root / "runtime"),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(rejected_profile.returncode, 2, rejected_profile.stderr)
+            self.assertTrue(artifact.is_dir())
+            self.assertEqual(sentinel.read_bytes(), b"must-survive-early-failure\n")
+
+            release_lock.parent.mkdir(parents=True, exist_ok=True)
+            lock_fd = os.open(release_lock, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                os.fchown(lock_fd, 0, 0)
+                os.fchmod(lock_fd, 0o600)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                contended = run(release_slug, "deploy")
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            self.assertNotEqual(contended.returncode, 0)
+            self.assertTrue(artifact.is_dir())
+            self.assertEqual(sentinel.read_bytes(), b"must-survive-early-failure\n")
+
+            retained_lock_fd = os.open(retained_lock, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                os.fchown(retained_lock_fd, 0, 0)
+                os.fchmod(retained_lock_fd, 0o600)
+                fcntl.flock(retained_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                retained_contended = run(release_slug, "deploy")
+            finally:
+                fcntl.flock(retained_lock_fd, fcntl.LOCK_UN)
+                os.close(retained_lock_fd)
+            self.assertNotEqual(retained_contended.returncode, 0)
+            self.assertTrue(artifact.is_dir())
+            self.assertEqual(sentinel.read_bytes(), b"must-survive-early-failure\n")
+
+            cleaned = run(release_slug, "deploy")
+            self.assertNotEqual(cleaned.returncode, 0)
+            self.assertFalse(artifact.exists())
+            self.assertFalse(artifact.is_symlink())
 
     def test_production_env_contract_matches_runtime_policy(self) -> None:
         example = (REPO_ROOT / "platform/.env.platform.example").read_text()
@@ -1754,7 +2218,10 @@ cleanup
         self.assertIn('case "$deploy_mode" in', deploy_supervisor)
         self.assertIn('case "$runtime_profile" in', deploy_supervisor)
         self.assertIn('[[ "$target_sha" =~ ^[0-9a-f]{40}$ ]]', deploy_supervisor)
-        self.assertIn('[[ "$release_slug" =~ ^[A-Za-z0-9]', deploy_supervisor)
+        self.assertIn(
+            '[[ "$release_slug" =~ ^gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$ ]]',
+            deploy_supervisor,
+        )
         self.assertNotIn('echo \'{"ok":true,"fixture_absent":true}\'', workflow)
         cleanup_supervisor = (
             REPO_ROOT
@@ -2074,6 +2541,43 @@ cleanup
                     )
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("Release ref", result.stderr)
+            self.assertFalse((Path(temp_dir) / "releases").exists())
+
+    def test_dispatch_release_slug_is_exact_and_source_bound(self) -> None:
+        script = BUILD_SCRIPT.read_text()
+        self.assertIn("--release-slug", script)
+        self.assertIn("RELEASE_SLUG_OVERRIDE", script)
+        self.assertIn(
+            '"$RELEASE_SLUG_OVERRIDE" != *"-${SOURCE_GIT_COMMIT:0:12}"',
+            script,
+        )
+        unsafe_slugs = (
+            "gha-123456-2",
+            "gha-123456-2-aaaaaaaaaaa",
+            "gha-123456-2-AAAAAAAAAAAA",
+            "gha-0-2-aaaaaaaaaaaa",
+            "gha-123456-0-aaaaaaaaaaaa",
+            "gha-123456-2-aaaaaaaaaaaa/escape",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for release_slug in unsafe_slugs:
+                with self.subTest(release_slug=release_slug):
+                    result = subprocess.run(
+                        [str(BUILD_SCRIPT), "--release-slug", release_slug],
+                        cwd=REPO_ROOT,
+                        env={
+                            **os.environ,
+                            "PLATFORM_RELEASE_OUTPUT_DIR": str(
+                                Path(temp_dir) / "releases"
+                            ),
+                        },
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Release slug", result.stderr)
             self.assertFalse((Path(temp_dir) / "releases").exists())
 
     def test_build_uses_only_tracked_source_and_lock_driven_node_install(self) -> None:

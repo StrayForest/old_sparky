@@ -21,6 +21,9 @@ SHA_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 RELEASE_REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
+CANONICAL_DISPATCH_SLUG_PATTERN = re.compile(
+    r"^gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$"
+)
 TIMESTAMP_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
 WEB_BUILD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 PINNED_NODE_VERSION = "26.3.1"
@@ -270,15 +273,19 @@ def _parse_release_json(raw: bytes, *, release_slug: str) -> dict[str, object]:
         datetime.strptime(built_at, "%Y%m%dT%H%M%SZ")  # noqa: DTZ007
     except ValueError as exc:
         raise ArtifactError("RELEASE.json built_at_utc is invalid") from exc
-    if (
-        parsed["release_slug"] != release_slug
-        or release_slug != f"{release_ref}-{built_at}"
-    ):
-        raise ArtifactError("RELEASE.json release identity does not match the archive")
-
     commit = parsed["source_git_commit"]
     if not isinstance(commit, str) or COMMIT_PATTERN.fullmatch(commit) is None:
         raise ArtifactError("RELEASE.json source_git_commit is invalid")
+    if parsed["release_slug"] != release_slug:
+        raise ArtifactError("RELEASE.json release identity does not match the archive")
+    if release_slug == release_ref:
+        if (
+            CANONICAL_DISPATCH_SLUG_PATTERN.fullmatch(release_slug) is None
+            or not release_slug.endswith(f"-{commit[:12]}")
+        ):
+            raise ArtifactError("RELEASE.json dispatch slug is not source-bound")
+    elif release_slug != f"{release_ref}-{built_at}":
+        raise ArtifactError("RELEASE.json release identity does not match the archive")
     expected_paths = {
         "python_requirements_file": "requirements-platform.txt",
         "python_lock_file": "requirements-platform.lock.txt",

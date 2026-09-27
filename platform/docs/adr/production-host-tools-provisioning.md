@@ -12,8 +12,8 @@ generation.  The immutable path is:
 The application release SHA (`TARGET_SHA`) and host-control generation SHA
 (`HOST_TOOLS_SHA`) are separate contracts. The repository-owned bounded pin at
 [`platform/contracts/host_tools_pin.json`](../../contracts/host_tools_pin.json)
-is the only source for `HOST_TOOLS_SHA`; it currently pins the installed
-generation `4233e3ce3395da6948192f14e50af2033774f4f0`. The pin records the
+is the only source for `HOST_TOOLS_SHA`; it currently pins the reviewed
+generation `25c67089fdfca99f58d801cc529bb0e987f5ecf8`. The pin records the
 expected repository, exact lowercase commit and a closure baseline of paths,
 source modes and digests. The resolver requires that commit to be a reachable
 ancestor of the reviewed application target. There is no `current` or

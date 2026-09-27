@@ -23,6 +23,8 @@ ARTIFACT_RE = re.compile(
     r"^/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$"
 )
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+OWNER_MARKER_NAME = ".old-sparky-platform-artifact-owner"
+OWNER_MARKER_PREFIX = b"platform_prepare_artifact_dir schema=1"
 
 
 def _safe_component(metadata: os.stat_result, *, mode: int | None = None) -> None:
@@ -80,13 +82,17 @@ def prepare(path: str) -> None:
                 or preflight.st_mode != existing.st_mode
             ):
                 raise RuntimeError("artifact directory leaf changed during preflight")
+            # The dispatcher invokes this helper once for each deployment
+            # handoff.  A matching directory from an earlier or unrelated
+            # invocation is never adopted: doing so would give the later
+            # supervisor cleanup authority over data it did not create.
+            raise RuntimeError("artifact directory already exists")
         except FileNotFoundError:
-            os.mkdir(leaf, 0o700, dir_fd=parent_fd)
+            try:
+                os.mkdir(leaf, 0o700, dir_fd=parent_fd)
+            except FileExistsError as exc:
+                raise RuntimeError("artifact directory appeared during creation") from exc
             existing = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
-        else:
-            # Existing directories are accepted only when they already have
-            # the exact root-owned private identity expected by deployment.
-            _safe_component(existing, mode=0o700)
 
         child_fd = os.open(leaf, DIR_FLAGS, dir_fd=parent_fd)
         try:
@@ -100,6 +106,39 @@ def prepare(path: str) -> None:
             ):
                 raise RuntimeError("artifact directory identity changed")
             _safe_component(current, mode=0o700)
+
+            owner_marker_content = (
+                f"platform_prepare_artifact_dir schema=1 "
+                f"dev={current.st_dev} ino={current.st_ino}\n"
+            ).encode("ascii")
+            marker_fd = os.open(
+                OWNER_MARKER_NAME,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                0o600,
+                dir_fd=child_fd,
+            )
+            try:
+                offset = 0
+                while offset < len(owner_marker_content):
+                    written = os.write(marker_fd, owner_marker_content[offset:])
+                    if written <= 0:
+                        raise OSError("artifact ownership marker write made no progress")
+                    offset += written
+                marker = os.fstat(marker_fd)
+                if (
+                    not stat.S_ISREG(marker.st_mode)
+                    or marker.st_nlink != 1
+                    or marker.st_uid != 0
+                    or stat.S_IMODE(marker.st_mode) != 0o600
+                    or marker.st_size != len(owner_marker_content)
+                ):
+                    raise RuntimeError("artifact ownership marker is unsafe")
+            finally:
+                os.close(marker_fd)
         finally:
             os.close(child_fd)
     finally:
