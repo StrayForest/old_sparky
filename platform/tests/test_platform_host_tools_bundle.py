@@ -34,7 +34,13 @@ from tools.platform_verify_contract import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOLS_ROOT = REPO_ROOT / "platform" / "tools"
 SOURCE_SHA = "d974c8b0536683d0ca8d6f1aca8331a215023fd4"
-PIN_SHA = "25c67089fdfca99f58d801cc529bb0e987f5ecf8"
+# Keep the fixture anchored to the repository's reviewed generation.  The
+# provenance lifecycle intentionally changes this value in a later pin-only
+# commit, so a test-side hard-coded SHA would make that commit alter unrelated
+# test code.
+PIN_SHA = json.loads(
+    (REPO_ROOT / pin.PIN_RELATIVE_PATH).read_text(encoding="utf-8")
+)["host_tools_sha"]
 ARTIFACT_DIGEST = "sha256:" + "e" * 64
 
 

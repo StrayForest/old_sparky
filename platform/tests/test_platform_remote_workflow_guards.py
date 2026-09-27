@@ -322,9 +322,37 @@ class RemoteWorkflowGuardContractTests(unittest.TestCase):
             metadata = path.lstat()
             self.assertTrue(metadata.st_mode & 0o700 == 0o700)
             self.assertFalse(path.is_symlink())
+            marker = path / platform_prepare_artifact_dir.OWNER_MARKER_NAME
+            marker_content = marker.read_text(encoding="ascii")
+            self.assertTrue(
+                marker_content.startswith(
+                    platform_prepare_artifact_dir.OWNER_MARKER_PREFIX.decode("ascii")
+                    + " dev="
+                )
+            )
+            self.assertIn(f" ino={metadata.st_ino}\n", marker_content)
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
         finally:
             if path.is_dir() and not path.is_symlink():
+                marker = path / platform_prepare_artifact_dir.OWNER_MARKER_NAME
+                if marker.is_file() and not marker.is_symlink():
+                    marker.unlink()
                 path.rmdir()
+
+        existing = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-4")
+        existing.mkdir(mode=0o700)
+        try:
+            sentinel = existing / "sentinel"
+            sentinel.write_bytes(b"preserve\n")
+            with self.assertRaises((OSError, RuntimeError)):
+                platform_prepare_artifact_dir.prepare(str(existing))
+            self.assertEqual(sentinel.read_bytes(), b"preserve\n")
+        finally:
+            if existing.is_dir() and not existing.is_symlink():
+                sentinel = existing / "sentinel"
+                if sentinel.is_file() and not sentinel.is_symlink():
+                    sentinel.unlink()
+                existing.rmdir()
 
         target = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-2")
         if target.exists() or target.is_symlink():

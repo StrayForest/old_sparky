@@ -32,6 +32,9 @@ storage_summary_tool=""
 artifact_path=""
 provenance_path="$artifact_dir/RELEASE.provenance.json"
 bootstrap_dir=""
+artifact_cleanup_owned=0
+artifact_identity_before_lock=""
+artifact_identity_owned=""
 
 failure_class="preflight"
 failure_phase="preflight"
@@ -52,13 +55,57 @@ fail() {
   exit 1
 }
 
+artifact_identity_snapshot() {
+  local directory="$1" marker="$1/.old-sparky-platform-artifact-owner"
+  local directory_metadata marker_metadata marker_content parent_metadata
+  local directory_device directory_inode expected_marker_content
+  [[ "$directory" =~ ^/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$ ]] \
+    || return 1
+  [[ -d "$directory" && ! -L "$directory" ]] || return 1
+  [[ "$(/usr/bin/stat -c '%F:%u' -- / 2>/dev/null)" == "directory:0" ]] \
+    || return 1
+  [[ "$(/usr/bin/stat -c '%F:%u:%g:%a' -- /tmp 2>/dev/null)" == "directory:0:0:1777" ]] \
+    || return 1
+  directory_metadata="$(/usr/bin/stat -c '%F:%u:%g:%h:%a:%d:%i' -- "$directory" 2>/dev/null)" \
+    || return 1
+  [[ "$directory_metadata" =~ ^directory:0:0:[2-9][0-9]*:700:[0-9]+:[0-9]+$ ]] \
+    || return 1
+  directory_inode="${directory_metadata##*:}"
+  directory_device="${directory_metadata%:*}"
+  directory_device="${directory_device##*:}"
+  expected_marker_content="platform_prepare_artifact_dir schema=1 dev=$directory_device ino=$directory_inode"
+  parent_metadata="$(/usr/bin/stat -c '%F:%u:%g:%a:%d:%i' -- /tmp 2>/dev/null)" \
+    || return 1
+  [[ "$parent_metadata" == directory:0:0:1777:* ]] || return 1
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  marker_metadata="$(/usr/bin/stat -c '%F:%u:%g:%h:%a:%d:%i:%s' -- "$marker" 2>/dev/null)" \
+    || return 1
+  [[ "$marker_metadata" =~ ^"regular file":0:0:1:600:[0-9]+:[0-9]+:([1-9][0-9]*)$ ]] \
+    || return 1
+  marker_content="$(/usr/bin/cat -- "$marker" 2>/dev/null)" || return 1
+  [[ "$marker_content" == "$expected_marker_content" ]] || return 1
+  [[ "$(/usr/bin/stat -c '%F:%u:%g:%h:%a:%d:%i:%s' -- "$marker" 2>/dev/null)" \
+    == "$marker_metadata" ]] || return 1
+  [[ "$(/usr/bin/stat -c '%F:%u:%g:%h:%a:%d:%i' -- "$directory" 2>/dev/null)" \
+    == "$directory_metadata" ]] || return 1
+  printf '%s|%s|%s\n' "$directory_metadata" "$marker_metadata" "$parent_metadata"
+}
+
 cleanup() {
   local cleanup_rc=$?
   trap - EXIT
   set +e
-  if [[ "$artifact_dir" =~ ^/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$ \
-    && -d "$artifact_dir" && ! -L "$artifact_dir" ]]; then
-    rm -rf -- "$artifact_dir" || cleanup_rc=1
+  if (( artifact_cleanup_owned == 1 )); then
+    local current_artifact_identity=""
+    current_artifact_identity="$(artifact_identity_snapshot "$artifact_dir" 2>/dev/null || true)"
+    if [[ -n "$current_artifact_identity" \
+      && "$current_artifact_identity" == "$artifact_identity_owned" ]]; then
+      rm -rf -- "$artifact_dir" || cleanup_rc=1
+    else
+      # The dispatcher-created directory was replaced, relinked or otherwise
+      # lost its immutable identity.  Never broaden cleanup to a new path.
+      cleanup_rc=1
+    fi
   fi
   if [[ -n "$bootstrap_dir" && -d "$bootstrap_dir" && ! -L "$bootstrap_dir" ]]; then
     rm -rf -- "$bootstrap_dir" || cleanup_rc=1
@@ -71,7 +118,6 @@ cleanup() {
   fi
   exit "$cleanup_rc"
 }
-trap cleanup EXIT
 
 [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || invalid_input
 [[ "$release_slug" =~ ^gha-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}-[0-9a-f]{12}$ ]] || invalid_input
@@ -85,6 +131,11 @@ case "$runtime_profile" in
   baseline|ready-vote-static-4|ready-vote-static-6|ready-vote-static-8|ready-vote-cprofile|ready-vote-static-12|ready-vote-static-16|ready-vote-adaptive-v2|api-3x16|api-1x48|read-mix-cprofile|authenticated-read-admission-32|authenticated-read-admission-24x8|pool-pre-ping-off|web-ssr-diagnostics|web-ssr-native-transport|web-ssr-workers-2|uvicorn-classic|uvicorn-optimized|api-pool-12|api-pool-16|api-pool-20|api-pool-24) ;;
   *) invalid_input ;;
 esac
+
+if [[ -e "$artifact_dir" || -L "$artifact_dir" ]]; then
+  artifact_identity_before_lock="$(artifact_identity_snapshot "$artifact_dir" 2>/dev/null || true)"
+  [[ -n "$artifact_identity_before_lock" ]] || invalid_input
+fi
 
 restart_web_and_wait() {
   systemctl restart deadlock-web
@@ -176,6 +227,18 @@ if [[ "${PLATFORM_RETAINED_LOAD_LOCK_SUPERVISED:-}" != "1" ]]; then
 fi
 platform_retained_load_lock_open \
   || fail "the retained-load lock could not be opened or is already held"
+
+if [[ "$deploy_mode" == "deploy" ]]; then
+  set_failure_context artifact artifact artifact_missing
+  [[ -n "$artifact_identity_before_lock" ]] \
+    || fail "CI release artifact directory was not prepared by the dispatcher"
+  artifact_identity_owned="$(artifact_identity_snapshot "$artifact_dir" 2>/dev/null || true)"
+  [[ -n "$artifact_identity_owned" \
+    && "$artifact_identity_owned" == "$artifact_identity_before_lock" ]] \
+    || fail "CI release artifact directory identity changed before ownership"
+  artifact_cleanup_owned=1
+fi
+trap cleanup EXIT
 
 set_failure_context preflight preflight environment
 test "$(id -u)" -eq 0 || fail "deployment user must be root"

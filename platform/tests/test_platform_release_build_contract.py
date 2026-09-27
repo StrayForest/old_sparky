@@ -44,6 +44,104 @@ def workflow_job(source: str, name: str) -> str:
 
 class PlatformReleaseBuildContractTests(unittest.TestCase):
     @staticmethod
+    def _install_supervisor_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
+        """Install an exact supervisor copy under the production path shape.
+
+        The real supervisor derives its trusted generation from ``BASH_SOURCE``
+        and uses absolute production lock paths.  Keep this subprocess fixture
+        isolated to one unique host-tools generation and two unique lock files;
+        no production helper or shared lock is replaced.
+        """
+
+        if os.geteuid() != 0:
+            raise AssertionError("supervisor ownership fixture requires root")
+        host_tools_root = Path("/opt/oldsparky/platform/shared/host-tools")
+        host_tools_root.mkdir(parents=True, exist_ok=True)
+        generation = hashlib.sha1(str(root).encode("utf-8")).hexdigest()
+        generation_dir = host_tools_root / generation
+        if generation_dir.exists() or generation_dir.is_symlink():
+            raise AssertionError("supervisor fixture generation unexpectedly exists")
+        generation_dir.mkdir(mode=0o555)
+        os.chown(generation_dir, 0, 0)
+        os.chmod(generation_dir, 0o555)
+
+        release_lock = Path(f"/run/lock/oldsparky-pr115-release-{generation[:16]}.lock")
+        retained_lock = Path(f"/run/lock/oldsparky-pr115-retained-{generation[:16]}.lock")
+        if (
+            release_lock.exists()
+            or release_lock.is_symlink()
+            or retained_lock.exists()
+            or retained_lock.is_symlink()
+        ):
+            raise AssertionError("supervisor fixture lock unexpectedly exists")
+
+        lock_source = (TOOLS_DIR / "platform_release_lock.sh").read_text(encoding="utf-8")
+        lock_source = lock_source.replace(
+            'PLATFORM_RELEASE_LOCK_CANONICAL_PATH="/run/lock/oldsparky-platform-release.lock"',
+            f'PLATFORM_RELEASE_LOCK_CANONICAL_PATH="{release_lock}"',
+            1,
+        )
+        lock_source = lock_source.replace(
+            (
+                'PLATFORM_RETAINED_LOAD_LOCK_CANONICAL_PATH='
+                '"/run/lock/oldsparky-retained-load-matrix.lock"'
+            ),
+            f'PLATFORM_RETAINED_LOAD_LOCK_CANONICAL_PATH="{retained_lock}"',
+            1,
+        )
+        lock_source = lock_source.replace(
+            "platform_release_lock_open() {",
+            "platform_release_lock_open_original() {",
+            1,
+        )
+        lock_source = lock_source.replace(
+            "platform_retained_load_lock_open() {",
+            "platform_retained_load_lock_open_original() {",
+            1,
+        )
+        lock_source += textwrap.dedent(
+            """
+
+            platform_release_lock_open() {
+              runtime="${PLATFORM_TEST_RUNTIME:-$runtime}"
+              platform_release_lock_open_original
+            }
+
+            platform_retained_load_lock_open() {
+              runtime="${PLATFORM_TEST_RUNTIME:-$runtime}"
+              platform_retained_load_lock_open_original
+            }
+            """
+        )
+
+        host_tool_files = (
+            "platform_workflow_remote_dispatch.py",
+            "platform_workflow_input_guard.py",
+            "platform_prepare_artifact_dir.py",
+            "platform_production_deploy_supervisor.sh",
+            "platform_release_lock.sh",
+            "platform_release_preflight.sh",
+            "platform_validate_release_artifact.py",
+            "platform_safe_env_exec.py",
+            "platform_render_service_envs.py",
+            "platform_validate_edge_policy.py",
+            "platform_configure_shared_env.py",
+            "platform_update_cloudflare_ips.py",
+            "platform_storage_evidence_summary.py",
+        )
+        for name in host_tool_files:
+            destination = generation_dir / name
+            if name == "platform_release_lock.sh":
+                destination.write_text(lock_source, encoding="utf-8")
+            else:
+                shutil.copyfile(TOOLS_DIR / name, destination)
+            os.chown(destination, 0, 0)
+            os.chmod(destination, 0o555)
+
+        supervisor = generation_dir / "platform_production_deploy_supervisor.sh"
+        return supervisor, release_lock, retained_lock, generation_dir
+
+    @staticmethod
     def _copy_staged_live_qa_builder(root: Path) -> tuple[Path, Path]:
         tools = root / "candidate" / "tools"
         tools.mkdir(parents=True, mode=0o755)
@@ -1612,10 +1710,17 @@ fail 'private stderr must not cross the public channel'
         cleanup_end = supervisor.index("\ntrap cleanup EXIT", cleanup_start)
         cleanup_body = supervisor[cleanup_start:cleanup_end]
         self.assertLess(
+            supervisor.index("platform_release_lock_supervise"),
             supervisor.index("trap cleanup EXIT"),
-            supervisor.index("\nplatform_release_lock_supervise"),
+        )
+        self.assertLess(
+            supervisor.index("\nplatform_retained_load_lock_open"),
+            supervisor.index("trap cleanup EXIT"),
         )
         self.assertIn('rm -rf -- "$artifact_dir"', cleanup_body)
+        self.assertIn("artifact_cleanup_owned", cleanup_body)
+        self.assertIn("artifact_identity_snapshot", cleanup_body)
+        self.assertIn(".old-sparky-platform-artifact-owner", supervisor)
         self.assertIn("platform_retained_load_lock_close", cleanup_body)
         self.assertIn("platform_release_lock_close", cleanup_body)
         self.assertIn("trap - EXIT", cleanup_body)
@@ -1623,6 +1728,134 @@ fail 'private stderr must not cross the public channel'
             "trap 'platform_retained_load_lock_close; platform_release_lock_close' EXIT",
             supervisor,
         )
+
+        # Exercise the actual supervisor in a root-owned immutable-generation
+        # fixture.  Invalid input must return before ownership/trap setup and
+        # preserve the pre-existing matching directory byte-for-byte.
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            fixture, release_lock, retained_lock, generation_dir = self._install_supervisor_fixture(
+                fixture_root
+            )
+
+            def cleanup_fixture() -> None:
+                for path in (release_lock, retained_lock):
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
+                if generation_dir.exists() or generation_dir.is_symlink():
+                    shutil.rmtree(generation_dir)
+
+            self.addCleanup(cleanup_fixture)
+            target_sha = "a" * 40
+            release_slug = "gha-123456-1-aaaaaaaaaaaa"
+            run_id = str(os.getpid())
+            artifact = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            if artifact.exists() or artifact.is_symlink():
+                run_id = str(int(run_id) + 1)
+                artifact = Path(f"/tmp/old-sparky-platform-artifact-{run_id}-1")
+            artifact.mkdir(mode=0o700)
+            os.chown(artifact, 0, 0)
+            os.chmod(artifact, 0o700)
+            marker = artifact / ".old-sparky-platform-artifact-owner"
+            marker.write_text(
+                f"platform_prepare_artifact_dir schema=1 "
+                f"dev={artifact.stat().st_dev} ino={artifact.stat().st_ino}\n",
+                encoding="ascii",
+            )
+            os.chown(marker, 0, 0)
+            os.chmod(marker, 0o600)
+            sentinel = artifact / "preexisting-sentinel"
+            sentinel.write_bytes(b"must-survive-early-failure\n")
+            os.chown(sentinel, 0, 0)
+            os.chmod(sentinel, 0o600)
+
+            def cleanup_artifact() -> None:
+                if artifact.is_dir() and not artifact.is_symlink():
+                    shutil.rmtree(artifact)
+
+            self.addCleanup(cleanup_artifact)
+
+            def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        str(fixture),
+                        target_sha,
+                        *arguments,
+                        str(artifact),
+                        "baseline",
+                    ],
+                    env={
+                        **os.environ,
+                        "PLATFORM_TEST_RUNTIME": str(fixture_root / "runtime"),
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=20,
+                )
+
+            for invalid in (
+                ("bad-release-slug", "deploy"),
+                (release_slug, "invalid-mode"),
+            ):
+                rejected = run(invalid[0], invalid[1])
+                self.assertEqual(rejected.returncode, 2, rejected.stderr)
+                self.assertTrue(artifact.is_dir())
+                self.assertEqual(sentinel.read_bytes(), b"must-survive-early-failure\n")
+
+            rejected_profile = subprocess.run(
+                [
+                    str(fixture),
+                    target_sha,
+                    release_slug,
+                    "deploy",
+                    str(artifact),
+                    "invalid-profile",
+                ],
+                env={
+                    **os.environ,
+                    "PLATFORM_TEST_RUNTIME": str(fixture_root / "runtime"),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+            self.assertEqual(rejected_profile.returncode, 2, rejected_profile.stderr)
+            self.assertTrue(artifact.is_dir())
+            self.assertEqual(sentinel.read_bytes(), b"must-survive-early-failure\n")
+
+            release_lock.parent.mkdir(parents=True, exist_ok=True)
+            lock_fd = os.open(release_lock, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                os.fchown(lock_fd, 0, 0)
+                os.fchmod(lock_fd, 0o600)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                contended = run(release_slug, "deploy")
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            self.assertNotEqual(contended.returncode, 0)
+            self.assertTrue(artifact.is_dir())
+            self.assertEqual(sentinel.read_bytes(), b"must-survive-early-failure\n")
+
+            retained_lock_fd = os.open(retained_lock, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                os.fchown(retained_lock_fd, 0, 0)
+                os.fchmod(retained_lock_fd, 0o600)
+                fcntl.flock(retained_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                retained_contended = run(release_slug, "deploy")
+            finally:
+                fcntl.flock(retained_lock_fd, fcntl.LOCK_UN)
+                os.close(retained_lock_fd)
+            self.assertNotEqual(retained_contended.returncode, 0)
+            self.assertTrue(artifact.is_dir())
+            self.assertEqual(sentinel.read_bytes(), b"must-survive-early-failure\n")
+
+            cleaned = run(release_slug, "deploy")
+            self.assertNotEqual(cleaned.returncode, 0)
+            self.assertFalse(artifact.exists())
+            self.assertFalse(artifact.is_symlink())
 
     def test_production_env_contract_matches_runtime_policy(self) -> None:
         example = (REPO_ROOT / "platform/.env.platform.example").read_text()
