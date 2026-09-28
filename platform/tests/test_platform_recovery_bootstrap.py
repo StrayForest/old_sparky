@@ -39,12 +39,15 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         ".github/workflows/platform-production-release-abort.yml",
         ".github/workflows/platform-production-release-recover.yml",
         "platform/docs/README.md",
+        "platform/docs/adr/production-host-tools-provisioning.md",
         "platform/docs/adr/recovery-bootstrap-retained-abort.md",
         "platform/docs/deployment-runbook.md",
         "platform/docs/release-state-machine.md",
         "platform/docs/test-suite-governance.md",
         "platform/tests/test_platform_live_qa_runtime_install.py",
         "platform/tests/test_platform_live_qa_wrappers.py",
+        "platform/tests/test_platform_ci_classifier.py",
+        "platform/tests/test_platform_host_tools_bundle.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
         "platform/tests/test_platform_release_audit_hardening.py",
         "platform/tests/test_platform_release_build_contract.py",
@@ -70,13 +73,37 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_release_transaction.py",
         "platform/tools/platform_run_alembic.sh",
         "platform/tools/platform_test_catalog.py",
+        "platform/tools/platform_verify_contract.py",
         "platform/tools/platform_workflow_input_guard.py",
+        "platform/tools/platform_workflow_remote_dispatch.py",
         "platform/contracts/host_tools_pin.json",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 40
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 45
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "662c3320b3b725894dffbf793fff84f1d934ac260408dcb2c777aeda3ab0af30"
+    "6197915b4fad322aa21b32c3e015346eabb4c5261d9c8307c108246362a84449"
+)
+
+# These two paths are deliberately present in the recovery route allowlist for
+# compatibility with the retained-release boundary, but were not changed by
+# this patch.  The remaining allowlisted paths plus the documentation files
+# below derive the complete committed patch fixture without consulting the
+# mutable checkout's git history.
+RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES = frozenset(
+    {
+        "platform/tests/test_platform_live_qa_guard.py",
+        "platform/tools/platform_release_lock.sh",
+    }
+)
+RECOVERY_BOOTSTRAP_PATCH_DOCS = frozenset(
+    {
+        "platform/docs/README.md",
+        "platform/docs/adr/production-host-tools-provisioning.md",
+        "platform/docs/adr/recovery-bootstrap-retained-abort.md",
+        "platform/docs/deployment-runbook.md",
+        "platform/docs/release-state-machine.md",
+        "platform/docs/test-suite-governance.md",
+    }
 )
 
 
@@ -1158,6 +1185,10 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             REPO_ROOT / ".github/workflows/platform-production-autodeploy.yml"
         ).read_text(encoding="utf-8")
         canonical = frozenset(classifier.RECOVERY_BOOTSTRAP_FILES)
+        derived_patch_files = (
+            canonical - RECOVERY_BOOTSTRAP_ALLOWLIST_ONLY_FILES
+        ) | RECOVERY_BOOTSTRAP_PATCH_DOCS
+        self.assertEqual(derived_patch_files, RECOVERY_BOOTSTRAP_PATCH_FILES)
         self.assertEqual(canonical, self._set_assignment(classifier_source, "RECOVERY_BOOTSTRAP_FILES"))
         self.assertEqual(canonical, self._set_assignment(artifact_source, "RECOVERY_BOOTSTRAP_FILES"))
         self.assertEqual(canonical, self._workflow_recovery_set(auto_deploy_source))
