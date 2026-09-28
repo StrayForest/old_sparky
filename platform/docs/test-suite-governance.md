@@ -538,9 +538,12 @@ workflow's secret/SSH ordering. `tests.test_platform_release_systemd_state`
 adds real subprocess coverage for operation-ID/path/inode mismatch,
 helper-manifest tamper-before-systemd, and rollback-target retry binding;
 `tests.test_platform_release_recovery_boundaries` covers rollback/recovery
-subprocess fault boundaries. The contract also covers the exact legacy-v2
-no-systemd cleanup bridge. The workflow is evidence-only and non-deployable;
-live execution remains an explicit operator recovery action.
+subprocess fault boundaries. The recovery-bootstrap contract also executes the
+attestation policy fixture with wrong source/ref/run-attempt/job/subject
+variants, including a recovery-job/evidence/API pairing mutation, and covers
+the exact legacy-v2 no-systemd cleanup bridge. The
+workflow is evidence-only and non-deployable; live execution remains an
+explicit operator recovery action.
 
 The `docs` gate checks document shape, repository-local links and project skill
 frontmatter/interface metadata. `verification-contract` checks registry/CI

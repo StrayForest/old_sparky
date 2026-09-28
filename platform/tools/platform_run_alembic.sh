@@ -126,30 +126,42 @@ else:
   # Repeat the complete release preflight after staging, while the deploy
   # wrapper holds the release lock. This closes the preflight->staging TOCTOU
   # window before the first database mutation.
+  migration_preflight_previous_flag=(--require-previous)
+  if [[ -z "${transaction_fields[4]:-}" ]]; then
+    if [[ -z "${transaction_fields[3]:-}" ]]; then
+      migration_preflight_previous_flag=(--allow-initial-install)
+    else
+      migration_preflight_previous_flag=(--allow-no-previous)
+    fi
+  fi
   "$TOOLS_DIR/platform_release_preflight.sh" \
     --app-dir "$PLATFORM_APP_DIR" \
-    --require-previous \
+    "${migration_preflight_previous_flag[@]}" \
     --require-verified-backup \
     --require-edge-parity \
     --backup-max-age-hours 24
 
-  # No old-code writer may overlap a schema migration. The release wrapper
-  # restarts these services only after the candidate pointer is activated, or
-  # after a failed command when the durable pre-migration snapshot proves that
-  # the original pointers and release identities are still safe. This wrapper
-  # itself never starts a writer on an uncertain migration outcome.
+  # No old-code writer may overlap a schema migration.  A first install has
+  # no old release (both durable pointers are absent), so it has no old
+  # service topology to quiesce and must not issue host-level systemd calls.
+  # Existing-release upgrades retain the stop/verify boundary below; the
+  # release wrapper restarts services only after pointer activation, or after
+  # a failed command when the durable pre-migration snapshot proves that the
+  # original pointers and release identities are still safe.
   recovery_tool="$PLATFORM_ROOT_DIR/tools/platform_tournament_list_read_model_recovery.py"
   if [[ ! -f "$recovery_tool" || -L "$recovery_tool" ]]; then
     echo "Production Alembic recovery helper is missing or unsafe." >&2
     exit 1
   fi
-  /usr/bin/systemctl stop deadlock-api deadlock-worker deadlock-web
-  for service in deadlock-api deadlock-worker deadlock-web; do
-    if /usr/bin/systemctl is-active --quiet "$service"; then
-      echo "Refusing migration while service remains active: $service" >&2
-      exit 1
-    fi
-  done
+  if [[ -n "${transaction_fields[3]:-}" || -n "${transaction_fields[4]:-}" ]]; then
+    /usr/bin/systemctl stop deadlock-api deadlock-worker deadlock-web
+    for service in deadlock-api deadlock-worker deadlock-web; do
+      if /usr/bin/systemctl is-active --quiet "$service"; then
+        echo "Refusing migration while service remains active: $service" >&2
+        exit 1
+      fi
+    done
+  fi
 
   # 0051 commits its table/backfill before concurrent indexes.  Repair only
   # that exact, validated partial state before Alembic is allowed to proceed;

@@ -35,6 +35,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         ".github/workflows/platform-production-autodeploy.yml",
         ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
         ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+        ".github/workflows/platform-production-release-abort.yml",
         ".github/workflows/platform-production-release-recover.yml",
         "platform/docs/README.md",
         "platform/docs/adr/recovery-bootstrap-retained-abort.md",
@@ -42,7 +43,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/docs/release-state-machine.md",
         "platform/docs/test-suite-governance.md",
         "platform/tests/test_platform_live_qa_runtime_install.py",
+        "platform/tests/test_platform_live_qa_wrappers.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
+        "platform/tests/test_platform_release_audit_hardening.py",
         "platform/tests/test_platform_release_build_diagnostics.py",
         "platform/tests/test_platform_release_recovery_boundaries.py",
         "platform/tests/test_platform_release_systemd_state.py",
@@ -56,15 +59,20 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_production_classifier_artifact.py",
         "platform/tools/platform_recovery_bootstrap.py",
         "platform/tools/platform_release_restore_runtime.sh",
+        "platform/tools/platform_production_deploy_supervisor.sh",
         "platform/tools/platform_release_rollback.sh",
+        "platform/tools/platform_release_deploy.sh",
+        "platform/tools/platform_release_preflight.sh",
         "platform/tools/platform_release_systemd_state.py",
         "platform/tools/platform_release_transaction.py",
+        "platform/tools/platform_run_alembic.sh",
         "platform/tools/platform_test_catalog.py",
+        "platform/tools/platform_workflow_input_guard.py",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 28
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 36
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "f0dda0b08c8efc665b5f100d1fff4f4595a43d5363babd9352495cb726713410"
+    "742cd93ab54cef15bf883ddbf80a5c5491590160a1df6377bcef8a52d70cda1a"
 )
 
 
@@ -231,6 +239,20 @@ class RecoveryBootstrapInstallTests(unittest.TestCase):
             installed = recovery.install_bundle(bundle, app_dir=app, expected_bundle_sha=result["bundle_sha256"])
             self.assertEqual(installed.name, result["bundle_sha256"])
             self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o555)
+            for name in ("platform_release_systemd_state.py", "platform_release_transaction.py"):
+                self.assertEqual(stat.S_IMODE((installed / name).stat().st_mode), 0o444)
+            self.assertEqual(
+                recovery.main(
+                    [
+                        "validate-generation",
+                        "--generation",
+                        str(installed),
+                        "--bundle-sha",
+                        result["bundle_sha256"],
+                    ]
+                ),
+                0,
+            )
             self.assertEqual(recovery.install_bundle(bundle, app_dir=app), installed)
             member = installed / "platform_recovery_bootstrap.py"
             member.chmod(0o644)
@@ -307,7 +329,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
         self.assertIn('"deployable":False', workflow)
         self.assertIn(
-            'evidence_name="platform-recovery-bootstrap-evidence-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}.json"',
+            'evidence_name="platform-recovery-bootstrap-evidence-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}-${RECOVERY_BUILD_RUN_ID}-${RECOVERY_BUILD_RUN_ATTEMPT}.json"',
             workflow,
         )
         self.assertIn(
@@ -328,12 +350,34 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         secrets = workflow.index("secrets.PROD_SSH_HOST")
         self.assertLess(evidence, secrets)
         self.assertIn("gh attestation verify", workflow)
+        self.assertIn("--source-ref refs/heads/dev", workflow)
+        self.assertIn("--source-digest \"$SOURCE_SHA\"", workflow)
+        self.assertIn("recovery_job_id", workflow)
+        self.assertIn("RECOVERY_BUILD_JOB_ID", workflow)
+        self.assertIn("attempt jobs API response", workflow)
+        self.assertIn("bundle_stat_before", workflow)
+        self.assertIn("bundle_stat_after", workflow)
+        self.assertIn("bundle_digest_before", workflow)
+        self.assertIn("bundle_digest_after", workflow)
+        for extension in (
+            'extensions.get("issuer")',
+            'extensions.get("sourceRepositoryURI")',
+            'extensions.get("sourceRepositoryRef")',
+            'extensions.get("sourceRepositoryDigest")',
+            'extensions.get("buildConfigURI")',
+            'extensions.get("buildSignerURI")',
+            'extensions.get("runInvocationURI")',
+        ):
+            self.assertIn(extension, workflow)
+        self.assertNotIn('extensions.get("Issuer")', workflow)
+        self.assertNotIn('extensions.get("SourceRepositoryURI")', workflow)
+        self.assertNotIn('statement.get("predicateType")', workflow)
         signer_identity = (
             "StrayForest/old_sparky/"
             ".github/workflows/platform-production-recovery-bootstrap-build.yml"
         )
         signer_lines = [
-            line.strip()
+            line.strip().removesuffix("\\").rstrip()
             for line in workflow.splitlines()
             if "--signer-workflow" in line
         ]
@@ -349,12 +393,21 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertIn("actions: read", workflow)
         self.assertIn("attestations: read", workflow)
         self.assertIn("ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY", workflow)
+        legacy_abort = (REPO_ROOT / ".github/workflows/platform-production-release-abort.yml").read_text(encoding="utf-8")
+        self.assertIn('0:0:555:2', legacy_abort)
+        self.assertNotIn('0:0:755:2', legacy_abort)
+        self.assertIn('0:0:444:1', legacy_abort)
+        release_recover = (REPO_ROOT / ".github/workflows/platform-production-release-recover.yml").read_text(encoding="utf-8")
+        self.assertIn('"platform_release_systemd_state.py": 0o444', release_recover)
+        self.assertIn('"platform_release_transaction.py": 0o444', release_recover)
+        self.assertIn("validate-generation", release_recover)
+        self.assertIn('systemd_state_tool_mode=444', release_recover)
         self.assertIn(
-            "evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{run_id}-{attempt}.json\\n",
+            "evidence_name=platform-recovery-bootstrap-evidence-{sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{run_id}-{attempt}.json",
             workflow,
         )
         self.assertNotIn(
-            "evidence_name=platform-recovery-bootstrap-evidence-{source_sha}-{run_id}-{attempt}\\n",
+            "evidence_name=platform-recovery-bootstrap-evidence-{sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{run_id}-{attempt}\\n",
             workflow,
         )
         self.assertIn("platform_recovery_bootstrap.py\" install", workflow)
@@ -693,6 +746,284 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 self.assertTrue(state.exists())
                 self.assertTrue(candidate.exists())
                 run.assert_not_called()
+
+    def test_attestation_policy_rejects_source_run_attempt_job_and_digest_drift(self) -> None:
+        workflow = (
+            REPO_ROOT
+            / ".github/workflows/platform-production-recovery-bootstrap-abort.yml"
+        ).read_text(encoding="utf-8")
+        policy_marker = '/usr/bin/python3 -I -B - "$attestation_json"'
+        policy_command = workflow.index(policy_marker)
+        policy_heredoc = workflow.index("<<'PY'", policy_command)
+        policy_start = workflow.index("\n", policy_heredoc) + 1
+        policy_end = workflow.index("\n          PY", policy_start)
+        policy = textwrap.dedent(workflow[policy_start:policy_end])
+        source_sha = "a" * 40
+        bundle_digest = "b" * 64
+        run_id = "12345"
+        attempt = "2"
+        build_uri = (
+            "https://github.com/StrayForest/old_sparky/"
+            ".github/workflows/platform-production-recovery-bootstrap-build.yml"
+            "@refs/heads/dev"
+        )
+        extensions = {
+            "issuer": "https://token.actions.githubusercontent.com",
+            "sourceRepositoryURI": "https://github.com/StrayForest/old_sparky",
+            "sourceRepositoryRef": "refs/heads/dev",
+            "sourceRepositoryDigest": source_sha,
+            "buildConfigURI": build_uri,
+            "buildSignerURI": build_uri,
+            "runInvocationURI": (
+                "https://github.com/StrayForest/old_sparky/"
+                f"actions/runs/{run_id}/attempts/{attempt}"
+            ),
+        }
+        payload = [
+            {
+                "verificationResult": {
+                    "signature": {"certificate": {"extensions": extensions}},
+                    "verifiedTimestamps": [{"timestamp": "2026-09-27T00:00:00Z"}],
+                    "statement": {
+                        "subject": [{"digest": {"sha256": bundle_digest}}],
+                        "predicateType": "https://slsa.dev/provenance/v1",
+                    },
+                }
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attestation = root / "attestation.json"
+            attestation.write_text(json.dumps(payload), encoding="utf-8")
+
+            def run_policy() -> subprocess.CompletedProcess[str]:
+                attestation.write_text(json.dumps(payload), encoding="utf-8")
+                env = os.environ.copy()
+                env["SOURCE_SHA"] = source_sha
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-",
+                        str(attestation),
+                        bundle_digest,
+                        run_id,
+                        attempt,
+                    ],
+                    input=policy,
+                    text=True,
+                    capture_output=True,
+                    env=env,
+                    check=False,
+                )
+
+            self.assertEqual(run_policy().returncode, 0)
+            for field, bad_value in (
+                ("issuer", "https://token.actions.githubusercontent.com.invalid"),
+                ("sourceRepositoryURI", "https://github.com/other/repo"),
+                ("sourceRepositoryRef", "refs/heads/main"),
+                ("sourceRepositoryDigest", "c" * 40),
+                ("buildConfigURI", build_uri.replace("refs/heads/dev", "refs/heads/main")),
+                ("buildSignerURI", "https://github.com/other/repo/.github/workflows/wrong.yml@refs/heads/dev"),
+                (
+                    "runInvocationURI",
+                    "https://github.com/StrayForest/old_sparky/actions/runs/12345/attempts/3",
+                ),
+            ):
+                with self.subTest(field=field):
+                    original = extensions[field]
+                    extensions[field] = bad_value
+                    try:
+                        self.assertNotEqual(run_policy().returncode, 0)
+                    finally:
+                        extensions[field] = original
+            original_runner = extensions["runInvocationURI"]
+            extensions["runInvocationURI"] = original_runner.replace("12345", "54321")
+            try:
+                self.assertNotEqual(run_policy().returncode, 0)
+            finally:
+                extensions["runInvocationURI"] = original_runner
+            subject = payload[0]["verificationResult"]["statement"]["subject"][0]["digest"]
+            subject["sha256"] = "c" * 64
+            try:
+                self.assertNotEqual(run_policy().returncode, 0)
+            finally:
+                subject["sha256"] = bundle_digest
+
+            jobs_marker = '"$metadata/recovery-jobs.json" "$GITHUB_OUTPUT" "$recovery_run_id" "$recovery_run_attempt" <<\'PY\''
+            jobs_heredoc = workflow.index(jobs_marker)
+            jobs_start = workflow.index("\n", jobs_heredoc) + 1
+            jobs_end = workflow.index("\n          PY", jobs_start)
+            jobs_policy = textwrap.dedent(workflow[jobs_start:jobs_end])
+            jobs = root / "jobs.json"
+            output = root / "output"
+            jobs.write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {
+                                "id": 42,
+                                "name": "Build retained-release recovery bootstrap evidence",
+                                "conclusion": "success",
+                                "run_id": 12345,
+                                "run_attempt": 2,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["RECOVERY_BUILD_JOB"] = "Build retained-release recovery bootstrap evidence"
+            valid_jobs = subprocess.run(
+                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2"],
+                input=jobs_policy,
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(valid_jobs.returncode, 0, valid_jobs.stderr)
+            jobs.write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {
+                                "id": 42,
+                                "name": "Build retained-release recovery bootstrap evidence",
+                                "conclusion": "success",
+                                "run_id": 12345,
+                                "run_attempt": 2,
+                            },
+                            {
+                                "id": 43,
+                                "name": "Build retained-release recovery bootstrap evidence",
+                                "conclusion": "success",
+                                "run_id": 12345,
+                                "run_attempt": 2,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            duplicate_jobs = subprocess.run(
+                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2"],
+                input=jobs_policy,
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertNotEqual(duplicate_jobs.returncode, 0)
+            jobs.write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {
+                                "id": 42,
+                                "name": "Build retained-release recovery bootstrap evidence",
+                                "conclusion": "failure",
+                                "run_id": 12345,
+                                "run_attempt": 2,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            invalid_jobs = subprocess.run(
+                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2"],
+                input=jobs_policy,
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertNotEqual(invalid_jobs.returncode, 0)
+
+            evidence_marker = '"$artifact_dir" "$GITHUB_OUTPUT" "$EVIDENCE_NAME" "$BUNDLE_NAME" <<\'PY\''
+            evidence_heredoc = workflow.index(evidence_marker)
+            evidence_start = workflow.index("\n", evidence_heredoc) + 1
+            evidence_end = workflow.index("\n          PY", evidence_start)
+            evidence_policy = textwrap.dedent(workflow[evidence_start:evidence_end])
+            bundle_name = "platform-recovery-bootstrap-test.zip"
+            evidence_name = "platform-recovery-bootstrap-evidence-test.json"
+            bundle_bytes = b"immutable bundle fixture\n"
+            expected_bundle_sha = hashlib.sha256(bundle_bytes).hexdigest()
+            evidence_payload = {
+                "schema": 1,
+                "capability": "abort_retained_only",
+                "deployable": False,
+                "bundle_name": bundle_name,
+                "bundle_sha256": expected_bundle_sha,
+                "recovery_run_id": "12345",
+                "recovery_run_attempt": "2",
+                "recovery_job_id": "42",
+                "provenance": {
+                    "repository": "StrayForest/old_sparky",
+                    "workflow": "Platform security and build",
+                    "job": "Verification contract",
+                    "run_id": "12345",
+                    "run_attempt": "2",
+                    "source_sha": SOURCE_SHA,
+                    "artifact_name": "platform-ci-route-12345-2",
+                    "artifact_sha256": "b" * 64,
+                    "deployable": False,
+                },
+            }
+
+            def write_artifacts(case_root: Path, payload: dict[str, object]) -> None:
+                def archive(path: Path, name: str, data: bytes) -> None:
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFREG | 0o600) << 16
+                    with zipfile.ZipFile(path, "w") as archive_file:
+                        archive_file.writestr(info, data)
+
+                archive(case_root / "evidence.zip", evidence_name, json.dumps(payload).encode("ascii"))
+                archive(case_root / "bundle.zip", bundle_name, bundle_bytes)
+
+            def run_evidence(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+                case_root = root / f"evidence-case-{len(list(root.glob('evidence-case-*')))}"
+                case_root.mkdir()
+                write_artifacts(case_root, payload)
+                case_output = case_root / "output"
+                policy_env = os.environ.copy()
+                policy_env.update(
+                    {
+                        "RECOVERY_RUN_ID": "12345",
+                        "RECOVERY_RUN_ATTEMPT": "2",
+                        "RECOVERY_BUILD_JOB_ID": "42",
+                        "SECURITY_RUN_ID": "12345",
+                        "SECURITY_RUN_ATTEMPT": "2",
+                        "SOURCE_SHA": SOURCE_SHA,
+                        "ROUTE_DIGEST": "b" * 64,
+                    }
+                )
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-",
+                        str(case_root),
+                        str(case_output),
+                        evidence_name,
+                        bundle_name,
+                    ],
+                    input=evidence_policy,
+                    text=True,
+                    capture_output=True,
+                    env=policy_env,
+                    check=False,
+                )
+
+            self.assertEqual(run_evidence(evidence_payload).returncode, 0)
+            evidence_payload["recovery_job_id"] = "43"
+            mismatched_evidence = run_evidence(evidence_payload)
+            self.assertNotEqual(mismatched_evidence.returncode, 0)
 
     def test_recovery_bootstrap_route_is_non_deployable_and_mixed_runtime_is_deployable(self) -> None:
         sys.path.insert(0, str(TOOLS))

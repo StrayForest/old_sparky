@@ -16,6 +16,7 @@ from tests import platform_test_lock_support as lock_support
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_SCRIPT = REPO_ROOT / "platform/tools/platform_release_deploy.sh"
 ROLLBACK_SCRIPT = REPO_ROOT / "platform/tools/platform_release_rollback.sh"
+ALEMBIC_SCRIPT = REPO_ROOT / "platform/tools/platform_run_alembic.sh"
 RUNTIME_RESTORE_SCRIPT = REPO_ROOT / "platform/tools/platform_release_restore_runtime.sh"
 TRANSACTION_TOOL = REPO_ROOT / "platform/tools/platform_release_transaction.py"
 SYSTEMD_STATE_TOOL = REPO_ROOT / "platform/tools/platform_release_systemd_state.py"
@@ -794,6 +795,83 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertIn("restart deadlock-api", log)
         self.assertNotIn("restart deadlock-worker", log)
         self.assertNotIn("restart deadlock-web", log)
+
+    def test_first_install_migration_does_not_touch_old_service_systemd_topology(self) -> None:
+        """An install with no old pointers must not stop or inspect old units."""
+
+        candidate = self.add_release("first-install-candidate")
+        shared_venv = self.shared / "venv"
+        self.add_fake_venv(shared_venv, marker="first-install")
+        self.run_transaction(
+            "create",
+            "--operation",
+            "install",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--shared-venv",
+            str(shared_venv),
+            "--peer",
+            str(self.shared / ".venv-install-first-install-candidate.0000"),
+            "--snapshot",
+            str(candidate / ".rollback" / "shared-venv-before-install"),
+            "--transition",
+            "none",
+        )
+        self.run_transaction("phase", "--expected", "prepared", "--phase", "venv-transitioned")
+        self.run_transaction("phase", "--expected", "venv-transitioned", "--phase", "staged")
+        self.run_transaction("record-services", "--service-state", "deadlock-api=inactive", "--service-state", "deadlock-worker=inactive", "--service-state", "deadlock-web=inactive", "--timer-active-before", "inactive")
+        self.run_transaction("phase", "--expected", "staged", "--phase", "migration-pending")
+
+        systemctl_log = self.root / "first-install-systemctl.log"
+        systemctl = self.root / "systemctl-first-install"
+        systemctl.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"printf '%s\\n' \"$*\" >> {str(systemctl_log)!r}\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        systemctl.chmod(0o755)
+        fake_python_log = self.root / "first-install-python.log"
+        fake_python = self.root / "first-install-python"
+        fake_python.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"printf '%s\\n' \"$*\" >> {str(fake_python_log)!r}\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        script = ALEMBIC_SCRIPT.read_text(encoding="utf-8")
+        tools_needle = 'TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
+        self.assertIn(tools_needle, script)
+        script = script.replace(tools_needle, f'TOOLS_DIR="{self.tools_dir}"', 1)
+        preflight_tool = '"$TOOLS_DIR/platform_release_preflight.sh"'
+        self.assertIn(preflight_tool, script)
+        script = script.replace(preflight_tool, "/usr/bin/true", 1)
+        script = script.replace("/usr/bin/systemctl", str(systemctl))
+        migration = self.root / "first-install-run-alembic.sh"
+        migration.write_text(script, encoding="utf-8")
+        migration.chmod(0o755)
+
+        result = self.run_script(
+            migration,
+            "upgrade",
+            "head",
+            env={
+                "PLATFORM_ENVIRONMENT": "production",
+                "PLATFORM_APP_DIR": str(self.app_dir),
+                "PLATFORM_ENV_FILE": str(self.shared / ".env.platform"),
+                "PLATFORM_PYTHON_BIN": str(fake_python),
+            },
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(systemctl_log.exists())
+        self.assertIn("-m alembic upgrade head", fake_python_log.read_text(encoding="utf-8"))
 
     def test_sigkill_after_snapshot_leaves_abortable_receipt_without_transaction(
         self,
@@ -1610,17 +1688,12 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
 
     def copy_deploy_migration_script(self, systemctl: Path) -> Path:
         script = self.script_with_physical_tools(DEPLOY_SCRIPT)
-        preflight = '''release_preflight() {
-  "$TOOLS_DIR/platform_release_preflight.sh" \\
-    --app-dir "$APP_DIR" \\
-    --require-previous \\
-    --require-verified-backup \\
-    --require-edge-parity \\
-    --backup-max-age-hours 24
-}
-'''
-        self.assertIn(preflight, script)
-        script = script.replace(preflight, "release_preflight() { /usr/bin/true; }\n", 1)
+        preflight_tool = '"$TOOLS_DIR/platform_release_preflight.sh"'
+        self.assertIn(preflight_tool, script)
+        # Keep the deploy wrapper's topology selection and dynamic
+        # --require-previous/--allow-no-previous/--allow-initial-install
+        # flags under test; only bypass the host-dependent preflight body.
+        script = script.replace(preflight_tool, "/usr/bin/true", 1)
         script = script.replace("/usr/bin/systemctl", str(systemctl))
         script = script.replace("/usr/bin/curl", "/usr/bin/true")
         target = self.root / "deploy-migration-failure.sh"
@@ -1636,17 +1709,11 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         replacement: str,
     ) -> Path:
         script = self.script_with_physical_tools(DEPLOY_SCRIPT)
-        preflight = '''release_preflight() {
-  "$TOOLS_DIR/platform_release_preflight.sh" \\
-    --app-dir "$APP_DIR" \\
-    --require-previous \\
-    --require-verified-backup \\
-    --require-edge-parity \\
-    --backup-max-age-hours 24
-}
-'''
-        self.assertIn(preflight, script)
-        script = script.replace(preflight, "release_preflight() { /usr/bin/true; }\n", 1)
+        preflight_tool = '"$TOOLS_DIR/platform_release_preflight.sh"'
+        self.assertIn(preflight_tool, script)
+        # Preserve the topology-derived flag array while replacing only the
+        # host-dependent preflight executable with a no-op.
+        script = script.replace(preflight_tool, "/usr/bin/true", 1)
         self.assertIn(needle, script)
         script = script.replace(needle, replacement, 1)
         script = script.replace("/usr/bin/systemctl", str(systemctl))

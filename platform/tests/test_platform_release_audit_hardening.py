@@ -105,6 +105,47 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         exec_at = alembic.index('exec "$PLATFORM_PYTHON_BIN" -m alembic')
         self.assertLess(stop_at, exec_at)
 
+    def test_current_only_preflight_rejects_stale_systemd_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app = Path(temporary) / "platform-app"
+            release = app / "releases" / "current-release"
+            shared = app / "shared"
+            release.mkdir(parents=True)
+            shared.mkdir()
+            (app / "current").symlink_to(release)
+            (shared / ".release-systemd-state.json").write_text("stale\n", encoding="ascii")
+            marker = Path(temporary) / "preflight-failure.txt"
+            preflight = Path(temporary) / "platform_release_preflight.sh"
+            source = (TOOLS_DIR / "platform_release_preflight.sh").read_text(encoding="utf-8")
+            self.assertIn("fail() {\n  exit 1\n}", source)
+            preflight.write_text(
+                source.replace(
+                    "fail() {\n  exit 1\n}",
+                    f"fail() {{\n  printf '%s\\n' \"$*\" > {str(marker)!r}\n  exit 1\n}}",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            preflight.chmod(0o755)
+            result = subprocess.run(
+                [
+                    str(preflight),
+                    "--app-dir",
+                    str(app),
+                    "--allow-no-previous",
+                ],
+                env={**os.environ, "PLATFORM_APP_DIR": str(app)},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                marker.read_text(encoding="utf-8").strip(),
+                "--allow-no-previous requires no systemd receipt.",
+            )
+
     def test_production_alembic_rejects_adversarial_commands_before_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -268,17 +309,12 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         self.assertNotIn("exec 9<", recover_workflow)
         self.assertNotIn("flock -n 9", recover_workflow)
         self.assertNotIn("PLATFORM_RELEASE_LOCK_FD=9", recover_workflow)
-        self.assertIn("STATE_VERSION = 2", abort_workflow)
-        self.assertIn("QUIESCE_STATE_VERSION = 1", abort_workflow)
-        self.assertIn("status-quiesce", abort_workflow)
-        self.assertIn('"service_state_before"', abort_workflow)
-        self.assertIn('"timer_active_before"', abort_workflow)
-        self.assertIn("trusted_transaction", abort_workflow)
-        self.assertIn("trusted_release", abort_workflow)
-        self.assertIn("assert_unit_state", abort_workflow)
-        self.assertIn('expected_timer', abort_workflow)
-        self.assertIn("preserved inactive", abort_workflow)
-        self.assertIn("test ! -e \"$state\"", abort_workflow)
+        self.assertIn("ABORT-LEGACY-RELEASE", abort_workflow)
+        self.assertIn("platform_recovery_bootstrap.py", abort_workflow)
+        self.assertIn("abort_retained_only", abort_workflow)
+        self.assertIn("legacy bridge accepts one exact v2 receipt schema", abort_workflow)
+        self.assertIn("current_before", abort_workflow)
+        self.assertNotIn("platform_release_deploy", abort_workflow)
         self.assertNotIn(
             'systemctl restart deadlock-api deadlock-worker deadlock-web',
             abort_workflow,
@@ -759,7 +795,11 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         for name in workflow_names:
             workflow = (WORKFLOW_DIR / name).read_text(encoding="utf-8")
             self.assertIn(expected_fingerprint, workflow, name)
-            self.assertIn("StrictHostKeyChecking yes", workflow, name)
+            self.assertTrue(
+                "StrictHostKeyChecking yes" in workflow
+                or "StrictHostKeyChecking=yes" in workflow,
+                name,
+            )
             self.assertIn("ssh-keygen -lf", workflow, name)
             self.assertNotIn(
                 'ssh-keyscan -T 10 -H "$PROD_SSH_HOST" >> ~/.ssh/known_hosts',

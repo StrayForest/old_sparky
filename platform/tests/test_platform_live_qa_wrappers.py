@@ -382,10 +382,6 @@ class LiveQaWrapperContractTests(unittest.TestCase):
         # table-driven contracts so adding another confirmation/SHA surface
         # does not create a second test identity in the catalog.
         confirmation_cases = (
-            (
-                "platform-production-release-abort.yml",
-                "ABORT-RETAINED-RELEASE-MIGRATION-NOT-REVERSED",
-            ),
             ("platform-production-release-recover.yml", "RECOVER-PENDING-RELEASE"),
             ("platform-production-service-recovery.yml", "RECOVER-DEADLOCK-WEB"),
             (
@@ -400,6 +396,18 @@ class LiveQaWrapperContractTests(unittest.TestCase):
             "platform-production-web-runtime-diagnostics.yml",
         )
         workflow_dir = REPO_ROOT / ".github/workflows"
+        legacy_abort = (workflow_dir / "platform-production-release-abort.yml").read_text(
+            encoding="utf-8"
+        )
+        legacy_secret_position = legacy_abort.index("secrets.PROD_SSH")
+        self.assertIn(
+            'test "$RECOVERY_CONFIRMATION" = "ABORT-LEGACY-RELEASE"',
+            legacy_abort[:legacy_secret_position],
+        )
+        self.assertIn(
+            'test "$GITHUB_REF" = "refs/heads/dev"',
+            legacy_abort[:legacy_secret_position],
+        )
         for filename, expected in confirmation_cases:
             source = (workflow_dir / filename).read_text(encoding="utf-8")
             with self.subTest(workflow=filename, input="confirmation"):

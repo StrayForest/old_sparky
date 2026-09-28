@@ -2,7 +2,7 @@
 
 - Status: Active release design
 - Owner: Production operator and platform maintainers
-- Last reviewed: 2026-09-12
+- Last reviewed: 2026-09-27
 
 This document owns the end-to-end release transaction. The normal production
 path is `tools/platform_release_deploy.sh`; the low-level installer is a
@@ -46,6 +46,18 @@ acquire only the release lock. No path acquires these locks in the reverse
 order, so deploy cannot deadlock with a retained-load, maintenance or recovery
 operation. Recovery passes the inherited release-lock file descriptor through
 rollback and runtime restore and keeps it held for the final Nginx/readiness checks.
+
+## Installation topology
+
+Preflight is explicit about pointer topology. A clean first install has no
+`current` or `previous` pointer and performs only layout, lock, shared-runtime
+and candidate checks; it never invokes an old-release runtime or systemd
+helper. A current-only install validates `current` and deliberately permits no
+`previous`; it uses generic transaction/pointer recovery and requires no
+systemd receipt. An upgrade requires both canonical pointers and uses the full
+runtime/systemd snapshot contract. A previous pointer without current, or any
+pointer/symlink identity mismatch, is rejected. Rollback remains a separate
+two-pointer operation.
 
 Before stopping a writer or invoking the installer, the wrapper atomically
 writes `shared/.release-operation.json` in the `quiesce-pending` phase. It
@@ -227,27 +239,26 @@ database compatibility review and explicit abort/resume decision.
 
 When the receipt is in `migration-applied` or a later phase and the reviewed
 database evidence confirms that the migration was not reversed, use the
-explicit retained-release abort workflow:
+immutable recovery-bootstrap abort workflow described in the runbook. The
+older release-abort workflow is compatibility-only: it accepts only a legacy
+operation-less v2 `install`/`recovery-restored` receipt with no systemd receipt
+and performs receipt cleanup through the installed immutable generation. It
+never invokes a retained release deploy/runtime helper.
 
 ```bash
 gh workflow run platform-production-release-abort.yml \
   --repo StrayForest/old_sparky \
   --ref dev \
-  -f confirmation=ABORT-RETAINED-RELEASE-MIGRATION-NOT-REVERSED
+  -f confirmation=ABORT-LEGACY-RELEASE \
+  -f generation_sha=<installed-recovery-generation-sha256>
 ```
 
-This restores the exact pre-operation release/runtime, restarts and verifies
-only services recorded active before quiesce, leaves intentionally inactive
-units stopped, and never downgrades Alembic.
-
-The abort workflow independently validates the v2 receipt (or the exact
-pre-quiesce receipt schema) and the release identity before selecting the
-transaction/deploy tools. It then verifies that recovery consumed the receipt,
-restored both pointers, and left API, worker, web, and the Cloudflare timer in
-the exact durable active/inactive states recorded before quiesce. Readiness is
-required only for units recorded active; a missing, stale, legacy, or
-identity-mismatched receipt/tool fails closed and remains available for
-operator recovery.
+The legacy bridge performs receipt-owned candidate/venv cleanup only through
+the installed immutable generation. It does not restore runtime or Nginx,
+restart or verify services, invoke a retained release helper, or downgrade
+Alembic. It accepts only an operation-less v2 `install`/`recovery-restored`
+receipt with no systemd receipt and leaves malformed, mismatched, or
+operation-ID receipts retained for the immutable recovery-bootstrap workflow.
 
 The deploy gate also requires a read-only Cloudflare/Nginx/UFW range-parity
 proof and a direct-origin negative test. The current closure evidence for the

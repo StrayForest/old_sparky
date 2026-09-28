@@ -111,7 +111,87 @@ jobs:
 
           runtime=/opt/oldsparky/platform
           test "$(id -u)" -eq 0 || { echo "Production recovery must run as root" >&2; exit 1; }
-          lock_helper="$runtime/current/tools/platform_release_lock.sh"
+          trusted_generation=""
+          if [[ ! -e "$runtime/current" && ! -L "$runtime/current" ]]; then
+            generation_name="$({
+              /usr/bin/python3 -I - "$runtime/shared/.release-recovery/generations" <<'PY'
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          try:
+              root_stat = root.lstat()
+          except OSError as exc:
+              raise SystemExit(1) from exc
+          if (
+              not stat.S_ISDIR(root_stat.st_mode)
+              or stat.S_ISLNK(root_stat.st_mode)
+              or root_stat.st_uid != 0
+              or root_stat.st_gid != 0
+              or root_stat.st_nlink < 2
+              or stat.S_IMODE(root_stat.st_mode) != 0o755
+          ):
+              raise SystemExit(1)
+          candidates = []
+          for entry in root.iterdir():
+              if re.fullmatch(r"[0-9a-f]{64}", entry.name) is None:
+                  continue
+              metadata = entry.lstat()
+              if (
+                  not stat.S_ISDIR(metadata.st_mode)
+                  or stat.S_ISLNK(metadata.st_mode)
+                  or metadata.st_uid != 0
+                  or metadata.st_gid != 0
+                  or metadata.st_nlink < 2
+                  or stat.S_IMODE(metadata.st_mode) != 0o555
+              ):
+                  continue
+              required = {
+                  "manifest.json": 0o444,
+                  "platform_abort_retained_only.sh": 0o555,
+                  "platform_live_qa_guard.py": 0o444,
+                  "platform_live_qa_runtime_install.py": 0o444,
+                  "platform_recovery_bootstrap.py": 0o444,
+                  "platform_release_lock.sh": 0o555,
+                  "platform_release_restore_runtime.sh": 0o555,
+                  "platform_release_systemd_state.py": 0o444,
+                  "platform_release_transaction.py": 0o444,
+              }
+              if all(
+                  (candidate := entry / name).is_file()
+                  and not candidate.is_symlink()
+                  and candidate.lstat().st_uid == 0
+                  and candidate.lstat().st_gid == 0
+                  and candidate.lstat().st_nlink == 1
+                  and stat.S_IMODE(candidate.lstat().st_mode) == mode
+                  for name, mode in required.items()
+              ):
+                  candidates.append(entry.name)
+          if len(candidates) != 1:
+              raise SystemExit(1)
+          print(candidates[0])
+          PY
+            } 2>/dev/null
+          })"
+            || { echo "No unique trusted recovery generation is available for first-install recovery" >&2; exit 1; }
+            trusted_generation="$runtime/shared/.release-recovery/generations/$generation_name"
+            export RECOVERY_TRUSTED_GENERATION="$trusted_generation"
+            lock_helper="$trusted_generation/platform_release_lock.sh"
+            bootstrap_tool="$trusted_generation/platform_recovery_bootstrap.py"
+            test -f "$bootstrap_tool" && test ! -L "$bootstrap_tool" \
+              && test "$(stat -c '%u:%h:%a' "$bootstrap_tool" 2>/dev/null)" = "0:1:444" \
+              || { echo "Recovery bootstrap validator is missing or unsafe" >&2; exit 1; }
+            /usr/bin/python3 -I -B "$bootstrap_tool" validate-generation \
+              --generation "$trusted_generation" --bundle-sha "$generation_name" \
+              >/dev/null 2>/dev/null \
+              || { echo "Immutable recovery generation manifest validation failed" >&2; exit 1; }
+          else
+            lock_helper="$runtime/current/tools/platform_release_lock.sh"
+            unset RECOVERY_TRUSTED_GENERATION
+          fi
           test -f "$lock_helper" && test ! -L "$lock_helper" && test -x "$lock_helper" \
             || { echo "Canonical release lock helper is missing or unsafe" >&2; exit 1; }
           # Run the entire recovery body under the pathname-form common
@@ -123,10 +203,11 @@ jobs:
           runtime=/opt/oldsparky/platform
           state="$runtime/shared/.release-operation.json"
           systemd_state="$runtime/shared/.release-systemd-state.json"
-          systemd_state_tool="$runtime/current/tools/platform_release_systemd_state.py"
-          transaction_tool="$runtime/current/tools/platform_release_transaction.py"
+          trusted_tools="${RECOVERY_TRUSTED_GENERATION:-$runtime/current/tools}"
+          systemd_state_tool="$trusted_tools/platform_release_systemd_state.py"
+          transaction_tool="$trusted_tools/platform_release_transaction.py"
           # shellcheck source=/dev/null
-          source "$runtime/current/tools/platform_release_lock.sh"
+          source "$trusted_tools/platform_release_lock.sh"
           platform_release_lock_open || {
             echo "Canonical release lock supervisor could not be validated" >&2
             exit 75
@@ -134,8 +215,12 @@ jobs:
           test -f "$state" || { echo "No pending release transaction exists" >&2; exit 1; }
           test "$(stat -c '%u:%h:%a' "$state" 2>/dev/null)" = "0:1:600" \
             || { echo "Pending release transaction metadata is unsafe" >&2; exit 1; }
+          systemd_state_tool_mode=755
+          if [[ -n "${RECOVERY_TRUSTED_GENERATION:-}" ]]; then
+            systemd_state_tool_mode=444
+          fi
           test -f "$systemd_state_tool" && test ! -L "$systemd_state_tool" \
-            && test "$(stat -c '%u:%h:%a' "$systemd_state_tool" 2>/dev/null)" = "0:1:755" \
+            && test "$(stat -c '%u:%h:%a' "$systemd_state_tool" 2>/dev/null)" = "0:1:$systemd_state_tool_mode" \
             || { echo "Systemd state helper is missing or unsafe" >&2; exit 1; }
           if [[ -e "$systemd_state" || -L "$systemd_state" ]]; then
             test -f "$systemd_state" && test ! -L "$systemd_state" \
@@ -178,6 +263,32 @@ jobs:
               echo "Legacy or malformed release receipt cannot enter this recovery path" >&2
             fi
             exit 1
+          fi
+          if [[ "$pending_operation" == "install" ]]; then
+            [[ "$operation_id" =~ ^[0-9a-f]{32}$ ]] \
+              || { echo "Release transaction operation identity is invalid" >&2; exit 1; }
+            if [[ -z "$original_previous" ]]; then
+              # First-install and current-only recovery are deliberately
+              # generic transaction cleanup. They have no two-release
+              # systemd/runtime authority; a receipt here is a mismatch.
+              [[ ! -e "$systemd_state" && ! -L "$systemd_state" ]] \
+                || { echo "Nullable previous recovery cannot use a systemd receipt" >&2; exit 1; }
+              if [[ -n "$original_current" ]]; then
+                [[ -L "$runtime/current" && "$(readlink -f "$runtime/current")" == "$original_current" ]] \
+                  || { echo "Current-only recovery pointer does not match receipt" >&2; exit 1; }
+              else
+                [[ ! -e "$runtime/current" && ! -L "$runtime/current" ]] \
+                  || { echo "First-install recovery current pointer is not absent" >&2; exit 1; }
+              fi
+              [[ ! -e "$runtime/previous" && ! -L "$runtime/previous" ]] \
+                || { echo "Nullable previous recovery has an unexpected previous pointer" >&2; exit 1; }
+              /usr/bin/python3 -I "$transaction_tool" recover \
+                --state "$state" >/dev/null 2>/dev/null
+              test ! -e "$state" && test ! -L "$state" \
+                || { echo "Generic recovery did not complete" >&2; exit 1; }
+              printf 'RELEASE_RUNTIME schema=1 status=passed class=recovery release_slug=unavailable source_sha=unavailable\n'
+              exit 0
+            fi
           fi
           test -n "$original_current" && test -n "$original_previous" \
             || { echo "Release transaction identities are incomplete" >&2; exit 1; }

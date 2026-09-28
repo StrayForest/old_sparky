@@ -382,12 +382,10 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
     trap - HUP INT TERM
     public_status passed recovery
   elif [[ "$PENDING_OPERATION" == "install" ]]; then
-    # First-install recovery has no rollback target.  Keep it on the generic
-    # transaction state machine, which restores an absent current/previous
-    # pointer pair and the created venv without invoking rollback-specific
-    # systemd/runtime helpers.  A legacy receipt or a paired systemd receipt
-    # is outside this owner and remains fail-closed for the release-recover or
-    # immutable recovery-bootstrap path to handle with its strict correlation.
+    # Install recovery is deliberately pointer/transaction-only.  A release
+    # install may have started with no pointers, or with current only; neither
+    # topology owns a rollback systemd snapshot.  Never synthesize one and
+    # never let a receipt-bearing install invoke retained runtime helpers.
     operation_id="$(transaction_json | json_field operation_id)"
     if [[ -z "$operation_id" ]]; then
       public_status failed transaction >&2

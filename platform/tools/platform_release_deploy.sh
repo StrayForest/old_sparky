@@ -176,10 +176,40 @@ DEADLOCK_WEB_STATE=""
 CLOUDFLARE_TIMER_STATE=""
 CANDIDATE_HINT=""
 EXIT_RECOVERY_RUNNING=0
+INITIAL_INSTALL=0
+CURRENT_ONLY_INSTALL=0
 
 if [[ ! -d "$APP_DIR" || -L "$APP_DIR" || ! -d "$SHARED_DIR" || -L "$SHARED_DIR" ]]; then
   public_status failed layout >&2
   exit 1
+fi
+
+read_pointer_target() {
+  local pointer="$1"
+  if [[ -L "$pointer" ]]; then
+    readlink -f "$pointer" 2>/dev/null || return 1
+  elif [[ -e "$pointer" ]]; then
+    return 1
+  else
+    printf '%s\n' ""
+  fi
+}
+
+INITIAL_CURRENT_TARGET="$(read_pointer_target "$APP_DIR/current")" || {
+  public_status failed layout >&2
+  exit 1
+}
+INITIAL_PREVIOUS_TARGET="$(read_pointer_target "$APP_DIR/previous")" || {
+  public_status failed layout >&2
+  exit 1
+}
+if [[ -z "$INITIAL_CURRENT_TARGET" && -n "$INITIAL_PREVIOUS_TARGET" ]]; then
+  public_status failed layout >&2
+  exit 1
+elif [[ -z "$INITIAL_CURRENT_TARGET" && -z "$INITIAL_PREVIOUS_TARGET" ]]; then
+  INITIAL_INSTALL=1
+elif [[ -n "$INITIAL_CURRENT_TARGET" && -z "$INITIAL_PREVIOUS_TARGET" ]]; then
+  CURRENT_ONLY_INSTALL=1
 fi
 
 transaction_exists() {
@@ -245,9 +275,29 @@ run_candidate() {
 }
 
 release_preflight() {
+  local previous_flag=(--require-previous)
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    previous_flag=(--allow-initial-install)
+  elif [[ "$CURRENT_ONLY_INSTALL" -eq 1 ]]; then
+    previous_flag=(--allow-no-previous)
+  fi
+  if transaction_path_present; then
+    local transaction_previous transaction_current
+    transaction_previous="$(transaction_json | json_field previous_before)"
+    transaction_current="$(transaction_json | json_field current_before)"
+    if [[ -z "$transaction_previous" ]]; then
+      if [[ -z "$transaction_current" ]]; then
+        previous_flag=(--allow-initial-install)
+      else
+        previous_flag=(--allow-no-previous)
+      fi
+    else
+      previous_flag=(--require-previous)
+    fi
+  fi
   "$TOOLS_DIR/platform_release_preflight.sh" \
     --app-dir "$APP_DIR" \
-    --require-previous \
+    "${previous_flag[@]}" \
     --require-verified-backup \
     --require-edge-parity \
     --backup-max-age-hours 24
@@ -309,10 +359,17 @@ capture_pre_migration_service_state() {
   if [[ "$SERVICE_STATE_CAPTURED" -eq 1 ]]; then
     return 0
   fi
-  DEADLOCK_API_STATE="$(read_unit_state deadlock-api)" || return 1
-  DEADLOCK_WORKER_STATE="$(read_unit_state deadlock-worker)" || return 1
-  DEADLOCK_WEB_STATE="$(read_unit_state deadlock-web)" || return 1
-  CLOUDFLARE_TIMER_STATE="$(read_unit_state deadlock-cloudflare-ips.timer)" || return 1
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    DEADLOCK_API_STATE="inactive"
+    DEADLOCK_WORKER_STATE="inactive"
+    DEADLOCK_WEB_STATE="inactive"
+    CLOUDFLARE_TIMER_STATE="inactive"
+  else
+    DEADLOCK_API_STATE="$(read_unit_state deadlock-api)" || return 1
+    DEADLOCK_WORKER_STATE="$(read_unit_state deadlock-worker)" || return 1
+    DEADLOCK_WEB_STATE="$(read_unit_state deadlock-web)" || return 1
+    CLOUDFLARE_TIMER_STATE="$(read_unit_state deadlock-cloudflare-ips.timer)" || return 1
+  fi
   SERVICE_STATE_CAPTURED=1
 }
 
@@ -494,6 +551,9 @@ quiesce_runtime_writers() {
   # The durable receipt is now on disk. Every subsequent stop/stage operation
   # therefore has an explicit service state to recover, including SIGKILL.
   WRITERS_QUIESCED=1
+  if [[ "$INITIAL_INSTALL" -eq 1 ]]; then
+    return 0
+  fi
   /usr/bin/systemctl stop deadlock-cloudflare-ips.timer >/dev/null 2>/dev/null
   for attempt in {1..60}; do
     cloudflare_service_state="$(read_unit_state deadlock-cloudflare-ips.service)"
@@ -542,8 +602,15 @@ original_current_from_quiesce() {
 restore_snapshot_runtime() {
   local original_current="$1"
   if [[ -z "$original_current" ]]; then
-    public_status failed recovery >&2
-    return 1
+    # A clean first install has no prior release and therefore no safe old
+    # helper/runtime/systemd authority. Recovery is limited to the durable
+    # transaction and pointer topology; never infer or start host services.
+    [[ ! -e "$APP_DIR/shared/.release-systemd-state.json" \
+      && ! -L "$APP_DIR/shared/.release-systemd-state.json" ]] || {
+      public_status failed recovery >&2
+      return 1
+    }
+    return 0
   fi
   restore_previous_runtime "$original_current"
   restore_recorded_services
@@ -697,8 +764,51 @@ abort_retained_release() {
     load_recorded_service_state
   fi
   original_current="$(printf '%s' "$TRANSACTION_JSON" | json_field current_before)"
+  original_previous="$(printf '%s' "$TRANSACTION_JSON" | json_field previous_before)"
+  if [[ "$(printf '%s' "$TRANSACTION_JSON" | json_field operation)" == "install" \
+    && -z "$original_previous" ]]; then
+    # Install receipts without a previous release (including clean
+    # first-install and current-only hosts) have no rollback target. Only the
+    # transaction's own pointer/venv cleanup is authorized, and only before
+    # any migration outcome is uncertain; a systemd receipt is never accepted
+    # for this nullable-pointer topology.
+    if [[ -n "$original_current" ]]; then
+      [[ -L "$APP_DIR/current" && "$(readlink -f "$APP_DIR/current")" == "$original_current" ]] || {
+        public_status failed recovery >&2
+        return 1
+      }
+    else
+      [[ ! -e "$APP_DIR/current" && ! -L "$APP_DIR/current" ]] || {
+        public_status failed recovery >&2
+        return 1
+      }
+    fi
+    [[ ! -e "$APP_DIR/previous" && ! -L "$APP_DIR/previous" ]] || {
+      public_status failed recovery >&2
+      return 1
+    }
+    [[ ! -e "$APP_DIR/shared/.release-systemd-state.json" \
+      && ! -L "$APP_DIR/shared/.release-systemd-state.json" ]] || {
+      public_status failed recovery >&2
+      return 1
+    }
+    case "$retained_phase" in
+      migration-pending|migration-failed|migration-applied|activation-pending|\
+      services-restarted|nginx-pending|nginx-applied|smoke-passed|activation-committed)
+        public_status failed recovery >&2
+        return 1
+        ;;
+    esac
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+      --retain --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+      --state "$TRANSACTION_STATE" >/dev/null 2>/dev/null
+    clear_quiesce_receipt
+    public_status passed abort >&2
+    return 0
+  fi
   if [[ -z "$original_current" ]]; then
-    original_current="$(printf '%s' "$TRANSACTION_JSON" | json_field previous_before)"
+    original_current="$original_previous"
   fi
   case "$retained_phase" in
     migration-pending|migration-failed|migration-applied|activation-pending|\

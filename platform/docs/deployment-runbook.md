@@ -358,13 +358,14 @@ after the rollback transaction has completed successfully. A legacy v2
 when the systemd receipt is absent and the candidate is inactive; that bridge
 performs receipt cleanup only and never executes retained release helpers.
 
-The production abort workflow applies the same receipt authority: it accepts
-only a validated v2 transaction (or the exact pre-quiesce receipt), selects a
-release whose identity contract includes the v2 recovery implementation, and
-checks every API/worker/web unit and the Cloudflare timer against the durable
-pre-quiesce snapshot. It does not require intentionally inactive units to be
-active, and it fails closed while retaining the receipt if recovery, pointer,
-identity, or readiness evidence is incomplete.
+The legacy production release-abort workflow is only a compatibility bridge.
+It accepts the exact operation-less v2 `install`/`recovery-restored` receipt,
+requires a missing systemd receipt, inactive candidate and absent peer, and
+uses the supplied installed recovery-generation SHA. It performs receipt-owned
+cleanup only; it never parses an operation-ID receipt and never executes a
+retained release's deploy, runtime or systemd helper. Operation-ID receipts use
+the immutable recovery-bootstrap workflow below. A malformed, mismatched or
+systemd-paired receipt remains retained.
 
 ## Immutable recovery bootstrap
 
@@ -374,7 +375,14 @@ not reversed. Supply the exact successful `Platform security and build` run
 ID and attempt, then type `ABORT-RECOVERY-BOOTSTRAP-RETAINED-ONLY`. The
 workflow validates the default-branch run, route artifact, closed evidence,
 bundle digest and build attestation before it reads `PROD_SSH_*` secrets or
-opens SSH. It transfers no source checkout to the host.
+opens SSH. Attestation verification pins `refs/heads/dev`, the exact source
+digest, recovery run attempt and successful build job; the downloaded bundle is
+re-hashed and re-stat'ed immediately before transfer. It transfers no source
+checkout to the host. GitHub's certificate `runInvocationURI` is scoped to the
+run and attempt, not an individual job; the workflow therefore binds the
+numeric job ID selected from that exact attempt's jobs API into the closed
+evidence artifact and rejects any evidence/API pairing drift before accepting
+the attestation.
 
 The host installs the verified bundle as one immutable generation and invokes
 only its fixed `platform_abort_retained_only.sh` entrypoint. The entrypoint
@@ -387,6 +395,15 @@ states are clean. A retry after one of those side effects resumes from the
 remaining receipt and never repeats an unproven runtime transition. This workflow is
 non-deployable recovery authority: it does not run normal deploy, Alembic
 downgrade or a manually selected `systemctl` command.
+
+For an interrupted first install with no `current`, release recovery selects a
+single root-owned, immutable recovery generation from
+`shared/.release-recovery/generations/` and uses only its lock and transaction
+helpers. If a unique trusted generation is unavailable, recovery fails closed;
+it never resolves helpers from a missing current release. This path accepts
+only a new operation-ID receipt whose current and previous identities are both
+absent (or the deliberate current-only topology), and it requires no systemd
+receipt.
 
 ## Smoke
 

@@ -1016,6 +1016,9 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--bundle", type=Path, required=True)
     validate.add_argument("--source-sha")
     validate.add_argument("--provenance", type=Path)
+    validate_generation = commands.add_parser("validate-generation")
+    validate_generation.add_argument("--generation", type=Path, required=True)
+    validate_generation.add_argument("--bundle-sha", required=True)
     install = commands.add_parser("install")
     install.add_argument("--bundle", type=Path, required=True)
     install.add_argument("--app-dir", type=Path, required=True)
@@ -1032,8 +1035,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
         expected_provenance = None
-        if args.provenance is not None:
-            value = _read_bounded_json(args.provenance, maximum=MAX_PROVENANCE_BYTES, label="recovery provenance")
+        provenance_path = getattr(args, "provenance", None)
+        if provenance_path is not None:
+            value = _read_bounded_json(provenance_path, maximum=MAX_PROVENANCE_BYTES, label="recovery provenance")
             expected_provenance = _provenance_schema(value)
         if args.command == "build":
             provenance = _read_bounded_json(args.provenance, maximum=MAX_PROVENANCE_BYTES, label="recovery provenance")
@@ -1044,6 +1048,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "validate":
             result = verify_bundle(args.bundle, expected_source_sha=args.source_sha, expected_provenance=expected_provenance)
             print(json.dumps({"schema": SCHEMA, "capability": CAPABILITY, "bundle_sha256": result["bundle_sha256"], "deployable": False}, sort_keys=True))
+        elif args.command == "validate-generation":
+            _validate_generation_tree(args.generation, bundle_sha=args.bundle_sha)
+            print(json.dumps({"schema": SCHEMA, "capability": CAPABILITY, "generation": str(args.generation), "deployable": False}, sort_keys=True))
         elif args.command == "install":
             target = install_bundle(args.bundle, app_dir=args.app_dir, expected_bundle_sha=args.expected_bundle_sha, expected_source_sha=args.source_sha, expected_provenance=expected_provenance)
             print(json.dumps({"schema": SCHEMA, "capability": CAPABILITY, "generation": str(target), "deployable": False}, sort_keys=True))

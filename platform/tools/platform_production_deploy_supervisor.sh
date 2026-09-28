@@ -242,19 +242,43 @@ trap cleanup EXIT
 
 set_failure_context preflight preflight environment
 test "$(id -u)" -eq 0 || fail "deployment user must be root"
-test -L "$current" || fail "current release symlink is missing"
-test -L "$runtime/previous" || fail "previous release symlink is missing"
-set_failure_context preflight preflight service_state
-for service in deadlock-api deadlock-worker deadlock-web; do
-  systemctl is-active --quiet "$service" || fail "$service is not active before deployment"
-done
+initial_install=0
+current_only_install=0
+if [[ -L "$current" ]]; then
+  if [[ -L "$runtime/previous" ]]; then
+    :
+  elif [[ ! -e "$runtime/previous" ]]; then
+    current_only_install=1
+  else
+    fail "previous release pointer is unsafe"
+  fi
+elif [[ ! -e "$current" ]]; then
+  [[ ! -e "$runtime/previous" && ! -L "$runtime/previous" ]] \
+    || fail "first install cannot have a previous release"
+  initial_install=1
+else
+  fail "current release pointer is unsafe"
+fi
 
-set_failure_context preflight preflight nginx_config
-nginx -t >/dev/null
+if (( initial_install == 0 )); then
+  set_failure_context preflight preflight service_state
+  for service in deadlock-api deadlock-worker deadlock-web; do
+    systemctl is-active --quiet "$service" || fail "$service is not active before deployment"
+  done
+
+  set_failure_context preflight preflight nginx_config
+  nginx -t >/dev/null
+fi
 
 set_failure_context preflight preflight preflight_failed
+preflight_previous_flag=(--require-previous)
+if (( initial_install == 1 )); then
+  preflight_previous_flag=(--allow-initial-install)
+elif (( current_only_install == 1 )); then
+  preflight_previous_flag=(--allow-no-previous)
+fi
 "$host_tools_dir/platform_release_preflight.sh" \
-  --require-previous \
+  "${preflight_previous_flag[@]}" \
   --require-verified-backup \
   --require-edge-parity \
   --backup-max-age-hours 24 >/dev/null 2>/dev/null
@@ -397,7 +421,7 @@ fi
 set_failure_context preflight preflight preflight_failed
 "$host_tools_dir/platform_release_preflight.sh" \
   --app-dir "$runtime" \
-  --require-previous \
+  "${preflight_previous_flag[@]}" \
   --require-verified-backup \
   --require-edge-parity \
   --backup-max-age-hours 24 >/dev/null 2>/dev/null

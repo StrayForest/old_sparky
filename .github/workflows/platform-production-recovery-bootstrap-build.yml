@@ -39,9 +39,12 @@ jobs:
       SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
       SECURITY_RUN_ID: ${{ github.event.workflow_run.id }}
       SECURITY_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      RECOVERY_BUILD_RUN_ID: ${{ github.run_id }}
+      RECOVERY_BUILD_RUN_ATTEMPT: ${{ github.run_attempt }}
       SECURITY_WORKFLOW: Platform security and build
       SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
       SECURITY_JOB: Verification contract
+      RECOVERY_BUILD_JOB: Build retained-release recovery bootstrap evidence
       PYTHONUNBUFFERED: '1'
     steps:
       - name: Validate exact successful security run, source and job provenance
@@ -76,6 +79,12 @@ jobs:
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "$GITHUB_API_URL/repos/$REPOSITORY/actions/runs/$SECURITY_RUN_ID/artifacts?per_page=100&page=1" \
             --output "$metadata/artifacts.json"
+          curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$REPOSITORY/actions/runs/$RECOVERY_BUILD_RUN_ID/attempts/$RECOVERY_BUILD_RUN_ATTEMPT/jobs?per_page=100" \
+            --output "$metadata/recovery-jobs.json"
           /usr/bin/python3 -I -B - "$metadata" "$GITHUB_OUTPUT" <<'PY'
           import json
           from pathlib import Path
@@ -87,7 +96,7 @@ jobs:
           run = json.loads((root / "run.json").read_text(encoding="utf-8"))
           jobs = json.loads((root / "jobs.json").read_text(encoding="utf-8"))
           artifacts = json.loads((root / "artifacts.json").read_text(encoding="utf-8"))
-          source_sha = sys.argv[3] if len(sys.argv) > 3 else None
+          recovery_jobs = json.loads((root / "recovery-jobs.json").read_text(encoding="utf-8"))
           if (
               run.get("id") != int(__import__("os").environ["SECURITY_RUN_ID"])
               or run.get("run_attempt") != int(__import__("os").environ["SECURITY_RUN_ATTEMPT"])
@@ -121,6 +130,23 @@ jobs:
               raise SystemExit("security artifact provenance is not exact")
           if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
               raise SystemExit("security artifact digest is invalid")
+          recovery_rows = recovery_jobs.get("jobs") if isinstance(recovery_jobs, dict) else None
+          if not isinstance(recovery_rows, list):
+              raise SystemExit("recovery build jobs response is malformed")
+          recovery_matches = [
+              row
+              for row in recovery_rows
+              if (
+                  isinstance(row, dict)
+                  and row.get("name") == __import__("os").environ["RECOVERY_BUILD_JOB"]
+                  and isinstance(row.get("id"), int)
+                  and ("run_id" not in row or row.get("run_id") == int(__import__("os").environ["RECOVERY_BUILD_RUN_ID"]))
+                  and ("run_attempt" not in row or row.get("run_attempt") == int(__import__("os").environ["RECOVERY_BUILD_RUN_ATTEMPT"]))
+              )
+          ]
+          if len(recovery_matches) != 1:
+              raise SystemExit("exact recovery build job is missing")
+          recovery_job_id = recovery_matches[0]["id"]
           provenance = {
               "repository": __import__('os').environ["REPOSITORY"],
               "workflow": __import__('os').environ["SECURITY_WORKFLOW"],
@@ -140,6 +166,7 @@ jobs:
               stream.write(f"artifact_name={artifact_name}\n")
               stream.write(f"artifact_id={artifact.get('id')}\n")
               stream.write(f"artifact_sha256={provenance['artifact_sha256']}\n")
+              stream.write(f"recovery_job_id={recovery_job_id}\n")
           PY
 
       - name: Checkout exact trusted default-branch source
@@ -176,25 +203,28 @@ jobs:
       - name: Build and validate deterministic recovery bundle
         id: bundle
         shell: bash
+        env:
+          RECOVERY_BUILD_JOB_ID: ${{ steps.provenance.outputs.recovery_job_id }}
         run: |
           set -euo pipefail
           provenance="$RUNNER_TEMP/platform-recovery-provenance/provenance.json"
-          bundle_name="platform-recovery-bootstrap-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}.zip"
+          bundle_name="platform-recovery-bootstrap-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}-${RECOVERY_BUILD_RUN_ID}-${RECOVERY_BUILD_RUN_ATTEMPT}.zip"
           /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py build \
             --source-root "$GITHUB_WORKSPACE/trusted-source" \
             --source-sha "$SOURCE_SHA" \
             --provenance "$provenance" \
             --output "$RUNNER_TEMP/$bundle_name" > "$RUNNER_TEMP/recovery-build.json"
           bundle_sha="$(/usr/bin/python3 -I -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["bundle_sha256"])' "$RUNNER_TEMP/recovery-build.json")"
+          [[ "$RECOVERY_BUILD_JOB_ID" =~ ^[1-9][0-9]{0,31}$ ]]
           /usr/bin/python3 -I -B trusted-source/platform/tools/platform_recovery_bootstrap.py validate \
             --bundle "$RUNNER_TEMP/$bundle_name" --source-sha "$SOURCE_SHA" --provenance "$provenance"
-          evidence_name="platform-recovery-bootstrap-evidence-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}.json"
+          evidence_name="platform-recovery-bootstrap-evidence-${SOURCE_SHA}-${SECURITY_RUN_ID}-${SECURITY_RUN_ATTEMPT}-${RECOVERY_BUILD_RUN_ID}-${RECOVERY_BUILD_RUN_ATTEMPT}.json"
           evidence="$RUNNER_TEMP/$evidence_name"
-          /usr/bin/python3 -I -B - "$provenance" "$evidence" "$bundle_name" "$bundle_sha" <<'PY'
+          /usr/bin/python3 -I -B - "$provenance" "$evidence" "$bundle_name" "$bundle_sha" "$RECOVERY_BUILD_JOB_ID" <<'PY'
           import json,sys
           from pathlib import Path
           provenance=json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-          payload={"schema":1,"capability":"abort_retained_only","deployable":False,"bundle_name":sys.argv[3],"bundle_sha256":sys.argv[4],"provenance":provenance}
+          payload={"schema":1,"capability":"abort_retained_only","deployable":False,"bundle_name":sys.argv[3],"bundle_sha256":sys.argv[4],"recovery_run_id":__import__("os").environ["RECOVERY_BUILD_RUN_ID"],"recovery_run_attempt":__import__("os").environ["RECOVERY_BUILD_RUN_ATTEMPT"],"recovery_job_id":sys.argv[5],"provenance":provenance}
           Path(sys.argv[2]).write_text(json.dumps(payload,sort_keys=True,separators=(",",":"))+"\n",encoding="ascii")
           Path(sys.argv[2]).chmod(0o600)
           PY
@@ -233,6 +263,8 @@ jobs:
             echo "### Retained-release recovery bootstrap evidence"
             echo "- Source SHA: `$SOURCE_SHA`"
             echo "- Security run: `$SECURITY_RUN_ID` attempt `$SECURITY_RUN_ATTEMPT`"
+            echo "- Recovery build run: `$RECOVERY_BUILD_RUN_ID` attempt `$RECOVERY_BUILD_RUN_ATTEMPT`"
+            echo "- Recovery build job: `${{ steps.provenance.outputs.recovery_job_id }}`"
             echo "- Bundle: `${{ steps.bundle.outputs.bundle_name }}`"
             echo "- Bundle SHA-256: `${{ steps.bundle.outputs.bundle_sha }}`"
             echo "- Evidence artifact: `${{ steps.bundle.outputs.evidence_name }}`"

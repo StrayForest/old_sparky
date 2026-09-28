@@ -18,7 +18,11 @@ non-deployable bundle containing only the closed recovery-helper closure. Its
 manifest binds source SHA, exact security run/attempt, artifact digest, modes
 and member digests. The manual recovery-bootstrap abort workflow validates the
 successful run, route artifact, evidence, bundle digest and attestation before
-reading production secrets or opening SSH.
+reading production secrets or opening SSH. Because the GitHub certificate's
+`runInvocationURI` identifies a run/attempt rather than a job, the exact
+recovery job ID is selected from that attempt's jobs API, emitted by the build
+evidence, and cross-checked as a closed evidence/API pair; it is never inferred
+from or fabricated into the certificate URI.
 
 The host installs one root-owned, immutable, content-addressed generation
 under `shared/.release-recovery/generations/<bundle-sha256>`. Its fixed
@@ -31,6 +35,13 @@ operation receipt with a final `complete-recovery`. A retry after either
 durable cleanup side effect is idempotent and fails closed if the receipt pair
 or cleanup identities are inconsistent. It never checks out source, runs
 Alembic, downgrades a migration or selects a normal deploy entrypoint.
+
+The normal release-recover entrypoint has an explicit topology split. For a
+first-install receipt with no `current`, it selects exactly one validated
+generation from the shared recovery store and runs only that generation's
+lock/transaction helpers; it does not source `current/tools`. Current-only
+install recovery follows the same no-systemd generic cleanup rule, while
+upgrade and rollback retain the two-pointer systemd contract.
 
 New transaction receipts carry one immutable 32-hex `operation_id`; the
 systemd receipt must carry the same ID and the canonical current/previous
