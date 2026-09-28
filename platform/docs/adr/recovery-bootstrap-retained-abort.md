@@ -52,14 +52,29 @@ recorded release.
 
 For an operation-ID rollback, `platform_recover_pending.sh` owns the complete
 phase matrix inside that generation: pre-runtime phases retain the filesystem
-transaction, runtime-pending phases restore the original runtime and bound
-systemd receipt, `restart-pending` resumes the swapped target, and later
-phases only verify and complete the two-phase cleanup. A retry after the
-systemd receipt has been cleared consumes the already-proven transaction phase
-without querying systemd. No rollback recovery path executes a helper from
+transaction, runtime-pending phases first record
+`filesystem-restored-runtime-pending` after restoring pointers/venv and then
+restore the original runtime and bound systemd receipt, `restart-pending`
+resumes the swapped target, and later phases only verify and complete the
+two-phase cleanup. The explicit filesystem marker makes a kill between the
+filesystem and runtime steps replay the runtime step instead of incorrectly
+considering the rollback complete. A retry after the systemd receipt has been
+cleared consumes the already-proven transaction phase without querying
+systemd. No rollback recovery path executes a helper from
 `current/tools` or invokes the release's rollback shim; release-specific
 runtime files are data-plane inputs whose immutable receipt manifest is
 revalidated before use.
+
+The same wrapper has a narrowly scoped pre-promotion branch for an exact
+operation-less version-1 `install` receipt in `quiesce-pending`. It requires
+complete service/timer state, unchanged current/previous identities, an absent
+candidate path or empty safe candidate directory (the legacy receipt has no
+candidate inode binding), and no systemd receipt. It restores the recorded
+snapshot through immutable helper
+code and then calls `abort-quiesce`. Unknown keys, other operation-less phases,
+partial state or an occupied candidate fail before any systemd call. This is
+separate from the operation-less `recovery-restored` receipt-owned cleanup
+bridge.
 
 New transaction receipts carry one immutable 32-hex `operation_id`; the
 systemd receipt must carry the same ID and the canonical current/previous

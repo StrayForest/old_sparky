@@ -83,6 +83,7 @@ platform_release_lock_open || { public_status failed lock >&2; exit 3; }
 trap platform_release_lock_close EXIT
 
 STATE="$APP_DIR/shared/.release-operation.json"
+QUIESCE_STATE="$APP_DIR/shared/.release-quiesce.json"
 SYSTEMD_STATE="$APP_DIR/shared/.release-systemd-state.json"
 TRANSACTION_TOOL="$TOOLS_DIR/platform_release_transaction.py"
 SYSTEMD_STATE_TOOL="$TOOLS_DIR/platform_release_systemd_state.py"
@@ -120,6 +121,30 @@ original_current="${transaction_fields[2]:-}"
 original_previous="${transaction_fields[3]:-}"
 
 [[ "$operation_id" =~ ^[0-9a-f]{32}$ ]] || {
+  if [[ -z "$operation_id" && "$pending_operation" == "install" && "$transaction_phase" == "quiesce-pending" ]]; then
+    # This is the narrow pre-promotion receipt written by the immutable
+    # transaction helper.  It has no operation id by design, but its exact
+    # schema/pointers/snapshot must be verified before restoring any unit.
+    # A full operation or systemd receipt alongside it is an ambiguous state.
+    [[ ! -e "$QUIESCE_STATE" && ! -L "$QUIESCE_STATE" ]] \
+      || { public_status failed transaction >&2; exit 1; }
+    [[ ! -e "$SYSTEMD_STATE" && ! -L "$SYSTEMD_STATE" ]] \
+      || { public_status failed systemd_state >&2; exit 1; }
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" verify-quiesce --state "$STATE" \
+      >/dev/null 2>/dev/null \
+      || { public_status failed transaction >&2; exit 1; }
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" restore-quiesce \
+      --state "$STATE" --systemctl "$SYSTEMCTL_BIN" \
+      >/dev/null 2>/dev/null \
+      || { public_status failed service_state >&2; exit 1; }
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" abort-quiesce --state "$STATE" \
+      >/dev/null 2>/dev/null \
+      || { public_status failed transaction >&2; exit 1; }
+    test ! -e "$STATE" && test ! -L "$STATE" \
+      || { public_status failed transaction >&2; exit 1; }
+    public_status passed recovery
+    exit 0
+  fi
   public_status failed transaction >&2
   exit 1
 }
@@ -238,14 +263,16 @@ if [[ "$pending_operation" == "rollback" ]]; then
         >/dev/null 2>/dev/null \
         || { public_status failed transaction >&2; exit 1; }
       ;;
-    rollback-runtime-pending|services-restarted|smoke-passed)
+    rollback-runtime-pending|services-restarted|smoke-passed|filesystem-restored-runtime-pending)
       # Runtime may have been applied to the rollback target.  First restore
       # the original pointers/venv, then restore the original release's
       # release-specific files without restart, and finally restore/verify the
       # captured active systemd state through the immutable helper.
-      /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --retain --state "$STATE" \
-        >/dev/null 2>/dev/null \
-        || { public_status failed transaction >&2; exit 1; }
+      if [[ "$transaction_phase" != "filesystem-restored-runtime-pending" ]]; then
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --retain --runtime-pending --state "$STATE" \
+          >/dev/null 2>/dev/null \
+          || { public_status failed transaction >&2; exit 1; }
+      fi
       rollback_systemd_validate "$original_current" \
         || { public_status failed systemd_state >&2; exit 1; }
       PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$RESTORE_TOOL" \
@@ -260,6 +287,12 @@ if [[ "$pending_operation" == "rollback" ]]; then
         || { public_status failed systemd_state >&2; exit 1; }
       rollback_systemd_verify "$original_current" \
         || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+        --state "$STATE" \
+        --expected filesystem-restored-runtime-pending \
+        --phase recovery-restored \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
       /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
         --retain-receipt --state "$STATE" \
         >/dev/null 2>/dev/null \

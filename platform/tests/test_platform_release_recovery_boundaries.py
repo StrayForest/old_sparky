@@ -108,6 +108,363 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertFalse(candidate.exists())
         self.assertFalse((self.root / "current-helper-used").exists())
 
+    def test_immutable_recovery_wrapper_recovers_operationless_quiesce_receipts(
+        self,
+    ) -> None:
+        """A SIGKILL before promotion restores the exact immutable snapshot."""
+
+        for index, topology in enumerate(("current-only", "upgrade")):
+            if index:
+                self.tearDown()
+                self.setUp()
+            generation = self.install_recovery_generation()
+            current = self.add_release(f"quiesce-{topology}-current")
+            (self.app_dir / "current").symlink_to(current)
+            previous = None
+            if topology == "upgrade":
+                previous = self.add_release("quiesce-upgrade-previous")
+                (self.app_dir / "previous").symlink_to(previous)
+            self.add_current_control_helper_bombs(current)
+            systemctl = self.write_stateful_systemctl(
+                {
+                    "deadlock-api": "active",
+                    "deadlock-worker": "inactive",
+                    "deadlock-web": "active",
+                    "deadlock-cloudflare-ips.timer": "active",
+                    "deadlock-cloudflare-ips.service": "inactive",
+                }
+            )
+            artifact = self.root / f"quiesce-{topology}.tar.gz"
+            artifact.write_bytes(b"not reached after the quiesce receipt")
+            interrupted = self.copy_initial_deploy_with_fault(
+                f"quiesce-{topology}-kill.sh",
+                systemctl,
+                "  quiesce_runtime_writers\n",
+                '  quiesce_runtime_writers\n  /bin/kill -KILL "$$"\n',
+            )
+            result = self.run_script(
+                interrupted,
+                "--artifact",
+                str(artifact),
+                "--app-dir",
+                str(self.app_dir),
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            receipt = json.loads((self.shared / STATE_NAME).read_text())
+            self.assertEqual(receipt["phase"], "quiesce-pending")
+            self.assertNotIn("operation_id", receipt)
+            self.assertEqual(
+                receipt["service_state_before"],
+                {
+                    "deadlock-api": "active",
+                    "deadlock-worker": "inactive",
+                    "deadlock-web": "active",
+                },
+            )
+            self.assertEqual(receipt["timer_active_before"], True)
+            self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+            self.assertEqual(
+                json.loads((self.root / "systemd-state.json").read_text())[
+                    "deadlock-api"
+                ],
+                "inactive",
+            )
+            (self.root / "systemctl.log").write_text("")
+
+            result = self.run_script(
+                generation / RECOVERY_WRAPPER.name,
+                "--app-dir",
+                str(self.app_dir),
+                "--systemctl",
+                str(systemctl),
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((self.shared / STATE_NAME).exists())
+            self.assertFalse((self.shared / ".release-quiesce.json").exists())
+            self.assertEqual(
+                json.loads((self.root / "systemd-state.json").read_text()),
+                {
+                    "deadlock-api": "active",
+                    "deadlock-worker": "inactive",
+                    "deadlock-web": "active",
+                    "deadlock-cloudflare-ips.timer": "active",
+                    "deadlock-cloudflare-ips.service": "inactive",
+                },
+            )
+            self.assertFalse((self.root / "current-helper-used").exists())
+
+    def test_immutable_recovery_wrapper_rejects_partial_quiesce_snapshot_before_systemd(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("quiesce-partial-current")
+        (self.app_dir / "current").symlink_to(current)
+        candidate = self.releases / "quiesce-partial-candidate"
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "active",
+        )
+        receipt_path = self.shared / STATE_NAME
+        receipt = json.loads(receipt_path.read_text())
+        receipt["service_state_before"].pop("deadlock-web")
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+        systemctl, systemctl_log = self.write_failing_systemctl("quiesce-partial")
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(receipt_path.exists())
+        self.assertFalse(systemctl_log.exists())
+
+    def test_immutable_recovery_wrapper_rejects_unbound_quiesce_receipts_before_systemd(
+        self,
+    ) -> None:
+        for index, mutation in enumerate(("phase", "extra", "candidate")):
+            if index:
+                self.tearDown()
+                self.setUp()
+            generation = self.install_recovery_generation()
+            current = self.add_release(f"quiesce-unbound-{mutation}-current")
+            (self.app_dir / "current").symlink_to(current)
+            candidate = self.releases / f"quiesce-unbound-{mutation}-candidate"
+            self.run_transaction(
+                "prepare-quiesce",
+                "--app-dir",
+                str(self.app_dir),
+                "--candidate-release",
+                str(candidate),
+                "--service-state",
+                "deadlock-api=active",
+                "--service-state",
+                "deadlock-worker=inactive",
+                "--service-state",
+                "deadlock-web=active",
+                "--timer-active-before",
+                "active",
+            )
+            receipt_path = self.shared / STATE_NAME
+            receipt = json.loads(receipt_path.read_text())
+            if mutation == "phase":
+                receipt["phase"] = "prepared"
+            elif mutation == "extra":
+                receipt["unexpected"] = True
+            else:
+                candidate.mkdir()
+                (candidate / "unbound.txt").write_text("not receipt-bound")
+            receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+            systemctl, systemctl_log = self.write_failing_systemctl(
+                f"quiesce-unbound-{mutation}"
+            )
+
+            result = self.run_script(
+                generation / RECOVERY_WRAPPER.name,
+                "--app-dir",
+                str(self.app_dir),
+                "--systemctl",
+                str(systemctl),
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, mutation)
+            self.assertTrue(receipt_path.exists(), mutation)
+            self.assertFalse(systemctl_log.exists(), mutation)
+
+    def test_abort_quiesce_low_level_candidate_guard_is_fail_closed(self) -> None:
+        for index, mutation in enumerate(("occupied", "symlink", "hardlink", "special")):
+            if index:
+                self.tearDown()
+                self.setUp()
+            current = self.add_release(f"abort-candidate-{mutation}-current")
+            (self.app_dir / "current").symlink_to(current)
+            candidate = self.releases / f"abort-candidate-{mutation}"
+            self.run_transaction(
+                "prepare-quiesce",
+                "--app-dir",
+                str(self.app_dir),
+                "--candidate-release",
+                str(candidate),
+                "--service-state",
+                "deadlock-api=active",
+                "--service-state",
+                "deadlock-worker=inactive",
+                "--service-state",
+                "deadlock-web=active",
+                "--timer-active-before",
+                "inactive",
+            )
+            if mutation == "occupied":
+                candidate.mkdir()
+                (candidate / "unbound.txt").write_text("not receipt-bound")
+            elif mutation == "symlink":
+                replacement = self.releases / f"{mutation}-replacement"
+                replacement.mkdir()
+                candidate.symlink_to(replacement, target_is_directory=True)
+            elif mutation == "hardlink":
+                source = self.root / "candidate-hardlink-source"
+                source.write_text("not a directory")
+                candidate.hardlink_to(source)
+            else:
+                os.mkfifo(candidate)
+
+            result = self.run_script(
+                TRANSACTION_TOOL,
+                "abort-quiesce",
+                "--state",
+                str(self.shared / STATE_NAME),
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, mutation)
+            self.assertTrue((self.shared / STATE_NAME).exists(), mutation)
+            self.assertTrue(os.path.lexists(candidate), mutation)
+            if mutation == "occupied":
+                self.assertTrue((candidate / "unbound.txt").exists())
+
+    def test_abort_quiesce_empty_candidate_and_mutable_wrapper_cleanup(self) -> None:
+        current = self.add_release("abort-empty-current")
+        (self.app_dir / "current").symlink_to(current)
+        candidate = self.releases / "abort-empty-candidate"
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "inactive",
+        )
+        candidate.mkdir()
+        result = self.run_script(
+            TRANSACTION_TOOL,
+            "abort-quiesce",
+            "--state",
+            str(self.shared / STATE_NAME),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+
+        self.tearDown()
+        self.setUp()
+        current = self.add_release("abort-mutable-current")
+        (self.app_dir / "current").symlink_to(current)
+        self.add_runtime_stubs(current)
+        self.add_fake_venv(self.shared / "venv", marker="mutable-abort")
+        self.write_fake_python(self.shared / "venv" / "bin" / "python")
+        candidate = self.releases / "abort-mutable-candidate"
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "inactive",
+        )
+        candidate.mkdir()
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        result = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="mutable-abort"),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(candidate.exists())
+
+        self.tearDown()
+        self.setUp()
+        current = self.add_release("abort-mutable-occupied-current")
+        (self.app_dir / "current").symlink_to(current)
+        self.add_runtime_stubs(current)
+        self.add_fake_venv(self.shared / "venv", marker="mutable-occupied")
+        self.write_fake_python(self.shared / "venv" / "bin" / "python")
+        candidate = self.releases / "abort-mutable-occupied-candidate"
+        self.run_transaction(
+            "prepare-quiesce",
+            "--app-dir",
+            str(self.app_dir),
+            "--candidate-release",
+            str(candidate),
+            "--service-state",
+            "deadlock-api=active",
+            "--service-state",
+            "deadlock-worker=inactive",
+            "--service-state",
+            "deadlock-web=active",
+            "--timer-active-before",
+            "inactive",
+        )
+        candidate.mkdir()
+        marker = candidate / "unbound.txt"
+        marker.write_text("retain me")
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api": "inactive",
+                "deadlock-worker": "inactive",
+                "deadlock-web": "inactive",
+                "deadlock-cloudflare-ips.timer": "inactive",
+                "deadlock-cloudflare-ips.service": "inactive",
+            }
+        )
+        abort = self.copy_abort_script_with_systemctl(systemctl)
+        result = self.run_script(
+            abort,
+            "--abort-retained",
+            "--confirm-migration-not-reversed",
+            "--app-dir",
+            str(self.app_dir),
+            env=self.runtime_env(label="mutable-occupied"),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertTrue(marker.exists())
+        self.assertIn("restart deadlock-api", (self.root / "systemctl.log").read_text())
+
     def test_immutable_recovery_wrapper_rejects_incomplete_two_pointer_snapshot_before_systemd(
         self,
     ) -> None:
@@ -420,6 +777,79 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
             check=False,
         )
 
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(receipt.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+
+    def test_immutable_recovery_wrapper_replays_runtime_after_filesystem_recovery_crash(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("rollback-window-current")
+        previous = self.add_release("rollback-window-previous")
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(previous)
+        (self.app_dir / "current").symlink_to(previous)
+        (self.app_dir / "previous").symlink_to(current)
+        self.add_fake_venv(self.shared / "venv", marker="rollback")
+        self.write_fake_python(self.shared / "venv" / "bin" / "python")
+        self.create_wrapper_rollback_transaction(
+            current, previous, phase="rollback-runtime-pending"
+        )
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api.service": "active",
+                "deadlock-worker.service": "inactive",
+                "deadlock-web.service": "active",
+            }
+        )
+        receipt = self.shared / ".release-systemd-state.json"
+        self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "capture-transaction",
+            "--state",
+            str(receipt),
+            "--transaction",
+            str(self.shared / STATE_NAME),
+            "--app-dir",
+            str(self.app_dir),
+            "--helper-release",
+            str(previous),
+            "--require-helper-manifest",
+            "--systemctl",
+            str(systemctl),
+        )
+        (self.root / "systemctl.log").write_text("")
+        interrupted = self.root / "filesystem-recovery-kill.sh"
+        interrupted.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"/usr/bin/python3 -I {shlex.quote(str(TRANSACTION_TOOL))} recover --retain --runtime-pending --state {shlex.quote(str(self.shared / STATE_NAME))}\n"
+            "/bin/kill -KILL \"$$\"\n",
+            encoding="utf-8",
+        )
+        interrupted.chmod(0o755)
+        result = self.run_script(interrupted, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state_phase(), "filesystem-restored-runtime-pending")
+        self.assertTrue(receipt.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            env={
+                **self.runtime_env(label="current"),
+                "PLATFORM_TEST_NGINX_LABEL": "current",
+            },
+            check=False,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.shared / STATE_NAME).exists())
         self.assertFalse(receipt.exists())

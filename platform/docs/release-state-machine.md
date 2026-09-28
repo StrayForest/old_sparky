@@ -83,11 +83,25 @@ pre-quiesce transaction is sufficient to restore the old runtime and remove a
 partial candidate, or remains retained for explicit abort when any identity,
 pointer, restart or readiness check fails.
 
+The immutable recovery wrapper has one deliberately narrow operation-less
+exception for this boundary: an exact version-1 `install` receipt in
+`quiesce-pending`, with complete API/worker/web/timer state, unchanged pointer
+identities, no populated candidate path and no systemd receipt. An empty,
+canonical root-owned candidate directory is also safe to remove. It restores
+that recorded service/timer snapshot through the generation's transaction
+helper, then performs `abort-quiesce`. A malformed receipt, an unexpected
+phase, an occupied or replaced candidate, or any partial snapshot remains
+retained before
+the first systemd call. This pre-promotion branch is not the legacy
+`recovery-restored` cleanup bridge.
+
 Rollback uses the same receipt discipline after switching pointers:
 
 ```text
 pointer/venv switch
     -> rollback-runtime-pending
+    -> filesystem-restored-runtime-pending
+    -> immutable runtime/systemd restore
     -> restart-pending
     -> services-restarted
     -> smoke-passed
@@ -162,12 +176,16 @@ compatibility handoff needed for the normal cross-release boundary.
   restores the recorded pointers/venv and then reinstalls the previous
   release's units and Nginx configuration before restart/readiness/smoke.
 - A rollback runtime failure retains `rollback-runtime-pending` (or its later
-  phase). Recovery either completes the already committed restart-pending
-  rollback or restores the exact pre-rollback pointers, venv, units and Nginx
-  while both the rollback transaction and the systemd-state receipt remain
-  durable. Recovery is invoked through the shared bundle, including when
-  `current` already resolves to the previous release. A missing, stale or
-  malformed systemd-state receipt never authorizes an enable/start operation.
+  phase). Recovery first durably restores the filesystem and venv, recording
+  `filesystem-restored-runtime-pending` before invoking any runtime or systemd
+  helper. A retry at that marker replays the bound runtime/systemd restore and
+  only then advances to `recovery-restored` and the two-phase receipt cleanup.
+  Recovery either completes the already committed restart-pending rollback or
+  restores the exact pre-rollback pointers, venv, units and Nginx while both
+  the rollback transaction and the systemd-state receipt remain durable.
+  Recovery is invoked through the shared bundle, including when `current`
+  already resolves to the previous release. A missing, stale or malformed
+  systemd-state receipt never authorizes an enable/start operation.
 - An interrupted first install with a new operation ID and no systemd receipt
   is recovered by the generic transaction state machine, including the valid
   case where `current_before` and `previous_before` are absent. It never enters
@@ -188,8 +206,9 @@ already quiesced services. It still requires the confirmation flag for a
 single guarded operator command, but no migration authorization is applied to
 that phase. A SIGKILL before promotion is represented by
 `.release-operation.json` with `phase=quiesce-pending`; `--abort-retained`
-consumes that receipt, restores its exact service state and removes a partial
-candidate. Missing or malformed
+consumes that receipt, restores its exact service state and removes only an
+empty, canonical candidate directory. A populated or replaced candidate is
+retained with the receipt. Missing or malformed
 service-state data is never interpreted as “all active”; recovery stops before
 any service start and retains the receipt.
 

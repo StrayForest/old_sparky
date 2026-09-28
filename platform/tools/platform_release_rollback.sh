@@ -246,16 +246,23 @@ capture_rollback_systemd_state() {
 }
 
 recover_rollback_to_original() {
-  local original_current
+  local original_current pending_phase
   original_current="$(transaction_json | json_field current_before)"
   if [[ -z "$original_current" ]]; then
     original_current="$(transaction_json | json_field previous_before)"
   fi
-  /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
-    --retain \
-    --state "$TRANSACTION_STATE"
+  pending_phase="$(transaction_json | json_field phase)"
+  if [[ "$pending_phase" != "filesystem-restored-runtime-pending" ]]; then
+    /usr/bin/python3 -I "$TRANSACTION_TOOL" recover \
+      --retain --runtime-pending \
+      --state "$TRANSACTION_STATE"
+  fi
   restore_release_runtime "$original_current" 1
   restore_rollback_systemd_state 1 "$original_current"
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+    --state "$TRANSACTION_STATE" \
+    --expected filesystem-restored-runtime-pending \
+    --phase recovery-restored
   /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
     --retain-receipt \
     --state "$TRANSACTION_STATE"
@@ -354,7 +361,8 @@ if [[ -e "$TRANSACTION_STATE" || -L "$TRANSACTION_STATE" ]]; then
     trap - HUP INT TERM
     public_status passed recovery
   elif [[ "$PENDING_OPERATION" == "rollback" \
-    && "$PENDING_PHASE" == "rollback-runtime-pending" ]]; then
+    && ( "$PENDING_PHASE" == "rollback-runtime-pending" \
+      || "$PENDING_PHASE" == "filesystem-restored-runtime-pending" ) ]]; then
     trap '' HUP INT TERM
     recover_rollback_to_original
     trap - HUP INT TERM
@@ -676,6 +684,7 @@ cleanup_failed_rollback() {
     pending_phase="${pending_status#* }"
     if [[ "$pending_operation" == "rollback" && ( \
       "$pending_phase" == "rollback-runtime-pending" || \
+      "$pending_phase" == "filesystem-restored-runtime-pending" || \
       "$pending_phase" == "restart-pending" || \
       "$pending_phase" == "services-restarted" || \
       "$pending_phase" == "smoke-passed" || \

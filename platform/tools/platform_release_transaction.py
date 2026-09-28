@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import sys
 from typing import cast
 from uuid import uuid4
@@ -48,6 +49,7 @@ PHASES = {
     "restart-pending",
     "rollback-runtime-pending",
     "rollback-runtime-applied",
+    "filesystem-restored-runtime-pending",
     "recovery-restored",
 }
 PHASE_TRANSITIONS = {
@@ -91,9 +93,11 @@ PHASE_TRANSITIONS = {
     "rollback-runtime-pending": {
         "restart-pending",
         "rollback-runtime-applied",
+        "filesystem-restored-runtime-pending",
         "recovery-authorized",
     },
     "rollback-runtime-applied": {"recovery-authorized"},
+    "filesystem-restored-runtime-pending": {"recovery-restored"},
     "recovery-restored": set(),
 }
 MIGRATION_OUTCOME_UNCERTAIN_PHASES = {
@@ -1031,8 +1035,16 @@ def abort_quiesce(state: Path) -> None:
     record = _load_quiesce_record(state)
     verify_quiesce(state)
     candidate = cast(Path, record["candidate_path"])
+    _validate_quiesce_candidate_for_abort(candidate)
     if _lexists(candidate):
-        _remove_tree(candidate)
+        # Only an empty directory is authorized above.  Keep the final
+        # removal non-recursive so a concurrent replacement/population turns
+        # into a retained receipt rather than a recursive delete.
+        try:
+            candidate.rmdir()
+        except OSError as exc:
+            raise TransactionError("pre-quiesce candidate release changed") from exc
+        _fsync_directory(candidate.parent)
     shared = cast(Path, record["shared"])
     if record["shared_env_before"] is None:
         shared_env = shared / ".env.platform"
@@ -1056,6 +1068,124 @@ def abort_quiesce(state: Path) -> None:
                 _fsync_directory(shared)
     state.unlink()
     _fsync_directory(state.parent)
+
+
+def _validate_quiesce_candidate_for_abort(candidate: Path) -> None:
+    """Allow only an empty, receipt-owned candidate directory to be removed.
+
+    The pre-promotion receipt predates candidate extraction and therefore has
+    no candidate inode/content identity.  A populated path is consequently
+    unbound data, not cleanup authority; retain it for operator review rather
+    than recursively deleting it.  The same check is used before restoring
+    services so every abort caller fails closed before its first systemd
+    operation when the candidate has been replaced or is unsafe.
+    """
+
+    if not _lexists(candidate):
+        return
+    metadata = _safe_directory(candidate, label="pre-quiesce candidate release")
+    releases = candidate.parent
+    releases_metadata = _safe_directory(releases, label="releases directory")
+    if metadata.st_dev != releases_metadata.st_dev:
+        raise TransactionError("pre-quiesce candidate release is on another device")
+    try:
+        with os.scandir(candidate) as entries:
+            if next(entries, None) is not None:
+                raise TransactionError("pre-quiesce candidate release is occupied")
+    except OSError as exc:
+        raise TransactionError("pre-quiesce candidate release is unavailable") from exc
+
+
+def _systemctl_path(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or "\n" in value
+        or "\x00" in value
+    ):
+        raise TransactionError("systemctl path is invalid")
+    path = Path(value)
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise TransactionError("systemctl path is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_nlink != 1
+        or not stat.S_IMODE(metadata.st_mode) & 0o111
+    ):
+        raise TransactionError("systemctl path metadata is unsafe")
+    return value
+
+
+def _run_systemctl(systemctl: str, *arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            [systemctl, *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TransactionError("systemctl operation failed") from exc
+    output = result.stdout.strip()
+    if result.returncode != 0:
+        raise TransactionError("systemctl operation failed")
+    return output
+
+
+def _read_systemctl_state(systemctl: str, unit: str) -> str:
+    try:
+        result = subprocess.run(
+            [systemctl, "is-active", unit],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TransactionError("systemctl state query failed") from exc
+    output = result.stdout.strip()
+    if output not in {"active", "inactive"}:
+        raise TransactionError("systemctl state query is invalid")
+    return output
+
+
+def restore_quiesce(state: Path, *, systemctl: str) -> None:
+    """Restore the exact pre-quiesce service snapshot before abort cleanup."""
+
+    systemctl = _systemctl_path(systemctl)
+    record = _load_quiesce_record(state)
+    verify_quiesce(state)
+    # The operation-less receipt is written before staging.  It carries the
+    # candidate pathname, but deliberately no candidate inode/content
+    # identity, so a pre-promotion recovery may only proceed while that path
+    # is absent or is an empty, canonical root-owned release directory.
+    # Treating populated data as recoverable would turn an unbound directory
+    # into cleanup authority.
+    candidate = cast(Path, record["candidate_path"])
+    _validate_quiesce_candidate_for_abort(candidate)
+    service_state = cast(dict[str, str], record["service_state_before"])
+    for unit in SERVICE_UNITS:
+        expected = service_state[unit]
+        _run_systemctl(systemctl, "restart" if expected == "active" else "stop", unit)
+        if _read_systemctl_state(systemctl, unit) != expected:
+            raise TransactionError("quiesced service state was not restored")
+    timer_expected = "active" if record["timer_active_before"] else "inactive"
+    _run_systemctl(
+        systemctl,
+        "start" if timer_expected == "active" else "stop",
+        "deadlock-cloudflare-ips.timer",
+    )
+    if _read_systemctl_state(systemctl, "deadlock-cloudflare-ips.timer") != timer_expected:
+        raise TransactionError("quiesced timer state was not restored")
 
 
 def authorize_recovery(state: Path, *, confirmation: str) -> None:
@@ -1412,8 +1542,19 @@ def _cleanup_recovered_install(
         _fsync_directory(state.parent)
 
 
-def recover(state: Path, *, retain: bool = False) -> None:
+def recover(
+    state: Path,
+    *,
+    retain: bool = False,
+    runtime_pending: bool = False,
+) -> None:
     record = _load_record(state)
+    if runtime_pending and (
+        not retain or record["operation"] != "rollback"
+    ):
+        raise TransactionError(
+            "runtime-pending recovery requires a retained rollback transaction"
+        )
     if (
         record["operation"] == "install"
         and record["phase"] in MIGRATION_OUTCOME_UNCERTAIN_PHASES
@@ -1434,7 +1575,12 @@ def recover(state: Path, *, retain: bool = False) -> None:
         _restore_pointers(record)
         _restore_venv(record)
         _verify_original_pointers(record)
-        record = _mark_recovery_restored(state, record)
+        if runtime_pending:
+            record["phase"] = "filesystem-restored-runtime-pending"
+            _write_record(state, _record_for_write(record), creating=False)
+            record = _load_record(state)
+        else:
+            record = _mark_recovery_restored(state, record)
     else:
         _verify_original_pointers(record)
         _restore_venv(record)
@@ -1610,6 +1756,9 @@ def _build_parser() -> argparse.ArgumentParser:
     clear_quiesce_parser.add_argument("--state", required=True, type=Path)
     abort_quiesce_parser = commands.add_parser("abort-quiesce")
     abort_quiesce_parser.add_argument("--state", required=True, type=Path)
+    restore_quiesce_parser = commands.add_parser("restore-quiesce")
+    restore_quiesce_parser.add_argument("--state", required=True, type=Path)
+    restore_quiesce_parser.add_argument("--systemctl", required=True)
     status_quiesce_parser = commands.add_parser("status-quiesce")
     status_quiesce_parser.add_argument("--state", required=True, type=Path)
     status_quiesce_parser.add_argument("--json", action="store_true", dest="as_json")
@@ -1628,6 +1777,7 @@ def _build_parser() -> argparse.ArgumentParser:
     recover_parser = commands.add_parser("recover")
     recover_parser.add_argument("--state", required=True, type=Path)
     recover_parser.add_argument("--retain", action="store_true")
+    recover_parser.add_argument("--runtime-pending", action="store_true")
     authorize_parser = commands.add_parser("authorize-recovery")
     authorize_parser.add_argument("--state", required=True, type=Path)
     authorize_parser.add_argument("--confirm", required=True)
@@ -1697,6 +1847,8 @@ def main() -> int:
             clear_quiesce(args.state)
         elif args.command == "abort-quiesce":
             abort_quiesce(args.state)
+        elif args.command == "restore-quiesce":
+            restore_quiesce(args.state, systemctl=args.systemctl)
         elif args.command == "status-quiesce":
             record = _load_quiesce_record(args.state)
             if args.as_json:
@@ -1725,7 +1877,11 @@ def main() -> int:
         elif args.command == "switch-pointer":
             switch_pointer(args.state, name=args.name, target_value=args.target)
         elif args.command == "recover":
-            recover(args.state, retain=args.retain)
+            recover(
+                args.state,
+                retain=args.retain,
+                runtime_pending=args.runtime_pending,
+            )
         elif args.command == "authorize-recovery":
             authorize_recovery(args.state, confirmation=args.confirm)
         elif args.command == "verify-original":

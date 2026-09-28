@@ -322,6 +322,15 @@ restart, then checks only services that were active before quiesce. Intentionall
 inactive services and timers remain stopped. A pointer, identity, restart or
 readiness mismatch retains the receipt for another guarded attempt.
 
+An interrupted pre-promotion install has a separate immutable recovery path.
+Only an exact operation-less version-1 `quiesce-pending` receipt with complete
+service/timer state, unchanged pointer identities, an absent candidate and no
+systemd receipt is accepted; an empty, canonical root-owned candidate directory
+is also safe to remove. The recovery generation restores the recorded
+snapshot and then consumes the receipt with `abort-quiesce`; malformed,
+partial, occupied-candidate or other operation-less receipts fail before a
+systemd query. This is not the legacy `recovery-restored` cleanup bridge.
+
 If an operator explicitly chooses code/runtime rollback after reviewing
 database compatibility, use the guarded abort command. It restores the
 recorded pointers and venv and never downgrades Alembic:
@@ -353,7 +362,11 @@ Recovery restores only that closed owned set, first without `--now` enablement
 and then to the recorded active state; an unsupported or malformed state fails
 closed. `--no-restart` installs the files with activation disabled and verifies
 the recorded active state without starting units. The receipt is removed only
-after the rollback transaction has completed successfully. A legacy v2
+after the rollback transaction has completed successfully. When a rollback
+filesystem restore completes before its runtime restore, the immutable
+transaction records `filesystem-restored-runtime-pending`; retries replay the
+bound runtime/systemd restore before advancing to `recovery-restored`, so a
+crash in that window cannot skip runtime repair. A legacy v2
 `install`/`recovery-restored` receipt with no operation ID is recoverable only
 when the systemd receipt is absent and the candidate is inactive; that bridge
 performs receipt cleanup only and never executes retained release helpers.
