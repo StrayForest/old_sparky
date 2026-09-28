@@ -2189,6 +2189,33 @@ jobs:
             --header "Accept: application/vnd.github+json"
             --header "X-GitHub-Api-Version: 2022-11-28"
           )
+          attempt_metadata="$RUNNER_TEMP/host-tools-production-attempt.json"
+          curl --fail-with-body --silent --show-error --location --max-filesize 524288 \
+            "${api_headers[@]}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --output "$attempt_metadata"
+          /usr/bin/python3 - "$attempt_metadata" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$TARGET_SHA" "$GITHUB_REPOSITORY" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path, run_id, attempt, target_sha, repository = sys.argv[1:]
+          payload = json.loads(Path(path).read_text(encoding="ascii"))
+          repo = payload.get("repository")
+          if (
+              not isinstance(payload, dict)
+              or type(payload.get("id")) is not int
+              or payload.get("id") != int(run_id)
+              or type(payload.get("run_attempt")) is not int
+              or payload.get("run_attempt") != int(attempt)
+              or payload.get("head_sha") != target_sha
+              or payload.get("head_branch") != "dev"
+              or payload.get("event") != "workflow_dispatch"
+              or not isinstance(repo, dict)
+              or repo.get("full_name") != repository
+          ):
+              raise SystemExit("host-tools production workflow attempt is not exact")
+          PY
           handoff_metadata="$RUNNER_TEMP/host-tools-handoff-metadata.json"
           handoff_zip="$RUNNER_TEMP/host-tools-handoff.zip"
           curl --fail-with-body --silent --show-error --location --max-filesize 1048576 \
@@ -2212,8 +2239,15 @@ jobs:
               or payload.get("digest") != artifact_digest
               or not isinstance(run, dict)
               or run.get("id") != int(run_id)
-              or run.get("run_attempt") != int(attempt)
+              or (
+                  "run_attempt" in run
+                  and (
+                      type(run.get("run_attempt")) is not int
+                      or run.get("run_attempt") != int(attempt)
+                  )
+              )
               or run.get("head_sha") != target_sha
+              or run.get("head_branch") != "dev"
               or re.fullmatch(r"sha256:[0-9a-f]{64}", str(artifact_digest)) is None
           ):
               raise SystemExit("host-tools handoff artifact is not bound to this exact run")
@@ -2301,6 +2335,14 @@ jobs:
               or not isinstance(run, dict)
               or run.get("id") != int(run_id)
               or run.get("head_sha") != target_sha
+              or run.get("head_branch") != "dev"
+              or (
+                  "run_attempt" in run
+                  and (
+                      type(run.get("run_attempt")) is not int
+                      or run.get("run_attempt") != int(attempt)
+                  )
+              )
               or re.fullmatch(r"[0-9a-f]{64}", digest) is None
           ):
               raise SystemExit("host-tools outer artifact is not bound to the exact build")
@@ -2639,6 +2681,7 @@ jobs:
           ssh_dir="$RUNNER_TEMP/platform-production-deploy-ssh"
           test "$ssh_dir" = "$RUNNER_TEMP/platform-production-deploy-ssh"
           rm -f -- "$RUNNER_TEMP/deploy-input/platform-production-deploy-input.json" "$RUNNER_TEMP/platform-production-deploy-remote.log" "$RUNNER_TEMP/platform-production-deploy-remote-error.log" "$RUNNER_TEMP/platform-release-artifact.zip" \
+            "$RUNNER_TEMP/host-tools-production-attempt.json" \
             "$RUNNER_TEMP/host-tools-handoff-metadata.json" "$RUNNER_TEMP/host-tools-handoff.zip" \
             "$RUNNER_TEMP/host-tools-production-metadata.json" "$RUNNER_TEMP/host-tools-production.zip" \
             "$RUNNER_TEMP/host-tools-production-attestation.json" "$RUNNER_TEMP/host-tools-production-jobs.json"
