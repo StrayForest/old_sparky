@@ -46,6 +46,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tests/test_platform_live_qa_wrappers.py",
         "platform/tests/test_platform_recovery_bootstrap.py",
         "platform/tests/test_platform_release_audit_hardening.py",
+        "platform/tests/test_platform_release_build_contract.py",
         "platform/tests/test_platform_release_build_diagnostics.py",
         "platform/tests/test_platform_release_recovery_boundaries.py",
         "platform/tests/test_platform_release_systemd_state.py",
@@ -72,9 +73,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/contracts/host_tools_pin.json",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 38
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 39
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "b53de14231bebbb3e50c2815194d9f0712803458ce9468027d2722e96721742e"
+    "dddb940be5a47e5443f2ede6fa9bee2279f1eeced411f155af3dedb29ace3020"
 )
 
 
