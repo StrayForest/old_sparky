@@ -68,11 +68,12 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_run_alembic.sh",
         "platform/tools/platform_test_catalog.py",
         "platform/tools/platform_workflow_input_guard.py",
+        "platform/contracts/host_tools_pin.json",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 36
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 37
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "742cd93ab54cef15bf883ddbf80a5c5491590160a1df6377bcef8a52d70cda1a"
+    "ed302edc4e310c4a946b30543c6416dcdf1a071b0b944e876b84dee4353855e5"
 )
 
 
