@@ -211,6 +211,348 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         self.assertFalse((self.app_dir / "previous").exists())
         self.assertTrue(candidate.is_dir())
 
+    def test_immutable_recovery_wrapper_rollback_pre_runtime_uses_bound_receipt(self) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("rollback-wrapper-current")
+        previous = self.add_release("rollback-wrapper-previous")
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(previous)
+        (self.app_dir / "current").symlink_to(current)
+        (self.app_dir / "previous").symlink_to(previous)
+        self.create_wrapper_rollback_transaction(current, previous, phase="prepared")
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api.service": "active",
+                "deadlock-worker.service": "inactive",
+                "deadlock-web.service": "active",
+            }
+        )
+        receipt = self.shared / ".release-systemd-state.json"
+        self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "capture-transaction",
+            "--state",
+            str(receipt),
+            "--transaction",
+            str(self.shared / STATE_NAME),
+            "--app-dir",
+            str(self.app_dir),
+            "--helper-release",
+            str(previous),
+            "--require-helper-manifest",
+            "--systemctl",
+            str(systemctl),
+        )
+        (self.root / "systemctl.log").write_text("")
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(receipt.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+        self.assertEqual((self.root / "systemctl.log").read_text(), "")
+
+    def test_immutable_recovery_wrapper_rollback_rejects_receipt_identity_before_systemd(self) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("rollback-receipt-current")
+        previous = self.add_release("rollback-receipt-previous")
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(previous)
+        (self.app_dir / "current").symlink_to(current)
+        (self.app_dir / "previous").symlink_to(previous)
+        self.create_wrapper_rollback_transaction(current, previous, phase="prepared")
+        systemctl = self.write_stateful_systemctl({})
+        receipt = self.shared / ".release-systemd-state.json"
+        self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "capture-transaction",
+            "--state",
+            str(receipt),
+            "--transaction",
+            str(self.shared / STATE_NAME),
+            "--app-dir",
+            str(self.app_dir),
+            "--helper-release",
+            str(previous),
+            "--require-helper-manifest",
+            "--systemctl",
+            str(systemctl),
+        )
+        payload = json.loads(receipt.read_text())
+        payload["operation_id"] = "0" * 32
+        receipt.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        (self.root / "systemctl.log").write_text("")
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.shared / STATE_NAME).exists())
+        self.assertTrue(receipt.exists())
+        self.assertEqual((self.root / "systemctl.log").read_text(), "")
+
+    def test_immutable_recovery_wrapper_rollback_restart_pending_resumes_immutable_runtime(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("rollback-restart-current")
+        previous = self.add_release("rollback-restart-previous")
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(previous)
+        (self.app_dir / "current").symlink_to(current)
+        (self.app_dir / "previous").symlink_to(previous)
+        self.add_fake_venv(self.shared / "venv", marker="rollback")
+        self.write_fake_python(self.shared / "venv" / "bin" / "python")
+        self.create_wrapper_rollback_transaction(current, previous, phase="restart-pending")
+        self.switch_pointer("current", previous)
+        self.switch_pointer("previous", current)
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api.service": "active",
+                "deadlock-worker.service": "active",
+                "deadlock-web.service": "inactive",
+            }
+        )
+        receipt = self.shared / ".release-systemd-state.json"
+        self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "capture-transaction",
+            "--state",
+            str(receipt),
+            "--transaction",
+            str(self.shared / STATE_NAME),
+            "--app-dir",
+            str(self.app_dir),
+            "--helper-release",
+            str(previous),
+            "--require-helper-manifest",
+            "--systemctl",
+            str(systemctl),
+        )
+        (self.root / "systemctl.log").write_text("")
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            env={
+                **self.runtime_env(label="previous"),
+                "PLATFORM_TEST_NGINX_LABEL": "previous",
+            },
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(receipt.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), previous)
+        self.assertEqual((self.app_dir / "previous").resolve(), current)
+
+    def test_immutable_recovery_wrapper_rollback_runtime_pending_restores_original_state(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("rollback-runtime-current")
+        previous = self.add_release("rollback-runtime-previous")
+        self.add_runtime_stubs(current)
+        self.add_runtime_stubs(previous)
+        (self.app_dir / "current").symlink_to(current)
+        (self.app_dir / "previous").symlink_to(previous)
+        self.add_fake_venv(self.shared / "venv", marker="rollback")
+        self.write_fake_python(self.shared / "venv" / "bin" / "python")
+        self.create_wrapper_rollback_transaction(
+            current, previous, phase="rollback-runtime-pending"
+        )
+        self.switch_pointer("current", previous)
+        self.switch_pointer("previous", current)
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api.service": "active",
+                "deadlock-worker.service": "inactive",
+                "deadlock-web.service": "active",
+            }
+        )
+        receipt = self.shared / ".release-systemd-state.json"
+        self.run_script(
+            SYSTEMD_STATE_TOOL,
+            "capture-transaction",
+            "--state",
+            str(receipt),
+            "--transaction",
+            str(self.shared / STATE_NAME),
+            "--app-dir",
+            str(self.app_dir),
+            "--helper-release",
+            str(previous),
+            "--require-helper-manifest",
+            "--systemctl",
+            str(systemctl),
+        )
+        (self.root / "systemctl.log").write_text("")
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            env={
+                **self.runtime_env(label="current"),
+                "PLATFORM_TEST_NGINX_LABEL": "current",
+            },
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse(receipt.exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+
+    def test_immutable_recovery_wrapper_early_rollback_without_receipt_is_filesystem_only(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        for phase in ("prepared", "pointers-switched"):
+            with self.subTest(phase=phase):
+                for pointer in (self.app_dir / "current", self.app_dir / "previous"):
+                    pointer.unlink(missing_ok=True)
+                current = self.add_release(f"rollback-no-receipt-{phase}-current")
+                previous = self.add_release(f"rollback-no-receipt-{phase}-previous")
+                self.add_runtime_stubs(current)
+                self.add_runtime_stubs(previous)
+                (self.app_dir / "current").symlink_to(current)
+                (self.app_dir / "previous").symlink_to(previous)
+                self.create_wrapper_rollback_transaction(current, previous, phase=phase)
+                systemctl, systemctl_log = self.write_failing_systemctl(f"rollback-no-receipt-{phase}")
+
+                result = self.run_script(
+                    generation / RECOVERY_WRAPPER.name,
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--systemctl",
+                    str(systemctl),
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(systemctl_log.exists())
+                self.assertFalse((self.shared / STATE_NAME).exists())
+                self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+
+    def test_immutable_recovery_wrapper_late_runtime_phases_use_immutable_restore(self) -> None:
+        generation = self.install_recovery_generation()
+        for phase in ("services-restarted", "smoke-passed"):
+            with self.subTest(phase=phase):
+                for pointer in (self.app_dir / "current", self.app_dir / "previous"):
+                    pointer.unlink(missing_ok=True)
+                shutil.rmtree(self.shared / "venv", ignore_errors=True)
+                current = self.add_release(f"rollback-{phase}-current")
+                previous = self.add_release(f"rollback-{phase}-previous")
+                self.add_runtime_stubs(current)
+                self.add_runtime_stubs(previous)
+                (self.app_dir / "current").symlink_to(current)
+                (self.app_dir / "previous").symlink_to(previous)
+                self.add_fake_venv(self.shared / "venv", marker="rollback")
+                self.write_fake_python(self.shared / "venv" / "bin" / "python")
+                self.create_wrapper_rollback_transaction(current, previous, phase=phase)
+                self.switch_pointer("current", previous)
+                self.switch_pointer("previous", current)
+                systemctl = self.write_stateful_systemctl(
+                    {
+                        "deadlock-api.service": "active",
+                        "deadlock-worker.service": "inactive",
+                        "deadlock-web.service": "active",
+                    }
+                )
+                receipt = self.shared / ".release-systemd-state.json"
+                self.run_script(
+                    SYSTEMD_STATE_TOOL,
+                    "capture-transaction",
+                    "--state",
+                    str(receipt),
+                    "--transaction",
+                    str(self.shared / STATE_NAME),
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--helper-release",
+                    str(previous),
+                    "--require-helper-manifest",
+                    "--systemctl",
+                    str(systemctl),
+                )
+                (self.root / "systemctl.log").write_text("")
+                result = self.run_script(
+                    generation / RECOVERY_WRAPPER.name,
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--systemctl",
+                    str(systemctl),
+                    env={
+                        **self.runtime_env(label="current"),
+                        "PLATFORM_TEST_NGINX_LABEL": "current",
+                    },
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((self.shared / STATE_NAME).exists())
+                self.assertFalse(receipt.exists())
+
+    def test_immutable_recovery_wrapper_post_clear_runtime_and_restored_retries_are_idempotent(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        for phase in ("rollback-runtime-applied", "recovery-restored"):
+            with self.subTest(phase=phase):
+                for pointer in (self.app_dir / "current", self.app_dir / "previous"):
+                    pointer.unlink(missing_ok=True)
+                current = self.add_release(f"rollback-post-clear-{phase}-current")
+                previous = self.add_release(f"rollback-post-clear-{phase}-previous")
+                self.add_runtime_stubs(current)
+                self.add_runtime_stubs(previous)
+                (self.app_dir / "current").symlink_to(previous)
+                (self.app_dir / "previous").symlink_to(current)
+                transaction_phase = (
+                    "rollback-runtime-applied" if phase == "recovery-restored" else phase
+                )
+                self.create_wrapper_rollback_transaction(
+                    current, previous, phase=transaction_phase
+                )
+                systemctl, systemctl_log = self.write_failing_systemctl(f"rollback-post-clear-{phase}")
+                receipt = self.shared / ".release-systemd-state.json"
+                if phase == "recovery-restored":
+                    self.run_transaction("recover", "--retain")
+                    self.assertEqual(self.state_phase(), "recovery-restored")
+                receipt.unlink(missing_ok=True)
+                result = self.run_script(
+                    generation / RECOVERY_WRAPPER.name,
+                    "--app-dir",
+                    str(self.app_dir),
+                    "--systemctl",
+                    str(systemctl),
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(systemctl_log.exists())
+                self.assertFalse((self.shared / STATE_NAME).exists())
+
     def test_resume_activation_committed_cleans_receipt(self) -> None:
         current, previous, candidate = self.prepare_install_state()
         self.advance_install_state(candidate, current, phase="activation-committed")
@@ -1605,6 +1947,49 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 "inactive",
             )
         return candidate
+
+    def create_wrapper_rollback_transaction(
+        self, current: Path, previous: Path, *, phase: str
+    ) -> None:
+        rollback = current / ".rollback"
+        rollback.mkdir()
+        snapshot = rollback / "shared-venv-before-install"
+        self.run_transaction(
+            "create",
+            "--operation",
+            "rollback",
+            "--app-dir",
+            str(self.app_dir),
+            "--current-before",
+            str(current),
+            "--previous-before",
+            str(previous),
+            "--candidate-release",
+            str(current),
+            "--shared-venv",
+            str(self.shared / "venv"),
+            "--peer",
+            str(snapshot),
+            "--snapshot",
+            str(snapshot),
+            "--transition",
+            "none",
+        )
+        if phase != "prepared":
+            for expected, next_phase in (
+                ("prepared", "venv-transitioned"),
+                ("venv-transitioned", "current-switched"),
+                ("current-switched", "pointers-switched"),
+                ("pointers-switched", "rollback-runtime-pending"),
+                ("rollback-runtime-pending", "restart-pending"),
+                ("restart-pending", "services-restarted"),
+                ("services-restarted", "smoke-passed"),
+                ("smoke-passed", "rollback-runtime-applied"),
+            ):
+                self.run_transaction("phase", "--expected", expected, "--phase", next_phase)
+                if next_phase == phase:
+                    return
+            raise AssertionError(f"unsupported rollback test phase: {phase}")
 
     def write_failing_systemctl(self, label: str) -> tuple[Path, Path]:
         log = self.root / f"{label}-systemctl.log"

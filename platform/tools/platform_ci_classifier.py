@@ -130,6 +130,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
     {
         ".github/workflows/platform-production-recovery-bootstrap-build.yml",
         ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+        ".github/workflows/platform-production-deploy.yml",
         ".github/workflows/platform-production-release-abort.yml",
         ".github/workflows/platform-production-release-recover.yml",
         ".github/workflows/platform-production-autodeploy.yml",

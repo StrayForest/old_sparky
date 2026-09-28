@@ -116,12 +116,13 @@ after clear leaves a retryable transaction and no guessed service transition.
 
 Before a rollback pointer switch, the rollback tool refreshes the root-owned
 `shared/.release-recovery/` bundle and installs a small compatibility shim as
-the previous release's `tools/platform_release_rollback.sh`. If the rollback
-process crashes after `current` has switched, a new invocation through the old
-`current` therefore delegates to the shared bundle rather than the old
-release's transaction code. The application files and runtime tools of the
-previous release remain unchanged; only its rollback entrypoint is replaced by
-the recovery handoff needed for this cross-release boundary.
+the previous release's `tools/platform_release_rollback.sh`. That shim is a
+normal rollback handoff only. Operation-ID recovery is entered through the
+exact verified content-addressed generation and its immutable
+`platform_recover_pending.sh` wrapper; it never selects `current/tools` or the
+shim as control code. The application files and runtime tools of the previous
+release remain unchanged; only its rollback entrypoint is replaced by the
+compatibility handoff needed for the normal cross-release boundary.
 
 ## Failure behavior
 

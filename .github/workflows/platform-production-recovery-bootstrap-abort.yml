@@ -124,7 +124,20 @@ jobs:
           ):
               raise SystemExit("security run provenance is not exact")
           rows = jobs.get("jobs")
-          if not isinstance(rows, list) or len([row for row in rows if isinstance(row, dict) and row.get("name") == os.environ["SECURITY_JOB"] and row.get("conclusion") == "success"]) != 1:
+          security_matches = [
+              row for row in rows or []
+              if (
+                  isinstance(row, dict)
+                  and type(row.get("id")) is int
+                  and row.get("name") == os.environ["SECURITY_JOB"]
+                  and row.get("run_id") == run_id
+                  and row.get("run_attempt") == attempt
+                  and row.get("status") == "completed"
+                  and row.get("conclusion") == "success"
+                  and row.get("head_sha") == source_sha
+              )
+          ]
+          if not isinstance(rows, list) or len(security_matches) != 1:
               raise SystemExit("exact successful security verification job is missing")
           artifact_rows = artifacts.get("artifacts")
           if not isinstance(artifact_rows, list):
@@ -137,7 +150,7 @@ jobs:
           if not isinstance(recovery_rows, list):
               raise SystemExit("recovery workflow response is malformed")
           recovery_matches = [row for row in recovery_rows if isinstance(row, dict) and row.get("name") == "Platform production recovery bootstrap build" and row.get("path") == ".github/workflows/platform-production-recovery-bootstrap-build.yml" and row.get("head_sha") == source_sha and row.get("head_branch") == "dev" and row.get("event") == "workflow_run" and row.get("status") == "completed" and row.get("conclusion") == "success" and (row.get("repository") or {}).get("full_name") == repository]
-          if len(recovery_matches) != 1 or not isinstance(recovery_matches[0].get("id"), int):
+          if len(recovery_matches) != 1 or type(recovery_matches[0].get("id")) is not int:
               raise SystemExit("exact successful recovery-bootstrap build run is missing")
           recovery_run = recovery_matches[0]
           if not isinstance(route.get("digest"), str) or re.fullmatch(r"sha256:[0-9a-f]{64}", route["digest"]) is None:
@@ -202,7 +215,7 @@ jobs:
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "$api/actions/runs/$recovery_run_id/attempts/$recovery_run_attempt/jobs?per_page=100" --output "$metadata/recovery-jobs.json"
-          /usr/bin/python3 -I -B - "$metadata/recovery-jobs.json" "$GITHUB_OUTPUT" "$recovery_run_id" "$recovery_run_attempt" <<'PY'
+          /usr/bin/python3 -I -B - "$metadata/recovery-jobs.json" "$GITHUB_OUTPUT" "$recovery_run_id" "$recovery_run_attempt" "$source_sha" <<'PY'
           import json
           import os
           from pathlib import Path
@@ -214,6 +227,7 @@ jobs:
               raise SystemExit("recovery build jobs response is malformed")
           expected_run_id = int(sys.argv[3])
           expected_attempt = int(sys.argv[4])
+          expected_source = sys.argv[5]
           matches = [
               row
               for row in rows
@@ -221,9 +235,11 @@ jobs:
                   isinstance(row, dict)
                   and row.get("name") == os.environ["RECOVERY_BUILD_JOB"]
                   and row.get("conclusion") == "success"
-                  and isinstance(row.get("id"), int)
+                  and type(row.get("id")) is int
                   and row.get("run_id") == expected_run_id
                   and row.get("run_attempt") == expected_attempt
+                  and row.get("status") == "completed"
+                  and row.get("head_sha") == expected_source
               )
           ]
           if len(matches) != 1:

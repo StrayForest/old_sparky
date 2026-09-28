@@ -10,6 +10,8 @@ filesystem mutation is reached.  Values then cross only a local
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -132,6 +134,7 @@ HOST_TOOL_FILES = (
     "platform_storage_evidence_summary.py",
 )
 HOST_TOOLS_INVENTORY = frozenset((*HOST_TOOL_FILES, "manifest.json", "capabilities.txt"))
+HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _fail() -> int:
@@ -190,6 +193,141 @@ def _trusted_data(path: Path) -> bool:
         and metadata.st_nlink == 1
         and stat.S_IMODE(metadata.st_mode) == 0o444
     )
+
+
+def _stable_host_file(path: Path, *, mode: int, maximum: int = 512 * 1024) -> bytes | None:
+    """Read one immutable generation member through a stable descriptor."""
+
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != mode
+            or before.st_size > maximum
+        ):
+            return None
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_size != before.st_size
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != mode
+        ):
+            return None
+        data = bytearray()
+        while len(data) <= maximum:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        final = os.fstat(descriptor)
+        if (
+            len(data) != final.st_size
+            or final.st_dev != opened.st_dev
+            or final.st_ino != opened.st_ino
+            or final.st_uid != opened.st_uid
+            or final.st_gid != opened.st_gid
+            or final.st_nlink != opened.st_nlink
+            or final.st_mode != opened.st_mode
+            or final.st_mtime_ns != opened.st_mtime_ns
+            or final.st_ctime_ns != opened.st_ctime_ns
+        ):
+            return None
+        return bytes(data)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _verify_host_tools_contract(payload: dict[str, object]) -> bool:
+    """Rebind the dispatcher to the exact handoff and immutable generation."""
+
+    handoff = payload.get("host_tools")
+    if handoff is None:
+        # Preflight mode remains a read-only compatibility caller, but every
+        # deploy-side privileged entrypoint must carry the closed handoff.
+        return False
+    if not isinstance(handoff, dict):
+        return False
+    generation_sha = handoff.get("host_tools_sha")
+    manifest_sha = handoff.get("manifest_sha256")
+    capabilities_sha = handoff.get("capabilities_sha256")
+    if (
+        not isinstance(generation_sha, str)
+        or HOST_GENERATION_RE.fullmatch(generation_sha) is None
+        or not isinstance(manifest_sha, str)
+        or not isinstance(capabilities_sha, str)
+        or HEX_DIGEST_RE.fullmatch(manifest_sha) is None
+        or HEX_DIGEST_RE.fullmatch(capabilities_sha) is None
+        or ACTIVE_TOOLS_DIR != HOST_TOOLS_ROOT / generation_sha
+    ):
+        return False
+    try:
+        if {entry.name for entry in ACTIVE_TOOLS_DIR.iterdir()} != HOST_TOOLS_INVENTORY:
+            return False
+    except OSError:
+        return False
+    members: dict[str, bytes] = {}
+    for name in HOST_TOOL_FILES:
+        data = _stable_host_file(ACTIVE_TOOLS_DIR / name, mode=0o555)
+        if data is None:
+            return False
+        members[name] = data
+    manifest_bytes = _stable_host_file(ACTIVE_TOOLS_DIR / "manifest.json", mode=0o444)
+    capabilities_bytes = _stable_host_file(ACTIVE_TOOLS_DIR / "capabilities.txt", mode=0o444)
+    if manifest_bytes is None or capabilities_bytes is None:
+        return False
+    if hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha:
+        return False
+    if hashlib.sha256(capabilities_bytes).hexdigest() != capabilities_sha:
+        return False
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    records = manifest.get("files") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != 1
+        or manifest.get("source_sha") != generation_sha
+        or manifest.get("generation") != generation_sha
+        or not isinstance(records, list)
+        or len(records) != len(HOST_TOOL_FILES) + 1
+    ):
+        return False
+    seen: set[str] = set()
+    expected = set(HOST_TOOL_FILES) | {"capabilities.txt"}
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "mode"}:
+            return False
+        name = record.get("path")
+        digest = record.get("sha256")
+        mode = record.get("mode")
+        if (
+            not isinstance(name, str)
+            or name not in expected
+            or name in seen
+            or not isinstance(digest, str)
+            or HEX_DIGEST_RE.fullmatch(digest) is None
+            or type(mode) is not int
+            or mode not in {0o444, 0o555}
+        ):
+            return False
+        seen.add(name)
+        data = capabilities_bytes if name == "capabilities.txt" else members.get(name)
+        if data is None or hashlib.sha256(data).hexdigest() != digest:
+            return False
+    return seen == expected
 
 
 def _trusted_host_helper(path: Path) -> bool:
@@ -485,6 +623,8 @@ def _remove_exports(
 def _prepare_deployment(payload: dict[str, str]) -> int:
     if payload["mode"] != "deploy" or not _trusted_generation():
         return 2
+    if not _verify_host_tools_contract(payload):
+        return 2
     if not _trusted_host_helper(ARTIFACT_DIR_HELPER):
         return 2
     # The host helper performs the privileged directory-relative open/mkdir
@@ -506,6 +646,30 @@ def _prepare_deployment(payload: dict[str, str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if len(arguments) == 4 and arguments[0] == "host-contract":
+        generation_sha, manifest_sha, capabilities_sha = arguments[1:]
+        if (
+            HOST_GENERATION_RE.fullmatch(generation_sha) is None
+            or HEX_DIGEST_RE.fullmatch(manifest_sha) is None
+            or HEX_DIGEST_RE.fullmatch(capabilities_sha) is None
+            or not _trusted_generation()
+            or not _verify_host_tools_contract(
+                {
+                    "host_tools": {
+                        "host_tools_sha": generation_sha,
+                        "manifest_sha256": manifest_sha,
+                        "capabilities_sha256": capabilities_sha,
+                    }
+                }
+            )
+        ):
+            return _fail()
+        print(
+            "HOST_TOOLS_CONTRACT "
+            f"source_sha={generation_sha} generation={generation_sha} "
+            f"manifest_sha256={manifest_sha} capabilities_sha256={capabilities_sha}"
+        )
+        return 0
     if arguments == ["host-capabilities"]:
         return _host_capabilities()
     if arguments == ["external-fixture"]:
@@ -578,6 +742,8 @@ def main(argv: list[str] | None = None) -> int:
                 cleanup_run_id=payload["cleanup_run_id"],
             )
         if arguments == ["production-deploy"]:
+            if payload["mode"] == "deploy" and not _verify_host_tools_contract(payload):
+                return _fail()
             return _run_sudo(
                 DEPLOY_HELPER,
                 [
@@ -586,6 +752,15 @@ def main(argv: list[str] | None = None) -> int:
                     payload["mode"],
                     payload["artifact_remote_dir"],
                     payload["runtime_profile"],
+                    *(
+                        [
+                            payload["host_tools"]["host_tools_sha"],
+                            payload["host_tools"]["manifest_sha256"],
+                            payload["host_tools"]["capabilities_sha256"],
+                        ]
+                        if "host_tools" in payload
+                        else []
+                    ),
                 ],
             )
         if arguments == ["live-user-qa"]:

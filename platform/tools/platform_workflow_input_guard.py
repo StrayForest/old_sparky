@@ -37,7 +37,6 @@ CONFIRMATION_PHRASES = frozenset(
         DELETE_CONFIRMATION,
         "RUN-LIVE-USER-QA",
         "RUN-PRODUCTION-PROFILE-REVIEW",
-        "ABORT-PRODUCTION-RETAINED-LOAD",
         "RECOVER-PENDING-RELEASE",
         "RECOVER-DEADLOCK-WEB",
         "APPLY-PRODUCTION-STORAGE-MAINTENANCE",
@@ -89,6 +88,13 @@ DEPLOY_RELEASE_SLUG_RE = re.compile(
 )
 ARTIFACT_REMOTE_DIR_RE = re.compile(
     r"^/tmp/old-sparky-platform-artifact-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$"
+)
+HOST_TOOLS_ARTIFACT_NAME_RE = re.compile(
+    r"^platform-host-tools-bundle-[1-9][0-9]{0,31}-[1-9][0-9]{0,31}$"
+)
+HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+HOST_TOOLS_SIGNER_WORKFLOW = (
+    "StrayForest/old_sparky/.github/workflows/platform-production-deploy.yml"
 )
 
 
@@ -389,11 +395,11 @@ def validate_cleanup_payload(payload: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
-def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, str]:
+def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the complete production deployment handoff object."""
 
     payload = _require_mapping(payload)
-    keys = {
+    legacy_keys = {
         "schema",
         "mode",
         "runtime_profile",
@@ -404,8 +410,18 @@ def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, str]:
         "classifier_run_attempt",
         "web_compression",
     }
-    _require_exact_keys(payload, keys)
-    _validate_schema(payload.get("schema"))
+    host_tools_key = "host_tools"
+    if set(payload) == legacy_keys:
+        schema_with_host_tools = False
+    elif set(payload) == legacy_keys | {host_tools_key}:
+        schema_with_host_tools = True
+    else:
+        raise _invalid()
+    if schema_with_host_tools:
+        if payload.get("schema") not in (2, "2"):
+            raise _invalid()
+    else:
+        _validate_schema(payload.get("schema"))
     mode = _require_string(payload, "mode")
     if mode not in DEPLOY_MODES:
         raise _invalid()
@@ -433,7 +449,7 @@ def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, str]:
     web_compression = _require_string(payload, "web_compression")
     if web_compression not in {"enabled", "disabled"}:
         raise _invalid()
-    return {
+    result: dict[str, Any] = {
         "schema": "1",
         "mode": mode,
         "runtime_profile": runtime_profile,
@@ -443,6 +459,104 @@ def validate_deployment_payload(payload: Mapping[str, Any]) -> dict[str, str]:
         "classifier_run_id": classifier_run_id,
         "classifier_run_attempt": classifier_run_attempt,
         "web_compression": web_compression,
+    }
+    if schema_with_host_tools:
+        result["schema"] = "2"
+        result[host_tools_key] = validate_host_tools_payload(payload.get(host_tools_key))
+    return result
+
+
+def validate_host_tools_payload(payload: Mapping[str, Any]) -> dict[str, str]:
+    """Validate the closed host-tools handoff consumed before production SSH.
+
+    The handoff binds the API artifact envelope, the attested inner bundle and
+    the exact contract sidecars used to validate the immutable host generation.
+    Every value is serialized as a bounded string so runner and remote
+    consumers share one representation.
+    """
+
+    payload = _require_mapping(payload)
+    keys = {
+        "schema",
+        "target_sha",
+        "host_tools_sha",
+        "artifact_id",
+        "artifact_name",
+        "artifact_size",
+        "artifact_digest",
+        "bundle_sha256",
+        "manifest_sha256",
+        "capabilities_sha256",
+        "files_contract_sha256",
+        "modes_contract_sha256",
+        "signer_workflow",
+        "source_ref",
+        "source_digest",
+        "attestation_run_id",
+        "attestation_run_attempt",
+        "attestation_job_id",
+    }
+    _require_exact_keys(payload, keys)
+    _validate_schema(payload.get("schema"))
+    target_sha = _require_string(payload, "target_sha")
+    host_tools_sha = _require_string(payload, "host_tools_sha")
+    if SHA_RE.fullmatch(target_sha) is None or SHA_RE.fullmatch(host_tools_sha) is None:
+        raise _invalid()
+    artifact_id = _validate_run_id(payload.get("artifact_id"))
+    artifact_name = _require_string(payload, "artifact_name")
+    if HOST_TOOLS_ARTIFACT_NAME_RE.fullmatch(artifact_name) is None:
+        raise _invalid()
+    artifact_size = _validate_positive_integer(payload.get("artifact_size"), maximum=8 * 1024 * 1024)
+    for field in (
+        "artifact_digest",
+        "bundle_sha256",
+        "manifest_sha256",
+        "capabilities_sha256",
+        "files_contract_sha256",
+        "modes_contract_sha256",
+    ):
+        value = _require_string(payload, field)
+        if HEX_DIGEST_RE.fullmatch(value) is None:
+            raise _invalid()
+    signer_workflow = _require_string(payload, "signer_workflow")
+    source_ref = _require_string(payload, "source_ref")
+    source_digest = _require_string(payload, "source_digest")
+    if signer_workflow != HOST_TOOLS_SIGNER_WORKFLOW or source_ref != "refs/heads/dev":
+        raise _invalid()
+    if source_digest != target_sha:
+        raise _invalid()
+    attestation_run_id = _validate_run_id(payload.get("attestation_run_id"))
+    attestation_run_attempt = _validate_run_id(payload.get("attestation_run_attempt"))
+    attestation_job_id = _validate_run_id(payload.get("attestation_job_id"))
+    artifact_match = re.fullmatch(
+        r"platform-host-tools-bundle-([1-9][0-9]{0,31})-([1-9][0-9]{0,31})",
+        artifact_name,
+    )
+    if (
+        artifact_match is None
+        or artifact_match.group(1) != attestation_run_id
+        or artifact_match.group(2) != attestation_run_attempt
+    ):
+        raise _invalid()
+    return {
+        "schema": "1",
+        "target_sha": target_sha,
+        "host_tools_sha": host_tools_sha,
+        "artifact_id": artifact_id,
+        "artifact_name": artifact_name,
+        "artifact_size": artifact_size,
+        "artifact_digest": _require_string(payload, "artifact_digest"),
+        "bundle_sha256": _require_string(payload, "bundle_sha256"),
+        "manifest_sha256": _require_string(payload, "manifest_sha256"),
+        "capabilities_sha256": _require_string(payload, "capabilities_sha256"),
+        "files_contract_sha256": _require_string(payload, "files_contract_sha256"),
+        "modes_contract_sha256": _require_string(payload, "modes_contract_sha256"),
+        "signer_workflow": signer_workflow,
+        "source_ref": source_ref,
+        "source_digest": source_digest,
+        "attestation_run_id": attestation_run_id,
+        "attestation_run_attempt": attestation_run_attempt,
+        "attestation_job_id": attestation_job_id,
     }
 
 
@@ -504,6 +618,8 @@ def load_payload(path: Path, *, mode: str) -> dict[str, str]:
         return validate_cleanup_payload(payload)
     if mode == "deployment":
         return validate_deployment_payload(payload)
+    if mode == "host-tools":
+        return validate_host_tools_payload(payload)
     raise _invalid()
 
 
@@ -521,6 +637,8 @@ def load_stdin_payload(*, mode: str) -> dict[str, str]:
         return validate_cleanup_payload(payload)
     if mode == "deployment":
         return validate_deployment_payload(payload)
+    if mode == "host-tools":
+        return validate_host_tools_payload(payload)
     raise _invalid()
 
 
@@ -626,6 +744,30 @@ def _deployment_from_args(args: argparse.Namespace) -> dict[str, str]:
     return validate_deployment_payload(payload)
 
 
+def _host_tools_from_args(args: argparse.Namespace) -> dict[str, str]:
+    payload: dict[str, Any] = {
+        "schema": 1,
+        "target_sha": args.target_sha,
+        "host_tools_sha": args.host_tools_sha,
+        "artifact_id": args.artifact_id,
+        "artifact_name": args.artifact_name,
+        "artifact_size": args.artifact_size,
+        "artifact_digest": args.artifact_digest,
+        "bundle_sha256": args.bundle_sha256,
+        "manifest_sha256": args.manifest_sha256,
+        "capabilities_sha256": args.capabilities_sha256,
+        "files_contract_sha256": args.files_contract_sha256,
+        "modes_contract_sha256": args.modes_contract_sha256,
+        "signer_workflow": args.signer_workflow,
+        "source_ref": args.source_ref,
+        "source_digest": args.source_digest,
+        "attestation_run_id": args.attestation_run_id,
+        "attestation_run_attempt": args.attestation_run_attempt,
+        "attestation_job_id": args.attestation_job_id,
+    }
+    return validate_host_tools_payload(payload)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _WorkflowInputArgumentParser(
         description="Validate production workflow handoff data"
@@ -697,6 +839,30 @@ def _parser() -> argparse.ArgumentParser:
     deployment.add_argument("--classifier-run-attempt", required=True)
     deployment.add_argument("--web-compression", required=True)
 
+    host_tools = subparsers.add_parser("host-tools")
+    host_tools.add_argument("--input", type=Path)
+    host_tools.add_argument("--output", type=Path)
+    for argument in (
+        "target-sha",
+        "host-tools-sha",
+        "artifact-id",
+        "artifact-name",
+        "artifact-size",
+        "artifact-digest",
+        "bundle-sha256",
+        "manifest-sha256",
+        "capabilities-sha256",
+        "files-contract-sha256",
+        "modes-contract-sha256",
+        "signer-workflow",
+        "source-ref",
+        "source-digest",
+        "attestation-run-id",
+        "attestation-run-attempt",
+        "attestation-job-id",
+    ):
+        host_tools.add_argument(f"--{argument}")
+
     return parser
 
 
@@ -739,6 +905,36 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "deployment":
             _write_private_json(args.output, _deployment_from_args(args))
+            return 0
+        if args.command == "host-tools":
+            if args.input is not None:
+                payload = load_payload(args.input, mode="host-tools")
+                print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+                return 0
+            if args.output is None or any(
+                getattr(args, argument.replace("-", "_")) is None
+                for argument in (
+                    "target-sha",
+                    "host-tools-sha",
+                    "artifact-id",
+                    "artifact-name",
+                    "artifact-size",
+                    "artifact-digest",
+                    "bundle-sha256",
+                    "manifest-sha256",
+                    "capabilities-sha256",
+                    "files-contract-sha256",
+                    "modes-contract-sha256",
+                    "signer-workflow",
+                    "source-ref",
+                    "source-digest",
+                    "attestation-run-id",
+                    "attestation-run-attempt",
+                    "attestation-job-id",
+                )
+            ):
+                raise _invalid()
+            _write_private_json(args.output, _host_tools_from_args(args))
             return 0
     except (WorkflowInputError, SystemExit):
         # argparse's own usage output is intentionally suppressed for dispatch

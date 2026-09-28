@@ -810,6 +810,7 @@ def _production_secret_scope_issues(production_text: str) -> list[str]:
         "Validate deployment secrets": {"PROD_SSH_HOST", "PROD_SSH_USER", "PROD_SSH_KEY"},
         "Configure SSH": {"PROD_SSH_HOST", "PROD_SSH_KEY"},
         "Verify SSH connection": {"PROD_SSH_HOST", "PROD_SSH_USER"},
+        "Revalidate host-tools contract before production side effects": {"PROD_SSH_HOST", "PROD_SSH_USER"},
         "Upload verified CI artifact": {"PROD_SSH_HOST", "PROD_SSH_USER"},
         "Run production preflight or deployment": {"PROD_SSH_HOST", "PROD_SSH_USER"},
     }

@@ -164,6 +164,86 @@ def _read_source_file(path: Path) -> bytes:
         os.close(descriptor)
 
 
+def _metadata_matches(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare all file facts that can change while a descriptor is read."""
+
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_mode == right.st_mode
+        and left.st_uid == right.st_uid
+        and left.st_gid == right.st_gid
+        and left.st_nlink == right.st_nlink
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
+
+
+def _read_stable_file(
+    path: Path,
+    *,
+    maximum: int,
+    label: str,
+    require_root: bool = False,
+    mode: int | None = None,
+    allowed_modes: set[int] | None = None,
+) -> bytes:
+    """Read one regular file through one no-follow descriptor.
+
+    Validation, hashing and the returned bytes must describe the same inode.
+    In particular, no caller may validate a pathname and then use a second
+    pathname lookup for the trusted contents.
+    """
+
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise RecoveryBootstrapError(f"{label} is unavailable") from exc
+    before_mode = stat.S_IMODE(before.st_mode)
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or (require_root and (before.st_uid != 0 or before.st_gid != 0))
+        or (mode is not None and before_mode != mode)
+        or (allowed_modes is not None and before_mode not in allowed_modes)
+        or before.st_size > maximum
+    ):
+        raise RecoveryBootstrapError(f"{label} metadata is unsafe")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise RecoveryBootstrapError(f"{label} cannot be opened") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not _metadata_matches(opened, before):
+            raise RecoveryBootstrapError(f"{label} changed during validation")
+        data = bytearray()
+        while len(data) <= maximum:
+            chunk = os.read(descriptor, maximum + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(descriptor)
+        if (
+            not _metadata_matches(after, opened)
+            or len(data) != after.st_size
+            or len(data) > maximum
+        ):
+            raise RecoveryBootstrapError(f"{label} changed during read")
+        return bytes(data)
+    except OSError as exc:
+        raise RecoveryBootstrapError(f"{label} cannot be read") from exc
+    finally:
+        os.close(descriptor)
+
+
 def _validate_source_name(name: str) -> None:
     if (
         not isinstance(name, str)
@@ -247,20 +327,15 @@ def _read_bounded_json(
     path: Path, *, maximum: int, label: str, require_root: bool = False
 ) -> object:
     try:
-        metadata = path.lstat()
-        if (
-            stat.S_ISLNK(metadata.st_mode)
-            or not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or (require_root and metadata.st_uid != 0)
-            or (require_root and metadata.st_gid != 0)
-            or stat.S_IMODE(metadata.st_mode) not in {0o400, 0o444, 0o600}
-            or metadata.st_size > maximum
-        ):
-            raise RecoveryBootstrapError(f"{label} metadata is unsafe")
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise RecoveryBootstrapError(f"{label} is unavailable") from exc
+        raw = _read_stable_file(
+            path,
+            maximum=maximum,
+            label=label,
+            require_root=require_root,
+            allowed_modes={0o400, 0o444, 0o600},
+        )
+    except RecoveryBootstrapError:
+        raise
     try:
         return json.loads(raw.decode("ascii"), object_pairs_hook=_strict_object)
     except (UnicodeError, json.JSONDecodeError, RecoveryBootstrapError) as exc:
@@ -468,7 +543,21 @@ def verify_bundle(
     ):
         raise RecoveryBootstrapError("recovery archive metadata is unsafe")
     try:
-        with zipfile.ZipFile(bundle, mode="r", allowZip64=False) as archive:
+        descriptor = os.open(
+            bundle,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise RecoveryBootstrapError("recovery archive cannot be opened") from exc
+    stream = None
+    try:
+        opened = os.fstat(descriptor)
+        if not _metadata_matches(opened, metadata):
+            raise RecoveryBootstrapError("recovery archive changed during validation")
+        stream = os.fdopen(descriptor, "rb", closefd=False)
+        with zipfile.ZipFile(stream, mode="r", allowZip64=False) as archive:
             infos = archive.infolist()
             if len(infos) != len(RECOVERY_FILES) + 1:
                 raise RecoveryBootstrapError("recovery archive member count is invalid")
@@ -489,10 +578,33 @@ def verify_bundle(
                 members[name] = data
                 modes[name] = (info.external_attr >> 16) & 0o7777
                 total_member_bytes += len(data)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        total = 0
+        while total <= MAX_ARCHIVE_BYTES:
+            chunk = os.read(descriptor, MAX_ARCHIVE_BYTES + 1 - total)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+        after = os.fstat(descriptor)
+        if (
+            not _metadata_matches(after, opened)
+            or total != after.st_size
+            or total > MAX_ARCHIVE_BYTES
+        ):
+            raise RecoveryBootstrapError("recovery archive changed during read")
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
         if isinstance(exc, RecoveryBootstrapError):
             raise
         raise RecoveryBootstrapError("recovery archive is invalid") from exc
+    finally:
+        if stream is not None:
+            stream.close()
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
     expected_members = set(RECOVERY_FILES) | {"manifest.json"}
     if set(members) != expected_members:
         raise RecoveryBootstrapError("recovery archive inventory is not closed")
@@ -519,7 +631,7 @@ def verify_bundle(
             raise RecoveryBootstrapError("recovery member digest is invalid")
     return {
         "manifest": manifest,
-        "bundle_sha256": _sha256(bundle.read_bytes()),
+        "bundle_sha256": digest.hexdigest(),
         "members": members,
     }
 
@@ -601,14 +713,31 @@ def _validate_generation_tree(
         raise RecoveryBootstrapError("recovery generation capability is unavailable")
     records = {str(record["path"]): record for record in manifest["files"]}
     for name, record in records.items():
-        data = (generation / name).read_bytes()
+        data = _read_stable_file(
+            generation / name,
+            maximum=MAX_MANIFEST_BYTES if name == "manifest.json" else MAX_FILE_BYTES,
+            label=f"recovery generation member {name}",
+            require_root=True,
+            mode=0o444 if name == "manifest.json" else (
+                EXECUTABLE_MODE if name.endswith(".sh") else DATA_MODE
+            ),
+        )
         if _sha256(data) != record["sha256"]:
             raise RecoveryBootstrapError("recovery generation member digest is invalid")
     if expected_members is not None:
         if set(expected_members) != set(records) | {"manifest.json"}:
             raise RecoveryBootstrapError("recovery generation does not match the bundle")
         for name, expected in expected_members.items():
-            if (generation / name).read_bytes() != expected:
+            actual = _read_stable_file(
+                generation / name,
+                maximum=MAX_MANIFEST_BYTES if name == "manifest.json" else MAX_FILE_BYTES,
+                label=f"recovery generation member {name}",
+                require_root=True,
+                mode=0o444 if name == "manifest.json" else (
+                    EXECUTABLE_MODE if name.endswith(".sh") else DATA_MODE
+                ),
+            )
+            if actual != expected:
                 raise RecoveryBootstrapError("recovery generation does not match the bundle")
 
 

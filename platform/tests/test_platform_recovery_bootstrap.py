@@ -33,6 +33,7 @@ SOURCE_SHA = "a" * 40
 RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
     {
         ".github/workflows/platform-production-autodeploy.yml",
+        ".github/workflows/platform-production-deploy.yml",
         ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
         ".github/workflows/platform-production-recovery-bootstrap-build.yml",
         ".github/workflows/platform-production-release-abort.yml",
@@ -73,9 +74,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/contracts/host_tools_pin.json",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 39
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 40
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "dddb940be5a47e5443f2ede6fa9bee2279f1eeced411f155af3dedb29ace3020"
+    "662c3320b3b725894dffbf793fff84f1d934ac260408dcb2c777aeda3ab0af30"
 )
 
 
@@ -204,6 +205,22 @@ class RecoveryBootstrapBundleTests(unittest.TestCase):
         with mock.patch.object(recovery, "MAX_TOTAL_MEMBER_BYTES", 1):
             with self.assertRaises(recovery.RecoveryBootstrapError):
                 recovery.verify_bundle(aggregate_archive)
+
+    def test_archive_replacement_between_path_check_and_open_fails_closed(self) -> None:
+        self.build()
+        replacement = self.root / "replacement.zip"
+        shutil.copy2(self.bundle, replacement)
+        original_open = recovery.os.open
+
+        def replace_before_open(path, flags, *arguments):
+            if Path(path) == self.bundle:
+                self.bundle.unlink()
+                self.bundle.symlink_to(replacement)
+            return original_open(path, flags, *arguments)
+
+        with mock.patch.object(recovery.os, "open", side_effect=replace_before_open):
+            with self.assertRaises(recovery.RecoveryBootstrapError):
+                recovery.verify_bundle(self.bundle)
 
     def test_manifest_duplicate_keys_and_provenance_schema_are_rejected(self) -> None:
         self.build()
@@ -862,7 +879,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             finally:
                 subject["sha256"] = bundle_digest
 
-            jobs_marker = '"$metadata/recovery-jobs.json" "$GITHUB_OUTPUT" "$recovery_run_id" "$recovery_run_attempt" <<\'PY\''
+            jobs_marker = '"$metadata/recovery-jobs.json" "$GITHUB_OUTPUT" "$recovery_run_id" "$recovery_run_attempt" "$source_sha" <<\'PY\''
             jobs_heredoc = workflow.index(jobs_marker)
             jobs_start = workflow.index("\n", jobs_heredoc) + 1
             jobs_end = workflow.index("\n          PY", jobs_start)
@@ -879,6 +896,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                                 "conclusion": "success",
                                 "run_id": 12345,
                                 "run_attempt": 2,
+                                "status": "completed",
+                                "head_sha": SOURCE_SHA,
                             }
                         ]
                     }
@@ -888,7 +907,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             env = os.environ.copy()
             env["RECOVERY_BUILD_JOB"] = "Build retained-release recovery bootstrap evidence"
             valid_jobs = subprocess.run(
-                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2"],
+                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2", SOURCE_SHA],
                 input=jobs_policy,
                 text=True,
                 capture_output=True,
@@ -906,6 +925,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                                 "conclusion": "success",
                                 "run_id": 12345,
                                 "run_attempt": 2,
+                                "status": "completed",
+                                "head_sha": SOURCE_SHA,
                             },
                             {
                                 "id": 43,
@@ -913,6 +934,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                                 "conclusion": "success",
                                 "run_id": 12345,
                                 "run_attempt": 2,
+                                "status": "completed",
+                                "head_sha": SOURCE_SHA,
                             },
                         ]
                     }
@@ -920,7 +943,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             duplicate_jobs = subprocess.run(
-                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2"],
+                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2", SOURCE_SHA],
                 input=jobs_policy,
                 text=True,
                 capture_output=True,
@@ -938,6 +961,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                                 "conclusion": "failure",
                                 "run_id": 12345,
                                 "run_attempt": 2,
+                                "status": "completed",
+                                "head_sha": SOURCE_SHA,
                             }
                         ]
                     }
@@ -945,7 +970,7 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             invalid_jobs = subprocess.run(
-                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2"],
+                [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2", SOURCE_SHA],
                 input=jobs_policy,
                 text=True,
                 capture_output=True,
@@ -953,6 +978,32 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(invalid_jobs.returncode, 0)
+            for field, bad_value in (
+                ("id", None),
+                ("run_id", 54321),
+                ("run_attempt", 3),
+            ):
+                with self.subTest(recovery_job_field=field):
+                    valid_row = {
+                        "id": 42,
+                        "name": "Build retained-release recovery bootstrap evidence",
+                        "conclusion": "success",
+                        "run_id": 12345,
+                        "run_attempt": 2,
+                        "status": "completed",
+                        "head_sha": SOURCE_SHA,
+                    }
+                    valid_row[field] = bad_value
+                    jobs.write_text(json.dumps({"jobs": [valid_row]}), encoding="utf-8")
+                    malformed_identity = subprocess.run(
+                        [sys.executable, "-I", "-B", "-", str(jobs), str(output), "12345", "2", SOURCE_SHA],
+                        input=jobs_policy,
+                        text=True,
+                        capture_output=True,
+                        env=env,
+                        check=False,
+                    )
+                    self.assertNotEqual(malformed_identity.returncode, 0)
 
             evidence_marker = '"$artifact_dir" "$GITHUB_OUTPUT" "$EVIDENCE_NAME" "$BUNDLE_NAME" <<\'PY\''
             evidence_heredoc = workflow.index(evidence_marker)
@@ -1036,6 +1087,19 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             evidence_payload["recovery_job_id"] = "43"
             mismatched_evidence = run_evidence(evidence_payload)
             self.assertNotEqual(mismatched_evidence.returncode, 0)
+
+    def test_provenance_workflows_have_closed_exact_job_identity_predicates(self) -> None:
+        workflow_paths = (
+            REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-build.yml",
+            REPO_ROOT / ".github/workflows/platform-production-recovery-bootstrap-abort.yml",
+            REPO_ROOT / ".github/workflows/platform-production-release-recover.yml",
+        )
+        for path in workflow_paths:
+            text_value = path.read_text(encoding="utf-8")
+            with self.subTest(workflow=path.name):
+                self.assertIn('type(row.get("id")) is int', text_value)
+                self.assertIn('row.get("run_id") ==', text_value)
+                self.assertIn('row.get("run_attempt") ==', text_value)
 
     def test_recovery_bootstrap_route_is_non_deployable_and_mixed_runtime_is_deployable(self) -> None:
         sys.path.insert(0, str(TOOLS))

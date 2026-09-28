@@ -113,8 +113,23 @@ jobs:
           rows = jobs.get("jobs") if isinstance(jobs, dict) else None
           if not isinstance(rows, list):
               raise SystemExit("security jobs response is malformed")
-          matches = [row for row in rows if isinstance(row, dict) and row.get("id") and row.get("name") == __import__("os").environ["SECURITY_JOB"]]
-          if len(matches) != 1 or matches[0].get("conclusion") != "success":
+          security_run_id = int(__import__("os").environ["SECURITY_RUN_ID"])
+          security_attempt = int(__import__("os").environ["SECURITY_RUN_ATTEMPT"])
+          source_sha = __import__("os").environ["SOURCE_SHA"]
+          matches = [
+              row for row in rows
+              if (
+                  isinstance(row, dict)
+                  and type(row.get("id")) is int
+                  and row.get("name") == __import__("os").environ["SECURITY_JOB"]
+                  and row.get("run_id") == security_run_id
+                  and row.get("run_attempt") == security_attempt
+                  and row.get("status") == "completed"
+                  and row.get("conclusion") == "success"
+                  and row.get("head_sha") == source_sha
+              )
+          ]
+          if len(matches) != 1:
               raise SystemExit("exact successful security verification job is missing")
           artifact_name = f"platform-ci-route-{__import__('os').environ['SECURITY_RUN_ID']}-{__import__('os').environ['SECURITY_RUN_ATTEMPT']}"
           artifact_rows = artifacts.get("artifacts") if isinstance(artifacts, dict) else None
@@ -139,9 +154,12 @@ jobs:
               if (
                   isinstance(row, dict)
                   and row.get("name") == __import__("os").environ["RECOVERY_BUILD_JOB"]
-                  and isinstance(row.get("id"), int)
-                  and ("run_id" not in row or row.get("run_id") == int(__import__("os").environ["RECOVERY_BUILD_RUN_ID"]))
-                  and ("run_attempt" not in row or row.get("run_attempt") == int(__import__("os").environ["RECOVERY_BUILD_RUN_ATTEMPT"]))
+                  and type(row.get("id")) is int
+                  and row.get("run_id") == int(__import__("os").environ["RECOVERY_BUILD_RUN_ID"])
+                  and row.get("run_attempt") == int(__import__("os").environ["RECOVERY_BUILD_RUN_ATTEMPT"])
+                  and row.get("status") == "completed"
+                  and row.get("conclusion") == "success"
+                  and row.get("head_sha") == source_sha
               )
           ]
           if len(recovery_matches) != 1:

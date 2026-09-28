@@ -119,10 +119,240 @@ transaction_phase="${transaction_fields[1]:-}"
 original_current="${transaction_fields[2]:-}"
 original_previous="${transaction_fields[3]:-}"
 
-[[ "$pending_operation" == "install" && "$operation_id" =~ ^[0-9a-f]{32}$ ]] || {
+[[ "$operation_id" =~ ^[0-9a-f]{32}$ ]] || {
   public_status failed transaction >&2
   exit 1
 }
+
+if [[ "$pending_operation" == "rollback" ]]; then
+  # Rollback recovery is deliberately implemented in this immutable wrapper.
+  # The old release and its tools are data-plane inputs only; no retained
+  # current/tools control helper may be selected for any rollback phase.
+  [[ -n "$original_current" && -n "$original_previous" ]] || {
+    public_status failed topology >&2
+    exit 1
+  }
+  # A crash after the receipt has been durably cleared must not recreate or
+  # query systemd.  The transaction phase is the immutable two-phase commit
+  # marker; finish only the already-proven filesystem cleanup on retry.
+  if [[ ! -e "$SYSTEMD_STATE" && ! -L "$SYSTEMD_STATE" ]]; then
+    case "$transaction_phase" in
+      prepared|venv-transitioned|snapshot-placed|current-switched|previous-switched|pointers-switched)
+        # Rollback captures the systemd receipt after the pointer transaction
+        # reaches its durable boundary.  An early crash can therefore leave
+        # no receipt at all; restore only the immutable filesystem transaction
+        # and never synthesize or query live systemd state.
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --retain --state "$STATE" \
+          >/dev/null 2>/dev/null \
+          || { public_status failed transaction >&2; exit 1; }
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery --state "$STATE" \
+          >/dev/null 2>/dev/null \
+          || { public_status failed transaction >&2; exit 1; }
+        test ! -e "$STATE" && test ! -L "$STATE" \
+          || { public_status failed transaction >&2; exit 1; }
+        public_status passed recovery
+        exit 0
+        ;;
+      recovery-restored)
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery --state "$STATE" \
+          >/dev/null 2>/dev/null \
+          || { public_status failed transaction >&2; exit 1; }
+        test ! -e "$STATE" && test ! -L "$STATE" \
+          || { public_status failed transaction >&2; exit 1; }
+        public_status passed recovery
+        exit 0
+        ;;
+      rollback-runtime-applied)
+        /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$STATE" \
+          >/dev/null 2>/dev/null \
+          || { public_status failed transaction >&2; exit 1; }
+        test ! -e "$STATE" && test ! -L "$STATE" \
+          || { public_status failed transaction >&2; exit 1; }
+        public_status passed recovery
+        exit 0
+        ;;
+    esac
+  fi
+  test -f "$SYSTEMD_STATE" && test ! -L "$SYSTEMD_STATE" \
+    && test "$(stat -c '%u:%g:%h:%a' "$SYSTEMD_STATE" 2>/dev/null)" = "0:0:1:600" \
+    || { public_status failed systemd_state >&2; exit 1; }
+
+  rollback_systemd_validate() {
+    local helper_release="$1"
+    /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" validate \
+      --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+      --transaction "$STATE" --helper-release "$helper_release" \
+      --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
+  }
+
+  rollback_systemd_restore() {
+    local active="$1" helper_release="$2" command=(restore-enabled)
+    if [[ "$active" == "1" ]]; then
+      command=(restore)
+    elif [[ "$active" != "0" ]]; then
+      return 1
+    fi
+    /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" "${command[@]}" \
+      --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+      --transaction "$STATE" --helper-release "$helper_release" \
+      --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
+  }
+
+  rollback_systemd_verify() {
+    local helper_release="$1"
+    /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" verify \
+      --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+      --transaction "$STATE" --helper-release "$helper_release" \
+      --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
+  }
+
+  rollback_systemd_clear() {
+    local helper_release="$1"
+    /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" clear \
+      --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+      --transaction "$STATE" --helper-release "$helper_release" \
+      --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null
+  }
+
+  # Validate the operation/receipt pair before any phase action.  This checks
+  # the operation id, release identities and every recorded helper digest while
+  # the receipt still exists; the validate command never queries systemd.
+  rollback_systemd_validate "$original_current" \
+    || { public_status failed systemd_state >&2; exit 1; }
+
+  case "$transaction_phase" in
+    prepared|venv-transitioned|snapshot-placed|current-switched|previous-switched|pointers-switched)
+      # Before the runtime boundary, restore only the durable filesystem
+      # transaction.  The paired receipt is cleared only after recovery has
+      # reached recovery-restored and is still bound to the same operation.
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --retain --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      rollback_systemd_validate "$original_current" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      rollback_systemd_clear "$original_current" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      test ! -e "$SYSTEMD_STATE" && test ! -L "$SYSTEMD_STATE" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      ;;
+    rollback-runtime-pending|services-restarted|smoke-passed)
+      # Runtime may have been applied to the rollback target.  First restore
+      # the original pointers/venv, then restore the original release's
+      # release-specific files without restart, and finally restore/verify the
+      # captured active systemd state through the immutable helper.
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --retain --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      rollback_systemd_validate "$original_current" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$RESTORE_TOOL" \
+        --app-dir "$APP_DIR" --release "$original_current" --no-restart \
+        --systemd-state "$SYSTEMD_STATE" --transaction "$STATE" \
+        --live-qa-runtime-installer "$original_current/tools/platform_live_qa_runtime_install.py" \
+        --systemctl "$SYSTEMCTL_BIN" --expected-csp-mode enforce \
+        --edge-origin https://127.0.0.1 --edge-host old-sparky.com \
+        --public-edge-origin https://old-sparky.com \
+        || { public_status failed runtime >&2; exit 1; }
+      rollback_systemd_restore 1 "$original_current" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      rollback_systemd_verify "$original_current" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+        --retain-receipt --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      rollback_systemd_clear "$original_current" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      test ! -e "$SYSTEMD_STATE" && test ! -L "$SYSTEMD_STATE" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      ;;
+    restart-pending)
+      # Filesystem rollback is complete and the target pointer pair must stay
+      # swapped.  Resume only the target runtime/systemd phase, then mark the
+      # durable rollback-runtime-applied boundary before receipt cleanup.
+      rollback_systemd_validate "$original_previous" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      pending_release="$(readlink -f "$APP_DIR/current" 2>/dev/null || true)"
+      [[ "$pending_release" == "$original_previous" ]] \
+        || { public_status failed topology >&2; exit 1; }
+      PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$RESTORE_TOOL" \
+        --app-dir "$APP_DIR" --release "$pending_release" --no-restart \
+        --systemd-state "$SYSTEMD_STATE" --transaction "$STATE" \
+        --live-qa-runtime-installer "$pending_release/tools/platform_live_qa_runtime_install.py" \
+        --systemctl "$SYSTEMCTL_BIN" --expected-csp-mode enforce \
+        --edge-origin https://127.0.0.1 --edge-host old-sparky.com \
+        --public-edge-origin https://old-sparky.com \
+        || { public_status failed runtime >&2; exit 1; }
+      rollback_systemd_restore 1 "$original_previous" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      rollback_systemd_verify "$original_previous" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" phase \
+        --state "$STATE" --expected restart-pending \
+        --phase rollback-runtime-applied \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      rollback_systemd_clear "$original_previous" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      test ! -e "$SYSTEMD_STATE" && test ! -L "$SYSTEMD_STATE" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      ;;
+    rollback-runtime-applied)
+      # No runtime replay on a retry after the two-phase runtime boundary.
+      rollback_systemd_validate "$original_previous" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      rollback_systemd_verify "$original_previous" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete \
+        --retain-receipt --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      rollback_systemd_clear "$original_previous" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      test ! -e "$SYSTEMD_STATE" && test ! -L "$SYSTEMD_STATE" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      ;;
+    recovery-restored)
+      # Idempotent finish after recover --retain.  Do not rerun runtime or
+      # systemd actions; only prove and consume the same operation pair.
+      rollback_systemd_validate "$original_current" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      rollback_systemd_verify "$original_current" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery \
+        --retain-receipt --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      rollback_systemd_clear "$original_current" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      test ! -e "$SYSTEMD_STATE" && test ! -L "$SYSTEMD_STATE" \
+        || { public_status failed systemd_state >&2; exit 1; }
+      /usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery --state "$STATE" \
+        >/dev/null 2>/dev/null \
+        || { public_status failed transaction >&2; exit 1; }
+      ;;
+    *)
+      public_status failed transaction >&2
+      exit 1
+      ;;
+  esac
+  test ! -e "$STATE" && test ! -L "$STATE" \
+    || { public_status failed transaction >&2; exit 1; }
+  public_status passed recovery
+  exit 0
+fi
 
 if [[ -z "$original_previous" ]]; then
   # First-install/current-only recovery never queries systemd or retained

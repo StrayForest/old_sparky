@@ -112,9 +112,11 @@ jobs:
               raise SystemExit("security run provenance is not exact")
           if not isinstance(jobs, list) or len([
               row for row in jobs
-              if isinstance(row, dict) and row.get("name") == os.environ["SECURITY_JOB"]
+              if isinstance(row, dict) and type(row.get("id")) is int
+              and row.get("name") == os.environ["SECURITY_JOB"]
               and row.get("conclusion") == "success" and row.get("run_id") == sid
               and row.get("run_attempt") == sattempt
+              and row.get("status") == "completed" and row.get("head_sha") == source
           ]) != 1:
               raise SystemExit("exact successful security verification job is missing")
           route = [
@@ -182,11 +184,14 @@ jobs:
           if not isinstance(rows, list):
               raise SystemExit("recovery jobs response is malformed")
           run_id, attempt = int(sys.argv[3]), int(sys.argv[4])
+          source = json.loads((Path(sys.argv[1]).parent / "recovery-run.json").read_text(encoding="utf-8")).get("head_sha")
           matches = [
               row for row in rows
               if isinstance(row, dict) and row.get("name") == os.environ["RECOVERY_BUILD_JOB"]
-              and row.get("conclusion") == "success" and isinstance(row.get("id"), int)
+              and row.get("conclusion") == "success" and type(row.get("id")) is int
               and row.get("run_id") == run_id and row.get("run_attempt") == attempt
+              and row.get("status") == "completed"
+              and row.get("head_sha") == source
           ]
           if len(matches) != 1:
               raise SystemExit("exact successful recovery build job is missing")

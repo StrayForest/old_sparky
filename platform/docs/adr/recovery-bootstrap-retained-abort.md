@@ -50,6 +50,17 @@ generation wrapper for the two-pointer systemd contract, while release-specific
 data-plane helpers are accepted only through the systemd manifest bound to the
 recorded release.
 
+For an operation-ID rollback, `platform_recover_pending.sh` owns the complete
+phase matrix inside that generation: pre-runtime phases retain the filesystem
+transaction, runtime-pending phases restore the original runtime and bound
+systemd receipt, `restart-pending` resumes the swapped target, and later
+phases only verify and complete the two-phase cleanup. A retry after the
+systemd receipt has been cleared consumes the already-proven transaction phase
+without querying systemd. No rollback recovery path executes a helper from
+`current/tools` or invokes the release's rollback shim; release-specific
+runtime files are data-plane inputs whose immutable receipt manifest is
+revalidated before use.
+
 New transaction receipts carry one immutable 32-hex `operation_id`; the
 systemd receipt must carry the same ID and the canonical current/previous
 release paths and inode identities before any runtime helper, `systemctl`, or

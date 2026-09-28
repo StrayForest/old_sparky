@@ -454,14 +454,22 @@ recovery bundle and a compatibility handoff in the previous release before
 switching `current`, so recovery remains available if the process dies after
 the pointer switch.
 
-If a rollback is interrupted, recover with the stable bundle (or the
-`current/tools/platform_release_rollback.sh` shim, which delegates to it):
+If an operation-ID rollback is interrupted, use the exact content-addressed
+generation selected and verified by the release-recover workflow. Invoke its
+immutable wrapper directly; do not use `current/tools` or a release rollback
+shim as recovery control code:
 
 ```bash
-/opt/oldsparky/platform/shared/.release-recovery/platform_release_rollback.sh \
-  --recover-pending \
+/opt/oldsparky/platform/shared/.release-recovery/generations/<bundle-sha256>/platform_recover_pending.sh \
   --app-dir /opt/oldsparky/platform
 ```
+
+The wrapper resumes the recorded rollback phase, validates the operation-ID
+and systemd receipt pair before systemd or runtime work, and completes receipt
+cleanup in two phases. A crash after receipt clear is finished from the
+transaction phase without querying systemd. The legacy shim remains only for
+normal rollback handoff compatibility and is not an operation-ID recovery
+authority.
 
 After rollback, repeat preflight plus origin/SNI and public smoke against the restored release.
 
