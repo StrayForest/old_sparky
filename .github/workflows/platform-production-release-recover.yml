@@ -3,6 +3,14 @@ name: Platform production release recovery
 on:
   workflow_dispatch:
     inputs:
+      security_run_id:
+        description: "Exact successful Platform security and build run ID"
+        required: true
+        type: string
+      security_run_attempt:
+        description: "Exact attempt for that security run"
+        required: true
+        type: string
       confirmation:
         description: "Type RECOVER-PENDING-RELEASE after reviewing the retained receipt"
         required: true
@@ -10,6 +18,8 @@ on:
 
 permissions:
   contents: read
+  actions: read
+  attestations: read
 
 concurrency:
   group: platform-production-deploy
@@ -22,19 +32,331 @@ jobs:
     timeout-minutes: 20
     environment: production
     env:
+      REPOSITORY: StrayForest/old_sparky
+      SECURITY_RUN_ID: ${{ inputs.security_run_id }}
+      SECURITY_RUN_ATTEMPT: ${{ inputs.security_run_attempt }}
       RECOVERY_CONFIRMATION: ${{ inputs.confirmation }}
+      SECURITY_WORKFLOW: Platform security and build
+      SECURITY_WORKFLOW_PATH: .github/workflows/platform-security.yml
+      SECURITY_JOB: Verification contract
+      RECOVERY_BUILD_JOB: Build retained-release recovery bootstrap evidence
     steps:
       - name: Validate explicit recovery confirmation
         shell: bash
         run: |
           set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "$REPOSITORY" \
+            || { echo "Recovery repository is not canonical" >&2; exit 1; }
           test "$GITHUB_REF" = "refs/heads/dev" \
             || { echo "Production recovery must run from the reviewed dev ref" >&2; exit 1; }
+          [[ "$SECURITY_RUN_ID" =~ ^[1-9][0-9]{0,31}$ ]] \
+            || { echo "Security run ID is invalid" >&2; exit 1; }
+          [[ "$SECURITY_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,31}$ ]] \
+            || { echo "Security run attempt is invalid" >&2; exit 1; }
           case "$RECOVERY_CONFIRMATION" in
             RECOVER-PENDING-RELEASE) ;;
             *) echo "Refusing recovery without exact confirmation" >&2; exit 1 ;;
           esac
 
+
+      - name: Validate exact security and recovery provenance before SSH
+        id: provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/platform-production-release-recover-provenance"
+          install -d -m 700 "$metadata"
+          api="$GITHUB_API_URL/repos/$REPOSITORY"
+          gh_header=(--header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28')
+          curl --fail-with-body --silent --show-error "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID" --output "$metadata/security-run.json"
+          curl --fail-with-body --silent --show-error "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/attempts/$SECURITY_RUN_ATTEMPT/jobs?per_page=100" --output "$metadata/security-jobs.json"
+          curl --fail-with-body --silent --show-error "${gh_header[@]}" "$api/actions/runs/$SECURITY_RUN_ID/artifacts?per_page=100&page=1" --output "$metadata/security-artifacts.json"
+          source_sha="$(/usr/bin/python3 -I - "$metadata/security-run.json" <<'PY'
+          import json
+          import re
+          import sys
+          value = json.loads(open(sys.argv[1], encoding="utf-8").read()).get("head_sha")
+          if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+              raise SystemExit("security source SHA is invalid")
+          print(value)
+          PY
+          )"
+          curl --fail-with-body --silent --show-error "${gh_header[@]}" "$api/actions/workflows/platform-production-recovery-bootstrap-build.yml/runs?head_sha=$source_sha&event=workflow_run&status=success&per_page=100" --output "$metadata/recovery-runs.json"
+          /usr/bin/python3 -I -B - "$metadata" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          root = Path(sys.argv[1])
+          out = Path(sys.argv[2])
+          sid = int(os.environ["SECURITY_RUN_ID"])
+          sattempt = int(os.environ["SECURITY_RUN_ATTEMPT"])
+          repo = os.environ["REPOSITORY"]
+          security = json.loads((root / "security-run.json").read_text(encoding="utf-8"))
+          jobs = json.loads((root / "security-jobs.json").read_text(encoding="utf-8")).get("jobs")
+          artifacts = json.loads((root / "security-artifacts.json").read_text(encoding="utf-8")).get("artifacts")
+          runs = json.loads((root / "recovery-runs.json").read_text(encoding="utf-8")).get("workflow_runs")
+          source = security.get("head_sha")
+          if not (
+              security.get("id") == sid and security.get("run_attempt") == sattempt
+              and security.get("head_branch") == "dev" and security.get("event") == "push"
+              and security.get("status") == "completed" and security.get("conclusion") == "success"
+              and security.get("name") == os.environ["SECURITY_WORKFLOW"]
+              and security.get("path") == os.environ["SECURITY_WORKFLOW_PATH"]
+              and (security.get("repository") or {}).get("full_name") == repo
+              and isinstance(source, str) and re.fullmatch(r"[0-9a-f]{40}", source)
+          ):
+              raise SystemExit("security run provenance is not exact")
+          if not isinstance(jobs, list) or len([
+              row for row in jobs
+              if isinstance(row, dict) and row.get("name") == os.environ["SECURITY_JOB"]
+              and row.get("conclusion") == "success" and row.get("run_id") == sid
+              and row.get("run_attempt") == sattempt
+          ]) != 1:
+              raise SystemExit("exact successful security verification job is missing")
+          route = [
+              row for row in artifacts or []
+              if isinstance(row, dict)
+              and row.get("name") == f"platform-ci-route-{sid}-{sattempt}"
+              and row.get("expired") is False
+              and isinstance(row.get("workflow_run"), dict)
+              and row["workflow_run"].get("id") == sid
+              and row["workflow_run"].get("head_sha") == source
+          ]
+          if len(route) != 1 or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(route[0].get("digest"))):
+              raise SystemExit("exact security route artifact is missing")
+          selected = [
+              row for row in runs or []
+              if isinstance(row, dict)
+              and row.get("name") == "Platform production recovery bootstrap build"
+              and row.get("path") == ".github/workflows/platform-production-recovery-bootstrap-build.yml"
+              and row.get("head_sha") == source and row.get("head_branch") == "dev"
+              and row.get("event") == "workflow_run" and row.get("status") == "completed"
+              and row.get("conclusion") == "success"
+              and (row.get("repository") or {}).get("full_name") == repo
+          ]
+          if len(selected) != 1 or not isinstance(selected[0].get("id"), int):
+              raise SystemExit("exact successful recovery build run is missing")
+          with out.open("a", encoding="ascii") as stream:
+              stream.write(f"source_sha={source}\n")
+              stream.write(f"route_digest={route[0]['digest'].removeprefix('sha256:')}\n")
+              stream.write(f"recovery_run_id={selected[0]['id']}\n")
+          PY
+          recovery_run_id="$(awk -F= '$1 == "recovery_run_id" {print $2}' "$GITHUB_OUTPUT")"
+          curl --fail-with-body --silent --show-error "${gh_header[@]}" "$api/actions/runs/$recovery_run_id" --output "$metadata/recovery-run.json"
+          /usr/bin/python3 -I -B - "$metadata" "$GITHUB_OUTPUT" "$recovery_run_id" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          run = json.loads((Path(sys.argv[1]) / "recovery-run.json").read_text(encoding="utf-8"))
+          security = json.loads((Path(sys.argv[1]) / "security-run.json").read_text(encoding="utf-8"))
+          attempt = run.get("run_attempt")
+          if not (
+              run.get("id") == int(sys.argv[3]) and isinstance(attempt, int) and 1 <= attempt < 10**32
+              and run.get("name") == "Platform production recovery bootstrap build"
+              and run.get("path") == ".github/workflows/platform-production-recovery-bootstrap-build.yml"
+              and run.get("event") == "workflow_run" and run.get("status") == "completed"
+              and run.get("conclusion") == "success" and run.get("head_branch") == "dev"
+              and run.get("head_sha") == security.get("head_sha")
+              and (run.get("repository") or {}).get("full_name") == os.environ["REPOSITORY"]
+          ):
+              raise SystemExit("recovery build run provenance is not exact")
+          sha = run["head_sha"]
+          with Path(sys.argv[2]).open("a", encoding="ascii") as stream:
+              stream.write(f"recovery_run_attempt={attempt}\n")
+              stream.write(f"bundle_name=platform-recovery-bootstrap-{sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{run['id']}-{attempt}.zip\n")
+              stream.write(f"evidence_name=platform-recovery-bootstrap-evidence-{sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{run['id']}-{attempt}.json\n")
+          PY
+          recovery_run_attempt="$(awk -F= '$1 == "recovery_run_attempt" {print $2}' "$GITHUB_OUTPUT")"
+          curl --fail-with-body --silent --show-error "${gh_header[@]}" "$api/actions/runs/$recovery_run_id/attempts/$recovery_run_attempt/jobs?per_page=100" --output "$metadata/recovery-jobs.json"
+          /usr/bin/python3 -I - "$metadata/recovery-jobs.json" "$metadata/recovery-job-id" "$recovery_run_id" "$recovery_run_attempt" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("jobs")
+          if not isinstance(rows, list):
+              raise SystemExit("recovery jobs response is malformed")
+          run_id, attempt = int(sys.argv[3]), int(sys.argv[4])
+          matches = [
+              row for row in rows
+              if isinstance(row, dict) and row.get("name") == os.environ["RECOVERY_BUILD_JOB"]
+              and row.get("conclusion") == "success" and isinstance(row.get("id"), int)
+              and row.get("run_id") == run_id and row.get("run_attempt") == attempt
+          ]
+          if len(matches) != 1:
+              raise SystemExit("exact successful recovery build job is missing")
+          Path(sys.argv[2]).write_text(str(matches[0]["id"]), encoding="ascii")
+          PY
+          recovery_job_id="$(cat "$metadata/recovery-job-id")"
+          artifact_dir="$RUNNER_TEMP/platform-production-release-recover-artifacts"
+          install -d -m 700 "$artifact_dir"
+          curl --fail-with-body --silent --show-error "${gh_header[@]}" "$api/actions/runs/$recovery_run_id/artifacts?per_page=100&page=1" --output "$artifact_dir/artifacts.json"
+          RECOVERY_RUN_ID="$recovery_run_id" RECOVERY_RUN_ATTEMPT="$recovery_run_attempt" SOURCE_SHA="$source_sha" RECOVERY_JOB_ID="$recovery_job_id" BUNDLE_NAME="$(awk -F= '$1 == "bundle_name" {print $2}' "$GITHUB_OUTPUT")" EVIDENCE_NAME="$(awk -F= '$1 == "evidence_name" {print $2}' "$GITHUB_OUTPUT")"             /usr/bin/python3 -I - "$artifact_dir/artifacts.json" "$artifact_dir" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          root = Path(sys.argv[2])
+          rows = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("artifacts")
+          if not isinstance(rows, list):
+              raise SystemExit("recovery artifacts response is malformed")
+          run_id = int(os.environ["RECOVERY_RUN_ID"])
+          attempt = int(os.environ["RECOVERY_RUN_ATTEMPT"])
+          source = os.environ["SOURCE_SHA"]
+          for name, output in ((os.environ["BUNDLE_NAME"], "bundle.id"), (os.environ["EVIDENCE_NAME"], "evidence.id")):
+              matches = [
+                  row for row in rows
+                  if isinstance(row, dict) and row.get("name") == name
+                  and row.get("expired") is False and isinstance(row.get("workflow_run"), dict)
+                  and row["workflow_run"].get("id") == run_id
+                  and row["workflow_run"].get("head_sha") == source
+                  and ("run_attempt" not in row["workflow_run"] or row["workflow_run"].get("run_attempt") == attempt)
+              ]
+              if len(matches) != 1 or not isinstance(matches[0].get("id"), int):
+                  raise SystemExit(f"exact {name} artifact is missing")
+              (root / output).write_text(str(matches[0]["id"]), encoding="ascii")
+          PY
+          bundle_id="$(cat "$artifact_dir/bundle.id")"
+          evidence_id="$(cat "$artifact_dir/evidence.id")"
+          for pair in "bundle:$bundle_id" "evidence:$evidence_id"; do
+            kind="${pair%%:*}"; id="${pair#*:}"
+            curl --fail-with-body --silent --show-error --location "${gh_header[@]}" "$api/actions/artifacts/$id/zip" --output "$artifact_dir/$kind.download.zip"
+          done
+          source_sha="$(awk -F= '$1 == "source_sha" {print $2}' "$GITHUB_OUTPUT")"
+          RECOVERY_RUN_ID="$recovery_run_id" RECOVERY_RUN_ATTEMPT="$recovery_run_attempt" RECOVERY_JOB_ID="$recovery_job_id" SOURCE_SHA="$source_sha" ROUTE_DIGEST="$(awk -F= '$1 == "route_digest" {print $2}' "$GITHUB_OUTPUT")" BUNDLE_NAME="$(awk -F= '$1 == "bundle_name" {print $2}' "$GITHUB_OUTPUT")" EVIDENCE_NAME="$(awk -F= '$1 == "evidence_name" {print $2}' "$GITHUB_OUTPUT")"             /usr/bin/python3 -I - "$artifact_dir" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+          import zipfile
+          root = Path(sys.argv[1])
+          out = Path(sys.argv[2])
+          def extract(archive, expected):
+              with zipfile.ZipFile(archive) as source:
+                  infos = source.infolist()
+                  if len(infos) != 1 or infos[0].filename != expected:
+                      raise SystemExit("artifact archive is not a single exact file")
+                  info = infos[0]
+                  mode = (info.external_attr >> 16) & 0o177777
+                  if info.create_system != 3 or info.is_dir() or not stat.S_ISREG(mode) or stat.S_IMODE(mode) & 0o022:
+                      raise SystemExit("artifact member metadata is unsafe")
+                  data = source.read(info)
+                  if len(data) != info.file_size:
+                      raise SystemExit("artifact member is truncated")
+                  target = root / expected
+                  descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  with os.fdopen(descriptor, "wb") as stream:
+                      stream.write(data)
+                      stream.flush()
+                      os.fsync(stream.fileno())
+                  return target
+          bundle = extract(root / "bundle.download.zip", os.environ["BUNDLE_NAME"])
+          evidence = extract(root / "evidence.download.zip", os.environ["EVIDENCE_NAME"])
+          payload = json.loads(evidence.read_text(encoding="ascii"))
+          if (
+              set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance"}
+              or payload.get("schema") != 1 or payload.get("capability") != "recovery_bootstrap"
+              or payload.get("capabilities") != ["abort_retained_only", "recover_pending"]
+              or payload.get("deployable") is not False
+          ):
+              raise SystemExit("recovery evidence schema is not closed")
+          if payload.get("bundle_name") != bundle.name or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_sha256"))):
+              raise SystemExit("recovery evidence bundle identity is invalid")
+          if (
+              payload.get("recovery_run_id") != os.environ["RECOVERY_RUN_ID"]
+              or payload.get("recovery_run_attempt") != os.environ["RECOVERY_RUN_ATTEMPT"]
+              or payload.get("recovery_job_id") != os.environ["RECOVERY_JOB_ID"]
+          ):
+              raise SystemExit("recovery evidence build identity is invalid")
+          expected = {
+              "repository": "StrayForest/old_sparky",
+              "workflow": "Platform security and build",
+              "job": "Verification contract",
+              "run_id": os.environ["SECURITY_RUN_ID"],
+              "run_attempt": os.environ["SECURITY_RUN_ATTEMPT"],
+              "source_sha": os.environ["SOURCE_SHA"],
+              "artifact_name": f"platform-ci-route-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}",
+              "artifact_sha256": os.environ["ROUTE_DIGEST"],
+              "deployable": False,
+          }
+          if payload.get("provenance") != expected:
+              raise SystemExit("recovery evidence provenance is invalid")
+          digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+          if digest != payload["bundle_sha256"]:
+              raise SystemExit("recovery bundle digest mismatch")
+          with out.open("a", encoding="ascii") as stream:
+              stream.write(f"bundle_path={bundle}\n")
+              stream.write(f"bundle_sha={digest}\n")
+          PY
+          bundle_path="$(awk -F= '$1 == "bundle_path" {print $2}' "$GITHUB_OUTPUT")"
+          bundle_sha="$(awk -F= '$1 == "bundle_sha" {print $2}' "$GITHUB_OUTPUT")"
+          bundle_stat_before="$(stat -c '%d:%i:%h:%s:%u:%g:%a' "$bundle_path")"
+          bundle_digest_before="$(sha256sum "$bundle_path" | awk '{print $1}')"
+          test "$bundle_digest_before" = "$bundle_sha"
+          attestation_json="$artifact_dir/attestation.json"
+          gh attestation verify "$bundle_path" --repo "$REPOSITORY" --signer-workflow StrayForest/old_sparky/.github/workflows/platform-production-recovery-bootstrap-build.yml --source-ref refs/heads/dev --source-digest "$source_sha" --format json >"$attestation_json"
+          bundle_stat_after="$(stat -c '%d:%i:%h:%s:%u:%g:%a' "$bundle_path")"
+          bundle_digest_after="$(sha256sum "$bundle_path" | awk '{print $1}')"
+          test "$bundle_stat_before" = "$bundle_stat_after"
+          test "$bundle_digest_before" = "$bundle_digest_after"
+          SOURCE_SHA="$source_sha" /usr/bin/python3 -I -B - "$attestation_json" "$bundle_digest_after" "$recovery_run_id" "$recovery_run_attempt" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          values = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(values, list) or not values:
+              raise SystemExit("attestation JSON is not a non-empty array")
+          build = "https://github.com/StrayForest/old_sparky/.github/workflows/platform-production-recovery-bootstrap-build.yml@refs/heads/dev"
+          repo = "https://github.com/StrayForest/old_sparky"
+          runner = f"https://github.com/StrayForest/old_sparky/actions/runs/{sys.argv[3]}/attempts/{sys.argv[4]}"
+          for item in values:
+              if not isinstance(item, dict):
+                  continue
+              result = item.get("verificationResult")
+              signature = result.get("signature") if isinstance(result, dict) else None
+              certificate = signature.get("certificate") if isinstance(signature, dict) else None
+              extensions = certificate.get("extensions") if isinstance(certificate, dict) else None
+              statement = result.get("statement") if isinstance(result, dict) else None
+              timestamps = result.get("verifiedTimestamps") if isinstance(result, dict) else None
+              if not isinstance(extensions, dict) or not isinstance(statement, dict) or not isinstance(timestamps, list) or not timestamps:
+                  continue
+              if (
+                  extensions.get("issuer") != "https://token.actions.githubusercontent.com"
+                  or extensions.get("sourceRepositoryURI") != repo
+                  or extensions.get("sourceRepositoryRef") != "refs/heads/dev"
+                  or extensions.get("sourceRepositoryDigest") != os.environ["SOURCE_SHA"]
+                  or extensions.get("buildConfigURI") != build
+                  or extensions.get("buildSignerURI") != build
+                  or extensions.get("runInvocationURI") != runner
+              ):
+                  continue
+              subjects = statement.get("subject")
+              digest = subjects[0].get("digest") if isinstance(subjects, list) and len(subjects) == 1 and isinstance(subjects[0], dict) else None
+              if isinstance(digest, dict) and digest.get("sha256") == sys.argv[2]:
+                  break
+          else:
+              raise SystemExit("attestation certificate/source/run/subject policy failed")
+          PY
+          {
+            echo "source_sha=$source_sha"
+            echo "security_run_id=$SECURITY_RUN_ID"
+            echo "security_run_attempt=$SECURITY_RUN_ATTEMPT"
+            echo "route_digest=$(awk -F= '$1 == \"route_digest\" {print $2}' \"$GITHUB_OUTPUT\" | tail -n 1)"
+            echo "bundle_sha=$bundle_sha"
+            echo "bundle_path=$bundle_path"
+            echo "recovery_run_id=$recovery_run_id"
+            echo "recovery_run_attempt=$recovery_run_attempt"
+            echo "recovery_job_id=$recovery_job_id"
+          } >> "$GITHUB_OUTPUT"
       - name: Validate production SSH inputs
         shell: bash
         env:
@@ -76,11 +398,94 @@ jobs:
           install -m 600 "$ssh_scan" "$ssh_dir/known_hosts"
           echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
+
+      - name: Transfer exact attested recovery bundle
+        shell: bash
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          BUNDLE_PATH: ${{ steps.provenance.outputs.bundle_path }}
+          BUNDLE_SHA: ${{ steps.provenance.outputs.bundle_sha }}
+        run: |
+          set -euo pipefail
+          test -f "$BUNDLE_PATH" && test ! -L "$BUNDLE_PATH"
+          test "$(stat -c '%h:%a' "$BUNDLE_PATH")" = "1:600"
+          test "$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')" = "$BUNDLE_SHA"
+          ssh_common=(
+            -F /dev/null
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts"
+            -o ConnectTimeout=10
+            -i "$SSH_DIR/id_ed25519"
+          )
+          remote_stage=""
+          cleanup_remote_upload() {
+            local status="$?"
+            trap - EXIT
+            if [[ -n "$remote_stage" ]]; then
+              set +e
+              timeout --foreground 10s ssh "${ssh_common[@]}" \
+                "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage'" \
+                >/dev/null 2>&1 <<'CLEANUP'
+          set -u
+          stage="$1"
+          [[ "$stage" =~ ^/tmp/oldsparky-recovery-upload\.[A-Za-z0-9]{6}$ ]] || exit 0
+          if [[ -e "$stage" || -L "$stage" ]]; then
+            [[ -d "$stage" && ! -L "$stage" ]] || exit 0
+            [[ "$(id -u)" -eq 0 ]] || exit 0
+            [[ "$(stat -c '%u:%h:%a' "$stage" 2>/dev/null)" == "0:1:700" ]] || exit 0
+            rm -f -- "$stage/bundle.zip" || true
+            rmdir -- "$stage" || true
+          fi
+          CLEANUP
+              set -e
+            fi
+            exit "$status"
+          }
+          trap cleanup_remote_upload EXIT
+          remote_stage="$(ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" 'umask 077; test "$(id -u)" -eq 0; d="$(mktemp -d --tmpdir=/tmp oldsparky-recovery-upload.XXXXXX)"; chmod 700 "$d"; printf "%s" "$d"')"
+          [[ "$remote_stage" =~ ^/tmp/oldsparky-recovery-upload\.[A-Za-z0-9]{6}$ ]]
+          scp -p "${ssh_common[@]}" "$BUNDLE_PATH" "$PROD_SSH_USER@$PROD_SSH_HOST:$remote_stage/bundle.zip"
+          ssh "${ssh_common[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "bash -s -- '$remote_stage' '$BUNDLE_SHA'" <<'REMOTE'
+          set -Eeuo pipefail
+          stage="$1"
+          expected="$2"
+          [[ "$stage" =~ ^/tmp/oldsparky-recovery-upload\.[A-Za-z0-9]{6}$ ]]
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          test "$(id -u)" -eq 0
+          test -d "$stage" && test ! -L "$stage"
+          test "$(stat -c '%u:%h:%a' "$stage")" = "0:1:700"
+          bundle="$stage/bundle.zip"
+          test -f "$bundle" && test ! -L "$bundle"
+          test "$(stat -c '%u:%h:%a' "$bundle")" = "0:1:600"
+          test "$(sha256sum "$bundle" | awk '{print $1}')" = "$expected"
+          final="/tmp/oldsparky-recovery-bundle-$expected.zip"
+          if [[ -e "$final" || -L "$final" ]]; then
+            test -f "$final" && test ! -L "$final"
+            test "$(stat -c '%u:%h:%a' "$final")" = "0:1:600"
+            test "$(sha256sum "$final" | awk '{print $1}')" = "$expected"
+            rm -f -- "$bundle"
+          else
+            mv -- "$bundle" "$final"
+            chmod 600 "$final"
+          fi
+          rmdir -- "$stage"
+          REMOTE
       - name: Recover the pending release and restore runtime
         shell: bash
         env:
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          BUNDLE_SHA: ${{ steps.provenance.outputs.bundle_sha }}
+          SOURCE_SHA: ${{ steps.provenance.outputs.source_sha }}
+          SECURITY_RUN_ID: ${{ steps.provenance.outputs.security_run_id }}
+          SECURITY_RUN_ATTEMPT: ${{ steps.provenance.outputs.security_run_attempt }}
+          RECOVERY_RUN_ID: ${{ steps.provenance.outputs.recovery_run_id }}
+          RECOVERY_RUN_ATTEMPT: ${{ steps.provenance.outputs.recovery_run_attempt }}
+          RECOVERY_JOB_ID: ${{ steps.provenance.outputs.recovery_job_id }}
+          ROUTE_DIGEST: ${{ steps.provenance.outputs.route_digest }}
         run: |
           set -euo pipefail
           umask 077
@@ -106,392 +511,138 @@ jobs:
             -o ConnectTimeout=10 \
             -i "$SSH_DIR/id_ed25519" \
             "$PROD_SSH_USER@$PROD_SSH_HOST" \
-            'bash -s' >"$remote_log" 2>"$remote_error" <<'REMOTE'
+            "bash -s -- '$BUNDLE_SHA' '$SOURCE_SHA' '$SECURITY_RUN_ID' '$SECURITY_RUN_ATTEMPT' '$RECOVERY_RUN_ID' '$RECOVERY_RUN_ATTEMPT' '$RECOVERY_JOB_ID' '$ROUTE_DIGEST'" >"$remote_log" 2>"$remote_error" <<'REMOTE'
           set -Eeuo pipefail
 
           runtime=/opt/oldsparky/platform
           test "$(id -u)" -eq 0 || { echo "Production recovery must run as root" >&2; exit 1; }
-          trusted_generation=""
-          if [[ ! -e "$runtime/current" && ! -L "$runtime/current" ]]; then
-            generation_name="$({
-              /usr/bin/python3 -I - "$runtime/shared/.release-recovery/generations" <<'PY'
+          bundle_sha="$1"
+          source_sha="$2"
+          security_run_id="$3"
+          security_run_attempt="$4"
+          recovery_run_id="$5"
+          recovery_run_attempt="$6"
+          recovery_job_id="$7"
+          route_digest="$8"
+          test "$#" -eq 8
+          [[ "$bundle_sha" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$security_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$security_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$recovery_run_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$recovery_run_attempt" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$recovery_job_id" =~ ^[1-9][0-9]{0,31}$ ]]
+          [[ "$route_digest" =~ ^[0-9a-f]{64}$ ]]
+          bundle_path="/tmp/oldsparky-recovery-bundle-$bundle_sha.zip"
+          test -f "$bundle_path" && test ! -L "$bundle_path"
+          test "$(stat -c '%u:%h:%a' "$bundle_path" 2>/dev/null)" = "0:1:600"
+          test "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$bundle_sha"
+          install_stage="$(mktemp -d --tmpdir=/tmp oldsparky-recovery-install.XXXXXX)"
+          [[ "$install_stage" =~ ^/tmp/oldsparky-recovery-install\.[A-Za-z0-9]{6}$ ]]
+          chmod 700 "$install_stage"
+          cleanup_remote_recovery() {
+            local status="$?"
+            trap - EXIT
+            rm -rf -- "$install_stage" || true
+            rm -f -- "$bundle_path" || true
+            exit "$status"
+          }
+          trap cleanup_remote_recovery EXIT
+          provenance_path="$install_stage/provenance.json"
+          /usr/bin/python3 -I - "$provenance_path" "$security_run_id" "$security_run_attempt" "$source_sha" "$recovery_run_id" "$recovery_run_attempt" "$recovery_job_id" "$route_digest" <<'PY'
+          import json
           import os
-          import re
+          import sys
+          from pathlib import Path
+          destination = Path(sys.argv[1])
+          payload = {
+              "repository": "StrayForest/old_sparky",
+              "workflow": "Platform security and build",
+              "job": "Verification contract",
+              "run_id": sys.argv[2],
+              "run_attempt": sys.argv[3],
+              "source_sha": sys.argv[4],
+              "artifact_name": f"platform-ci-route-{sys.argv[2]}-{sys.argv[3]}",
+              "artifact_sha256": sys.argv[8],
+              "deployable": False,
+          }
+          raw = (json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(descriptor, "wb") as stream:
+              stream.write(raw)
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+          bootstrap_tool="$install_stage/platform_recovery_bootstrap.py"
+          /usr/bin/python3 -I - "$bundle_path" "$bootstrap_tool" <<'PY'
+          import os
           import stat
           import sys
+          import zipfile
           from pathlib import Path
-
-          root = Path(sys.argv[1])
-          try:
-              root_stat = root.lstat()
-          except OSError as exc:
-              raise SystemExit(1) from exc
-          if (
-              not stat.S_ISDIR(root_stat.st_mode)
-              or stat.S_ISLNK(root_stat.st_mode)
-              or root_stat.st_uid != 0
-              or root_stat.st_gid != 0
-              or root_stat.st_nlink < 2
-              or stat.S_IMODE(root_stat.st_mode) != 0o755
-          ):
-              raise SystemExit(1)
-          candidates = []
-          for entry in root.iterdir():
-              if re.fullmatch(r"[0-9a-f]{64}", entry.name) is None:
-                  continue
-              metadata = entry.lstat()
-              if (
-                  not stat.S_ISDIR(metadata.st_mode)
-                  or stat.S_ISLNK(metadata.st_mode)
-                  or metadata.st_uid != 0
-                  or metadata.st_gid != 0
-                  or metadata.st_nlink < 2
-                  or stat.S_IMODE(metadata.st_mode) != 0o555
-              ):
-                  continue
-              required = {
-                  "manifest.json": 0o444,
-                  "platform_abort_retained_only.sh": 0o555,
-                  "platform_live_qa_guard.py": 0o444,
-                  "platform_live_qa_runtime_install.py": 0o444,
-                  "platform_recovery_bootstrap.py": 0o444,
-                  "platform_release_lock.sh": 0o555,
-                  "platform_release_restore_runtime.sh": 0o555,
-                  "platform_release_systemd_state.py": 0o444,
-                  "platform_release_transaction.py": 0o444,
-              }
-              if all(
-                  (candidate := entry / name).is_file()
-                  and not candidate.is_symlink()
-                  and candidate.lstat().st_uid == 0
-                  and candidate.lstat().st_gid == 0
-                  and candidate.lstat().st_nlink == 1
-                  and stat.S_IMODE(candidate.lstat().st_mode) == mode
-                  for name, mode in required.items()
-              ):
-                  candidates.append(entry.name)
-          if len(candidates) != 1:
-              raise SystemExit(1)
-          print(candidates[0])
+          bundle = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          expected = "platform-recovery-bootstrap/platform_recovery_bootstrap.py"
+          with zipfile.ZipFile(bundle) as archive:
+              infos = [info for info in archive.infolist() if info.filename == expected]
+              if len(infos) != 1:
+                  raise SystemExit("immutable recovery bootstrap member is missing")
+              info = infos[0]
+              mode = (info.external_attr >> 16) & 0o177777
+              if info.create_system != 3 or info.is_dir() or not stat.S_ISREG(mode) or stat.S_IMODE(mode) != 0o444:
+                  raise SystemExit("immutable recovery bootstrap member metadata is unsafe")
+              data = archive.read(info)
+              if len(data) != info.file_size:
+                  raise SystemExit("immutable recovery bootstrap member is truncated")
+          descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
+          with os.fdopen(descriptor, "wb") as stream:
+              stream.write(data)
+              stream.flush()
+              os.fsync(stream.fileno())
+          os.chown(destination, 0, 0)
+          os.chmod(destination, 0o444)
           PY
-            } 2>/dev/null
-          })"
-            || { echo "No unique trusted recovery generation is available for first-install recovery" >&2; exit 1; }
-            trusted_generation="$runtime/shared/.release-recovery/generations/$generation_name"
-            export RECOVERY_TRUSTED_GENERATION="$trusted_generation"
-            lock_helper="$trusted_generation/platform_release_lock.sh"
-            bootstrap_tool="$trusted_generation/platform_recovery_bootstrap.py"
-            test -f "$bootstrap_tool" && test ! -L "$bootstrap_tool" \
-              && test "$(stat -c '%u:%h:%a' "$bootstrap_tool" 2>/dev/null)" = "0:1:444" \
-              || { echo "Recovery bootstrap validator is missing or unsafe" >&2; exit 1; }
-            /usr/bin/python3 -I -B "$bootstrap_tool" validate-generation \
-              --generation "$trusted_generation" --bundle-sha "$generation_name" \
-              >/dev/null 2>/dev/null \
-              || { echo "Immutable recovery generation manifest validation failed" >&2; exit 1; }
-          else
-            lock_helper="$runtime/current/tools/platform_release_lock.sh"
-            unset RECOVERY_TRUSTED_GENERATION
-          fi
-          test -f "$lock_helper" && test ! -L "$lock_helper" && test -x "$lock_helper" \
-            || { echo "Canonical release lock helper is missing or unsafe" >&2; exit 1; }
-          # Run the entire recovery body under the pathname-form common
-          # supervisor.  It uses --close, so no numeric FD is inherited by the
-          # rollback, restore or readiness commands; pending state is allowed
-          # because this is the explicit recovery entrypoint.
-          "$lock_helper" --run /bin/bash -s <<'LOCKED'
-          set -Eeuo pipefail
-          runtime=/opt/oldsparky/platform
-          state="$runtime/shared/.release-operation.json"
-          systemd_state="$runtime/shared/.release-systemd-state.json"
-          trusted_tools="${RECOVERY_TRUSTED_GENERATION:-$runtime/current/tools}"
-          systemd_state_tool="$trusted_tools/platform_release_systemd_state.py"
-          transaction_tool="$trusted_tools/platform_release_transaction.py"
-          # shellcheck source=/dev/null
-          source "$trusted_tools/platform_release_lock.sh"
-          platform_release_lock_open || {
-            echo "Canonical release lock supervisor could not be validated" >&2
-            exit 75
-          }
-          test -f "$state" || { echo "No pending release transaction exists" >&2; exit 1; }
-          test "$(stat -c '%u:%h:%a' "$state" 2>/dev/null)" = "0:1:600" \
-            || { echo "Pending release transaction metadata is unsafe" >&2; exit 1; }
-          systemd_state_tool_mode=755
-          if [[ -n "${RECOVERY_TRUSTED_GENERATION:-}" ]]; then
-            systemd_state_tool_mode=444
-          fi
-          test -f "$systemd_state_tool" && test ! -L "$systemd_state_tool" \
-            && test "$(stat -c '%u:%h:%a' "$systemd_state_tool" 2>/dev/null)" = "0:1:$systemd_state_tool_mode" \
-            || { echo "Systemd state helper is missing or unsafe" >&2; exit 1; }
-          if [[ -e "$systemd_state" || -L "$systemd_state" ]]; then
-            test -f "$systemd_state" && test ! -L "$systemd_state" \
-              && test "$(stat -c '%u:%h:%a' "$systemd_state" 2>/dev/null)" = "0:1:600" \
-              || { echo "Retained systemd state receipt is unsafe" >&2; exit 1; }
-          fi
-          pending_operation="$({
-            /usr/bin/python3 -I - "$state" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-          value = record.get("operation")
-          if value not in {"install", "rollback"}:
-              raise SystemExit(1)
-          print(value)
-          PY
-          } 2>/dev/null)"
-          transaction_context="$({
-            /usr/bin/python3 -I - "$state" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-          for key in ("operation_id", "phase", "current_before", "previous_before"):
-              value = record.get(key)
-              print("" if value is None else value)
-          PY
-          } 2>/dev/null)"
-          mapfile -t transaction_fields <<<"$transaction_context"
-          operation_id="${transaction_fields[0]:-}"
-          transaction_phase="${transaction_fields[1]:-}"
-          original_current="${transaction_fields[2]:-}"
-          original_previous="${transaction_fields[3]:-}"
-          if [[ "$pending_operation" == "install" && -z "$operation_id" ]]; then
-            if [[ "$transaction_phase" == "recovery-restored" \
-              && ! -e "$systemd_state" && ! -L "$systemd_state" ]]; then
-              echo "Legacy v2 recovery must use the immutable recovery-bootstrap bridge" >&2
-            else
-              echo "Legacy or malformed release receipt cannot enter this recovery path" >&2
-            fi
-            exit 1
-          fi
-          if [[ "$pending_operation" == "install" ]]; then
-            [[ "$operation_id" =~ ^[0-9a-f]{32}$ ]] \
-              || { echo "Release transaction operation identity is invalid" >&2; exit 1; }
-            if [[ -z "$original_previous" ]]; then
-              # First-install and current-only recovery are deliberately
-              # generic transaction cleanup. They have no two-release
-              # systemd/runtime authority; a receipt here is a mismatch.
-              [[ ! -e "$systemd_state" && ! -L "$systemd_state" ]] \
-                || { echo "Nullable previous recovery cannot use a systemd receipt" >&2; exit 1; }
-              if [[ -n "$original_current" ]]; then
-                [[ -L "$runtime/current" && "$(readlink -f "$runtime/current")" == "$original_current" ]] \
-                  || { echo "Current-only recovery pointer does not match receipt" >&2; exit 1; }
-              else
-                [[ ! -e "$runtime/current" && ! -L "$runtime/current" ]] \
-                  || { echo "First-install recovery current pointer is not absent" >&2; exit 1; }
-              fi
-              [[ ! -e "$runtime/previous" && ! -L "$runtime/previous" ]] \
-                || { echo "Nullable previous recovery has an unexpected previous pointer" >&2; exit 1; }
-              /usr/bin/python3 -I "$transaction_tool" recover \
-                --state "$state" >/dev/null 2>/dev/null
-              test ! -e "$state" && test ! -L "$state" \
-                || { echo "Generic recovery did not complete" >&2; exit 1; }
-              printf 'RELEASE_RUNTIME schema=1 status=passed class=recovery release_slug=unavailable source_sha=unavailable\n'
-              exit 0
-            fi
-          fi
-          test -n "$original_current" && test -n "$original_previous" \
-            || { echo "Release transaction identities are incomplete" >&2; exit 1; }
-          # This entrypoint recovers an interrupted install transaction. A
-          # rollback transaction has its own state machine and receipt owner;
-          # refusing it here prevents a second recovery path from guessing
-          # which release/runtime snapshot is authoritative.
-          case "$pending_operation" in
-            install)
-              if [[ -e "$systemd_state" ]]; then
-                /usr/bin/python3 -I "$systemd_state_tool" validate \
-                  --state "$systemd_state" --app-dir "$runtime" \
-                  --transaction "$state" --helper-release "$original_current" \
-                  --systemctl /usr/bin/systemctl >/dev/null 2>/dev/null
-                /usr/bin/python3 -I - "$state" "$systemd_state" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          transaction = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-          receipt = json.loads(Path(sys.argv[2]).read_text(encoding="ascii"))
-          if transaction.get("operation") != "install":
-              raise SystemExit(1)
-          if transaction.get("current_before") != receipt.get("current_before"):
-              raise SystemExit(1)
-          if transaction.get("previous_before") != receipt.get("previous_before"):
-              raise SystemExit(1)
-          PY
-              else
-                /usr/bin/python3 -I "$systemd_state_tool" capture-transaction \
-                  --state "$systemd_state" \
-                  --transaction "$state" \
-                  --app-dir "$runtime" \
-                  --helper-release "$original_current" \
-                  --require-helper-manifest \
-                  --systemctl /usr/bin/systemctl \
-                  >/dev/null 2>/dev/null
-              fi
-              ;;
-            *) echo "Unsupported pending release operation" >&2; exit 1 ;;
-          esac
-          test -f "$transaction_tool" && test ! -L "$transaction_tool" \
-            && test -x "$transaction_tool" \
-            && test "$(stat -c '%u:%h:%a' "$transaction_tool" 2>/dev/null)" = "0:1:755" \
-            || { echo "Release transaction tool is missing or unsafe" >&2; exit 1; }
-          /usr/bin/grep -Fq 'STATE_VERSION = 2' \
-            "$transaction_tool" \
-            || { echo "Release transaction tool is stale" >&2; exit 1; }
-
-          # Recover only the filesystem pointers/venv and retain both durable
-          # receipts. Cleanup is committed only after runtime, systemd, Nginx
-          # and health checks have all succeeded.
-          /usr/bin/python3 -I "$transaction_tool" recover \
-            --retain --state "$state" >/dev/null 2>/dev/null
-          test -f "$state" && test ! -L "$state" \
-            || { echo "Retained release transaction disappeared during recovery" >&2; exit 1; }
-
-          current_release="$(readlink -f "$runtime/current" 2>/dev/null)"
-          test -L "$runtime/current" \
-            && test "$(stat -c '%u:%h' "$runtime/current" 2>/dev/null)" = "0:1" \
-            || { echo "Recovered current pointer is unsafe" >&2; exit 1; }
-          test -n "$current_release" \
-            && test -d "$current_release" && test ! -L "$current_release" \
-            && test "$(dirname "$current_release")" = "$runtime/releases" \
-            && test "$(stat -c '%u:%h:%a' "$current_release" 2>/dev/null)" = "0:1:755" \
-            || { echo "Recovered current release is unsafe" >&2; exit 1; }
-          expected_current="$({
-            /usr/bin/python3 -I - "$systemd_state" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-          value = record.get("current_before")
-          if not isinstance(value, str) or not value.startswith("/opt/oldsparky/platform/releases/"):
-              raise SystemExit(1)
-          print(value)
-          PY
-          } 2>/dev/null)"
-          test "$current_release" = "$expected_current" \
-            || { echo "Recovered current release does not match retained receipt" >&2; exit 1; }
-          current_slug="$(basename "$current_release")"
-          [[ "$current_slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$ ]] \
-            || { echo 'RELEASE_RUNTIME schema=1 status=failed class=layout release_slug=unavailable source_sha=unavailable' >&2; exit 1; }
-          current_sha="$({
-            /usr/bin/python3 -I - "$current_release/RELEASE.json" <<'PY'
-          import json
-          import re
-          import sys
-          from pathlib import Path
-
-          try:
-              value = json.loads(Path(sys.argv[1]).read_text(encoding="ascii")).get(
-                  "source_git_commit", ""
-              )
-          except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
-              value = ""
-          if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value):
-              print(value)
-          PY
-          } 2>/dev/null)"
-          [[ -n "$current_sha" ]] || current_sha=unavailable
-          restore="$current_release/tools/platform_release_restore_runtime.sh"
-          restore_lock_helper="$current_release/tools/platform_release_lock.sh"
-          systemd_state_tool="$current_release/tools/platform_release_systemd_state.py"
-          test -f "$restore" && test ! -L "$restore" && test -x "$restore" \
-            || { echo "Runtime restore tool is missing" >&2; exit 1; }
-          test -f "$restore_lock_helper" && test ! -L "$restore_lock_helper" \
-            && test -x "$restore_lock_helper" \
-            || { echo "Runtime restore lock helper is missing" >&2; exit 1; }
-          test "$(stat -c '%u:%h:%a' "$restore" 2>/dev/null)" = "0:1:755" \
-            || { echo "Runtime restore tool metadata is unsafe" >&2; exit 1; }
-          test "$(stat -c '%u:%h:%a' "$restore_lock_helper" 2>/dev/null)" = "0:1:755" \
-            || { echo "Runtime restore lock helper metadata is unsafe" >&2; exit 1; }
-          test -f "$systemd_state_tool" && test ! -L "$systemd_state_tool" \
-            && test "$(stat -c '%u:%h:%a' "$systemd_state_tool" 2>/dev/null)" = "0:1:755" \
-            || { echo "Runtime systemd state helper is missing or unsafe" >&2; exit 1; }
-          /usr/bin/grep -Fq 'platform_release_lock_open' "$restore" \
-            || { echo "Runtime restore tool has no v2 lock contract" >&2; exit 1; }
-          platform_release_lock_supervisor_holds \
-            || { echo "Platform release lock was lost" >&2; exit 1; }
-          PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$restore" \
-            --app-dir "$runtime" \
-            --release "$current_release" \
-            --systemd-state "$systemd_state" \
-            --transaction "$state" \
-            --systemctl /usr/bin/systemctl \
-            --expected-csp-mode enforce \
-            --edge-origin https://127.0.0.1 \
-            --edge-host old-sparky.com \
-            --public-edge-origin https://old-sparky.com
-
-          # Restore and verify both active and enablement dimensions. Do not
-          # assume every managed service was active before the interrupted
-          # transaction; inactive services must remain inactive on recovery.
-          /usr/bin/python3 -I "$current_release/tools/platform_release_systemd_state.py" \
-            verify --state "$systemd_state" --app-dir "$runtime" \
-            --transaction "$state" --helper-release "$current_release" \
-            --systemctl /usr/bin/systemctl >/dev/null 2>/dev/null
-          nginx -t >/dev/null 2>/dev/null
-          for service in deadlock-api.service deadlock-worker.service deadlock-web.service; do
-            expected_state="$({
-              /usr/bin/python3 -I - "$systemd_state" "$service" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-          for item in record["units"]:
-              if item["name"] == sys.argv[2]:
-                  print(item["active"])
-                  break
-          else:
-              raise SystemExit(1)
-          PY
-            } 2>/dev/null)"
-            case "$expected_state" in
-              active) systemctl is-active --quiet "$service" >/dev/null 2>/dev/null ;;
-              inactive) ! systemctl is-active --quiet "$service" >/dev/null 2>/dev/null ;;
-              *) echo "Retained active state is invalid" >&2; exit 1 ;;
-            esac
+          /usr/bin/python3 -I -B "$bootstrap_tool" install \
+            --bundle "$bundle_path" --app-dir "$runtime" \
+            --expected-bundle-sha "$bundle_sha" \
+            --provenance "$provenance_path" --capability recover_pending \
+            >/dev/null
+          generation_name="$bundle_sha"
+          trusted_generation="$runtime/shared/.release-recovery/generations/$generation_name"
+          test -d "$trusted_generation" && test ! -L "$trusted_generation"
+          export RECOVERY_TRUSTED_GENERATION="$trusted_generation"
+          lock_helper="$trusted_generation/platform_release_lock.sh"
+          bootstrap_tool="$trusted_generation/platform_recovery_bootstrap.py"
+          /usr/bin/python3 -I -B "$bootstrap_tool" validate-generation \
+            --generation "$trusted_generation" --bundle-sha "$generation_name" \
+            --provenance "$provenance_path" --capability recover_pending \
+            >/dev/null 2>/dev/null \
+            || { echo "Immutable recovery generation manifest validation failed" >&2; exit 1; }
+          for helper_spec in \
+            "platform_recovery_bootstrap.py:444" \
+            "platform_release_lock.sh:555" \
+            "platform_release_restore_runtime.sh:555" \
+            "platform_release_systemd_state.py:444" \
+            "platform_release_transaction.py:444" \
+            "platform_recover_pending.sh:555"; do
+            helper_name="${helper_spec%%:*}"
+            helper_mode="${helper_spec##*:}"
+            helper_path="$trusted_generation/$helper_name"
+            test -f "$helper_path" && test ! -L "$helper_path" \
+              && test "$(stat -c '%u:%h:%a' "$helper_path" 2>/dev/null)" = "0:1:$helper_mode" \
+              || { echo "Immutable recovery helper is missing or unsafe" >&2; exit 1; }
           done
-          api_state="$({ /usr/bin/python3 -I - "$systemd_state" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-          print(next(item["active"] for item in record["units"] if item["name"] == "deadlock-api.service"))
-          PY
-          } 2>/dev/null)"
-          web_state="$({ /usr/bin/python3 -I - "$systemd_state" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-          record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-          print(next(item["active"] for item in record["units"] if item["name"] == "deadlock-web.service"))
-          PY
-          } 2>/dev/null)"
-          if [[ "$api_state" == active ]]; then
-            curl --fail --silent --show-error --max-time 10 \
-              http://127.0.0.1:8010/api/v1/health/ready >/dev/null 2>/dev/null
-          fi
-          if [[ "$web_state" == active ]]; then
-            curl --fail --silent --show-error --max-time 10 \
-              http://127.0.0.1:3000/ >/dev/null 2>/dev/null
-          fi
-          /usr/bin/python3 -I "$current_release/tools/platform_release_systemd_state.py" \
-            clear --state "$systemd_state" --app-dir "$runtime" \
-            --transaction "$state" --helper-release "$current_release" \
-            --systemctl /usr/bin/systemctl >/dev/null 2>/dev/null
-          test ! -e "$systemd_state" && test ! -L "$systemd_state" \
-            || { echo "Systemd state receipt was not cleared" >&2; exit 1; }
-          # The receipt is no longer needed only after the restored state was
-          # verified and all readiness checks passed. The transaction command
-          # now performs the final identity-checked candidate cleanup and
-          # removes .release-operation.json.
-          /usr/bin/python3 -I "$transaction_tool" complete-recovery \
-            --state "$state" >/dev/null 2>/dev/null
-          test ! -e "$state" && test ! -L "$state" \
-            || { echo "Release transaction was not completed" >&2; exit 1; }
-          printf 'RELEASE_RUNTIME schema=1 status=passed class=recovery release_slug=%s source_sha=%s\n' \
-            "$current_slug" "$current_sha"
-          LOCKED
+          test -f "$lock_helper" && test ! -L "$lock_helper" \
+            || { echo "Canonical release lock helper is missing or unsafe" >&2; exit 1; }
+          rm -rf -- "$install_stage"
+          # The immutable generation wrapper owns lock, transaction, systemd and
+          # runtime restoration for every supported topology.
+          set +e
+          "$trusted_generation/platform_recover_pending.sh" \
+            --app-dir "$runtime" --systemctl /usr/bin/systemctl
+          remote_status="$?"
+          set -e
+          exit "$remote_status"
           REMOTE
           remote_status="$?"
           set -e

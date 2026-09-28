@@ -64,6 +64,7 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/tools/platform_release_deploy.sh",
         "platform/tools/platform_release_preflight.sh",
         "platform/tools/platform_release_systemd_state.py",
+        "platform/tools/platform_recover_pending.sh",
         "platform/tools/platform_release_transaction.py",
         "platform/tools/platform_run_alembic.sh",
         "platform/tools/platform_test_catalog.py",
@@ -71,9 +72,9 @@ RECOVERY_BOOTSTRAP_PATCH_FILES = frozenset(
         "platform/contracts/host_tools_pin.json",
     }
 )
-RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 37
+RECOVERY_BOOTSTRAP_PATCH_FILE_COUNT = 38
 RECOVERY_BOOTSTRAP_PATCH_FILE_DIGEST = (
-    "ed302edc4e310c4a946b30543c6416dcdf1a071b0b944e876b84dee4353855e5"
+    "b53de14231bebbb3e50c2815194d9f0712803458ce9468027d2722e96721742e"
 )
 
 
@@ -399,10 +400,18 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
         self.assertNotIn('0:0:755:2', legacy_abort)
         self.assertIn('0:0:444:1', legacy_abort)
         release_recover = (REPO_ROOT / ".github/workflows/platform-production-release-recover.yml").read_text(encoding="utf-8")
-        self.assertIn('"platform_release_systemd_state.py": 0o444', release_recover)
-        self.assertIn('"platform_release_transaction.py": 0o444', release_recover)
+        self.assertIn('"platform_release_systemd_state.py:444"', release_recover)
+        self.assertIn('"platform_release_transaction.py:444"', release_recover)
+        self.assertIn('"platform_recover_pending.sh:555"', release_recover)
         self.assertIn("validate-generation", release_recover)
-        self.assertIn('systemd_state_tool_mode=444', release_recover)
+        self.assertIn("platform_recover_pending.sh", release_recover)
+        self.assertIn("security_run_id", release_recover)
+        self.assertIn("security_run_attempt", release_recover)
+        self.assertIn("cleanup_remote_upload", release_recover)
+        self.assertIn("trap cleanup_remote_upload EXIT", release_recover)
+        self.assertIn("timeout --foreground 10s ssh", release_recover)
+        self.assertIn('rm -f -- "$stage/bundle.zip" || true', release_recover)
+        self.assertNotIn("$runtime/current/tools", release_recover)
         self.assertIn(
             "evidence_name=platform-recovery-bootstrap-evidence-{sha}-{os.environ['SECURITY_RUN_ID']}-{os.environ['SECURITY_RUN_ATTEMPT']}-{run_id}-{attempt}.json",
             workflow,
@@ -955,7 +964,8 @@ class RecoveryBootstrapContractTests(unittest.TestCase):
             expected_bundle_sha = hashlib.sha256(bundle_bytes).hexdigest()
             evidence_payload = {
                 "schema": 1,
-                "capability": "abort_retained_only",
+                "capability": "recovery_bootstrap",
+                "capabilities": ["abort_retained_only", "recover_pending"],
                 "deployable": False,
                 "bundle_name": bundle_name,
                 "bundle_sha256": expected_bundle_sha,

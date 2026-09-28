@@ -709,6 +709,13 @@ def capture_transaction(
     ) = _read_transaction(
         transaction, app_dir
     )
+    if operation == "install" and not active_overrides:
+        # The low-level transaction schema permits an install receipt to be
+        # created before the deploy wrapper records its service snapshot.
+        # Recovery must never turn that nullable representation into a live
+        # systemd observation: doing so would create an authoritative receipt
+        # from state that was not captured before quiesce.
+        raise StateError("install transaction service snapshot is incomplete")
     expected_releases = {"current_before": Path(current_before)}
     if operation == "rollback":
         expected_releases["previous_before"] = Path(previous_before)

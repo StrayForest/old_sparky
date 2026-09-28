@@ -349,7 +349,7 @@ jobs:
           evidence = one(root / "evidence.zip", evidence_name)
           bundle = one(root / "bundle.zip", bundle_name)
           payload = json.loads(evidence.read_text(encoding="ascii"))
-          if set(payload) != {"schema", "capability", "deployable", "bundle_name", "bundle_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance"} or payload.get("schema") != 1 or payload.get("capability") != "abort_retained_only" or payload.get("deployable") is not False:
+          if set(payload) != {"schema", "capability", "capabilities", "deployable", "bundle_name", "bundle_sha256", "recovery_run_id", "recovery_run_attempt", "recovery_job_id", "provenance"} or payload.get("schema") != 1 or payload.get("capability") != "recovery_bootstrap" or payload.get("capabilities") != ["abort_retained_only", "recover_pending"] or payload.get("deployable") is not False:
               raise SystemExit("recovery evidence schema is not closed")
           if not isinstance(payload.get("bundle_name"), str) or payload["bundle_name"] != bundle.name or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("bundle_sha256"))):
               raise SystemExit("recovery evidence bundle identity is invalid")
@@ -710,6 +710,7 @@ jobs:
               "platform-recovery-bootstrap/platform_release_restore_runtime.sh",
               "platform-recovery-bootstrap/platform_release_transaction.py",
               "platform-recovery-bootstrap/platform_release_systemd_state.py",
+              "platform-recovery-bootstrap/platform_recover_pending.sh",
           }
           with zipfile.ZipFile(bundle) as source:
               infos = source.infolist()
@@ -766,7 +767,7 @@ jobs:
                           pass
                       raise
           PY
-          for name in manifest.json platform_abort_retained_only.sh platform_live_qa_guard.py platform_live_qa_runtime_install.py platform_recovery_bootstrap.py platform_release_lock.sh platform_release_restore_runtime.sh platform_release_systemd_state.py platform_release_transaction.py; do
+          for name in manifest.json platform_abort_retained_only.sh platform_live_qa_guard.py platform_live_qa_runtime_install.py platform_recovery_bootstrap.py platform_release_lock.sh platform_release_restore_runtime.sh platform_release_systemd_state.py platform_release_transaction.py platform_recover_pending.sh; do
             if [[ "$name" == *.sh ]]; then
               validate_stage_file "$payload/$name" 555
             else

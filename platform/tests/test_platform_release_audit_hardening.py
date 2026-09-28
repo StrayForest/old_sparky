@@ -262,50 +262,16 @@ class ReleaseHardeningContractTests(unittest.TestCase):
         recover_workflow = (
             WORKFLOW_DIR / "platform-production-release-recover.yml"
         ).read_text(encoding="utf-8")
-        recover_lock = recover_workflow.index(
-            'lock_helper="$runtime/current/tools/platform_release_lock.sh"'
-        )
-        recover_supervisor = recover_workflow.index(
-            '"$lock_helper" --run /bin/bash -s <<\'LOCKED\'', recover_lock
-        )
-        retain_recovery = recover_workflow.index(
-            'recover \\\n            --retain --state "$state"', recover_supervisor
-        )
-        restore_runtime = recover_workflow.index(
-            'PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$restore"', retain_recovery
-        )
-        verify_runtime = recover_workflow.index(
-            'verify --state "$systemd_state"', restore_runtime
-        )
-        nginx_check = recover_workflow.index("nginx -t", verify_runtime)
-        api_health_check = recover_workflow.index(
-            "http://127.0.0.1:8010/api/v1/health/ready", nginx_check
-        )
-        web_health_check = recover_workflow.index(
-            "http://127.0.0.1:3000/", nginx_check
-        )
-        clear_systemd_receipt = recover_workflow.index(
-            'clear --state "$systemd_state"', web_health_check
-        )
-        complete_recovery = recover_workflow.index(
-            'complete-recovery \\\n            --state "$state"', verify_runtime
-        )
-        self.assertLess(recover_lock, recover_supervisor)
-        self.assertLess(recover_supervisor, retain_recovery)
-        self.assertLess(retain_recovery, restore_runtime)
-        self.assertLess(restore_runtime, verify_runtime)
-        self.assertLess(verify_runtime, nginx_check)
-        self.assertLess(nginx_check, api_health_check)
-        self.assertLess(nginx_check, web_health_check)
-        self.assertLess(api_health_check, complete_recovery)
-        self.assertLess(web_health_check, complete_recovery)
-        self.assertLess(clear_systemd_receipt, complete_recovery)
-        self.assertLess(verify_runtime, complete_recovery)
-        self.assertIn("platform_release_lock_supervisor_holds", recover_workflow)
-        self.assertIn("PLATFORM_ENABLE_SYSTEMD_UNITS=0", recover_workflow)
-        self.assertIn('test ! -e "$systemd_state"', recover_workflow)
-        self.assertNotIn("recover-pending", recover_workflow)
-        self.assertNotIn("--recover-pending", recover_workflow)
+        self.assertIn("Transfer exact attested recovery bundle", recover_workflow)
+        self.assertIn('"$bootstrap_tool" install', recover_workflow)
+        self.assertIn("--capability recover_pending", recover_workflow)
+        self.assertIn("generation_name=\"$bundle_sha\"", recover_workflow)
+        self.assertIn("trusted_generation=\"$runtime/shared/.release-recovery/generations/$generation_name\"", recover_workflow)
+        self.assertIn("platform_recover_pending.sh", recover_workflow)
+        self.assertIn("validate-generation", recover_workflow)
+        self.assertIn("set +e", recover_workflow)
+        self.assertNotIn("$runtime/current/tools", recover_workflow)
+        self.assertNotIn("platform_release_rollback.sh", recover_workflow)
         self.assertNotIn("exec 9<", recover_workflow)
         self.assertNotIn("flock -n 9", recover_workflow)
         self.assertNotIn("PLATFORM_RELEASE_LOCK_FD=9", recover_workflow)

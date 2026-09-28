@@ -221,7 +221,9 @@ if [[ ! -x "$UNITS_TOOL" || ! -f "$NGINX_TOOL" || ! -x "$SHARED_VENV/bin/python"
   exit 1
 fi
 if [[ -n "$SYSTEMD_STATE" ]]; then
-  if [[ ! -f "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE" || ! -x "$SYSTEMD_STATE_TOOL" ]]; then
+  systemd_state_tool_metadata="$(stat -c '%u:%g:%h:%a' "$SYSTEMD_STATE_TOOL" 2>/dev/null || true)"
+  if [[ ! -f "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE_TOOL" \
+    || "$systemd_state_tool_metadata" != "0:0:1:444" && "$systemd_state_tool_metadata" != "0:0:1:755" ]]; then
     public_status failed systemd_state >&2
     exit 1
   fi

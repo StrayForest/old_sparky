@@ -74,6 +74,7 @@ RECOVERY_BOOTSTRAP_FILES = frozenset(
         "platform/tools/platform_production_deploy_supervisor.sh",
         "platform/tools/platform_release_rollback.sh",
         "platform/tools/platform_release_systemd_state.py",
+        "platform/tools/platform_recover_pending.sh",
         "platform/tools/platform_release_transaction.py",
         "platform/tools/platform_run_alembic.sh",
         "platform/tools/platform_live_qa_guard.py",

@@ -31,6 +31,7 @@ import zipfile
 
 SCHEMA = 1
 CAPABILITY = "abort_retained_only"
+RECOVER_PENDING_CAPABILITY = "recover_pending"
 ENTRYPOINT = "platform_abort_retained_only.sh"
 MEMBER_ROOT = "platform-recovery-bootstrap"
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
@@ -61,6 +62,7 @@ RECOVERY_FILES = (
     "platform_release_systemd_state.py",
     "platform_live_qa_guard.py",
     "platform_live_qa_runtime_install.py",
+    "platform_recover_pending.sh",
 )
 
 
@@ -271,6 +273,7 @@ def _manifest(
     return {
         "schema": SCHEMA,
         "capability": CAPABILITY,
+        "capabilities": [CAPABILITY, RECOVER_PENDING_CAPABILITY],
         "entrypoint": ENTRYPOINT,
         "source_sha": source_sha,
         "deployable": False,
@@ -393,11 +396,13 @@ def _validate_manifest(
 ) -> dict[str, object]:
     if not isinstance(manifest, dict):
         raise RecoveryBootstrapError("recovery manifest is not an object")
-    expected_keys = {"schema", "capability", "entrypoint", "source_sha", "deployable", "provenance", "limits", "files"}
+    expected_keys = {"schema", "capability", "capabilities", "entrypoint", "source_sha", "deployable", "provenance", "limits", "files"}
     if set(manifest) != expected_keys:
         raise RecoveryBootstrapError("recovery manifest schema is not closed")
     if manifest.get("schema") != SCHEMA or manifest.get("capability") != CAPABILITY or manifest.get("entrypoint") != ENTRYPOINT:
         raise RecoveryBootstrapError("recovery manifest capability is invalid")
+    if manifest.get("capabilities") != [CAPABILITY, RECOVER_PENDING_CAPABILITY]:
+        raise RecoveryBootstrapError("recovery manifest capabilities are invalid")
     if manifest.get("deployable") is not False:
         raise RecoveryBootstrapError("recovery manifest is deployable")
     source_sha = manifest.get("source_sha")
@@ -563,6 +568,8 @@ def _validate_generation_tree(
     bundle_sha: str,
     require_generation_name: bool = True,
     expected_members: dict[str, bytes] | None = None,
+    expected_provenance: dict[str, object] | None = None,
+    required_capability: str = CAPABILITY,
 ) -> None:
     if not HEX64_RE.fullmatch(bundle_sha) or (
         require_generation_name and generation.name != bundle_sha
@@ -587,8 +594,11 @@ def _validate_generation_tree(
         require_root=True,
     )
     manifest = _validate_manifest(
-        manifest, expected_source_sha=None, expected_provenance=None
+        manifest, expected_source_sha=None, expected_provenance=expected_provenance
     )
+    capabilities = manifest.get("capabilities")
+    if required_capability not in capabilities:
+        raise RecoveryBootstrapError("recovery generation capability is unavailable")
     records = {str(record["path"]): record for record in manifest["files"]}
     for name, record in records.items():
         data = (generation / name).read_bytes()
@@ -647,6 +657,7 @@ def install_bundle(
             target,
             bundle_sha=bundle_sha,
             expected_members=verified["members"],
+            expected_provenance=expected_provenance,
         )
         return target
     temporary = generations / f".{bundle_sha}.install-{os.getpid()}"
@@ -674,7 +685,10 @@ def install_bundle(
                 os.close(descriptor)
         os.chmod(temporary, 0o555)
         _validate_generation_tree(
-            temporary, bundle_sha=bundle_sha, require_generation_name=False
+            temporary,
+            bundle_sha=bundle_sha,
+            require_generation_name=False,
+            expected_provenance=expected_provenance,
         )
         os.rename(temporary, target)
         directory_fd = os.open(generations, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -1019,12 +1033,23 @@ def _parser() -> argparse.ArgumentParser:
     validate_generation = commands.add_parser("validate-generation")
     validate_generation.add_argument("--generation", type=Path, required=True)
     validate_generation.add_argument("--bundle-sha", required=True)
+    validate_generation.add_argument("--provenance", type=Path)
+    validate_generation.add_argument(
+        "--capability",
+        choices=(CAPABILITY, RECOVER_PENDING_CAPABILITY),
+        default=CAPABILITY,
+    )
     install = commands.add_parser("install")
     install.add_argument("--bundle", type=Path, required=True)
     install.add_argument("--app-dir", type=Path, required=True)
     install.add_argument("--expected-bundle-sha")
     install.add_argument("--source-sha")
     install.add_argument("--provenance", type=Path)
+    install.add_argument(
+        "--capability",
+        choices=(CAPABILITY, RECOVER_PENDING_CAPABILITY),
+        default=CAPABILITY,
+    )
     abort = commands.add_parser("abort_retained_only")
     abort.add_argument("--app-dir", type=Path, required=True)
     abort.add_argument("--generation", type=Path)
@@ -1044,16 +1069,27 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(provenance, dict):
                 raise RecoveryBootstrapError("recovery provenance is invalid")
             result = build_bundle(args.source_root, source_sha=args.source_sha, provenance=provenance, output=args.output)
-            print(json.dumps({"schema": SCHEMA, "capability": CAPABILITY, "bundle_sha256": result["bundle_sha256"], "deployable": False}, sort_keys=True))
+            print(json.dumps({"schema": SCHEMA, "capability": "recovery_bootstrap", "capabilities": [CAPABILITY, RECOVER_PENDING_CAPABILITY], "bundle_sha256": result["bundle_sha256"], "deployable": False}, sort_keys=True))
         elif args.command == "validate":
             result = verify_bundle(args.bundle, expected_source_sha=args.source_sha, expected_provenance=expected_provenance)
-            print(json.dumps({"schema": SCHEMA, "capability": CAPABILITY, "bundle_sha256": result["bundle_sha256"], "deployable": False}, sort_keys=True))
+            print(json.dumps({"schema": SCHEMA, "capability": "recovery_bootstrap", "capabilities": [CAPABILITY, RECOVER_PENDING_CAPABILITY], "bundle_sha256": result["bundle_sha256"], "deployable": False}, sort_keys=True))
         elif args.command == "validate-generation":
-            _validate_generation_tree(args.generation, bundle_sha=args.bundle_sha)
-            print(json.dumps({"schema": SCHEMA, "capability": CAPABILITY, "generation": str(args.generation), "deployable": False}, sort_keys=True))
+            _validate_generation_tree(
+                args.generation,
+                bundle_sha=args.bundle_sha,
+                expected_provenance=expected_provenance,
+                required_capability=args.capability,
+            )
+            print(json.dumps({"schema": SCHEMA, "capability": args.capability, "generation": str(args.generation), "deployable": False}, sort_keys=True))
         elif args.command == "install":
             target = install_bundle(args.bundle, app_dir=args.app_dir, expected_bundle_sha=args.expected_bundle_sha, expected_source_sha=args.source_sha, expected_provenance=expected_provenance)
-            print(json.dumps({"schema": SCHEMA, "capability": CAPABILITY, "generation": str(target), "deployable": False}, sort_keys=True))
+            _validate_generation_tree(
+                target,
+                bundle_sha=target.name,
+                expected_provenance=expected_provenance,
+                required_capability=args.capability,
+            )
+            print(json.dumps({"schema": SCHEMA, "capability": args.capability, "generation": str(target), "deployable": False}, sort_keys=True))
         elif args.command == "abort_retained_only":
             generation = args.generation or Path(__file__).resolve().parent
             abort_retained_only(app_dir=args.app_dir, generation=generation)

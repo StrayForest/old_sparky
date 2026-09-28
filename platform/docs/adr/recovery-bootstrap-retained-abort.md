@@ -25,8 +25,10 @@ evidence, and cross-checked as a closed evidence/API pair; it is never inferred
 from or fabricated into the certificate URI.
 
 The host installs one root-owned, immutable, content-addressed generation
-under `shared/.release-recovery/generations/<bundle-sha256>`. Its fixed
-entrypoint executes only `abort_retained_only`, accepts a v2
+under `shared/.release-recovery/generations/<bundle-sha256>`. Its manifest
+advertises the two closed capabilities `abort_retained_only` and
+`recover_pending`; the fixed abort entrypoint executes only
+`abort_retained_only`, accepts a v2
 `recovery-restored` install receipt, restores the recorded runtime, verifies
 the retained systemd receipt, and performs two-phase completion: it removes
 the candidate/venv cleanup artifacts with `complete-recovery
@@ -36,12 +38,17 @@ durable cleanup side effect is idempotent and fails closed if the receipt pair
 or cleanup identities are inconsistent. It never checks out source, runs
 Alembic, downgrades a migration or selects a normal deploy entrypoint.
 
-The normal release-recover entrypoint has an explicit topology split. For a
-first-install receipt with no `current`, it selects exactly one validated
-generation from the shared recovery store and runs only that generation's
-lock/transaction helpers; it does not source `current/tools`. Current-only
-install recovery follows the same no-systemd generic cleanup rule, while
-upgrade and rollback retain the two-pointer systemd contract.
+The normal release-recover entrypoint has an explicit topology split but one
+immutable control plane. It transfers or reuses the exact attested bundle
+whose SHA is bound to the security-run/recovery-run evidence, installs it
+under that content address, validates its closed manifest and requested
+`recover_pending` capability, and invokes only
+`platform_recover_pending.sh`. For first-install and current-only receipts it
+runs only the generation's lock/transaction helpers and requires no systemd
+receipt; it never sources `current/tools`. Upgrade and rollback use that same
+generation wrapper for the two-pointer systemd contract, while release-specific
+data-plane helpers are accepted only through the systemd manifest bound to the
+recorded release.
 
 New transaction receipts carry one immutable 32-hex `operation_id`; the
 systemd receipt must carry the same ID and the canonical current/previous

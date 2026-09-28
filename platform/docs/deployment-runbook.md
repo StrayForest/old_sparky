@@ -385,7 +385,10 @@ evidence artifact and rejects any evidence/API pairing drift before accepting
 the attestation.
 
 The host installs the verified bundle as one immutable generation and invokes
-only its fixed `platform_abort_retained_only.sh` entrypoint. The entrypoint
+only its fixed `platform_abort_retained_only.sh` entrypoint for this workflow.
+The separate operation-aware release-recover workflow requests the explicit
+`recover_pending` capability and invokes only
+`platform_recover_pending.sh`. The abort entrypoint
 accepts only an install receipt in `phase=recovery-restored`; uncertain
 migration phases, missing identities, lock contention and any runtime,
 systemd, pointer or completion failure remain retained. It first keeps the
@@ -396,14 +399,14 @@ remaining receipt and never repeats an unproven runtime transition. This workflo
 non-deployable recovery authority: it does not run normal deploy, Alembic
 downgrade or a manually selected `systemctl` command.
 
-For an interrupted first install with no `current`, release recovery selects a
-single root-owned, immutable recovery generation from
-`shared/.release-recovery/generations/` and uses only its lock and transaction
-helpers. If a unique trusted generation is unavailable, recovery fails closed;
-it never resolves helpers from a missing current release. This path accepts
-only a new operation-ID receipt whose current and previous identities are both
-absent (or the deliberate current-only topology), and it requires no systemd
-receipt.
+For an interrupted first install with no `current`, release recovery selects
+the exact root-owned, immutable recovery generation bound to the supplied
+security run/attempt and recovery build run/attempt/job evidence. If that
+content address or capability is unavailable, recovery fails closed; it never
+scans for a latest or sole generation and never resolves helpers from a missing
+current release. This path accepts only a new operation-ID receipt whose
+current and previous identities are both absent (or the deliberate
+current-only topology), and it requires no systemd receipt.
 
 ## Smoke
 

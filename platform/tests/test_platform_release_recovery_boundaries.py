@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 from tests import platform_test_lock_support as lock_support
+from tools import platform_recovery_bootstrap as recovery
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +19,7 @@ DEPLOY_SCRIPT = REPO_ROOT / "platform/tools/platform_release_deploy.sh"
 ROLLBACK_SCRIPT = REPO_ROOT / "platform/tools/platform_release_rollback.sh"
 ALEMBIC_SCRIPT = REPO_ROOT / "platform/tools/platform_run_alembic.sh"
 RUNTIME_RESTORE_SCRIPT = REPO_ROOT / "platform/tools/platform_release_restore_runtime.sh"
+RECOVERY_WRAPPER = REPO_ROOT / "platform/tools/platform_recover_pending.sh"
 TRANSACTION_TOOL = REPO_ROOT / "platform/tools/platform_release_transaction.py"
 SYSTEMD_STATE_TOOL = REPO_ROOT / "platform/tools/platform_release_systemd_state.py"
 STATE_NAME = ".release-operation.json"
@@ -53,6 +55,161 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
                 self._release_lock.cleanup()
         finally:
             self.temp_dir.cleanup()
+
+    def test_immutable_recovery_wrapper_first_install_avoids_systemd_and_current_helpers(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        candidate = self.create_wrapper_transaction(None, None, "first-install")
+        systemctl, systemctl_log = self.write_failing_systemctl("first-install")
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(systemctl_log.exists())
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+        self.assertFalse((self.app_dir / "current").exists())
+        self.assertFalse((self.app_dir / "previous").exists())
+        self.assertFalse(candidate.exists())
+
+    def test_immutable_recovery_wrapper_current_only_avoids_systemd_and_tampered_helpers(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("current-only-current")
+        (self.app_dir / "current").symlink_to(current)
+        self.add_current_control_helper_bombs(current)
+        candidate = self.create_wrapper_transaction(current, None, "current-only")
+        systemctl, systemctl_log = self.write_failing_systemctl("current-only")
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(systemctl_log.exists())
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertFalse((self.app_dir / "previous").exists())
+        self.assertFalse(candidate.exists())
+        self.assertFalse((self.root / "current-helper-used").exists())
+
+    def test_immutable_recovery_wrapper_rejects_incomplete_two_pointer_snapshot_before_systemd(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("two-pointer-current")
+        previous = self.add_release("two-pointer-previous")
+        (self.app_dir / "current").symlink_to(current)
+        (self.app_dir / "previous").symlink_to(previous)
+        self.add_current_control_helper_bombs(current)
+        candidate = self.create_wrapper_transaction(current, previous, "two-pointer")
+        systemctl, systemctl_log = self.write_failing_systemctl("two-pointer")
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(systemctl_log.exists())
+        self.assertTrue((self.shared / STATE_NAME).is_file())
+        self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+        self.assertTrue(candidate.is_dir())
+        self.assertFalse((self.root / "current-helper-used").exists())
+
+    def test_immutable_recovery_wrapper_two_pointer_uses_bound_data_helpers(self) -> None:
+        generation = self.install_recovery_generation()
+        current = self.add_release("upgrade-current")
+        previous = self.add_release("upgrade-previous")
+        (self.app_dir / "current").symlink_to(current)
+        (self.app_dir / "previous").symlink_to(previous)
+        self.add_bound_release_tools(current)
+        venv = self.shared / "venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python").write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
+            encoding="utf-8",
+        )
+        (venv / "bin" / "python").chmod(0o755)
+        (venv / "deps-version").write_text("unchanged\n", encoding="ascii")
+        candidate = self.create_wrapper_transaction(
+            current, previous, "upgrade", complete_snapshot=True
+        )
+        # The immutable helper must use the supplied control-plane systemctl
+        # boundary; a release-specific control helper is only digest-read.
+        systemctl = self.write_stateful_systemctl(
+            {
+                "deadlock-api.service": "inactive",
+                "deadlock-worker.service": "inactive",
+                "deadlock-web.service": "inactive",
+            }
+        )
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "current-helper-used").exists())
+        self.assertFalse((self.shared / STATE_NAME).exists())
+        self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+        self.assertEqual((self.app_dir / "current").resolve(), current)
+        self.assertEqual((self.app_dir / "previous").resolve(), previous)
+        self.assertFalse(candidate.exists())
+
+    def test_immutable_recovery_wrapper_rejects_tampered_generation_before_transaction(
+        self,
+    ) -> None:
+        generation = self.install_recovery_generation()
+        candidate = self.create_wrapper_transaction(None, None, "tampered-generation")
+        systemctl, systemctl_log = self.write_failing_systemctl("tampered-generation")
+        transaction_helper = generation / "platform_release_transaction.py"
+        transaction_helper.chmod(0o644)
+        transaction_helper.write_bytes(transaction_helper.read_bytes() + b"\n# tampered\n")
+        transaction_helper.chmod(0o444)
+
+        result = self.run_script(
+            generation / RECOVERY_WRAPPER.name,
+            "--app-dir",
+            str(self.app_dir),
+            "--systemctl",
+            str(systemctl),
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(systemctl_log.exists())
+        self.assertTrue((self.shared / STATE_NAME).is_file())
+        self.assertFalse((self.shared / ".release-systemd-state.json").exists())
+        self.assertFalse((self.app_dir / "current").exists())
+        self.assertFalse((self.app_dir / "previous").exists())
+        self.assertTrue(candidate.is_dir())
 
     def test_resume_activation_committed_cleans_receipt(self) -> None:
         current, previous, candidate = self.prepare_install_state()
@@ -1341,6 +1498,187 @@ class PlatformReleaseRecoveryBoundaryTests(unittest.TestCase):
         path.write_text("#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n")
         path.chmod(0o755)
         return path
+
+    def recovery_provenance(self) -> dict[str, object]:
+        return {
+            "repository": "StrayForest/old_sparky",
+            "workflow": "Platform security and build",
+            "job": "Verification contract",
+            "run_id": "12345",
+            "run_attempt": "2",
+            "source_sha": "a" * 40,
+            "artifact_name": "platform-ci-route-12345-2",
+            "artifact_sha256": "b" * 64,
+            "deployable": False,
+        }
+
+    def install_recovery_generation(self) -> Path:
+        source_tools = self.root / "recovery-source" / "platform" / "tools"
+        source_tools.mkdir(parents=True)
+        for name in recovery.RECOVERY_FILES:
+            source = self.tools_dir / name
+            destination = source_tools / name
+            shutil.copy2(source, destination, follow_symlinks=False)
+            destination.chmod(0o755 if name.endswith(".sh") else 0o644)
+        self.install_test_lock_helper(source_tools / "platform_release_lock.sh")
+        bundle = self.root / "recovery-bundle.zip"
+        summary = recovery.build_bundle(
+            source_tools.parent.parent,
+            source_sha="a" * 40,
+            provenance=self.recovery_provenance(),
+            output=bundle,
+        )
+        return recovery.install_bundle(
+            bundle,
+            app_dir=self.app_dir,
+            expected_bundle_sha=str(summary["bundle_sha256"]),
+            expected_source_sha="a" * 40,
+            expected_provenance=self.recovery_provenance(),
+        )
+
+    def create_wrapper_transaction(
+        self,
+        current: Path | None,
+        previous: Path | None,
+        label: str,
+        *,
+        complete_snapshot: bool = False,
+    ) -> Path:
+        candidate = self.add_release(f"{label}-candidate")
+        rollback = candidate / ".rollback"
+        rollback.mkdir()
+        current_value = "" if current is None else str(current)
+        previous_value = "" if previous is None else str(previous)
+        if current is not None:
+            freeze = candidate / "requirements-platform.freeze.txt"
+            freeze.write_text("pip==test\n", encoding="ascii")
+            freeze.chmod(0o444)
+            previous_record = rollback / "previous-release"
+            previous_record.write_text(f"{current}\n", encoding="ascii")
+            previous_record.chmod(0o600)
+            transition = rollback / "venv-transition"
+            transition.write_text("unchanged\n", encoding="ascii")
+            transition.chmod(0o600)
+            freeze_record = rollback / "shared-freeze.sha256"
+            freeze_record.write_text(
+                f"{hashlib.sha256(freeze.read_bytes()).hexdigest()}\n",
+                encoding="ascii",
+            )
+            freeze_record.chmod(0o600)
+        self.run_transaction(
+            "create",
+            "--operation",
+            "install",
+            "--app-dir",
+            str(self.app_dir),
+            "--current-before",
+            current_value,
+            "--previous-before",
+            previous_value,
+            "--candidate-release",
+            str(candidate),
+            "--shared-venv",
+            str(self.shared / "venv"),
+            "--peer",
+            str(self.shared / f".venv-install-{candidate.name}.0000"),
+            "--snapshot",
+            str(rollback / "shared-venv-before-install"),
+            "--transition",
+            "none",
+        )
+        if complete_snapshot:
+            self.run_transaction(
+                "phase", "--expected", "prepared", "--phase", "venv-transitioned"
+            )
+            self.run_transaction(
+                "phase", "--expected", "venv-transitioned", "--phase", "staged"
+            )
+            self.run_transaction(
+                "record-services",
+                "--service-state",
+                "deadlock-api=inactive",
+                "--service-state",
+                "deadlock-worker=inactive",
+                "--service-state",
+                "deadlock-web=inactive",
+                "--timer-active-before",
+                "inactive",
+            )
+        return candidate
+
+    def write_failing_systemctl(self, label: str) -> tuple[Path, Path]:
+        log = self.root / f"{label}-systemctl.log"
+        path = self.root / f"systemctl-{label}"
+        path.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"printf '%s\\n' \"$*\" >> {str(log)!r}\n"
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        return path, log
+
+    def add_current_control_helper_bombs(self, release: Path) -> None:
+        tools = release / "tools"
+        tools.mkdir()
+        for name in (
+            "platform_release_transaction.py",
+            "platform_release_systemd_state.py",
+            "platform_release_restore_runtime.sh",
+            "platform_release_lock.sh",
+        ):
+            helper = tools / name
+            helper.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f"printf '%s\\n' used >> {str(self.root / 'current-helper-used')!r}\n"
+                "exit 99\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o755)
+
+    def add_bound_release_tools(self, release: Path) -> None:
+        tools = release / "tools"
+        tools.mkdir()
+        helper_names = (
+            "platform_install_systemd_units.sh",
+            "platform_install_nginx.py",
+            "platform_deploy_smoke.py",
+            "platform_live_qa_runtime_install.py",
+            "platform_install_logging.sh",
+            "platform_prepare_service_user.sh",
+            "platform_render_service_envs.py",
+            "platform_deploy_smoke_impl.py",
+            "platform_safe_env_exec.py",
+            "platform_release_restore_runtime.sh",
+            "platform_release_systemd_state.py",
+            "platform_release_transaction.py",
+            "platform_release_lock.sh",
+        )
+        control_names = {
+            "platform_release_restore_runtime.sh",
+            "platform_release_systemd_state.py",
+            "platform_release_transaction.py",
+            "platform_release_lock.sh",
+        }
+        for name in helper_names:
+            helper = tools / name
+            if name in control_names:
+                helper.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "set -euo pipefail\n"
+                    f"printf '%s\\n' used >> {str(self.root / 'current-helper-used')!r}\n"
+                    "exit 99\n",
+                    encoding="utf-8",
+                )
+            else:
+                helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            helper.chmod(0o755)
+        (release / "RELEASE.json").write_text(
+            json.dumps({"source_git_commit": "a" * 40}) + "\n",
+            encoding="ascii",
+        )
 
     def copy_deploy_script_with_fault(
         self,

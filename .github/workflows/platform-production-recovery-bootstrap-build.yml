@@ -224,7 +224,7 @@ jobs:
           import json,sys
           from pathlib import Path
           provenance=json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-          payload={"schema":1,"capability":"abort_retained_only","deployable":False,"bundle_name":sys.argv[3],"bundle_sha256":sys.argv[4],"recovery_run_id":__import__("os").environ["RECOVERY_BUILD_RUN_ID"],"recovery_run_attempt":__import__("os").environ["RECOVERY_BUILD_RUN_ATTEMPT"],"recovery_job_id":sys.argv[5],"provenance":provenance}
+          payload={"schema":1,"capability":"recovery_bootstrap","capabilities":["abort_retained_only","recover_pending"],"deployable":False,"bundle_name":sys.argv[3],"bundle_sha256":sys.argv[4],"recovery_run_id":__import__("os").environ["RECOVERY_BUILD_RUN_ID"],"recovery_run_attempt":__import__("os").environ["RECOVERY_BUILD_RUN_ATTEMPT"],"recovery_job_id":sys.argv[5],"provenance":provenance}
           Path(sys.argv[2]).write_text(json.dumps(payload,sort_keys=True,separators=(",",":"))+"\n",encoding="ascii")
           Path(sys.argv[2]).chmod(0o600)
           PY

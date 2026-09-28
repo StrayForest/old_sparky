@@ -229,7 +229,9 @@ Actions after reviewing the receipt:
 gh workflow run platform-production-release-recover.yml \
   --repo StrayForest/old_sparky \
   --ref dev \
-  -f confirmation=RECOVER-PENDING-RELEASE
+  -f confirmation=RECOVER-PENDING-RELEASE \
+  -f security_run_id=<exact-security-run-id> \
+  -f security_run_attempt=<exact-security-run-attempt>
 ```
 
 The recovery restores the exact pre-operation release/runtime and verifies

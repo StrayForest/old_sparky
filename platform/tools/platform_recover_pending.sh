@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ORIGINAL_ARGS=("$@")
+APP_DIR="${PLATFORM_APP_DIR:-/opt/oldsparky/platform}"
+SYSTEMCTL_BIN="/usr/bin/systemctl"
+PUBLIC_RELEASE_SLUG="unavailable"
+PUBLIC_SOURCE_SHA="unavailable"
+
+public_status() {
+  local status="$1" class="${2:-recovery}"
+  printf 'RELEASE_RUNTIME schema=1 status=%s class=%s release_slug=%s source_sha=%s\n' \
+    "$status" "$class" "$PUBLIC_RELEASE_SLUG" "$PUBLIC_SOURCE_SHA"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --app-dir)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      APP_DIR="$2"; shift 2
+      ;;
+    --systemctl)
+      [[ $# -ge 2 ]] || { public_status failed argument >&2; exit 1; }
+      SYSTEMCTL_BIN="$2"; shift 2
+      ;;
+    --help|-h)
+      cat <<'EOF'
+Usage: platform_recover_pending.sh --app-dir <path> [--systemctl <absolute-path>]
+EOF
+      exit 0
+      ;;
+    *) public_status failed argument >&2; exit 1 ;;
+  esac
+done
+
+[[ "$EUID" -eq 0 ]] || { public_status failed privilege >&2; exit 1; }
+[[ "$APP_DIR" == /* && "$APP_DIR" != "/" ]] || { public_status failed argument >&2; exit 1; }
+[[ "$SYSTEMCTL_BIN" == /* && "$SYSTEMCTL_BIN" != *$'\n'* ]] || {
+  public_status failed argument >&2
+  exit 1
+}
+
+TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+GENERATION_SHA="$(basename "$TOOLS_DIR")"
+[[ "$GENERATION_SHA" =~ ^[0-9a-f]{64}$ ]] || { public_status failed generation >&2; exit 1; }
+
+validate_generation_helper() {
+  local name="$1" mode="$2" path="$TOOLS_DIR/$1"
+  test -f "$path" && test ! -L "$path" \
+    && test "$(stat -c '%u:%h:%a' "$path" 2>/dev/null)" = "0:1:$mode" \
+    || { public_status failed generation >&2; exit 1; }
+}
+
+validate_generation_helper platform_recovery_bootstrap.py 444
+validate_generation_helper platform_release_lock.sh 555
+validate_generation_helper platform_release_restore_runtime.sh 555
+validate_generation_helper platform_release_systemd_state.py 444
+validate_generation_helper platform_release_transaction.py 444
+/usr/bin/python3 -I -B "$TOOLS_DIR/platform_recovery_bootstrap.py" \
+  validate-generation --generation "$TOOLS_DIR" --bundle-sha "$GENERATION_SHA" \
+  --capability recover_pending \
+  >/dev/null 2>/dev/null \
+  || { public_status failed generation >&2; exit 1; }
+
+# This immutable wrapper owns lock/transaction/systemd/restore orchestration.
+# It is intentionally separate from the abort-retained-only entrypoint.
+# shellcheck source=/dev/null
+source "$TOOLS_DIR/platform_release_lock.sh"
+platform_release_lock_supervise "${ORIGINAL_ARGS[@]}" || {
+  lock_status=$?
+  if [[ "$lock_status" -eq "$PLATFORM_RELEASE_LOCK_CONFLICT_EXIT_CODE" ]]; then
+    public_status failed lock >&2
+    exit 3
+  fi
+  exit "$lock_status"
+}
+if [[ "${PLATFORM_RELEASE_LOCK_SUPERVISED:-}" != "1" ]]; then
+  exit 0
+fi
+platform_release_lock_open || { public_status failed lock >&2; exit 3; }
+trap platform_release_lock_close EXIT
+
+STATE="$APP_DIR/shared/.release-operation.json"
+SYSTEMD_STATE="$APP_DIR/shared/.release-systemd-state.json"
+TRANSACTION_TOOL="$TOOLS_DIR/platform_release_transaction.py"
+SYSTEMD_STATE_TOOL="$TOOLS_DIR/platform_release_systemd_state.py"
+RESTORE_TOOL="$TOOLS_DIR/platform_release_restore_runtime.sh"
+test -f "$STATE" && test ! -L "$STATE" \
+  && test "$(stat -c '%u:%h:%a' "$STATE" 2>/dev/null)" = "0:1:600" \
+  || { public_status failed transaction >&2; exit 1; }
+
+pending_operation="$({
+  /usr/bin/python3 -I - "$STATE" <<'PY'
+import json
+import sys
+from pathlib import Path
+record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+if record.get("operation") not in {"install", "rollback"}:
+    raise SystemExit(1)
+print(record["operation"])
+PY
+} 2>/dev/null)" || { public_status failed transaction >&2; exit 1; }
+transaction_context="$({
+  /usr/bin/python3 -I - "$STATE" <<'PY'
+import json
+import sys
+from pathlib import Path
+record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+for key in ("operation_id", "phase", "current_before", "previous_before"):
+    value = record.get(key)
+    print("" if value is None else value)
+PY
+} 2>/dev/null)" || { public_status failed transaction >&2; exit 1; }
+mapfile -t transaction_fields <<<"$transaction_context"
+operation_id="${transaction_fields[0]:-}"
+transaction_phase="${transaction_fields[1]:-}"
+original_current="${transaction_fields[2]:-}"
+original_previous="${transaction_fields[3]:-}"
+
+[[ "$pending_operation" == "install" && "$operation_id" =~ ^[0-9a-f]{32}$ ]] || {
+  public_status failed transaction >&2
+  exit 1
+}
+
+if [[ -z "$original_previous" ]]; then
+  # First-install/current-only recovery never queries systemd or retained
+  # release tools. Only the immutable transaction helper may clean the receipt.
+  [[ ! -e "$SYSTEMD_STATE" && ! -L "$SYSTEMD_STATE" ]] \
+    || { public_status failed topology >&2; exit 1; }
+  if [[ -n "$original_current" ]]; then
+    [[ -L "$APP_DIR/current" && "$(readlink -f "$APP_DIR/current")" == "$original_current" ]] \
+      || { public_status failed topology >&2; exit 1; }
+  else
+    [[ ! -e "$APP_DIR/current" && ! -L "$APP_DIR/current" ]] \
+      || { public_status failed topology >&2; exit 1; }
+  fi
+  [[ ! -e "$APP_DIR/previous" && ! -L "$APP_DIR/previous" ]] \
+    || { public_status failed topology >&2; exit 1; }
+  /usr/bin/python3 -I "$TRANSACTION_TOOL" recover --state "$STATE" \
+    >/dev/null 2>/dev/null \
+    || { public_status failed transaction >&2; exit 1; }
+  test ! -e "$STATE" && test ! -L "$STATE" \
+    || { public_status failed transaction >&2; exit 1; }
+  public_status passed
+  exit 0
+fi
+
+[[ -n "$original_current" ]] && [[ -n "$original_previous" ]] \
+  && [[ "$pending_operation" == "install" ]] || {
+  public_status failed topology >&2
+  exit 1
+}
+
+complete_service_snapshot() {
+  /usr/bin/python3 -I - "$STATE" <<'PY'
+import json
+import sys
+from pathlib import Path
+record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+service_state = record.get("service_state_before")
+expected = {"deadlock-api", "deadlock-worker", "deadlock-web"}
+if (
+    not isinstance(service_state, dict)
+    or set(service_state) != expected
+    or any(value not in {"active", "inactive"} for value in service_state.values())
+    or record.get("quiesced_services") != ["deadlock-api", "deadlock-worker", "deadlock-web"]
+    or type(record.get("timer_active_before")) is not bool
+):
+    raise SystemExit(1)
+PY
+}
+
+if [[ -e "$SYSTEMD_STATE" || -L "$SYSTEMD_STATE" ]]; then
+  test -f "$SYSTEMD_STATE" && test ! -L "$SYSTEMD_STATE" \
+    && test "$(stat -c '%u:%h:%a' "$SYSTEMD_STATE" 2>/dev/null)" = "0:1:600" \
+    || { public_status failed systemd_state >&2; exit 1; }
+  /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" validate \
+    --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+    --transaction "$STATE" --helper-release "$original_current" \
+    --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
+    || { public_status failed systemd_state >&2; exit 1; }
+else
+  # Reject null/partial snapshots before capture can query systemctl or write
+  # the durable receipt; the operation receipt remains retained on failure.
+  complete_service_snapshot \
+    || { public_status failed service_state >&2; exit 1; }
+  /usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" capture-transaction \
+    --state "$SYSTEMD_STATE" --transaction "$STATE" --app-dir "$APP_DIR" \
+    --helper-release "$original_current" --require-helper-manifest \
+    --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
+    || { public_status failed systemd_state >&2; exit 1; }
+fi
+
+/usr/bin/python3 -I "$TRANSACTION_TOOL" recover --retain --state "$STATE" \
+  >/dev/null 2>/dev/null \
+  || { public_status failed transaction >&2; exit 1; }
+test -f "$STATE" && test ! -L "$STATE" \
+  || { public_status failed transaction >&2; exit 1; }
+
+current_release="$(readlink -f "$APP_DIR/current" 2>/dev/null || true)"
+test -L "$APP_DIR/current" && test -n "$current_release" \
+  && test -d "$current_release" && test ! -L "$current_release" \
+  && test "$(dirname "$current_release")" = "$APP_DIR/releases" \
+  && test "$(stat -c '%u:%a' "$current_release" 2>/dev/null)" = "0:755" \
+  && test "$(stat -c '%h' "$current_release" 2>/dev/null)" -ge 2 \
+  || { public_status failed layout >&2; exit 1; }
+expected_current="$({
+  /usr/bin/python3 -I - "$SYSTEMD_STATE" <<'PY'
+import json
+import sys
+from pathlib import Path
+record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+value = record.get("current_before")
+if not isinstance(value, str):
+    raise SystemExit(1)
+print(value)
+PY
+} 2>/dev/null)" || { public_status failed systemd_state >&2; exit 1; }
+test "$current_release" = "$expected_current" \
+  || { public_status failed topology >&2; exit 1; }
+PUBLIC_RELEASE_SLUG="$(basename "$current_release")"
+source_sha="$({
+  /usr/bin/python3 -I - "$current_release/RELEASE.json" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+try:
+    value = json.loads(Path(sys.argv[1]).read_text(encoding="ascii")).get("source_git_commit", "")
+except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+    value = ""
+if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value):
+    print(value)
+PY
+} 2>/dev/null)"
+[[ -n "$source_sha" ]] && PUBLIC_SOURCE_SHA="$source_sha"
+
+# Release-specific installers are data-plane inputs. The immutable systemd
+# helper has already verified their recorded digest manifest before this call.
+PLATFORM_ENABLE_SYSTEMD_UNITS=0 "$RESTORE_TOOL" \
+  --app-dir "$APP_DIR" --release "$current_release" \
+  --systemd-state "$SYSTEMD_STATE" --transaction "$STATE" \
+  --live-qa-runtime-installer "$current_release/tools/platform_live_qa_runtime_install.py" \
+  --systemctl "$SYSTEMCTL_BIN" --expected-csp-mode enforce \
+  --edge-origin https://127.0.0.1 --edge-host old-sparky.com \
+  --public-edge-origin https://old-sparky.com
+
+/usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" verify \
+  --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+  --transaction "$STATE" --helper-release "$current_release" \
+  --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
+  || { public_status failed systemd_state >&2; exit 1; }
+/usr/sbin/nginx -t >/dev/null 2>/dev/null
+for service in deadlock-api.service deadlock-worker.service deadlock-web.service; do
+  expected_state="$({
+    /usr/bin/python3 -I - "$SYSTEMD_STATE" "$service" <<'PY'
+import json
+import sys
+from pathlib import Path
+record = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
+for item in record["units"]:
+    if item["name"] == sys.argv[2]:
+        print(item["active"])
+        break
+else:
+    raise SystemExit(1)
+PY
+  } 2>/dev/null)"
+  case "$expected_state" in
+    active) "$SYSTEMCTL_BIN" is-active --quiet "$service" >/dev/null 2>/dev/null ;;
+    inactive) ! "$SYSTEMCTL_BIN" is-active --quiet "$service" >/dev/null 2>/dev/null ;;
+    *) public_status failed systemd_state >&2; exit 1 ;;
+  esac
+done
+/usr/bin/python3 -I "$SYSTEMD_STATE_TOOL" clear \
+  --state "$SYSTEMD_STATE" --app-dir "$APP_DIR" \
+  --transaction "$STATE" --helper-release "$current_release" \
+  --systemctl "$SYSTEMCTL_BIN" >/dev/null 2>/dev/null \
+  || { public_status failed systemd_state >&2; exit 1; }
+test ! -e "$SYSTEMD_STATE" && test ! -L "$SYSTEMD_STATE" \
+  || { public_status failed systemd_state >&2; exit 1; }
+/usr/bin/python3 -I "$TRANSACTION_TOOL" complete-recovery --state "$STATE" \
+  >/dev/null 2>/dev/null \
+  || { public_status failed transaction >&2; exit 1; }
+test ! -e "$STATE" && test ! -L "$STATE" \
+  || { public_status failed transaction >&2; exit 1; }
+public_status passed
